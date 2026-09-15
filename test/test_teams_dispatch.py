@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
+from kiro_crew.messaging.session_resume import RoutingDecision
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.teams.client import TeamsInbound
 from kiro_crew.teams.transport_dispatch import TeamsDispatcher
@@ -72,6 +74,7 @@ class FakeSessions:
         self.mirror_links: dict = {}
         self.opt_outs: dict = {}
         self.locked = False
+        self.reserved_generations: list[str] = []
 
     # -- dashboard mirror -------------------------------------------------
     def mirror_opt_out(self, key) -> bool:
@@ -162,6 +165,9 @@ class FakeSessions:
 
     def is_busy(self, key) -> bool:
         return self._busy
+
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
 
     def max_generation(self, bucket: str) -> int:
         return -1
@@ -335,7 +341,7 @@ class TestTurn:
     @pytest.mark.asyncio
     async def test_hard_threshold_declines_silently_on_auto_managed_backend(self) -> None:
         # No /compact to dispatch and no notice: the backend compacts on its
-        # own as context fills (#8156).
+        # own as context fills.
         provider = FakeProvider(
             [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
         )
@@ -352,7 +358,7 @@ class TestTurn:
     @pytest.mark.asyncio
     async def test_soft_nudge_suppressed_on_auto_managed_backend(self) -> None:
         # The nudge advises /compact, which this backend refuses — it compacts
-        # on its own, so there is nothing for the user to act on (#8156).
+        # on its own, so there is nothing for the user to act on.
         provider = FakeProvider(
             [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
         )
@@ -368,6 +374,45 @@ class TestTurn:
 
 class TestCommands:
     @pytest.mark.asyncio
+    async def test_closed_admission_spools_new_before_reset(self, monkeypatch) -> None:
+        sessions = FakeSessions(FakeProvider([]))
+        sessions.reserve_inbound_callback = lambda: None  # type: ignore[attr-defined]
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+        spool = AsyncMock(return_value=True)
+        monkeypatch.setattr("kiro_crew.messaging.dispatch.spool_refused_turn", spool)
+
+        await d.handle_message(_inbound("/new"))
+
+        assert client.sent == []
+        assert d._conv.current_gen(_EMAIL) == 0
+        route = spool.await_args.kwargs["route"]
+        assert spool.await_args.kwargs["channel_type"] == "teams"
+        assert route.conversation_id == "CONV"
+        assert route.text == "/new"
+        assert route.user_id == _EMAIL
+        assert route.message_id == "act-1"
+
+    @pytest.mark.asyncio
+    async def test_closed_admission_never_spools_a_restricted_resumed_session(
+        self, monkeypatch
+    ) -> None:
+        sessions = FakeSessions(FakeProvider([]))
+        sessions.reserve_inbound_callback = lambda: None  # type: ignore[attr-defined]
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        d._session_resume.route = AsyncMock(
+            return_value=RoutingDecision(resumed_key="dashboard:restricted")
+        )
+        d._session_restricted = AsyncMock(side_effect=lambda key: key == "dashboard:restricted")
+        spool = AsyncMock(return_value=True)
+        monkeypatch.setattr("kiro_crew.messaging.dispatch.spool_refused_turn", spool)
+
+        await d.handle_message(_inbound("keep this private"))
+
+        spool.assert_not_awaited()
+        d._session_restricted.assert_awaited()
+
+    @pytest.mark.asyncio
     async def test_new_bumps_gen_and_acks(self) -> None:
         sessions = FakeSessions(FakeProvider([]))
         client = FakeClient()
@@ -377,6 +422,7 @@ class TestCommands:
 
         assert client.sent == [("CONV", "✅ Started a fresh conversation.", _SVC)]
         assert d._conv.current_gen(_EMAIL) == 1
+        assert sessions.reserved_generations == [d._session_key(_EMAIL)]
         assert sessions.successes == []
 
     @pytest.mark.asyncio
@@ -409,7 +455,7 @@ class TestCommands:
     @pytest.mark.asyncio
     async def test_compact_declined_on_auto_managed_backend(self) -> None:
         # A backend that cannot serve /compact gets the informational reply and
-        # compact() is NEVER dispatched (#8156).
+        # compact() is NEVER dispatched.
         provider = FakeProvider([])
         provider.manual_compact_unsupported_backend = "kas"
         sessions = FakeSessions(provider)

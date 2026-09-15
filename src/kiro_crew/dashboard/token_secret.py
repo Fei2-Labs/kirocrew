@@ -165,17 +165,17 @@ def _unlink_if_same_file(key_path: Path, created_stat: os.stat_result) -> None:
 
 
 def _create_key_in_place(key_path: Path) -> bytes | None:
-    """Create the key by exclusive create AT *key_path*, the historical path.
+    """Create the key by exclusive create AT *key_path*, the in-place fallback.
 
     Reached only when the filesystem cannot hard-link, so the stage-then-link
     publish in :func:`_load_or_create_secret` is unavailable. Returns the new
     key, or ``None`` when another process won the create (the caller retries).
 
-    This carries the pre-existing truncation window with it: the destination is
-    created EMPTY and only then written, so a kill between the two leaves a
-    0-byte key. That is deliberate -- on a filesystem with no hard links the
-    alternative is no persisted key at all -- and it is why the linked publish
-    is the default rather than this.
+    This path carries a truncation window: the destination is created EMPTY and
+    only then written, so a kill between the two leaves a 0-byte key. That is
+    deliberate -- on a filesystem with no hard links the alternative is no
+    persisted key at all -- and it is why the linked publish is the default
+    rather than this.
     """
     # O_EXCL guarantees exactly one process across all sharers of this data
     # home wins the create; everyone else hits FileExistsError and loops back
@@ -338,7 +338,7 @@ def _load_or_create_secret() -> bytes:
                 # from the winner's persisted key (silent auth corruption). POSIX
                 # permits the concurrent read, so this branch is Windows-only; a
                 # genuinely unreadable file still degrades to ephemeral after the
-                # retry budget is exhausted (same as before, ~1s later).
+                # retry budget is exhausted (~1s later).
                 logger.debug(  # nosemgrep: python-logger-credential-disclosure -- logs the path only, never key bytes
                     "token signing key read contended at %s; retrying", key_path
                 )
@@ -365,7 +365,7 @@ def _load_or_create_secret() -> bytes:
             #    os.link is the publish step, not os.replace, because exactly
             #    ONE key may ever exist. link fails with FileExistsError once a
             #    sibling has published, which keeps the single-creator election
-            #    the in-place O_EXCL create used to provide; os.replace would
+            #    an in-place O_EXCL create provides; os.replace would
             #    let each racer install its own key and leave the losers
             #    signing with bytes that are no longer on disk.
             # The suffix is load-bearing, not cosmetic. This file holds the FULL

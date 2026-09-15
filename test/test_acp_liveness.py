@@ -205,7 +205,7 @@ def test_no_matching_child_is_unknown(tmp_path):
     assert "no matching" in evidence
 
 
-# ── The never-matched fork: absent child vs unrecognized live child (#4840) ──
+# ── The never-matched fork: absent child vs unrecognized live child ──
 
 # Dating a process against its dispatch needs the platform tick rate, which does
 # not exist off Linux (Windows has no os.sysconf, and no /proc for the oracle to
@@ -265,7 +265,7 @@ def test_tick_rate_lookup_survives_a_platform_without_sysconf(monkeypatch):
 
 @_needs_tick_rate
 def test_absent_shell_child_is_tagged_when_every_descendant_predates_dispatch(tmp_path):
-    """#4840: the sub-second command whose result frame was lost.
+    """The sub-second command whose result frame was lost.
 
     The oracle's first look happens at check_after_secs, by which time an ``ls |
     grep | wc`` child is long gone — it is never observed alive, so the
@@ -782,6 +782,102 @@ def test_model_wait_flat_with_established_socket_is_unknown_tagged(tmp_path):
     verdict, evidence = oracle.check_model_wait(100)
     assert verdict == VERDICT_UNKNOWN
     assert evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
+
+
+# ── Portable model-wait fallback (no procfs) ───────────────────
+#
+# macOS and Windows have no ``/proc``, so the tree walk reads NO counter at all
+# and the verdict was "unknown: no readable counters" — which the AcpClient's
+# stale cutoff treats as reap. Absent evidence must not read as death on the
+# platform most third-party backends run on.
+
+
+def _no_procfs_oracle(clock: _Clock, tmp_path) -> LivenessOracle:
+    """An oracle whose ``/proc`` root does not exist — i.e. any non-Linux host."""
+    return LivenessOracle(str(tmp_path / "nonexistent"), now=clock, sample_min_secs=1.0)
+
+
+def test_model_wait_portable_cpu_delta_is_working(tmp_path, monkeypatch):
+    """A CPU delta on a live pid forgives silence where the /proc walk is blind."""
+    from kiro_crew import platform_compat
+
+    clock = _Clock()
+    cpu = {"ns": 5_000_000_000}
+    monkeypatch.setattr(platform_compat, "proc_cpu_nanos_for_pid", lambda _pid: cpu["ns"])
+    monkeypatch.setattr(platform_compat, "pid_exists", lambda _pid: True)
+    oracle = _no_procfs_oracle(clock, tmp_path)
+
+    assert oracle.check_model_wait(100) == (VERDICT_UNKNOWN, "sampling")  # baseline
+    cpu["ns"] += 250_000_000
+    clock.advance(2.0)
+    verdict, evidence = oracle.check_model_wait(100)
+    assert verdict == VERDICT_WORKING
+    assert "backend activity" in evidence
+
+
+def test_model_wait_portable_flat_cpu_stays_unknown(tmp_path, monkeypatch):
+    """An idle process is not evidence of work — today's cutoff is preserved."""
+    from kiro_crew import platform_compat
+
+    clock = _Clock()
+    monkeypatch.setattr(platform_compat, "proc_cpu_nanos_for_pid", lambda _pid: 5_000_000_000)
+    monkeypatch.setattr(platform_compat, "pid_exists", lambda _pid: True)
+    oracle = _no_procfs_oracle(clock, tmp_path)
+
+    oracle.check_model_wait(100)  # baseline
+    clock.advance(2.0)
+    assert oracle.check_model_wait(100)[0] == VERDICT_UNKNOWN
+
+
+def test_model_wait_portable_movement_needs_a_live_pid(tmp_path, monkeypatch):
+    """A moving counter for a pid that is gone must not attest to work.
+
+    Both halves are required: the alive check alone would forgive a
+    finished-but-lost-frame backend forever (a wedged process is alive too),
+    trading a 90s truncation for a full-prompt-timeout hang.
+    """
+    from kiro_crew import platform_compat
+
+    clock = _Clock()
+    cpu = {"ns": 1_000_000_000}
+    monkeypatch.setattr(platform_compat, "proc_cpu_nanos_for_pid", lambda _pid: cpu["ns"])
+    monkeypatch.setattr(platform_compat, "pid_exists", lambda _pid: False)
+    oracle = _no_procfs_oracle(clock, tmp_path)
+
+    oracle.check_model_wait(100)  # baseline
+    cpu["ns"] += 900_000_000
+    clock.advance(2.0)
+    assert oracle.check_model_wait(100)[0] == VERDICT_UNKNOWN
+
+
+def test_model_wait_without_any_portable_counter_is_unknown(tmp_path, monkeypatch):
+    """No counter readable anywhere → the pre-fix verdict, unchanged."""
+    from kiro_crew import platform_compat
+
+    clock = _Clock()
+    monkeypatch.setattr(platform_compat, "proc_cpu_nanos_for_pid", lambda _pid: None)
+    oracle = _no_procfs_oracle(clock, tmp_path)
+
+    assert oracle.check_model_wait(100) == (VERDICT_UNKNOWN, "no readable counters")
+
+
+def test_model_wait_prefers_procfs_when_it_is_readable(tmp_path, monkeypatch):
+    """On Linux the portable probe is never consulted — the tree walk answers."""
+    from kiro_crew import platform_compat
+
+    def _never(_pid):
+        raise AssertionError("portable probe consulted while /proc was readable")
+
+    monkeypatch.setattr(platform_compat, "proc_cpu_nanos_for_pid", _never)
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, io_bytes=1000)
+    oracle = _oracle(fake, clock, sample_min=1.0)
+
+    oracle.check_model_wait(100)  # baseline
+    fake.set_io(100, 9000)
+    clock.advance(2.0)
+    assert oracle.check_model_wait(100)[0] == VERDICT_WORKING
 
 
 # ── Fail-safe behavior ───────────────────────────────────────────────────────

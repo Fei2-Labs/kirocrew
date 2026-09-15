@@ -598,12 +598,12 @@ async def _discover_worktrees() -> list[dict]:
             # git never ran: the HOST has no git the resolver is willing to
             # execute. Checked before the .git probe because the probe's
             # outcome is irrelevant here — wrapping this in "worktree
-            # discovery failed in <repo>" (the old behavior) sent users to
-            # debug a healthy checkout (#2530). The trusted-PATH detail is
+            # discovery failed in <repo>" would send users to debug a healthy
+            # checkout. The trusted-PATH detail is
             # operator-diagnostic, so it goes to the log, not the banner.
             runtime.logger.warning("dev-fleet: %s", raw)
             raise RepoUnreadable(runtime._unresolved_tool_message("git"))
-        # Every other git failure was previously swallowed into a silent [] —
+        # Every other git failure must NOT be swallowed into a silent [] —
         # which the UI renders as the "No worktrees found / Nothing under the
         # worktrees root yet" empty state. When MAIN_REPO is wrong that empty
         # state is a lie: the fleet is not empty, it is unreadable. Reaching here
@@ -712,6 +712,20 @@ def _type_change_refusal(rel: str) -> str:
     return f"refusing to discard {rel!r}: it is now a directory, not the file that was confirmed"
 
 
+def _is_directory_at(name: str, dir_fd: int) -> bool:
+    """Whether *name*, resolved relative to the pinned *dir_fd*, is a directory.
+
+    ``lstat`` through the descriptor and without following links, so the answer is
+    about the entry the failed ``unlink`` addressed and not about whatever a link
+    at that name points to. Any error reads as "not a directory": the caller then
+    reports the original failure instead of a guess.
+    """
+    try:
+        return stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
 def _discard_untracked_files(worktree: str, rel_paths: list[str]) -> str | None:
     """Delete exactly the approved untracked files. None on success, else a reason.
 
@@ -784,10 +798,10 @@ def _discard_untracked_files(worktree: str, rel_paths: list[str]) -> str | None:
         ):
             return f"refusing to discard a path that is not worktree-relative: {rel!r}"
         dir_fds: list[int] = []
+        walked = 0
         try:
             try:
                 dir_fds.append(os.open("/", os.O_RDONLY | os.O_DIRECTORY))
-                walked = 0
                 for comp in (*root_parts[1:], *parts[:-1]):
                     dir_fds.append(
                         os.open(
@@ -809,7 +823,7 @@ def _discard_untracked_files(worktree: str, rel_paths: list[str]) -> str | None:
                 continue
             except IsADirectoryError:
                 return _type_change_refusal(rel)
-            except PermissionError:
+            except PermissionError as exc:
                 # macOS answers EPERM (PermissionError) rather than EISDIR when
                 # `unlink` is handed a directory, so the type change would
                 # otherwise be reported as a generic permission failure and the
@@ -825,8 +839,16 @@ def _discard_untracked_files(worktree: str, rel_paths: list[str]) -> str | None:
                     swapped_to_dir = False
                 if swapped_to_dir:
                     return _type_change_refusal(rel)
-                return f"could not discard {rel!r}: permission denied"
+                return f"could not discard {rel!r}: {exc.strerror or exc}"
             except OSError as exc:
+                if exc.errno == errno.EPERM and _is_directory_at(parts[-1], dir_fds[-1]):
+                    # macOS and the BSDs answer unlink() on a directory with EPERM,
+                    # not Linux's EISDIR, so the type change arrives here instead of
+                    # in the clause above. Same refusal: nothing recurses into it.
+                    return (
+                        f"refusing to discard {rel!r}: it is now a directory, not the "
+                        "file that was confirmed"
+                    )
                 if walked < len(root_parts) - 1 and exc.errno in (errno.ELOOP, errno.ENOTDIR):
                     # A component of the worktree path is a symlink. Could be a
                     # host whose home directory is linked, could be an ancestor
@@ -846,6 +868,18 @@ def _discard_untracked_files(worktree: str, rel_paths: list[str]) -> str | None:
                 except OSError:  # pragma: no cover - defensive
                     pass
     return None
+
+
+def _is_dir_at(name: str, dir_fd: int) -> bool:
+    """Whether *name* under *dir_fd* is a real directory right now.
+
+    Never raises: the caller is already handling a refusal and only needs to know
+    which refusal to report.
+    """
+    try:
+        return stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
 
 
 async def _real_dirty(path: str) -> bool | None:
@@ -986,6 +1020,11 @@ async def _find_worktree_by_path(path: str) -> tuple[dict | None, str | None]:
     if not path:
         return None, "'path' must be a non-empty string"
     try:
+        # Explicit on every platform: POSIX ``realpath`` raises ValueError on an
+        # embedded NUL, but Windows' swallows it and resolves the string anyway,
+        # which would send garbage on to the enumeration instead of refusing it.
+        if "\x00" in path:
+            raise ValueError("embedded null byte")
         want = Path(path).resolve()
     except (OSError, ValueError, RuntimeError):
         return None, f"invalid path: {path!r}"

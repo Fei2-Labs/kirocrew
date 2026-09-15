@@ -1,10 +1,10 @@
 """Tests for the ``kiro_agent`` template contract on POST /api/agents.
 
-``kiro_agent`` used to default to ``"kirocrew"`` when a create request omitted
-it. Because dispatch flattens a crew alias to its ``kiro_agent`` pointer
-(``config.loader.resolve_agent_bindings``), such a crew was offered in the chat
-picker and then the DEFAULT agent answered — the "picker reverts to default"
-report behind #1684, with only a log line marking the substitution.
+Dispatch flattens a crew alias to its ``kiro_agent`` pointer
+(``config.loader.resolve_agent_bindings``), so a crew whose ``kiro_agent`` is
+allowed to default to ``"kirocrew"`` is offered in the chat picker and then
+answered by the DEFAULT agent — the picker appears to revert to default, with
+only a log line marking the substitution.
 
 The contract these tests pin:
 
@@ -31,6 +31,9 @@ from unittest.mock import patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from member_memory_helpers import patch_private_memory_supported
+
+from kiro_crew.config.sections import MemoryConfig
 
 
 @pytest.fixture(autouse=True)
@@ -43,17 +46,28 @@ def _owner_caller(monkeypatch):
         "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
         lambda request: True,
     )
+    patch_private_memory_supported(monkeypatch)
 
 
 def _fake_config():
-    """A stand-in KiroCrewConfig recording whether save() was reached."""
+    """A stand-in KiroCrewConfig snapshot.
+
+    The handler persists via a delta mutate through ``update_config_locked`` --
+    ``_post`` patches that and records the mutated document into
+    ``written`` -- so ``saved``/``written`` observe whether and what the
+    endpoint persisted.
+    """
     saved: list[bool] = []
     return SimpleNamespace(
         agent=SimpleNamespace(provider="acp"),
+        memory=MemoryConfig(),
+        degraded_sections=frozenset(),
         agents={},
+        memory_stores={},
         default_agent="kirocrew",
         save=lambda: saved.append(True),
         saved=saved,
+        written={},
     )
 
 
@@ -80,10 +94,21 @@ async def _post(body, cfg, installed=(), spy=None):
             spy.append(True)
         return rows
 
+    def _fake_update_config_locked(*args, **kwargs):
+        doc: dict = {"agents": {}}
+        result = kwargs["mutate"](doc)
+        cfg.written["doc"] = result
+        cfg.saved.append(True)
+        return result
+
     with (
         patch(
             "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
             return_value=cfg,
+        ),
+        patch(
+            "kiro_crew.config.loader.update_config_locked",
+            new=_fake_update_config_locked,
         ),
         patch(
             "kiro_crew.dashboard.handlers.agents.list_agents",
@@ -188,7 +213,7 @@ class TestTemplateNameGrammar:
             {"name": "crew-d", "kiro_agent": "my_agent2"}, cfg, installed=("my_agent2",)
         )
         assert status == 200
-        assert cfg.agents["crew-d"].kiro_agent == "my_agent2"
+        assert cfg.written["doc"]["agents"]["crew-d"]["kiro_agent"] == "my_agent2"
 
 
 class TestExplicitTemplateStillWorks:
@@ -203,8 +228,8 @@ class TestExplicitTemplateStillWorks:
         )
         assert status == 200
         assert data["ok"] is True
-        assert cfg.agents["researcher"].kiro_agent == "kirocrew"
-        assert cfg.agents["researcher"].workspace == "research"
+        assert cfg.written["doc"]["agents"]["researcher"]["kiro_agent"] == "kirocrew"
+        assert cfg.written["doc"]["agents"]["researcher"]["workspace"] == "research"
 
     @pytest.mark.asyncio
     async def test_listed_template_creates_without_warning(self, caplog):
@@ -231,7 +256,7 @@ class TestMissingTemplateWarnsButCreates:
             )
         # Accepted (an edition may resolve it even when unlisted)…
         assert status == 200
-        assert cfg.agents["crew-c"].kiro_agent == "not-installed"
+        assert cfg.written["doc"]["agents"]["crew-c"]["kiro_agent"] == "not-installed"
         # …but the substitution risk is on the record rather than silent.
         assert "not in the installed agent listing" in caplog.text
         assert "not-installed" in caplog.text

@@ -1,9 +1,8 @@
 """The ``agent.acp_backend`` axis has one comparison, and it lives in agent_sdk.
 
-Four places used to spell ``backend == ACP_BACKEND_CLAUDE`` independently:
+Four places spell the ``backend == ACP_BACKEND_CLAUDE`` decision:
 ``AcpProvider.is_claude_backend``, ``providers.acp.provider_label``,
-``session._is_claude_backend``, and ``AcpClient._is_claude``. Nothing asserted
-they agreed. Three now delegate to
+``session._is_claude_backend``, and ``AcpClient._is_claude``. Three delegate to
 :func:`kiro_crew.agent_sdk.backend_identity.is_claude_backend_name`; the client
 keeps its own for a layering reason this module pins so the exception stays
 deliberate.
@@ -75,10 +74,15 @@ def test_a_failed_lookup_reads_as_not_claude() -> None:
 def test_module_reaches_only_the_leaf_constants() -> None:
     """The helper may import ``acp_backends`` and nothing else from the package.
 
-    ``acp_backends`` is a documented leaf. An import of ``kiro_crew.acp`` or
-    ``kiro_crew.providers`` here would put the consolidation point inside the
-    very roots the boundary gate forbids, so every consumer that routed through
-    it would gain a forbidden edge instead of losing one.
+    ``agent_sdk.backends`` is a documented leaf -- the vocabulary module, moved
+    there from ``kiro_crew/acp_backends.py`` by RFC PR 3a. An import of
+    ``kiro_crew.acp`` or ``kiro_crew.providers`` here would put the consolidation
+    point inside the very roots the boundary gate forbids, so every consumer that
+    routed through it would gain a forbidden edge instead of losing one.
+
+    Reaching the constant through the ``kiro_crew.acp_backends`` shim would also
+    fail this: the shim imports this package, so a sibling inside ``agent_sdk``
+    that read it would close a cycle through its own parent's ``__init__``.
     """
     tree = ast.parse((SRC / "agent_sdk" / "backend_identity.py").read_text(encoding="utf-8"))
     imported: list[str] = []
@@ -87,7 +91,7 @@ def test_module_reaches_only_the_leaf_constants() -> None:
             imported.append(node.module)
         elif isinstance(node, ast.Import):
             imported.extend(alias.name for alias in node.names)
-    assert [m for m in imported if m.startswith("kiro_crew")] == ["kiro_crew.acp_backends"]
+    assert [m for m in imported if m.startswith("kiro_crew")] == ["kiro_crew.agent_sdk.backends"]
 
 
 def test_importing_this_module_does_not_load_acp_or_providers() -> None:
@@ -108,7 +112,7 @@ def test_importing_this_module_does_not_load_acp_or_providers() -> None:
         "loaded = {\n"
         "    'acp': 'kiro_crew.acp' in sys.modules,\n"
         "    'providers': 'kiro_crew.providers' in sys.modules,\n"
-        "    'acp_backends': 'kiro_crew.acp_backends' in sys.modules,\n"
+        "    'backends': 'kiro_crew.agent_sdk.backends' in sys.modules,\n"
         "}\n"
         "print(repr(loaded))\n"
     )
@@ -124,7 +128,7 @@ def test_importing_this_module_does_not_load_acp_or_providers() -> None:
     assert loaded["acp"] is False, "importing the helper loaded kiro_crew.acp"
     assert loaded["providers"] is False, "importing the helper loaded kiro_crew.providers"
     # Asserted, not tolerated: the helper reads its constant from here.
-    assert loaded["acp_backends"] is True
+    assert loaded["backends"] is True
 
 
 def _constant_comparisons(path: Path) -> list[int]:

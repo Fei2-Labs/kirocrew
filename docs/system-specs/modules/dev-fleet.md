@@ -256,7 +256,8 @@ it as hung clicks again or reloads mid-scan.
 
 Relies on `kiro_crew.pod` subpackage (optional import — degrades gracefully if unavailable):
 
-- `runtime.active_names(cfg)` — systemctl list (blocking, offloaded via `run_in_executor`)
+- `runtime.active_names(cfg)` — one point-in-time systemctl/launchctl listing per fleet build
+  (blocking, offloaded via `run_in_executor`), shared by every worktree row
 - `runtime.derive_port(cfg, name)` — cksum-based port derivation (blocking, offloaded)
 - `runtime.health(cfg, name, port, timeout)` — identity-gated HTTP probe (blocking,
   offloaded). Takes the pod's NAME, not just its port, because a derived port is
@@ -649,6 +650,56 @@ upstream's. Skipping is what makes it safe, and it costs an edition nothing —
 the only artifact this path could produce for it is a bundle it must never
 serve.
 
+**The frontend half is also suppressed on a backend-only sync — one whose
+incoming ref changes nothing under `website/`.** Both `npm ci` and `npm build +
+stage` are then work with no output: no new lockfile to install, no new source to
+build, and the staged bundle is already the current one. The decision is made by
+the `Verify dependencies` preflight, the one step that runs after `fetch` has
+pinned the incoming ref and before `merge` makes the worktree equal to it — the
+only point where "does the incoming ref touch the frontend?" has a correct answer.
+It cannot be decided when the step list is assembled, because the per-PID sync ref
+is not written until fetch runs; on a long-lived gateway's second sync it would
+still point at the prior tip. The preflight signals the verdict by exiting a
+reserved code (`EXIT_FRONTEND_SKIP`, 48) that the runner trusts ONLY from the
+preflight's own label — a worktree-run step exiting the same code is demoted to a
+plain failure, so it cannot forge a "skip the build". The runner then suppresses
+the two frontend steps whole, transaction included: a suppressed `npm ci` must not
+enter the `node_modules` transaction, whose move-aside-then-drop-backup on a no-op
+exit would delete the tree.
+
+The suppression fires only when ALL of these hold together, so the tree that
+produced the staged bundle and the tree now on disk are provably identical across
+tracked files, untracked files, and installed packages:
+
+1. the incoming ref changes nothing under `website/` (the tracked `git diff` the
+   probe skip already computes);
+2. the working subtree is clean INCLUDING untracked files (`git status
+   --porcelain --untracked-files=normal -- website` empty) — the same check the
+   fingerprint is STAMPED behind, re-checked before it is TRUSTED, so an untracked
+   `website/` file added between build and skip cannot ride through;
+3. `node_modules` is complete against the lockfile (`npm ls --all` exits 0), which
+   closes the partial-tree residual a bare "populated" check would leave;
+4. a build-source fingerprint — the git tree id of `website/` stamped beside the
+   staged bundle on the last successful build, and only when that build's tree was
+   clean — equals the incoming ref's `website/` tree.
+
+Any single failure, or any uncertainty (missing or failing `git`/`npm`, a
+timeout), returns "run", so the unknown case always rebuilds; the suppression
+cannot hold while a rebuild is owed.
+
+**Declared bound: this is a skip optimisation, so it has an inherent
+check-then-skip window.** The preflight decides before the merge, the runner
+suppresses after it, and the fingerprint is read right after the build; a tree
+changed by a concurrent writer in between yields a STALE build, never a wrong or
+corrupt one. This is the defining window of every build cache — closing it
+completely would need a lock held across the whole build, which destroys the
+~28 s the suppression saves. The worst outcome is a stale build on the operator's
+OWN checkout, rebuilt by re-running Pull + Build: no data lost, nothing corrupted,
+and whoever changed the tree mid-sync is who sees the result. The window is kept
+as narrow as it cheaply can be without a lock — the cleanliness check and the
+tree-id read run back-to-back under the staging lock, and the preflight runs
+immediately before the merge.
+
 The final **npm build + stage** step builds the frontend and copies `website/dist` into
 `src/kiro_crew/static/dist` under the Dev Fleet backend's OWN interpreter, with
 the target repo passed as an argument. Resolving the helper from the target
@@ -705,6 +756,26 @@ stdlib-only, so the copy needs no package context. Both halves matter: `-I` drop
 the cwd from `sys.path`, and the snapshot means an editable install cannot make
 the tree being synced supply the code doing the verifying.
 
+**The generated runner itself carries `-I` too, and for the same reason.** `python
+-c` puts the inherited cwd at `sys.path[0]`, ahead of the standard library, and
+the cwd a module-style app backend hands down is the gateway's own source root —
+which on the editable install Dev Fleet exists to manage *is* `<checkout>/src`,
+the tree being synced. So the runner's own startup imports (`os`, `shutil`,
+`subprocess`, `json`) resolve against that directory first, and the runner is the
+one process here that is **not** sandbox-wrapped: only the step argvs go through
+`sandboxed_spawn_argv`. Without `-I`, a `shutil.py` dropped in that directory runs
+arbitrary code outside the per-step sandbox. The shadowing module only has to be
+on disk when the runner *starts* — a revision an earlier sync already landed, or
+anything an agent wrote in the checkout between syncs, is enough — so this is not
+a race with the run's own merge. It is set on the interpreter rather than scrubbed
+inside the script so it holds for the process's whole life, including any import
+the runner grows later after a step has merged untrusted content. It costs
+nothing: the script is stdlib-only by design, and the `-E`/`-s` that `-I` implies
+remove env and user-site import sources it never uses. A mask from the sandbox
+could not substitute — an app backend's `extra_hidden_dirs` is silently dropped by
+`wrap_argv`'s nested passthrough (pinned in `test_sandbox_argv.py`), so it would
+read as a control at the call site and enforce nothing.
+
 **The install is skipped when the answer is already on disk.** Most syncs are
 backend-only and change nothing under `website/`, so paying a full scratch install
 to re-derive "is this lockfile installable" on every Pull + Build is cost without
@@ -717,15 +788,14 @@ still probes. Anything the comparison cannot answer — a failing or missing `gi
 a timeout — probes as well: the unknown case costs an install rather than a
 guarantee.
 
-A populated tree is evidence, not a verified install, and the bound is worth
-stating: a prior frontend sync whose post-merge `npm ci` died partway can leave a
-partial tree beside the merged lockfile, and later backend-only syncs will skip on
-it, since from there on the subtree is unchanged and nothing re-examines it. The
-consequence is the same class as the dead-registry residual — the skip decides only
-whether this sync pays for a rehearsal, so a refusal lands one step later rather
-than never, and the transaction keeps the checkout consistent either way. Issue
-[#7132](https://github.com/kirodotdev/KiroCrew/issues/7132) tracks the stronger
-evidence check that would close it.
+A populated tree is evidence, not a verified install. On its own that would let a
+partial tree — a prior frontend sync whose post-merge `npm ci` died partway,
+leaving packages missing beside the merged lockfile — pass as "populated". For
+the PROBE skip that residual is benign (the skip decides only whether this sync
+pays for a rehearsal, so a refusal lands one step later rather than never, and the
+transaction keeps the checkout consistent either way). For the frontend-STEP
+suppression below it would not be benign, so that path does not rely on the
+populated check alone — see the build-currency preconditions there.
 
 The condition is the whole subtree rather than just `package-lock.json` /
 `package.json` / `.npmrc`, and the difference is load-bearing. With those three
@@ -753,6 +823,97 @@ reserved code arriving from any step OTHER than the probe is demoted to a plain
 failure, because every other step runs worktree-controlled code that can exit any
 number it likes; and only the sync run kind is stamped at all, since `_start_run`
 is shared with `provision`, whose script enforces no such reservation.
+
+**When there is no reserved code, the failure is named from the failing step's
+stderr — never from the last output line.** Every step's stdout and stderr land
+in ONE pipe (`_start_run` spawns the runner with `stderr=STDOUT`, and steps
+inherit it), and a child block-buffers stdout to a pipe while writing stderr
+unbuffered — so the stdout buffer flushes at process EXIT, *after* the
+diagnostic. The stream order is therefore not evidence of what failed. A refused
+`git merge --ff-only` demonstrates it exactly:
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+        config-baseline.json
+Please commit your changes or stash them before you merge.
+Aborting
+Updating 2f9ed9724..bf09e50e5     <- stdout, flushed last
+```
+
+`run_step` therefore gives each step's stderr its own pipe, pumps it through to
+stdout line by line (so the log and the live "current activity" line are
+unchanged), and remembers its last `_STEPERR_TAIL` non-blank lines. When the step
+fails, `run_steps` re-emits those as `::steperr::<idx>::<line>` markers, and the
+UI's ladder is `cause` → the `::steperr::` block → the last output line. Both
+marker families are filtered out of the log panel: the stderr lines already
+appear there in their own order, so the markers would only duplicate the tail.
+
+Order WITHIN each stream is preserved; order ACROSS the two is unspecified. The
+child writes stdout straight to the inherited descriptor while the pump relays
+stderr, so the two interleave by timing rather than by causality. That is the
+premise of the change rather than a gap in it — a position in this stream was
+never evidence of what failed, which is why the tail is labelled instead of
+located.
+
+**The pump reads with a cap, it does not iterate the handle.** A step runs
+worktree-controlled code, so it can write a newline-free blob of any length, and
+`for line in stream` would allocate the whole blob inside the runner — the
+unbounded-read shape `test_jsonl_util.py::TestNoUnboundedHandleIteration`
+refuses. `readline(_STEPERR_READ_CAP)` bounds every allocation instead: a longer
+run arrives as cap-sized pieces, each forwarded, so splitting is the only effect and
+the
+blob is merely split across lines. The repo's own `jsonl_util` bounded readers
+are unavailable here — this module is stdlib-only and executes from a snapshot by
+path — so the bound is spelled with the stdlib.
+
+**That cap is derived from the gateway's byte limit, not chosen.** The two ends
+count different units: `readline` caps CHARACTERS because the stream is a text
+wrapper, while the gateway reads this pipe with `asyncio.StreamReader.readline()`,
+whose 64 KiB limit counts BYTES — and a line past it raises `LimitOverrunError`
+there, whose handler reaps the whole process tree. A character encodes to at most
+4 UTF-8 bytes and the pump appends one newline, so the cap is
+`(_GATEWAY_LINE_BYTES - 1) // 4`. A round-number character cap would satisfy the
+byte ceiling only for ASCII, and multibyte stderr — a non-ASCII checkout path, a
+localized git message — is ordinary. `test_dev_fleet_sync_runner.py` asserts the
+ENCODED length of every forwarded line, since an ASCII fixture cannot see the
+gap. A remembered tail line is separately capped at `_STEPERR_LINE_CHARS`, because
+the tail is rendered in a one-notice banner rather than in a log.
+
+**The drain after the step exits is bounded too.** `pump.join` waits
+`_STEPERR_DRAIN_S` and no longer. EOF on that pipe needs every writer gone, and a
+GRANDCHILD inherits the write end — `npm` spawns several — so one survivor keeps
+it open and EOF never arrives. An unbounded join would turn that survivor from a
+cosmetic leak into a wedged Pull+Build, so late lines are dropped instead. What
+that costs is precise: everything the STEP ITSELF wrote is relayed, since its
+bytes are in the pipe by the time `wait()` returns; what can be dropped is output
+written after the cutoff by something that outlived the step, which is the
+survivor this bound exists for.
+
+**This runner is the SOLE writer to its stdout pipe, and that is what makes the
+byte bound real.** Capping our own writes bounds nothing while a step also owns
+the descriptor: it can emit a newline-free blob that prepends to a terminated
+relay line, and the merged inter-newline run the gateway reads then exceeds
+`_GATEWAY_LINE_BYTES` however tightly each writer capped itself — which raises in
+the reader and reaps the process tree. So `run_step` pipes stdout as well as
+stderr, relays each on its own pump, and every write in the module — both pumps
+and every `::step::` / `::steperr::` / transaction line — goes through `emit`,
+which holds one lock for the whole line. A step that deliberately interleaves
+newline-free stdout blobs with terminated stderr lines produces 15 spliced lines
+without that, which `test_concurrent_stdout_cannot_splice_a_relayed_line` pins by
+mutation.
+
+`run_step`'s docstring states the guarantees exhaustively, as four numbered
+lines. Read them there rather than inferring them from prose here — sweeping
+wording about the log being complete or in order is what made this paragraph wrong
+twice.
+
+`::steperr::` is a **label on a worktree-controlled stream, not a diagnosis.** It
+never sets `lastIsCause`, so it renders as the raw tail it is — a step printing a
+plausible sentence to stderr gains exactly what it already had, its output shown
+verbatim. The one shape that is guarded is an all-blank forged tail, which would
+resolve to the empty string and make `ErrorNotice` render nothing: blank marker
+texts are dropped, and the last-line fallback skips marker lines too, so a forged
+marker can neither hide the notice nor be surfaced raw.
 
 The build and the copy are ONE step because they share ONE holder of the staging
 lock (`.dist.staging.lock`, next to `static/dist`). `npm run build` empties
@@ -970,6 +1131,38 @@ Disk and loaded launchd definitions must both report `KeepAlive=true` and
 `GRACEFUL_SHUTDOWN_SECS` (10s), leaving the remaining budget for cleanup and
 exit before launchd escalates to SIGKILL. An agent with a legacy contract falls
 back to staged-only Make Live and names `kirocrew service install` as the repair.
+
+## Git environment hardening
+
+Every git invocation from this module — foreground inspection, the unattended
+background fetch, rebase, the sync pull, and any git a build step runs — carries
+`runtime._GIT_ENV_NEUTRALIZERS`, injected as **environment** rather than as
+per-call-site `-c` flags so one chokepoint covers call sites that have not been
+written yet. The environment form has the same precedence as `git -c`, so it
+overrides every config file, including an agent-writable repo-local one.
+
+Two different jobs live in that one dict, and they are worth keeping apart:
+
+- **Config-driven execution.** `GIT_ALLOW_PROTOCOL` / `GIT_PROTOCOL_FROM_USER`
+  make git itself refuse `ext::` and custom remote helpers; the four
+  `GIT_CONFIG_KEY_*` / `VALUE_*` pairs disable `core.fsmonitor` and
+  `core.hooksPath`, reset `credential.helper` to empty, and pin `core.sshCommand`
+  to plain `ssh`. Each of those is a config key a repo can set to name a program
+  git will spawn. (The operator's own *global* credential helpers are re-pinned
+  after the reset — see `_GIT_TRUSTED_HELPERS` — because a global config is
+  operator-owned rather than part of the repo attack surface.)
+- **Which object graph git answers from.** `GIT_NO_REPLACE_OBJECTS=1` is not a
+  config key and is not about code execution. A `refs/replace/<oid>` ref
+  substitutes one object for another in *every* read, so `log`,
+  `rev-list --count`, `merge-base` and `merge --ff-only` all answer about the
+  substitute graph — a history no checked-out commit names. Every git answer this
+  module acts on is a statement about the checkout on disk, so the real graph is
+  the only one that answers the question asked, and "behind by N commits" derived
+  from a grafted walk is simply wrong. `git replace` is a legitimate local
+  operation, so this is a correctness pin first and a tamper pin second. It is
+  therefore an env var in its own right and **not** one of the counted config
+  pairs: `GIT_CONFIG_COUNT` stays at 4. `platform/update_governance.py` and
+  `auto_improvement`'s clone setup pin it for the same reason.
 
 ## Output Redaction
 

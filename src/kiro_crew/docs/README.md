@@ -24,6 +24,7 @@ organized for someone browsing the repository.
 |---|---|
 | [agents.md](agents.md) | Switching between specialized agents per conversation, thread, or cron job. |
 | [skills.md](skills.md) | Drop-in markdown knowledge packs for domain-specific workflows. |
+| [monitoring.md](monitoring.md) | Token-efficient pull-request monitoring and finite legacy fallbacks. |
 | [cron-and-scheduling.md](cron-and-scheduling.md) | Scheduling recurring tasks. |
 | [subagents.md](subagents.md) | Spawning parallel background workers for fan-out work. |
 | [dynamic-subagent-sizing.md](dynamic-subagent-sizing.md) | How the concurrent sub-agent cap is sized from host memory and CPU. |
@@ -35,9 +36,17 @@ organized for someone browsing the repository.
 | [agent-questions.md](agent-questions.md) | Letting an agent pause mid-turn to ask a clickable question. |
 | [followup-suggestions.md](followup-suggestions.md) | Agent-proposed next steps above the composer. |
 | [feature-tips.md](feature-tips.md) | Personalized tips pointing at features you have not used. |
+| [feature-videos.md](feature-videos.md) | Short intro clips for features this install has not used yet. |
 | [inbound-webhooks.md](inbound-webhooks.md) | Letting external systems trigger an agent turn over HTTP. |
 | [deploy-web.md](deploy-web.md) | Publishing artifacts to a public HTTPS URL on your own AWS. |
 | [snapshot-and-restore.md](snapshot-and-restore.md) | Backing up and restoring Kiro Crew state. |
+| [workflows.md](workflows.md) | Multi-phase agent runs you can watch, restart in part, and save for reuse. |
+| [secrets-vault.md](secrets-vault.md) | Storing credentials encrypted where the agent cannot read them. |
+| [monitor-loops.md](monitor-loops.md) | Keeping one session checking something on an interval until an exit condition fires. |
+| [session-ledger.md](session-ledger.md) | The durable per-session work record that survives context compaction. |
+| [artifacts.md](artifacts.md) | Saving, versioning, and reverting generated UI and documents. |
+| [computer-use.md](computer-use.md) | Reading and driving native desktop applications; opt-in and off by default. |
+| [browser-control.md](browser-control.md) | Driving a real web page from the dashboard's Browser panel. |
 
 ## Channels
 
@@ -52,19 +61,19 @@ organized for someone browsing the repository.
 | [weixin-integration.md](weixin-integration.md) | Weixin setup, and the risks to read first. |
 | [whatsapp-integration.md](whatsapp-integration.md) | WhatsApp (QR-linked personal account) setup, and the risks to read first. |
 | [feishu-integration.md](feishu-integration.md) | Feishu (Lark/飞书) setup and behavior. |
-| [messaging-transport.md](messaging-transport.md) | The channel-neutral contracts every transport shares. |
+| [imessage-integration.md](imessage-integration.md) | iMessage setup and behavior on a Mac that owns the Messages database. |
+| [channel-capabilities.md](channel-capabilities.md) | One matrix of what every channel can do: streaming, buttons, uploads, reply length, approval timeout. |
 
 ## Platform
 
 | Doc | Covers |
 |---|---|
-| [app-platform-trust-model.md](app-platform-trust-model.md) | Enabled apps run in-process with full privileges: the trust boundary and its audit. |
 | [mcp-apps.md](mcp-apps.md) | Rendering interactive MCP tool output in chat: the two gates, what a server declares, and the plain-text fallback. |
-| [dashboard-iframe-hosts.md](dashboard-iframe-hosts.md) | The four iframe hosts, their differing sandboxes, and why they are not interchangeable. |
+| [settings-deeplink.md](settings-deeplink.md) | Answering "where is that setting?" with a link that opens and flashes the control, and the generated registry it comes from. |
 
 ## Maintaining this directory
 
-Two constraints make this tree different from `docs/`:
+Three constraints make this tree different from `docs/`:
 
 - **Filenames are an API.** `tips.py` globs `*.md` here and filters through
   `tips_allowlist.py`, extracting each doc's H1 and first paragraph into the in-app
@@ -75,6 +84,11 @@ Two constraints make this tree different from `docs/`:
 - **The tree is flat, deliberately.** `setup.cfg`'s `package_data` glob for this
   directory does not recurse, so a file in a subdirectory would ship in the sdist
   but be missing from the wheel.
+- **Not every file here is prose.** `settings-registry.generated.json` is a build
+  artifact of the dashboard (`npm run gen:settings`), shipped beside
+  [settings-deeplink.md](settings-deeplink.md) so the agent can enumerate the
+  Settings controls at runtime. Do not hand-edit it; a frontend test byte-matches
+  it against the live panels.
 
 Because every doc here reaches every user, keep the content task-oriented and free
 of internal design narration. An engineering note belongs in

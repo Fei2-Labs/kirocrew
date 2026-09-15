@@ -23,20 +23,40 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import socket
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
+from tmpdir_helpers import short_tmp_base
 
 import kiro_crew.dashboard.token_auth as ta
 from kiro_crew import platform_compat
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_gateway.socketsec import PeerCredResult
 from kiro_crew.peer_resolve import resolve_peer_identity
+
+
+@pytest.fixture
+def short_sock_dir() -> "Iterator[Path]":
+    """A SHORT base for every AF_UNIX bind/connect path in this module.
+
+    ``sun_path`` caps at 104 bytes on macOS, and a pytest ``tmp_path`` under a
+    deep TMPDIR (or xdist) exceeds it, failing ``bind()`` with ``OSError:
+    AF_UNIX path too long``. Same pattern as ``test_socketsec.py``:
+    ``mkdtemp`` under :func:`short_tmp_base`, removed at teardown because
+    ``mkdtemp`` registers no finalizer.
+    """
+    base = Path(tempfile.mkdtemp(dir=short_tmp_base()))
+    yield base
+    shutil.rmtree(base, ignore_errors=True)
+
 
 SECRET = "test-internal-secret"
 INTERNAL = frozenset({"/api/spawn"})
@@ -233,6 +253,10 @@ async def test_unix_peer_mismatch_denied_with_sel(monkeypatch: pytest.MonkeyPatc
     )
     resp = await mw(req, _ok_handler)
     assert resp.status == 403
+    assert json.loads(resp.body) == {
+        "error": "Forbidden",
+        "code": "peer_session_mismatch",
+    }
     mismatches = [c for c in calls if c.get("operation") == "dashboard.peer-identity-mismatch"]
     assert len(mismatches) == 1
     assert mismatches[0]["outcome"] == "denied"
@@ -298,6 +322,10 @@ async def test_unix_peer_uid_mismatch_denied(monkeypatch: pytest.MonkeyPatch) ->
     )
     resp = await mw(req, _ok_handler)
     assert resp.status == 403
+    assert json.loads(resp.body) == {
+        "error": "Forbidden",
+        "code": "unix_peer_unverified",
+    }
     assert any(c.get("outcome") == "denied" for c in calls)
 
 
@@ -316,6 +344,10 @@ async def test_unix_peer_uid_unverifiable_denied(monkeypatch: pytest.MonkeyPatch
     )
     resp = await mw(req, _ok_handler)
     assert resp.status == 403
+    assert json.loads(resp.body) == {
+        "error": "Forbidden",
+        "code": "unix_peer_unverified",
+    }
     assert any("unverifiable" in c.get("error", "") for c in calls)
 
 
@@ -405,7 +437,7 @@ def _unix_http_request(
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
 @pytest.mark.asyncio
 async def test_unix_site_end_to_end_peer_verification(
-    short_sock_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, short_sock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Real UnixSite + real AF_UNIX connect: the kernel reports OUR pid/uid,
     so with a session_pid file for an ancestor of this test process the
@@ -539,13 +571,13 @@ async def test_start_unix_site_skipped_on_windows(monkeypatch: pytest.MonkeyPatc
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
 @pytest.mark.asyncio
 async def test_start_unix_site_bind_failure_degrades(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    short_sock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A non-socket file squatting the path makes the bind fail; startup must
     degrade to TCP-only (return None), never raise."""
     from kiro_crew.dashboard import server as srv
 
-    squatter = tmp_path / "dashboard-6001.sock"
+    squatter = short_sock_dir / "dashboard-6001.sock"
     squatter.write_text("not a socket", encoding="utf-8")
     monkeypatch.setattr("kiro_crew.dashboard.server.dashboard_socket_path", lambda port: squatter)
     app = web.Application()
@@ -607,11 +639,11 @@ def test_loopback_urlopen_uses_unix_socket(unix_http_server: str) -> None:
         assert json.loads(resp.read()) == {"via": "unix"}
 
 
-def test_loopback_urlopen_absent_socket_falls_back_to_tcp(tmp_path: Path) -> None:
+def test_loopback_urlopen_absent_socket_falls_back_to_tcp(short_sock_dir: Path) -> None:
     """Socket file missing → straight to TCP (refused on a dead port)."""
     req = urllib.request.Request("http://127.0.0.1:1/api/x")
     with pytest.raises(urllib.error.URLError):
-        loopback_urlopen(req, timeout=2, unix_socket_path=str(tmp_path / "nope.sock"))
+        loopback_urlopen(req, timeout=2, unix_socket_path=str(short_sock_dir / "nope.sock"))
 
 
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
@@ -709,12 +741,12 @@ def test_mcp_core_post_prefers_unix_socket(
 
 
 def test_mcp_core_post_falls_back_to_tcp_when_socket_absent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    short_sock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Error shape of _get is unchanged when neither transport answers."""
     import kiro_crew.mcp_core as mcp_core
 
-    monkeypatch.setattr(mcp_core, "_API_UNIX_SOCKET", str(tmp_path / "absent.sock"))
+    monkeypatch.setattr(mcp_core, "_API_UNIX_SOCKET", str(short_sock_dir / "absent.sock"))
     monkeypatch.setattr(mcp_core, "_API", "http://127.0.0.1:1")
     monkeypatch.setattr(mcp_core, "_internal_secret", lambda: "s")
     monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:chat-1")
@@ -750,14 +782,12 @@ async def test_non_loopback_mixed_denial_names_which_credential_was_wrong(
     assert resp.status == 403
 
     denials = [
-        c
-        for c in calls
-        if c.get("operation") == "internal_auth" and c.get("outcome") == "denied"
+        c for c in calls if c.get("operation") == "internal_auth" and c.get("outcome") == "denied"
     ]
     assert len(denials) == 1
     err = denials[0]["error"]
     assert "non-loopback mixed" in err, err
-    assert "received=absent" in err, (
-        "the mixed arm still cannot say an absent credential from a wrong one"
-    )
+    assert (
+        "received=absent" in err
+    ), "the mixed arm still cannot say an absent credential from a wrong one"
     assert f"expected={ta._credential_fingerprint(SECRET)}" in err, err

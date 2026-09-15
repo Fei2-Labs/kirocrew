@@ -729,7 +729,7 @@ def test_malformed_host_issue_numbers_stay_unconfirmed() -> None:
 
 
 def test_bare_reference_without_a_verb_is_reported() -> None:
-    """The exact shape that merged in #2433/#2439 and closed nothing.
+    """A bare reference with no closing verb is reported and closes nothing.
 
     Reported, not blocked -- the author decides.
     """
@@ -749,7 +749,7 @@ def test_verb_present_but_host_resolved_nothing_is_reported_distinctly() -> None
     assert "no closing keyword" not in reason
 
 
-# --- explicit closing-trailer grammar (#3450) --------------------------------
+# --- explicit closing-trailer grammar ----------------------------------------
 #
 # A trailer must occupy the WHOLE visible line, and the accepted targets are
 # same-repo `#123`, qualified `owner/repo#123`, and a full issue URL. Each
@@ -760,7 +760,7 @@ def test_verb_present_but_host_resolved_nothing_is_reported_distinctly() -> None
 
 
 def test_prose_mentioning_a_past_close_is_not_a_trailer() -> None:
-    """The gap that motivated #3450.
+    """Prose mentioning a past close is not a trailer.
 
     ``Fixed #123 in an earlier release`` is a sentence, not a declaration. It
     must be reported as the missing-verb (bare-reference) case, never as
@@ -923,22 +923,21 @@ def test_same_number_in_different_repositories_stays_unconfirmed() -> None:
     assert reason is not None
     # One unqualified `Fixes #7` covers ONE closure, so the second repository's
     # #7 -- named only in prose, never in a trailer -- is reported as undeclared.
-    # This used to read "the same number resolved in multiple repositories",
-    # which said the shape was ambiguous; naming the unaccounted-for closure is
-    # both narrower and true.
+    # Naming the unaccounted-for closure is both narrower and true than calling
+    # the shape ambiguous.
     assert "no explicit closing trailer" in reason
     assert "#7" in reason
 
 
 def test_two_qualified_trailers_for_one_number_do_not_trigger_a_notice() -> None:
-    """The false positive the "same number twice" notice used to produce.
+    """Two qualified trailers for one number must not trigger a duplicate notice.
 
-    Once matching became repository-aware this body was fully accounted for --
+    Repository-aware matching accounts for this body fully --
     `Fixes #7` declares this repository's #7 and `Fixes other/repo#7` declares
-    the other one, and the host resolved exactly those two -- yet a
-    duplicate-number branch still fired. An advisory that fires on a correct body
-    is how authors learn to ignore advisories, so the branch is gone: genuine
-    ambiguity is already covered by the undeclared-closure case.
+    the other one, and the host resolves exactly those two. An advisory that
+    fires on a correct body is how authors learn to ignore advisories, so it
+    does not fire here: genuine ambiguity is covered by the undeclared-closure
+    case.
     """
     module = _load_script()
     body = "Fixes #7\nFixes other/repo#7"
@@ -1143,7 +1142,7 @@ def test_a_code_indented_trailer_is_never_a_declaration() -> None:
     that closes itself (see the sibling test). The bound replaces the state: a
     trailer at four or more columns is not a declaration, full stop.
 
-    The cost is this body no longer being credited, which prints an advisory
+    The cost is this body not being credited, which prints an advisory
     notice on an odd shape. The benefit is that no block type can smuggle an
     EXAMPLE through as a declaration, which silently suppresses a real warning.
     """
@@ -1286,11 +1285,11 @@ def test_opt_out_phrasing_carries_no_closing_keyword() -> None:
     """The opt-out line itself must never read as a close-on-merge trigger.
 
     GitHub closes an issue on merge when the body matches
-    ``(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s*:?\\s+#<n>``. The retired
-    phrasing ``no issue closed: <why>`` put the keyword ``closed`` directly
+    ``(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s*:?\\s+#<n>``. A phrasing like
+    ``no issue closed: <why>`` puts the keyword ``closed`` directly
     before the colon, so a ``<why>`` opening with an issue number
-    (``no issue closed: #1234 tracks the follow-up``) produced
-    ``closed: #1234`` — auto-closing the very issue the line disclaims.
+    (``no issue closed: #<n> tracks the follow-up``) yields
+    ``closed: #<n>`` — auto-closing the very issue the line disclaims.
     Lock in both properties: the canonical phrasing matches the opt-out
     regex, and no closing keyword survives anywhere in it.
     """
@@ -1397,7 +1396,7 @@ def test_resolved_issue_link_reports_the_number_and_no_notice(capsys) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Issue #2550: reviewer-marker freshness + blocking markers + head-run
+# Reviewer-marker freshness + blocking markers + head-run
 # assertion move from babysit prose into the script.
 # ---------------------------------------------------------------------------
 
@@ -1449,7 +1448,7 @@ def test_stale_reviewer_stamp_blocks_a_would_be_clean_pr() -> None:
 # A realistic head: the all-`f` fixture cannot exercise elision, because any
 # splice of it is also a prefix of it.
 _MIXED_HEAD = "db7c4361f0a92be5147c3d8e6b0af215934cde78"
-# The shape the Design lane actually emitted on PR 4107: the head's first 14
+# The shape the Design lane emits: the head's first 14
 # characters spliced to its last 11, middle dropped, 25 characters total.
 _ELIDED = _MIXED_HEAD[:14] + _MIXED_HEAD[-11:]
 
@@ -1469,7 +1468,7 @@ class TestShaMatches:
         assert not module.sha_matches(_MIXED_HEAD[:6], _MIXED_HEAD)
 
     def test_elided_middle_matches_the_head_it_mangles(self) -> None:
-        """PR 4107's exact failure: 25 characters, prefix+suffix of this head."""
+        """The elided form is 25 characters: prefix+suffix of this head."""
         module = _load_script()
         assert len(_ELIDED) == 25
         assert not _MIXED_HEAD.startswith(_ELIDED)  # the old test rejected it
@@ -2035,7 +2034,7 @@ def test_degraded_rollup_reason_is_distinct_from_a_genuine_no_checks_pr(capsys) 
 
 
 # ---------------------------------------------------------------------------
-# Issue #4187: the disposition gate -- one lane, one rationale per finding.
+# The disposition gate -- one lane, one rationale per finding.
 # The computation is pinned byte-identical to pr_findings.py's copy by
 # test_prepare_pr_findings.py; these tests cover the GATING half.
 # ---------------------------------------------------------------------------
@@ -2104,8 +2103,8 @@ def test_per_finding_same_lane_disposition_stays_clean(capsys) -> None:
 
 
 def test_spanless_disposition_for_a_lane_with_findings_blocks(capsys) -> None:
-    """The observed #3963 shape: a blanket ruling naming no finding identity
-    while its lane has findings on the current head."""
+    """A blanket ruling naming no finding identity while its lane has findings
+    on the current head."""
     module = _load_script()
     bot_comment, _span = _gpt_finding_comment(module)
     disposition = _disposition("alice", "gpt", "> out of scope for this fix")
@@ -2230,7 +2229,7 @@ def test_prior_head_record_still_blocks_after_the_fix_push(capsys) -> None:
     """The ordinary flow: the writer stamps head=<prior-reviewed-sha> and then
     pushes, so the PR head has moved by the time the gate polls. The record
     must be validated against the head it judged -- skipping it as history is
-    exactly how the blanket ruling shipped green on #3963."""
+    exactly how a blanket ruling ships green."""
     module = _load_script()
     prior = "f" * 40
     current = "e" * 40
@@ -2267,7 +2266,7 @@ def test_prior_head_record_still_blocks_after_the_fix_push(capsys) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Issue #6658: the disposition rule is enforced server-side, in pr-readiness.yml,
+# The disposition rule is enforced server-side, in pr-readiness.yml,
 # by calling THIS script's --disposition-gate mode -- so the rule keeps one
 # definition instead of gaining a workflow-side copy of the grammar. These pin
 # the JSON contract that workflow step parses.
@@ -2429,7 +2428,7 @@ def test_disposition_gate_flattens_newlines_out_of_each_violation(capsys) -> Non
 
 
 # ---------------------------------------------------------------------------
-# GPT round 2 on #7014: an INDETERMINATE writer lookup must not read as "not a
+# An INDETERMINATE writer lookup must not read as "not a
 # writer". The adjudication ledger makes the identical lookup at review time, so
 # it can have admitted a record whose later verification here fails transiently
 # -- dropping it would leave the record's downgrade power intact while the
@@ -2557,3 +2556,494 @@ def test_the_gate_reports_an_indeterminate_permission_as_not_ok(capsys) -> None:
     report = json.loads(capsys.readouterr().out.strip())
     assert report["ok"] is False
     assert report["violations"] == []
+
+
+# ---------------------------------------------------------------------------
+# A settled reviewer round acts even while the rest of the rollup runs: the
+# AI-review lanes are the gate, not the test matrix.
+# ---------------------------------------------------------------------------
+
+
+def test_settled_reviewer_round_acts_while_other_checks_still_run() -> None:
+    """Every pinned lane stamped this head and one blocks: act now.
+
+    The backend/frontend runs still in flight are on a commit the block
+    already condemns, so waiting them out only delays the edit.
+    """
+    module = _load_script()
+    comments = json.dumps(
+        [
+            _bot_comment(f"[GPT-REVIEWED] {_HEAD}\n[BLOCK-MERGE] {_HEAD}"),
+            _bot_comment(f"[OPUS-REVIEWED] {_HEAD}", key="claude-ai-review"),
+        ]
+    )
+    payload = _pr_payload([{"context": "PR Readiness", "state": "PENDING"}])
+    _install_fake_gh(module, payload, comments=comments)
+
+    assert module.main(["pr_status.py", "42", "--reviewers", "GPT,OPUS"]) == 20
+
+
+def test_pending_reviewer_lane_still_holds_the_round_open() -> None:
+    """One lane blocks but another has not stamped: the round is not settled.
+
+    Acting here would push before the pending lane posts, throwing away a
+    verdict that was still coming and buying an extra round.
+    """
+    module = _load_script()
+    comments = json.dumps([_bot_comment(f"[GPT-REVIEWED] {_HEAD}\n[BLOCK-MERGE] {_HEAD}")])
+    payload = _pr_payload([{"context": "PR Readiness", "state": "PENDING"}])
+    _install_fake_gh(module, payload, comments=comments)
+
+    assert module.main(["pr_status.py", "42", "--reviewers", "GPT,OPUS"]) == 10
+
+
+def test_discovery_mode_does_not_act_early_on_a_blocking_marker() -> None:
+    """Unpinned, an empty stale set cannot mean 'every lane reported'.
+
+    Only the lane that already spoke is visible, so a mid-round block stays a
+    wait until the rollup itself completes.
+    """
+    module = _load_script()
+    comments = json.dumps([_bot_comment(f"[GPT-REVIEWED] {_HEAD}\n[BLOCK-MERGE] {_HEAD}")])
+    payload = _pr_payload([{"context": "PR Readiness", "state": "PENDING"}])
+    _install_fake_gh(module, payload, comments=comments)
+
+    assert module.main(["pr_status.py", "42"]) == 10
+
+
+def test_settled_reviewer_round_without_a_blocker_is_not_an_early_act() -> None:
+    """All pinned lanes stamped and none blocks: nothing to act on yet."""
+    module = _load_script()
+    comments = json.dumps(
+        [
+            _bot_comment(f"No findings.\n[GPT-REVIEWED] {_HEAD}"),
+            _bot_comment(f"No findings.\n[OPUS-REVIEWED] {_HEAD}", key="claude-ai-review"),
+        ]
+    )
+    payload = _pr_payload([{"context": "PR Readiness", "state": "PENDING"}])
+    _install_fake_gh(module, payload, comments=comments)
+
+    assert module.main(["pr_status.py", "42", "--reviewers", "GPT,OPUS"]) == 10
+
+
+def test_failing_non_reviewer_check_does_not_act_while_a_lane_is_pending() -> None:
+    """A red test mid-round is still a wait: one round fixes one full set."""
+    module = _load_script()
+    comments = json.dumps([_bot_comment(f"[GPT-REVIEWED] {_HEAD}")])
+    payload = _pr_payload(
+        [
+            {"context": "PR Readiness", "state": "PENDING"},
+            {"context": "backend-test", "state": "FAILURE"},
+        ]
+    )
+    _install_fake_gh(module, payload, comments=comments)
+
+    assert module.main(["pr_status.py", "42", "--reviewers", "GPT,OPUS"]) == 10
+
+
+# ---------------------------------------------------------------------------
+# An unanswered whole-design CONCERNS is a LOCAL stop condition. SKILL.md said
+# "a green rollup with an unanswered CONCERNS verdict is not converged" while
+# the script returned 0 for exactly that state, so the loop armed auto-merge
+# past a Design review that had named the defect. The repository's required
+# status is deliberately NOT changed: CONCERNS stays advisory for every writer
+# who never runs this loop, which is what the --disposition-gate tests below
+# pin.
+# ---------------------------------------------------------------------------
+
+_CONCERNS_HEAD = "f" * 40
+
+
+def _design_comment(
+    verdict: str = "CONCERNS",
+    key: str = "design-review",
+    stamp: str = "DESIGN",
+    head: str = _CONCERNS_HEAD,
+) -> dict:
+    return {
+        "user": {"type": "Bot", "login": "github-actions[bot]"},
+        "body": (
+            "<!-- {} -->\n"
+            "Design-Verdict: {}\n\n"
+            "**The win32 predicate depends on a macOS-only settings file.**\n\n"
+            "### Watch\n"
+            "- Absent-file -> False means every classified spawn raises\n"
+            "  SandboxUnavailableError at boot on a default Windows install.\n"
+            "  Clears when: kiro-cli confirms the key is read on win32.\n"
+            "- The deleted pin was the only regression guard.\n\n"
+            "[{}-REVIEWED] {}".format(key, verdict, stamp, head)
+        ),
+    }
+
+
+def test_unanswered_design_concerns_blocks_a_green_rollup(capsys) -> None:
+    module = _load_script()
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_design_comment()]),
+    )
+
+    code = module.main(["pr_status.py", "42", "--json"])
+
+    out = capsys.readouterr().out
+    status = json.loads(out.strip().splitlines()[-1])["progress_key"]["status"]
+    assert code == 20
+    assert "unanswered CONCERNS from DESIGN on current head" in status
+    assert "target=design head=" + _CONCERNS_HEAD in status
+    assert "fix, rebut, or accept-and-defer" in status
+    assert "UNANSWERED: DESIGN reported CONCERNS" in out
+
+
+def test_a_matching_design_disposition_clears_the_concerns_stop() -> None:
+    """The stop is answerable with prose alone -- posting the ruling clears it,
+    no push required."""
+    module = _load_script()
+    ruling = _disposition("alice", "design", "- **rebutted** the item\n> reason")
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_design_comment(), ruling]),
+        permissions={"alice": "write"},
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 0
+
+
+def test_a_design_disposition_for_an_older_head_does_not_clear_it() -> None:
+    """A ruling names the head it judged; a new head gets a new review, so a
+    stale record cannot answer the current one."""
+    module = _load_script()
+    stale = {
+        "id": 33,
+        "user": {"type": "User", "login": "alice"},
+        "body": (
+            "<!-- ai-review-disposition target=design head=" + "e" * 40 + " -->\n"
+            "- **rebutted** the item\n> reason"
+        ),
+    }
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_design_comment(), stale]),
+        permissions={"alice": "write"},
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 20
+
+
+def test_a_non_writers_design_disposition_does_not_clear_it() -> None:
+    """Only a repository writer's record holds ruling power, exactly as the
+    adjudication ledger admits records."""
+    module = _load_script()
+    ruling = _disposition("drive-by", "design", "- **rebutted** the item\n> reason")
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_design_comment(), ruling]),
+        permissions={"drive-by": "read"},
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 20
+
+
+def test_a_design_pass_verdict_is_not_a_stop() -> None:
+    module = _load_script()
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_design_comment(verdict="PASS")]),
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 0
+
+
+def test_every_whole_design_lane_carries_the_concerns_stop() -> None:
+    module = _load_script()
+    lanes = [
+        _design_comment(key="design-review", stamp="DESIGN"),
+        _design_comment(key="ux-review", stamp="UX"),
+        _design_comment(key="first-principles-review", stamp="FIRST-PRINCIPLES"),
+    ]
+    for comment in lanes:
+        module = _load_script()
+        _install_fake_gh(
+            module, _pr_payload(_GREEN_CHECKS), comments=json.dumps([comment])
+        )
+        assert module.main(["pr_status.py", "42"]) == 20
+
+
+def test_a_stale_design_concerns_stamp_is_not_the_concerns_stop(capsys) -> None:
+    """Freshness first: a CONCERNS stamped for an older head is last round's
+    review. It still blocks -- on the pre-existing STALE STAMP reason -- but it
+    must not be reported as an unanswered CONCERNS, because the ruling it would
+    ask for is a ruling on a review the current head never got."""
+    module = _load_script()
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_design_comment(head="e" * 40)]),
+    )
+
+    assert module.main(["pr_status.py", "42"]) == 20
+    out = capsys.readouterr().out
+    assert "stale reviewer stamp(s)" in out
+    assert "unanswered CONCERNS" not in out
+
+
+def test_the_concerns_stop_never_reaches_the_server_side_gate(capsys) -> None:
+    """--disposition-gate JSON is byte-identical whether or not the body
+    carries a whole-design CONCERNS. The required status must keep treating
+    CONCERNS as advisory -- turning it into a red for every writer is a policy
+    change this local loop does not get to make."""
+    reports = []
+    for extra in ([], [_design_comment()]):
+        module = _load_script()
+        span = module.span_hash("src/x.py", "gpt/FINDING")
+        ruling = {
+            "id": 901,
+            "user": {"type": "User", "login": "alice"},
+            "body": (
+                "<!-- ai-review-disposition target=gpt head=" + _GATE_HEAD + " -->\n"
+                + f"- **rebutted** span={span}\n> reason"
+            ),
+        }
+        _install_fake_gh(
+            module,
+            _pr_payload(_GREEN_CHECKS),
+            comments=json.dumps([_gate_bot_comment(), ruling] + extra),
+            permissions={"alice": "write"},
+        )
+        assert module.main(_gate_argv()) == 0
+        reports.append(capsys.readouterr().out.strip())
+
+    assert reports[0] == reports[1]
+    assert json.loads(reports[0])["violations"] == []
+
+
+def test_a_spanless_design_disposition_stays_clean_server_side(capsys) -> None:
+    """The regression the separate extractor exists to prevent: design items
+    are NOT in the extract_findings universe, so a spanless target=design
+    record that is valid today must not become a violation. Folding them in
+    would fail the required status on PRs nobody touched."""
+    module = _load_script()
+    spanless = {
+        "id": 902,
+        "user": {"type": "User", "login": "alice"},
+        "body": (
+            "<!-- ai-review-disposition target=design head=" + _GATE_HEAD + " -->\n"
+            "> the Windows semantics are confirmed; keeping the predicate"
+        ),
+    }
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_gate_bot_comment(), _design_comment(head=_GATE_HEAD), spanless]),
+        permissions={"alice": "write"},
+    )
+
+    assert module.main(_gate_argv()) == 0
+
+    report = json.loads(capsys.readouterr().out.strip())
+    assert report["ok"] is True
+    assert report["violations"] == []
+
+
+def test_a_design_disposition_may_claim_a_design_span(capsys) -> None:
+    """A target=design record naming an extract_design_items span is not a
+    violation: the design lane has no extract_findings identities, so the
+    "resolves to no finding" rule does not reach it."""
+    module = _load_script()
+    comment = _design_comment(head=_GATE_HEAD)
+    items = list(
+        module.extract_design_items(
+            [comment], _GATE_HEAD, dict(module.DEFAULT_MARKER_BINDINGS)
+        )
+    )
+    assert items, "the design body must yield at least one item"
+    ruling = {
+        "id": 903,
+        "user": {"type": "User", "login": "alice"},
+        "body": (
+            "<!-- ai-review-disposition target=design head=" + _GATE_HEAD + " -->\n"
+            + "- **rebutted** span={}\n> reason".format(items[0]["span"])
+        ),
+    }
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_gate_bot_comment(), comment, ruling]),
+        permissions={"alice": "write"},
+    )
+
+    assert module.main(_gate_argv()) == 0
+    assert json.loads(capsys.readouterr().out.strip())["violations"] == []
+
+
+def test_another_lane_claiming_a_design_span_is_still_a_violation(capsys) -> None:
+    """Cross-lane claims stay rejected. The mechanism is the existing
+    "resolves to no finding" rule -- a design span is not in the GPT lane's
+    finding map -- so this holds while the GPT lane has findings of its own on
+    the judged head, which is every round it reviewed."""
+    module = _load_script()
+    comment = _design_comment(head=_GATE_HEAD)
+    items = list(
+        module.extract_design_items(
+            [comment], _GATE_HEAD, dict(module.DEFAULT_MARKER_BINDINGS)
+        )
+    )
+    ruling = {
+        "id": 904,
+        "user": {"type": "User", "login": "alice"},
+        "body": (
+            "<!-- ai-review-disposition target=gpt head=" + _GATE_HEAD + " -->\n"
+            + "- **rebutted** span={}\n> reason".format(items[0]["span"])
+        ),
+    }
+    _install_fake_gh(
+        module,
+        _pr_payload(_GREEN_CHECKS),
+        comments=json.dumps([_gate_bot_comment(), comment, ruling]),
+        permissions={"alice": "write"},
+    )
+
+    assert module.main(_gate_argv()) == 0
+
+    violations = json.loads(capsys.readouterr().out.strip())["violations"]
+    assert len(violations) == 1
+    assert "resolves to no finding" in violations[0]
+
+
+def test_design_item_spans_are_stable_and_change_with_the_item() -> None:
+    module = _load_script()
+    bindings = dict(module.DEFAULT_MARKER_BINDINGS)
+    comment = _design_comment()
+    first = [
+        i["span"] for i in module.extract_design_items([comment], _CONCERNS_HEAD, bindings)
+    ]
+    again = [
+        i["span"] for i in module.extract_design_items([comment], _CONCERNS_HEAD, bindings)
+    ]
+    assert first == again
+    assert len(set(first)) == len(first)
+
+    reworded = {
+        "user": comment["user"],
+        "body": comment["body"].replace("Absent-file", "A missing file"),
+    }
+    changed = [
+        i["span"] for i in module.extract_design_items([reworded], _CONCERNS_HEAD, bindings)
+    ]
+    assert changed[0] != first[0]
+    assert changed[1] == first[1]
+
+
+def test_design_items_carry_the_section_kind_and_the_clears_when_line() -> None:
+    module = _load_script()
+    items = list(
+        module.extract_design_items(
+            [_design_comment()], _CONCERNS_HEAD, dict(module.DEFAULT_MARKER_BINDINGS)
+        )
+    )
+
+    assert [i["kind"] for i in items] == ["WATCH", "WATCH"]
+    assert [i["path"] for i in items] == ["(design)", "(design)"]
+    assert items[0]["clears_when"] == "kiro-cli confirms the key is read on win32."
+    assert items[1]["clears_when"] == ""
+    assert items[0]["block_merge"] is False
+
+
+def test_a_blocking_design_verdict_marks_its_items_block_merge() -> None:
+    module = _load_script()
+    items = list(
+        module.extract_design_items(
+            [_design_comment(verdict="BLOCK")],
+            _CONCERNS_HEAD,
+            dict(module.DEFAULT_MARKER_BINDINGS),
+        )
+    )
+
+    assert items and all(i["block_merge"] for i in items)
+
+
+def test_the_inventory_and_evidence_sections_are_not_disposable_items() -> None:
+    """First Principles' `### What this change ships` is an inventory and UX's
+    `### Evidence gaps` is a note; neither is an item an author rules on one by
+    one, so the extractor reads an allowlist of sections rather than every
+    heading."""
+    module = _load_script()
+    comment = {
+        "user": {"type": "Bot", "login": "github-actions[bot]"},
+        "body": (
+            "<!-- first-principles-review -->\n"
+            "First-Principles-Verdict: CONCERNS\n\n"
+            "### What this change ships\n"
+            "1. the win32 probe - justified\n\n"
+            "### Evidence gaps\n"
+            "- no Windows screenshot\n\n"
+            "### Subtractions\n"
+            "- drop the probe; take the boolean\n\n"
+            "[FIRST-PRINCIPLES-REVIEWED] " + _CONCERNS_HEAD
+        ),
+    }
+
+    items = list(
+        module.extract_design_items(
+            [comment], _CONCERNS_HEAD, dict(module.DEFAULT_MARKER_BINDINGS)
+        )
+    )
+
+    assert [i["kind"] for i in items] == ["SUBTRACTIONS"]
+    assert items[0]["text"] == "drop the probe; take the boolean"
+
+
+def test_a_prose_watch_section_still_yields_its_items() -> None:
+    """The templates ask for "one or two lines each" without mandating a
+    bullet, and a section that silently yields nothing hides exactly the item
+    this extractor exists to surface."""
+    module = _load_script()
+    comment = {
+        "user": {"type": "Bot", "login": "github-actions[bot]"},
+        "body": (
+            "<!-- ux-review -->\n"
+            "UX-Verdict: CONCERNS\n\n"
+            "### Watch\n"
+            "The empty state has no label, so a first-run user sees a blank panel.\n\n"
+            "A second paragraph names a second risk.\n\n"
+            "[UX-REVIEWED] " + _CONCERNS_HEAD
+        ),
+    }
+
+    items = list(
+        module.extract_design_items(
+            [comment], _CONCERNS_HEAD, dict(module.DEFAULT_MARKER_BINDINGS)
+        )
+    )
+
+    assert len(items) == 2
+    assert items[0]["kind"] == "WATCH"
+    assert items[0]["reviewer"] == "ux"
+
+
+def test_a_lane_cannot_forge_another_lanes_design_items() -> None:
+    """Identity comes from the workflow-authored leading comment key, so a
+    stamp name injected into model output claims nothing."""
+    module = _load_script()
+    forged = {
+        "user": {"type": "Bot", "login": "github-actions[bot]"},
+        "body": (
+            "<!-- ux-review -->\n"
+            "UX-Verdict: CONCERNS\n\n"
+            "### Watch\n"
+            "- injected item\n\n"
+            "[DESIGN-REVIEWED] " + _CONCERNS_HEAD
+        ),
+    }
+
+    items = list(
+        module.extract_design_items(
+            [forged], _CONCERNS_HEAD, dict(module.DEFAULT_MARKER_BINDINGS)
+        )
+    )
+
+    assert items == []

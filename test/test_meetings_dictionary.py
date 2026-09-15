@@ -83,6 +83,58 @@ class TestMatching:
     def test_empty_text_untouched(self, dictionary):
         assert dictionary.correct("") == ""
 
+    @pytest.mark.parametrize(
+        ("alias", "correct", "said", "expected"),
+        [
+            ("c++", "C++", "we used c++ today", "we used C++ today"),
+            ("c#", "C#", "the c# team shipped", "the C# team shipped"),
+            (".net", ".NET", "migrated to .net core", "migrated to .NET core"),
+            ("++x", "++X", "the ++x trick", "the ++X trick"),
+        ],
+    )
+    def test_an_alias_edged_with_punctuation_matches(
+        self, alias: str, correct: str, said: str, expected: str
+    ):
+        """An alias whose first or last character is not a word character.
+
+        `\\b` asserts a word character on exactly one side, so wrapping such an
+        alias in it demanded a word character OUTSIDE the punctuation: "c++",
+        "c#" and ".net" were accepted by the dictionary editor, listed as active
+        terms, and then silently never corrected anything.
+        """
+        d = DomainDictionary()
+        d.load_terms([{"correct": correct, "aliases": [alias]}])
+        assert d.correct(said) == expected
+
+    @pytest.mark.parametrize(
+        ("alias", "said"),
+        [
+            (".net", "asp.net rocks"),
+            ("c#", "objc#tag"),
+            ("c++", "c++11 shipped"),
+        ],
+    )
+    def test_a_punctuation_edged_alias_does_not_match_inside_a_token(
+        self, alias: str, said: str
+    ):
+        """The same `\\b` fired where the term did NOT apply.
+
+        `\\b\\.net\\b` requires a word character before the dot, which is exactly
+        the "asp.net" case, so the standalone term was skipped and the substring
+        was rewritten instead. Both directions have to hold.
+        """
+        d = DomainDictionary()
+        d.load_terms([{"correct": "REPLACED", "aliases": [alias]}])
+        assert d.correct(said) == said
+
+    def test_an_alphanumeric_alias_keeps_its_boundaries(self):
+        """The word-character edges are unchanged: still no match inside a word."""
+        d = DomainDictionary()
+        d.load_terms([{"correct": "AWS", "aliases": ["aws"]}])
+        assert d.correct("aws bill") == "AWS bill"
+        assert d.correct("awsome sauce") == "awsome sauce"
+        assert d.correct("beclaws") == "beclaws"
+
     def test_regex_special_alias_is_literal(self):
         d = DomainDictionary()
         d.load_terms([{"correct": "C++", "aliases": ["c plus plus"]}])
@@ -179,6 +231,72 @@ class TestMutation:
 
 
 class TestSerialization:
+    @pytest.mark.parametrize(
+        "correct, aliases",
+        [
+            ("\U00020bb7田", ["yoshida"]),
+            ("Yoshida", ["\U00020bb7田"]),
+            ("Launch \U0001f680", ["launch team"]),
+            ("delete\x7fmarker", ["control\x7falias"]),
+        ],
+    )
+    def test_unicode_terms_survive_save_and_reload(self, tmp_path, correct, aliases):
+        path = tmp_path / "dictionary.toml"
+        first = DomainDictionary()
+        first.add_term("DynamoDB", ["dynamo db"])
+        first.add_term(correct, aliases)
+        first.save(path)
+
+        second = DomainDictionary()
+        second.load(path)
+
+        assert second.as_list() == first.as_list()
+        assert second.correct("use dynamo db") == "use DynamoDB"
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "\ud800",  # a lone HIGH surrogate
+            "\udfff",  # a lone LOW surrogate
+            "Lone\ud83dEnd",  # the high half of an emoji pair, on its own
+        ],
+    )
+    @pytest.mark.parametrize("field", ["correct", "alias"])
+    def test_a_surrogate_code_point_is_refused_before_anything_is_mutated(
+        self, tmp_path: Path, bad: str, field: str
+    ):
+        """A surrogate has no UTF-8 encoding, so it can never round-trip.
+
+        The JSON body ``{"correct": "\\ud800"}`` decodes to exactly this string, so
+        it reaches ``add_term`` from a plain HTTP request. Refusing it there — with
+        the ValueError the route already maps to 400 — is what keeps the shared
+        in-memory dictionary and the document on disk from disagreeing.
+        """
+        path = tmp_path / "dictionary.toml"
+        d = DomainDictionary()
+        d.add_term("DynamoDB", ["dynamo db"])
+        d.save(path)
+        before = d.as_list()
+        on_disk = path.read_bytes()
+
+        with pytest.raises(ValueError):
+            if field == "correct":
+                d.add_term(bad, ["some alias"])
+            else:
+                d.add_term("Some Term", [bad])
+
+        # The unrelated term is untouched, in memory and on disk...
+        assert d.as_list() == before
+        assert path.read_bytes() == on_disk
+        # ...the refusal did not stop a later, legitimate edit...
+        d.add_term("PostgreSQL", ["postgres q l"])
+        d.save(path)
+        # ...and what was persisted still parses.
+        reloaded = DomainDictionary()
+        reloaded.load(path)
+        assert reloaded.as_list() == d.as_list()
+        assert reloaded.correct("use dynamo db") == "use DynamoDB"
+
     def test_roundtrip_through_disk(self, tmp_path: Path):
         path = tmp_path / "d.toml"
         first = DomainDictionary()

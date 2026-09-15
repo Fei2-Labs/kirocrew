@@ -1,10 +1,9 @@
 """AWS Control backups as durable Job SDK runs.
 
-What moved: starting a backup used to execute it inside the request and return
-its terminal record, so "a backup of mine is running" lived only in the React
-component that started it -- a reload or a navigation destroyed the fact while
-the work kept going. The route now claims a server-owned run and returns its
-id, and the browser follows it on the shared ``_jobs`` surface.
+The route claims a server-owned run and returns its id, and the browser follows
+it on the shared ``_jobs`` surface. Because the run is server-owned, "a backup of
+mine is running" survives a reload or a navigation instead of living only in the
+React component that started it and dying with it while the work keeps going.
 
 The cases here are the ones that shape the design rather than merely cover it:
 
@@ -437,6 +436,12 @@ def _enabled_owner_env():
         ),
         mock.patch.object(routes_mod.aws_consent, "refuse_and_log", AsyncMock(return_value=True)),
         mock.patch.object(routes_mod.storage_mod, "find_drive", return_value=BUCKET),
+        # The platform-availability pre-check (kind_unavailable_reason) is its own
+        # guard with its own dedicated tests in test_aws_control_windows.py; the
+        # tests using this helper are about job-dispatch mechanics for a kind
+        # that IS available, so this guard must read as satisfied everywhere,
+        # including on the Windows CI shard where the real value is False.
+        mock.patch.object(backup, "_CAN_PIN_TRAVERSAL", True),
     )
 
 
@@ -781,7 +786,7 @@ class TestRunnerAuthorization:
 
 class TestReconcile:
     def _write_orphan(self, data_dir: Path, *, status: str = job_sdk.RUNNING) -> str:
-        """A record from a process that no longer exists (a FOREIGN origin)."""
+        """A record from a process that does not exist (a FOREIGN origin)."""
         run_id = "d" * 32
         runs = data_dir / "jobs"
         runs.mkdir(parents=True, exist_ok=True)

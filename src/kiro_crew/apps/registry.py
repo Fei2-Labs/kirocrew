@@ -27,6 +27,7 @@ minimal environment that excludes process secrets.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -337,6 +338,21 @@ def _manifest_cache_dir() -> Path:
 
 
 _MANIFEST_CACHE_TTL = 86400  # 24 hours
+
+#: Subdirectory of :func:`_manifest_cache_dir` holding the source-keyed
+#: manifest files. Registry INDEX caches live at the dir root; keeping the
+#: manifest files in a subdirectory separates the two by something an external
+#: index cannot spell in an app name (``_safe_cache_stem`` returns plain names
+#: byte-identical, so a name-prefix convention would be imitable — an app
+#: literally named ``_registry_x`` must not be able to place its manifest
+#: outside the garbage collector's reach).
+_MANIFEST_SOURCE_SUBDIR = "by-source"
+
+#: How far past its TTL a cache file's mtime is pushed by
+#: :func:`_expire_cache_file`. The GC grace below is derived from this so
+#: expiry (which deliberately preserves the file) and reclamation (which
+#: deletes it) can never collide however this slack changes.
+_CACHE_EXPIRY_BACKDATE_SLACK = 3600
 
 # ---------------------------------------------------------------------------
 # Registry loading
@@ -1282,16 +1298,77 @@ def _safe_cache_stem(name: str) -> str:
     return f"{slug}-{digest}"
 
 
-def _manifest_cache_path(name: str) -> Path:
-    # Sanitize the name so a hostile/traversal entry name from an external
-    # registry can never resolve outside the manifest cache dir (read, write,
-    # AND delete all go through here, so they stay mutually consistent).
-    return _manifest_cache_dir() / f"{_safe_cache_stem(name)}.json"
+def _manifest_source_coordinates(entry: dict[str, Any]) -> tuple[str, str, str, str]:
+    """The full source coordinates a cached manifest's identity is scoped to.
+
+    Returns ``(origin, ref, subdirectory, name)`` where *origin* is the
+    normalized, credential-free clone URL (:func:`_normalize_git_target`
+    strips userinfo, so a token in a configured URL never reaches a cache
+    file name or key material), *ref* is the effective ref — always the
+    configured branch, plus the pinned commit when the row carries one — and
+    *subdirectory*/*name* are the entry's remaining coordinates.
+
+    The branch is folded in even when a commit is present: the listing fetch
+    resolves non-catalog rows by BRANCH (their pins are data fidelity, not
+    authorization), so a ref that kept only the commit would hold the cache
+    path fixed across an operator's branch change — the exact reuse this
+    identity exists to rule out. The pin is folded in as well so a
+    republished pin is a miss rather than a stale hit.
+
+    Every value an external index controls degrades to a safe default when it
+    is not a string: the coordinates feed a cache KEY, so a malformed value
+    must produce a distinct-but-harmless identity, never a crash.
+    """
+    name = entry.get("name", "")
+    if not isinstance(name, str):
+        name = ""
+    git_url = _entry_git_url(entry)
+    origin = _normalize_git_target(git_url) if git_url else ""
+    commit = entry.get("commit")
+    branch = entry.get("branch", "main")
+    if not isinstance(branch, str) or not branch:
+        branch = "main"
+    ref = f"branch:{branch}"
+    if isinstance(commit, str) and commit:
+        ref = f"{ref}|commit:{commit}"
+    subdirectory = entry.get("subdirectory", "")
+    if not isinstance(subdirectory, str):
+        subdirectory = ""
+    return origin, ref, subdirectory, name
 
 
-def _read_manifest_cache(name: str) -> dict[str, Any] | None:
-    """Read cached app.json for a registry app. Returns None if missing or stale."""
-    path = _manifest_cache_path(name)
+def _manifest_cache_path(entry: dict[str, Any]) -> Path:
+    """Cache file for *entry*'s fetched ``app.json``, keyed on SOURCE IDENTITY.
+
+    The stem sanitizes the name so a hostile/traversal entry name from an
+    external registry can never resolve outside the manifest cache dir (read,
+    write, AND expiry all go through here, so they stay mutually consistent).
+    The digest folds the full source coordinates — normalized credential-free
+    origin, effective branch/pinned commit, repository subdirectory, and app
+    name — into the identity, so changing the configured branch is a cache
+    MISS by construction and two same-name apps from different repositories
+    can never share (or poison) each other's cached metadata. Name-keyed
+    caching could not establish provenance: a listing configured for branch
+    ``dev`` happily reused a manifest resolved earlier from ``main``.
+    """
+    origin, ref, subdirectory, name = _manifest_source_coordinates(entry)
+    # json.dumps gives each coordinate an escaped, delimited slot, so a value
+    # containing a would-be separator can never make two different coordinate
+    # tuples serialize to the same key material.
+    material = json.dumps([origin, ref, subdirectory, name])
+    digest = sha256(material.encode("utf-8")).hexdigest()[:16]
+    return _manifest_cache_dir() / _MANIFEST_SOURCE_SUBDIR / f"{_safe_cache_stem(name)}-{digest}.json"
+
+
+def _read_manifest_cache(entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Read cached app.json for a registry entry's exact source coordinates.
+
+    Returns None if missing or stale — and, because the path is derived from
+    the entry's full source identity, also None whenever the branch, pinned
+    commit, repository, or subdirectory differ from what was cached, so a
+    failed fetch can never silently fall back to another source's manifest.
+    """
+    path = _manifest_cache_path(entry)
     if not path.is_file():
         return None
     try:
@@ -1303,16 +1380,63 @@ def _read_manifest_cache(name: str) -> dict[str, Any] | None:
         return None
 
 
-def _write_manifest_cache(name: str, data: dict[str, Any]) -> None:
-    """Write app.json to the manifest cache (atomic)."""
-    _manifest_cache_dir().mkdir(parents=True, exist_ok=True)
+#: Extra age beyond the largest TTL before a cache file is reclaimed. Derived
+#: from the expiry backdate slack so a file :func:`_expire_cache_file` just
+#: backdated (whose whole point is surviving its expiry) is never GC-eligible
+#: in the same breath, whatever value the slack takes.
+_MANIFEST_CACHE_GC_GRACE = _CACHE_EXPIRY_BACKDATE_SLACK + 2 * 86400
+
+
+def _gc_manifest_cache_dir() -> None:
+    """Best-effort reclamation of manifest cache files nothing can read anymore.
+
+    Coordinate-keyed cache files are orphaned whenever a row's branch, pin,
+    repository, or subdirectory changes: the new coordinates write a NEW file
+    and no reader ever derives the old path again. An untrusted index that
+    churns its coordinates every refresh would otherwise grow the cache dir
+    without bound. Reclaim is age-based and read-invisible: only files older
+    than every TTL plus a grace window are removed, and ``_read_manifest_cache``
+    already answers ``None`` for anything past ``_MANIFEST_CACHE_TTL`` (there
+    is no ``ignore_ttl`` read of a manifest file), so deleting them changes no
+    read result. Only the ``by-source/`` subdirectory is scanned: registry
+    index caches live at the cache-dir ROOT, so the boundary between "GC may
+    reclaim" and "GC never touches" is structural — an index cannot spell a
+    directory into an app name, where a name-prefix convention (skip
+    ``_registry_*``) would be imitable and hand a hostile index files the
+    sweep never reclaims. Runs on the write path because writes are the only
+    way the directory grows, which bounds it by construction.
+    """
+    cutoff = (
+        time.time()
+        - max(_MANIFEST_CACHE_TTL, _EXTERNAL_REGISTRY_CACHE_TTL)
+        - _MANIFEST_CACHE_GC_GRACE
+    )
+    try:
+        entries = list((_manifest_cache_dir() / _MANIFEST_SOURCE_SUBDIR).iterdir())
+    except OSError:
+        return
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def _write_manifest_cache(entry: dict[str, Any], data: dict[str, Any]) -> None:
+    """Write app.json to the manifest cache (atomic), keyed on source identity."""
+    path = _manifest_cache_path(entry)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         atomic_write(
-            _manifest_cache_path(name),
+            path,
             json.dumps(data, indent=2) + "\n",
         )
     except OSError as exc:
-        logger.warning("Failed to cache manifest for %s: %s", name, exc)
+        logger.warning("Failed to cache manifest for %s: %s", entry.get("name", ""), exc)
+    _gc_manifest_cache_dir()
 
 
 def _is_safe_registry_subdir(subdir: Any) -> bool:
@@ -1423,8 +1547,7 @@ async def _fetch_app_manifest(
         # was placed, never what it now holds. This manifest is what the admission and
         # platform gates read, so a local edit bypasses `installMode`/`os`
         # restrictions and gets the tree built server-side. It is the same reason a
-        # pinned install never reuses an existing checkout; the rule belongs here too,
-        # and previously stopped one caller short of this one.
+        # pinned install never reuses an existing checkout; the rule belongs here too.
         #
         # The cost is a shallow single-commit fetch per pinned listing, which the
         # pinned branch below already performs.
@@ -2171,8 +2294,9 @@ async def _resolve_manifest(entry: dict[str, Any]) -> dict[str, Any]:
     if not git_url:
         return entry
 
-    # Try cache first
-    cached = await asyncio.to_thread(_read_manifest_cache, name)
+    # Try cache first — keyed on the entry's full source coordinates, so a
+    # row configured for another branch/repo/subdirectory can never answer.
+    cached = await asyncio.to_thread(_read_manifest_cache, entry)
     if cached:
         return _merge_manifest(entry, cached)
 
@@ -2190,10 +2314,13 @@ async def _resolve_manifest(entry: dict[str, Any]) -> dict[str, Any]:
         owner_designated=bool(owner_target),
     )
     if manifest:
-        await asyncio.to_thread(_write_manifest_cache, name, manifest)
+        await asyncio.to_thread(_write_manifest_cache, entry, manifest)
         return _merge_manifest(entry, manifest)
 
-    # No manifest available — return entry as-is (minimal info)
+    # No manifest available — return entry as-is (minimal info). The failed
+    # fetch attaches NOTHING: the source-scoped cache read above already
+    # missed, and there is deliberately no name-only fallback that could
+    # attach a manifest cached for another branch or repository.
     logger.info("Could not fetch app.json for %s — showing minimal info", name)
     return entry
 
@@ -3225,7 +3352,11 @@ def _expire_cache_file(path: Path) -> None:
         if cache_dir not in resolved.parents:
             logger.warning("Refusing to expire cache file outside cache dir: %s", path)
             return
-        past = time.time() - max(_MANIFEST_CACHE_TTL, _EXTERNAL_REGISTRY_CACHE_TTL) - 3600
+        past = (
+            time.time()
+            - max(_MANIFEST_CACHE_TTL, _EXTERNAL_REGISTRY_CACHE_TTL)
+            - _CACHE_EXPIRY_BACKDATE_SLACK
+        )
         os.utime(resolved, (past, past))
     except FileNotFoundError:
         pass
@@ -3286,13 +3417,19 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
             continue
         # Expire per-app manifest caches so fresh display info is refetched
         # lazily on the next read (mtime expiry preserves the stale fallback).
-        manifest_names: set[str] = set()
+        # Both the prior and the fresh index rows contribute: the cache path is
+        # derived from each row's FULL source coordinates, so a row whose
+        # branch/repo changed in the new index expires the old coordinates'
+        # cache (via the prior row) as well as priming a miss for the new ones.
+        expire_paths: set[Path] = set()
         for e in (prior or []) + entries:
+            if not isinstance(e, dict):
+                continue
             entry_name = e.get("name")
             if isinstance(entry_name, str) and entry_name:
-                manifest_names.add(entry_name)
-        for entry_name in manifest_names:
-            await asyncio.to_thread(_expire_cache_file, _manifest_cache_path(entry_name))
+                expire_paths.add(_manifest_cache_path(e))
+        for cache_path in expire_paths:
+            await asyncio.to_thread(_expire_cache_file, cache_path)
         refreshed.append(display_name)
         results.append({"name": display_name, "ok": True})
 
@@ -3516,8 +3653,8 @@ async def list_registry() -> list[dict[str, Any]]:
 
     # Probe the seed/catalog rows, then append external registries at the single
     # shared merge site. Reserving every seed/catalog name means an external row
-    # can only ADD a name none of them claim — the precedence the inline dedup
-    # here used to enforce.
+    # can only ADD a name none of them claim, which is the precedence this merge
+    # site enforces.
     detected = await _detect_installed_probe(entries, installed_map)
     entries, external_detected = await _append_external_registry_apps(
         entries, {e.get("name") for e in entries}, installed_map
@@ -3540,8 +3677,8 @@ async def list_registry() -> list[dict[str, Any]]:
     #
     # Annotate from the SAME fresh entries the inventory came from, never the cache.
     #
-    # Round 11 stopped the agent-writable cache from INTRODUCING a row; this stops it
-    # from REWRITING one. `annotate` overlays `displayName` and `description`, which
+    # Blocking the agent-writable cache from INTRODUCING a row is not enough; this
+    # stops it from REWRITING one. `annotate` overlays `displayName` and `description`, which
     # are exactly what the consent modal renders, and it only skips rows carrying
     # `_registry` -- so a poisoned cache entry could re-label a freshly fetched
     # first-party row and the name-scoped grant would then execute the real app under
@@ -5234,7 +5371,7 @@ async def _git_clone_or_pull(
                         "manually and retry the install."
                     ),
                 }
-            # Fall through: `dest` no longer exists, so the pinned fetch below
+            # Fall through: `dest` is gone, so the pinned fetch below
             # creates it fresh inside the try/finally that owns restoration.
         else:
             # Already cloned from the verified origin AND branch (or the branch
@@ -5747,8 +5884,8 @@ async def _unpoison_rejected_checkout(
         # is best-effort and must never mask the refusal it follows.
         logger.debug("post-rejection rollback failed for %s: %s", app_name, exc)
     if _contained_join(pkg_dir, manifest_relpath) is None:
-        # manifest_relpath (the FULL path, e.g. "sub/app.json") no longer
-        # resolves inside pkg_dir RIGHT NOW — some callers reach this point
+        # manifest_relpath (the FULL path, e.g. "sub/app.json") does not
+        # resolve inside pkg_dir RIGHT NOW — some callers reach this point
         # after a build step or onInstall script ran with write access to the
         # checkout, so a containment check the caller made earlier cannot be
         # trusted here. Checking only `subdirectory` (the directory, and only
@@ -5959,14 +6096,13 @@ async def _clone_build_app_locked(
 
     # Build in the directory that actually HOLDS the package, not the clone root.
     #
-    # A monorepo registry entry declares `subdirectory`, and historically it was
-    # joined only AFTER this build ran — so `_run_app_build` looked for
-    # pyproject.toml/package.json at the clone root, found none, logged "No build
-    # step detected — using source as-is", and returned ok=True having installed
-    # nothing. The app's own pyproject.toml was never seen. A silent success is
-    # the worst shape for this: `setup.onInstall` does get `cwd=app_source`, so
-    # an app could paper over it with a script, which is exactly how a bug like
-    # this stays hidden.
+    # A monorepo registry entry declares `subdirectory`, and joining it only AFTER
+    # this build ran would leave `_run_app_build` looking for
+    # pyproject.toml/package.json at the clone root, finding none, logging "No build
+    # step detected — using source as-is", and returning ok=True having installed
+    # nothing — the app's own pyproject.toml never seen. A silent success is the
+    # worst shape for this: `setup.onInstall` does get `cwd=app_source`, so an app
+    # could paper over it with a script, which is how such a break stays hidden.
     #
     # `app_source` is already the containment-checked join of `subdirectory`
     # under the clone root (the identity gate above fails closed on an escaping
@@ -6039,7 +6175,7 @@ async def _clone_build_app_locked(
                         f"{stale_path}"
                     )
         # Drop the checkouts actually put back from the caller-owned pending
-        # list: a restored checkout is no longer a retained `.stale-*` sibling,
+        # list: a restored checkout is not a retained `.stale-*` sibling,
         # so `_clone_build_app`'s single-exit stamp must not carry it and the
         # caller's `_report_retained_stale_checkouts` must not name it. A rename
         # that FAILED above stays in the list so it is still reported stranded.
@@ -6134,13 +6270,25 @@ async def _run_app_build(
                     "signed application bundle and cannot install packages"
                 ),
             }
-        pip_cmd = [sys.executable, "-m", "pip"]
-        if (build_dir / "requirements.txt").is_file() and not (
-            (build_dir / "pyproject.toml").is_file() or (build_dir / "setup.py").is_file()
-        ):
-            build_cmds.append([*pip_cmd, "install", "-r", "requirements.txt"])
+        # A missing `pip` module is a soft skip, exactly like a missing npm
+        # (see the docstring). `sys.executable` is the gateway interpreter, and a
+        # venv created with `--without-pip` — or any minimal runtime — has no `pip`
+        # module: running `-m pip` against it exits non-zero and would abort the
+        # whole registry install. Probe with `find_spec` on THIS interpreter (no
+        # subprocess: it is the interpreter that would run the build) and skip when
+        # pip is absent, so an app that needs no Python build still installs cleanly.
+        if importlib.util.find_spec("pip") is None:
+            log_lines.append(
+                "pip not available in the gateway interpreter — skipping Python build step"
+            )
         else:
-            build_cmds.append([*pip_cmd, "install", "."])
+            pip_cmd = [sys.executable, "-m", "pip"]
+            if (build_dir / "requirements.txt").is_file() and not (
+                (build_dir / "pyproject.toml").is_file() or (build_dir / "setup.py").is_file()
+            ):
+                build_cmds.append([*pip_cmd, "install", "-r", "requirements.txt"])
+            else:
+                build_cmds.append([*pip_cmd, "install", "."])
 
     if not build_cmds:
         log_lines.append("No build step detected — using source as-is")
@@ -6217,14 +6365,13 @@ def _report_retained_stale_checkouts(
       exception path is still named instead of being silently swept.
 
     Both routes funnel the wording through here precisely so they can never
-    drift: the reporter used to be hand-replicated across every exit with a
+    drift: hand-replicating the reporter across every exit, with a
     ``filter_restorable`` flag manually mirrored to ``durable_success`` at each
-    one, which is the scattered-per-exit stranding class the caller's
-    move-aside bookkeeping exists to avoid — a new exit could forget the call
-    or pass the wrong flag and silently strand or double-report a checkout.
-    Every normal exit now reaches the single ``finally`` call and derives the
-    flag once; the only other caller is the exception path that no ``finally``
-    return can cover.
+    one, is the scattered-per-exit stranding class the caller's move-aside
+    bookkeeping exists to avoid — a new exit could forget the call or pass the
+    wrong flag and silently strand or double-report a checkout. Every normal
+    exit reaches the single ``finally`` call and derives the flag once; the only
+    other caller is the exception path that no ``finally`` return can cover.
 
     ``_pending_stale_cleanup`` collects every move-aside regardless of
     reason, but ``_restorable_stale`` (a subset) is put back by the
@@ -6562,7 +6709,7 @@ async def install_from_registry(
 
     # NOTE: the provenance signer is computed LATER, from the identity-checked
     # CLONED manifest — not from this pre-clone prefetch. An update can pull a
-    # commit whose manifest is no longer signed (or signed by someone else);
+    # commit whose manifest is not signed (or is signed by someone else);
     # provenance must record the artifact actually installed, not the preview.
 
     # Platform compatibility check — if the app requires a specific OS and
@@ -6821,8 +6968,8 @@ async def install_from_registry(
 
         # ADMISSION GATE, third pass — the post-build manifest is what
         # install_app/update_app will actually register, and a build step can
-        # rewrite app.json; a manifest that no longer satisfies the admission
-        # policy (e.g. signature required and now absent) must not install.
+        # rewrite app.json; a manifest that does not satisfy the admission
+        # policy (e.g. signature required but absent) must not install.
         denied = app_admission_denied(
             name,
             manifest=AppManifest.from_dict(manifest_data),
@@ -7129,7 +7276,7 @@ async def install_from_registry(
             # filter_restorable=False and names the genuinely-retained restorable
             # stale rather than letting it sit unlogged until the sweep.
             if official_entry:
-                install_receipt.dispatch(
+                await install_receipt.dispatch_async(
                     name,
                     official=True,
                     kind=(
@@ -7198,7 +7345,7 @@ async def install_from_registry(
             # = False — so the restorable stale is reported, not stranded.
             if official_entry:
                 # Detached best-effort telemetry runs only after durable success.
-                install_receipt.dispatch(
+                await install_receipt.dispatch_async(
                     name,
                     official=True,
                     kind=(
@@ -7301,7 +7448,7 @@ async def install_from_registry(
             # never off `outcome`), so removing them here deprives no consumer.
             # Two of them -- `_pending_stale_cleanup` and `_restorable_stale` --
             # are `list[Path]`, which is not JSON-serializable, so a build
-            # refusal that spreads `{**build_result}` into `outcome` used to make
+            # refusal that spreads `{**build_result}` into `outcome` would make
             # the API/SSE layer raise `TypeError` when it serialized the refusal.
             # Scrubbing the CLASS (every `_`-prefixed key) rather than those two
             # names closes it at the single seam: `_checkout_preexisted`,

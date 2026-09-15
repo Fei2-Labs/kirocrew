@@ -2,6 +2,7 @@ import { api } from '../../api/client'
 import modelTokensRaw from '../../model_tokens.json'
 import { markModelsDegraded } from '../modelListHealth'
 import { isPricedMultiplier } from '../modelList'
+import { i18nT } from '../../i18n/t'
 import type {
   ProviderAdapter,
   ProviderCapabilities,
@@ -182,6 +183,22 @@ function readCachedModels(expected: string | null): ModelInfo[] | null {
  *  it. */
 for (const m of readCachedModels(lastKnownBackend()) ?? []) learnWindow(m.name, m.contextWindow ?? 0)
 
+/** Drop the last-good list. Called when `agent.acp_backend` changes: the cache
+ *  is keyed by nothing but time, so after a switch it still holds the PREVIOUS
+ *  backend's ids. If the new backend's first `/api/models` then fails (a cold
+ *  `--list-models` spawn past the gateway timeout is the common case), the
+ *  degraded path would serve that list and the picker would offer ids the new
+ *  backend rejects. Dropping it makes the degraded answer auto-only, which every
+ *  backend accepts, until the first live success rewrites the cache. */
+export function clearCachedModels(): void {
+  try {
+    if (typeof localStorage === 'undefined') return
+    localStorage.removeItem(MODELS_CACHE_KEY)
+  } catch {
+    /* storage disabled — nothing to drop */
+  }
+}
+
 /** Persist a live model list with a timestamp. Best-effort — storage errors
  *  (quota, disabled, SSR) are swallowed so caching never breaks the picker. */
 function writeCachedModels(models: ModelInfo[], backend: string): void {
@@ -336,7 +353,6 @@ export class AcpAdapter implements ProviderAdapter {
     sessionProcess: 'ACP subprocess',
     agentTemplateField: 'Agent Template',
     processCountLabel: 'acp_cli',
-    warmPoolDescription: 'Pre-spawn ACP CLI processes for instant session start.',
     configFile: 'kirocrew.json',
     pluginRegistryName: 'Packages',
     hooksSection: 'ACP Agent Hooks',
@@ -396,7 +412,24 @@ export class AcpAdapter implements ProviderAdapter {
 
   async fetchUsage(): Promise<NormalizedUsage> {
     const data = await api.kiroUsage()
-    const s = data.sessions
+    const s = data?.sessions
+    // A 2xx whose body is not the route's contract at all: no `sessions` half
+    // (a proxy or a stub answering `[]`, a gateway that never had the route).
+    // Reading `s.total_sessions` off that rejects with the engine's own
+    // "Cannot read properties of undefined", and the Overview card and the
+    // Usage tab render whatever this rejects with verbatim -- an English JS
+    // TypeError in place of a message, in every locale. Say what happened
+    // instead, in the catalog's words.
+    if (!s || typeof s !== 'object' || Array.isArray(s)) {
+      throw new Error(i18nT('api.client.unexpected_server_response'))
+    }
+    // The route answers 200 even when the transcript directory could not be
+    // read, because billing is a separate half of the payload. `error` is the
+    // server's own message for that failure, and the statistics beside it are
+    // a zero SHAPE rather than a measurement -- so reporting the reason is the
+    // only honest reading. Raising here puts it on the same channel a non-2xx
+    // takes, which the Usage tab already renders verbatim.
+    if (s?.error) throw new Error(String(s.error))
     const b = data.billing || {}
     return {
       sessions: {
@@ -405,6 +438,7 @@ export class AcpAdapter implements ProviderAdapter {
         thisWeek: { sessions: s.this_week.sessions, messages: s.this_week.messages, toolCalls: s.this_week.tool_calls },
         thisMonth: { sessions: s.this_month.sessions, messages: s.this_month.messages, toolCalls: s.this_month.tool_calls },
         avgMsgsPerSession: s.avg_msgs_per_session,
+        refusedTranscripts: s.refused_transcripts ?? 0,
         dailyHistory: (s.daily_history || []).map((d: RawDailyHistory) => ({
           date: d.date,
           sessions: d.sessions,

@@ -198,9 +198,12 @@ class TestSpawnResolvesEachBackendsOwnArgv:
 
         source = inspect.getsource(AcpClient._spawn)
         assert "_is_codex" in source
-        assert "acp import codex" in source or "acp.codex" in source
+        # Upstream owns the codex branch now: it resolves through the shared
+        # ``_resolve_codex_acp_bin`` ladder rather than this build's ``acp.codex``.
+        assert "_resolve_codex_acp_bin" in source or "acp.codex" in source
         assert "ACP_BACKEND_GOOSE" in source
-        assert "ACP_BACKEND_OPENCODE" in source
+        # opencode's branch is upstream's (resolved through the shared ladder), so
+        # only this build's own adapters are pinned by name here.
         assert "ACP_BACKEND_PI" in source
         assert "resolve_argv_cached" in source
 

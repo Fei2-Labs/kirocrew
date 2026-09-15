@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { useProvider } from '../providers'
 import { lastKnownBackend, servesAutoModel } from '../providers/adapters/acp'
-import { modelListRefetchInterval, modelListScope } from '../providers/modelListHealth'
+import { modelListRefetchInterval, modelListScope, useModelsDegraded } from '../providers/modelListHealth'
 import { withAutoFirst } from '../providers/modelList'
 import type { ModelInfo } from '../providers/types'
 
@@ -57,19 +57,20 @@ const EMPTY: ModelInfo[] = []
  * pickers pass the configured backend (or omit both, which is the kiro /
  * unknown-config key).
  */
-export function useAvailableModels({
-  enabled,
-  slot,
-  backend,
-}: {
+type AvailableModelsOptions = {
   enabled?: boolean
   slot?: string
   backend?: string | null
-} = {}): ModelInfo[] {
+}
+
+export function useAvailableModelsQuery({ enabled, slot, backend }: AvailableModelsOptions = {}) {
   const provider = useProvider()
   const intendedBackend = backend ?? ''
   const scope = modelListScope(slot, intendedBackend)
-  const { data } = useQuery({
+  // Read the flag for THIS scope: the adapter stamps a config-namespace failure
+  // on the scoped key only, so the unscoped flag would stay green for Settings.
+  const isDegraded = useModelsDegraded(provider.id, scope)
+  const query = useQuery({
     queryKey: ['available-models', provider.id, scope],
     queryFn: async () =>
       withAutoFirst(
@@ -78,16 +79,20 @@ export function useAvailableModels({
     refetchInterval: modelListRefetchInterval,
     ...(enabled === undefined ? {} : { enabled }),
   })
-  // `data` is undefined only before the first fetch resolves for this key. The
-  // placeholder is a SYNTHETIC Auto row, so it may only be offered on a backend
-  // that serves `auto` — otherwise the picker's very first paint shows one row,
-  // it is the only thing to pick, and the id is rejected at the wire. Everything
-  // `fetchAvailableModels` does to avoid fabricating that row is undone here if
-  // this is left unconditional, because this branch runs BEFORE any of it.
-  if (data) return data
+  // `query.data` is undefined only before the first fetch resolves for this key.
+  // The placeholder is a SYNTHETIC Auto row, so it may only be offered on a
+  // backend that serves `auto` — otherwise the picker's very first paint shows
+  // one row, it is the only thing to pick, and the id is rejected at the wire.
   // After a default-harness switch the last-known cache is still the previous
-  // namespace. Showing Auto (or that namespace's rows) for the new key is the
-  // flash this placeholder exists to prevent.
-  if (intendedBackend && intendedBackend !== (lastKnownBackend() ?? '')) return EMPTY
-  return servesAutoModel() ? PLACEHOLDER : EMPTY
+  // namespace, so showing Auto (or that namespace's rows) for the new key is
+  // the flash this placeholder exists to prevent.
+  let data: ModelInfo[]
+  if (query.data) data = query.data
+  else if (intendedBackend && intendedBackend !== (lastKnownBackend() ?? '')) data = EMPTY
+  else data = servesAutoModel() ? PLACEHOLDER : EMPTY
+  return { ...query, data, isDegraded }
+}
+
+export function useAvailableModels(options: AvailableModelsOptions = {}): ModelInfo[] {
+  return useAvailableModelsQuery(options).data
 }

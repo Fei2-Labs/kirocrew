@@ -73,7 +73,6 @@ const UNMAPPED_PANELS: Record<string, string> = {
   'PostureDisclosure.tsx': "read-only disclosure rows for SecurityPanel's posture section (manual entry security.live-security-posture)",
   'ReleasesPanel.tsx': 'read-only changelog viewer, zero persistent settings',
   'ReportProblemCard.tsx': 'feedback action card, no settings',
-  'SecretsPanel.tsx': 'CRUD list for stored secrets; add/delete forms are transient, no persistent knobs',
   'SettingsSearch.tsx': 'the settings search box itself — indexing it would be self-referential',
   'ThemeDroppedRulesNotice.tsx': 'informational notice, zero controls',
   'WebhooksPanel.tsx': 'status summary card; the real controls live on the /webhooks page',
@@ -161,6 +160,10 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
     counts: { Input: 1 },
     reason: 'attach-token credential field with Save/Clear semantics (manual: browser.attach-token)',
   },
+  'ChatPanel.tsx': {
+    counts: { Input: 2 },
+    reason: "LinkPatternsEditor's per-row pattern/url fields — part of a composite the extractor indexes whole (chat.text-link-patterns)",
+  },
   'DisplayPanel.tsx': {
     counts: { SimpleSelect: 1, Input: 1 },
     reason: 'theme-install form (source picker + location) — transient install flow, not settings',
@@ -191,7 +194,7 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       'non-URL sub-tab a deep link cannot mount',
   },
   'SecretsPanel.tsx': {
-    counts: { input: 2 },
+    counts: { Input: 2 },
     reason: 'add-secret name/value form — transient CRUD, not persistent knobs',
   },
   'SecurityPanel.tsx': {
@@ -274,6 +277,12 @@ const EXPECTED_DYNAMIC_SKIPS: Record<string, { count: number; reason: string }> 
       'per-category sound SettingsSelect renders label={i18nT(CATEGORY_LABEL_KEY[cat])} ' +
       'inside a map over a closed union — indexed via manual entries ' +
       'notifications.sound-category-*',
+  },
+  'SecretsPanel.tsx': {
+    count: 1,
+    reason:
+      'managed SecretField labels are selected from a closed kind-to-copy map and the ' +
+      'rows are transient server-provided credential slots, not persistent settings',
   },
 }
 

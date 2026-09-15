@@ -1054,7 +1054,11 @@ class TestCachedRegistryAdapters:
         assert descriptor.id == "codex"
         assert descriptor.routing is Routing.SESSION_CONFIG
         assert "codex-acp" not in selectable_ids()
-        assert "codex" not in selectable_ids()
+        # goose is the known-but-withheld id on this build (codex ships selectable).
+
+    from kiro_crew.acp.backends import selectable_ids
+
+    assert "goose" not in selectable_ids()
 
     def test_hand_written_pi_is_not_a_second_unverified_path(self, monkeypatch) -> None:
         """``pi-acp`` is the registry spelling of the hand-written ``pi`` backend."""

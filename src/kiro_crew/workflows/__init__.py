@@ -8,10 +8,10 @@ The runner, schema enforcement, the Workflows UI app, and the wrappers for the
 ports native to Kiro Crew are all written against this contract — several of them
 without importing it, so nothing but the conformance test catches a drift.
 Changing a signature or event shape here is a re-freeze and must update that test
-(GATE F2 in ``docs/system-specs/modules/workflow-gates.md``).
+(GATE F2 in ``docs/system-specs/modules/workflows.md``).
 
 Spec: ``docs/system-specs/modules/workflows.md``.
-Gate catalog: ``docs/system-specs/modules/workflow-gates.md``.
+Gate catalog: ``docs/system-specs/modules/workflows.md``.
 
 NOTE: This module is intentionally implementation-free. It declares Protocols and
 typed event records only. ``import``-ing it must have no side effects.
@@ -82,7 +82,7 @@ class CronPort(Protocol):
         """Register a recurring workflow run (interval or cron)."""
 
     def remove(self, name: str) -> None:
-        """Remove a previously registered job (owner-scoped)."""
+        """Remove an already-registered job (owner-scoped)."""
 
 
 @runtime_checkable

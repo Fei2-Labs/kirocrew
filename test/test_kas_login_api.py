@@ -17,10 +17,17 @@ import aiohttp
 import pytest
 
 from kiro_crew.auth.login.portal import PortalAuthError, wait_for_callback
-from kiro_crew.auth.service import KasLoginService, UnknownLoginError
+from kiro_crew.auth.service import (
+    KasLoginService,
+    LoopbackUnavailableError,
+    UnknownIdentityError,
+    UnknownLoginError,
+)
 from kiro_crew.dashboard.handlers import kas_login
 from kiro_crew.dashboard.handlers.kas_login import (
     api_kas_login_begin_device,
+    api_kas_login_begin_loopback,
+    api_kas_login_cancel,
     api_kas_login_logout,
     api_kas_login_poll,
     api_kas_login_status,
@@ -68,10 +75,22 @@ class _StubService(KasLoginService):
 
     async def status(self):
         self.calls.append("status")
-        return {"authenticated": False, "provider": "", "identity": "", "transport": "device"}
+        return {
+            "authenticated": False,
+            "provider": "",
+            "identity": "",
+            "transport": "device",
+            "expires_at": None,
+            "expired": False,
+            "has_refresh_token": False,
+            "refresh_rejected": False,
+            "usable": False,
+        }
 
-    async def begin_device(self, provider_str, *, start_url="", region=""):
-        self.calls.append(("begin", provider_str))
+    async def begin_device(self, provider_str, *, start_url="", region="", replaces=""):
+        self.calls.append(("begin", provider_str, replaces))
+        if replaces and replaces not in ("social", "builder_id", "identity_center", "external_idp"):
+            raise UnknownIdentityError(replaces)
         if provider_str == "facebook":
             raise ValueError(provider_str)
         return {
@@ -91,6 +110,22 @@ class _StubService(KasLoginService):
         self.calls.append(("logout", identity))
         if identity != "social":
             raise ValueError(identity)
+
+    async def begin_loopback(self, provider_str, *, replaces=""):
+        self.calls.append(("loopback", provider_str, replaces))
+        if provider_str == "facebook":
+            raise ValueError(provider_str)
+        if provider_str == "github":
+            raise LoopbackUnavailableError("every allowlisted port is busy")
+        return {
+            "login_id": "lid-lb",
+            "auth_url": "https://app.kiro.dev/signin?state=s",
+            "port": 8337,
+            "expires_at": "2026-01-01T00:00:00+00:00",
+        }
+
+    async def cancel(self, login_id):
+        self.calls.append(("cancel", login_id))
 
 
 @pytest.fixture(autouse=True)
@@ -119,6 +154,8 @@ async def test_all_handlers_503_with_code_when_service_unavailable(monkeypatch):
         (api_kas_login_begin_device, {"provider": "google"}),
         (api_kas_login_poll, {"login_id": "x"}),
         (api_kas_login_logout, {"identity": "social"}),
+        (api_kas_login_begin_loopback, {"provider": "google"}),
+        (api_kas_login_cancel, {"login_id": "x"}),
     ):
         resp = await handler(_FakeRequest(None, body))
         assert resp.status == 503
@@ -128,13 +165,40 @@ async def test_all_handlers_503_with_code_when_service_unavailable(monkeypatch):
 async def test_status_ok():
     resp = await api_kas_login_status(_FakeRequest(_StubService()))
     assert resp.status == 200
-    assert _body(resp)["transport"] == "device"
+    body = _body(resp)
+    assert body["transport"] == "device"
+    # The usability fields the sign-in card renders are passed through as the
+    # service answers them -- the handler adds nothing and hides nothing.
+    for key in ("expires_at", "expired", "has_refresh_token", "refresh_rejected", "usable"):
+        assert key in body
 
 
 async def test_begin_device_ok():
     resp = await api_kas_login_begin_device(_FakeRequest(_StubService(), {"provider": "google"}))
     assert resp.status == 200
     assert _body(resp)["login_id"] == "lid-1"
+
+
+async def test_begin_passes_replaces_through_and_rejects_an_unknown_slot():
+    """An account switch names the slot it replaces; the handler forwards it as-is
+    on both transports and answers a coded 400 (not `invalid_provider`) when the
+    slot is not one the store has."""
+    svc = _StubService()
+    resp = await api_kas_login_begin_device(
+        _FakeRequest(svc, {"provider": "google", "replaces": "identity_center"})
+    )
+    assert resp.status == 200
+    assert svc.calls[-1] == ("begin", "google", "identity_center")
+    resp = await api_kas_login_begin_loopback(
+        _FakeRequest(svc, {"provider": "google", "replaces": "builder_id"})
+    )
+    assert resp.status == 200
+    assert svc.calls[-1] == ("loopback", "google", "builder_id")
+    resp = await api_kas_login_begin_device(
+        _FakeRequest(svc, {"provider": "google", "replaces": "../etc"})
+    )
+    assert resp.status == 400
+    assert _body(resp)["code"] == "invalid_identity"
 
 
 async def test_begin_device_missing_and_unknown_provider():
@@ -177,6 +241,48 @@ async def test_logout_ok_and_invalid_identity():
     assert _body(resp)["code"] == "invalid_identity"
 
 
+async def test_logout_retires_running_identity_store_runtimes():
+    """A sign-out sweeps running KAS processes that were spawned on the vault's
+    identity (same remedy as an external kiro-cli logout); a sweep failure is
+    logged, not surfaced -- the credential is already gone."""
+
+    class _Sessions:
+        def __init__(self, fail=False):
+            self.calls = 0
+            self.fail = fail
+
+        async def retire_kiro_identity_sessions(self):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("sweep exploded")
+            return ["k1"], True
+
+    req = _FakeRequest(_StubService(), {"identity": "social"})
+    req.app["state"].sessions = _Sessions()
+    resp = await api_kas_login_logout(req)
+    assert resp.status == 200
+    assert req.app["state"].sessions.calls == 1
+
+    req = _FakeRequest(_StubService(), {"identity": "social"})
+    req.app["state"].sessions = _Sessions(fail=True)
+    resp = await api_kas_login_logout(req)
+    assert resp.status == 200
+    assert _body(resp) == {"ok": True}
+
+    # A failed delete never reaches the sweep: nothing to retire for.
+    from kiro_crew.auth.store import TokenStoreError
+
+    class _BrokenStoreService(_StubService):
+        async def logout(self, identity):
+            raise TokenStoreError("boom")
+
+    req = _FakeRequest(_BrokenStoreService(), {"identity": "social"})
+    req.app["state"].sessions = _Sessions()
+    resp = await api_kas_login_logout(req)
+    assert resp.status == 500
+    assert req.app["state"].sessions.calls == 0
+
+
 async def test_credential_mutations_reject_non_owner():
     # begin/poll/logout mutate the machine-global Kiro credential, so a non-owner
     # dashboard caller must get an audited 403 and never reach the service.
@@ -184,6 +290,8 @@ async def test_credential_mutations_reject_non_owner():
         (api_kas_login_begin_device, {"provider": "google"}),
         (api_kas_login_poll, {"login_id": "lid-1"}),
         (api_kas_login_logout, {"identity": "social"}),
+        (api_kas_login_begin_loopback, {"provider": "google"}),
+        (api_kas_login_cancel, {"login_id": "lid-lb"}),
     ):
         svc = _StubService()
         resp = await handler(_FakeRequest(svc, body, owner=False))
@@ -215,7 +323,7 @@ async def test_begin_and_poll_return_502_on_transport_error():
     import aiohttp
 
     class _OfflineService(_StubService):
-        async def begin_device(self, provider_str, *, start_url="", region=""):
+        async def begin_device(self, provider_str, *, start_url="", region="", replaces=""):
             raise aiohttp.ClientError("connection refused")
 
         async def poll_device(self, login_id):
@@ -228,6 +336,95 @@ async def test_begin_and_poll_return_502_on_transport_error():
     resp = await api_kas_login_poll(_FakeRequest(_OfflineService(), {"login_id": "lid-1"}))
     assert resp.status == 502
     assert _body(resp)["code"] == "auth_service_unreachable"
+
+
+async def test_begin_answers_409_when_a_sign_out_landed_mid_begin():
+    from kiro_crew.auth.service import SignedOutDuringLoginError
+
+    class _SignedOutService(_StubService):
+        async def begin_device(self, provider_str, *, start_url="", region="", replaces=""):
+            raise SignedOutDuringLoginError()
+
+        async def begin_loopback(self, provider_str, *, replaces=""):
+            raise SignedOutDuringLoginError()
+
+    for handler in (api_kas_login_begin_device, api_kas_login_begin_loopback):
+        resp = await handler(_FakeRequest(_SignedOutService(), {"provider": "google"}))
+        assert resp.status == 409
+        assert _body(resp)["code"] == "signed_out_during_login"
+
+
+async def test_status_store_failure_returns_coded_500():
+    from kiro_crew.auth.store import TokenStoreError
+
+    class _BrokenStoreService(_StubService):
+        async def status(self):
+            raise TokenStoreError("refusing linked token directory")
+
+    resp = await api_kas_login_status(_FakeRequest(_BrokenStoreService()))
+    assert resp.status == 500
+    assert _body(resp)["code"] == "token_store_failed"
+
+
+# ── loopback begin / cancel handlers ────────────────────────────────────────
+
+
+async def test_begin_loopback_ok_returns_portal_url_and_port():
+    svc = _StubService()
+    resp = await api_kas_login_begin_loopback(_FakeRequest(svc, {"provider": "google"}))
+    assert resp.status == 200
+    body = _body(resp)
+    assert body["login_id"] == "lid-lb"
+    assert body["auth_url"].startswith("https://")
+    assert body["port"] == 8337
+    assert svc.calls == [("loopback", "google", "")]
+
+
+async def test_begin_loopback_missing_unknown_and_malformed_provider_are_400():
+    resp = await api_kas_login_begin_loopback(_FakeRequest(_StubService(), {}))
+    assert resp.status == 400
+    assert _body(resp)["code"] == "invalid_provider"
+
+    resp = await api_kas_login_begin_loopback(
+        _FakeRequest(_StubService(), {"provider": "facebook"})
+    )
+    assert resp.status == 400
+    assert _body(resp)["code"] == "invalid_provider"
+
+    resp = await api_kas_login_begin_loopback(_FakeRequest(_StubService(), None))
+    assert resp.status == 400
+    assert _body(resp)["code"] == "invalid_provider"
+
+
+async def test_begin_loopback_unavailable_is_coded_409():
+    # The dashboard keys its device-code fallback off this exact status + code,
+    # so the shape is a contract, not a courtesy.
+    resp = await api_kas_login_begin_loopback(_FakeRequest(_StubService(), {"provider": "github"}))
+    assert resp.status == 409
+    assert _body(resp)["code"] == "loopback_unavailable"
+
+
+async def test_cancel_ok_and_missing_login_id():
+    svc = _StubService()
+    resp = await api_kas_login_cancel(_FakeRequest(svc, {"login_id": "lid-lb"}))
+    assert resp.status == 200
+    assert _body(resp) == {"ok": True}
+    assert svc.calls == [("cancel", "lid-lb")]
+
+    svc = _StubService()
+    resp = await api_kas_login_cancel(_FakeRequest(svc, {}))
+    assert resp.status == 400
+    assert _body(resp)["code"] == "missing_login_id"
+    assert svc.calls == []  # nothing to cancel, service untouched
+
+
+async def test_cancel_is_idempotent_for_unknown_login_id():
+    # Cancel is called on every start-over path in the dashboard, including after
+    # the login already finished or expired, so an unknown id is a no-op 200.
+    svc = _StubService()
+    resp = await api_kas_login_cancel(_FakeRequest(svc, {"login_id": "never-existed"}))
+    assert resp.status == 200
+    assert _body(resp) == {"ok": True}
 
 
 # ── loopback callback listener ──────────────────────────────────────────────

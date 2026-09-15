@@ -9,6 +9,7 @@ from ._component import ManagerComponent
 if TYPE_CHECKING:
     from ..subagent import (
         KiroCrewConfig,
+        SpawnApprovalUnreachable,
         Stats,
         SubagentInfo,
         _context_groups_field,
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
         check_memory_available,
         create_agent_folder,
         logger,
+        platform_compat,
         redact_credentials,
         redact_exfiltration_urls,
         sel,
@@ -55,6 +57,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         include_memory: bool = True,
         include_lessons: bool = True,
         include_project: bool = True,
+        memory_store: str = "",
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
@@ -69,9 +72,14 @@ class SpawnAdmissionCoordinator(ManagerComponent):
 
         1. YOLO mode → immediate execution
         2. ``approval_mode="auto"`` from caller → immediate execution
-        3. ``auto_approve_subagent_spawn`` config → auto-approved execution
-        4. ``on_spawn_approval`` callback → interactive approval
-        5. Otherwise → rejected
+        3. parent session trust (``approval_policy == "auto"``, the dashboard
+           Trust toggle) → auto-approved execution
+        4. ``auto_approve_subagent_spawn`` config → auto-approved execution
+        5. ``on_spawn_approval`` callback → interactive approval, unless the
+           callback reports it has no surface to raise the prompt on, in which
+           case the spawn is refused immediately (see
+           ``_spawn_with_approval_impl``)
+        6. Otherwise → rejected
 
         When ``approval_mode="auto"`` is set, it has two effects:
         - Skips the spawn approval gate (this method)
@@ -175,6 +183,47 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         # --- Redact task once for all SubagentInfo storage (raw task kept for kiro-cli prompt) ---
         _redacted_task = redact_credentials(redact_exfiltration_urls(task)[0])[0]
 
+        # Synchronous and yield-free with registration below: a spawn is either
+        # visible to the updater's busy count before the pause, or rejected after
+        # SessionManager closes admission. MagicMock-based embedders only block
+        # when they expose the literal boolean True.
+        if getattr(self._manager._sessions, "admission_closed", False) is True:
+            return self._manager._announce_rejection(
+                SubagentInfo(
+                    id=agent_id,
+                    task=_redacted_task,
+                    agent=agent,
+                    parent_session_key=parent_session_key,
+                    done=True,
+                    error="spawn refused: gateway admission is closed",
+                    batch_id=batch_id,
+                    batch_total=max(0, int(batch_total)),
+                )
+            )
+
+        # Validate before queueing/starting. An explicit private identity may
+        # never degrade to V1 after deletion, a config error, or a restart.
+        try:
+            if not isinstance(memory_store, str):
+                raise ValueError("the supplied memory identity is malformed")
+            if memory_store:
+                from kiro_crew.memory_stores import require_memory_store
+
+                memory_store = require_memory_store(memory_store)
+        except (OSError, ValueError) as exc:
+            return self._manager._announce_rejection(
+                SubagentInfo(
+                    id=agent_id,
+                    task=_redacted_task,
+                    agent=agent,
+                    parent_session_key=parent_session_key,
+                    done=True,
+                    error=f"memory_unavailable: {exc}",
+                    batch_id=batch_id,
+                    batch_total=max(0, int(batch_total)),
+                )
+            )
+
         # --- Memory guard: refuse to spawn if system memory is critically low ---
         try:
             min_mem = KiroCrewConfig.load().agent.spawn_min_memory_gb
@@ -208,7 +257,40 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
             )
-            return announce_rejection(info)
+            return self._manager._announce_rejection(info)
+        if avail_gb < 0 and platform_compat.IS_LINUX:
+            # A negative reading means the guard did not run: /proc/meminfo is
+            # unreadable on the one platform where it must exist. Proceeding
+            # is the stated fail-open contract for an unmeasurable host, but
+            # on Linux it must be observable rather than indistinguishable
+            # from a healthy check. macOS/Windows structurally lack
+            # /proc/meminfo, so emitting there would fire on every spawn and
+            # drown the signal.
+            logger.warning(
+                "Subagent memory guard could not run (min %.1f GB); proceeding unchecked",
+                min_mem,
+            )
+            # Context-aware pass so a host with a companion loaded is not
+            # audited with the weaker OSS baseline (the census gate in
+            # test_security_posture.py pins the baseline site count). Imported
+            # here because this function runs rebound on the subagent module's
+            # namespace, where a module-level import in this file is inert
+            # (see _component.bind_component_globals). The slice comes AFTER
+            # redaction: slicing first could split a companion-only credential
+            # at the boundary and persist an unmatched fragment.
+            from kiro_crew.platform.context import redact_log_via_context
+
+            task_note = redact_log_via_context(_redacted_task)[:120]
+            sel().log_tool_invocation(
+                session_key=parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="memory_check_unavailable",
+                metadata={
+                    "min_gb": min_mem,
+                    "task": task_note,
+                },
+            )
 
         # --- Admission gate: refuse NEW spawns while host memory posture is
         # critical. Complements the absolute spawn_min_memory_gb floor above
@@ -374,6 +456,13 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                     "include_memory": include_memory,
                     "include_lessons": include_lessons,
                     "include_project": include_project,
+                    # Queued alongside the context triple, and for the same
+                    # reason: the drain re-enters `spawn` from this dict alone, so
+                    # a field missing here is a scope the run silently regains.
+                    # For the store that means a delegation which happened to hit
+                    # the concurrency gate runs against the GLOBAL memory instead
+                    # of the crew it was handed to.
+                    "memory_store": memory_store,
                     "_agent_prevalidated": _agent_prevalidated,
                     "_preassigned_id": agent_id,
                     "_coordinator_admitted": _coordinator_admitted,
@@ -476,6 +565,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             include_memory=include_memory,
             include_lessons=include_lessons,
             include_project=include_project,
+            memory_store=memory_store or "",
         )
         info._raw_task = task  # unredacted prompt for kiro-cli execution
         info._coordinator_admitted = _coordinator_admitted
@@ -869,11 +959,22 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         If approval is denied the subagent is marked as done with an
         error and the running count is decremented without executing.
 
+        A callback that has nowhere to raise the prompt reports it by raising
+        ``SpawnApprovalUnreachable``, and the spawn is refused right here rather
+        than left registered until the reaper's deadline. Waiting is only correct
+        when a prompt actually reached a surface and went unanswered; when it
+        reached none, the wait can only end one way and costs the caller the full
+        deadline to learn it.
+
         Args:
             info (SubagentInfo): The subagent metadata.
         """
         assert self._manager._on_spawn_approval is not None
         request_id: str = f"spawn:{info.id}"
+        # Set only on the unreachable path, where it carries the refusal prose.
+        # Also the flag that picks the audit reason below, so the two cannot
+        # drift apart.
+        no_surface_error: str = ""
         try:
             from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -889,10 +990,10 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             # cause.
             info._awaiting_approval = True
             # Name the wait as well as marking it. The flag above is machine
-            # state read by the reaper and (now) by the wire; this is the line an
-            # operator gets. #6484's reporter had no lead at all because
-            # ``kirocrew logs`` held no record keyed to the affected run id —
-            # while a wait with no deadline of its own held the run at turn 0.
+            # state read by the reaper and by the wire; this is the line an
+            # operator gets. Without it an operator has no lead at all:
+            # ``kirocrew logs`` holds no record keyed to the affected run id,
+            # while a wait with no deadline of its own holds the run at turn 0.
             # ``parent_session_key`` is in the record on purpose: an unowned
             # spawn (the CLI posts none) raises its prompt with ``slot=""``, so
             # it is surfaced only on the global approvals feed and appears in no
@@ -909,6 +1010,47 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 )
             finally:
                 info._awaiting_approval = False
+        except SpawnApprovalUnreachable as unreachable:
+            # Not a refusal: nobody was there to refuse. Ordered ABOVE the
+            # generic handler below, which would otherwise flatten this into the
+            # same "spawn rejected" a human decline produces — and the generic
+            # prose is slow to diagnose.
+            #
+            # The raiser names the missing SURFACE; the rungs are this gate's own
+            # cascade. Keeping the split means the sentence does not go stale
+            # when a channel learns to deliver the prompt itself.
+            detail = str(unreachable).strip() or "no interactive surface is attached"
+            # TWO AUDIENCES, and which text each gets is a security decision, not
+            # a formatting one. The rung list is the OPERATOR's: it names two
+            # `config.json` keys, and `security.py` records that `config.json` is
+            # writable by any auto-approved agent shell. `info.error` travels to
+            # the calling agent as a completion event — automation input — so
+            # putting the how-to there hands the party this gate CONSTRAINS the
+            # recipe for removing it, which an unattended or prompt-injected
+            # agent can simply follow. The log is where an operator looks, so
+            # the how-to lives here and nowhere the agent can read it.
+            logger.warning(
+                "Subagent %s refused: the spawn approval prompt reached no "
+                "surface that could answer it (%s, parent=%s). To let spawns run "
+                "without a prompt, use any one of: spawn with "
+                'approval_mode="auto"; turn on Trust for the parent session in '
+                "the dashboard; set hooks.auto_approve_subagent_spawn to true in "
+                'config.json; or add "subagent" to hooks.auto_approve_sources.',
+                info.id,
+                detail,
+                info.parent_session_key or "<unowned>",
+            )
+            approved = False
+            # Terse, and names no file and no key — so it is actionable for the
+            # agent (tell the human, or stop delegating) without being followable
+            # into a self-granted bypass.
+            no_surface_error = (
+                "spawn rejected: no surface could show the approval prompt, so "
+                f"nobody could answer it ({detail}). The spawn was refused now "
+                "rather than held until the reaper's deadline. Ask the operator "
+                "to open the dashboard and spawn again, or to enable spawn "
+                "auto-approval."
+            )
         except Exception:
             logger.exception("Spawn approval failed for %s", info.id)
             approved = False
@@ -933,7 +1075,14 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                     )
                     return
             info.done = True
-            info.error = rejection_error
+            # Prose only, deliberately no ``error_code``. The one reader of
+            # that field (``POST /api/spawn``) runs BEFORE this task does, so a
+            # code minted here would reach no caller — and an unread code is
+            # contract surface bought for nothing (see ``error_code``'s own
+            # note in ``subagent.py``). The audit ``reason`` below is what
+            # separates this from a decline for a machine; the prose is what
+            # separates it for the agent that receives the completion event.
+            info.error = no_surface_error or "spawn rejected"
             # Slot accounting through the one-shot token, NOT a bare decrement.
             # A user Stop funnels into `_force_reap` and can land while this
             # approval is still pending (a human prompt has no deadline), and
@@ -944,12 +1093,19 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 self._manager._running_count -= 1
                 self._manager._drain_queue()
             self._manager._tasks.pop(info.id, None)
+            # ``outcome`` keeps its existing vocabulary — the refusal is still a
+            # rejection — and the reason rides in metadata, so an auditor can
+            # tell a declined spawn from an undeliverable one without a new
+            # outcome value to teach every reader.
+            _reject_meta: dict[str, str] = {"subagent_id": info.id}
+            if no_surface_error:
+                _reject_meta["reason"] = "no_approval_surface"
             sel().log_tool_invocation(
                 session_key=info.parent_session_key,
                 source="subagent",
                 tool_name="spawn_run",
                 outcome="rejected",
-                metadata={"subagent_id": info.id},
+                metadata=_reject_meta,
             )
             logger.info("Subagent %s spawn rejected", info.id)
             # Report ownership through the same claim every other terminal path
@@ -989,9 +1145,15 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 parent_session=info.parent_session_key,
                 max_turns=info.max_turns,
                 context_groups=_context_groups_field(info),
+                memory_store=info.memory_store,
             )
         except Exception:
             logger.warning("Failed to create agent folder for %s", info.id, exc_info=True)
+            if info.memory_store:
+                # The run task may already be registered. Its normal terminal
+                # path settles the failure before allocating a provider.
+                info.error = "memory_unavailable: could not persist this member's run binding"
+                return
 
         Stats().inc_subagent_spawned()
         # Beside that stat, and for the same reason: this is the confirmed-start

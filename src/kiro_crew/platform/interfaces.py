@@ -26,6 +26,7 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    Tuple,
 )
 
 if TYPE_CHECKING:
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     from kiro_crew.config.loader import KiroCrewConfig, TelemetryConfig
     from kiro_crew.security import DeniedCommandRule
     from kiro_crew.skill_providers.base import SkillProvider
+    from kiro_crew.tips_pool import TipsPool
 
 
 class InterceptDecision(enum.Enum):
@@ -640,6 +642,68 @@ class SkillDiscoveryProvider(Protocol):
         ...
 
 
+class TipsProvider(Protocol):
+    """The edition's feature-tip pool — the one REPLACE-capable edition seam.
+
+    Every other edition hook in this contract is ADD-only: an edition UNIONS its
+    contribution into the public set (``McpToolingProvider.extra_mcp_servers``,
+    ``SkillDiscoveryProvider.skill_providers``, ``DeniedRuleProvider``…).  Tips
+    cannot work that way.  A tip asserts that a feature exists and is worth
+    using, so a public tip shown on an edition build advertises a capability that
+    build may not have or may deliberately not expose — and the failure is
+    silent, because a tip is an unprompted suggestion nobody asked to verify.
+
+    Subtraction is not an alternative: a deny-list has to enumerate the public
+    pool to subtract from it, so every tip added to the public pool afterwards
+    would surface on the edition build until someone remembered to deny it — the
+    default would be leak, not withhold.  Hence full replacement: when an edition
+    supplies a pool, the public curated file and the public docs-scan catalog are
+    not consulted at all.
+    """
+
+    def tips_pool(self) -> "Optional[TipsPool]":
+        """The edition's COMPLETE tip pool, or ``None`` to keep the public one.
+
+        WIRED: ``tips.get_tips_cache`` calls this once per process when it builds
+        the tips cache.  ``None`` (the public Default) leaves today's behavior
+        byte-for-byte — bundled catalog, docs-scan fallback, bundled curated
+        file.  A :class:`TipsPool` REPLACES both the curated pool and the feature
+        catalog, so neither the public curated file nor ``docs/*.md`` is read and
+        no public feature is offered to the tip generator.  An empty pool is legal
+        and means this build shows no tips.
+
+        Scope of that guarantee: the prompt is built from the pool's catalog
+        alone, so a public feature is never put in front of the model, and a
+        generated tip whose ``doc`` is outside that catalog is dropped at parse
+        time (``tips._parse_tips``).  What remains is narrow: a tip could cite a
+        valid pool doc while its prose names something absent, because generated
+        text is checked for shape and provenance, not for subject.  Constrain the
+        pool; treat a generated tip's wording as unverified.
+
+        Pool entries are re-validated on the way into the cache through the same
+        checks the public pool's entries pass (``tips._sanitize_pool``); a
+        malformed entry is dropped and logged rather than served.
+
+        The pool's ``pool_id`` is persisted and compared on load: when it differs
+        from the stamp in ``tips_state.json``, tips generated against the previous
+        pool are discarded rather than re-served, which is what closes the leak on
+        a host that gains (or loses) the companion after tips were already
+        generated.  User dismissals and snoozes are deliberately NOT discarded —
+        they are keyed by tip id and doc, so an entry from another pool simply
+        never matches, and dropping them would silently un-dismiss tips the user
+        already refused.
+
+        Read fail-closed through ``safe_context_call`` at the call site, and the
+        degrade is profile-dependent: on ``standalone`` a failure falls back to the
+        public pool, because there is no other pool to prefer; on a non-standalone
+        build it WITHHOLDS tips (an empty pool stamped ``edition-unavailable``),
+        because falling back to public there would serve exactly the tips this
+        seam exists to keep off that build. A ``PlatformCompositionError`` is
+        re-raised on both. v1 addition (no ``CONTRACT_VERSION`` bump).
+        """
+        ...
+
+
 class DeniedRuleProvider(Protocol):
     """Edition-contributed DENIED-COMMAND RULES that the user can switch off.
 
@@ -837,13 +901,24 @@ class CapabilityManager(Protocol):
 
     async def uninstall_mcp(self, server_id: str) -> "CapabilityResult": ...
 
-    async def registry(self) -> List[Dict[str, Any]]:
+    async def registry(self, query: Optional[str] = None) -> List[Dict[str, Any]]:
         """Available MCP servers from the registry.
 
         The manager parses its own registry output into entries; the core passes
         them through verbatim as ``{"servers": [...]}``. Conventional keys the
         dashboard consumes: ``id``, ``installed``, ``title``, ``tier``,
         ``description`` (plus any extra fields the edition includes).
+
+        ``query`` is an OPTIONAL free-text filter HINT, passed only by MCP
+        discovery search (``mcp_providers.capability``); the browse endpoint
+        ``GET /api/capability/mcp/registry`` omits it and still gets the full
+        listing. A manager MAY use it to filter server-side, and SHOULD when its
+        registry is large enough that it truncates: the caller consumes at most
+        ``_LIST_LIMIT_GUARD`` rows, so on a big registry every row past that cap
+        is unsearchable unless the filter runs manager-side. Ignoring the hint
+        stays CORRECT — the caller filters again — it only costs reach. Because
+        the hint is feature-detected on the signature, an older zero-arg
+        implementation keeps working unchanged.
         """
         ...
 
@@ -1225,6 +1300,85 @@ class MobileConnectProvider(Protocol):
         ``capabilities.mobile_connect`` governance scope; the mint endpoints
         re-check the same scope per id, so the filtered list is presentation,
         never the control.
+        """
+        ...
+
+
+#: The id AND kind of the provisioner the core ships: EC2 in the user's own
+#: AWS account, driven by ``cloud.launch_engine.RealLaunchEngine``. A companion
+#: may return a list without it (hiding the AWS lane) but may not register a
+#: second descriptor under this id.
+BUILTIN_PROVISIONER_ID = "aws_ec2"
+
+
+@dataclass(frozen=True)
+class RemoteProvisioner:
+    """One way this deployment can CREATE a machine that runs a Kiro Crew
+    gateway and register it as a remote instance.
+
+    A descriptor says WHICH provisioners exist and how the dashboard should
+    draw each one, never how a machine is created: creation stays behind the
+    ``LaunchEngine`` the provider hands out for the id, driven by the core's
+    durable launch job (``cloud/launch_job.py``), which is where cancel,
+    rollback, one-launch-at-a-time and orphan reaping already live. A seam
+    that let an edition run its own launch loop would move a billing action
+    outside that machinery.
+
+    ``id`` is the identifier a launch request names (``provider_id`` on
+    ``POST /api/cloud/launch``) and the one a future governance scope narrows
+    on. ``kind`` names the frontend form: ``aws_ec2`` is drawn by the core's
+    own prerequisites + size form, any other kind needs a
+    ``registerRemoteProvisionerRenderer`` on the SPA side, and the dashboard
+    skips a kind it cannot draw (an older frontend renders an edition's new
+    provisioner as absent, never as a broken panel).
+
+    ``label`` is the untranslated display name shown on the selector; it is
+    edition-owned copy (a product name), so it deliberately does not route
+    through the core catalog. ``posix_only`` says whether a launch may run on a
+    Windows gateway; the built-in shells to ``bash``/``aws`` and cannot.
+    ``step_labels`` overrides the user-facing label of any of the four fixed
+    launch steps (``preflight``/``provision``/``signin``/``connect``) so a
+    provisioner that does not create an AWS instance is not described as one;
+    the step KEYS are fixed because cancel/rollback semantics hang off them.
+    """
+
+    id: str
+    kind: str
+    label: str
+    posix_only: bool = True
+    step_labels: Tuple[Tuple[str, str], ...] = ()
+
+
+class RemoteProvisionerProvider(Protocol):
+    """Edition-contributed remote-instance provisioners.
+
+    Public default = the single built-in ``aws_ec2`` descriptor backed by
+    ``RealLaunchEngine``, reproducing today's Set-up tab exactly. A companion
+    replaces the list with its own (keeping or dropping the built-in) and
+    supplies a ``LaunchEngine`` per id: a DevSpace, a Fargate task, a fleet
+    API, whatever creates a box that ends up running ``kirocrew gateway``.
+    """
+
+    def provisioners(self) -> List[RemoteProvisioner]:
+        """Return the deployment's provisioners, in display order.
+
+        WIRED: ``dashboard/handlers_cloud.py::api_cloud_provisioners`` reads
+        this via ``safe_context_call`` (fallback: the built-in descriptor
+        alone, so a degraded seam read keeps today's tab rather than an empty
+        one) and ``api_cloud_launch_create`` resolves the requested
+        ``provider_id`` against it before any job is persisted.
+        """
+        ...
+
+    def engine_for(self, provisioner_id: str) -> Any:
+        """Return the ``cloud.launch_job.LaunchEngine`` that drives *provisioner_id*.
+
+        Raise ``KeyError`` for an id not in :meth:`provisioners`; the handler
+        answers 400 ``unknown_provisioner``. Typed ``Any`` here only to keep
+        this module import-light (``cloud/launch_job.py`` is heavy); the
+        contract is the five-method ``LaunchEngine`` Protocol.
+
+        WIRED: ``dashboard/handlers_cloud.py::_engine``.
         """
         ...
 

@@ -15,20 +15,22 @@ which :func:`test_added_line_gate_self_test_passes` runs.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import inspect
 import os
 import subprocess
 import sys
+import textwrap
 from dataclasses import fields
 from unittest.mock import MagicMock
 
 import pytest
 
-from kiro_crew import acp_backends
 from kiro_crew.acp import client as acp_client
 from kiro_crew.acp import runtime as acp_runtime
 from kiro_crew.acp import types as acp_types
+from kiro_crew.acp.harness import KasHarness, KiroHarness
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
@@ -52,6 +54,7 @@ from kiro_crew.acp.types import (
     PROVIDER_LABELS_BY_BACKEND,
 )
 from kiro_crew.acp_backends import (
+    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
@@ -59,8 +62,10 @@ from kiro_crew.acp_backends import (
     BASELINE_SELECTABLE_BACKENDS,
     selectable_backends,
 )
+from kiro_crew.agent_sdk import backends as acp_backends
 from kiro_crew.config.loader import AgentConfig, _normalize_acp_backend
 from kiro_crew.providers import acp as providers_acp
+from kiro_crew.providers import mirrors
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GATE_PATH = os.path.join(_REPO_ROOT, "scripts", "check_harness_parity.py")
@@ -130,6 +135,9 @@ def test_initial_adapter_selection_is_limited_to_reviewed_backends() -> None:
             ACP_BACKEND_KIRO,
             ACP_BACKEND_KAS,
             ACP_BACKEND_CLAUDE,
+            # Selectable since the 2026-09-14 sync: upstream added an install probe
+            # for it, which is the criterion NOT_SHIPPED_SELECTABLE names.
+            ACP_BACKEND_CODEX,
             ACP_BACKEND_COPILOT,
             ACP_BACKEND_OPENCODE,
         }
@@ -190,6 +198,10 @@ def test_registering_a_backend_makes_it_survive_load() -> None:
     the baseline too, and restoring only the effective set would leak a widened
     baseline into the rest of the run.
     """
+    # Reaches the private registry state through ``agent_sdk.backends``, the module
+    # that DEFINES it. The ``kiro_crew.acp_backends`` shim re-exports the public
+    # names only: a second binding to a mutable set is how two views of one
+    # registry start disagreeing, so the private pair deliberately has one home.
     baseline_before = set(acp_backends._baseline)
     before = set(acp_backends._selectable)
     try:
@@ -482,15 +494,20 @@ def test_unknown_backend_rejected_at_construction() -> None:
 
 
 def test_kiro_spawn_argv_keeps_its_own_branch() -> None:
-    """H9: the Kiro branch keeps agent materialization and the model pin.
+    """H9: the Kiro spawn keeps agent materialization and the model pin.
 
     kiro-cli discovers selectable modes from ``~/.kiro/agents/*.json`` at
     startup, so a missing agent file makes a later ``set_mode`` fail with "Mode
     not found"; and ``--model`` at spawn is the only way to run a model outside
-    the agent's own provider. A dict-of-builders refactor that treats Kiro as one
-    entry among N drops both without failing anything else.
+    the agent's own provider. A refactor that treats Kiro as one entry among N
+    drops both without failing anything else.
+
+    The Kiro spawn now lives in its own harness rather than as a branch inside
+    the runtime, which is what keeps this invariant satisfiable at all: the
+    materialization and the model pin are in a file no other host shares, so a
+    host added later cannot reach them and cannot generalize them away.
     """
-    source = inspect.getsource(acp_runtime.AcpRuntime._resolve_spawn_argv)
+    source = inspect.getsource(KiroHarness.resolve_spawn)
     assert "ensure_agent_materialized" in source
     assert '"--model"' in source
     assert '"--agent"' in source
@@ -501,15 +518,18 @@ def test_handshake_is_per_backend() -> None:
 
     Collapsing the two capability dicts into one every harness accepts silently
     downgrades what the Kiro session declares.
-    """
-    kiro_version, kiro_capabilities = acp_runtime._runtime_wire_contract(ACP_BACKEND_KIRO)
-    kas_version, kas_capabilities = acp_runtime._runtime_wire_contract(ACP_BACKEND_KAS)
 
-    assert kiro_version == acp_runtime.PROTOCOL_VERSION
-    assert kas_version == acp_runtime.PROTOCOL_VERSION_KAS
-    assert kiro_capabilities is ACP_CLIENT_CAPABILITIES
-    assert kas_capabilities is KAS_CLIENT_CAPABILITIES
+    Each harness answers with its OWN constant, so the two answers cannot be
+    merged without deleting one of these two lines. The protocol version is
+    pinned alongside because the hosts disagree on its TYPE, and a shared
+    handshake would have to pick one and break the other outright.
+    """
+    kiro_source = inspect.getsource(KiroHarness.client_capabilities.fget)
+    kas_source = inspect.getsource(KasHarness.client_capabilities.fget)
+    assert "ACP_CLIENT_CAPABILITIES" in kiro_source
+    assert "KAS_CLIENT_CAPABILITIES" in kas_source
     assert KAS_CLIENT_CAPABILITIES != ACP_CLIENT_CAPABILITIES
+    assert KiroHarness().protocol_version != KasHarness().protocol_version
 
 
 def test_every_known_backend_has_a_label() -> None:
@@ -534,19 +554,72 @@ def test_every_known_backend_has_a_label() -> None:
     assert len(set(labels.values())) == len(labels), "two backends share a label"
 
 
-def test_codex_is_known_but_not_shipped_selectable() -> None:
-    """H1/H8: a switch a build cannot answer for must not be offered by default.
+def test_opencode_is_selectable_and_answerable() -> None:
+    """H1/H8: offered only because the build can answer for it, on two counts.
 
-    This is not the stance ``claude`` has: claude is baseline-selectable because
-    ``client.py`` owns its spawn path and its adapter is a public npm package —
-    both true of codex now too. What codex still lacks is the other half,
-    ``backend_install.py``'s probe: without one its install row can only read
-    ``unknown``, so a failed session arrives with nothing to act on.
-    ``register_selectable_backend`` is the way in until that probe lands.
+    Asserted TOGETHER, like the codex pairing below, because either half alone is
+    the state the pairing exists to prevent. Without the install probe a failed
+    session arrives with nothing to act on; without ENFORCED routing the switch
+    offers a harness whose tool calls would not reach the host gate -- and this
+    harness's own permission default is permissive, so that second half is not
+    hypothetical.
     """
+    from kiro_crew.agent_sdk import tool_gate
+    from kiro_crew.agent_sdk.backend_install import _PROBES
+
+    assert ACP_BACKEND_OPENCODE in ACP_BACKENDS_KNOWN
+    assert ACP_BACKEND_OPENCODE in BASELINE_SELECTABLE_BACKENDS
+    assert ACP_BACKEND_OPENCODE in selectable_backends()
+    assert ACP_BACKEND_OPENCODE in _PROBES, (
+        "opencode is offered in the switch, so backend_install must be able to say "
+        "what is missing when a session fails to start"
+    )
+    assert tool_gate.is_enforced(ACP_BACKEND_OPENCODE), (
+        "opencode is offered in the switch, so its routing must be one this core "
+        "enforces -- its own permission default asks for nothing"
+    )
+
+
+def test_codex_is_selectable_and_answerable() -> None:
+    """H1/H8: a harness may only be offered once the build can answer for it.
+
+    Codex was withheld for one stated reason -- ``backend_install.py`` had no probe,
+    so its install row could only read ``unknown`` and a failed session arrived with
+    nothing to act on. The probe closes that, which is what makes the switch
+    honest rather than merely present.
+
+    Asserted TOGETHER on purpose: selectability without a probe is the exact state
+    the withholding existed to prevent, so a future change that removed the probe
+    while leaving the baseline entry would fail here rather than silently ship a
+    switch with nothing behind it.
+    """
+    from kiro_crew.agent_sdk.backend_install import _PROBES
+
     assert ACP_BACKEND_CODEX in ACP_BACKENDS_KNOWN
-    assert ACP_BACKEND_CODEX not in BASELINE_SELECTABLE_BACKENDS
-    assert ACP_BACKEND_CODEX not in selectable_backends()
+    assert ACP_BACKEND_CODEX in BASELINE_SELECTABLE_BACKENDS
+    assert ACP_BACKEND_CODEX in selectable_backends()
+    assert ACP_BACKEND_CODEX in _PROBES, (
+        "codex is offered in the switch, so backend_install must be able to say "
+        "what is missing when a session fails to start"
+    )
+
+
+def test_codex_tool_calls_are_gated_before_it_is_offered() -> None:
+    """A selectable harness must route its tool calls, or the switch is a trap.
+
+    This is the invariant that makes admission mean something: the picker offering
+    an id and the gate being armed for it are separate facts, and selectability
+    without routing would put the operator's narrowing silently out of circuit.
+    """
+    from kiro_crew import acp_tool_gate
+
+    verdict, _reason = acp_tool_gate.routing_verdict(ACP_BACKEND_CODEX)
+    assert verdict is acp_tool_gate.Verdict.ROUTED
+    assert acp_tool_gate.is_enforced(ACP_BACKEND_CODEX) is True
+    assert acp_tool_gate.adapter_hidden_credential_dirs(ACP_BACKEND_CODEX), (
+        "ACP v1 cannot require a prompt for a passive read, so the credential "
+        "homes must be denied at the OS boundary instead"
+    )
 
 
 def test_codex_carries_its_own_provider_label() -> None:
@@ -648,65 +721,122 @@ def test_codex_spawn_keeps_its_own_branch() -> None:
     earlier — and folding its protocol version into the claude literal would make a
     future divergence a silent downgrade for whichever harness moved first.
 
-    FORK DIVERGENCE: upstream resolves the adapter with an in-client
-    ``_resolve_codex_acp_bin``. This fork routes the same step through its own
-    ``kiro_crew.acp.codex`` module, which additionally enforces a Node-MAJOR floor
-    (codex-acp 1.4.0 dies on Node 16). The resolver NAME is what changed; the
-    invariant is unchanged, so it is pinned at the fork's resolver. Do not
-    "restore" upstream's symbol here on a later sync — that silently drops the
-    Node floor — and do not relax it to a bare ``"codex" in spawn_source``, which
-    a comment would satisfy.
+    Codex is an upstream-owned harness, so its spawn resolves through upstream's
+    in-client ``_resolve_codex_acp_bin`` (operator rule: where upstream ships a
+    harness, this build runs upstream's implementation of it entirely; the fork
+    keeps only the adapters upstream does not have). The fork's own
+    ``acp/codex.py`` resolver, which added a Node-major floor, is retired with
+    that rule. Not relaxed to a bare ``"codex" in spawn_source``, which a comment
+    would satisfy.
     """
     spawn_source = inspect.getsource(acp_client.AcpClient._spawn)
     assert "_is_codex" in spawn_source
-    assert "resolve_argv_cached" in spawn_source
-    assert "acp import codex" in spawn_source or "acp.codex" in spawn_source
+    assert "_resolve_codex_acp_bin" in spawn_source
     assert acp_client.PROTOCOL_VERSION_CODEX is not None
-    # FORK DIVERGENCE: the per-backend wire contract lives in the module-level
-    # ``_wire_contract_for_backend`` rather than inline in ``_initialize_session``.
-    # Both halves are pinned so the extraction cannot decay: codex's OWN literal is
-    # in the contract table, and the handshake still reaches that table instead of
-    # carrying a second copy that could drift.
+    # The per-backend wire contract lives in the module-level
+    # ``_wire_contract_for_backend``, which reads ONE table
+    # (``_PROTOCOL_VERSION_BY_BACKEND``). Both halves are pinned so the
+    # extraction cannot decay: codex's OWN literal is the table's entry (H10),
+    # and the contract helper still reaches that table instead of carrying a
+    # second copy that could drift (H13).
+    table = acp_client._PROTOCOL_VERSION_BY_BACKEND
+    assert table[ACP_BACKEND_CODEX] is acp_client.PROTOCOL_VERSION_CODEX
     contract_source = inspect.getsource(acp_client._wire_contract_for_backend)
-    assert "PROTOCOL_VERSION_CODEX" in contract_source
-    assert (
-        "PROTOCOL_VERSION_CLAUDE" in contract_source
-    ), "codex must keep its own literal rather than share the claude one (H10)"
+    assert "_PROTOCOL_VERSION_BY_BACKEND" in contract_source
     assert "_wire_contract_for_backend" in inspect.getsource(
         acp_client.AcpClient._initialize_session
     )
 
 
 def test_each_mcp_seam_is_spliced_only_for_its_own_harness() -> None:
-    """H6: a per-harness hook must not reach a session of a different harness.
+    """H6/mcp-injection-composition: the wire array is ONE gated call, never a
+    per-harness splice.
 
-    Both defaults return ``[]``, so an ungated splice is inert in this tree — but an
-    edition that overrides both hooks would hand a claude session codex's server
-    entries and vice versa, and an entry whose transport the adapter does not
-    advertise fails the whole ``session/new`` rather than being skipped. Pinned at
-    the source, in the file's existing idiom, because the splice sits inside an
-    async session-setup path with no unit-level seam.
+    Upstream splices `_claude_session_mcp_servers` / `_codex_session_mcp_servers`
+    / `_opencode_session_mcp_servers` directly and ungated (each guarded only by
+    its own `self._is_<harness>` check, so a hand-written override of two of them
+    could still cross-contaminate a third's session). This build routes every
+    non-kiro backend through ONE tool-gate-gated call instead
+    (`_gated_session_mcp_servers`, `.fork-sync.yml`, divergences/
+    mcp-injection-composition): a harness whose permission route is unproven gets
+    NO Crew control plane, so there is no ungated per-harness hook left to
+    cross-splice in the first place. Pinned at the source, in the file's existing
+    idiom, because the splice sits inside an async session-setup path with no
+    unit-level seam.
     """
     for fn in (
         acp_client.AcpClient._new_session_following_substitution,
         acp_client.AcpClient._initialize_session,
     ):
         source = inspect.getsource(fn)
-        if "_codex_session_mcp_servers" not in source:
+        if "_gated_session_mcp_servers" not in source:
             continue
-        assert "if self._is_codex" in source, f"{fn.__name__}: codex seam spliced ungated"
-        assert "if self._is_claude" in source, f"{fn.__name__}: claude seam spliced ungated"
+        # The wire site is one call, not an array literal: `self._is_claude`
+        # and friends legitimately appear elsewhere in the same function (the
+        # `_meta.claudeCode` block right after it), which is unrelated to how
+        # the array is spliced. Scope to that one call expression.
+        start = source.index('"mcpServers": ')
+        line = source[start : source.index("\n", start)]
+        assert "if self._is_codex" not in line, f"{fn.__name__}: codex seam spliced ungated"
+        assert "if self._is_claude" not in line, f"{fn.__name__}: claude seam spliced ungated"
+        assert "if self._is_opencode" not in line, f"{fn.__name__}: opencode seam spliced ungated"
+        assert (
+            "await self._gated_session_mcp_servers()" in line
+        ), f"{fn.__name__}: wire array is no longer the one gated call"
 
 
-def test_codex_mcp_seam_defaults_to_empty() -> None:
-    """The public core sends no mcpServers for codex, exactly as for claude.
+def test_codex_mcp_seam_projects_through_its_mirror() -> None:
+    """The seam is FILLED, and it fills from the mirror rather than from itself.
 
-    kiro-cli receives its servers through ``--agent``; an edition overrides the seam.
-    A non-empty default here would put servers on a public session that the adapter
-    was never configured for.
+    An empty array is byte-identical for kiro-cli (``--agent`` carries its
+    servers) and a real gap for codex: the adapter reads no spec of Crew's, so a
+    selectable public backend would serve sessions with no ``spawn_run``, no
+    ``cron_add``, no ``send_message`` and no error anywhere.
+
+    What this pins is WHERE the array comes from. A translator written here rather
+    than in ``providers/mirrors/codex.py`` is the shape the mirror folder exists to
+    stop: one per-harness override per author, each rediscovering the same
+    projection.
     """
-    client = acp_client.AcpClient.__new__(acp_client.AcpClient)
-    assert client._codex_session_mcp_servers() == []
+    source = inspect.getsource(acp_client.AcpClient._codex_session_mcp_servers)
+    assert "self._session_mcp_servers()" in source
+    assert acp_backends.ACP_BACKEND_CODEX in acp_backends.ACP_BACKENDS_SESSION_MCP_ARRAY
+    assert mirrors.mirror_for(acp_backends.ACP_BACKEND_CODEX) is not None
+
+
+def test_opencode_mcp_seam_projects_through_its_mirror() -> None:
+    """The same three facts for opencode, and the one that had to be MEASURED.
+
+    This seam was empty on the reading that opencode's ``initialize`` advertises
+    ``mcpCapabilities`` of http and sse and no stdio, so the array could not carry
+    Crew's stdio servers. ACP's ``McpCapabilities`` has exactly two boolean fields
+    and no stdio field, so no conforming agent can advertise stdio and the absence
+    was never evidence -- driven against a real ``opencode acp``, the element Crew
+    already emits is accepted. Until then a selectable harness served sessions with
+    no ``spawn_run``, no ``cron_add`` and no ``send_message``, and nothing was red.
+
+    What it must NOT contain is codex's transport filter: this harness accepts
+    ``http`` and ``sse`` elements too, so dropping them would remove capability the
+    session would have had.
+    """
+    source = inspect.getsource(acp_client.AcpClient._opencode_session_mcp_servers)
+    assert "self._session_mcp_servers()" in source
+    assert acp_backends.ACP_BACKEND_OPENCODE in acp_backends.ACP_BACKENDS_SESSION_MCP_ARRAY
+    assert mirrors.mirror_for(acp_backends.ACP_BACKEND_OPENCODE) is not None
+    # The absent filter is read off the AST rather than the text, because the
+    # docstring EXPLAINS why codex's filter is not applied here -- a substring check
+    # would be satisfied by deleting that explanation and broken by writing it.
+    fn = ast.parse(textwrap.dedent(source)).body[0]
+    assert isinstance(fn, ast.FunctionDef)
+    called = {
+        node.func.id
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "drop_unadvertised_transports" not in called, (
+        "the opencode hook applies codex's transport filter, which would drop the "
+        "http and sse elements this harness accepts"
+    )
 
 
 def test_model_preflight_allows_unknown_advertised_set() -> None:
@@ -728,18 +858,21 @@ def test_model_namespace_membership() -> None:
     The claude seam must NOT be a member: it advertises bare ids
     (``claude-opus-4-8[1m]``) while the configured model is the prefixed
     provider id, so a membership test across those namespaces withholds every
-    legitimate model. copilot and opencode MUST be members — their advertised
-    ``provider/model`` ids are exactly what their ``session/set_model``
-    accepts, so a config carrying a kiro-namespace id (e.g.
+    legitimate model. copilot MUST be a member — its advertised
+    ``provider/model`` ids are exactly what its ``session/set_model`` accepts,
+    so a config carrying a kiro-namespace id (e.g.
     ``agents.default.model = claude-opus-4.6``) must be withheld at startup
-    rather than sent and rejected by the backend.
+    rather than sent and rejected by the backend. opencode is upstream's
+    harness and follows upstream's model handling, which runs no entitlement
+    pre-flight for it, so it is deliberately NOT a member (operator rule: an
+    upstream-owned harness runs upstream's implementation entirely).
     """
     assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_MODEL_NAMESPACE
+    assert ACP_BACKEND_OPENCODE not in ACP_BACKENDS_MODEL_NAMESPACE
     for backend in (
         ACP_BACKEND_KIRO,
         ACP_BACKEND_KAS,
         ACP_BACKEND_COPILOT,
-        ACP_BACKEND_OPENCODE,
     ):
         assert backend in ACP_BACKENDS_MODEL_NAMESPACE
 
@@ -812,3 +945,254 @@ def test_added_line_gate_flags_a_planted_negative_test(tmp_path, monkeypatch) ->
         encoding="utf-8",
     )
     assert gate.main([planted]) == 0
+
+
+# ---------------------------------------------------------------------------
+# H6 completeness — every per-host answer on the runtime path reads its table
+# ---------------------------------------------------------------------------
+#
+# H5 and H6 each catch a SITE: the added-line gate catches a negative identity
+# test, and the assertions above catch one capability granted by negation. Neither
+# catches the shape below, which is the one that reaches a user: a site that answers
+# a per-host question correctly for the hosts it was written against,
+# from an identity test or from "is this host on the shared runtime", while a
+# membership table already holds the answer. Every one of them read correctly with
+# kiro and KAS and answered wrongly for the third host the moment one arrived --
+# steer advertised then met with ``-32601``, a configured effort silently dropped,
+# an empty model picker, an entitlement probe that could not heal the snapshot it
+# exists for.
+#
+# So this section is a COMPLETENESS gate rather than another per-site pin. It has
+# two halves, and the second is what makes it a gate:
+#
+#   1. Every answer below is asserted equal to its table FOR EVERY BACKEND IN
+#      ``ACP_BACKENDS_KNOWN``, not only for the ones the site was written against.
+#      A host that is not on the runtime today still goes through the answer, so a
+#      divergence is caught before that host is ever admitted.
+#   2. Every backend-identity comparison in the runtime-path modules must be
+#      DECLARED below with a reason. A new one goes red until its author either
+#      points it at a table or records why identity is the honest answer there.
+#
+# Half 2 is the part a future author meets. It cannot decide whether a reason is
+# good -- a reviewer does that -- but it makes adding a seventh site a deliberate
+# act with a written justification instead of a line nobody notices.
+
+_RUNTIME_PATH_MODULES = (
+    "src/kiro_crew/acp/runtime.py",
+    "src/kiro_crew/acp/session_handle.py",
+)
+
+#: Backend-identity comparisons the runtime path is allowed to make, keyed by
+#: ``(module, enclosing function)``, with why a table cannot answer instead. A
+#: comparison against an ``ACP_BACKEND_*`` constant that is not listed here fails
+#: :func:`test_every_runtime_path_identity_test_is_declared`.
+_DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
+    (
+        "src/kiro_crew/acp/runtime.py",
+        "create_session",
+    ): "KAS alone is handed no ``--agent`` and its custom agents omit ``mcpServers``, "
+    "so session injection is the single owner of its Crew servers "
+    "(``_with_kas_managed_servers``). No capability set answers 'this host needs "
+    "Crew's managed servers merged in': membership would have to mean the OPPOSITE "
+    "for kiro, which reads them off disk, so a set here would have to be spelled as "
+    "an absence. Pinned by divergences/mcp-injection-composition.",
+    (
+        "src/kiro_crew/acp/runtime.py",
+        "load_session",
+    ): "KAS alone must have its custom agents re-attached on resume, and no harness "
+    "property means 'this host needs its agent re-sent'. Adding one would cost the "
+    "kiro path an awaited step it does not need (H13).",
+    (
+        "src/kiro_crew/acp/session_handle.py",
+        "stream_command",
+    ): "``_kiro.dev/commands/execute`` is kiro-cli's own RPC. The positive test is what "
+    "makes every other harness fail CLOSED onto the prompt transport instead of "
+    "inheriting a kiro-only verb (H5/H6).",
+    (
+        "src/kiro_crew/acp/session_handle.py",
+        "set_model",
+    ): "KAS is deliberately absent from ``ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION``: it "
+    "advertises the option and accepts the resolved id, so the member ladder would only "
+    "add retries after a terminal failure and would turn a refusal into a silent "
+    "stay-on-default. The reason is recorded at the branch.",
+    (
+        "src/kiro_crew/acp/session_handle.py",
+        "ensure_served_default",
+    ): "The served-default backfill reads kiro-cli's own ``currentModelId`` semantics. "
+    "Another host reaching it would have its resolved id rewritten from a list it did "
+    "not author.",
+    (
+        "src/kiro_crew/acp/session_handle.py",
+        "_handle_update",
+    ): "KAS emits its own notification discriminants. The positive gate restores those "
+    "displays without touching the kiro parser, and returns None for anything not "
+    "KAS-specific so shared frames still fall through (H5).",
+}
+
+
+def _handle_for(backend: str):
+    """A session handle whose runtime names *backend* — enough for every answer here."""
+    import asyncio
+
+    rt = MagicMock()
+    rt.acp_backend = backend
+    return acp_runtime.AcpSessionHandle("s-parity", asyncio.Queue(), rt)
+
+
+def _runtime_for(backend: str):
+    return acp_runtime.AcpRuntime(work_dir="/tmp", acp_backend=backend)
+
+
+#: A ``model`` select and nothing else — the shape a host advertises when it has no
+#: ``models`` object, which is what the advertised-selection table decides about.
+_SELECT_ONLY_SESSION_RESP = {
+    "configOptions": [{"id": "model", "type": "select", "options": [{"value": "some-model"}]}]
+}
+
+
+@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
+def test_steer_advertisement_matches_the_steer_table(backend):
+    """H6: the handle advertises steer iff the host is in ``ACP_BACKENDS_STEER``.
+
+    Ran for every known backend, which is the point: this answer was a literal
+    ``True`` for years and was honest only while ``AcpRuntime`` served one host.
+    """
+    assert _handle_for(backend).supports_steer is (backend in ACP_BACKENDS_STEER)
+
+
+@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
+def test_agent_activation_by_mode_matches_the_routing_table(backend):
+    """H6: ``session/set_mode`` names a Crew agent iff the host is governed by a spec.
+
+    The hosts an agent spec governs are exactly the hosts that HAVE an agent to
+    activate, so the routing table already answers this and the runtime must not
+    re-derive it from "is this kiro".
+    """
+    from kiro_crew import acp_tool_gate
+
+    expected = acp_tool_gate.routing_for(backend) is acp_tool_gate.Routing.AGENT_SPEC
+    assert _runtime_for(backend)._activates_agent_by_mode() is expected
+
+
+@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
+def test_the_model_select_fold_matches_the_advertised_selection_table(backend):
+    """H6: a ``model`` select becomes the advertised list iff the host opted in.
+
+    Both readers go through one fold, so asserting the fold covers the session-init
+    capture and the entitlement probe together.
+    """
+    from kiro_crew.acp.session_handle import (
+        advertised_models_from_session,
+        models_from_config_options,
+    )
+
+    opted_in = backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION
+    assert (models_from_config_options(_SELECT_ONLY_SESSION_RESP, backend) is not None) is opted_in
+    folded = advertised_models_from_session(_SELECT_ONLY_SESSION_RESP, backend)
+    assert bool(folded) is opted_in
+
+
+@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
+def test_unprojected_pooled_mcp_is_refused_for_exactly_the_mirrored_hosts(backend):
+    """H6: pooled servers are refused iff this host's MCP surface needs a projection.
+
+    Read from the mirror registry rather than from a backend name, so a host added to
+    ``providers.mirrors`` inherits the refusal instead of the gap.
+    """
+    from kiro_crew.acp.client import AcpToolGateUnroutable
+
+    rt = _runtime_for(backend)
+    rt._refuse_unprojected_pooled_servers([])  # empty never refuses, for any host
+    pooled = [{"name": "brokered", "command": "x"}]
+    if mirrors.has_mirror(backend):
+        with pytest.raises(AcpToolGateUnroutable):
+            rt._refuse_unprojected_pooled_servers(pooled)
+    else:
+        rt._refuse_unprojected_pooled_servers(pooled)
+
+
+def test_every_runtime_path_identity_test_is_declared():
+    """H6 completeness: a NEW backend-identity test on the runtime path goes red here.
+
+    The equality tests above pin the answers that exist. This pins the SET of sites
+    allowed to answer from identity at all, so one more cannot arrive unnoticed --
+    which is how every site in the declaration list below arrived.
+    """
+    import ast
+
+    undeclared: list[str] = []
+    for rel in _RUNTIME_PATH_MODULES:
+        path = os.path.join(_REPO_ROOT, rel)
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=rel)
+        scope: list[str] = []
+
+        def visit(node, scope=scope, rel=rel):
+            pushed = False
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                scope.append(node.name)
+                pushed = True
+            if isinstance(node, ast.Compare):
+                for cmp_node in [node.left, *node.comparators]:
+                    name = getattr(cmp_node, "id", None)
+                    if not (isinstance(name, str) and name.startswith("ACP_BACKEND_")):
+                        continue
+                    if name.startswith("ACP_BACKENDS_"):
+                        continue  # a set membership test IS the sanctioned form
+                    where = scope[-1] if scope else "<module>"
+                    if (rel, where) not in _DECLARED_IDENTITY_TESTS:
+                        undeclared.append(f"{rel}:{node.lineno} in {where}() compares {name}")
+            for child in ast.iter_child_nodes(node):
+                visit(child)
+            if pushed:
+                scope.pop()
+
+        visit(tree)
+
+    assert not undeclared, (
+        "backend-identity test(s) on the runtime path with no entry in "
+        "_DECLARED_IDENTITY_TESTS. Point the site at the membership table that already "
+        "answers it, or add an entry saying why identity is the honest answer there:\n  "
+        + "\n  ".join(undeclared)
+    )
+
+
+def test_the_identity_test_declarations_are_all_still_live():
+    """A declaration whose site is gone must be pruned, so the list cannot rot.
+
+    Without this the allowlist only ever grows, and a stale entry silently
+    pre-approves a future site that happens to land in the same function.
+    """
+    import ast
+
+    seen: set[tuple[str, str]] = set()
+    for rel in _RUNTIME_PATH_MODULES:
+        path = os.path.join(_REPO_ROOT, rel)
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=rel)
+        scope: list[str] = []
+
+        def visit(node, scope=scope, rel=rel):
+            pushed = False
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                scope.append(node.name)
+                pushed = True
+            if isinstance(node, ast.Compare):
+                for cmp_node in [node.left, *node.comparators]:
+                    name = getattr(cmp_node, "id", None)
+                    if (
+                        isinstance(name, str)
+                        and name.startswith("ACP_BACKEND_")
+                        and not name.startswith("ACP_BACKENDS_")
+                        and scope
+                    ):
+                        seen.add((rel, scope[-1]))
+            for child in ast.iter_child_nodes(node):
+                visit(child)
+            if pushed:
+                scope.pop()
+
+        visit(tree)
+
+    stale = sorted(set(_DECLARED_IDENTITY_TESTS) - seen)
+    assert not stale, f"prune these dead _DECLARED_IDENTITY_TESTS entries: {stale}"

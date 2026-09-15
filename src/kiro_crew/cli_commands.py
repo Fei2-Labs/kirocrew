@@ -9,6 +9,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import logging
 import os
 import re
 import shutil
@@ -19,6 +20,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -50,17 +52,32 @@ from kiro_crew.config.loader import (
     KiroCrewAgentConfig,
     KiroCrewConfig,
     WorkspaceConfig,
+    WorkspaceDirUnusable,
     build_provider_factory,
+    coerce_dict_section,
     config_local_path,
     config_path,
+    materialize_workspace_dir,
     read_config_for_update,
     read_local_secret,
     update_config_locked,
 )
-from kiro_crew.cron import CronSchedule, CronService, CronStoreUnreadable, format_schedule
+from kiro_crew.cron import (
+    CronSchedule,
+    CronService,
+    CronStoreUnreadable,
+    format_schedule,
+    lookup_cron_folder_id,
+)
 from kiro_crew.cron_trigger import trigger_cron_job
 from kiro_crew.dashboard import tailnet, tailnet_serve
 from kiro_crew.dashboard.origin import parse_dashboard_url
+from kiro_crew.embeddings import (
+    get_shared_embedder,
+    make_sync_embed_fn,
+    model_file_present,
+    store_embedding_space_is_stale,
+)
 from kiro_crew.eval.judge import LLMJudge
 from kiro_crew.eval.runner import EvalRunner, format_results, score_by_dimension
 from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
@@ -68,7 +85,20 @@ from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.member_memory_auth import require_member_memory_creation
 from kiro_crew.memory import MemoryStore
+from kiro_crew.memory_stores import (
+    DEFAULT_MEMORY_STORE,
+    UnknownMemoryStore,
+    archive_member_memory_store,
+    memory_store_binding_defect,
+    memory_store_namespace_lock,
+    named_store_or_empty,
+    persist_member_config,
+    provision_member_memory,
+    retire_unpublished_member_memory_store,
+    rollback_member_memory_archive_if_active,
+)
 from kiro_crew.port_resolution import resolve_client_port_ex
 from kiro_crew.secrets.migrate import (
     MigrationConflictError,
@@ -98,7 +128,7 @@ from kiro_crew.vector_memory import LessonWriteOutcome, VectorMemoryStore, _less
 # Workspace dirs are confined to the data home: a workspace is agent-writable
 # working state, so letting --dir escape would let it be pointed at ~/.ssh or the
 # keystone policy files. The refusal is deliberate — say so, and say what to pass
-# instead, rather than the bare "invalid directory path" this used to print.
+# instead, rather than a bare "invalid directory path".
 _WS_DIR_OUTSIDE_HOME = (
     "Error: --dir must resolve inside the KiroCrew data home ({home}); got {given!r}. "
     "Pass a relative directory name (e.g. 'workspace-myproject')."
@@ -117,8 +147,43 @@ def _ws_dir_error(given: str) -> str:
     return _WS_DIR_OUTSIDE_HOME.format(home=config_dir(), given=given)
 
 
-def _ws_dir_resolves_inside_home(ws_dir: str) -> bool:
-    """True when *ws_dir* resolves to a STRICT descendant of the data home.
+def _cli_validated_workspace_dst(ws_dir: str, *, operation: str, name: str) -> Path:
+    """Refuse *ws_dir* unless it is contained in the data home; else return its path.
+
+    The ONE place the CLI turns a workspace ``dir`` string into a directory. The
+    containment check runs first and exits the command on refusal (SEL ``denied``
+    event + the outside-home message); it fails closed on a ``~unknownuser``
+    prefix, so ``expanduser()`` never escapes as a traceback. What it returns is
+    the very ``Path`` object the check resolved and judged -- ``~`` expanded, an
+    absolute dir taken as given, a relative dir joined onto the data home --
+    resolved ONCE there and never again: the create pins this parent chain, so a
+    component swapped for a link after that resolution is refused, not followed,
+    and there is no second resolution for a swap to slip through. Composing or
+    resolving separately at a call site is how earlier revisions crashed on a
+    tilde spelling and re-resolved after validation, so no call site does either.
+    """
+    validated = _ws_dir_resolves_inside_home(ws_dir)
+    if validated is None:
+        sel().log_api_access(
+            caller="cli",
+            operation=operation,
+            outcome="denied",
+            source="cli",
+            resources=name,
+        )
+        print(_ws_dir_error(ws_dir), file=sys.stderr)
+        sys.exit(1)
+    return validated
+
+
+def _ws_dir_resolves_inside_home(ws_dir: str) -> Path | None:
+    """The resolved path when *ws_dir* is a STRICT descendant of the data home, else None.
+
+    The path is resolved exactly ONCE and the resolved object itself is returned,
+    so the caller materializes the very path these checks judged. Resolving a
+    second time after the checks would follow a parent swapped for a link in the
+    meantime, and the pinned create can only refuse a swap that happens AFTER the
+    path it is handed was resolved.
 
     ``expanduser()`` FIRST is what makes this honest: ``config_dir() / "~/x"``
     silently yields ``<home>/~/x`` — contained, but it creates a literal ``~``
@@ -132,13 +197,11 @@ def _ws_dir_resolves_inside_home(ws_dir: str) -> bool:
     form would, so there is nothing to refuse). What is rejected is anything
     resolving OUTSIDE — which is the property the boundary actually protects.
 
-    STRICT descendant, so the root itself is refused HERE. The separate
-    "cannot use config root" checks at each call site compare
-    ``config_dir() / ws_dir`` WITHOUT expanding ``~``, so ``~/.kiro/crew`` used to
-    become ``<home>/~/.kiro/crew`` there — unequal to the root, hence accepted —
-    while the plain absolute form was refused. Deciding it in this one expanded
-    place removes that split: a workspace pointed at the data-home root would put
-    agent-writable memory/lessons on top of ``config.json`` / ``.env``.
+    STRICT descendant, so the root itself is refused HERE, in the one place
+    that expands ``~`` -- the earlier per-call-site root checks compared
+    ``config_dir() / ws_dir`` unexpanded, so ``~/.kiro/crew`` slipped past them.
+    A workspace pointed at the data-home root would put agent-writable
+    memory/lessons on top of ``config.json`` / ``.env``.
 
     Inside the home is NOT automatically safe: the keystone paths live there too
     (``profiles/``, ``security_policy.json``, ``admission_policy.json``,
@@ -152,7 +215,7 @@ def _ws_dir_resolves_inside_home(ws_dir: str) -> bool:
     Fails CLOSED on any path we cannot resolve. ``expanduser()`` raises
     ``RuntimeError`` for a ``~unknownuser/...`` prefix (no such user, so no home
     to expand), and ``resolve()`` can raise ``OSError`` on a pathological path —
-    both must return False and route into the normal refusal, never escape as a
+    both must return None and route into the normal refusal, never escape as a
     traceback. That is the whole point of this PR, so the guard cannot be the one
     thing that crashes.
     """
@@ -161,10 +224,10 @@ def _ws_dir_resolves_inside_home(ws_dir: str) -> bool:
         candidate = (expanded if expanded.is_absolute() else config_dir() / expanded).resolve()
         root = config_dir().resolve()
         if candidate == root or not candidate.is_relative_to(root):
-            return False
-        return not is_sensitive_path(str(candidate))
+            return None
+        return None if is_sensitive_path(str(candidate)) else candidate
     except (RuntimeError, OSError, ValueError):
-        return False
+        return None
 
 
 def _format_schedule(schedule: object) -> str:
@@ -173,9 +236,15 @@ def _format_schedule(schedule: object) -> str:
     if not isinstance(schedule, CronSchedule):
         return str(schedule)
     if schedule.kind == "at" and schedule.at_ts:
-
-        dt = datetime.fromtimestamp(schedule.at_ts)
-        return f"at {dt:%Y-%m-%d %H:%M}"
+        try:
+            dt = datetime.fromtimestamp(schedule.at_ts)
+            return f"at {dt:%Y-%m-%d %H:%M}"
+        except Exception:
+            # Same degrade-on-render posture as cron.format_schedule: an
+            # extreme stored at_ts (beyond year 9999, epoch milliseconds)
+            # must not crash `kirocrew cron list` -- fall through to the
+            # shared renderer, whose own fallback string covers it.
+            pass
     return format_schedule(schedule)
 
 
@@ -226,9 +295,8 @@ def _spawn(args: argparse.Namespace) -> None:
             if a.get("done"):
                 status, note = "✅", ""
             elif a.get("awaiting_approval"):
-                # A run parked on its spawn-approval prompt used to render the
-                # same bare hourglass as one that is executing, so `spawn list`
-                # could not answer "is this working or waiting for me?" (#6484).
+                # A distinct icon from the executing hourglass, so `spawn list`
+                # answers "is this working or waiting for me?".
                 status, note = "🔐", "  — waiting for spawn approval"
             else:
                 status, note = "⏳", ""
@@ -343,7 +411,7 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         # raises its approval prompt unowned, so it appears only on the global
         # approvals surface -- not in any chat tab -- and this loop would
         # otherwise sit on "waiting for result..." indefinitely with nothing to
-        # act on (#6484). Announced once, not every 2s poll.
+        # act on. Announced once, not every 2s poll.
         if status.get("awaiting_approval") and not told_awaiting:
             told_awaiting = True
             print(
@@ -357,6 +425,46 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
                 sys.exit(1)
             print(status.get("result", ""))
             return
+
+
+class _CliConflict(Exception):
+    """An in-lock precondition re-check failed for a CLI config CRUD write.
+
+    The CLI pre-checks its inputs against a config snapshot for fast, friendly
+    errors, but the snapshot can be stale by the time the write runs. The
+    mutate callbacks below re-decide every state-dependent precondition on the
+    document read INSIDE the sidecar flock and raise this to refuse.
+    """
+
+
+def _locked_config_write(mutate, *, cleanup_conflict=None, cleanup_failure=None) -> None:
+    """Run one config delta under the sidecar flock; exit(1) on a conflict.
+
+    A load -> mutate dataclass -> ``cfg.save()`` shape cannot be used here: its
+    whole-document rename silently discards any change another process
+    landed between the load and the save.
+
+    Resolved through the loader MODULE, not this module's by-value imports,
+    so it honors the same ``kiro_crew.config.loader.config_path`` patches the
+    old ``cfg.save()`` path did (save() resolves its path inside loader).
+
+    ``cleanup_conflict`` runs before the exit(1) on a refused precondition;
+    ``cleanup_failure`` runs when the write itself fails -- the workspace
+    create passes its staging-drop / install-rollback handlers here.
+    """
+    from kiro_crew.config import loader as _loader
+
+    try:
+        _loader.update_config_locked(_loader.config_path(), mutate=mutate)
+    except _CliConflict as exc:
+        if cleanup_conflict is not None:
+            cleanup_conflict()
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except BaseException:
+        if cleanup_failure is not None:
+            cleanup_failure()
+        raise
 
 
 def _handle_workspace(args: argparse.Namespace) -> None:
@@ -383,6 +491,8 @@ def _handle_workspace(args: argparse.Namespace) -> None:
             print(f"Error: workspace '{args.name}' already exists", file=sys.stderr)
             sys.exit(1)
         copy_from = getattr(args, "copy_from", None)
+        staged_path: Path | None = None
+        install_state = {"installed": False}
         if copy_from:
             if copy_from not in cfg.workspaces:
                 print(
@@ -393,17 +503,12 @@ def _handle_workspace(args: argparse.Namespace) -> None:
 
             ws_dir = args.dir if args.dir is not None else f"workspace-{args.name}"
             src_path = config_dir() / cfg.workspaces[copy_from].dir
-            dst_path = config_dir() / ws_dir
-            if not _ws_dir_resolves_inside_home(ws_dir):
-                sel().log_api_access(
-                    caller="cli",
-                    operation="workspace.create",
-                    outcome="denied",
-                    source="cli",
-                    resources=args.name,
-                )
-                print(_ws_dir_error(ws_dir), file=sys.stderr)
-                sys.exit(1)
+            # Validated and composed in one step (refuses and exits on a dir
+            # outside the data home): the install and the fallback mkdir below
+            # both land on this path, the one the containment check judged.
+            dst_path = _cli_validated_workspace_dst(
+                ws_dir, operation="workspace.create", name=args.name
+            )
             if not src_path.resolve().is_relative_to(config_dir().resolve()):
                 sel().log_api_access(
                     caller="cli",
@@ -414,9 +519,9 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 )
                 print("Error: invalid source directory path", file=sys.stderr)
                 sys.exit(1)
-            # Reject config root itself to avoid copying .env / config.json
+            # Reject the config root as a SOURCE (the destination root was refused above).
             cfg_root = config_dir().resolve()
-            if src_path.resolve() == cfg_root or dst_path.resolve() == cfg_root:
+            if src_path.resolve() == cfg_root:
                 sel().log_api_access(
                     caller="cli",
                     operation="workspace.create",
@@ -444,36 +549,34 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                             skip.add(entry)
                     return skip
 
-                shutil.copytree(
-                    src_path,
-                    dst_path,
-                    dirs_exist_ok=True,
-                    symlinks=True,
-                    ignore=_ignore_sensitive,
-                )
+                # Copy to a STAGING sibling, not the destination: the copy
+                # runs before the locked registration, so a losing same-name
+                # race must leave the winner's directory untouched. The staged
+                # tree is installed inside the locked mutate below, only after
+                # the in-lock checks pass.
+                staging = dst_path.parent / f".{dst_path.name}.staging-{uuid.uuid4().hex[:8]}"
+                try:
+                    shutil.copytree(
+                        src_path,
+                        staging,
+                        symlinks=True,
+                        ignore=_ignore_sensitive,
+                    )
+                except BaseException:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    raise
+                staged_path = staging
         else:
             ws_dir = args.dir if args.dir is not None else f"workspace-{args.name}"
 
-            if not _ws_dir_resolves_inside_home(ws_dir):
-                sel().log_api_access(
-                    caller="cli",
-                    operation="workspace.create",
-                    outcome="denied",
-                    source="cli",
-                    resources=args.name,
-                )
-                print(_ws_dir_error(ws_dir), file=sys.stderr)
-                sys.exit(1)
-            if (config_dir() / ws_dir).resolve() == config_dir().resolve():
-                sel().log_api_access(
-                    caller="cli",
-                    operation="workspace.create",
-                    outcome="denied",
-                    source="cli",
-                    resources=args.name,
-                )
-                print("Error: cannot use config root as workspace directory", file=sys.stderr)
-                sys.exit(1)
+            # Validated and composed in one step (refuses and exits on a dir
+            # outside the data home). Defined for BOTH branches, so the
+            # destination is never an undefined name in the rollback closure
+            # below, and it is the directory the containment check judged --
+            # not ``<home>/~/...``.
+            dst_path = _cli_validated_workspace_dst(
+                ws_dir, operation="workspace.create", name=args.name
+            )
         # Check for directory collision with existing workspaces
         existing_dirs = {ws.dir for ws in cfg.workspaces.values()}
         if ws_dir in existing_dirs:
@@ -482,8 +585,70 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        cfg.workspaces[args.name] = WorkspaceConfig(dir=ws_dir)
-        cfg.save()
+
+        def _mutate_ws_create(doc: dict) -> dict:
+            workspaces = coerce_dict_section(doc, "workspaces")
+            if args.name in workspaces:
+                raise _CliConflict(f"workspace '{args.name}' already exists")
+            used = {str(ws.get("dir", "")) for ws in workspaces.values() if isinstance(ws, dict)}
+            if ws_dir in used:
+                raise _CliConflict(f"directory '{ws_dir}' is already used by another workspace")
+            if staged_path is not None:
+                # Same install invariant as the dashboard handler: the
+                # destination must not exist AT ALL. publish_dir_noreplace,
+                # not check-then-rename: POSIX os.rename silently replaces an
+                # EMPTY destination, so a racer's directory created between
+                # the check and the rename would be destroyed.
+                if dst_path.exists():
+                    raise _CliConflict(
+                        f"destination directory '{ws_dir}' already exists; "
+                        "choose another dir or remove it first"
+                    )
+                try:
+                    platform_compat.publish_dir_noreplace(staged_path, dst_path)
+                except (FileExistsError, OSError) as exc:
+                    raise _CliConflict(
+                        f"destination directory '{ws_dir}' already exists; "
+                        "choose another dir or remove it first"
+                    ) from exc
+                install_state["installed"] = True
+            # A create with no copy source still needs its directory to EXIST (see
+            # materialize_workspace_dir: the config entry alone is a fleet-wide
+            # private-memory outage). Created through the pinned parent, adopting a
+            # directory already there; deliberately NOT rolled back on a failed
+            # write -- a concurrent create can already have adopted and registered it.
+            else:
+                try:
+                    materialize_workspace_dir(dst_path, display=ws_dir)
+                except WorkspaceDirUnusable as exc:
+                    raise _CliConflict(str(exc)) from exc
+            workspaces[args.name] = dataclasses.asdict(WorkspaceConfig(dir=ws_dir))
+            return doc
+
+        def _drop_staging() -> None:
+            if staged_path is not None and not install_state["installed"]:
+                shutil.rmtree(staged_path, ignore_errors=True)
+
+        def _rollback_install() -> None:
+            if install_state["installed"]:
+                # Same rule as the dashboard handler and as the plain-create
+                # directory: an installed tree is left in place. A concurrent create
+                # can already have adopted and registered it (EEXIST is accepted),
+                # so deleting it would leave that workspace declared with no
+                # directory. Say where it is; a silent orphan reads as a leak.
+                print(
+                    f"Note: leaving '{dst_path}' in place; the workspace was not "
+                    "registered and no entry names it.",
+                    file=sys.stderr,
+                )
+            elif staged_path is not None:
+                shutil.rmtree(staged_path, ignore_errors=True)
+
+        _locked_config_write(
+            _mutate_ws_create,
+            cleanup_conflict=_drop_staging,
+            cleanup_failure=_rollback_install,
+        )
         sel().log_api_access(
             caller="cli",
             operation="workspace.create",
@@ -498,27 +663,12 @@ def _handle_workspace(args: argparse.Namespace) -> None:
             print(f"Error: workspace '{args.name}' not found", file=sys.stderr)
             sys.exit(1)
         if args.dir is not None:
-            resolved = (config_dir() / args.dir).resolve()
-            if not _ws_dir_resolves_inside_home(args.dir):
-                sel().log_api_access(
-                    caller="cli",
-                    operation="workspace.update",
-                    outcome="denied",
-                    source="cli",
-                    resources=args.name,
-                )
-                print(_ws_dir_error(args.dir), file=sys.stderr)
-                sys.exit(1)
-            if resolved == config_dir().resolve():
-                sel().log_api_access(
-                    caller="cli",
-                    operation="workspace.update",
-                    outcome="denied",
-                    source="cli",
-                    resources=args.name,
-                )
-                print("Error: cannot use config root as workspace directory", file=sys.stderr)
-                sys.exit(1)
+            # Validated and composed in one step (refuses and exits on a dir
+            # outside the data home); the locked mutate below checks this same
+            # path, so the update judges the directory the check judged.
+            update_dst = _cli_validated_workspace_dst(
+                args.dir, operation="workspace.update", name=args.name
+            )
             existing_dirs = {ws.dir for n, ws in cfg.workspaces.items() if n != args.name}
             if args.dir in existing_dirs:
                 print(
@@ -526,8 +676,36 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            cfg.workspaces[args.name].dir = args.dir
-        cfg.save()
+
+        def _mutate_ws_update(doc: dict) -> dict:
+            workspaces = coerce_dict_section(doc, "workspaces")
+            entry = workspaces.get(args.name)
+            if not isinstance(entry, dict):
+                raise _CliConflict(f"workspace '{args.name}' not found")
+            if args.dir is not None:
+                used = {
+                    str(ws.get("dir", ""))
+                    for n, ws in workspaces.items()
+                    if n != args.name and isinstance(ws, dict)
+                }
+                if args.dir in used:
+                    raise _CliConflict(
+                        f"directory '{args.dir}' is already used by another workspace"
+                    )
+                # Same materialize-or-refuse invariant the create path holds: the
+                # V2 private-memory layout resolves EVERY declared workspace
+                # strictly, so rebinding to a path that is not a directory arms a
+                # refusal for every private member. An update names a destination
+                # the owner already chose, so it refuses rather than creating one.
+                if not update_dst.is_dir():
+                    raise _CliConflict(
+                        f"directory '{args.dir}' does not exist or is not a "
+                        "directory; create it first"
+                    )
+                entry["dir"] = args.dir
+            return doc
+
+        _locked_config_write(_mutate_ws_update)
         sel().log_api_access(
             caller="cli",
             operation="workspace.update",
@@ -576,8 +754,32 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        del cfg.workspaces[args.name]
-        cfg.save()
+
+        def _mutate_ws_delete(doc: dict) -> dict:
+            workspaces = coerce_dict_section(doc, "workspaces")
+            if args.name not in workspaces:
+                raise _CliConflict(f"workspace '{args.name}' not found")
+            # Re-check the TOP-LEVEL default in-lock: a concurrent default
+            # change between this command's snapshot and the lock would
+            # otherwise leave config pointing at a deleted workspace.
+            if doc.get("default_workspace") == args.name:
+                raise _CliConflict(f"cannot delete default workspace '{args.name}'")
+            agents = doc.get("agents")
+            if isinstance(agents, dict):
+                still_referencing = sorted(
+                    a
+                    for a, ac in agents.items()
+                    if isinstance(ac, dict) and ac.get("workspace") == args.name
+                )
+                if still_referencing:
+                    raise _CliConflict(
+                        f"workspace '{args.name}' is referenced by agents: "
+                        + ", ".join(still_referencing)
+                    )
+            del workspaces[args.name]
+            return doc
+
+        _locked_config_write(_mutate_ws_delete)
         sel().log_api_access(
             caller="cli",
             operation="workspace.delete",
@@ -667,30 +869,35 @@ def _register_app_crons_to_scheduler(app_name: str) -> list[str]:
 
 
 def _warn_hooks_need_restart(app_name: str) -> bool:
-    """Say plainly that a running gateway will not pick up this app's backend hooks.
+    """Tell the operator how a CLI enable's backend-hook change reaches a gateway.
 
     Everything else a CLI enable writes is re-read by a running gateway:
     ``enable_app`` writes ``installed.json``, ``register_app`` writes agent and
     skill files, and ``_register_app_crons_to_scheduler`` writes through the
     shared cron store that the gateway's timer tick re-syncs by content digest.
-    Backend hooks are the exception -- they are Python modules imported INTO the
-    gateway process, and only the gateway can replace them (``on_app_enable`` ->
+    Backend hooks are Python modules imported INTO the gateway process, and only
+    the gateway can replace them (``on_app_enable`` ->
     ``RouteRegistry.register_app_routes`` -> ``load_app_module``, reached by the
-    HTTP enable route and by ``on_gateway_startup``). This process has no handle
-    on that one's ``sys.modules``, so a CLI enable cannot load them.
+    HTTP enable route and by ``on_gateway_startup``). This CLI process has no
+    handle on that one's ``sys.modules``, so it cannot load them directly --
+    and it does not need to: the gateway runs a hook reconciler
+    (``apps/hook_reconcile.py``) that notices an on-disk hook change this CLI
+    made and reloads it in-process within a poll interval. A
+    stopped gateway loads the new code on its next start.
 
-    Printing only "enabled <app>" reads as though it had. The operator then
-    verifies a hook change against the code the gateway imported earlier and
-    concludes the change did not work -- or that it did, when it never ran
-    (issue #7880).
+    Printing only "enabled <app>" reads as though the change were already live in
+    a running gateway, when in fact it lands a few seconds later. This notice
+    states the actual timing so an operator does not verify a hook change against
+    stale code and draw the wrong conclusion.
 
     Deliberately NOT gated on a live-gateway probe. ``_marker_port`` is the only
     verified one available here, and it writes its own multi-gateway warning to
     stderr, which would surface out of context on an app enable. The notice is
-    phrased conditionally instead, so it stays true when no gateway is up.
+    phrased conditionally instead, so it stays true whether or not a gateway is
+    up.
 
-    Only for apps that declare ``backend.hooks``: there is nothing stale to warn
-    about otherwise. Returns whether the notice was printed.
+    Only for apps that declare ``backend.hooks``: there is nothing to say
+    otherwise. Returns whether the notice was printed.
     """
     info = get_app(app_name)
     manifest = info.get("manifest") if isinstance(info, dict) else None
@@ -701,10 +908,9 @@ def _warn_hooks_need_restart(app_name: str) -> bool:
     declared = ", ".join(sorted(str(k) for k in hooks))
     print(
         f"  note: this app declares backend hooks ({declared}).\n"
-        "  A gateway that is already running keeps executing the hook code it\n"
-        "  imported earlier; this command cannot replace it. Run `kirocrew\n"
-        "  restart`, or disable and re-enable the app from the dashboard, for\n"
-        "  hook changes to take effect."
+        "  A gateway that is already running reloads them automatically within a\n"
+        "  few seconds (the gateway reconciles hook changes it did not perform\n"
+        "  itself); if the gateway is stopped, they load on its next start."
     )
     return True
 
@@ -859,7 +1065,22 @@ def _handle_app(args: argparse.Namespace) -> None:
         from kiro_crew.apps.dev_mode import set_dev_mode
 
         enabled = not getattr(args, "off", False)
-        dev_result = set_dev_mode(args.name, enabled)
+        confirm_root = getattr(args, "confirm_out_of_install_root", False)
+        if confirm_root and not enabled:
+            # The confirmation only applies to enabling: a disable never
+            # grants. Say so rather than silently ignoring the flag — an
+            # operator who reaches for it on the wrong invocation would
+            # otherwise read the exit-0 as "confirmed".
+            print(
+                "⚠️  --confirm-out-of-install-root has no effect with --off "
+                "(disabling grants nothing)",
+                file=sys.stderr,
+            )
+        dev_result = set_dev_mode(
+            args.name,
+            enabled,
+            confirm_out_of_install_root=confirm_root,
+        )
         if "error" in dev_result:
             print(f"❌ {dev_result['error']}", file=sys.stderr)
             sys.exit(1)
@@ -909,6 +1130,57 @@ def _handle_app(args: argparse.Namespace) -> None:
         print("Usage: kirocrew app {install|list|enable|disable|uninstall|info|init}")
 
 
+def _memory_store_or_exit(raw: str) -> str:
+    """Return *raw* when it may bind a crew to a memory store, else exit 1.
+
+    The same predicate the dashboard verbs apply, so the two surfaces cannot
+    persist different sets of values into one ``config.json``. Only the SHAPE is
+    refused: an undeclared but well-formed name is accepted and warned about, since
+    no verb here can declare a store either.
+
+    ``repr`` on the value, not the bare string: it arrives from a shell argument
+    and can carry an OSC/ANSI sequence, and this message goes to a terminal.
+    """
+    defect = memory_store_binding_defect(raw)
+    if defect is not None:
+        print(
+            f"Error: memory store {raw!r} is not a usable store name ({defect}); use "
+            "lowercase letters, digits and hyphens, or '' for the default store",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return raw
+
+
+def _finding_store_suffix(finding: dict) -> str:
+    """`` (store <name>)`` for a NAMED store's finding, ``""`` for the default's.
+
+    ``security.scan_memory`` returns one flat list spanning every declared store,
+    and an unlabelled row reads as the global memory's — so a crew silo's rows
+    have to say which silo, or one crew's memory text lands in another crew's
+    report with nothing marking it.
+
+    Empty for the default store rather than ``(store default)`` so an install
+    with no named stores prints exactly the bytes it always printed.
+    ``named_store_or_empty`` is the positive predicate for "this is a named
+    store", so the literal ``"default"`` and a missing key answer the same way.
+    """
+    name = named_store_or_empty(finding.get("store", ""))
+    return f" (store {name})" if name else ""
+
+
+def _retire_failed_cli_member_allocation(cfg: KiroCrewConfig, name: str, prior_store: str) -> None:
+    try:
+        store = cfg.agents[name].memory_store
+        if store == prior_store:
+            return
+        retire_unpublished_member_memory_store(store, name)
+    except BaseException:
+        logging.getLogger(__name__).warning(
+            "Could not retire unpublished memory for member %s", name, exc_info=True
+        )
+
+
 def _handle_agent(args: argparse.Namespace) -> None:
     """Dispatch agent subcommands: list, create, update, delete."""
 
@@ -933,12 +1205,28 @@ def _handle_agent(args: argparse.Namespace) -> None:
         if args.name in cfg.agents:
             print(f"Error: agent '{args.name}' already exists", file=sys.stderr)
             sys.exit(1)
+        memory_store = _memory_store_or_exit(args.memory_store)
+        if memory_store not in ("", DEFAULT_MEMORY_STORE):
+            print(
+                "Error: members receive an empty private memory store automatically",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         cfg.agents[args.name] = KiroCrewAgentConfig(
             kiro_agent=args.kiro_agent,
             workspace=args.workspace,
-            memory_store=args.memory_store,
+            memory_store=memory_store,
         )
-        cfg.save()
+        try:
+            require_member_memory_creation(args.name)
+            provision_member_memory(cfg, args.name)
+            persist_member_config(cfg, args.name, create=True)
+        except BaseException as exc:
+            _retire_failed_cli_member_allocation(cfg, args.name, memory_store)
+            if not isinstance(exc, (OSError, UnknownMemoryStore)):
+                raise
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
         print(f"Created agent: {args.name}")
 
     elif action == "update":
@@ -946,13 +1234,39 @@ def _handle_agent(args: argparse.Namespace) -> None:
             print(f"Error: agent '{args.name}' not found", file=sys.stderr)
             sys.exit(1)
         agent = cfg.agents[args.name]
+        prior_memory_store = agent.memory_store
+        if args.memory_store is not None and args.memory_store != prior_memory_store:
+            print("Error: a member's private memory cannot be rebound or shared", file=sys.stderr)
+            sys.exit(1)
         if args.kiro_agent is not None:
             agent.kiro_agent = args.kiro_agent
         if args.workspace is not None:
             agent.workspace = args.workspace
-        if args.memory_store is not None:
-            agent.memory_store = args.memory_store
-        cfg.save()
+        try:
+            if getattr(args, "provision_memory", False):
+                prior_record = cfg.memory_stores.get(prior_memory_store)
+                if prior_record is None or prior_record.memory_version != 2:
+                    require_member_memory_creation(args.name)
+                provision_member_memory(cfg, args.name)
+            changed_fields = {
+                field
+                for field in ("kiro_agent", "workspace")
+                if getattr(args, field, None) is not None
+            }
+            if agent.memory_store != prior_memory_store:
+                changed_fields.add("memory_store")
+            persist_member_config(
+                cfg,
+                args.name,
+                expected_store=prior_memory_store,
+                changed_fields=changed_fields,
+            )
+        except BaseException as exc:
+            _retire_failed_cli_member_allocation(cfg, args.name, prior_memory_store)
+            if not isinstance(exc, (OSError, UnknownMemoryStore)):
+                raise
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
         print(f"Updated agent: {args.name}")
 
     elif action == "delete":
@@ -965,8 +1279,48 @@ def _handle_agent(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        del cfg.agents[args.name]
-        cfg.save()
+
+        created_archive: list[tuple[str, str]] = []
+
+        def _mutate_agent_delete(doc: dict) -> dict:
+            agents = coerce_dict_section(doc, "agents")
+            if args.name not in agents:
+                raise _CliConflict(f"agent '{args.name}' not found")
+            # Re-check the default in-lock, at the authoritative TOP-LEVEL key
+            # (loader reads `data.get("default_agent")`); the agent-section
+            # key is the migration-era location and is checked as well.
+            agent_section = doc.get("agent")
+            if doc.get("default_agent") == args.name or (
+                isinstance(agent_section, dict) and agent_section.get("default_agent") == args.name
+            ):
+                raise _CliConflict(f"cannot delete default agent '{args.name}'")
+            entry = agents[args.name]
+            stores = coerce_dict_section(doc, "memory_stores")
+            store_name = entry.get("memory_store", "") if isinstance(entry, dict) else ""
+            record = stores.get(store_name)
+            if isinstance(record, dict) and record.get("memory_version") == 2:
+                if record.get("owner_member") != args.name:
+                    raise _CliConflict(
+                        f"memory store '{store_name}' ownership changed concurrently"
+                    )
+                if archive_member_memory_store(store_name, args.name):
+                    created_archive.append((store_name, args.name))
+            del agents[args.name]
+            return doc
+
+        def _rollback_archive() -> None:
+            for store_name, owner in reversed(created_archive):
+                try:
+                    rollback_member_memory_archive_if_active(store_name, owner)
+                except Exception:
+                    logging.getLogger(__name__).error(
+                        "failed to roll back member memory retirement for %s",
+                        store_name,
+                        exc_info=True,
+                    )
+
+        with memory_store_namespace_lock():
+            _locked_config_write(_mutate_agent_delete, cleanup_failure=_rollback_archive)
         print(f"Deleted agent: {args.name}")
 
     elif action == "reset-model":
@@ -1150,6 +1504,19 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
         approval_mode = getattr(args, "approval_mode", "") or ""
         agent = (getattr(args, "agent", "") or "").strip()
         silent = getattr(args, "silent", False)
+        folder_ref = (getattr(args, "folder", "") or "").strip()
+        # Resolve BEFORE add_job so a typo'd folder never leaves an orphaned
+        # job behind. Existing folders only: cron_folders.json is owned by the
+        # dashboard (its state rewrites the file wholesale), so a CLI-side
+        # create could be silently clobbered by the next Schedule-page folder
+        # operation.
+        folder_id = ""
+        if folder_ref:
+            found = lookup_cron_folder_id(folder_ref)
+            if found.error:
+                print(f"Error: {found.error}", file=sys.stderr)
+                sys.exit(1)
+            folder_id = found.folder_id
         if agent and not _AGENT_NAME_RE.match(agent):
             print(
                 "Error: invalid agent name (alphanumeric, hyphens, underscores; 1-64 chars)",
@@ -1161,25 +1528,31 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 f"Error: invalid channel ID format (expected {CHANNEL_ID_RE.pattern.strip('^$')})"
             )
             return
-        if cron_expr:
-            job = svc.add_job(
-                name=args.name,
-                message=args.message,
-                cron_expr=cron_expr,
-                channel=channel,
-                approval_mode=approval_mode,
-            )
-        elif every:
-            job = svc.add_job(
-                name=args.name,
-                message=args.message,
-                every_secs=every,
-                channel=channel,
-                approval_mode=approval_mode,
-            )
-        else:
-            print("Provide --every or --cron")
-            return
+        try:
+            if cron_expr:
+                job = svc.add_job(
+                    name=args.name,
+                    message=args.message,
+                    cron_expr=cron_expr,
+                    channel=channel,
+                    approval_mode=approval_mode,
+                    folder_id=folder_id,
+                )
+            elif every:
+                job = svc.add_job(
+                    name=args.name,
+                    message=args.message,
+                    every_secs=every,
+                    channel=channel,
+                    approval_mode=approval_mode,
+                    folder_id=folder_id,
+                )
+            else:
+                print("Provide --every or --cron")
+                return
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
         # agent_id and silent are CronJob fields but not add_job kwargs;
         # mirror the MCP cron_add post-create mutation pattern so they
         # are persisted with the job.
@@ -1520,7 +1893,7 @@ def _security(args: argparse.Namespace) -> None:
         if mem_findings:
             print(f"\n⚠️  {len(mem_findings)} suspicious memory entries:\n")
             for f in mem_findings:
-                print(f"  [{f['type']}] {f['key']}: {f['warning']}")
+                print(f"  [{f['type']}] {f['key']}{_finding_store_suffix(f)}: {f['warning']}")
                 print(f"    {f['value'][:120]}\n")
         elif not findings:
             pass
@@ -1566,7 +1939,7 @@ def _security(args: argparse.Namespace) -> None:
         # detailed=True: a segment dir that refused to pin (or was swapped
         # mid-verification) leaves the ROTATED segments unchecked, and the
         # command whose job is to surface tampering must not call that run
-        # "intact" over the live log alone (#5051 review).
+        # "intact" over the live log alone.
         result = sel().verify_integrity(detailed=True)
         if not result.history_verifiable:
             # The live-log clause is derived from the SAME pass's counts, so
@@ -1603,10 +1976,10 @@ def _print_denied_command_summary(*, ids: bool) -> None:
 
     The built-in rules are visible and configurable to the USER (Settings
     → Security renders them in category accordions, backed by
-    ``GET /api/security/denied-commands``) but were invisible to the AGENT --
-    ``policy show`` reported everything except them, so an agent planning a
-    multi-step task had no way to learn a class of work is hard-denied before
-    committing to a plan that turns out to be impossible. See issue #3454.
+    ``GET /api/security/denied-commands``) but are invisible to the AGENT --
+    ``policy show`` reports everything except them, so without this an agent
+    planning a multi-step task has no way to learn a class of work is hard-denied
+    before committing to a plan that turns out to be impossible.
 
     Deliberately just counts + ids, not the full 139 regex patterns: enough
     for planning ("this class of work is blocked") and for citing a rule id
@@ -1872,6 +2245,28 @@ def _policy_fetch(*, force: bool) -> None:
     raise SystemExit(1)
 
 
+def write_eval_artifacts(
+    results_dir: Path, ts: str, report: str, json_data: dict[str, object]
+) -> tuple[Path, Path]:
+    """Write the run's Markdown report and JSON summary, and return their paths.
+
+    Both are written as UTF-8 rather than the host's locale codec.
+    ``eval.runner.format_results`` puts a ✅ or ❌ on every scenario, session and
+    turn, so the report is never ASCII, and the turn snippets it embeds carry
+    whatever the agent said. Under the default codec on a Windows host — cp1252 in
+    the US and western Europe, cp950, cp932 and friends elsewhere — encoding that
+    raises ``UnicodeEncodeError``, and the raise lands AFTER the whole eval has
+    run, taking the JSON summary with it.
+    """
+
+    results_dir.mkdir(exist_ok=True)
+    report_path = results_dir / f"eval_{ts}.md"
+    report_path.write_text(report + "\n", encoding="utf-8")
+    json_path = results_dir / f"eval_{ts}.json"
+    json_path.write_text(json.dumps(json_data, indent=2) + "\n", encoding="utf-8")
+    return report_path, json_path
+
+
 async def _run_eval(args: argparse.Namespace) -> None:
     """Run multi-session evaluation scenarios."""
 
@@ -1959,13 +2354,7 @@ async def _run_eval(args: argparse.Namespace) -> None:
 
     # Save results
     results_dir = Path.cwd() / "eval_results"
-    results_dir.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
-    report_path = results_dir / f"eval_{ts}.md"
-    report_path.write_text(report + "\n")
-
-    json_path = results_dir / f"eval_{ts}.json"
     json_data = {
         "timestamp": ts,
         "scenarios": [r.summary() for r in results],
@@ -1973,7 +2362,7 @@ async def _run_eval(args: argparse.Namespace) -> None:
         "overall_passed": overall,
         "overall_total": len(results),
     }
-    json_path.write_text(json.dumps(json_data, indent=2) + "\n")
+    report_path, json_path = write_eval_artifacts(results_dir, ts, report, json_data)
 
     print(f"\nResults saved to:\n  {report_path}\n  {json_path}")
 
@@ -2019,25 +2408,74 @@ def _learn(args: argparse.Namespace) -> None:
             rule = args.rule
             category = args.category
             negative = getattr(args, "negative", None)
-            # The reporting form, not the bool. This command used to read EVERY falsy
-            # return as "the vector store did not take it" and write a second record
-            # into lessons.jsonl. Most of those returns mean the opposite -- the
-            # lesson is already stored exactly as submitted -- so the fallback wrote a
-            # redundant record for a lesson that was fine, and printed "Saved:" when
-            # nothing needed saving.
+            # The reporting form, not the bool. Most falsy returns mean the lesson
+            # is already stored exactly as submitted, so reading one as "the vector
+            # store did not take it" and writing a second record into lessons.jsonl
+            # would leave a redundant record for a lesson that was fine, and print
+            # "Saved:" when nothing needed saving.
             #
             # The one return that really does mean "nothing was stored" is a REFUSAL,
-            # and routing that into the JSONL store was worse than redundant: that
-            # store validates no content at all, so a value this store rejected (an
-            # injection-pattern clause) landed there anyway, and the context builder
-            # reads lessons.jsonl whenever the vector store holds no lessons.
+            # and routing that into the JSONL store would be worse than redundant:
+            # that store validates no content at all, so a value this store rejected
+            # (an injection-pattern clause) would land there anyway, and the context
+            # builder reads lessons.jsonl whenever the vector store holds no lessons.
             #
-            # So the fallback is REMOVED, not narrowed. There is no "vector store
-            # unavailable" state to fall back from here: ``vs`` is constructed and
-            # ``init()``-ed unconditionally above, which means a falsy return was the
-            # only way into that branch.
+            # So there is no fallback here, not a narrowed one. There is no "vector
+            # store unavailable" state to fall back from: ``vs`` is constructed and
+            # ``init()``-ed unconditionally above.
             result = vs.write_lesson(rule, category, negative)
             neg = f" ({negative})" if negative else ""
+            # What the save COST. The store's dedup rules tombstone a stored lesson
+            # the submitted rule contains or heavily overlaps, and printing "Saved:"
+            # plus the dedup NOTE below without ever naming the removed rule would
+            # hide that adding a conditional rule retires the general rule inside it,
+            # leaving a row with is_deleted=1 as the only trace. Printed in
+            # full for every outcome that can carry it, because the row is a
+            # tombstone: `learn list` cannot show it and this is the last readable
+            # copy.
+            lost = ""
+            if result.superseded:
+                # Strip terminal controls FIRST, then redact. The order is the whole
+                # correctness of this function, and the intuitive order is the wrong
+                # one: redacting first leaves `AKIA<CSI>IOSFODNN7EXAMPLE` untouched,
+                # because the escape breaks the token so the credential regex does not
+                # match it -- and the control-strip then REASSEMBLES the complete
+                # credential and prints it. Measured: redact-then-strip leaks that
+                # input verbatim; strip-then-redact masks it. Stripping can only ever
+                # JOIN characters, never split a token, so running it first can only
+                # help the regex, never hide a credential from it.
+                #
+                # Both treatments are needed: an OSC payload stored in a rule
+                # would otherwise be interpreted by the terminal, and a credential
+                # in a lesson would otherwise be printed. This block prints a rule the user did NOT ask
+                # to see, on the one path guaranteed to surface it.
+                #
+                # Redacting at all, rather than control-stripping only, is
+                # deliberate. `learn list` prints every stored lesson with
+                # control-stripping alone, and that looks like the convention to
+                # match -- but it is an EXPLICIT request to see the store, while this
+                # block surfaces a lesson the user is about to lose. The right
+                # comparison is the route, which delivers the SAME field and does
+                # redact, so controls-only would make one feature's two delivery paths
+                # disagree about whether a superseded rule may carry a secret. A lesson
+                # written by history consolidation also holds model output the user
+                # never typed, so "their own store" is not "their own knowledge".
+                def _safe(text: str) -> str:
+                    text = _TERMINAL_CTRL_RE.sub("", text)
+                    text, _ = redact_exfiltration_urls(text)
+                    text, _ = redact_credentials(text)
+                    return text
+
+                lines = "".join(f"\n    - {_safe(s)}" for s in result.superseded)
+                lost = (
+                    f"\n  REMOVED {len(result.superseded)} stored "
+                    f"lesson{'s' if len(result.superseded) != 1 else ''} this rule "
+                    f"contains or overlaps:{lines}\n"
+                    "  Those are no longer in effect. A verbatim re-add is DECLINED "
+                    "while this rule is stored, so to restore one exactly, "
+                    "`learn remove` this rule first; wording that shares few "
+                    "significant words with it can coexist."
+                )
             # The category is echoed ONLY where the store adopted the submitted one.
             # It is write-once (vector_memory.py builds an enrichment with the STORED
             # category, falling back to the submitted one only when the row has none),
@@ -2046,7 +2484,10 @@ def _learn(args: argparse.Namespace) -> None:
             # the same defect this PR fixes on the reporting side. `learn list` is
             # where stored values belong.
             if result.outcome is LessonWriteOutcome.INSERTED:
-                print(f"Saved: {rule}{neg} [{category}]\n{_LEARN_EMBED_NOTE}\n{_LEARN_DEDUP_NOTE}")
+                print(
+                    f"Saved: {rule}{neg} [{category}]\n{_LEARN_EMBED_NOTE}\n"
+                    f"{_LEARN_DEDUP_NOTE}{lost}"
+                )
             elif result.outcome is LessonWriteOutcome.ENRICHED:
                 # No _LEARN_DEDUP_NOTE here: an enrichment matched its existing row in
                 # pass 1, which SKIPS the generic dedup scan. Instead say what the
@@ -2066,14 +2507,18 @@ def _learn(args: argparse.Namespace) -> None:
                     "changing one means `learn remove` then `learn add`."
                 )
             elif result.outcome is LessonWriteOutcome.DEDUPED:
-                print(f"Not saved: an existing lesson already covers this ({result.reason})")
+                covered = f"Not saved: an existing lesson already covers this ({result.reason})"
+                print(f"{covered}{lost}")
             else:
                 # REFUSED -- and any outcome a later change adds, which is deliberate:
                 # every branch above names ONE outcome, so a new one lands here and
                 # exits non-zero rather than being silently reported as a success. A
                 # non-zero exit so a script driving this command sees the failure.
                 reason = f" ({result.reason})" if result.reason else ""
-                print(f"NOT saved: the memory store refused this lesson{reason}", file=sys.stderr)
+                print(
+                    f"NOT saved: the memory store refused this lesson{reason}{lost}",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
 
         elif action == "list":
@@ -2210,6 +2655,255 @@ def _memory_show(args: argparse.Namespace) -> None:
         print(_TERMINAL_CTRL_RE.sub("", text))
 
 
+# Each says WHICH index answered, because the caller cannot tell a keyword hit
+# from a semantic one by looking at the output. On stderr, not stdout: the hits
+# are still the answer and `--layer vector`'s stdout shape is a documented
+# promise. Same degradations, same wording shape, as the `kirocrew run`
+# store in cli_server.
+_SEARCH_KEYWORD_ONLY_NO_MODEL = (
+    "Embedding model not downloaded yet — keyword-matching this query "
+    "(the gateway downloads it in the background)"
+)
+_SEARCH_KEYWORD_ONLY_STALE_SPACE = (
+    "Embedding model changed — keyword-matching this query "
+    "(the gateway re-embeds in the background)"
+)
+_SEARCH_KEYWORD_ONLY_NOT_READY = (
+    "Embedding model did not load — keyword-matching this query "
+    "(run 'kirocrew doctor' for the reason)"
+)
+_SEARCH_KEYWORD_ONLY_PENDING_ROWS = (
+    "No embedded episodic row matched — keyword-matching this query "
+    "(rows still waiting for the gateway's re-embed sweep are keyword-only)"
+)
+# Loading the GGUF off local disk, matching the wait the knowledge bench allows
+# for the same one-shot CLI block (`cli_bench._KB_REAL_EMBED_TIMEOUT_S`).
+_SEARCH_MODEL_LOAD_TIMEOUT_SECS = 120.0
+
+
+def _memory_search_embedding(store: VectorMemoryStore, query: str) -> list[float] | None:
+    """Query vector for `memory search`, or None when it must degrade to keyword.
+
+    ``search_episodic`` text-searches whenever ``query_embedding`` is None and
+    does NOT auto-embed (only ``get_episodic_context`` does), and nothing repairs
+    an un-embedded QUERY the way the gateway's boot sweep repairs an un-embedded
+    row — so a one-shot read has to produce its own vector or it can never do
+    semantic recall at all. Without one, `--layer all` prints two labelled
+    sections that are both keyword hits over different corpora, while the two are
+    documented as answering different questions ("where did I write this word"
+    versus "what does this mean like").
+
+    Deliberately NO download kick: this is a one-shot CLI and must not start a
+    610MB download it will abandon at exit; the long-lived gateway owns that. A
+    stale vector space degrades this query too — the loaded FAISS index was built
+    by a different model, so scoring a new-model query vector against it compares
+    incomparable vectors, which is worse than keyword.
+
+    Unlike the long-lived stores (gateway, `kirocrew run`), this store embeds
+    exactly once, so ``embed_fn`` is bound only on the path that reaches the
+    embed and no ``embed_fn_factory`` is wired: there is no later write for a
+    lazy rebind to serve, and leaving the factory unset means the degraded
+    branches above cannot be silently undone underneath them.
+    """
+    if not query:
+        return None
+    if not model_file_present():
+        print(_SEARCH_KEYWORD_ONLY_NO_MODEL, file=sys.stderr)
+        return None
+    if store_embedding_space_is_stale(store):
+        print(_SEARCH_KEYWORD_ONLY_STALE_SPACE, file=sys.stderr)
+        return None
+    # BLOCK once, here. The callable from make_sync_embed_fn() never waits on the
+    # model load — it kicks the background load and returns None — so binding it
+    # alone leaves the very invocation the user typed on keyword search. A
+    # one-shot read is exactly the sync context wait_ready() exists for.
+    # wait_ready is the llama.cpp backend's seam and NOT on the EmbeddingBackend
+    # ABC, so probe for it, same as the dashboard and the re-embed sweep.
+    embedder = get_shared_embedder()
+    wait_ready = getattr(embedder, "wait_ready", None)
+    ready = (
+        wait_ready(timeout=_SEARCH_MODEL_LOAD_TIMEOUT_SECS)
+        if callable(wait_ready)
+        else embedder.is_ready()
+    )
+    if not ready:
+        print(_SEARCH_KEYWORD_ONLY_NOT_READY, file=sys.stderr)
+        return None
+    store.embed_fn = make_sync_embed_fn()
+    return store._try_embed(query)
+
+
+def _memory_backup_cmd(action: str, args: argparse.Namespace) -> None:
+    """The three verbs that must work on a store too broken to open.
+
+    Split out rather than inlined so the ordering above is visible: none of these
+    touches ``VectorMemoryStore``, which is what lets them run against a file that
+    fails ``PRAGMA journal_mode=WAL``.
+    """
+    if action == "backup":
+        from kiro_crew import memory_backup
+
+        keep = getattr(args, "keep", None)
+        if keep is None:
+            keep = KiroCrewConfig.load().memory.backup_keep
+        result = memory_backup.back_up_all_stores(int(keep))
+        print(
+            f"Backed up {result['backed_up']} store(s); "
+            f"removed {result['pruned']} old; {result['failed']} failed."
+        )
+
+    elif action == "backups":
+        from kiro_crew import memory_backup
+        from kiro_crew.memory_stores import declared_store_names, owned_store_path
+
+        only = getattr(args, "store", None)
+        # ``declared_store_names`` so the listing order matches the pass that WROTE the
+        # backups (default first, then sorted), and ``owned_store_path`` so an undeclared
+        # name cannot be listed at all: ``resolve_store_path`` degrades onto the DEFAULT
+        # store's file, which exists -- so without the guard this prints the operator's
+        # own backups under the heading the caller typed.
+        for name in [only] if only else declared_store_names():
+            path = owned_store_path(name)
+            if path is None:
+                print(f"{name}: not a declared memory store")
+                continue
+            backups = memory_backup.list_backups(path)
+            print(f"{name}:")
+            if not backups:
+                # Named plainly: "none" for the store an operator is about to rely on is
+                # the answer they need, and silence reads as "fine".
+                print("  (no backups yet)")
+            for backup in backups:
+                print(f"  {backup.name}  {backup.stat().st_size / 1_048_576:.1f} MiB")
+
+    elif action == "restore":
+        from kiro_crew import memory_backup
+        from kiro_crew.member_memory_backup import is_member_store
+        from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
+
+        target_store = getattr(args, "store", None) or DEFAULT_MEMORY_STORE
+        chosen = getattr(args, "from_backup", None)
+        if getattr(args, "cancel_pending", False):
+            from kiro_crew.memory_stores import owned_store_path
+
+            path = owned_store_path(target_store)
+            if chosen or path is None:
+                raise ValueError("Cancel requires an available memory store and cannot use --from")
+            cancelled = memory_backup.cancel_pending_restore(path)
+            print("Staged restore cancelled." if cancelled else "No staged restore to cancel.")
+            print("Current memory and backups are unchanged.")
+            return
+        source = Path(chosen) if chosen else memory_backup.newest_backup(target_store)
+        if source is None:
+            # This handler returns None; raising is how the surrounding command
+            # surfaces a failure, and a restore that found nothing must not read as
+            # success to whoever is relying on it.
+            raise FileNotFoundError(f"no backup found for memory store {target_store!r}")
+        restored = memory_backup.restore_from_backup(source, target_store)
+        print(f"Staged restore for {target_store!r} from {source.name}.")
+        print("Restart the gateway to activate it. Current memory is unchanged.")
+        if is_member_store(restored):
+            print("Activation preserves any existing member memory directory in full.")
+            return
+        print("Activation preserves the prior database and WAL as memory.db.superseded.*")
+
+
+def _memory_carve(args: argparse.Namespace) -> None:
+    """Filter or count one memory store's rows by their carve facets.
+
+    Reads the store NAMED on the command line, which is the whole point of the
+    verb: facets exist only on a crew silo, and ``_memory_cmd``'s shared store is
+    the default one.
+
+    The name is RESOLVED before it is reported. ``resolve_store_path`` degrades an
+    undeclared name onto the default store and raises on a malformed one, so
+    echoing the requested name would attribute the default store's answer — the
+    refusal included — to a store that was never opened.
+
+    Operator-facing, and deliberately not an MCP tool: no verb in the
+    ``kirocrew memory`` group has an MCP twin, the facets are attribution metadata
+    rather than recallable content (an agent already receives its memory through
+    context injection), and letting a session name an arbitrary store is exactly
+    the cross-crew read a silo exists to prevent — which is why the HTTP route
+    requires the dashboard owner to select a named store.
+    """
+    from kiro_crew import memory_schema
+    from kiro_crew.memory_stores import (
+        DEFAULT_MEMORY_STORE,
+        UnknownMemoryStore,
+        resolve_declared_store,
+        resolve_store_path,
+    )
+
+    requested = getattr(args, "store", None) or DEFAULT_MEMORY_STORE
+    try:
+        name = resolve_declared_store(requested)
+    except UnknownMemoryStore as exc:
+        # A shape defect raises rather than degrading, because repairing `../work`
+        # or `Work` onto `work` is the one case that would silently point two crews
+        # at one directory. Reported as one line, not a traceback.
+        print(f"Error: {exc}")
+        return
+    if name != requested:
+        print(f"Note: memory store {requested!r} is not declared; reading {name!r}.")
+    cfg = KiroCrewConfig.load()
+    store = VectorMemoryStore(
+        db_path=resolve_store_path(name), embedding_dim=cfg.memory.embedding_dim
+    )
+    store.init()
+    try:
+        # Keyed by facet NAME, read off the namespace by that name: an omitted flag
+        # is absent from the mapping (the axis is unconstrained), while an
+        # explicitly empty one filters for the rows no writer attributed.
+        filters = {
+            facet: value
+            for facet in memory_schema.FACET_NAMES
+            for value in [getattr(args, facet, None)]
+            if value is not None
+        }
+        kind = getattr(args, "kind", None) or ""
+        group_by = getattr(args, "count_by", None)
+        if group_by:
+            counts = store.count_by_facet(group_by, filters, kind=kind)
+            if not counts:
+                print(f"No live rows in {name!r} match that carve.")
+                return
+            for value, total in counts.items():
+                label = _TERMINAL_CTRL_RE.sub("", value) if value else "(unattributed)"
+                print(f"  {label}: {total}")
+            return
+        rows = store.list_by_facets(
+            filters,
+            kind=kind,
+            limit=int(getattr(args, "limit", 50)),
+            offset=int(getattr(args, "offset", 0)),
+        )
+        if not rows:
+            print(f"No live rows in {name!r} match that carve.")
+            return
+        for row in rows:
+            # The key for a semantic row, the id for an episode, which has none.
+            handle = row["key"] or row["id"]
+            text = _TERMINAL_CTRL_RE.sub("", str(row["text"]))[:120]
+            print(f"  [{row['kind']}] {_TERMINAL_CTRL_RE.sub('', str(handle))}: {text}")
+            axes = " ".join(
+                f"{facet}={_TERMINAL_CTRL_RE.sub('', str(row[facet]))}"
+                for facet in memory_schema.FACET_NAMES
+                if row[facet]
+            )
+            if axes:
+                print(f"        {axes}")
+    except memory_schema.FacetsUnsupported as exc:
+        # Named, never answered with an empty list: "no rows carry that crew" and
+        # "this store cannot record a crew at all" are different facts, and only
+        # one of them means the carve is empty.
+        print(f"Cannot carve {name!r}: {exc}")
+    except memory_schema.UnknownFacet as exc:
+        print(f"Error: {exc}")
+    finally:
+        store.close()
+
+
 def _memory_cmd(args: argparse.Namespace) -> None:
     """Manage the memory system (vector store + markdown layer)."""
     action = getattr(args, "mem_action", None)
@@ -2222,6 +2916,21 @@ def _memory_cmd(args: argparse.Namespace) -> None:
     # (or create) the vector store for it — same reason as "show" above.
     if action == "search" and getattr(args, "layer", "all") == "history":
         _memory_search_history(args)
+        return
+    # The backup verbs run BEFORE the store is opened, and that ordering is the whole
+    # point of them: `restore` and `backups` are what an operator reaches for when the
+    # store is corrupt, and `store.init()` below runs `PRAGMA journal_mode=WAL`, which
+    # raises "file is not a database" on exactly that file. Opening first would make the
+    # recovery path unreachable in the only situation it exists for.
+    if action in ("backup", "backups", "restore"):
+        _memory_backup_cmd(action, args)
+        return
+    # "carve" opens the store NAMED on the command line, so it must not go through
+    # the shared open below, which is hardwired to the default store's path. Same
+    # ordering rule as the backup verbs: a verb whose target is not the default
+    # store dispatches before anything opens one.
+    if action == "carve":
+        _memory_carve(args)
         return
     cfg = KiroCrewConfig.load()
     store = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim)
@@ -2250,7 +2959,32 @@ def _memory_cmd(args: argparse.Namespace) -> None:
         elif action == "search":
             layer = getattr(args, "layer", "all")
             if layer in ("vector", "all"):
-                results = store.search_episodic(query_text=args.query, limit=10)
+                query_embedding = _memory_search_embedding(store, args.query)
+                results = store.search_episodic(
+                    query_embedding=query_embedding,
+                    query_text=args.query,
+                    limit=10,
+                )
+                if not results and query_embedding is not None:
+                    # Both vector legs score only rows with a non-NULL embedding
+                    # (search_episodic's FAISS branch and _sqlite_vector_search's
+                    # "embedding IS NOT NULL"), and NULL rows are a designed
+                    # state: write_episodic(defer_embedding=True) bulk writers,
+                    # `memory import` / `memory migrate` — THIS store binds no
+                    # embed_fn on those paths — and rows cleared by
+                    # reconcile_embedding_space. All of them wait on the
+                    # gateway's boot-only, paced backfill sweep, so an empty
+                    # semantic result over an un-embedded corpus is not "no such
+                    # memory". Retry the keyword leg the pre-embedding CLI used
+                    # rather than reporting nothing; guarded on query_embedding
+                    # so the degraded paths above never run it twice.
+                    results = store.search_episodic(query_text=args.query, limit=10)
+                    if results:
+                        # Only when keyword actually recovered something the
+                        # vector pass could not see — an empty store must not
+                        # emit a degrade line. Same stderr rule as the three
+                        # degrades above: stdout shape is a promise.
+                        print(_SEARCH_KEYWORD_ONLY_PENDING_ROWS, file=sys.stderr)
                 if not results:
                     print("No episodic memories found.")
                     # Under "all" the markdown layer is still to come: an empty
@@ -2288,13 +3022,28 @@ def _memory_cmd(args: argparse.Namespace) -> None:
             else:
                 print("  FAISS accelerator: not installed — stdlib cosine fallback (exact)")
             print(f"  Audit events: {stats['events_count']}")
+            reads = store.read_counters()
+            # This process only: the store was constructed for this command, so
+            # the totals describe the reads this invocation itself performed, not
+            # the store's lifetime. The gateway's own totals are the `reads`
+            # object on GET /api/memory/observability.
+            print(
+                f"  Reads (this process): {reads['rows_read']} rows over "
+                f"{reads['statements_executed']} statements"
+            )
+            print(
+                f"    population scans: semantic {reads['semantic_full_scans']}"
+                f" ({reads['semantic_rows_read']} rows),"
+                f" episodic {reads['episodic_full_scans']}"
+                f" ({reads['episodic_rows_read']} rows)"
+            )
 
         elif action == "audit":
             findings = scan_memory()
             if findings:
                 print(f"⚠️  {len(findings)} suspicious entries:\n")
                 for f in findings:
-                    print(f"  [{f['type']}] {f['key']}: {f['warning']}")
+                    print(f"  [{f['type']}] {f['key']}{_finding_store_suffix(f)}: {f['warning']}")
                     print(f"    {f['value'][:120]}\n")
             else:
                 print("✅ No suspicious content in memory.")
@@ -2323,6 +3072,19 @@ def _memory_cmd(args: argparse.Namespace) -> None:
             print(f"  Semantic: {counts['semantic']}")
             print(f"  Episodic: {counts['episodic']}")
             print(f"  Skipped:  {counts['skipped']}")
+
+        elif action == "retired":
+            restore_id = getattr(args, "restore_id", None)
+            if restore_id:
+                ok = store.restore_episodic(restore_id)
+                print("Restored." if ok else "Not found, or already active.")
+            else:
+                rows = store.get_retired_episodic(limit=int(getattr(args, "limit", 20)))
+                if not rows:
+                    print("No episodes were superseded by a semantic write.")
+                for row in rows:
+                    print(f"  {row['id']}  superseded by {row['superseded_by']}")
+                    print(f"    {row['text'][:120]}")
 
         elif action == "import":
             import_file = getattr(args, "file", None)
@@ -2804,7 +3566,7 @@ def _tailnet(args: argparse.Namespace) -> None:
 
     if not enabled:
         # Checked BEFORE publishing, and never written. Three reasons this is a
-        # check rather than the config write it used to be:
+        # check rather than a config write:
         #
         # 1. A read-modify-write of the shared config cannot be made atomic from a
         #    second process. Every construction tried here -- a caller-side
@@ -2813,9 +3575,9 @@ def _tailnet(args: argparse.Namespace) -> None:
         #    dashboard save landing mid-flight is replaced by our older snapshot, or
         #    (when the lock went into the shared writer) blocks the gateway's event
         #    loop. Closing it needs one primitive that ALL ~29 writers take, which is
-        #    #2147, not this feature.
+        #    its own change, not this feature.
         # 2. Failing here beats the alternative ordering. Writing after publishing
-        #    left a published-but-untrusted dashboard whenever the write failed --
+        #    leaves a published-but-untrusted dashboard whenever the write fails --
         #    reachable on the tailnet and answering 403, which is the confusing state
         #    this command exists to eliminate.
         # 3. The cost is paid once per machine, not per invocation. After the operator
@@ -2984,7 +3746,7 @@ def _telemetry(args: argparse.Namespace) -> None:
 
     # Verify the write actually took EFFECT before claiming success.
     # config.local.json deep-merges OVER config.json at load, so a host that
-    # previously set this key locally would keep sending while this command
+    # sets this key locally would keep sending while this command
     # printed "DISABLED" — a false promise on a privacy control is worse than an
     # error, so re-read the effective config and report the shadowing file.
     try:

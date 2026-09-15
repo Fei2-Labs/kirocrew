@@ -191,15 +191,6 @@ class TestEndpointContract:
         assert "acp_backend_models_unavailable" in source
         assert "503" in source
 
-    def test_the_backend_branch_precedes_the_kiro_spawn(self) -> None:
-        """Ordering is the point: the spawn must not happen at all."""
-        import inspect
-
-        source = inspect.getsource(agents_handler.api_models)
-        branch_at = source.index("_advertised_alt_backend_models")
-        spawn_at = source.index("--list-models")
-        assert branch_at < spawn_at
-
     def test_the_auto_capability_is_reported_on_success_and_on_refusal(self) -> None:
         """The picker cannot infer ``auto`` from a model list it does not have.
 

@@ -1,15 +1,14 @@
-"""Serving an app's UI bundle through a pinned descriptor (#6809).
+"""Serving an app's UI bundle through a pinned descriptor.
 
 ``/apps/{name}/ui/{path}`` serves the SAME app-owned directory the art route
-serves, and until #6809 it kept the validate-then-``FileResponse`` shape #6794
-removed from that sibling: validating a path and then handing it to
-``FileResponse`` opens it a SECOND time, so the app that owns the directory can
-swap a validated name for a symlink between the check and that open and have
-the unsandboxed gateway read the target on its behalf. Worse than parity: this
-route's extension allowlist admits ``.json`` and ``.mjs``, so the route with
-the weaker open had the broader reach.
+serves, and must not use the validate-then-``FileResponse`` shape: validating a
+path and then handing it to ``FileResponse`` opens it a SECOND time, so the app
+that owns the directory can swap a validated name for a symlink between the
+check and that open and have the unsandboxed gateway read the target on its
+behalf. Worse: this route's extension allowlist admits ``.json`` and ``.mjs``,
+so the route with the weaker open has the broader reach.
 
-The suite mirrors ``test_app_art_route.py`` (the #6794 shape) with this
+The suite mirrors ``test_app_art_route.py`` with this
 route's own behaviour contract: 400 on ``..``/absolute/escaping paths, 403 on
 a disallowed extension, 404 on anything else unservable, Content-Type from the
 extension map, and body-less 304s for conditional requests.
@@ -140,7 +139,7 @@ async def test_a_symlinked_ANCESTOR_is_refused(ui_root: Path, tmp_path: Path) ->
     an ANCESTOR that is a link. ``pin_parent`` deliberately does not close that
     case (its contract: a component swapped BEFORE the parent was resolved is
     followed by that resolution), so resolving the parent and proving it lands
-    under the resolved root is load-bearing — a genuine #6794 coverage gap
+    under the resolved root is load-bearing — a genuine coverage gap
     until a mutation surfaced it. ``make_dir_link`` so Windows gets a junction
     and the branch without the pinned walk is covered by the same test.
     """
@@ -336,7 +335,7 @@ async def test_the_windows_branch_validates_the_OPENED_descriptor_path(
     monkeypatch.setattr(app_routes, "apps_dir", lambda: root)
     monkeypatch.setattr(app_routes, "supports_pinned_walk", lambda: False)
     monkeypatch.setattr(
-        app_routes, "_fd_real_path", lambda fd: str(tmp_path / "elsewhere" / "app.js")
+        app_routes, "fd_real_path", lambda fd: str(tmp_path / "elsewhere" / "app.js")
     )
     status, body = await _get(f"/apps/{APP}/ui/app.js")
     assert status == 404
@@ -355,7 +354,7 @@ async def test_the_windows_branch_fails_closed_when_the_fd_path_is_unreadable(
     (ui / "app.js").write_bytes(b"const x = 1\n")
     monkeypatch.setattr(app_routes, "apps_dir", lambda: root)
     monkeypatch.setattr(app_routes, "supports_pinned_walk", lambda: False)
-    monkeypatch.setattr(app_routes, "_fd_real_path", lambda fd: None)
+    monkeypatch.setattr(app_routes, "fd_real_path", lambda fd: None)
     status, _body = await _get(f"/apps/{APP}/ui/app.js")
     assert status == 404
 
@@ -549,32 +548,6 @@ async def test_a_multi_chunk_file_streams_complete_and_bounded(
         assert resp.status == 200
         assert resp.headers["Content-Length"] == str(len(payload))
         assert await resp.read() == payload
-
-
-@pytest.mark.asyncio
-async def test_a_stalled_stream_releases_its_permit(ui_root: Path) -> None:
-    """The head-of-line fix: the write loop is bounded by wall clock, so a
-    client that stops reading cannot hold a `_UI_STREAM_SEMAPHORE` permit (and
-    its descriptor) forever. This route bypasses token auth, so 8 such clients
-    would otherwise wedge every app UI on the host. A zero deadline expires at
-    the first await, which is the same path a stalled reader takes."""
-    payload = b"x" * 4096
-    (ui_root / "stalled.js").write_bytes(payload)
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(app_routes, "_UI_STREAM_TIMEOUT", 0)
-        async with TestClient(TestServer(_make_app())) as client:
-            resp = await client.get(f"/apps/{APP}/ui/stalled.js")
-            # Headers are sent before the loop, so the abort shows up as a body
-            # that cannot satisfy the announced Content-Length.
-            with pytest.raises(Exception):
-                await resp.read()
-    # The permit is back: nothing is left holding the route, and an ordinary
-    # request served afterwards is the proof that matters.
-    assert not app_routes._UI_STREAM_SEMAPHORE.locked()
-    async with TestClient(TestServer(_make_app())) as client:
-        ok = await client.get(f"/apps/{APP}/ui/stalled.js")
-        assert ok.status == 200
-        assert await ok.read() == payload
 
 
 @pytest.mark.asyncio

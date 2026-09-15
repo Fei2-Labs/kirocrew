@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -14,7 +15,12 @@ from kiro_crew.auth.login.portal import (
     exchange_code,
 )
 from kiro_crew.auth.provider import KasAuthProvider, NotAuthenticated
-from kiro_crew.auth.refresh import RefreshError, ensure_fresh
+from kiro_crew.auth.refresh import (
+    IdentitySignedOut,
+    RefreshError,
+    RefreshRejected,
+    ensure_fresh,
+)
 from kiro_crew.auth.store import KasToken, SocialProvider, TokenStore
 
 pytestmark = pytest.mark.asyncio
@@ -271,6 +277,7 @@ async def test_refresh_no_refresh_token_raises(tmp_path: Path):
         refresh_token=None,
         profile_arn="arn:x",
     )
+    store.save(tok)
     with pytest.raises(RefreshError, match="no refresh token"):
         await ensure_fresh(store, tok, session=_FakeSession([]))
 
@@ -284,6 +291,7 @@ async def test_refresh_sso_oidc_needs_client_creds(tmp_path: Path):
         identity="builder_id",
         refresh_token="r",
     )  # no client_id/secret
+    store.save(tok)
     with pytest.raises(RefreshError, match="client credentials"):
         await ensure_fresh(store, tok, session=_FakeSession([]))
 
@@ -315,6 +323,7 @@ async def test_refresh_sso_oidc_http_error_raises(tmp_path: Path):
         provider="Enterprise",
         identity="identity_center",
         refresh_token="rt",
+        profile_arn="arn:x",  # an IdC entry without one is dropped by store.load
         region="us-east-1",
         client_id="cid",
         client_secret="csec",
@@ -355,6 +364,7 @@ async def test_refresh_external_idp_needs_token_endpoint(tmp_path: Path):
         identity="external_idp",
         refresh_token="rt",
     )  # no token_endpoint
+    store.save(stale)
     with pytest.raises(RefreshError, match="token endpoint"):
         await ensure_fresh(store, stale, session=_FakeSession([]))
 
@@ -398,6 +408,137 @@ async def test_concurrent_ensure_fresh_serializes_single_flight(tmp_path: Path):
     assert calls["n"] == 1
 
 
+async def test_logout_before_refresh_does_not_resurrect_the_token(tmp_path: Path):
+    """A stale token handed to ensure_fresh whose identity is absent from the
+    store is NOT refreshed and NOT re-persisted: the in-lock re-read finds nothing
+    and the refresh stops. This is the delete-then-refresh half of the logout race."""
+    store = TokenStore(tmp_path)
+    stale = _fresh("social", "Google", ttl=10)
+    store.save(stale)
+    store.delete("social")  # logout landed first
+
+    session = _FakeSession([])  # any HTTP call would IndexError
+    with pytest.raises(IdentitySignedOut):
+        await ensure_fresh(store, stale, session=session)
+    assert store.load("social") is None
+    assert session.calls == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="contention timing assumes POSIX flock")
+async def test_logout_during_refresh_leaves_no_token_behind(tmp_path: Path):
+    """The refresh-then-delete half: a logout that arrives while a refresh holds
+    the lock across its HTTP round-trip waits for the save, then deletes it, so
+    the vault ends empty and the logout's success is true."""
+    import asyncio
+
+    store = TokenStore(tmp_path)
+    stale = _fresh("social", "Google", ttl=10)
+    store.save(stale)
+
+    in_http = asyncio.Event()
+    release_http = asyncio.Event()
+
+    class _SlowResp(_FakeResp):
+        async def __aenter__(self):
+            in_http.set()
+            await release_http.wait()
+            return self
+
+    session = _FakeSession(
+        [
+            _SlowResp(
+                200,
+                {
+                    "accessToken": "new-at",
+                    "refreshToken": "new-rt",
+                    "expiresIn": 3600,
+                    "profileArn": "arn:x",
+                },
+            )
+        ]
+    )
+    refresh = asyncio.ensure_future(ensure_fresh(store, stale, session=session))
+    await in_http.wait()
+    # Logout while the refresher holds the lock: delete must block until the
+    # refresher has saved, then remove what it saved.
+    logout = asyncio.ensure_future(asyncio.to_thread(store.delete, "social"))
+    await asyncio.sleep(0.05)
+    assert not logout.done(), "delete must wait for the in-flight refresh"
+    release_http.set()
+    refreshed = await refresh
+    await logout
+    assert refreshed.access_token == "new-at"
+    assert store.load("social") is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="contention timing assumes POSIX flock")
+async def test_account_switch_during_refresh_is_not_overwritten(tmp_path: Path):
+    """A sign-in that lands a different account in the slot while a refresh of the
+    old one is in flight waits for the refresher's save and then replaces it, so
+    the vault ends on the account the operator just chose -- never on a renewed
+    copy of the one they left."""
+    import asyncio
+
+    store = TokenStore(tmp_path)
+    stale = _fresh("social", "Google", ttl=10)
+    store.save(stale)
+
+    in_http = asyncio.Event()
+    release_http = asyncio.Event()
+
+    class _SlowResp(_FakeResp):
+        async def __aenter__(self):
+            in_http.set()
+            await release_http.wait()
+            return self
+
+    session = _FakeSession(
+        [
+            _SlowResp(
+                200,
+                {
+                    "accessToken": "renewed-old",
+                    "refreshToken": "rt-old-2",
+                    "expiresIn": 3600,
+                    "profileArn": "arn:x",
+                },
+            )
+        ]
+    )
+    refresh = asyncio.ensure_future(ensure_fresh(store, stale, session=session))
+    await in_http.wait()
+    new_account = _fresh("social", "Github", ttl=3600, profile="arn:new")
+    login = asyncio.ensure_future(asyncio.to_thread(store.save, new_account))
+    await asyncio.sleep(0.05)
+    assert not login.done(), "the sign-in save must wait for the in-flight refresh"
+    release_http.set()
+    await refresh
+    await login
+    kept = store.load("social")
+    assert kept is not None
+    assert kept.provider == "Github" and kept.profile_arn == "arn:new"
+
+
+async def test_provider_maps_signed_out_during_refresh_to_not_authenticated(tmp_path: Path):
+    """What the KAS callback sees: a sign-out that raced the refresh reads as
+    'not signed in', the same verdict as an empty vault."""
+    store = TokenStore(tmp_path)
+    stale = _fresh("social", "Google", ttl=10)
+    store.save(stale)
+    provider = KasAuthProvider(store, session=_FakeSession([]))
+
+    real_resolve = store.resolve
+
+    def resolve_then_logout():
+        token = real_resolve()
+        store.delete("social")
+        return token
+
+    store.resolve = resolve_then_logout  # type: ignore[method-assign]
+    with pytest.raises(NotAuthenticated):
+        await provider.current()
+
+
 # ---- KasAuthProvider -----------------------------------------------------------
 
 
@@ -416,6 +557,18 @@ async def test_provider_env_api_key_bypass(tmp_path: Path, monkeypatch):
     tok = await provider.current()
     assert tok.access_token == "sk-test"
     assert tok.provider == "ApiKey"
+
+
+async def test_provider_env_api_key_bypass_can_be_disabled(tmp_path: Path, monkeypatch):
+    """A vault-only consumer (the relay callback) opts out: an ambient key is
+    neither an identity nor authentication, and an empty vault stays empty."""
+    monkeypatch.setenv("KIRO_API_KEY", "sk-test")
+    provider = KasAuthProvider(
+        TokenStore(tmp_path), session=_FakeSession([]), allow_env_api_key=False
+    )
+    assert provider.is_authenticated() is False
+    with pytest.raises(NotAuthenticated):
+        await provider.current()
 
 
 async def test_provider_callback_shape(tmp_path: Path, monkeypatch):
@@ -450,3 +603,75 @@ async def test_provider_resolve_request_credential(tmp_path: Path, monkeypatch):
     provider = KasAuthProvider(store, session=_FakeSession([]))
     cred = await provider.resolve_request_credential()
     assert cred == {"accessToken": "at-social", "profileArn": "arn:x", "provider": "Google"}
+
+
+# ---- issuer refusal is recorded, transient failure is not ------------------------
+
+
+async def test_refresh_rejected_by_issuer_is_recorded_on_the_store(tmp_path: Path):
+    """A 4xx from the issuer is a REFUSAL of the grant: RefreshRejected, and the
+    store carries the marker the dashboard card and doctor read. The token in
+    the vault is untouched -- nothing here demotes or deletes the identity."""
+    store = TokenStore(tmp_path)
+    stale = _fresh("social", "Google", ttl=10)
+    store.save(stale)
+    assert store.refresh_rejected("social") is None
+    with pytest.raises(RefreshRejected, match="social refresh failed: HTTP 401"):
+        await ensure_fresh(store, stale, session=_FakeSession([_FakeResp(401, "invalid_grant")]))
+    when = store.refresh_rejected("social")
+    assert when is not None
+    assert when.tzinfo is not None
+    assert datetime.now(timezone.utc) - when < timedelta(minutes=1)
+    # Still stored, still the same credential: a refusal is reported, not acted on.
+    assert store.load("social").access_token == stale.access_token
+    # RefreshRejected is still a RefreshError, so every existing handler keeps working.
+    assert issubclass(RefreshRejected, RefreshError)
+
+
+async def test_refresh_transient_failure_is_not_recorded(tmp_path: Path):
+    """A 5xx means "try later", not "the grant is dead": plain RefreshError, no marker."""
+    store = TokenStore(tmp_path)
+    stale = _fresh("social", "Google", ttl=10)
+    store.save(stale)
+    with pytest.raises(RefreshError) as excinfo:
+        await ensure_fresh(store, stale, session=_FakeSession([_FakeResp(503, "busy")]))
+    assert not isinstance(excinfo.value, RefreshRejected)
+    assert store.refresh_rejected("social") is None
+
+
+async def test_successful_refresh_after_rejection_clears_the_marker(tmp_path: Path):
+    """The refresher's own save goes through TokenStore.save, which clears the marker:
+    a grant the issuer honours again (or a fresh sign-in) stops reading as 'expired'."""
+    store = TokenStore(tmp_path)
+    stale = _fresh("social", "Google", ttl=10)
+    store.save(stale)
+    store.mark_refresh_rejected("social")
+    assert store.refresh_rejected("social") is not None
+    session = _FakeSession(
+        [
+            _FakeResp(
+                200,
+                {
+                    "accessToken": "new-at",
+                    "refreshToken": "new-rt",
+                    "expiresIn": 3600,
+                    "profileArn": "arn:x",
+                },
+            )
+        ]
+    )
+    out = await ensure_fresh(store, stale, session=session)
+    assert out.access_token == "new-at"
+    assert store.refresh_rejected("social") is None
+
+
+async def test_provider_maps_rejection_to_the_same_failure_as_before(tmp_path: Path):
+    """KasAuthProvider.current still raises the refresh error (the KAS callback
+    turns it into the engine's sign-in prompt); the marker is a side record."""
+    store = TokenStore(tmp_path)
+    stale = _fresh("social", "Google", ttl=10)
+    store.save(stale)
+    provider = KasAuthProvider(store, session=_FakeSession([_FakeResp(400, "invalid_grant")]))
+    with pytest.raises(RefreshRejected):
+        await provider.current()
+    assert store.refresh_rejected("social") is not None

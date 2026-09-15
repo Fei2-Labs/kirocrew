@@ -197,7 +197,7 @@ def _descriptor_payload(
             missing_components = list(install_row.get("missing_components") or [])
             restart_required = bool(install_row.get("restart_required"))
         install_command = str(install_row.get("install_command") or "") or install_command
-    return {
+    payload = {
         "id": descriptor.id,
         # The kiro backend's id is "" in code, so it cannot be its own wire
         # name. An unregistered id falls back to itself rather than to "", so a
@@ -216,6 +216,11 @@ def _descriptor_payload(
         "missing_components": missing_components,
         "restart_required": restart_required,
     }
+    # Sign-in is the harness's own third fact (``agent_sdk.host_auth``), carried
+    # by the snapshot row; only present when the machine half was consulted.
+    if install_row is not None and install_row.get("auth") is not None:
+        payload["auth"] = install_row["auth"]
+    return payload
 
 
 def _active_state(

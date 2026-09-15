@@ -30,13 +30,56 @@ with the theme CSS custom properties or Tailwind classes mapped to them,
 <div className="bg-[var(--card)] text-[var(--card-fg)]" />
 ```
 
-The 54 CSS variables are the single source of truth for color. They are the
+The 56 CSS variables are the single source of truth for color. They are the
 customization surface a theme (built-in, custom, or installed) can set.
+
+**Fills are flat.** The brand system is flat: a new decorative gradient fill
+(`linear-`, `radial-`, or `conic-gradient` used as a background or surface
+color) on chrome, a dialog, or an exported image such as a share card is a UX
+review finding. A fill is one solid token, or the brand purple `#7c3aed` on an
+outward-facing artifact. "Looks premium" is not an exception; a gradient also
+bands under every social platform's re-encode. Functional gradients are not
+fills and are fine: `mask-image` scroll-edge fades, loading shimmer, and the
+streaming glow. So are the shipped gradient mechanisms — the appstore gradient
+art in `components/appstore/gradient.ts` (which reads as content, not chrome)
+and the session `'gradient'` color mode. The UX review lane
+(`.github/workflows/ux-review.yml` and its fork variant) applies this rule.
 Theme blocks in `index.css` also set a few non-color properties that are
 deliberately NOT on the allowlist: the font tokens (`--font-body`, `--mono`)
 and radii are injected as fixed defaults by `buildCustomThemeCss` (fonts are a
 pack-level L1 surface, not per-color-mode data), and the `--search-highlight*`
 trio is an internal find-in-page surface not exposed to theme packs.
+
+**`buildCustomThemeCss` also fills the allowlisted colors a pack OMITS.** Fonts
+and radii are not the only thing it emits. Because `variables.json` requires only
+`--bg`, `--text` and `--accent`, a valid pack can leave ~50 tokens unset, and an
+unset token inherits from the bare `:root` in `index.css` — which carries the DARK
+palette and has no light counterpart. A pack with a light `--bg` would therefore
+paint dark-mode surfaces under its own light palette. So the builder derives the
+gap from the pack's own palette: surfaces and borders as small steps from `--bg`
+toward `--text`, the muted ramp at 75/85% of that axis, a foreground on a
+saturated fill picked black-or-white by that fill's luminance, and the designed
+syntax/diff sets taken from the built-in theme of the matching polarity. Only
+omitted tokens are filled, so a declared value always wins, and only
+`[data-theme="custom-*"]` selectors are written, so no built-in palette moves.
+The author-facing detail lives in the `theme-pack-authoring` skill.
+
+**A card must carry its own edge.** `--card` is not guaranteed to differ from
+`--bg`: in `kiro-light` both are `#ffffff`, because the canvas is white and the
+shell (nav rail, sessions list) steps back onto `--panel` instead. So a `bg-card`
+surface that sits directly on the page and has no `border`, `ring`, or `shadow`
+paints nothing visible there — it "works" in every other theme and ships invisible
+in that one, with no gate failing. The rule for a new component: a `bg-card` box on
+`--bg` gets a `border-border`, a `ring-1 ring-border`, or a `shadow-*`, the way the
+top-bar search field and the settings cards already do. The three surfaces that
+deliberately stay borderless (the user bubble, the two top-bar capsules) are
+handled by kiro-light-scoped hooks in `index.css`, and
+`src/test/kiroLightShellHooks.test.ts` pins that list; a new borderless card is a
+fourth hook there, not an unmarked exception. The inverse holds too: a `bg-bg`
+well nested inside a `bg-card` container is the same pair of values seen from the
+other side, so a code or output block that relies on the well being darker than its
+card gets the same `border-border` — and a `hover:bg-card` on a row that sits on
+the page is not a hover at all in this theme; hover states use `bg-bg-hover`.
 
 ## Adding a new color role
 
@@ -68,17 +111,90 @@ allowlist), which is exactly why the corpus pins both verdicts.
 references no token that does not exist. A `var(--nope, #16213e)` fallback would
 otherwise always win and silently ignore the active theme.
 
+**The MCP App surface is a consumer of this token set.**
+`src/lib/mcpAppTheme.ts` maps the tokens onto SEP-1865's `McpUiStyleVariableKey`
+set and hands them to a null-origin app iframe as `hostContext.styles.variables`
+(the theming handoff, spec'd in
+[`docs/system-specs/modules/mcp-apps.md`](../../docs/system-specs/modules/mcp-apps.md)).
+So renaming a color role reaches this map too: `mcpAppTheme.test.ts` parses
+`ALLOWED_CSS_VARS` out of `themeCss.ts` and asserts every `--color-*` source in
+`COLOR_TOKEN_MAP` is a member, so a rename that misses the map fails a test rather
+than silently un-theming apps. Two reads there are **not** allowlisted tokens and
+are deliberate: `--font-body` (feeding `--font-sans`) and `--mono` (feeding
+`--font-mono`) are read as the host-fixed font defaults `buildCustomThemeCss`
+injects, so an installed pack's faces reach the app; they are the same host-fixed
+defaults called out above, not a theme-customizable per-color surface.
+
+**The four status roles map symmetrically**, and that is load-bearing. Every
+`--color-background-{info,success,warning,danger}` gets the `-subtle` wash; every
+`--color-text-*` / `--color-border-*` / `--color-ring-*` gets the strong hue. That
+keeps both pairings an app can build legible — strong hue on its own wash, and
+strong hue on `--color-background-primary`. A `-fg` token (`--info-fg`,
+`--danger-fg`, …) is the ink for a SOLID fill and is `#000` in most themes, so it
+never belongs on a `--color-text-*` key: `--color-text-info` read `--info-fg` once
+and rendered black-on-dark in every dark theme.
+
+**Reading resolved tokens: key the read on `themeVersion` ALONE.** Anything that
+resolves tokens off `document.documentElement` (`getComputedStyle`, i.e.
+`readThemeVars` / `readMcpAppStyleVariables`) must memoize on
+`useTheme().themeVersion` and **not** on `theme` / `colorTheme`. Those two change
+during RENDER, while `applyTheme` writes `data-theme` in a `ThemeProvider`
+effect — and React flushes child effects before parent ones, so a read keyed on
+them resolves the OUTGOING palette one commit early. `themeVersion` is bumped by
+the same effect that writes the attribute, so a read keyed on it sees the palette
+that mode actually renders. Where a mode NAME travels beside the palette, keep
+both in one memoized value so they cannot be read independently
+(`McpAppFrame`'s `themeSnapshot`).
+
+Six sites still key on the three-dep spelling and are **not** fixed here — find
+them with `grep -rn '\[theme, colorTheme, themeVersion\]' src/`, which lists
+`components/WidgetFrame.tsx`, `components/ArtifactBody.tsx`,
+`components/library/ArtifactThumbs.tsx`, `pages/ArtifactDetailPage.tsx` and
+`pages/RemoteArtifactDetailPage.tsx`, plus `hooks/useSessionPalette.ts` (a
+`useLayoutEffect` on `[themeMode, colorTheme, themeVersion]`, same ordering). A
+grep rather than line numbers on purpose: a cited line goes stale silently, and
+the dep array IS the defect, so the pattern is the honest locator. Each takes an
+extra early read that the `themeVersion` re-read then corrects, and none pairs a
+mode name into a wire payload, so the residue is a transient frame rather than a
+stuck value — which is why they are recorded here rather than changed in a PR
+about MCP apps. Do not copy the three-dep spelling into a new site.
+
+**Where each wash comes from is not symmetric, and follows the dashboard.**
+`--ok-subtle`, `--warn-subtle` and `--danger-subtle` are stored per theme and are
+read directly. `--info` has no stored companion in the 56 — `bg-info-subtle` is
+derived in `tailwind.config.js` as
+`color-mix(in srgb, var(--info) 12%, transparent)` — so `COLOR_TOKEN_MAP` derives
+`--color-background-info` the same way, from `INFO_WASH` of the resolved
+`--info`, rather than adding a 57th variable to the customization surface. One
+wash, one definition: an app's info fill and the dashboard's own
+`bg-info-subtle` surfaces cannot drift into two visibly different washes of one
+hue, and `mcpAppTheme.test.ts` parses `tailwind.config.js` to keep the two
+percentages equal. A pack that wants a different info wash retunes `--info`,
+which moves both. Adding the stored token later is still open — the customization
+surface only ever grows safely, because a pack install REJECTS unknown keys and so
+cannot shrink.
+
 ## What is / isn't customizable
 
 | Tier | Surface |
 |---|---|
-| **L0 Color** | the 54 CSS vars (dark + light) |
+| **L0 Color** | the 56 CSS vars (dark + light) |
 | **L1 Brand** | logo, favicon, wordmark, botName, fonts, scoped `overrides.css` |
 | **L2 Experience** | sandboxed overlays, topbar, audio, persona |
 
 Out of contract: app structure/routing, functional-control behavior, security
 chrome, and anything outside the CSS-var set + the `overrides.css` selector
 allowlist.
+
+**L2 overlay stacking.** A pack's `assets.overlays` render inside the dashboard
+shell's own stacking context, strictly below the top bar (`OVERLAY_Z_MAX` in
+`src/lib/themeDecorLayer.ts`, derived from the header's z-indexes), whatever
+`zIndex` the manifest asks for — so a `fullscreen` overlay decorates the chat
+surface but never paints over the header's controls (#7377). The `topbar` asset
+is the opposite by design: it is branding laid OVER the header strip and stays
+above it. The `body::before` / `body::after` idiom in `overrides.css` is not
+covered by this rule: it paints at the document root and therefore over the
+whole shell, header included.
 
 ## Brand identity
 
@@ -166,7 +282,7 @@ rule aimed at anything else never reaches the document.
 | Class | Where it is applied |
 |---|---|
 | `topbar` | the header shell (`App.tsx`) |
-| `sidebar` | the chat session list (`ChatSidebar.tsx`) |
+| `sidebar` | the conversation-list cards: the chat session list (`ChatSidebar.tsx`) and the Crew Members roster (`members/MembersPage.tsx`), both via `LIST_SHELL_CLS` in `components/listShell.ts` |
 | `chat-container` | the chat scroll region (`ChatPane.tsx`, `ChatPage.tsx`) |
 | `message-bubble` | a user or assistant turn (`chat/UserMessage.tsx`, `chat/AssistantMessage.tsx`) |
 | `input-area` | the composer (`ChatInput.tsx`) |
@@ -319,6 +435,28 @@ because swapping an icon changes the rendered component type and remounts its
 element, and animating the icon itself would restart that animation and desync it
 from the other layer. If your loader swaps artwork on a timer, animate a stable
 wrapper for the same reason.
+
+### Installed packs: custom loader art
+
+`registerThemeBranding()` is compiled-theme only. An **installed pack** (a
+`theme.json` dropped in via Settings) reaches the loader through **files**, not
+code:
+
+- **`loaderIcons`** — the allowlisted stock symbols (Level 1), as above.
+- **`loader/*.png` `.webp` `.gif` `.svg`** — ship your **own images** (Level 1).
+  Ship **one** and it renders on its own; ship **2–8** and the stock carousel
+  cycles them. Animated WebP/APNG/GIF and animated SVG **self-animate** inside
+  the `<img>`, so a single fully-authored loop is a first-class loader. Ordered
+  by filename; each is served with a strict Content-Type + `nosniff` under the
+  sandboxed asset CSP (`default-src 'none'; sandbox`), referenced only as an
+  `<img>`. SVG is safe here for the same reason `logo.svg` is: an `<img>`-loaded
+  SVG runs in the browser's **secure static/animated mode** — scripts disabled,
+  external references not fetched — so it cannot run code or beacon out, while
+  its SMIL/CSS animation still plays. A count outside 1–8 fails install.
+
+Precedence, highest first: compiled `loader` → pack `loader/*` images (one on its
+own, 2–8 cycled) → `loaderIcons` (pack manifest, then compiled) → the default
+mascot pool.
 
 Registration is read at module load (see `src/extensions.ts`); registering after
 the shell has rendered does not take effect until the next theme switch.

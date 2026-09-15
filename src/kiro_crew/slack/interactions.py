@@ -104,20 +104,17 @@ _FENCE_MARKER_RE = re.compile(
     r"-{0,}\s*(?:UNTRUSTED FORWARDED CONTENT|CONTEXT ENTRY)\s+(?:BEGIN|END)\s*-{0,}",
     re.IGNORECASE,
 )
+_FENCE_MARKER_NEUTRALIZED = "[removed embedded fence marker]"
 
 
 def _neutralize_fence_markers(text: str) -> str:
-    """Strip any embedded quarantine/context fence markers from untrusted text.
+    """Neutralize Unicode-normalized forwarded/context fence variants."""
+    # Local import avoids the context -> Slack handler import cycle during
+    # module initialization; interaction handlers run only after startup.
+    from kiro_crew.context import _apply_marker_spans, _marker_spans
 
-    The forwarded body is authored by an arbitrary third party (possibly
-    external via Slack-Connect). If it contains a literal ``--- UNTRUSTED
-    FORWARDED CONTENT END ---`` (or a CONTEXT ENTRY marker), interpolating it
-    between the real fence markers would let the attacker's trailing text break
-    out of the quarantine and land in the trusted first-party region of the
-    prompt. Replace any such marker phrase with a defanged placeholder so the
-    boundary the model relies on cannot be forged from within the content.
-    """
-    return _FENCE_MARKER_RE.sub("[removed embedded fence marker]", text)
+    spans = _marker_spans(text, (_FENCE_MARKER_RE,))
+    return _apply_marker_spans(text, spans, _FENCE_MARKER_NEUTRALIZED)
 
 
 # Module-level orchestrator reference — set by ``init()``.
@@ -326,9 +323,11 @@ async def ack_button(payload: dict, channel: str, msg_ts: str) -> None:
 
 def _get_forward_callback() -> str:
     """Return the configured forward-to-agent callback ID, or empty if disabled."""
-    if not _orch or not _orch._cfg:
+    if not _orch:
         return ""
-    return _orch._cfg.slack.forward_to_agent_callback
+    from kiro_crew.slack.handler import slack_cfg
+
+    return slack_cfg(_orch).slack.forward_to_agent_callback
 
 
 async def _handle_message_shortcut(payload: dict) -> None:
@@ -1047,13 +1046,14 @@ async def _refresh_channels_modal(view_id: str) -> None:
     if not _orch or not _orch.slack:
         return
     from kiro_crew.slack.blocks import channels_modal
+    from kiro_crew.slack.handler import slack_cfg
 
     current_ids = sorted(_orch._tracking_channels)
     channels = [
         {
             "channel_id": cid,
-            "activation": _orch._cfg.channel_config(cid).activation,
-            "agent": _orch._cfg.channel_config(cid).agent,
+            "activation": slack_cfg(_orch).channel_config(cid).activation,
+            "agent": slack_cfg(_orch).channel_config(cid).agent,
         }
         for cid in current_ids
     ]
@@ -1079,9 +1079,12 @@ async def _handle_ch_activation(payload: dict, action: dict) -> None:
 
     await run_config_write(_persist_channel_config, cid, activation=new_mode)
     if _orch:
-        from kiro_crew.config.loader import KiroCrewConfig
+        # In place, never a rebind: ``_orch._cfg`` is the object the handler
+        # module and every dispatcher hold, so rebinding it here would leave
+        # them on the stale one.
+        from kiro_crew.slack.handler import _reload_orch_cfg
 
-        _orch._cfg = KiroCrewConfig.load()
+        _reload_orch_cfg()
     sel().log_api_access(
         caller=caller,
         operation="slack.channel_activation_change",
@@ -1107,9 +1110,12 @@ async def _handle_ch_agent(payload: dict, action: dict) -> None:
 
     await run_config_write(_persist_channel_config, cid, agent=new_agent)
     if _orch:
-        from kiro_crew.config.loader import KiroCrewConfig
+        # In place, never a rebind: ``_orch._cfg`` is the object the handler
+        # module and every dispatcher hold, so rebinding it here would leave
+        # them on the stale one.
+        from kiro_crew.slack.handler import _reload_orch_cfg
 
-        _orch._cfg = KiroCrewConfig.load()
+        _reload_orch_cfg()
     logger.info("Channel %s agent changed to %s", cid, new_agent or "default")
     sel().log_api_access(
         caller=caller,

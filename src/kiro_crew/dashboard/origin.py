@@ -31,8 +31,7 @@ import socket  # noqa: F401
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-# Re-exported for backwards compatibility — every name that used to be defined
-# in this module is still importable from it.
+# Re-exported so every name this module owns stays importable from it.
 from kiro_crew.dashboard.urls import (  # noqa: F401
     _BIND_ALL,
     _BIND_LOCAL,
@@ -133,12 +132,11 @@ def is_proxied_request(request: web.Request) -> bool:
       bridge, a LAN jump host) in front of a widened bind
       (``KIROCREW_BIND``), which presents a NON-loopback peer.
 
-    An earlier version of this predicate required a loopback peer, on the
-    premise that a non-loopback peer is the client itself. That premise is only
-    true when no upstream proxy exists — with one, the non-loopback peer is the
-    proxy and the address is just as shared. Scoping to loopback therefore
-    reported the second shape as per-client, reproducing exactly the untrue
-    claim this predicate was added to remove.
+    Requiring a loopback peer would be wrong: that rests on the premise that a
+    non-loopback peer is the client itself, which holds only when no upstream
+    proxy exists — with one, the non-loopback peer is the proxy and the address
+    is just as shared. Scoping to loopback therefore reports the second shape as
+    per-client, which is the untrue claim this predicate exists to remove.
 
     Accepted trade-off, stated because it is a deliberate direction: a client
     that sends a forwarding header with no proxy in the path (a transparent
@@ -374,7 +372,7 @@ def frame_ancestors_value(extra: "Iterable[str]" = ()) -> str:
       rewrites ``Host`` to the loopback backend and may not forward
       ``X-Forwarded-Proto``: the header then names ``http://localhost:<port>`` while
       the browser is on ``https://<tunnel-host>``, no ancestor matches, and the frame
-      is refused. That regression is invisible on a direct loopback connection.
+      is refused — a breakage invisible on a direct loopback connection.
     * **``'self'`` alone is not enough, because the directive is matched against
       EVERY ancestor.** Kiro Crew frames at depth: the Instances embed puts a remote
       dashboard inside the local one, so a widget sits three levels down (local

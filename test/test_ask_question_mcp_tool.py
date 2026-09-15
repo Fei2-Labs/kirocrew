@@ -1,6 +1,6 @@
-"""Contract tests for the stateless ``ask_question`` MCP tool (issue #755).
+"""Contract tests for the stateless ``ask_question`` MCP tool.
 
-``ask_question`` no longer resolves a user-scoped token or blocks on a
+``ask_question`` does not resolve a user-scoped token or block on a
 server-side HTTP round-trip. It VALIDATES its arguments and returns a session
 DIRECTIVE — a human confirmation plus an opaque marker carrying the validated
 questions (and NO session key). The session-aware consumer
@@ -20,10 +20,9 @@ The tests split along that seam:
   the slot's key, that the confirmation tells the model to END its turn, and
   that a no-client post steers the model to ask in plain text instead.
 
-The former mock-dashboard HTTP server, the ``_post_user`` user-token handshake,
-the socket-timeout margin, and the answered/timeout/error round-trip tests are
-gone: that logic no longer exists — the tool is stateless and the card is posted
-in-process by the applier.
+The tool is stateless: there is no mock-dashboard HTTP server, no ``_post_user``
+user-token handshake, no socket-timeout margin, and no answered/timeout/error
+round-trip test, because the card is posted in-process by the applier.
 """
 
 from __future__ import annotations
@@ -66,12 +65,18 @@ def default_install(monkeypatch):
 # ── Tool contract ─────────────────────────────────────────────────────────────
 
 
-def test_ask_question_returns_directive_with_validated_questions(default_install):
+def test_ask_question_returns_directive_with_validated_questions(default_install, gateway_posts):
     """A valid call on a default install returns a directive that decodes to the
     validated questions payload — no session key, no HTTP round-trip."""
-    result = _call_tool_inner("ask_question", {"questions": QUESTIONS})
+    result = _call_tool("ask_question", {"questions": QUESTIONS})
     args = session_directive.decode(result, "ask_question")
     assert args == {"questions": _validated_questions()}
+    # BOTH halves of the delivery contract: the marker above, and the CALL
+    # reported out of band (tool + raw args) for the gateway to derive the same
+    # record from, for a consumer that never sees the marker.
+    assert gateway_posts == [
+        ("/api/session-directive", {"tool": "ask_question", "raw_args": {"questions": QUESTIONS}})
+    ]
 
 
 def test_ask_question_directive_confirmation_tells_the_model_to_end_its_turn(default_install):
@@ -81,7 +86,7 @@ def test_ask_question_directive_confirmation_tells_the_model_to_end_its_turn(def
     assert "end your turn" in result.lower()
 
 
-def test_non_dashboard_session_is_refused_with_options_hint(monkeypatch):
+def test_non_dashboard_session_is_refused_with_options_hint(monkeypatch, gateway_posts):
     """A non-empty, non-dashboard key (Slack/Discord) has no question card, so
     the tool steers to the [OPTIONS:] tag and emits NO directive."""
     monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "slack:C1")
@@ -90,6 +95,8 @@ def test_non_dashboard_session_is_refused_with_options_hint(monkeypatch):
     assert "[OPTIONS:" in result
     # It is a plain message, not a directive.
     assert session_directive.decode(result, "ask_question") is None
+    # A refusal must not publish: no marker, no parked record.
+    assert gateway_posts == []
 
 
 def test_questions_is_required(default_install):
@@ -120,7 +127,7 @@ def test_advertised_description_does_not_promise_a_blocking_result():
     """The description is what an agent reads BEFORE its first call, so it has to
     match the seam the rest of this file tests.
 
-    It used to say the tool would "BLOCK until they answer" and hand back the
+    It must not say the tool will "BLOCK until they answer" and hand back the
     answer "as this tool's result — no extra turn". Acting on that is the failure
     mode: the agent posts a card and then keeps working through the turn the
     answer can never arrive in, because delivery is the user's NEXT message.
@@ -148,9 +155,7 @@ def test_timeout_secs_is_not_advertised_but_is_still_accepted(default_install):
     assert "timeout_secs" not in spec["inputSchema"]["properties"]
     assert "timeout_secs" not in spec["description"]
 
-    result = _call_tool_inner(
-        "ask_question", {"questions": QUESTIONS, "timeout_secs": 60}
-    )
+    result = _call_tool_inner("ask_question", {"questions": QUESTIONS, "timeout_secs": 60})
     args = session_directive.decode(result, "ask_question")
     assert args == {"questions": _validated_questions()}
 
@@ -199,7 +204,10 @@ def test_applier_with_no_attached_client_steers_to_plain_text():
     slot = _FakeSlot()
     result = asyncio.run(
         apply_session_directive(
-            state, slot, "dashboard:chat-1-1700000000", "ask_question",
+            state,
+            slot,
+            "dashboard:chat-1-1700000000",
+            "ask_question",
             {"questions": _validated_questions()},
         )
     )

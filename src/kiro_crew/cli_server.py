@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import http.client
+import io
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -15,7 +18,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from pathlib import Path
+from typing import NoReturn
 
 from kiro_crew import __version__, dep_sync, fork_version, platform_compat
 from kiro_crew.beacon import distribution, is_default_home
@@ -44,6 +49,7 @@ from kiro_crew.embeddings import (
 )
 from kiro_crew.env import activate_mise
 from kiro_crew.frontend import build_frontend_sync, ensure_dev_dist_symlink
+from kiro_crew.gateway_lock import LockProbeError, lock_holder
 from kiro_crew.git_divergence import (
     UNREADABLE_UNPARSEABLE,
     DivergenceUnreadable,
@@ -323,8 +329,10 @@ _SHUTDOWN_RESPONSE_MAX_BYTES = 4096
 def _request_gateway_shutdown(port: int) -> bool:
     """Request graceful shutdown through the gateway's self-authenticating API.
 
-    This is the safe fallback when the platform listener lookup is available but
-    returns no pid. The request targets a fixed IPv4 loopback URL and presents
+    This is the safe fallback when the platform listener lookup returns no pid,
+    whether because nothing listens on TCP or because the lookup tool itself is
+    unavailable -- the request needs no port tool. The request targets a fixed
+    IPv4 loopback URL and presents
     the per-generation local secret; the handler independently requires both
     loopback origin and a constant-time secret match before setting the same
     shutdown event as SIGTERM.
@@ -378,6 +386,26 @@ def _report_authenticated_shutdown(port: int) -> bool:
     return True
 
 
+#: Longest process basename ``_stop`` echoes to the operator's terminal.
+_MAX_ECHOED_NAME_LEN = 64
+
+
+def _terminal_safe_name(name: str) -> str:
+    """Reduce an untrusted process name to characters safe to print.
+
+    The name comes from another process's own ``argv[0]``: any local process
+    can bind the gateway port and choose it, so it is attacker-producible text
+    headed for the operator's terminal. Every non-printable code point is dropped
+    -- C0/C1 controls (so ESC and BEL, which start and end ANSI SGR and OSC
+    sequences), and Unicode format characters -- and the result is capped, so a
+    crafted name can neither drive the terminal nor flood the line.
+    ``str.isprintable`` is the filter: it keeps letters, digits, punctuation and
+    ordinary spaces of every script and rejects the whole control and format
+    classes without enumerating escape grammars.
+    """
+    return "".join(ch for ch in name if ch.isprintable())[:_MAX_ECHOED_NAME_LEN]
+
+
 def _stop(cli_port: int | None = None) -> None:
     """Stop a running KiroCrew gateway.
 
@@ -400,6 +428,7 @@ def _stop(cli_port: int | None = None) -> None:
             resources=f"port={port} via=service",
         )
         print("✅ Stopped kirocrew service. To remove it: kirocrew service uninstall")
+        _stop_mcp_gateway_daemon()
         return
 
     # Cross-platform port -> listening PID lookup (lsof on POSIX, netstat -ano
@@ -408,6 +437,40 @@ def _stop(cli_port: int | None = None) -> None:
     pids = platform_compat.find_listening_pids(port)
 
     if not pids:
+        # Neither fallback below needs the port tool, so both run BEFORE the
+        # tool-absent exit: a live gateway is stopped through its API or its
+        # lock file whether or not `lsof`/`netstat` can be trusted, and the
+        # tool diagnostic is reserved for the case where nothing else found a
+        # gateway either. Graceful API first -- it signals no guessed pid.
+        if _report_authenticated_shutdown(port):
+            return
+        # The port probe found nothing, but the port probe is not how a gateway
+        # is actually kept single-instance — the gateway.lock flock is (see
+        # gateway_lock.py). A gateway bound to a unix socket only, or one whose
+        # listener the port probe missed, still holds that lock; refusing here
+        # would tell the operator "nothing running" the same turn `kirocrew
+        # gateway` refuses to start because the lock IS held. Fall back to the
+        # lock-owner oracle before giving up.
+        try:
+            holder = lock_holder(config_dir())
+        except LockProbeError as exc:
+            # Indeterminate is neither "free" nor "held": signalling the pid the
+            # file records could hit an unrelated process that reused the number.
+            sel().log_api_access(
+                caller="cli",
+                operation="gateway_stop",
+                outcome="denied",
+                source="cli",
+                resources=f"port={port} reason=lock_probe_indeterminate",
+            )
+            print(f"❌ {exc}. Not signalling anything; check the file and retry.")
+            sys.exit(1)
+        if holder.pid is not None and holder.alive:
+            # A live holder is never signalled from here, whoever it is: the
+            # lock proves a gateway is up, not that the pid it names is one
+            # this command may stop or has confirmed the state of. Name the
+            # holder and the manual step instead.
+            _refuse_lock_holder("gateway_stop", port, holder.pid)
         # Distinguish "lookup tool absent" from "genuinely no listener":
         # find_listening_pids folds a missing lsof into an empty list, so without
         # this a running gateway would be mis-reported as stopped (and _restart
@@ -441,8 +504,6 @@ def _stop(cli_port: int | None = None) -> None:
                     f"port {port}. Install {_tool} and retry."
                 )
             sys.exit(1)
-        if _report_authenticated_shutdown(port):
-            return
         sel().log_api_access(
             caller="cli",
             operation="gateway_stop",
@@ -456,16 +517,45 @@ def _stop(cli_port: int | None = None) -> None:
     # Only kill processes that are actually KiroCrew gateways.
     # Note: TOCTOU race exists between this check and the kill — the PID could be
     # recycled. Acceptable risk for an interactive CLI tool with low blast radius.
+    unrecognized = [p for p in pids if not _is_kirocrew_process(p)]
     pids = [p for p in pids if _is_kirocrew_process(p)]
     if not pids:
+        # Something holds the port, but nothing on it classifies as a Kiro Crew
+        # gateway. Reporting "no gateway running" here is misleading — the port
+        # is occupied — and it sends ``kirocrew restart`` on to spawn a
+        # replacement the KIROCREW_HOME lock then refuses. Name the pids and, when
+        # a cmdline is cheap to read, its basename, so the operator can see what
+        # actually holds the port (an unregistered wrapper module is the common
+        # case). Exit 1 with a distinct audit reason.
+        basenames: list[str] = []
+        for p in unrecognized:
+            cmdline = platform_compat.process_command_line(p)
+            if not cmdline:
+                continue
+            # Tokenize the way _args_look_like_kirocrew does: a quoted executable
+            # path ("C:\Program Files\...\python.exe") is one token, so its
+            # basename is reported rather than the fragment before the first space.
+            try:
+                tokens = shlex.split(cmdline, posix=not platform_compat.IS_WINDOWS)
+            except ValueError:
+                tokens = cmdline.split()
+            if tokens:
+                safe = _terminal_safe_name(_basename_stem(tokens[0]))
+                if safe:
+                    basenames.append(safe)
+        pid_list = ", ".join(str(p) for p in unrecognized)
+        detail = f" ({', '.join(basenames)})" if basenames else ""
         sel().log_api_access(
             caller="cli",
             operation="gateway_stop",
             outcome="no_target",
             source="cli",
-            resources=f"port={port} reason=no_kirocrew_process",
+            resources=f"port={port} reason=unrecognized_listener pids={unrecognized}",
         )
-        print(f"No Kiro Crew gateway currently running on port {port}.")
+        print(
+            f"Port {port} is held by pid {pid_list}{detail}, not recognised as a "
+            f"Kiro Crew gateway. Not stopping it."
+        )
         sys.exit(1)
 
     sent: set[int] = set()
@@ -516,6 +606,7 @@ def _stop(cli_port: int | None = None) -> None:
         )
         _verb = "Terminated" if platform_compat.IS_WINDOWS else "Sent SIGTERM to"
         print(f"✅ {_verb} gateway (pid {', '.join(str(p) for p in sorted(sent))}).")
+        _stop_mcp_gateway_daemon()
     if denied:
         sel().log_api_access(
             caller="cli",
@@ -538,6 +629,112 @@ def _stop(cli_port: int | None = None) -> None:
         )
         print(f"No Kiro Crew gateway currently running on port {port} (process already exited).")
         sys.exit(1)
+
+
+def _manual_stop_command(pid: int) -> str:
+    """The command an operator runs to stop *pid* by hand on this platform."""
+    if platform_compat.IS_WINDOWS:
+        return f"taskkill /PID {pid} /T"
+    return f"kill -TERM {pid}"
+
+
+def _refuse_if_lock_held(operation: str, port: int) -> None:
+    """Refuse *operation* unless ``gateway.lock`` is positively free.
+
+    A live holder is refused and named (:func:`_refuse_lock_holder`); an
+    indeterminate probe is refused too, since "free" is the one answer that
+    would let a second writer spawn. Returns only when the lock is free.
+    """
+    try:
+        holder = lock_holder(config_dir())
+    except LockProbeError as exc:
+        sel().log_api_access(
+            caller="cli",
+            operation=operation,
+            outcome="denied",
+            source="cli",
+            resources=f"port={port} reason=lock_probe_indeterminate",
+        )
+        print(f"❌ {exc}. Not signalling anything and not starting a replacement.")
+        sys.exit(1)
+    if holder.pid is not None and holder.alive:
+        _refuse_lock_holder(operation, port, holder.pid)
+
+
+def _refuse_lock_holder(operation: str, port: int, pid: int) -> NoReturn:
+    """Refuse *operation* because ``gateway.lock`` is held by the live *pid*.
+
+    Reached when the port lookup found nothing and the authenticated shutdown
+    got no answer, yet the lock says a gateway is up. The lock is the oracle
+    for "is something running" -- without it ``kirocrew stop`` and ``kirocrew
+    restart`` report "nothing running" the same moment ``kirocrew gateway``
+    refuses to start for a live pid. It is NOT a path to signal through: a
+    Kiro Crew holder that neither the port nor the API could reach is in a
+    state this command cannot verify, and a foreign holder is not this
+    command's to stop. Both are refused the same way -- one SEL ``denied``
+    event whose reason names the kind of holder, a refusal that names the
+    lock path, the pid and the exact manual command, exit 1 -- and nothing is
+    signalled.
+    """
+    kirocrew = _is_kirocrew_process(pid)
+    kind = "kirocrew" if kirocrew else "foreign"
+    sel().log_api_access(
+        caller="cli",
+        operation=operation,
+        outcome="denied",
+        source="cli",
+        resources=f"pids=[{pid}] port={port} reason=lock_holder_{kind}",
+    )
+    lock_path = config_dir() / "gateway.lock"
+    manual = _manual_stop_command(pid)
+    tail = "\n   Not starting a replacement." if operation == "gateway_restart" else ""
+    if kirocrew:
+        print(
+            f"❌ {lock_path} is held by pid {pid}: a Kiro Crew gateway is running, but "
+            f"the port lookup and the authenticated shutdown could not reach it, so it is "
+            f"not signalled from here.\n"
+            f"   To stop it manually, run: {manual}{tail}"
+        )
+    else:
+        print(
+            f"❌ {lock_path} is held by pid {pid}, but it does not look like a Kiro Crew "
+            f"gateway process — refusing to stop it. If this is wrong, stop it manually: "
+            f"{manual}{tail}"
+        )
+    sys.exit(1)
+
+
+def _stop_mcp_gateway_daemon() -> None:
+    """Take the MCP gateway daemon down with the gateway it served.
+
+    The daemon is a separate session leader, so the gateway's own SIGTERM never
+    reaches it; it exits on its own once its owner is gone (``--owner-pid``), but
+    that probe runs on an interval, and a ``kirocrew restart`` spawns the next
+    gateway inside that window -- which then finds a healthy daemon on the socket
+    and adopts it. A daemon adopted across a code change is how pooled MCP
+    backends kept speaking a wire shape the new gateway did not read. Stopping
+    it here, synchronously, means the replacement always spawns its own.
+
+    Best-effort: a stop that finds no daemon, or one this user may not signal,
+    is reported and never fails the command that called it.
+    """
+    try:
+        from kiro_crew.mcp_gateway.daemon_control import stop_daemon
+
+        outcome = stop_daemon()
+    except Exception:  # pragma: no cover - defensive; the stop already succeeded
+        logging.getLogger(__name__).debug("mcp gateway daemon stop failed", exc_info=True)
+        return
+    if outcome == "stopped":
+        print("✅ Stopped the MCP gateway daemon and its pooled MCP servers.")
+    elif outcome == "draining":
+        print("⏳ MCP gateway daemon is draining its pooled MCP servers; it exits on its own.")
+    elif outcome == "denied":
+        print(
+            "⚠️  No permission to stop the MCP gateway daemon; it exits once it sees its gateway is gone."
+        )
+    elif outcome == "unverified":
+        print("⚠️  Something other than gatewayd answers the MCP gateway socket; left it alone.")
 
 
 def _pid_exited(pid: int) -> bool:
@@ -579,6 +776,52 @@ def _wait_for_pids_exit(pids: list[int], timeout: float) -> list[int]:
         if not alive or time.monotonic() >= deadline:
             return alive
         time.sleep(0.1)
+
+
+def _incumbent_from_lock_holder(port: int, *, shutdown_acknowledged: bool) -> list[int]:
+    """Name the gateway :func:`_restart` must outwait when the port lookup cannot.
+
+    ``_stop`` has just run without naming a pid: with ``lsof``/``netstat``
+    unavailable the port lookup is blind, so ``_stop`` requests a graceful
+    shutdown over the authenticated API and returns. The incumbent is now
+    exiting but still owns ``gateway.lock`` until its teardown finishes.
+    Waiting on an empty pid list returns at once, and a replacement spawned at
+    that moment loses the lock race to the exiting incumbent, exits, and
+    leaves NO gateway once the incumbent is gone. The lock itself knows who
+    the incumbent is, so ask it and wait on that pid with the same timeout
+    ladder as the port-lookup path.
+
+    *shutdown_acknowledged* says whether ``_stop`` returned, i.e. a gateway
+    accepted the authenticated shutdown. Only then is a live Kiro Crew holder
+    the exiting incumbent, and only then is it returned as ``[holder_pid]`` to
+    be waited on. Returns ``[]`` when the lock is free or its recorded holder
+    is dead (nothing left to outwait). Every other live holder -- a foreign
+    process, or a Kiro Crew gateway that did not acknowledge the shutdown
+    (``_stop`` has already refused it) -- is refused through
+    :func:`_refuse_lock_holder` with a ``denied`` event: the lock names the
+    pid but never makes it safe to signal or to spawn against. An
+    indeterminate probe (:class:`LockProbeError`) refuses to spawn with the
+    existing indeterminate message: spawning against a lock whose holder
+    cannot be established is the exact no-gateway outcome this guard exists
+    to prevent.
+    """
+    try:
+        holder = lock_holder(config_dir())
+    except LockProbeError as exc:
+        sel().log_api_access(
+            caller="cli",
+            operation="gateway_restart",
+            outcome="denied",
+            source="cli",
+            resources=f"port={port} reason=lock_probe_indeterminate",
+        )
+        print(f"❌ {exc}. Not signalling anything and not starting a replacement.")
+        sys.exit(1)
+    if holder.pid is None or not holder.alive:
+        return []
+    if shutdown_acknowledged and _is_kirocrew_process(holder.pid):
+        return [holder.pid]
+    _refuse_lock_holder("gateway_restart", port, holder.pid)
 
 
 def _own_console_script() -> str | None:
@@ -958,8 +1201,10 @@ def _restart(cli_port: int | None = None) -> None:
     # Also enter _stop() when the lookup tool is absent: find_listening_pids()
     # returns [] both when nothing listens AND when lsof is missing, so guarding
     # only on a truthy result would skip the stop and double-spawn a second
-    # gateway on a lsof-less POSIX host. _stop() surfaces the distinct
-    # "lsof not found" diagnostic (and exits) in that case.
+    # gateway on a lsof-less POSIX host. _stop() tries the authenticated API
+    # and the lock-holder oracle first (neither needs the tool) and surfaces
+    # the distinct "lsof not found" diagnostic (and exits) only when both find
+    # nothing.
     #
     # Capture the incumbent pids HERE, before the stop, so we can wait for them
     # afterwards: the replacement must not start while the old gateway still owns
@@ -982,12 +1227,26 @@ def _restart(cli_port: int | None = None) -> None:
         # lookup. _stop() raises SystemExit(1) when it finds nothing — for restart
         # that's the wrong behavior. Swallow SystemExit so we always proceed to
         # spawn a fresh gateway. The user asked for a restart; an exit-before-spawn
-        # here would leave them with no running gateway at all.
+        # here would leave them with no running gateway at all. _stop() also
+        # exits when it REFUSES (a live lock holder it does not signal); that
+        # case is re-read from the lock below, so the swallow does not turn a
+        # refusal into a spawn.
+        stop_returned = False
         try:
             _stop(cli_port)
+            stop_returned = True
         except SystemExit:
             pass
         wait_for_incumbents = True
+        if not incumbents:
+            # The port lookup named nobody to wait for. If _stop returned, a
+            # gateway acknowledged the authenticated shutdown (the one path that
+            # returns without a pid) and is exiting while still owning
+            # gateway.lock; an empty wait returns at once and the replacement
+            # loses the lock race to it. Resolve the pid through the lock so
+            # the wait below is a real one. If _stop exited instead, a live
+            # holder means it refused, and restart refuses too.
+            incumbents = _incumbent_from_lock_holder(port, shutdown_acknowledged=stop_returned)
     elif _report_authenticated_shutdown(port):
         sel().log_api_access(
             caller="cli",
@@ -1003,6 +1262,32 @@ def _restart(cli_port: int | None = None) -> None:
             "kirocrew restart"
         )
         sys.exit(1)
+    else:
+        # The port probe found nothing, but that is not how single-instance is
+        # actually enforced (see the matching note in _stop): a gateway
+        # reachable only over a unix socket, or one the probe simply missed,
+        # still holds gateway.lock. Spawning a replacement here would have it
+        # cold-refused by that lock a moment later — exactly the split-brain
+        # `kirocrew stop`/`kirocrew restart` reporting "nothing running" while
+        # `kirocrew gateway` refuses for a live pid. Ask the lock-owner oracle;
+        # a live holder is refused and named, never signalled, so the operator
+        # stops it by hand and retries.
+        try:
+            holder = lock_holder(config_dir())
+        except LockProbeError as exc:
+            # Indeterminate: neither signal the recorded pid (it may name an
+            # unrelated process) nor spawn a replacement the lock may refuse.
+            sel().log_api_access(
+                caller="cli",
+                operation="gateway_restart",
+                outcome="denied",
+                source="cli",
+                resources=f"port={port} reason=lock_probe_indeterminate",
+            )
+            print(f"❌ {exc}. Not signalling anything and not starting a replacement.")
+            sys.exit(1)
+        if holder.pid is not None and holder.alive:
+            _refuse_lock_holder("gateway_restart", port, holder.pid)
 
     if wait_for_incumbents:
         alive = _wait_for_pids_exit(incumbents, _RESTART_STOP_TIMEOUT)
@@ -1027,6 +1312,13 @@ def _restart(cli_port: int | None = None) -> None:
                 f"   If the process is wedged, force it: kill -9 {pids}"
             )
             sys.exit(1)
+
+    # The incumbents are gone (or there were none), yet the lock is the oracle
+    # for "is something running": a child that inherited the descriptor keeps
+    # the flock alive after its parent's exit, and a replacement spawned into
+    # that lock is refused a moment later, reported here as success. Probe once
+    # more, right before the spawn, and refuse on a held or indeterminate lock.
+    _refuse_if_lock_held("gateway_restart", port)
 
     proc = _spawn_detached_gateway(port)
     pid = proc.pid
@@ -1203,10 +1495,39 @@ def _update(force: bool = False) -> None:
         print(f"  ❌ git fetch failed:\n{result.stderr.strip()}")
         sys.exit(1)
 
+    # Pin the fetched upstream to one commit. Every judgment below -- "already
+    # up to date", the divergence counts, the interpreter floor -- and the reset
+    # itself name this OID rather than origin/<branch>, so they all describe
+    # the same revision by construction: a fetch run concurrently from another
+    # terminal can move the name, never the pin. Spelled as the full
+    # remote-tracking ref: the short form is resolved with tags ahead of
+    # remotes, so a tag named `origin/<branch>` -- which a fetch auto-follows
+    # from the remote -- would otherwise be what every judgment and the reset
+    # took as the upstream.
+    try:
+        pin_result = subprocess.run(
+            ["git", "rev-parse", "--verify", f"refs/remotes/origin/{branch}^{{commit}}"],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            **UTF8_TEXT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git rev-parse timed out after %ss during update", exc.timeout
+        )
+        print(f"  ❌ Could not resolve origin/{branch} (git rev-parse timed out)")
+        sys.exit(1)
+    target = pin_result.stdout.strip()
+    if pin_result.returncode != 0 or not target:
+        print(f"  ❌ Could not resolve origin/{branch}:\n{pin_result.stderr.strip()}")
+        sys.exit(1)
+
     # Check if there are new commits
     try:
         diff_result = subprocess.run(
-            ["git", "diff", "HEAD", f"origin/{branch}", "--quiet"],
+            ["git", "diff", "HEAD", target, "--quiet"],
             cwd=proj,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -1231,9 +1552,8 @@ def _update(force: bool = False) -> None:
     # Mirror the dashboard check's verdict: only a fast-forwardable checkout
     # (behind and not ahead) proceeds to the reset; ahead-only has nothing to
     # pull and returns without resetting; true divergence refuses unless the
-    # operator explicitly opted in with --force. Counted against
-    # origin/<branch> — the exact ref the reset targets, freshly updated by
-    # the fetch above.
+    # operator explicitly opted in with --force. Counted against the pinned
+    # commit — exactly what the reset targets.
     #
     # This runs TWICE — once here, once immediately before the reset — because
     # the prompt below makes the gap to the destructive step unbounded. Both
@@ -1241,7 +1561,7 @@ def _update(force: bool = False) -> None:
     # PRINT, never in which states they recognise: a state handled in one and
     # forgotten in the other is how a guard grows a hole.
     def _divergence_verdict() -> tuple[str, int, int]:
-        """Classify HEAD against ``origin/<branch>`` for the reset decision.
+        """Classify HEAD against the pinned upstream commit for the reset decision.
 
         Returns ``(verdict, ahead, behind)`` where verdict is one of:
 
@@ -1256,7 +1576,7 @@ def _update(force: bool = False) -> None:
         * ``"diverged"`` — ahead AND behind; resettable only under ``--force``.
         * ``"fast_forward"`` — behind and not ahead; nothing of its own to lose.
         """
-        counts = count_divergence_sync(proj, f"origin/{branch}")
+        counts = count_divergence_sync(proj, target)
         if isinstance(counts, DivergenceUnreadable):
             if counts.reason == UNREADABLE_UNPARSEABLE:
                 print(f"  ❌ Could not parse the commit counts against origin/{branch}:")
@@ -1292,6 +1612,26 @@ def _update(force: bool = False) -> None:
             print("      kirocrew update --force")
             sys.exit(1)
         print(f"  ⚠️  --force: discarding {ahead} local commit(s) not on origin/{branch}.")
+
+    # Interpreter floor of the pinned revision, read from the commit itself. The
+    # reinstall below would refuse it anyway, but only after the reset has moved
+    # the tree to code this venv cannot import -- leaving a running gateway
+    # serving old code out of memory while every lazy import reads the new
+    # files, and every later `kirocrew update` repeating the reset and the
+    # refusal. Judged here: before the operator is asked to discard anything,
+    # and outside the re-classification that must stay adjacent to the reset.
+    try:
+        floor_breach = dep_sync.incoming_python_floor_breach(
+            Path(proj), target, Path(sys.executable)
+        )
+    except dep_sync.IncomingFloorUnreadable as exc:
+        # Unreadable is not absent: a git failure here must refuse, or it is
+        # the one way the revision the gate exists to keep out still lands.
+        print(f"  ❌ Could not read the incoming revision's interpreter requirement: {exc}")
+        sys.exit(1)
+    if floor_breach:
+        print(f"  ❌ Refusing to update: {floor_breach}")
+        sys.exit(1)
 
     # Warn about local tracked-file changes before discarding
     try:
@@ -1331,8 +1671,8 @@ def _update(force: bool = False) -> None:
     # natural next step — the first leaves the snapshot stale, the second
     # turns the checkout ahead-only, and both end in the reset deleting the
     # commits the operator just made to save that work. Only HEAD can move
-    # here (origin/<branch> is a local ref that only a fetch rewrites), so
-    # this needs no second network round trip.
+    # here: the reset targets the pinned commit, which no concurrent fetch can
+    # rewrite, so this needs no second network round trip.
     verdict, ahead, behind = _divergence_verdict()
     if verdict == "unreadable":
         sys.exit(1)
@@ -1347,10 +1687,10 @@ def _update(force: bool = False) -> None:
         print(f"      Reconcile with: git rebase origin/{branch}")
         sys.exit(1)
 
-    print(f"  🔄 git reset --hard origin/{branch}…")
+    print(f"  🔄 git reset --hard origin/{branch} ({target[:12]})…")
     try:
         result = subprocess.run(
-            ["git", "reset", "--hard", f"origin/{branch}"],
+            ["git", "reset", "--hard", target],
             cwd=proj,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -1509,7 +1849,9 @@ def _update_wheel(layout) -> None:
         sys.exit(1)
     try:
         req = urllib.request.Request(feed_url, headers={"User-Agent": "kirocrew-update/1"})
-        with urllib.request.urlopen(req, timeout=15) as resp:  # nosemgrep: dynamic-urllib-use-detected
+        with urllib.request.urlopen(  # nosemgrep: dynamic-urllib-use-detected
+            req, timeout=15
+        ) as resp:
             raw = resp.read(65536 + 1)
     except (urllib.error.URLError, OSError, ValueError) as e:
         print(f"  ❌ Could not reach release feed: {e}")
@@ -1655,6 +1997,9 @@ def _update_approve() -> None:
     from kiro_crew.platform.update_stepup import read_pending
 
     print("👻 Approving the pending in-app update…\n")
+    # Default read: never writes. This runs in the CLI process, outside the
+    # gateway's nonce mutex — expiry cleanup here could race a gateway
+    # re-arm and delete a fresh request. Cleanup is the gateway's job.
     pending = read_pending()
     if pending is None:
         print("❌ No armed update request (it may have expired).")
@@ -1694,7 +2039,9 @@ def _update_approve() -> None:
             detail = json.loads(e.read()).get("error", "")
         except Exception:
             detail = ""
-        print(f"❌ Gateway refused the approval (HTTP {e.code})" + (f": {detail}" if detail else ""))
+        print(
+            f"❌ Gateway refused the approval (HTTP {e.code})" + (f": {detail}" if detail else "")
+        )
         sys.exit(1)
     except (urllib.error.URLError, OSError):
         print("❌ Gateway is not running — start it, or update directly with: kirocrew update")
@@ -1733,6 +2080,27 @@ def _status(args: argparse.Namespace) -> None:
     print(f"  Subagents:   {data.get('subagents', 0)}")
     print(f"  Cron jobs:   {data.get('crons', 0)}")
     print(f"  Lessons:     {data.get('lessons', 0)}")
+    print(f"  Memory:      {_format_memory_line(data)}")
+
+
+def _format_memory_line(data: dict) -> str:
+    """``<gateway rss> MiB rss, session ceiling <n> MiB`` from a status payload.
+
+    Reads the two fields ``/api/status`` publishes for exactly this line
+    (``gateway_rss_mb`` / ``watchdog_rss_max_mb``). An older gateway that does
+    not publish them prints a dash rather than a fabricated zero, and a ceiling
+    of ``0`` is spelled out as disabled so "0 MiB" cannot read as a bound.
+    """
+    rss = data.get("gateway_rss_mb")
+    ceiling = data.get("watchdog_rss_max_mb")
+    rss_text = f"{rss} MiB rss" if isinstance(rss, (int, float)) and rss > 0 else "— rss"
+    if not isinstance(ceiling, (int, float)):
+        ceiling_text = "session ceiling —"
+    elif ceiling > 0:
+        ceiling_text = f"session ceiling {int(ceiling)} MiB"
+    else:
+        ceiling_text = "session ceiling disabled (session.watchdog_rss_max_mb = 0)"
+    return f"{rss_text}, {ceiling_text}"
 
 
 def _should_reconcile_launchd_launcher() -> bool:
@@ -1822,7 +2190,13 @@ async def _gateway(
 
     if not config_path().exists():
         cfg = KiroCrewConfig()
-        cfg.save()
+        # _gateway is a coroutine, so this runs on the event loop: save() takes
+        # the sidecar advisory flock and a contended wait (another
+        # process writing config at boot) must block a worker thread, not the
+        # loop. run_config_write does not fit here — the dashboard's asyncio
+        # config lock guards loop-side handler writers, none of which exist
+        # before run_gateway starts serving.
+        await asyncio.to_thread(cfg.save)
         print(f"👻 Created default config: {config_path()}")
 
     cfg = KiroCrewConfig.load()
@@ -1867,6 +2241,7 @@ async def _run_task(args: argparse.Namespace) -> None:
         episodic_limit=cfg.memory.episodic_max_results,
         embedding_dim=cfg.memory.embedding_dim,
         decay_rates=cfg.memory.decay_rates or None,
+        dedup_threshold=cfg.memory.episodic_dedup_threshold,
     )
     # CALLER CONTRACT (vector_memory.py): async callers offload init() — it is
     # blocking file IO end to end (sqlite connect, migrations, lockdown pass)
@@ -1913,8 +2288,8 @@ async def _run_task(args: argparse.Namespace) -> None:
         await asyncio.to_thread(skills.sync_builtins)
     except Exception:
         logging.getLogger(__name__).warning(
-            "builtin-skill sync failed; continuing with the skills already "
-            "on disk", exc_info=True,
+            "builtin-skill sync failed; continuing with the skills already " "on disk",
+            exc_info=True,
         )
     consolidator = HistoryConsolidator(
         log=conv_log,
@@ -2161,8 +2536,60 @@ def _logs_cmd(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    if plat == Platform.UNSUPPORTED:
+        try:
+            _tail_log_file(fallback, lines, follow)
+        except OSError as exc:
+            print(
+                f"Unable to read gateway log: {exc}. "
+                "Check file access or retry `kirocrew logs` if the log is rotating.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return
     cmd = ["tail", "-n", str(lines)]
     if follow:
         cmd.append("-f")
     cmd.append(str(fallback))
     os.execvp("tail", cmd)
+
+
+def _tail_log_file(path: Path, lines: int, follow: bool) -> None:
+    """Follow the log by name, allowing the writer to rotate it during reads."""
+    identity: tuple[int, int] | None = None
+    offset = 0
+    first = True
+    decoder = io.IncrementalNewlineDecoder(
+        codecs.getincrementaldecoder("utf-8")(errors="replace"), translate=True
+    )
+    try:
+        while True:
+            try:
+                fd = platform_compat.open_log_file_for_tail(path)
+            except FileNotFoundError:
+                if not follow:
+                    raise
+            else:
+                with os.fdopen(fd, "rb") as log:
+                    info = os.fstat(log.fileno())
+                    current_identity = (info.st_dev, info.st_ino)
+                    if current_identity != identity or info.st_size < offset:
+                        offset = 0
+                        decoder.reset()
+                    if first:
+                        data = b"".join(deque(log, maxlen=abs(lines)))
+                        first = False
+                    else:
+                        log.seek(offset)
+                        data = log.read()
+                    offset = log.tell()
+                    identity = current_identity
+                # Close before output or sleep can block. Rotation after open
+                # is picked up by name on the next poll, without a retry loop.
+                sys.stdout.write(decoder.decode(data, final=not follow))
+                sys.stdout.flush()
+            if not follow:
+                return
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        return

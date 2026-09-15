@@ -210,11 +210,18 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
                       residual strip that jumps away when the animation ends. */}
                   <div className="pt-2.5 flex flex-col gap-1.5">
                   {q.options.map(opt => {
-                    const isSelected = selections[qIdx]?.has(opt.label)
+                    const isSelected = !!selections[qIdx]?.has(opt.label)
                     return (
                       <button
                         key={opt.label}
                         onClick={() => toggleOption(qIdx, opt.label, q.multiSelect ?? false)}
+                        /* WCAG 4.1.2: the selected state must be programmatic, not
+                           CSS-only. aria-pressed (toggle button) in BOTH modes: it
+                           matches multiSelect's independent toggles exactly, and for
+                           single-select it keeps the intended click-again-to-deselect
+                           honest — role=radio would promise a control that cannot be
+                           unchecked by re-activating it, which this one can. */
+                        aria-pressed={isSelected}
                         className={`text-left px-3 py-2 rounded-lg text-[13px] cursor-pointer transition-all border ${
                           isSelected
                             ? 'border-accent text-text bg-accent-subtle/60'
@@ -273,6 +280,7 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
             onClick={onDismiss}
             disabled={busy}
             aria-label={i18nT('components.questionCard.dismiss_question_without_answering')}
+            title={i18nT('components.questionCard.dismiss_hint')}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium cursor-pointer transition-all disabled:opacity-30 disabled:cursor-not-allowed bg-transparent text-muted hover:text-text border border-border"
           >
             {i18nT('components.questionCard.dismiss')}
@@ -286,6 +294,17 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
           <MessageSquare size={14} /> {i18nT('components.questionCard.submit')}
         </button>
       </div>
+      {/* Dismiss is the only control that ends a question nobody is going to
+          answer, so it has to say what it does: the label alone reads as "hide
+          this for now" and a user who suspects it might throw the question away
+          leaves a dead card parked above the composer instead. Rendered as a
+          line rather than only as the button's title, because a tooltip does not
+          exist for touch or for a keyboard user reading the row. */}
+      {onDismiss && (
+        <div className="px-4 pb-3 -mt-1.5 text-[12px] text-muted shrink-0 text-right">
+          {i18nT('components.questionCard.dismiss_hint')}
+        </div>
+      )}
     </div>
   )
 }

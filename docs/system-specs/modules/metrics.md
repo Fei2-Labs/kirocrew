@@ -12,8 +12,11 @@ survive a process death — currently only the session-lifetime breadcrumb — m
 gate that state on the same consent, and fail closed when consent cannot be
 read, so this sentence stays literally true.
 
-Source: `src/kiro_crew/metrics/` — `schema.py`, `recorder.py`, `provider.py`,
-`local_exporter.py`, `http_metrics.py`. Tests: `test/metrics/`.
+Source: the `src/kiro_crew/metrics/` package. The tables below cover the modules
+that carry contract meaning; the package holds more (per-domain instrument modules
+for sessions, turns, tool calls, DB, process and inventory gauges, plus
+`temporality.py` and `events.py`), so read the directory rather than treating any
+list here as the inventory. Tests: `test/metrics/`.
 
 ## Components
 
@@ -176,6 +179,20 @@ every `_CONSENT_RECHECK_SECS` (30s) and rebuilds when it moved (see "Recorder
 lifecycle & threading"). The gateway process is where the session/turn/HTTP
 metrics are recorded; other kirocrew processes pick the value up on their own
 recheck or at their next start.
+
+**Any `telemetry.*` change rebuilds the recorder, not just `enabled`.**
+`provider.watch_config()` registers one applier on the `telemetry` section, and its
+callback calls `shutdown()` — the next `get_recorder()` then builds a fresh
+recorder from the new config. That covers the settings the 30s consent recheck
+cannot see, because it only re-reads `enabled`: the OTLP endpoint, the export
+cadence, and every other value `_build_recorder` reads once. Registration is
+idempotent per process, so a re-entered boot path cannot stack appliers that each
+rebuild. The rebuild is lazy by design — `shutdown()` only drops the memo, so the
+~57ms of SDK import is paid on the next metric call rather than on the config
+watcher's own thread.
+
+Beacon fields are the exception: they are read once for the boot heartbeat, so a
+change to them applies at the next start.
 
 **External OTLP egress (opt-in, off by default):** egress destinations are
 **pluggable**. `_build_recorder` asks the active `TelemetryProvider` for them via
@@ -393,7 +410,7 @@ Tests: `test/metrics/test_resource_attrs.py`.
 | `kirocrew.inventory.monitor_loops.active` | gauge | — | Same module; `autonudge.get_instance()` then a materialized `list(...)` snapshot of the loop registry counting `active`. The registry is mutated only under an `asyncio.Lock` on the event loop, which gives a reader thread no protection and cannot be acquired from it; the snapshot is safe anyway because each dict op is atomic under the GIL and a gauge stale by one loop is fine. `get_instance()` returning None (spawned agent process, unit test, auto-nudge off) yields a gap — a `0` there would be indistinguishable from a running service with none armed. |
 | `kirocrew.inventory.skills.installed` | gauge | — | Same module; one module-global `SkillsLoader(install_builtins=False)` (`install_builtins=True` would make a metrics probe perform a content-hashing write sync). Listing is a recursive walk, so it is cached for `_EXPENSIVE_TTL_SECS` (300s) — five collection cycles on the default interval. One combined total, NOT a builtin/user split: builtins are copied onto disk into the same tree, so nothing in the listing distinguishes them and a split would be a guess. |
 | `kirocrew.inventory.memory.migrated` | gauge | — | Same module; `memory.migrated` as 0/1. Reports the migration bit rather than a "memory enabled" switch because no such switch exists — the embedding provider is coerced to a real value on load, so memory is structurally always on and an "enabled" gauge could only read 1. The bit flips on the first boot that initialises vector memory, fresh installs included, so 1 is the healthy reading and a **0 on a live install is a fault**: vector memory never initialised, migration aborted before the flip, or the flag write was skipped on an unparseable `config.json`. That is what keeps it from being a rollout metric that goes quiet once a fleet converges. |
-| `kirocrew.inventory.knowledge.documents` | gauge | — | Same module; the raw source count. Deliberately NOT a constant 1 under a magnitude-band attribute: the quasi-identifying argument for banding does not hold when the only destination is the operator's own collector describing their own machines, while the band costs a series per band, hides growth inside a band (the drift the gauge exists for), and fixes the boundaries at emit time — a backend can band a raw count at query time and cannot recover a count from a band. Counts the `sources` table, not `items` (an item is one chunk, so counting items would report a chunking artifact as a document count), via a **read-only** `sqlite3` URI guarded on `exists()`: constructing a `KnowledgeStore` would run schema init plus graph load and would CREATE the database on an install that never ingested anything. Cached 300s. Absent database yields a gap. |
+| `kirocrew.inventory.knowledge.documents` | gauge | — | Same module; the raw source count. Deliberately NOT a constant 1 under a magnitude-band attribute: the quasi-identifying argument for banding does not hold when the only destination is the operator's own collector describing their own machines, while the band costs a series per band, hides growth inside a band (the drift the gauge exists for), and fixes the boundaries at emit time — a backend can band a raw count at query time and cannot recover a count from a band. Counts the `sources` table, not `items` (an item is one chunk, so counting items would report a chunking artifact as a document count), via a **read-only** `sqlite3` URI guarded on `exists()`: constructing a `KnowledgeStore` would run schema init plus the writer-locked orphan migration and would CREATE the database on an install that never ingested anything. Cached 300s. Absent database yields a gap. |
 | `kirocrew.inventory.lessons` | gauge | — | Same module; the raw lesson count, same shape and rationale. Reads through one module-global `LessonStore`, whose own mtime cache makes a repeated read on an unchanged file a single `stat` — reused across ticks because that cache lives on the instance, and left uncached here because a second cache would add only staleness. An absent file is a genuine `0` (an install that never saved a lesson), unlike the knowledge database. |
 | `kirocrew.inventory.mcp.servers` | gauge | `class` (`first_party` / `third_party`) | Same module; the roster merged from the agent config and `_load_mcp_json_by_source`, classified against `mcp_discovery._MANAGED_SERVER_NAMES` — reused rather than restated, since a second name list here would drift silently the first time a managed server is added or renamed. **Server names are read to classify and then discarded: no name ever reaches an attribute.** A roster is user-chosen free-form text, so publishing it would be both a cardinality bomb and a disclosure of what the user has installed. An empty merged roster yields a gap: the loaders fail soft to `{}`, so empty cannot be told apart from an unwritten config, and the managed servers are always present once installed. |
 | `kirocrew.inventory.config.toggle` | gauge | `key` (closed enum, `inventory_gauges.CONFIG_TOGGLES`) | Same module; each declared feature switch as 0/1. Config is read ONCE for the whole set, so the gauge costs one fingerprint-cached load per collection instead of one per key. `telemetry.enabled` is deliberately absent — this module only runs inside the consent gate, so it could report nothing but 1. `memory.migrated` is absent because it has its own gauge. A key whose field cannot be resolved is OMITTED rather than reported as 0 (a renamed config field must read as a missing series, never as a switch someone turned off); `test_every_declared_toggle_resolves_against_a_real_config` is what keeps that from being a silent hole. |
@@ -864,19 +881,32 @@ modes, heartbeat maintenance ticks) never call a model and must not write a row.
 produced by `context_blocks.split_blocks(prompt, user_chars=…)`, which attributes
 the FINAL assembled prompt to the blocks that produced it by matching the bracket
 markers the assembly emits (`[CRITICAL RULES`, `[Memory`, `[Skills:]`,
-`[USER PROFILE]`, `[UI LANGUAGE]`, `[CURRENT USER REQUEST`, the trailing
-reply-format contract, …) rather than counting at each of the ~30 append sites.
+`[USER PROFILE]`, `[UI LANGUAGE]`, `[CURRENT USER REQUEST`,
+`[REPLY FORMAT RULES]`, …) rather than counting at each of the ~30 append sites.
 Reading the OUTPUT means the attribution cannot drift from what was actually
 sent. `_MARKERS` is deliberately kept in sync with EVERY opener the assembly can
 emit — including the identity/session banners (`[USER PROFILE]`, `[UI LANGUAGE]`,
 `[CHANNEL]`, `[INCOGNITO SESSION]`, `[TEMPORARY SESSION]`, the cancelled-turn
-preamble) and the openers added AFTER `build_message` returns (`[THEME PERSONA]`,
-the re-injected `[Previous chat history for this tab …]`, `[Hook context]` — in
+preamble), generated request-prefix openers assembled inside `build_message`
+before the current request (`[THEME PERSONA]`, triggered `[Skill: …]` bodies,
+and `[REPLY FORMAT RULES]`), and openers prepended AFTER `build_message` returns
+(the re-injected `[Previous chat history for this tab …]`, `[Hook context]` — in
 both emitted spellings, with and without the colon — and the `[System: …]`
 regenerate line): a marker absent from `_MARKERS` does NOT surface as its own
 bucket, it
 folds into the PRECEDING recognised block and mislabels those bytes, so the set
 must stay complete.
+
+**Current-request recency boundary.** Injected blocks are not the only proof that a
+turn is contextual. A keyed warm provider session (`is_new_session=False`) carries
+native conversation history even when this turn emits no Kiro Crew context block,
+and a cold `session/load` resume carries restored native history when
+`resumed=True`. Both paths mint `[REPLY FORMAT RULES]` (when interactive) and the
+`[CURRENT USER REQUEST …]` header before the current turn so the user's text owns
+EOF. Only a standalone call with no session key, no restored/native history, and
+no injected blocks preserves the legacy raw-user-text-first shape with guidance
+trailing; it has no older provider topic from which to regress.
+
 A block owns the span from its opener up to **the earlier of** the next opener and
 its OWN closer (`_CLOSERS`, keyed by the same labels — only the closers the
 assembly actually emits are listed, so extending it is a data change rather than a

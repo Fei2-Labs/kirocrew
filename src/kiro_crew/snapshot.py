@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import io
 import json
 import os
 import re
@@ -13,7 +14,8 @@ import socket
 import stat as _stat
 import tarfile
 import tempfile
-from contextlib import closing
+import threading
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -21,6 +23,24 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Callable
 
 from kiro_crew import pinned_fs, platform_compat
+from kiro_crew.jsonl_util import (
+    RECORD_CAP,
+    UndecodableRecord,
+    UnreadableRecord,
+    strict_raw_records,
+)
+from kiro_crew.member_memory_backup import (
+    StoresInUse,
+    hold_stores_for_read,
+    hold_stores_for_replace,
+)
+from kiro_crew.memory_stores import (
+    MEMBER_BACKUPS_DIR_NAME,
+    MEMORY_STORES_DIR_NAME,
+    is_host_local_store_state,
+    memory_store_namespace_lock,
+    named_store_product_file,
+)
 
 if TYPE_CHECKING:
     from kiro_crew import snapshot_redact
@@ -60,6 +80,35 @@ _TELEMETRY_SALT_BYTES = 32
 NEVER_SNAPSHOT_FILES: frozenset = frozenset({"sel_hmac.key"})
 
 
+def _never_ships(member_name: str) -> bool:
+    """Is this archive member one no bundle carries in EITHER direction?
+
+    Two rules, one by basename and one by path. `NEVER_SNAPSHOT_FILES` is the basename
+    rule above. The path rule is the host-local state under ``memory_stores/`` --
+    the member signing key, the execution logs and the local backup directories -- which
+    is matched by its position rather than its name for the reason the basename set's own
+    comment gives: a name filter over the whole tar drops an operator's file that merely
+    shares the name, and ``backups`` is a name an operator's workspace can easily hold.
+
+    Members are ``<bundle-root>/<data-home-relative path>``, so the root is dropped before
+    the predicate that speaks data-home-relative paths is asked.
+    """
+    parts = PurePosixPath(member_name).parts
+    if parts and parts[-1] in NEVER_SNAPSHOT_FILES:
+        return True
+    return is_host_local_store_state(parts[1:])
+
+
+def _tree_roots_replace_clears() -> frozenset[str]:
+    """The top-level directories replace mode removes before refilling.
+
+    Derived from the component table rather than listed: a tree added to a component
+    is a tree replace clears, and a hand-kept copy would leave the rejection filter
+    below blind to exactly the tree that was added last.
+    """
+    return frozenset(PurePosixPath(t).parts[0] for s in COMPONENTS.values() for t in s.trees)
+
+
 def _redactor() -> Any:
     """The outbound redaction pass, imported on first use.
 
@@ -96,11 +145,9 @@ def _safe_name(value: object, default: str = "unknown", limit: int = 300) -> str
     where the operator decides whether to restore it. Two of these sites print while
     REJECTING a hostile entry, so the raw name there is precisely the attacker's payload.
 
-    The escaping itself used to live beside the off-host destination code, because its
-    first caller printed S3 object keys. That destination is now the AWS Control app's,
-    and what is left to escape is a name out of an untrusted archive -- so the helper
-    lives with its remaining caller and its reason is stated in those terms. The length
-    is capped so one very long name cannot flood the view.
+    What is escaped is a name out of an untrusted archive, so the helper lives with its
+    caller and its reason is stated in those terms. The length is capped so one very
+    long name cannot flood the view.
     """
     cleaned = _CONTROL_CHARS.sub(lambda m: _escape_one(m.group()), str(value if value else default))
     if len(cleaned) > limit:
@@ -125,7 +172,7 @@ def _rejection_recording_filter(
     the source is a directory") cannot tell them apart, and it would revert the unconditional
     clear that a documented defect required. Extraction, by contrast, knows.
 
-    A `NEVER_SNAPSHOT_FILES` drop is NOT recorded: those are deliberate and expected. Nor is a
+    A `_never_ships` drop is NOT recorded: those are deliberate and expected. Nor is a
     rejection anywhere OUTSIDE a tree that replace clears -- and that limit is the point.
     `test_symlink_filtered_out` states the contract for those: a hostile entry injected into an
     otherwise sound bundle is dropped and the restore SUCCEEDS (`assert ret == 0`). Refusing on
@@ -133,11 +180,11 @@ def _rejection_recording_filter(
     cleared trees different is that dropping an entry there converts into DELETION of the
     operator's own tree, rather than merely into an absence.
     """
-    cleared_trees = {"workspace", "plan_memory", "skills"}
+    cleared_trees = _tree_roots_replace_clears()
 
     def _f(info: tarfile.TarInfo, dest: str = "") -> tarfile.TarInfo | None:
         kept = _data_filter(info, dest)
-        if kept is None and PurePosixPath(info.name).name not in NEVER_SNAPSHOT_FILES:
+        if kept is None and not _never_ships(info.name):
             # Entries are `<bundle-root>/<tree>/...`; the tree is what decides.
             parts = PurePosixPath(info.name).parts
             if len(parts) > 1 and parts[1] in cleared_trees:
@@ -183,17 +230,24 @@ def _data_filter(info: tarfile.TarInfo, _dest: str = "") -> tarfile.TarInfo | No
     if info.issym() or info.islnk():
         print(f"⚠️  Rejecting symlink/hardlink entry: {_safe_name(info.name)}")
         return None
-    # Never ship these — each must be regenerated on the restoring host.
+    # Never ship these — each must be regenerated on the restoring host, or is that
+    # host's own runtime state (the host-local half of ``memory_stores/``).
     basename = PurePosixPath(info.name).name
-    if basename in NEVER_SNAPSHOT_FILES:
+    if _never_ships(info.name):
         return None
     info.uid = info.gid = 0
     info.uname = info.gname = ""
-    # Security-sensitive files get restricted permissions
-    if not info.isdir() and basename in SECURITY_SENSITIVE_FILES:
+    # Security-sensitive files get restricted permissions. So does everything under
+    # memory_stores/: a store is provisioned owner-only on the writing host, and a restore
+    # should land it the way provisioning would rather than at the tar default.
+    parts = PurePosixPath(info.name).parts
+    private_store = len(parts) >= 2 and parts[1] == MEMORY_STORES_DIR_NAME
+    if info.isdir():
+        info.mode = 0o700 if private_store else 0o755
+    elif private_store or basename in SECURITY_SENSITIVE_FILES:
         info.mode = 0o600
     else:
-        info.mode = 0o755 if info.isdir() else 0o644
+        info.mode = 0o644
     return info
 
 
@@ -302,6 +356,13 @@ COMPONENTS: dict[str, ComponentSpec] = {
     # databases, but the markdown half of memory lives under workspace/. Naming those
     # trees here means restoring memory does not require restoring the whole
     # workspace, which on a real install is two orders of magnitude larger.
+    #
+    # `memory_stores/` is the NAMED stores -- one silo per crew member, each holding its
+    # own markdown tree, FTS index, vector file, lessons and ownership manifest. It is a
+    # component tree like the other two, so a bundle that declares `memory` carries every
+    # store and not only the default one. The tree's host-local half (the member signing
+    # key, execution logs, local backup directories) never rides: `_never_ships` names
+    # it, and the same predicate excludes it at staging and at extraction.
     "memory": ComponentSpec(
         # UNRESOLVED like every other component: a lesson or a note can contain a
         # token somebody pasted, and staging cannot tell. Memory is NOT redacted in a
@@ -311,10 +372,12 @@ COMPONENTS: dict[str, ComponentSpec] = {
         help=(
             "memory.db, memory_index.db (semantic, episodic, lessons), "
             "workspace/memory/ (preferences, projects, history), workspace/knowledge/ "
-            "(files; the knowledge database is replaced, not row-merged)"
+            "(files; the knowledge database is replaced, not row-merged), "
+            "memory_stores/ (every named store's memory; a store's database is "
+            "replaced, not row-merged)"
         ),
         files=("memory.db", "memory_index.db"),
-        trees=("workspace/memory", "workspace/knowledge"),
+        trees=("workspace/memory", "workspace/knowledge", MEMORY_STORES_DIR_NAME),
     ),
     "crons": ComponentSpec(
         # `CronJob.env` is a persisted dict of per-job environment variables
@@ -362,11 +425,11 @@ def resolve_components(requested: list[str] | None, purpose: Purpose) -> list[st
     an unknown name never silently stages nothing, and an ``UNRESOLVED`` component
     never rides a ``SHARE`` bundle just because nobody wrote the policy down.
 
-    Duplicates are collapsed, ORDER PRESERVED. ``--components config,config`` used to reach
-    the staging pass twice for one component, and the second pass hit the exclusive create
-    the pinned primitives make -- an uncaught ``FileExistsError`` traceback rather than a
-    snapshot. A repeated name is a typo, not a request to stage anything twice, so the
-    honest reading is to collapse it rather than to refuse the run.
+    Duplicates are collapsed, ORDER PRESERVED. Without that, ``--components config,config``
+    reaches the staging pass twice for one component, and the second pass hits the exclusive
+    create the pinned primitives make -- an uncaught ``FileExistsError`` traceback rather
+    than a snapshot. A repeated name is a typo, not a request to stage anything twice, so
+    the honest reading is to collapse it rather than to refuse the run.
     """
     names = list(COMPONENTS) if requested is None else list(dict.fromkeys(requested))
     unknown = [c for c in names if c not in COMPONENTS]
@@ -460,9 +523,37 @@ PRODUCT_TREE_DATABASES: frozenset[str] = frozenset(
     }
 )
 
+
+def is_product_tree_database(rel: str) -> bool:
+    """Is the bundle-relative path *rel* a database this product owns inside a tree?
+
+    The set above lists the FIXED paths. A named store's vector file and index sit at
+    ``memory_stores/<name>/memory.db`` and ``.../memory_index.db``, where ``<name>`` is
+    the operator's, so they cannot be listed and are recognised by shape instead --
+    through the layout owner, so this module holds no second spelling of a store path.
+    Both answers carry the same consequence: strict validation on the way in and on the
+    way out, exactly as for ``memory.db`` at the root.
+    """
+    return rel in PRODUCT_TREE_DATABASES or bool(named_store_product_file(PurePosixPath(rel).parts))
+
+
 COMPONENT_HELP = {name: spec.help for name, spec in COMPONENTS.items()}
 
 VALID_COMPONENTS: tuple[str, ...] = tuple(COMPONENTS)
+
+#: The manifest format this build writes. Bumped when a bundle's SHAPE changes in a way
+#: a restore has to know about, not per release: v3 introduced the component map; v4
+#: bundles carry the ``memory_stores/`` tree under `memory`. Replace mode reads it to
+#: tell "the source had no named stores" from "the writer did not know about them" --
+#: see `_bundle_carries_named_stores`.
+MANIFEST_VERSION = 4
+_FIRST_VERSION_WITH_NAMED_STORES = 4
+#: The dashboard export's zip manifest (`portability.create_export_zip`) is a separate
+#: line with its own history; v3 is where it gained the ``memory_stores/`` tree. Owned
+#: here rather than in `portability` because that module imports this one, and the
+#: restore side has to read the threshold.
+EXPORT_MANIFEST_VERSION = 3
+_FIRST_EXPORT_VERSION_WITH_NAMED_STORES = 3
 
 
 def _mc_dir() -> Path:
@@ -540,14 +631,13 @@ def _chain_is_link_free(root: Path, rel_parts: tuple[str, ...]) -> bool:
         # cannot verify as reachable without following a link.
         #
         # `open_dir_pinned` translates only `ELOOP`/`ENOTDIR` into `PinnedPathRefusal` and
-        # re-raises every other `OSError`, and this call sat OUTSIDE the try below. So a root
-        # lost to a concurrent rename or removal left `ENOENT` escaping as
-        # `FileNotFoundError` from a call site under `_build_snapshot`, whose enclosing try
-        # handles `PinnedPathRefusal`, `UnsafeComponentRoot` and `DatabaseCopyFailed` -- the
-        # `OSError` arm belongs to a later, separate try. The command exited on a traceback
-        # where the declared path owes a named refusal and the tree path owes a recorded
-        # skip. Returning False routes both through the `require_database` asymmetry the
-        # caller already implements. Review's finding.
+        # re-raises every other `OSError`, so a root lost to a concurrent rename or removal
+        # arrives as `FileNotFoundError`. Letting it escape from a call site under
+        # `_build_snapshot` exits on a traceback: that enclosing try handles
+        # `PinnedPathRefusal`, `UnsafeComponentRoot` and `DatabaseCopyFailed`, and its
+        # `OSError` arm belongs to a later, separate try. The declared path owes a named
+        # refusal and the tree path owes a recorded skip, so returning False routes both
+        # through the `require_database` asymmetry the caller already implements.
         #
         # `PinnedPathRefusal` is deliberately NOT caught here: `snapshot_main` handles it and
         # audits it as `unpinnable_staging`. That is a decision the operator should see, not
@@ -610,9 +700,9 @@ def _copy_database_consistently(
     """Copy the live SQLite database *src* to *dst* through the backup API, read-only.
 
     THE one place this module reads a live database on the creation path. Both staging
-    paths -- the fixed core-file list and the tree re-stage pass -- call it, because the
-    hardening below was arrived at over five review rounds on #5156 and a second,
-    structurally identical copy of it is how one of the two drifts back.
+    paths -- the fixed core-file list and the tree re-stage pass -- call it, because a
+    second, structurally identical copy of the hardening below is how one of the two
+    drifts back.
 
     Four properties, each closing a failure that reported success:
 
@@ -662,12 +752,12 @@ def _copy_database_consistently(
     """
     if not _chain_is_link_free(root, rel_parts):
         if require_database:
-            # Same reasoning as the not-a-database case below, and an earlier revision of
-            # this change applied it to only one of the two: omitting a REQUIRED database
-            # still let the snapshot succeed, so `--keep N` pruned the last complete
-            # archive in favour of one missing the database it claims. A recorded omission
-            # is "recoverable information" only while the operator still HAS the archive it
-            # could be recovered from. Review's finding.
+            # Same reasoning as the not-a-database case below, and it has to apply to
+            # BOTH: applying it to only one lets a snapshot that omitted a REQUIRED
+            # database succeed, so `--keep N` prunes the last complete archive in favour
+            # of one missing the database it claims. A recorded omission is "recoverable
+            # information" only while the operator still HAS the archive it could be
+            # recovered from.
             raise DatabaseCopyFailed(
                 src,
                 pinned_fs.PinnedPathRefusal(
@@ -712,11 +802,11 @@ def _copy_database_consistently(
         return DB_NOT_A_DATABASE
     # The connects are INSIDE the try, not just `backup()`. Between the probe above and
     # this open the file can disappear -- and `mode=ro` makes that a hard failure where a
-    # read-write open would have silently CREATED an empty database, so this change made
-    # the window matter more, not less. `sqlite3.connect` then raises `OperationalError`,
-    # which `snapshot_main` does not catch (it handles PinnedPathRefusal,
-    # UnsafeComponentRoot, DatabaseCopyFailed and _ArchiveTooLarge), so the command exited
-    # on a traceback instead of naming the database. Review's finding.
+    # read-write open would silently CREATE an empty database, so the window matters more,
+    # not less. `sqlite3.connect` then raises `OperationalError`, which `snapshot_main`
+    # does not catch (it handles PinnedPathRefusal, UnsafeComponentRoot, DatabaseCopyFailed
+    # and _ArchiveTooLarge), so letting it escape exits on a traceback instead of naming
+    # the database.
     try:
         with (
             closing(sqlite3.connect(ro_uri, uri=True)) as src_conn,
@@ -770,7 +860,7 @@ def _refuse_unsound_required_capture(src: Path, dst: Path) -> None:
     Raises ``DatabaseCopyFailed`` rather than restore's ``SourceComponentUnsound``: the try
     around ``_build_snapshot`` handles ``PinnedPathRefusal``, ``UnsafeComponentRoot`` and
     ``DatabaseCopyFailed``, so the restore-side type would leave here as a traceback --
-    the same escape this change fixed for the chain check. Review's finding.
+    the same escape the chain check avoids.
     """
     try:
         if src.stat().st_size == 0:
@@ -814,17 +904,16 @@ def _restage_databases(
     covered without anyone remembering to register it.
 
     A file whose suffix says database but which SQLite cannot open is left as the byte
-    copy already made -- UNLESS its bundle-relative path is in ``PRODUCT_TREE_DATABASES``,
-    in which case the snapshot fails. That set's own contract is that everything in it is
-    "validated as strictly as ``memory.db``", and the restore side already enforces exactly
-    that (``_refuse_unless_sound(..., strict=rel in PRODUCT_TREE_DATABASES)``). Staging a
+    copy already made -- UNLESS ``is_product_tree_database`` claims its bundle-relative path,
+    in which case the snapshot fails. That predicate's own contract is that everything it
+    claims is "validated as strictly as ``memory.db``", and the restore side already enforces
+    exactly that (``_refuse_unless_sound(..., strict=is_product_tree_database(rel))``). Staging a
     corrupt ``workspace/knowledge/knowledge.db`` as bytes and reporting success therefore
-    produced an archive that restore is guaranteed to refuse, which is worse than failing:
+    produces an archive that restore is guaranteed to refuse, which is worse than failing:
     ``--keep N`` counts the new archive as the newest backup and prunes a real one, so the
-    operator loses their last restorable copy to a snapshot that "succeeded". Review's
-    finding.
+    operator loses their last restorable copy to a snapshot that "succeeded".
 
-    *bundle_root* is what makes that key comparable. ``PRODUCT_TREE_DATABASES`` is spelled
+    *bundle_root* is what makes that key comparable. A product path is spelled
     relative to a bundle root, while this pass walks one tree, so a tree-relative path would
     never match any entry and the strictness would be silently vacuous.
 
@@ -867,7 +956,7 @@ def _restage_databases(
             dst,
             root=src_dir,
             rel_parts=src.relative_to(src_dir).parts,
-            require_database=rel in PRODUCT_TREE_DATABASES,
+            require_database=is_product_tree_database(rel),
         )
         if outcome == DB_UNSAFE_SOURCE:
             # The byte copy the walk already made stays -- it is the operator's data and
@@ -973,11 +1062,43 @@ class RollbackIncomplete(OSError):
     the worst of the three outcomes -- the operator stops looking.
     """
 
-    def __init__(self, cause: BaseException, failed: list[str], backup: "Path") -> None:
+    def __init__(
+        self,
+        cause: BaseException,
+        failed: list[str],
+        backup: Path,
+        *,
+        store_backup: Path | None = None,
+    ) -> None:
         self.cause = cause
         self.failed = failed
         self.backup = backup
+        self.store_backup = store_backup
         super().__init__(str(cause))
+
+
+class NamedStoresInUse(Exception):
+    """A named memory store the replace would remove is open in some process right now.
+
+    Raised before any live state moves. Replace removes each store directory and refills
+    it, and on POSIX an open SQLite handle survives that removal pointing at an unlinked
+    file: the process keeps writing memory nothing will ever open again. The gateway
+    check at the top of ``restore`` catches the ordinary case; this catches the one it
+    cannot -- an import applied INSIDE the running gateway, or a second process holding a
+    store -- by taking every store's lifetime lock exclusively for the whole replace
+    (``member_memory_backup.hold_stores_for_replace``), which fails at once for a store
+    that is open and holds a store that tries to open until the replace is done.
+    """
+
+    def __init__(self, names: list[str]) -> None:
+        self.names = names
+        super().__init__(
+            "named memory store(s) "
+            + ", ".join(_safe_name(n) for n in names)
+            + " are open right now, so replacing memory_stores/ would leave their live "
+            "writes in an unlinked database. Nothing has been changed. Stop the gateway "
+            "(kirocrew stop) and any other process using them, then re-run."
+        )
 
 
 class UnsafeComponentRoot(Exception):
@@ -1251,6 +1372,36 @@ def _staging_is_pinned(*, allow_unpinned: bool, what: str) -> bool:
     )
 
 
+def _staging_ignore(tree: str, root: Path) -> Callable[[str, list[str]], set[str]]:
+    """The names the staging walk leaves out of the component tree *tree* rooted at *root*.
+
+    Two rules composed. The by-NAME rule is the one every tree always had: SQLite sidecars
+    (the backup API re-copies each database whole, so a ``-wal`` next to that copy would be
+    replayed into a database it does not belong to) and the two dev-only patterns. The
+    by-POSITION rule is `is_host_local_store_state`, which needs to know WHERE in the data
+    home a listing sits -- ``backups`` is host-local at ``memory_stores/<store>/backups``
+    and an ordinary folder anywhere else -- so the tree's own path is prepended to the
+    directory's path below its root before the predicate is asked.
+
+    Receives ``(directory_by_name, contents)`` exactly as ``shutil.copytree``'s ``ignore``
+    does; both staging walks call it that way.
+    """
+    by_name = shutil.ignore_patterns("hygiene_data", "insert_facts*.py", *_DB_SIDECAR_GLOBS)
+    tree_parts = PurePosixPath(tree).parts
+    root_str = str(root)
+
+    def _ignore(directory: str, contents: list[str]) -> set[str]:
+        skipped = set(by_name(directory, contents))
+        rel = os.path.relpath(directory, root_str)
+        below = () if rel == os.curdir else Path(rel).parts
+        for name in contents:
+            if is_host_local_store_state((*tree_parts, *below, name)):
+                skipped.add(name)
+        return skipped
+
+    return _ignore
+
+
 def _copytree_safe(
     src: Path,
     dst: Path,
@@ -1269,11 +1420,11 @@ def _copytree_safe(
     the replaced tree was an ordinary file. Now the traversal is descriptor-pinned by
     :func:`kiro_crew.pinned_fs.stage_tree_pinned`, including the chain above the root.
 
-    ``dirs_exist_ok`` is still accepted and dropped -- it was a ``shutil.copytree``
-    keyword and callers may pass it out of habit -- but it is no longer meaningless
-    generally: whether an existing destination is tolerated is now decided by
-    *must_create*, and it is decided identically on both branches. Every other keyword is
-    rejected rather than silently dropped.
+    ``dirs_exist_ok`` is accepted and dropped -- it is a ``shutil.copytree`` keyword and
+    callers may pass it out of habit -- but it is not meaningless generally: whether an
+    existing destination is tolerated is decided by *must_create*, and it is decided
+    identically on both branches. Every other keyword is rejected rather than silently
+    dropped.
 
     *must_create* says the caller REPLACES its destination rather than merging into it, so
     a root that exists is refused. Only a caller that removed the tree it is about to write
@@ -1354,14 +1505,13 @@ def _copytree_safe(
 def _copy_tree_no_overwrite(src: Path, dst: Path, *, allow_unpinned: bool = False) -> None:
     """Merge *src* into *dst* without overwriting, with both ends pinned.
 
-    The destination side is where #3797's third finding lives. The previous version
-    walked the source with ``rglob`` and wrote each file with ``shutil.copy2`` to a
-    path composed by name, so the destination's ancestor chain was never pinned: a
-    component of *dst* swapped for a link after ``mkdir`` redirected the write, and
-    ``not target.exists()`` answered for whatever the link pointed at rather than for
-    the directory the caller validated.
+    The destination side is the delicate one. Walking the source with ``rglob`` and
+    writing each file with ``shutil.copy2`` to a path composed by name leaves the
+    destination's ancestor chain unpinned: a component of *dst* swapped for a link after
+    ``mkdir`` redirects the write, and ``not target.exists()`` answers for whatever the
+    link points at rather than for the directory the caller validated.
 
-    This is now one call into the shared primitive with ``skip_existing=True``, which
+    This is one call into the shared primitive with ``skip_existing=True``, which
     is what makes the no-overwrite promise real: exclusive creation is atomic, so "it
     did not exist a moment ago" and "this call created it" are the same statement
     rather than two with a window between them.
@@ -1382,15 +1532,15 @@ def _copy_tree_no_overwrite(src: Path, dst: Path, *, allow_unpinned: bool = Fals
                 target.mkdir(parents=True, exist_ok=True)
             elif item.is_file():
                 target.parent.mkdir(parents=True, exist_ok=True)
-                # `copy2` opened the destination BY NAME for writing, so a symlink planted
-                # at that name after the `not target.exists()` check was followed and an
-                # arbitrary external file was overwritten. Review's finding, and the
-                # `exists()` guard was itself the name-based check that created the window.
+                # `copy2` opens the destination BY NAME for writing, so a symlink planted
+                # at that name after a `not target.exists()` check is followed and an
+                # arbitrary external file is overwritten -- that `exists()` guard is itself
+                # the name-based check that creates the window.
                 #
                 # copy_file_pinned opens the destination O_CREAT|O_EXCL|O_NOFOLLOW even
                 # with no directory descriptor, so the link is refused rather than
-                # followed, and O_EXCL subsumes the skip-if-present behaviour the old
-                # `not target.exists()` was there to provide -- without the race.
+                # followed, and O_EXCL subsumes the skip-if-present behaviour
+                # `not target.exists()` provides -- without the race.
                 pinned_fs.copy_file_pinned(
                     str(item), str(target), skip_existing=True, on_skip=_report_skip
                 )
@@ -1512,6 +1662,46 @@ def _manifest_components(snap: Path) -> list[str] | None:
             + ", ".join(_safe_name(d) for d in dropped)
         )
     return known
+
+
+def _bundle_carries_named_stores(snap: Path) -> bool:
+    """Was *snap* written by a build that stages the ``memory_stores/`` tree?
+
+    Replace clears every memory tree unconditionally and refills it from the archive,
+    which is right when the archive is a faithful copy of its source. For this ONE tree
+    the archive can be silent for a second reason: bundles written before the tree was
+    a component do not carry it however many stores the source had, so clearing it on
+    their word would delete every crew's private memory to restore a backup that never
+    claimed to hold it. The manifest version is what tells the two silences apart --
+    ``version`` reached `_FIRST_VERSION_WITH_NAMED_STORES` when the tree became part of
+    the `memory` component -- so a pre-v4 bundle leaves the live tree alone and says so.
+
+    Reads the manifest leniently: an unreadable manifest is refused long before this is
+    asked (`_manifest_components` raises), so what is left here is a readable one whose
+    ``version`` may be absent (a pre-v3 bundle) or a non-integer (a hand-edited one), and
+    both mean "older than this tree".
+
+    The dashboard export (`portability`) writes a manifest on its own version line,
+    marked ``"format": "zip"``, and hands its extracted tree to the same replace pass;
+    `EXPORT_MANIFEST_VERSION` is that line's current value and the zip threshold below
+    is where it gained the tree. Both thresholds live here so the one decision -- did
+    the writer know about named stores -- has one home.
+    """
+    mf = snap / "MANIFEST.json"
+    if not mf.is_file():
+        return False
+    try:
+        manifest = json.loads(mf.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    version = manifest.get("version")
+    if not isinstance(version, int):
+        return False
+    if manifest.get("format") == "zip":
+        return version >= _FIRST_EXPORT_VERSION_WITH_NAMED_STORES
+    return version >= _FIRST_VERSION_WITH_NAMED_STORES
 
 
 def _trees_absent_from_bundle(snap: Path, names: list[str], mc: Path) -> list[str]:
@@ -1673,12 +1863,11 @@ def _build_snapshot(
     # archive rather than of whichever component ran last.
     pinned = _staging_is_pinned(allow_unpinned=allow_unpinned, what="data home")
 
-    # Every skip is recorded, not just printed. A snapshot that omitted a hardlinked
-    # or symlinked file used to report success with a console warning and nothing in
-    # the archive -- the same "silent partial" shape this change fixes on the restore
-    # side, raised in review. Paths are stored relative to the data home so the record
-    # names the file without carrying the absolute layout of the machine into an
-    # archive that may be moved somewhere else.
+    # Every skip is recorded, not just printed. Printing alone leaves a snapshot that
+    # omitted a hardlinked or symlinked file reporting success with a console warning
+    # and nothing in the archive -- a silent partial. Paths are stored relative to the
+    # data home so the record names the file without carrying the absolute layout of
+    # the machine into an archive that may be moved somewhere else.
     skipped: list[dict[str, str]] = []
 
     def _record_skip(reason: str, path: str) -> None:
@@ -1765,9 +1954,9 @@ def _build_snapshot(
                         # Through the SAME hardened copy the tree pass uses, so the two
                         # cannot drift: descriptor-verified chain, percent-escaped URI,
                         # `mode=ro`, and "not a database" told apart from "cannot read
-                        # this database". Before this, the core path was the last
-                        # unhardened SQLite read on the creation path -- it connected
-                        # READ-WRITE to the live name, which is what #5451 is about.
+                        # this database". Without it the core path is an unhardened
+                        # SQLite read on the creation path, connecting READ-WRITE to
+                        # the live name.
                         #
                         # `mc_fd` screened this name a few lines up and cannot be handed
                         # to SQLite, which takes only a path; the chain check inside the
@@ -1776,10 +1965,10 @@ def _build_snapshot(
                         # `require_database=True` makes every non-success outcome a raise,
                         # so there is no outcome to branch on here: a declared component
                         # file is either copied consistently or the snapshot fails. Both
-                        # degradations that used to live here -- byte-copying a corrupt
-                        # database, and omitting an unverifiable one -- let the command
-                        # succeed, which let `--keep` prune the last good archive in favour
-                        # of one that cannot be restored.
+                        # degradations it replaces -- byte-copying a corrupt database, and
+                        # omitting an unverifiable one -- let the command succeed, which
+                        # lets `--keep` prune the last good archive in favour of one that
+                        # cannot be restored.
                         _copy_database_consistently(
                             src,
                             stage / f,
@@ -1848,36 +2037,35 @@ def _build_snapshot(
             if not src_dir.is_dir():
                 continue
             dst_dir.parent.mkdir(parents=True, exist_ok=True)
-            _copytree_safe(
-                src_dir,
-                dst_dir,
-                allow_unpinned=allow_unpinned,
-                on_skip=_record_skip,
-                ignore=shutil.ignore_patterns(
-                    "hygiene_data", "insert_facts*.py", *_DB_SIDECAR_GLOBS
-                ),
-            )
-            # A tree can contain a LIVE SQLite database (workspace/knowledge holds
-            # knowledge.db, whose WAL is routinely megabytes). A filesystem copy
-            # reads the db and its sidecars at different instants, so a concurrent
-            # write yields a restored database missing committed rows or corrupt
-            # outright. Re-copy each one through the backup API, which takes a
-            # consistent snapshot, and leave the -wal/-shm out entirely: they
-            # describe the source's transaction state, not the copy's.
-            _restage_databases(src_dir, dst_dir, bundle_root=stage, on_skip=_record_skip)
+            with ExitStack() as admission:
+                if tree == MEMORY_STORES_DIR_NAME:
+                    # The manifest copy and database backup must see the same generation.
+                    admission.enter_context(hold_stores_for_read(src_dir))
+                _copytree_safe(
+                    src_dir,
+                    dst_dir,
+                    allow_unpinned=allow_unpinned,
+                    on_skip=_record_skip,
+                    ignore=_staging_ignore(tree, src_dir),
+                )
+                # Include WAL-resident rows through SQLite's backup API, without copying
+                # sidecars that belong to the live database rather than this snapshot.
+                _restage_databases(src_dir, dst_dir, bundle_root=stage, on_skip=_record_skip)
 
         # Manifest
         ws_files = sum(1 for _ in (stage / "workspace").rglob("*") if _.is_file())
         pm_files = sum(1 for _ in (stage / "plan_memory").rglob("*") if _.is_file())
         sk_dir = stage / "skills"
         sk_count = sum(1 for _ in sk_dir.iterdir() if _.is_dir()) if sk_dir.is_dir() else 0
+        ms_dir = stage / MEMORY_STORES_DIR_NAME
+        ms_count = sum(1 for _ in ms_dir.iterdir() if _.is_dir()) if ms_dir.is_dir() else 0
         # Recorded so a reader can tell how the archive was built. "unpinned" means
         # the trees were walked by name, which an ancestor swap during staging could
         # have redirected. Someone deciding whether to trust this archive needs that
         # on the record rather than in the memory of whoever ran the command.
         staging_mode = "pinned" if pinned else "unpinned"
         manifest = {
-            "version": 3,
+            "version": MANIFEST_VERSION,
             "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "hostname": socket.gethostname(),
             "user": os.environ.get("USER", "unknown"),
@@ -1898,6 +2086,7 @@ def _build_snapshot(
                 "workspace_files": ws_files,
                 "plan_memory_files": pm_files,
                 "skill_count": sk_count,
+                "memory_store_count": ms_count,
             },
         }
         (stage / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1915,11 +2104,7 @@ def _build_snapshot(
         try:
             with tarfile.open(str(tmp_tar), "w:gz") as tar:
                 tar.add(str(stage), arcname=arcname, filter=_data_filter)
-            # Lock the archive down BEFORE it is published. Carried over from main's
-            # #5317 during the rebase: this block was extracted out of snapshot_main
-            # into this function, and main had meanwhile moved the lockdown to before
-            # the rename, so taking this side of the conflict wholesale would have
-            # silently dropped that fix.
+            # Lock the archive down BEFORE it is published.
             #
             # This tarball can contain sel_hmac.key, and the window between the rename
             # and a lockdown applied afterwards is not Windows-only: tarfile does not
@@ -2065,13 +2250,12 @@ def snapshot_main(
         if total_mb > 500:
             print(f"⚠️  {mc} is {total_mb:.0f} MB — snapshot may be large and slow")
 
-    # NO pre-staging WAL checkpoint. There used to be one here, and removing it is the
-    # point rather than an omission: it was the ONLY write this command made to the live
-    # database, and it could not be made safe. A checkpoint cannot run read-only, so the
-    # name has to be reopened for writing -- and verifying the name first does not close
-    # that, because SQLite re-resolves it, so a swap in the window between the check and
-    # the open put the checkpoint's WRITE into whatever the name then pointed at,
-    # truncating an external database's log. Review's finding, and the remedy it asked for.
+    # NO pre-staging WAL checkpoint, deliberately: it would be the ONLY write this command
+    # makes to the live database, and it cannot be made safe. A checkpoint cannot run
+    # read-only, so the name has to be reopened for writing -- and verifying the name first
+    # does not close that, because SQLite re-resolves it, so a swap in the window between
+    # the check and the open puts the checkpoint's WRITE into whatever the name then points
+    # at, truncating an external database's log.
     #
     # Nothing the archive depends on is lost. The backup API reads a consistent snapshot
     # that already INCLUDES rows living only in the `-wal`: measured against a
@@ -2203,6 +2387,8 @@ def _print_manifest(snap: Path) -> None:
         print(f"  Skills: {c.get('skill_count', 0)}")
         print(f"  Notifications: {c.get('notifications_jsonl', 0) // 1024} KB")
         print(f"  Plan memory files: {c.get('plan_memory_files', 0)}")
+        if "memory_store_count" in c:
+            print(f"  Named memory stores: {c.get('memory_store_count', 0)}")
         # Both of these are the record that makes an incomplete or weaker archive
         # visible. A value written but never displayed is only findable by untarring
         # the archive by hand, which is not a reader -- so they are shown here, where
@@ -2341,21 +2527,32 @@ def _usable_cron_shape(parsed: object, path: Path) -> bool:
     return True
 
 
-def _merge_crons(src_path: Path, dst_path: Path) -> None:
+def _merge_crons(src_path: Path, dst_path: Path) -> bool:
+    """Merge the archive's cron jobs into the live store.
+
+    Returns ``True`` when the merged store was written, ``False`` when the
+    merge was refused: an unreadable source, an unreadable destination, or an
+    unusable cron shape on either side. The refusal diagnostics stay on
+    stdout, but a print is invisible to a caller with no terminal — the
+    dashboard import reported "crons (merged)" over a refusal that imported
+    zero jobs — so the outcome is also returned for the caller to report.
+    A failing WRITE of the merged store is not a refusal: the ``OSError``
+    propagates, which is the loud behavior the caller's error path expects.
+    """
     # Cron job names are operator-authored text and routinely non-ASCII, so the
     # locale codepage is the wrong decoder for this file on any host.
     try:
         src = json.loads(src_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         print(f"  ⚠️  Could not read {src_path}: {exc} — skipping cron merge")
-        return
+        return False
     try:
         dst = json.loads(dst_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         print(f"  ⚠️  Could not read {dst_path}: {exc} — skipping cron merge")
-        return
+        return False
     if not _usable_cron_shape(src, src_path) or not _usable_cron_shape(dst, dst_path):
-        return
+        return False
     existing = {j.get("name") for j in dst.get("jobs", [])}
     imported = 0
     for job in src.get("jobs", []):
@@ -2368,28 +2565,704 @@ def _merge_crons(src_path: Path, dst_path: Path) -> None:
     dst_path.write_text(json.dumps(dst, indent=2), encoding="utf-8")
     total = len(src.get("jobs", []))
     print(f"  Cron jobs imported: {imported} (skipped {total - imported} duplicates)")
+    return True
+
+
+_TERMINATORS = (b"\n", b"\r")
+
+# Longest single notification record either side of the merge will materialise.
+# Both trees are agent-writable and the read feeds an append to a durable file,
+# so an over-cap record aborts rather than being skipped. Named here, and read at
+# call time, so a test can move the dial instead of writing a 128 MiB fixture --
+# the same reason `subagent_cost` names its own.
+_NOTIFICATION_RECORD_CAP = RECORD_CAP
+
+# Largest notification SOURCE this will hold, in bytes. A whole-FILE cap, which the
+# streaming predecessor did not need and the single-read design does: the per-record
+# cap above bounds one record, not a file made of many.
+#
+# Sized from the destination's own invariants rather than from a sample.
+# ``_MAX_PERSISTED_NOTIFICATIONS`` is 200; ``_maybe_trim_notifications`` runs after
+# EVERY append and trims past 200*2; the loader keeps the last 200 and every rewrite
+# writes the last 200. So the live file is self-bounding at 400 records at all times,
+# and anything beyond 200 is discarded on the next read regardless -- installing more
+# than that is transient by construction, which is why refusing a larger source costs
+# the operator nothing real. Measured on a live install: 207 records, 370,107 bytes,
+# largest single record 20,821 bytes. 400 of that largest record is 8,316,000 bytes,
+# so this is ~4x the product-bounded worst case and a quarter of the per-record cap
+# the same file already accepts for ONE record.
+#
+# Peak held is about twice the SOURCE size, not twice this cap: the read accumulates in
+# 1 MiB chunks for that reason. A single `read(cap + 1)` preallocates the whole limit,
+# which made an 8 MB source cost 32 MiB and tied the peak to the constant rather than to
+# the file. Measured on the shipped code: 15.9 MiB for the 8.3 MB worst case below, and
+# 1.0 MiB for a realistic 207-record file. Both far under the 128 MiB single allocation
+# above.
+#
+# Over-cap is a REFUSAL naming the size, never a truncation and never a silent skip.
+# A cap that dropped the tail would recreate the defect this design removes, one layer
+# up: a partial install reported as success.
+_NOTIFICATION_SOURCE_CAP = 32 * 1024 * 1024
+
+
+def _notification_key(record: bytes, path: Path) -> tuple[Any, ...] | None:
+    """The dedupe key for one raw notification record, or ``None`` if it has none.
+
+    Well-defined and hashable for EVERY record shape. A naive
+    ``json.loads(line).get("ts") or line.strip()`` is not: a non-object record
+    raises ``AttributeError`` off ``.get``, and a list or dict ``ts`` raises
+    ``TypeError`` on set insert, and both escape as an aborted restore.
+
+    A ``ts`` is used whenever it is truthy AND hashable, which is every JSON
+    scalar. Restricting it to ``str`` is WORSE than keying a numeric ``ts`` on
+    the number: two rows carrying the same numeric ``ts`` with different bytes
+    -- one normalised, one not -- have to deduplicate, and keying them on their
+    raw form instead persists a duplicate. Only an unhashable ``ts``, which
+    cannot be a set member at all, falls through to the raw form.
+
+    The ``ts`` goes into the key under a KIND TAG that is deliberately coarser
+    than its Python type, because two different equalities are in play at once
+    and a naive tag gets one of them wrong:
+
+    * ``True == 1`` and ``hash(True) == hash(1)``, so an untagged key makes a row
+      with ``ts: true`` and a row with ``ts: 1`` one set member and DELETES the
+      second as a duplicate.
+    * ``1 == 1.0`` and they hash equal too, so tagging with
+      ``type(ts).__name__`` splits a row written as an integer here and a float
+      there -- an ordinary serializer artefact -- into two records and PERSISTS a
+      duplicate.
+
+    An earlier revision hit each of those in turn. One tag covers both: integers
+    and floats share ``"num"`` so they still deduplicate exactly as the
+    predecessor's bare-value key did, while ``bool`` is its own tag. ``bool`` is
+    tested first because it is a SUBCLASS of ``int``, so an ``isinstance(ts,
+    int)`` check would swallow it.
+
+    A record with no usable ``ts`` falls back to its RAW BYTES, and a record that
+    does not PARSE gets no key at all. The split is the fix. The predecessor fell
+    back to ``line.strip()`` for both, and stripping is what deleted bytes: it
+    makes two DISTINCT byte sequences share a key. Unstripped bytes cannot --
+    byte-equal records ARE the same record, so collapsing them loses nothing.
+    Withholding a key from an unparseable record covers the remaining case,
+    because the fragments a split record produces are exactly the unparseable
+    ones.
+
+    That is reachable, not theoretical, and it is why the two cases are separated.
+    A crash mid-append leaves a truncated row in the live file -- say ``b'{"a":
+    "x'``. A source record holding a bare carriage return is split at it, because
+    this reader's boundaries are the universal-newline set, yielding ``b'{"a":
+    "x\r'``. Those two are NOT byte-equal, but they STRIP to the same thing, so
+    the predecessor skipped the fragment as a duplicate, appended only the tail,
+    and left the live file with a line parsing as neither while the source's bytes
+    were gone. Measured on real bytes, before and after: stripping loses them,
+    raw bytes do not. The fragment is also unparseable, so it takes the ``None``
+    path and is doubly protected.
+
+    So a ``ts``-less row that parses IS deduplicated, on bytes -- which keeps the
+    predecessor's idempotence for a re-run without keeping the deletion. Only an
+    unparseable record is appended unconditionally.
+    Duplicating a row is recoverable; deleting one is not. ``_merge_notifications``
+    validates the whole source before appending anything so that a FAILED merge
+    does not leave a prefix for a retry to duplicate.
+
+    The kind tag also keeps the two families apart: ``json.loads`` can only
+    produce ``dict``, ``list``, ``str``, ``int``, ``float``, ``bool`` or ``None``,
+    so ``type(ts).__name__`` is never ``"raw"`` and a byte key can never collide
+    with a ``ts`` key.
+
+    Raises :class:`UndecodableRecord` for a record that is not valid UTF-8,
+    which is how the encoding property is enforced: this decode VALIDATES and
+    the result is used only for the key, while what gets appended is always the
+    original bytes. Validating by decoding and then writing the decoded form
+    back is what makes the copy non-byte-exact in the first place.
+    """
+    try:
+        text = record.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise UndecodableRecord(f"record is not valid UTF-8 in {path!r}") from exc
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        # A record that does not PARSE keeps no key, so it is never skipped.
+        # Deliberately not byte-keyed: framing splits a record at a bare
+        # carriage return, and the fragments of a split record are exactly the
+        # unparseable ones. Leaving them unkeyed is what makes "a fragment is
+        # never mistaken for a record already present" structural rather than a
+        # property of whichever collision one happens to think of.
+        return None
+    ts = parsed.get("ts") if isinstance(parsed, dict) else None
+    # Truthiness reproduces the predecessor's `or` fallback: an absent, empty or
+    # zero ts fell through to the line itself, and now falls through to None.
+    if ts:
+        try:
+            hash(ts)
+        except TypeError:
+            pass
+        else:
+            # `bool` first: it is a subclass of `int`, so the numeric arm would
+            # otherwise swallow it and re-create the True/1 collision.
+            if isinstance(ts, bool):
+                kind = "bool"
+            elif isinstance(ts, (int, float)):
+                kind = "num"
+            else:
+                kind = type(ts).__name__
+            return (kind, ts)
+    # No usable ``ts``, but the record PARSED -- so it is a whole record a
+    # producer wrote, not a framing fragment, and its raw bytes are an identity
+    # it is safe to deduplicate on. RAW, and never stripped: the predecessor's
+    # ``line.strip()`` is what deleted bytes, because stripping makes two
+    # DISTINCT byte sequences share a key -- a fragment ending in a carriage
+    # return strips to a crash-truncated row that does not contain one. Keying on
+    # the unstripped bytes cannot do that: byte-equal records ARE the same
+    # record, so a collapse here loses no information, while a stripped key
+    # collapses records that differ. That distinction is the whole fix.
+    #
+    # The key is the bytes that LAND, not the bytes that arrive. The append below
+    # terminates an unterminated record, so keying the arriving form makes a
+    # re-import compare an unterminated source row against the terminated row it
+    # itself wrote, miss, and append a second copy. Normalising here uses the
+    # SAME predicate as that write, so the two cannot drift.
+    #
+    # The direction matters and only one of the two is safe. Normalising by
+    # ADDING the terminator the writer adds is deterministic and merges only
+    # records that land identically. Normalising by REMOVING terminators would be
+    # ``rstrip``, and that is the predecessor's deleter wearing a different name:
+    # it maps ``X\r`` and ``X`` onto one key, which is precisely the fragment and
+    # crash-truncated-row pair above.
+    return ("raw", record if record.endswith(_TERMINATORS) else record + b"\n")
 
 
 def _merge_notifications(src_path: Path, dst_path: Path) -> None:
-    existing: set[str] = set()
-    with open(dst_path) as f:
-        for line in f:
-            try:
-                existing.add(json.loads(line).get("ts") or line.strip())
-            except (ValueError, TypeError):
-                pass
-    imported = 0
-    with open(dst_path, "a") as out, open(src_path) as f:
-        for line in f:
-            try:
-                key = json.loads(line).get("ts") or line.strip()
-                if key not in existing:
-                    out.write(line)
+    """Append the snapshot's notification records to the live file, byte for byte.
+
+    This is the only merge that COPIES records rather than consuming them, so
+    reading faithfully is not the whole contract -- the bytes must also be valid
+    for the destination. Both handles are BINARY and framing comes from
+    :func:`strict_raw_records`, because the text-mode predecessor was a locale
+    decode followed by a locale encode and neither half was byte-exact:
+
+    * Universal-newline translation on read, ``os.linesep`` on write. A record
+      terminated ``\\r\\n`` was appended as ``\\n`` -- a byte silently dropped --
+      and a bare ``\\r`` INSIDE a record split it in two, so both halves failed
+      ``json.loads``, the ``except`` swallowed both, and the record was lost
+      while the function printed success. Both fire on a pure UTF-8 host with
+      fully valid UTF-8 input, so an explicit ``encoding=`` does not address
+      them; ``newline=`` is a separate axis and binary mode closes both at once.
+    * The locale codec decided whether an invalid-UTF-8 record aborted the
+      restore or was delivered into the live file. ``for line in f`` decodes
+      OUTSIDE the ``try``, so ``UnicodeDecodeError`` -- a ``ValueError`` --
+      escaped the ``except (ValueError, TypeError)`` because the iterator raised
+      it, not ``json.loads``. On a UTF-8 host that aborted the restore with a
+      traceback; under a single-byte locale the decode succeeded, the encode put
+      the same bytes back, and the live file stopped being valid UTF-8 -- after
+      which its loader returns NO rows for the whole file and the next rewrite
+      persists that empty view.
+
+    The posture is ABORT, never skip, because the output feeds a durable write
+    and a skipped record is a deleted one. Abort means RAISE, not warn: this
+    function's callers report an outcome to somebody. ``apply_import_zip``
+    appends ``notifications (merged)`` to its summary and the dashboard handler
+    answers ``ok: True`` with a SEL ``outcome="ok"``, and a printed warning is
+    invisible to both -- so warn-and-return would tell an API caller the import
+    succeeded while records were left behind. The print stays so a CLI operator
+    reads the reason before the traceback. This is why it differs from
+    ``_merge_crons``, which warns and returns: a refused cron merge writes
+    nothing and skips one component, while this one may already have appended a
+    prefix, and the caller has to learn the write is incomplete.
+
+    * A destination-scan failure is still a true no-op -- the destination is not
+      even opened for append until that scan has completed.
+    * The SOURCE is validated whole before the destination is opened for append,
+      so a source-side refusal is also a no-op. Without that pass, a source whose
+      Nth record is undecodable had already appended N-1 records when it aborted,
+      and a retry re-appended every identity-less one of them, since a row with
+      no ``ts`` cannot be deduplicated. The cost is reading the source twice.
+    * A failure DURING the copy is therefore the residual case -- the source
+      changed between the two passes -- and its prefix stays. Rolling it back
+      would be a second unvalidated write to the live file.
+
+    Every appended record ends with a terminator, and an unterminated final
+    record already in the destination gains one before anything is appended
+    after it. Without that, two records glued into one line that parses as
+    neither.
+    """
+    existing: set[tuple[Any, ...]] = set()
+    dst_unterminated = False
+    try:
+        with open(dst_path, "rb") as f:
+            for record in strict_raw_records(f, dst_path, cap=_NOTIFICATION_RECORD_CAP):
+                key = _notification_key(record, dst_path)
+                if key is not None:
                     existing.add(key)
-                    imported += 1
-            except (ValueError, TypeError):
-                pass
+                dst_unterminated = not record.endswith(_TERMINATORS)
+    except (OSError, UnreadableRecord) as exc:
+        # No `_safe_name` here, deliberately: this path is the LIVE data home,
+        # chosen by the operator, not a name that came out of an archive -- which
+        # is the scope `_safe_name`'s own docstring states. The SOURCE prints do
+        # wrap it; see the one below.
+        print(f"  ⚠️  Could not read {dst_path}: {exc} — merge aborted")
+        raise
+    # The ENTIRE source is validated before the destination is opened for append.
+    # Without this pass, a source whose Nth record is undecodable or over-cap has
+    # already appended N-1 records by the time it aborts -- and a retry
+    # re-appends every identity-less one of those, because a row with no ``ts``
+    # cannot be deduplicated by construction. Validating first makes the source
+    # side all-or-nothing in the ordinary case, so there is no prefix to
+    # duplicate.
+    try:
+        with open(src_path, "rb") as f:
+            for record in strict_raw_records(f, src_path, cap=_NOTIFICATION_RECORD_CAP):
+                _notification_key(record, src_path)
+    except (OSError, UnreadableRecord) as exc:
+        # The PATH goes through `_safe_name` because a bundle chooses its own inner
+        # root, so an archive-derived path can carry ANSI controls -- and printing
+        # one raw lets a hostile archive move the cursor and overwrite lines right
+        # above the prompt where the operator decides whether to trust the restore.
+        #
+        # The EXCEPTION deliberately does NOT, and the invariant is worth stating
+        # because it is what makes the wrapper unnecessary rather than forgotten:
+        # both types this arm catches already render an embedded path with
+        # repr-style escaping -- `OSError.__str__` does it for its filename, and
+        # `jsonl_util` uses `{path!r}` for the reason its own comment gives.
+        # Measured: a control character in a directory name reaches neither
+        # exception's `str()` raw. Widening this `except` tuple means re-checking
+        # that, because a type formatting a path with `str()` would need the wrapper.
+        print(f"  ⚠️  Could not read {_safe_name(src_path)}: {exc} — merge aborted")
+        raise
+    imported = 0
+    try:
+        with open(dst_path, "ab") as out, open(src_path, "rb") as f:
+            if dst_unterminated:
+                out.write(b"\n")
+            for record in strict_raw_records(f, src_path, cap=_NOTIFICATION_RECORD_CAP):
+                key = _notification_key(record, src_path)
+                # A `None` key means the record did not PARSE, so it may be a
+                # framing fragment rather than a record -- nothing it could be a
+                # duplicate OF. Both `existing.add` sites refuse `None`, which is
+                # what keeps it out of this membership test; an unconditional
+                # `key is not None` here would be dead, and a mutation proved it
+                # unobservable. A ts-less row that DOES parse is keyed on its raw
+                # bytes and deduplicates normally; see _notification_key for why
+                # raw and not stripped.
+                if key in existing:
+                    continue
+                out.write(record if record.endswith(_TERMINATORS) else record + b"\n")
+                if key is not None:
+                    existing.add(key)
+                imported += 1
+    except (OSError, UnreadableRecord) as exc:
+        # Reached only when the source changed BETWEEN the validation pass and
+        # this one, so the prefix already appended stays: rolling it back would
+        # be a second unvalidated write. Names the count so an operator knows a
+        # prefix landed, and identity-less rows in it will re-append on a retry.
+        print(f"  ⚠️  Stopped merging {_safe_name(src_path)} after {imported} record(s): {exc}")
+        raise
     print(f"  Notifications imported: {imported}")
+
+
+def _serialise_with_notification_writes(work: Callable[[], None]) -> None:
+    """Run *work* in FIFO order with the dashboard's own notification writes.
+
+    ``_install_notifications`` writes the live ``notifications.jsonl`` while the
+    gateway may be writing it too, and ``O_APPEND`` alone is not enough. It stops a
+    concurrent row being OVERWRITTEN, and then orders it BEFORE the archive's rows:
+    the dashboard's append goes to end-of-file immediately while the copy's writes are
+    still buffered, so the live row lands first and the archive's follow it. The
+    reader's cap is POSITIONAL -- ``_load_notifications`` keeps the last
+    ``_MAX_PERSISTED_NOTIFICATIONS`` rows, not the newest by timestamp -- so importing
+    a full 200-record history pushes the live row out of the window. Measured: a note
+    delivered mid-copy landed at line 0 of 201 and the reader returned 200 rows
+    without it. The loss is silent: the operator was told the notification was
+    delivered, and after the next reload it is gone.
+
+    Notification persistence runs on ONE worker in submission order
+    (``_notification_io_executor``), so running the copy on that same worker is what
+    makes the two ordered rather than concurrent. A queued append then runs strictly
+    after the copy and lands at the end of the file, where the cap keeps it.
+
+    The trap in deciding whether to serialise is treating the absence of an OBSERVABLE
+    writer as the absence of a writer. "No pool" does not mean "no writer"; the writer is
+    what makes the pool. A fresh gateway has persisted nothing, so its pool is ``None``,
+    and a copy running inline on that basis races a delivery arriving at that moment: the
+    delivery CREATES the executor and appends through it, concurrently, putting the live
+    row back at line 0 of 201 and outside the reader's window. A broad
+    ``except Exception`` on the import one line above is the same error in another form:
+    it turns "I could not check" into "there is nothing to check", losing the ordering
+    silently inside a live gateway.
+
+    So this ACQUIRES rather than asks. ``_notification_io_executor()`` creates the
+    worker if there is none and returns the existing one if there is. That removes the
+    "is there a pool" question outright and narrows the import case to ``ImportError``.
+
+    TWO inline cases remain, and neither reads an absence of OBSERVATION as an absence
+    of a writer:
+
+    1. Already ON the worker. Then we ARE the ordering point, and submitting would wait
+       for a queue only this call can drain -- a deadlock rather than a race.
+    2. The dashboard module does not import. A missing MODULE is categorically different
+       from a missing pool: the sink lives in that module, so if it is not importable
+       there is no writer that could exist, rather than none currently visible. That is
+       the CLI restore. Narrowed to ``ImportError`` precisely so it cannot absorb
+       anything else -- a module that fails to import for any OTHER reason is a real
+       failure and must surface rather than quietly degrade the guarantee.
+
+    Acquiring costs the CLI path one idle worker thread. That is a short-lived process
+    and the thread exits at interpreter shutdown; a silent ordering hole is permanent, so
+    the trade is not close.
+
+    The executor is released as soon as *work* returns OR raises: ``result()``
+    re-raises rather than swallowing, so the failure path needs no separate release
+    and cannot leave notification writes blocked.
+
+    Relying on that executor for ordering means its own CREATION has to be ordered too.
+    An unlocked check-then-set would let two threads each observe ``None``, each build a
+    pool, and never be serialised against one another -- which would void this guarantee
+    rather than weaken it. ``dashboard/state.py`` takes a lock around the lazy init, so
+    acquiring the executor is itself race-free.
+    """
+    try:
+        from kiro_crew.dashboard import state as dashboard_state
+    except ImportError:
+        work()
+        return
+    if threading.current_thread().name.startswith("notif-io"):
+        work()
+        return
+    dashboard_state._notification_io_executor().submit(work).result()
+
+
+class NotificationCopyUnsupported(Exception):
+    """This platform cannot install notification records safely, so it does not.
+
+    Deliberately not an ``OSError``: the copy's own error arm catches ``OSError`` and
+    re-raises it as a failed import, which is the wrong shape for "this platform was
+    never able to do this". A distinct type lets the callers report a SKIP, and an
+    unhandled one still aborts rather than passing silently.
+    """
+
+
+def _copy_notifications(src_path: Path, dst_path: Path) -> None:
+    """Install the snapshot's notification records, ordered against the live writer.
+
+    Refuses outright where ``O_NOFOLLOW`` does not exist -- see below. The refusal is
+    made HERE, before the executor is acquired and before anything is opened, because
+    it is a question about the platform rather than about this source.
+
+    The whole body runs on the dashboard's notification worker when one exists, so a
+    row the gateway delivers during the restore cannot be ordered ahead of the
+    archive's and dropped by the reader's positional cap. See
+    :func:`_serialise_with_notification_writes` for why ``O_APPEND`` alone was not
+    enough, and note the cost: a restore briefly blocks notification writes. A
+    restore is rare and user-initiated; a lost notification is silent and permanent.
+
+    WHY A MISSING ``O_NOFOLLOW`` REFUSES INSTEAD OF FALLING BACK. The predecessor
+    checked ``pinned_fs.is_reparse_point(src_path)`` by NAME and then opened the same
+    NAME. Against an adversary that is not a floor, it is a check-to-open window: the
+    threat model this function is written for -- stated in ``_install_notifications``
+    and demonstrated by the revision review blocked -- is a concurrent agent replacing
+    the extracted file, and such an agent chooses the timing. The descriptor check does
+    not save it either: ``fstat`` asserts ``S_ISREG``, and a reparse point resolving to
+    a regular ``.env`` passes ``S_ISREG``. So on a platform with no ``O_NOFOLLOW`` there
+    is no sequence of by-name checks that makes this safe, and the honest move is to not
+    do it.
+
+    The alternative -- a ctypes ``CreateFileW`` with ``FILE_FLAG_OPEN_REPARSE_POINT`` --
+    is declined, and not by me: ``eval/bench/safepath.py`` records that it "is no longer
+    worth considering here: it would buy the same property exclusive creation already
+    has, at the price of security code that cannot be exercised on the machine this
+    harness is developed on", and ``skill_trust.py`` records that Python "does not expose
+    an equivalent handle-relative, no-reparse walk on Windows". Both decline the capable
+    route, which means this repo has already chosen less capability on that platform over
+    a hand-rolled walk. Refusing extends those two decisions; falling back contradicts
+    them.
+
+    The cost is not symmetric, which is what makes the trade easy. Refusing loses
+    notification HISTORY on one platform for one operation -- the records remain in the
+    snapshot and nothing is destroyed. Falling back can put attacker-chosen bytes, a
+    credentials file among them, into a location the agent then reads. And this PR exists
+    because snapshot restore installed unvalidated bytes: a remaining path that installs
+    attacker-chosen bytes is the same defect, closed everywhere except where it is
+    hardest.
+
+    The refusal is LOUD and the callers report the skip. A silent skip would be the same
+    class of bug as the one being fixed, so the message names the platform, the missing
+    primitive, and what was not imported.
+    """
+    if not getattr(os, "O_NOFOLLOW", 0):
+        raise NotificationCopyUnsupported(
+            f"this platform ({os.name}) has no O_NOFOLLOW, so the notification source "
+            "cannot be opened with any guarantee that the name checked is the file "
+            "read -- a by-name reparse-point check followed by a by-name open is a "
+            "window a concurrent writer chooses the timing of, and fstat's S_ISREG "
+            "does not close it because a reparse point to a regular file passes it. "
+            "Refusing rather than importing bytes that may not be the archive's: "
+            f"{_safe_name(src_path)} was NOT imported and remains in the snapshot"
+        )
+    _serialise_with_notification_writes(lambda: _install_notifications(src_path, dst_path))
+
+
+def _install_notifications(src_path: Path, dst_path: Path) -> None:
+    """Install the snapshot's notification records where the live file does not exist yet.
+
+    The sibling of ``_merge_notifications``, and the reason it exists separately
+    is that the two branches of one ``if`` had different postures: the merge
+    validates every source record's encoding and ABORTS on one it cannot deliver
+    intact, while this branch was ``shutil.copy2`` and validated nothing. A
+    byte-exact copy is correct as a copy and that is exactly the problem -- it
+    faithfully installs bytes the destination's own reader refuses.
+    ``_load_notifications`` decodes the WHOLE file inside one ``try`` that
+    returns ``[]``, so one invalid byte costs every row, and the next
+    ``_rewrite_notifications`` -- any delete, ack or clear -- persists that empty
+    view. Unlike the merge this fired on every locale, because nothing decoded on
+    the way in, and it fired on a fresh install or a first restore, where the
+    operator has the least reason to suspect anything.
+
+    So the posture matches the merge: ABORT, never accept, never skip. That is not
+    a new product decision, it is the decision the merge branch already carries --
+    a snapshot with an undecodable record aborted the restore when a live file
+    existed and was installed silently when one did not.
+
+    It is a SEPARATE function rather than a call into the merge with an empty
+    destination, and both halves of that were measured, not assumed:
+
+    * ``_merge_notifications`` opens the destination for READ first, so a missing
+      one raises ``FileNotFoundError`` out of the arm that guarantees a
+      destination-scan failure is a true no-op. Teaching that arm to tell
+      "missing, fine" from "unreadable, abort" reopens the fail-closed posture
+      that arm exists for.
+    * The merge DEDUPLICATES against what it has already written, which a copy
+      must not: run four source records -- two sharing a ``ts``, two byte-identical
+      without one -- through a merge into an empty destination and two land. There
+      is nothing here to deduplicate against, so keying source records against
+      each other converts a faithful copy into a lossy one.
+
+    Every path here is resolved to a descriptor EXACTLY ONCE and all later work goes
+    through that descriptor. That invariant closes a whole class rather than single
+    instances of it: the defect is an operation resolving a name more than once where
+    another process can change what the name means, and a fix that only re-checks moves
+    which name is vulnerable instead of removing the second resolution. The source is
+    opened once
+    ``O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_BINARY`` and read once, never seeked; the
+    destination is created once
+    ``O_CREAT|O_EXCL|O_WRONLY|O_APPEND|O_NOFOLLOW|O_BINARY``. The
+    remaining uses of either path -- ``_safe_name`` in the messages, and the ``path``
+    argument to ``strict_raw_records`` and ``_notification_key`` -- resolve nothing:
+    both callees only interpolate it into an error string.
+
+    That invariant is descriptor-bound on POSIX and CANNOT be on Windows, which has no
+    ``O_NOFOLLOW``: there the flag is 0. The predecessor put a by-name reparse-point
+    check in front of the open and treated it as a floor; it is not one, because a
+    by-name check followed by a by-name open is a window the concurrent agent in this
+    threat model chooses the timing of, and ``fstat``'s ``S_ISREG`` does not close it --
+    a reparse point resolving to a regular ``.env`` passes it. So this function is not
+    reached at all on such a platform: :func:`_copy_notifications` refuses the copy
+    before acquiring the executor. Naming the split rather than implying it, because
+    the two genuinely differ in what they can promise -- POSIX refuses a link inside
+    the open syscall, and a platform without the flag does not attempt the copy.
+
+    The caller reaches this branch on ``sn.is_file()`` and ``not dn.is_file()``, which
+    are by-name and therefore advisory. They are not trusted: each is confirmed or
+    refuted by the single authoritative resolution here. A destination that filled
+    after the check fails ``O_EXCL``, and a source that became a link or a FIFO fails
+    ``O_NOFOLLOW`` or the ``S_ISREG`` check on the descriptor. What is NOT closed here
+    is the ancestor chain -- both opens name a directory rather than a pinned
+    descriptor -- and that is deliberate: every core-file copy in this function
+    reaches its path the same way, so pinning one of ten sites would be the point
+    patch review already named. It is an axis for its own change.
+
+    ONE read of the source, and the ordering is the whole design:
+
+    1. The source is read ONCE, whole, under a byte cap, and the file is never
+       touched again. Everything after that reads the bytes in hand.
+    2. Those bytes are validated in full. A refusal here happens with the
+       destination never created, so there is nothing to roll back -- which matters
+       because there is no safe rollback: creating the live file and unlinking it on
+       refusal loses data -- ``apply_import_zip`` runs inside the live gateway, so the
+       dashboard's notification sink can append to that file first and the unlink
+       takes the operator's notification with it.
+    3. The destination is then created
+       ``O_CREAT|O_EXCL|O_WRONLY|O_APPEND|O_NOFOLLOW|O_BINARY`` and the validated
+       bytes are written. ``O_EXCL`` decides inside one syscall, so a name that
+       filled after the caller's ``is_file()`` check is refused rather than written
+       through -- a dangling symlink at that name included, which ``is_file()``
+       reports as absent and ``copy2`` followed, writing the archive's bytes outside
+       the data home.
+
+    Reading once is not an optimisation, it is what makes a whole class of defect
+    UNREPRESENTABLE rather than detected. Reading the file twice -- validate, then
+    install -- leaves a window with many different ways for the source to change
+    inside it: swapped for a symlink to a credential, reopened by name, truncated so
+    the second pass meets a clean EOF and reports success having installed fewer
+    records than it validated. Closing one variant only exposes the next, because a
+    check can only catch the case someone thought of. With the bytes held in memory
+    there is no name
+    left to resolve and no handle left open, so there is nothing for another process
+    to swap, truncate or extend. The two loops below are two passes over the same
+    immutable bytes, which is safe for exactly the reason two passes over the FILE
+    were not.
+
+    That trade needs a number, not a preference, and the number is the destination's
+    own bound: see ``_NOTIFICATION_SOURCE_CAP``. Peak held is about twice the SOURCE
+    size rather than twice the cap -- measured at 15.9 MiB for the 8.3 MB
+    product-bounded worst case and 1.0 MiB for a realistic 207-record file, against
+    the 128 MiB this same file already accepts for a SINGLE record. A source over the
+    cap is refused with its size named -- never truncated, never partially imported,
+    because a silently dropped tail is the defect being removed wearing a hat.
+
+    No temporary file, deliberately: a temp file in the data home is published through
+    a NAME, and a same-user process that can list that directory can swap what the name
+    holds between the write and the
+    publish -- which links bytes this function never validated into place as
+    ``notifications.jsonl``. The mitigations for that are inode verification on both
+    ends plus a non-hardlink fallback (``pinned_fs.put_back_no_clobber`` is the
+    repo's audited version, and its own docstring notes the landed check narrows the
+    window rather than closing it). Writing straight to an ``O_EXCL`` destination
+    needs none of it: there is no intermediate name to swap.
+
+    What this does NOT close: everything on the DESTINATION side. ``O_EXCL`` refuses a
+    name that filled, ``O_APPEND`` keeps a concurrent notification from being
+    overwritten, and both remain necessary -- the live file has other writers and
+    reading the source once says nothing about them. Only the read window is gone.
+
+    Records are written verbatim -- what is validated is the source's bytes, never a
+    decoded form of them -- with a single repair: an unterminated final record gains
+    a terminator. That is not cosmetic once the write is record-wise.
+    ``_persist_notification`` appends ``json.dumps(note) + "\\n"``, so the first
+    notification after the restore would otherwise glue onto an unterminated last
+    line and produce one line that parses as neither row. It is the same repair the
+    merge makes through ``dst_unterminated``.
+    """
+    # `_notification_key`'s result is discarded -- it is called for the
+    # `UndecodableRecord` it raises, which its own docstring documents as how the
+    # encoding property is enforced. Reusing the merge's predicate rather than
+    # inlining a second decode is what keeps the two branches' acceptance criteria
+    # identical, and a second decode is exactly how they drifted apart in the first
+    # place.
+    #
+    # The SOURCE is resolved exactly once and read exactly once. The revision before
+    # this one opened the name once per pass, and between the two a running agent
+    # could replace the extracted file with a symlink to `.env`: the second open
+    # followed it and the secret landed in an agent-readable `notifications.jsonl`.
+    # `O_NOFOLLOW` refuses a link at the name instead of following it -- consistent
+    # with `_backup_and_copy`, which already skips a symlinked file coming out of an
+    # archive -- and reading once removes the second resolution the flag was
+    # protecting.
+    #
+    # `O_NONBLOCK` closes the other way that by-name selection misleads this open,
+    # which review did not name: the caller chose this branch on `is_file()`, and a
+    # name that became a FIFO afterwards would block the open forever and hang the
+    # restore rather than failing it. The kind is then judged on the DESCRIPTOR with
+    # `fstat`, NOT by re-checking the name -- a second by-name check would be the
+    # same mistake one layer down, whereas a held descriptor cannot be swapped.
+    src_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    # 0o666 so the kernel applies the umask, giving the same mode as the `open(path,
+    # "a")` in `_persist_notification`: a restored file must not be tighter than one
+    # the product wrote itself.
+    #
+    # `O_APPEND` because the dashboard's notification sink writes to this same file
+    # with it, and its append goes to end-of-file while an ordinary write goes to
+    # THIS handle's offset. Buffered, that offset is stale by the time it flushes, so
+    # a notification delivered mid-copy would be overwritten by the flush. With
+    # `O_APPEND` every write lands at end-of-file, so the two writers
+    # interleave instead of clobbering. On the fresh file `O_EXCL` guarantees, it
+    # changes nothing about the ordinary outcome.
+    #
+    # `O_BINARY` on BOTH, because `os.open` is the one API here that can be in text
+    # mode: the repo documents it as required on Windows and every sibling passes it,
+    # `crash_dump_store.py` reaching for this exact read-flag triple. A no-op on
+    # POSIX, where the constant does not exist. It is a CONVENTION fix and not a
+    # corruption fix -- the corruption a review lane described is refuted by
+    # `test_a_clean_source_is_copied_record_for_record`, which asserts byte-exact
+    # `\\r\\n` survival through these very descriptors and passes on the Windows lane.
+    dst_flags = (
+        os.O_CREAT
+        | os.O_EXCL
+        | os.O_WRONLY
+        | os.O_APPEND
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    written = 0
+    opened_dst = False
+    try:
+        # No platform floor is attempted here. A platform with no `O_NOFOLLOW` to give
+        # never reaches this function: `_copy_notifications` refuses the whole copy up
+        # front, because a by-name `is_reparse_point` check followed by a by-name open
+        # is a check-to-open window and `fstat`'s `S_ISREG` does not close it -- a
+        # reparse point resolving to a regular `.env` passes it. So this open always
+        # carries a real `O_NOFOLLOW` and the refusal is decided by the open itself.
+        # An `lstat`-then-`fstat` identity comparison is deliberately NOT done -- that
+        # one pretends to close a window it merely narrows.
+        with os.fdopen(os.open(src_path, src_flags), "rb") as src:
+            if not _stat.S_ISREG(os.fstat(src.fileno()).st_mode):
+                raise OSError("source is not a regular file")
+            # ONE read of the file, and the file is not touched again. Chunked, and
+            # that is not incidental: `read(cap + 1)` in one call PREALLOCATES a
+            # buffer the size of the cap, so an 8 MB source cost 32 MiB and the peak
+            # was a function of the limit rather than of the file. Measured, which is
+            # the only reason it was noticed. Accumulating 1 MiB at a time keeps the
+            # peak proportional to the actual source.
+            #
+            # The cap is enforced on bytes ALREADY READ, not on a separately-stated
+            # size: `st_size` can be stale by the time it is compared, and the bytes
+            # in hand cannot be. Enforced inside the loop, so an oversized source is
+            # abandoned as soon as it crosses the line instead of being materialised
+            # first.
+            acc = bytearray()
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                if len(acc) + len(chunk) > _NOTIFICATION_SOURCE_CAP:
+                    raise OSError(
+                        f"notification source is at least "
+                        f"{len(acc) + len(chunk)} bytes, over the "
+                        f"{_NOTIFICATION_SOURCE_CAP} byte limit -- refusing rather "
+                        "than importing part of it"
+                    )
+                acc.extend(chunk)
+            blob = bytes(acc)
+        # Everything below reads MEMORY. The two loops are two passes over the same
+        # immutable bytes, which is what makes them safe where two passes over the FILE
+        # were not: nothing between them can swap the source for a symlink, truncate it,
+        # or append to it, because there is no name left to resolve and no file handle
+        # left open. The window is not detected here, it is unrepresentable.
+        #
+        # Framing goes through `strict_raw_records` over a `BytesIO` rather than a
+        # hand-rolled split, so the record boundaries are the SAME implementation the
+        # merge branch uses. A second splitter is how two paths drift apart, which is
+        # the defect this whole change exists to fix.
+        with io.BytesIO(blob) as buf:
+            for record in strict_raw_records(buf, src_path, cap=_NOTIFICATION_RECORD_CAP):
+                _notification_key(record, src_path)
+        with os.fdopen(os.open(dst_path, dst_flags, 0o666), "wb") as out:
+            opened_dst = True
+            with io.BytesIO(blob) as buf:
+                for record in strict_raw_records(buf, src_path, cap=_NOTIFICATION_RECORD_CAP):
+                    out.write(record if record.endswith(_TERMINATORS) else record + b"\n")
+                    written += 1
+    except (OSError, UnreadableRecord) as exc:
+        # Two outcomes, told apart by whether the destination was ever created:
+        # nothing written at all (a bad archive, a refused source, or a name that
+        # filled after the caller's check), or a prefix that STAYS. Every record in a
+        # prefix passed validation, and unlinking is what took a concurrent writer's
+        # file in the revision review blocked, so the count is named instead.
+        #
+        # `_safe_name` on the PATH because a bundle chooses its own inner root, so an
+        # archive-derived path can carry ANSI controls and printing one raw lets a
+        # hostile archive overwrite the lines right above the operator's prompt. The
+        # EXCEPTION does not need it, for the reason `_merge_notifications` states:
+        # both types this arm catches already render an embedded path with repr-style
+        # escaping.
+        tail = f"{written} imported" if opened_dst else "notifications not imported"
+        print(f"  ⚠️  Could not copy {_safe_name(src_path)}: {exc} — {tail}")
+        raise
 
 
 def _backup_and_copy(
@@ -2406,21 +3279,21 @@ def _backup_and_copy(
     *installed*, when given, is the rollback ledger, and this function is the ONLY place
     that may add a core file to it: a name goes in immediately before that file's own first
     mutation and never before, because the recovery leg reads membership as "this run
-    reached this path". The caller used to add every file the component DECLARES up front,
-    which is a different set -- a bundle may legitimately carry only some of them, and the
-    loops below SKIP the rest. Recovery then saw a file with no saved copy that was
-    nonetheless "installed", concluded the restore had created it, and deleted the
-    operator's untouched file. Recording per file is what makes membership mean what the
-    recovery leg already documents it to mean.
+    reached this path". Adding every file the component DECLARES up front is a different
+    set -- a bundle may legitimately carry only some of them, and the loops below SKIP the
+    rest. Recovery would then see a file with no saved copy that is nonetheless
+    "installed", conclude the restore created it, and delete the operator's untouched
+    file. Recording per file is what makes membership mean what the recovery leg already
+    documents it to mean.
 
-    The restore side used to compose ``mc / f`` and hand it to ``shutil.copy2``, so
-    the destination was reached by name every time. Two consequences, both real: a
-    component of the data home swapped for a link redirected the write out of the
-    data home entirely, and a symlink left at the core file's own name was written
-    THROUGH rather than refused -- the name-based ``islink`` check above skipped the
-    backup move and then the copy followed the link it had just declined to move.
+    Composing ``mc / f`` and handing it to ``shutil.copy2`` would reach the destination
+    by name every time. Two consequences, both real: a component of the data home
+    swapped for a link redirects the write out of the data home entirely, and a symlink
+    left at the core file's own name is written THROUGH rather than refused -- the
+    name-based ``islink`` check above skips the backup move and then the copy follows
+    the link it just declined to move.
 
-    Now the data home is pinned once and each file is created relative to that
+    Instead the data home is pinned once and each file is created relative to that
     descriptor with ``O_EXCL``. A name that is still occupied after the backup move
     is refused instead of written through, which is the symlink case above.
     """
@@ -2449,22 +3322,19 @@ def _backup_and_copy(
                 shutil.move(str(live), str(backup / f))
             # Not `copy2`: it opens the destination by name for writing and follows a
             # symlink planted there in the window after the live file was moved aside,
-            # overwriting whatever it points at. Review's finding. copy_file_pinned uses
+            # overwriting whatever it points at. copy_file_pinned uses
             # O_CREAT|O_EXCL|O_NOFOLLOW even without a directory descriptor, so a link at
             # the destination name is refused rather than written through.
             # `fatal_skip_reporter`, NOT `_report_skip`: the live file has ALREADY been
             # moved into the backup by this point, so a skip here is not an omission from
             # an archive -- it is the live file gone AND the archive's version never
-            # applied, reported as success. That is the whole reason this change has a
-            # fatal reporter, and this is the third site to need it: a skip is correct
-            # while PRODUCING an archive and is data loss on any path that has already
-            # moved or deleted the original. Review caught this site still holding the
-            # non-fatal one.
+            # applied, reported as success. That is the whole reason for a fatal
+            # reporter: a skip is correct while PRODUCING an archive and is data loss on
+            # any path that has already moved or deleted the original.
             # A collision here means something recreated the name after the live file was
             # moved aside. It is a real condition, not a skip, but it must not surface as a
-            # traceback: review found the same escape on the pinned tree walk, and this
-            # path had it too. The live bytes are recoverable from the backup, which is what
-            # the message has to say.
+            # traceback: the same escape exists on the pinned tree walk. The live bytes
+            # are recoverable from the backup, which is what the message has to say.
             try:
                 pinned_fs.copy_file_pinned(
                     str(snap / f),
@@ -2498,9 +3368,9 @@ def _backup_and_copy(
                     # nothing was restored, reported as success. Raised in review; the
                     # same validate-before-mutate ordering the platform gate follows.
                     # Asked through src_fd, not by composing a path. The by-name form
-                    # re-resolved the snapshot root, so a root swapped after pinning had
-                    # this guard inspecting the replacement while the copy below acted on
-                    # the descriptor -- review's finding, and the same class as the
+                    # re-resolves the snapshot root, so a root swapped after pinning
+                    # leaves this guard inspecting the replacement while the copy below
+                    # acts on the descriptor -- the same class as the
                     # destination-ownership check.
                     if not pinned_fs.is_regular_at(src_fd, f):
                         continue
@@ -2659,28 +3529,33 @@ def _lock_down_restored(path: Path, component: str) -> None:
         raise
 
 
-def _backup_tree_or_refuse(src: Path, dst: Path, *, allow_unpinned: bool = False) -> None:
+def _backup_tree_or_refuse(
+    src: Path,
+    dst: Path,
+    *,
+    allow_unpinned: bool = False,
+    ignore: Callable[[str, list[str]], set[str]] | None = None,
+) -> None:
     """Back a live tree up, and refuse the replace if the backup is not complete.
 
     Replace mode later runs ``rmtree`` on the live tree, so a file the backup pass
     SKIPPED is a file the restore is about to delete with no copy anywhere -- and the
     call site is deliberately hoisted ahead of every live mutation, so a refusal
-    arrives while nothing has been swapped yet (#2844). The staging
+    arrives while nothing has been swapped yet. The staging
     walk legitimately skips a hardlink alias, a symlink and a non-regular file -- which
     is right when producing an archive and catastrophic here, because the skip is
     followed by a delete rather than by an omission.
 
-    This was the second of the two findings that closed the earlier attempt at this
-    change (#2446): a concurrent writer's hardlinks were skipped at backup time and then
-    ``rmtree`` removed the only copies. Raised again in review against this diff, which
-    had carried the same shape forward. Refusing before the delete is the only ordering
-    that cannot lose data: the operator keeps a complete tree and a message naming what
-    could not be copied.
+    Without the refusal, a concurrent writer's hardlinks are skipped at backup time and
+    then ``rmtree`` removes the only copies. Refusing before the delete is the only
+    ordering that cannot lose data: the operator keeps a complete tree and a message
+    naming what could not be copied.
     """
     _copytree_safe(
         src,
         dst,
         allow_unpinned=allow_unpinned,
+        ignore=ignore,
         on_skip=pinned_fs.fatal_skip_reporter(f"backup of {src.name!r} before replacing it"),
     )
 
@@ -2760,13 +3635,17 @@ def _refuse_corrupt_source_databases(
           `memory.db` is ABSENT, whatever the index's own destination looks like. Keying on
           the index's own path let a corrupt index overwrite a healthy one.
 
-        Everything else is installed only where its own destination is missing.
+        Named stores are installed only where the whole store is absent. Other tree
+        files are installed only where their own destination is missing.
         """
         assert mc_for_merge is not None
         if rel == "crons.json":
             return True
         if rel == "memory_index.db":
             return not (mc_for_merge / "memory.db").exists()
+        parts = PurePosixPath(rel).parts
+        if len(parts) >= 2 and parts[0] == MEMORY_STORES_DIR_NAME:
+            return not (mc_for_merge / MEMORY_STORES_DIR_NAME / parts[1]).exists()
         return not (mc_for_merge / rel).exists()
 
     def _will_install(rel: str) -> bool:
@@ -2842,7 +3721,36 @@ def _refuse_corrupt_source_databases(
                 rel = src.relative_to(snap).as_posix()
                 if not _will_install(rel):
                     continue
-                _refuse_unless_sound(src, rel, strict=rel in PRODUCT_TREE_DATABASES)
+                _refuse_unless_sound(src, rel, strict=is_product_tree_database(rel))
+
+
+def _merge_named_stores(
+    src_root: Path, dst_root: Path, *, allow_unpinned: bool = False
+) -> list[str]:
+    """Install absent stores whole and return the names kept whole at the destination.
+
+    A manifest and its databases belong to one generation: filling missing files in an
+    existing store can combine a V2 manifest with a V1 database that cannot open as V2.
+    """
+    with memory_store_namespace_lock(dst_root):
+        platform_compat.make_owner_only_dir(dst_root)
+        kept: list[str] = []
+        for src in sorted(src_root.iterdir()):
+            if is_host_local_store_state((MEMORY_STORES_DIR_NAME, src.name)) or not src.is_dir():
+                continue
+            dst = dst_root / src.name
+            if dst.exists():
+                kept.append(src.name)
+                continue
+            _copytree_safe(
+                src,
+                dst,
+                allow_unpinned=allow_unpinned,
+                must_create=True,
+                on_skip=pinned_fs.fatal_skip_reporter(f"merge of store {src.name!r}"),
+            )
+            platform_compat.make_owner_only_dir(dst)
+        return kept
 
 
 def _report_unmerged_databases(src_tree: Path, dst_tree: Path, tree: str) -> None:
@@ -2861,19 +3769,24 @@ def _report_unmerged_databases(src_tree: Path, dst_tree: Path, tree: str) -> Non
 
     Until there is, the honest thing is to name it. Silence is what turns a known
     limitation into apparent data loss.
+
+    Named stores are handled separately by `_merge_named_stores`, which keeps an
+    existing store whole rather than copying missing files into its generation.
     """
-    for rel in sorted(PRODUCT_TREE_DATABASES):
-        prefix = f"{tree}/"
-        if not rel.startswith(prefix):
+    prefix = f"{tree}/"
+    for src in sorted(src_tree.rglob("*")):
+        if not src.is_file():
             continue
-        leaf = rel[len(prefix) :]
-        if (src_tree / leaf).is_file() and (dst_tree / leaf).is_file():
-            print(
-                f"  ⚠️  {rel}: kept the existing database; the bundle's copy was NOT "
-                "merged into it.\n"
-                "      Merge mode does not combine this database's rows. To take the "
-                "bundle's copy instead, use --mode replace."
-            )
+        leaf = src.relative_to(src_tree).as_posix()
+        rel = prefix + leaf
+        if not is_product_tree_database(rel) or not (dst_tree / leaf).is_file():
+            continue
+        print(
+            f"  ⚠️  {_safe_name(rel)}: kept the existing database; the bundle's copy was NOT "
+            "merged into it.\n"
+            "      Merge mode does not combine this database's rows. To take the "
+            "bundle's copy instead, use --mode replace."
+        )
 
 
 def _refuse_unless_json_object(src: Path, label: str, *, installed: bool) -> None:
@@ -2894,10 +3807,10 @@ def _refuse_unless_json_object(src: Path, label: str, *, installed: bool) -> Non
     into a failed restore of every other one, which is the opposite of what an off-host
     backup is for.
 
-    "Usually" is load-bearing, and this docstring used to say "never". Merge's per-component
-    branch merges only `if dst.is_file()`; its sibling `else` copies the bundle's file in
-    VERBATIM. So an absent destination -- the fresh-machine case, which is the scenario a
-    backup exists for -- does install, and was the one path skipping this check. The caller
+    "Usually" is load-bearing, not "never". Merge's per-component branch merges only
+    `if dst.is_file()`; its sibling `else` copies the bundle's file in VERBATIM. So an
+    absent destination -- the fresh-machine case, which is the scenario a backup exists
+    for -- does install, and is the one path that could skip this check. The caller
     therefore decides *installed* from "will this reach a consumer", not from "is this a
     replace". Reproduced before the fix: a well-formed JSON array, no live `crons.json`,
     merge copied it verbatim and reported success, and the cron loader then read zero jobs.
@@ -2928,10 +3841,9 @@ def _refuse_unless_json_object(src: Path, label: str, *, installed: bool) -> Non
     # The merge path is guarded by the merger: `_merge_crons` runs `_usable_cron_shape`
     # over BOTH sides and returns without writing when either is misshapen, and that guard
     # is a superset of these -- it also rejects a non-string job name and a lone surrogate
-    # inside one. An earlier revision ran the shape checks in both modes on the grounds
-    # that a merger's guard caught only a file it could not PARSE, so `{"jobs": ["x"]}`
-    # would flow past it; that is no longer true, so refusing on the merge path would only
-    # turn one misshapen component into a failed restore of every other one.
+    # inside one. It catches more than a file it cannot PARSE, so `{"jobs": ["x"]}` does
+    # not flow past it, and refusing on the merge path would only turn one misshapen
+    # component into a failed restore of every other one.
     #
     # The install path has no such guard -- it copies the file in and the consumer reads an
     # unusable one as empty -- so here this refusal is the only thing between a misshapen
@@ -3060,27 +3972,47 @@ def _do_replace(
     backup = _allocate_rollback_dir(mc)
     print("🔄 Replace mode — backing up current state...")
 
-    # `memory` names workspace/memory and workspace/knowledge. Selecting it ALONE must
-    # save and replace just those subtrees; when `workspace` is also selected its own pass
-    # covers them, and doing both would save the INCOMING memory over the saved original.
+    # `memory` names two subtrees of workspace/ plus memory_stores/. When `workspace` is
+    # also selected its own pass covers the two subtrees, and doing both would save the
+    # INCOMING memory over the saved original -- so those are dropped from this list
+    # exactly when a `workspace` tree contains them. memory_stores/ is under no other
+    # component's tree and stays on the list whatever else was selected.
     mem_roots: list[tuple[str, Path]] = []
-    if _want(components, "memory") and not _want(components, "workspace"):
+    if _want(components, "memory"):
+        covered_by_workspace = (
+            COMPONENTS["workspace"].trees if _want(components, "workspace") else ()
+        )
         unsafe_now = []
         for tree in COMPONENTS["memory"].trees:
+            if any(
+                PurePosixPath(tree).is_relative_to(PurePosixPath(other))
+                for other in covered_by_workspace
+            ):
+                continue
+            if tree == MEMORY_STORES_DIR_NAME and not _bundle_carries_named_stores(snap):
+                # Not saved, not cleared, not on the recovery target list: the archive is
+                # silent about this tree because its writer did not know it, not because
+                # the source had none, and replacing on that silence would erase every
+                # crew's private memory. Said out loud, because a replace that leaves one
+                # tree at the newer generation is a mixed result the operator should see.
+                print(
+                    f"  ↩️  {tree}/ is not carried by this archive (written before named "
+                    "memory stores were backed up) — the live named stores are left as "
+                    "they are"
+                )
+                continue
             d = mc / tree
             if safe_tree_root(d, what="destination root", home=mc) is None:
                 # REFUSED, not skipped. `_refuse_unsafe_destination_roots` already cleared
                 # this exact set moments ago, so a root that fails here failed AFTER that
-                # check -- something moved under us mid-run. This used to `continue`, which
-                # dropped the tree from `mem_roots` entirely: it was then neither saved nor
-                # restored, and the run still printed "Replace complete." Reproduced by
-                # letting the preflight pass and swapping `workspace` for an external link
-                # immediately after -- both memory trees were silently dropped and the
-                # command exited 0, so an operator restoring after losing a machine would
-                # believe memory came back when only the databases had. That is the very
-                # lie the hoisted preflight was written to end, surviving in the one site
-                # the hoist did not convert. Safe to raise here: this runs before phase
-                # one, so no live state has been mutated yet.
+                # check -- something moved under us mid-run. A `continue` here would drop
+                # the tree from `mem_roots` entirely: neither saved nor restored, with the
+                # run still printing "Replace complete." Letting the preflight pass and
+                # swapping `workspace` for an external link immediately after drops both
+                # memory trees silently and exits 0, so an operator restoring after losing
+                # a machine believes memory came back when only the databases did. That is
+                # exactly the lie the hoisted preflight exists to end. Safe to raise here:
+                # this runs before phase one, so no live state has been mutated yet.
                 unsafe_now.append(f"memory:{tree}")
             else:
                 mem_roots.append((tree, d))
@@ -3093,77 +4025,136 @@ def _do_replace(
                 "split between the old and new versions while reporting success."
             )
 
-    # ── Phase one: the rollback set. No live state is mutated in this block. ──
-    #
-    # `_backup_tree_or_refuse` reports a skipped entry as FATAL, so a tree that cannot be
-    # copied whole raises here rather than being rmtree'd later with an incomplete backup.
-    for tree, d in mem_roots:
-        if d.is_dir():
-            # `tree` is NESTED (`workspace/memory`), so the rollback destination's parent
-            # does not exist in a freshly-allocated backup dir. The pinned primitive pins
-            # an existing parent chain and does not create one -- callers create their own
-            # tree roots -- so without this the copy fails with FileNotFoundError on the
-            # intermediate component. The single-level trees below are unaffected because
-            # their parent IS the backup dir.
-            (backup / tree).parent.mkdir(parents=True, exist_ok=True)
-            _backup_tree_or_refuse(d, backup / tree, allow_unpinned=allow_unpinned)
-    if _want(components, "workspace"):
-        for dirname in ("workspace", "plan_memory"):
-            d = mc / dirname
-            if d.is_dir():
-                _backup_tree_or_refuse(d, backup / dirname, allow_unpinned=allow_unpinned)
-    if _want(components, "skills"):
-        sk = mc / "skills"
-        if sk.is_dir():
-            _backup_tree_or_refuse(sk, backup / "skills", allow_unpinned=allow_unpinned)
-
-    # Every relative path phase two can write. Recovery needs it because a target that did
-    # not exist before the restore has nothing saved for it, so putting saved entries back
-    # would leave that creation standing.
-    targets: list[str] = []
-    for comp in ("memory", "crons", "config", "notifications", "security"):
-        if _want(components, comp):
-            targets.extend(COMPONENTS[comp].files)
-    if _want(components, "workspace"):
-        targets.extend(("workspace", "plan_memory"))
-    if _want(components, "skills"):
-        targets.append("skills")
-    targets.extend(tree for tree, _ in mem_roots)
-
-    # Grows as phase two touches each target; recovery reads it to tell a creation from a
-    # target the phase never reached.
-    installed: set[str] = set()
+    # Still before phase one. A store open elsewhere would survive the removal below as an
+    # unlinked file and lose every later write, so every store's lifetime lock is taken
+    # EXCLUSIVELY here and held until the replace -- or its rollback -- is done: a store that
+    # is open refuses the replace at once, and a store opened while this is held waits for
+    # the replace to finish and then opens what it put there. Live and archived store
+    # names both, so a store the archive introduces is held before it can be found.
+    store_names: set[str] = set()
+    barrier = ExitStack()
     try:
-        _do_replace_mutations(
-            snap, mc, backup, components, mem_roots, installed, allow_unpinned=allow_unpinned
-        )
-    except BaseException as e:
-        # `BaseException`, not `Exception`, and deliberately wider than the three named
-        # classes this used to catch. `PinnedPathRefusal` was added here because it fires
-        # MID-mutation and leaving it out left live state half replaced; `KeyboardInterrupt`
-        # has exactly that property and is not an `Exception` at all, so it walked past this
-        # handler entirely. Reproduced: a Ctrl-C after the memory component was replaced left
-        # `memory.db` holding the archive's copy and `crons.json` still the live one, with no
-        # rollback attempted. A restore is the one operation where an interrupt must not be
-        # taken at face value -- the operator's own state is mid-swap.
-        #
-        # The exception is always re-raised, so an interrupt still terminates the command and
-        # `SystemExit` still exits; what changes is that the previous state is put back first.
-        # A second interrupt DURING the rollback cannot be defended against here, and the
-        # rollback directory is what answers for it.
-        #
-        # Phase one is deliberately outside this try: a refusal there happens before any
-        # mutation, so there is nothing to roll back and the clean refusal is the answer.
-        failed = _restore_everything_from_rollback(
-            backup, mc, targets, installed, allow_unpinned=allow_unpinned
-        )
-        if failed:
-            # The revert is part of the outcome, not a side effect of it. Re-raising the
-            # original error alone would let the caller summarise this as "you are back
-            # where you started", which is the one thing that must not be said when some
-            # of the previous state now exists only in the rollback directory.
-            raise RollbackIncomplete(e, failed, backup) from e
+        if any(tree == MEMORY_STORES_DIR_NAME for tree, _ in mem_roots):
+            barrier.enter_context(memory_store_namespace_lock(mc / MEMORY_STORES_DIR_NAME))
+            for root in (mc / MEMORY_STORES_DIR_NAME, snap / MEMORY_STORES_DIR_NAME):
+                if root.is_dir():
+                    store_names.update(
+                        p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")
+                    )
+        barrier.enter_context(hold_stores_for_replace(mc / MEMORY_STORES_DIR_NAME, store_names))
+    except BaseException as exc:
+        barrier.close()
+        backup.rmdir()
+        if isinstance(exc, StoresInUse):
+            raise NamedStoresInUse(exc.names) from exc
         raise
+    store_backup: Path | None = None
+    try:
+        # ── Phase one: the rollback set. No live state is mutated in this block. ──
+        #
+        # `_backup_tree_or_refuse` reports a skipped entry as FATAL, so a tree that cannot be
+        # copied whole raises here rather than being rmtree'd later with an incomplete backup.
+        for tree, d in mem_roots:
+            if d.is_dir():
+                if tree == MEMORY_STORES_DIR_NAME:
+                    # Private memory stays behind the same agent fence as its live copy.
+                    # Only root-level host state stays in place; V1 backups inside a
+                    # store must be saved because the mutation removes that directory.
+                    local_backups = mc.resolve() / tree / MEMBER_BACKUPS_DIR_NAME
+                    if local_backups.resolve() != local_backups.absolute():
+                        raise UnsafeComponentRoot("named store rollback directory is redirected")
+                    platform_compat.make_owner_only_dir(local_backups)
+                    store_backup = _allocate_rollback_dir(local_backups)
+
+                    def ignore_host_local_root(directory: str, contents: list[str]) -> set[str]:
+                        if Path(directory) != d:
+                            return set()
+                        return {
+                            name
+                            for name in contents
+                            if is_host_local_store_state((MEMORY_STORES_DIR_NAME, name))
+                        }
+
+                    _backup_tree_or_refuse(
+                        d,
+                        store_backup,
+                        allow_unpinned=allow_unpinned,
+                        ignore=ignore_host_local_root,
+                    )
+                    print(f"  Previous state saved to: {store_backup}/")
+                    continue
+                # `tree` is NESTED (`workspace/memory`), so the rollback destination's parent
+                # does not exist in a freshly-allocated backup dir. The pinned primitive pins
+                # an existing parent chain and does not create one -- callers create their own
+                # tree roots -- so without this the copy fails with FileNotFoundError on the
+                # intermediate component. The single-level trees below are unaffected because
+                # their parent IS the backup dir.
+                (backup / tree).parent.mkdir(parents=True, exist_ok=True)
+                _backup_tree_or_refuse(d, backup / tree, allow_unpinned=allow_unpinned)
+        if _want(components, "workspace"):
+            for dirname in ("workspace", "plan_memory"):
+                d = mc / dirname
+                if d.is_dir():
+                    _backup_tree_or_refuse(d, backup / dirname, allow_unpinned=allow_unpinned)
+        if _want(components, "skills"):
+            sk = mc / "skills"
+            if sk.is_dir():
+                _backup_tree_or_refuse(sk, backup / "skills", allow_unpinned=allow_unpinned)
+
+        # Every relative path phase two can write. Recovery needs it because a target that did
+        # not exist before the restore has nothing saved for it, so putting saved entries back
+        # would leave that creation standing.
+        targets: list[str] = []
+        for comp in ("memory", "crons", "config", "notifications", "security"):
+            if _want(components, comp):
+                targets.extend(COMPONENTS[comp].files)
+        if _want(components, "workspace"):
+            targets.extend(("workspace", "plan_memory"))
+        if _want(components, "skills"):
+            targets.append("skills")
+        targets.extend(tree for tree, _ in mem_roots)
+
+        # Grows as phase two touches each target; recovery reads it to tell a creation from a
+        # target the phase never reached.
+        installed: set[str] = set()
+        try:
+            _do_replace_mutations(
+                snap, mc, backup, components, mem_roots, installed, allow_unpinned=allow_unpinned
+            )
+        except BaseException as e:
+            # `BaseException`, not `Exception`, and deliberately wider than a few named
+            # classes. `PinnedPathRefusal` belongs here because it fires MID-mutation and
+            # leaving it out leaves live state half replaced; `KeyboardInterrupt` has exactly
+            # that property and is not an `Exception` at all, so a narrower handler misses it
+            # entirely. A Ctrl-C after the memory component is replaced otherwise leaves
+            # `memory.db` holding the archive's copy and `crons.json` still the live one, with
+            # no rollback attempted. A restore is the one operation where an interrupt must not
+            # be taken at face value -- the operator's own state is mid-swap.
+            #
+            # The exception is always re-raised, so an interrupt still terminates the command and
+            # `SystemExit` still exits; what changes is that the previous state is put back first.
+            # A second interrupt DURING the rollback cannot be defended against here, and the
+            # rollback directory is what answers for it.
+            #
+            # Phase one is deliberately outside this try: a refusal there happens before any
+            # mutation, so there is nothing to roll back and the clean refusal is the answer.
+            failed = _restore_everything_from_rollback(
+                backup,
+                mc,
+                targets,
+                installed,
+                allow_unpinned=allow_unpinned,
+                store_backup=store_backup,
+            )
+            if failed:
+                # The revert is part of the outcome, not a side effect of it. Re-raising the
+                # original error alone would let the caller summarise this as "you are back
+                # where you started", which is the one thing that must not be said when some
+                # of the previous state now exists only in the rollback directory.
+                raise RollbackIncomplete(e, failed, backup, store_backup=store_backup) from e
+            raise
+    finally:
+        barrier.close()
 
     try:
         backup.rmdir()
@@ -3184,9 +4175,14 @@ def _component_payload_absent(snap: Path, component: str) -> bool:
     restore, and counting it would let precisely the reproduced case through.
 
     Files AND trees both count, so a component whose data is a directory is not called hollow
-    just because it keeps no flat file. Derived from `COMPONENTS` / `CORE_FILES`, never a
-    hand-written list: a component gaining a file later must not silently start passing this
-    check on the strength of a stale enumeration.
+    just because it keeps no flat file. A tree counts only when it holds at least one FILE:
+    the staging walk copies a directory whose every entry it excluded as an empty directory
+    -- ``memory_stores/`` on a home whose only content there is the sandbox's precreated
+    runtime state is the ordinary case -- and an empty directory is nothing to restore, so
+    counting it would let a bundle with no memory at all pass this check on the strength of
+    a directory entry. Derived from `COMPONENTS` / `CORE_FILES`, never a hand-written list: a
+    component gaining a file later must not silently start passing this check on the
+    strength of a stale enumeration.
     """
     spec = COMPONENTS.get(component)
     if spec is None:
@@ -3197,8 +4193,11 @@ def _component_payload_absent(snap: Path, component: str) -> bool:
         if (snap / rel).exists():
             return False
     for rel in getattr(spec, "trees", ()) or ():
-        if (snap / rel).exists():
+        root = snap / rel
+        if root.is_dir() and any(p.is_file() for p in root.rglob("*")):
             return False
+        if root.exists() and not root.is_dir():
+            return False  # a non-directory at a tree's name is judged by the soundness check
     return True
 
 
@@ -3243,6 +4242,25 @@ def _drop_derived_indexes_absent_from_bundle(
         else:
             shutil.move(str(live), str(backup / rel))
         print(f"  ↩️  {rel} is not in the archive — moved aside so it can be rebuilt")
+
+
+def _clear_store_directories(root: Path) -> None:
+    """Remove everything under ``memory_stores/`` that a bundle can carry, keep the rest.
+
+    What stays is exactly `is_host_local_store_state`'s answer for a direct child: the
+    member signing key, execution logs, retirement records and member backup directory --
+    the last of which holds the lifetime locks the replace is holding. Everything else is a store
+    directory (or something an operator left there) that the archive's copy replaces.
+    """
+    for entry in sorted(root.iterdir()):
+        if is_host_local_store_state((MEMORY_STORES_DIR_NAME, entry.name)):
+            continue
+        if entry.is_dir() and not platform_compat.is_link_or_junction(entry):
+            shutil.rmtree(str(entry))
+        elif platform_compat.is_link_or_junction(entry) and not entry.is_symlink():
+            platform_compat.unlink_link_or_junction(entry)
+        else:
+            entry.unlink()
 
 
 def _do_replace_mutations(
@@ -3321,9 +4339,10 @@ def _do_replace_mutations(
             )
         print("  ✅ skills")
 
-    # Scoped to memory's own subtrees, and skipped entirely when `workspace` is selected:
-    # that pass has already replaced these paths, and repeating the work here would save
-    # the INCOMING memory over the saved original.
+    # Scoped to memory's own trees as `_do_replace` selected them: the two workspace/
+    # subtrees only when `workspace` is not also selected (that pass has already replaced
+    # them, and repeating the work here would save the INCOMING memory over the saved
+    # original), memory_stores/ whenever the archive is one that carries it.
     for tree, d in mem_roots:
         sd = snap / tree
         # CLEARED UNCONDITIONALLY, then filled only if the archive carries the tree.
@@ -3339,6 +4358,7 @@ def _do_replace_mutations(
         # no component map, which is the escape hatch for pre-seam archives. A v3 bundle
         # declares `memory` and legitimately may not carry every tree of it, and this is
         # the branch that has to answer for that.
+        keep_root = tree == MEMORY_STORES_DIR_NAME and d.is_dir()
         if d.is_dir() or platform_compat.is_link_or_junction(d):
             installed.add(tree)
             if platform_compat.is_link_or_junction(d):
@@ -3349,6 +4369,15 @@ def _do_replace_mutations(
                 # the replace then fails mid-flight on a platform where this is the ordinary
                 # shape of a linked tree.
                 platform_compat.unlink_link_or_junction(d)
+            elif keep_root:
+                # memory_stores/ is cleared ENTRY BY ENTRY and its host-local half kept in
+                # place: the lifetime locks `_do_replace` holds live under
+                # `.member-backups/`, and removing that directory would let a store opened
+                # mid-replace create a fresh, unheld lock beside the one being held. The
+                # archive never carries those entries (`_never_ships`), so the copy below
+                # meets no collision, and the local backups and execution logs stay where
+                # the default store's own `<home>/backups/` already stays.
+                _clear_store_directories(d)
             else:
                 shutil.rmtree(str(d))
         if sd.is_dir():
@@ -3362,7 +4391,9 @@ def _do_replace_mutations(
                 sd,
                 d,
                 allow_unpinned=allow_unpinned,
-                must_create=True,
+                # The kept root is the one destination that legitimately exists; every
+                # child the archive brings is still refused if a name occupies it.
+                must_create=not keep_root,
                 on_skip=pinned_fs.fatal_skip_reporter(f"restore of {tree!r}"),
             )
     if mem_roots:
@@ -3370,7 +4401,13 @@ def _do_replace_mutations(
 
 
 def _restore_everything_from_rollback(
-    backup: Path, mc: Path, targets: list[str], installed: set[str], *, allow_unpinned: bool = False
+    backup: Path,
+    mc: Path,
+    targets: list[str],
+    installed: set[str],
+    *,
+    allow_unpinned: bool = False,
+    store_backup: Path | None = None,
 ) -> list[str]:
     """Undo the mutation phase, target by target, using *targets* as the granularity.
 
@@ -3410,7 +4447,7 @@ def _restore_everything_from_rollback(
     print(f"↩️  Restoring the previous state from {backup} ...")
     failed: list[str] = []
     for rel in sorted(set(targets)):
-        saved = backup / rel
+        saved = store_backup if rel == MEMORY_STORES_DIR_NAME and store_backup else backup / rel
         target = mc / rel
         try:
             if platform_compat.is_link_or_junction(saved):
@@ -3451,34 +4488,42 @@ def _restore_everything_from_rollback(
                 # directory reparse point that `Path.unlink` cannot remove: recovery would
                 # raise here and leave the operator's prior state stranded, which is the
                 # one outcome this whole function exists to prevent.
+                keep_root = (
+                    rel == MEMORY_STORES_DIR_NAME
+                    and target.is_dir()
+                    and not platform_compat.is_link_or_junction(target)
+                )
                 if platform_compat.is_link_or_junction(target):
                     platform_compat.unlink_link_or_junction(target)
+                elif keep_root:
+                    # The rollback copy lives inside the kept host-local half, alongside
+                    # the held lock inodes; neither may be removed during recovery.
+                    _clear_store_directories(target)
                 elif target.is_dir():
                     shutil.rmtree(str(target))
                 target.parent.mkdir(parents=True, exist_ok=True)
-                # The plain staging copy is lossless HERE, which it would not have been
-                # for the save. `_backup_tree_or_refuse` reports a skipped entry as fatal,
-                # so a TREE containing a link never reaches the rollback directory at all
+                # The plain staging copy is lossless HERE, which it would not be for the
+                # save. `_backup_tree_or_refuse` reports a skipped entry as fatal, so a
+                # TREE containing a link never reaches the rollback directory at all
                 # -- whatever `backup` holds for a tree is links-free by construction, and
                 # there is nothing for a link-preserving copy to preserve on the way back.
                 #
-                # Scoped to trees deliberately. This used to read as a claim about the whole
-                # rollback directory, which is false: core FILES are saved by a different
-                # function that MOVES a symlink aside on purpose, and reading the claim that
-                # broadly is what left the saved-link case with no branch to match.
+                # Scoped to trees deliberately. Read as a claim about the whole rollback
+                # directory it is false: core FILES are saved by a different function that
+                # MOVES a symlink aside on purpose, and reading it that broadly leaves the
+                # saved-link case with no branch to match.
                 _copytree_safe(
                     saved,
                     target,
                     # The operator's opt-in has to reach HERE, not just the forward path.
-                    # Without it this copy took the default and refused on a platform with
+                    # Without it this copy takes the default and refuses on a platform with
                     # no directory descriptors -- so an operator who passed
-                    # `--allow-unpinned-staging` got a replace that was allowed to MUTATE
-                    # live state and a rollback that then refused to put it back. The safety
-                    # net became the one thing that would not run, at the only moment it
-                    # matters. Found by a test that could not be fixed from the test side
-                    # because this function had no way to be told.
+                    # `--allow-unpinned-staging` gets a replace that is allowed to MUTATE
+                    # live state and a rollback that then refuses to put it back. The
+                    # safety net becomes the one thing that will not run, at the only
+                    # moment it matters.
                     allow_unpinned=allow_unpinned,
-                    must_create=True,
+                    must_create=not keep_root,
                     on_skip=pinned_fs.fatal_skip_reporter(f"rollback of {rel!r}"),
                 )
             elif saved.is_file():
@@ -3533,6 +4578,9 @@ def _restore_everything_from_rollback(
                             "because nothing here proves this run created it)"
                         )
                         continue
+                    if rel == MEMORY_STORES_DIR_NAME:
+                        _clear_store_directories(target)
+                        continue
                     shutil.rmtree(str(target))
                 else:
                     # Covers a link or junction as well as a plain file, so it goes through
@@ -3548,8 +4596,9 @@ def _restore_everything_from_rollback(
             failed.append(f"{rel} ({e})")
     if failed:
         print("⚠️  Could not undo these: " + ", ".join(failed))
+        locations = ", ".join(str(p) for p in (backup, store_backup) if p is not None)
         print(
-            f"   The saved copies are still in {backup} — recover them by hand before "
+            f"   The saved copies are still in {locations} — recover them by hand before "
             "re-running."
         )
     else:
@@ -3613,19 +4662,32 @@ def _do_merge(
                         "not now was replaced mid-run (usually a symlink); merging past it "
                         "would write this component outside the data home."
                     )
+                if tree == MEMORY_STORES_DIR_NAME:
+                    kept = _merge_named_stores(sd, dd, allow_unpinned=allow_unpinned)
+                    for store in kept:
+                        print(
+                            f"  ↩️  {tree}/{_safe_name(store)}: kept the existing store; "
+                            "the bundle's copy was NOT merged into it. "
+                            "To take the bundle's copy instead, use --mode replace."
+                        )
+                    continue
                 dd.mkdir(parents=True, exist_ok=True)
                 _report_unmerged_databases(sd, dd, tree)
                 _copy_tree_no_overwrite(sd, dd, allow_unpinned=allow_unpinned)
 
     if _want(components, "crons"):
         sc, dc = snap / "crons.json", mc / "crons.json"
+        crons_ok = True
         if sc.is_file():
             if dc.is_file():
-                _merge_crons(sc, dc)
+                crons_ok = _merge_crons(sc, dc)
             else:
                 shutil.copy2(str(sc), str(dc))
                 print("  Crons: copied (no existing crons)")
-        print("  ✅ crons")
+        if crons_ok:
+            print("  ✅ crons")
+        else:
+            print("  ⚠️  crons: merge skipped (see warning above) — no jobs imported")
 
     if _want(components, "config"):
         for f in CORE_FILES["config"]:
@@ -3641,8 +4703,19 @@ def _do_merge(
             if dn.is_file():
                 _merge_notifications(sn, dn)
             else:
-                shutil.copy2(str(sn), str(dn))
-                print("  Notifications: copied")
+                # Not `copy2`: a byte-exact copy installs records the live file's
+                # own reader refuses, and that reader loses the whole file to one
+                # of them. Same abort posture as the merge branch above.
+                #
+                # The platform refusal is NOT that abort: it says this platform can
+                # never do this safely, not that this archive is bad, so it skips one
+                # component loudly and lets the rest of the restore proceed. Reported
+                # rather than swallowed -- a silent skip is the bug class being fixed.
+                try:
+                    _copy_notifications(sn, dn)
+                    print("  Notifications: copied")
+                except NotificationCopyUnsupported as exc:
+                    print(f"  ⚠️  Notifications: SKIPPED -- {exc}")
         print("  ✅ notifications")
 
     if _want(components, "security"):
@@ -4081,6 +5154,26 @@ def restore_main(argv: list[str] | None = None, *, parsed: argparse.Namespace | 
             # refusal on this path already follows.
             print(f"❌ {e}")
             return 1
+        except NamedStoresInUse as e:
+            # Also before any mutation: a store open elsewhere would keep writing into an
+            # unlinked database after the replace. The gateway check at the top catches the
+            # ordinary case; this is the one `--force` and a second process can reach.
+            _audit("state_restore_rejected", f"reason=named_store_in_use from={snap_path.name}")
+            print(f"❌ {e}")
+            return 1
+        except UnreadableRecord as exc:
+            # The notification merge aborts on a record it cannot deliver intact, so
+            # that a partial copy is never reported as a success -- see
+            # `_merge_notifications`. That refusal is as deliberate as the two above and
+            # belongs in this list; while it was missing, it left this command as a
+            # TRACEBACK, which tells the operator their tool broke rather than that their
+            # data was rejected. Deliberately narrower than `(OSError, UnreadableRecord)`,
+            # which is what the merge itself catches: an `OSError` here could come from
+            # any copy in the restore, and labelling one of those a refused notification
+            # record would be a wrong message rather than a missing one.
+            _audit("state_restore_rejected", f"reason=unreadable_notification_record detail={exc}")
+            print(f"❌ {exc}")
+            return 1
         except SourceComponentUnsound as e:
             # `_allocate_rollback_dir` raises this when every candidate name for the current
             # timestamp is taken. Rare, and still a refusal rather than a crash: it happens
@@ -4097,9 +5190,12 @@ def restore_main(argv: list[str] | None = None, *, parsed: argparse.Namespace | 
         except RollbackIncomplete as e:
             # Said first and said plainly: the operator's next action depends on it.
             print(f"❌ The restore failed partway through: {e.cause}")
+            locations = ", ".join(
+                _safe_name(str(p)) for p in (e.backup, e.store_backup) if p is not None
+            )
             print(
                 "   Putting your previous state back did NOT fully succeed. Some of it "
-                f"exists only in {_safe_name(str(e.backup))} now:"
+                f"exists only in {locations} now:"
             )
             for item in e.failed[:10]:
                 print(f"     {_safe_name(item)}")

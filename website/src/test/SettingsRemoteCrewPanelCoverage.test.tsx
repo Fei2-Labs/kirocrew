@@ -50,6 +50,7 @@ vi.mock('../api/client', () => {
       patchConfig: vi.fn(),
       cloudLaunches: vi.fn(),
       cloudPreflight: vi.fn(),
+      cloudProvisioners: vi.fn(),
       cloudIamPolicy: vi.fn(),
       cloudLaunch: vi.fn(),
       cloudLaunchStatus: vi.fn(),
@@ -65,7 +66,9 @@ vi.mock('../api/client', () => {
 // is absent, and happy-dom implements neither — the fallback would reject and
 // surface as an unhandled rejection, which reddens CI with a green summary.
 vi.mock('../utils/clipboard', () => ({
-  copyToClipboard: vi.fn().mockResolvedValue(undefined),
+  // Resolves `true` like the real helper: the panel now branches on the boolean
+  // and reports a failed copy instead of painting "Copied" unconditionally.
+  copyToClipboard: vi.fn().mockResolvedValue(true),
   copyCode: vi.fn().mockResolvedValue(undefined),
 }))
 
@@ -112,6 +115,7 @@ const DONE_JOB: LaunchJob = {
   id: 'j-done',
   tag: 'kc-3f9a',
   instance_id: 'i-0abc123456789def0',
+  provider_id: 'aws_ec2',
   profile: 'Admin',
   region: 'us-west-2',
   size_key: 'balanced',
@@ -124,6 +128,7 @@ const DONE_JOB: LaunchJob = {
 const RUNNING_JOB: LaunchJob = {
   id: 'j-run',
   tag: 'kc-4d10',
+  provider_id: 'aws_ec2',
   profile: '',
   region: 'us-east-1',
   size_key: 'light',
@@ -188,6 +193,19 @@ beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true })
   vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
   vi.mocked(api.cloudPreflight).mockResolvedValue(PREFLIGHT_OK)
+  // The setup tab asks which provisioners the gateway offers, and the AWS
+  // preflight waits for that answer (it must not probe AWS for a provisioner that
+  // has nothing to do with AWS). The stock single-row answer keeps every case
+  // here on the built-in form.
+  vi.mocked(api.cloudProvisioners).mockResolvedValue({
+    provisioners: [{
+      id: 'aws_ec2',
+      kind: 'aws_ec2',
+      label: 'AWS EC2 in your own account',
+      posix_only: true,
+      steps: [{ key: 'preflight', label: 'Check your AWS setup' }],
+    }],
+  })
   // The status query is enabled by the mere existence of a persisted job, so a
   // test that only cares about the crew list still polls it — an unmocked
   // resolve returns undefined, which React Query rejects noisily.
@@ -308,7 +326,10 @@ describe('RemoteCrewPanel — instance actions', () => {
     await u.click(await screen.findByRole('menuitem', { name: 'Diagnose dev-box-1' }))
     expect(await screen.findByText(/m1: host did not answer/, undefined, { timeout: 5_000 })).toBeInTheDocument()
 
-    await u.click(screen.getByRole('button', { name: 'Dismiss diagnosis' }))
+    // The note renders through ErrorNotice now, so its dismiss control carries
+    // the shared "Dismiss" label; scoped by testid because the actionErr notice
+    // on the same surface has an identical one.
+    await u.click(within(screen.getByTestId('remote-crew-diagnosis')).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText(/m1: host did not answer/)).not.toBeInTheDocument()
   })
 

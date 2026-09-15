@@ -15,22 +15,33 @@ test.describe('Overview Page E2E Tests', () => {
     // Old sub-tab bar is gone.
     await expect(page.getByRole('button', { name: 'KiroCrew Config', exact: true })).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Import/Export', exact: true })).toHaveCount(0)
-    // Both summary cards expose the same drill-in verb.
-    await expect(page.getByRole('button', { name: 'View details' })).toHaveCount(2)
+    // Three summary cards (Usage, WakaTime, Memory) expose the same drill-in verb.
+    await expect(page.getByRole('button', { name: 'View details' })).toHaveCount(3)
   })
 
   test('drills into the Memory browser and back', async ({ page }) => {
-    // Usage card renders first, Memory second.
-    await page.getByRole('button', { name: 'View details' }).nth(1).click()
-    await expect(page.getByRole('heading', { name: /memory settings/i })).toBeVisible({ timeout: 5000 })
+    // Card order: Usage (0), WakaTime (1), Memory (2).
+    await page.getByRole('button', { name: 'View details' }).nth(2).click()
+    await expect(page.getByRole('heading', { name: 'Memory store', exact: true })).toBeVisible({ timeout: 5000 })
+    await expect(page.getByRole('combobox', { name: 'Memory store', exact: true })).toContainText('Global Memory V1')
     await page.getByRole('button', { name: 'Back to Overview' }).click()
     await expect(page.getByText(/All systems running|Connecting…|Reconnecting…/)).toBeVisible({ timeout: 5000 })
   })
 
   test('Memory browser exposes the manual summarize action', async ({ page }) => {
-    await page.getByRole('button', { name: 'View details' }).nth(1).click()
+    await page.getByRole('button', { name: 'View details' }).nth(2).click()
+    await expect(page.getByRole('heading', { name: /memory settings/i })).toBeVisible({ timeout: 5000 })
     const summarize = page.getByRole('button', { name: /summarize now/i })
     await expect(summarize).toBeVisible({ timeout: 5000 })
+    await expect(summarize).toBeEnabled()
+  })
+
+  test('drills into WakaTime and back', async ({ page }) => {
+    // WakaTime card renders second (index 1).
+    await page.getByRole('button', { name: 'View details' }).nth(1).click()
+    await expect(page.getByRole('button', { name: 'Back to Overview' })).toBeVisible({ timeout: 5000 })
+    await page.getByRole('button', { name: 'Back to Overview' }).click()
+    await expect(page.getByText(/All systems running|Connecting…|Reconnecting…/)).toBeVisible({ timeout: 5000 })
   })
 
   test('drills into Usage and back', async ({ page }) => {

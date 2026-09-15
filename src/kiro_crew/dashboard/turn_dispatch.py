@@ -1,27 +1,23 @@
 """Guarded dispatch for dashboard chat turns.
 
 Every chat turn runs under a wall-clock ceiling so a genuinely runaway turn
-cannot pin a session forever. That ceiling was correct; the way it fired was
-not. Each dispatch site wrapped the turn in ``asyncio.wait_for`` and attached
-exactly one done-callback — ``state._background_tasks.discard``, a ``set``
-method that ignores its argument's result. Nothing ever awaited the task or
-called ``.exception()``, so when the ceiling fired the resulting
-``TimeoutError`` was **never retrieved**: the turn simply stopped. No error
-card, no row in the session transcript, and no log line the user would think
-to look for — only a garbage-collection-time "Task exception was never
-retrieved" message, emitted whenever the collector happened to run.
+cannot pin a session forever. Reaching that ceiling must always produce a
+VISIBLE outcome: an error card and a row in the session transcript. A dispatch
+that only wrapped the turn in ``asyncio.wait_for`` and attached
+``state._background_tasks.discard`` — a ``set`` method that ignores its
+argument's result — never retrieves the resulting ``TimeoutError``, so the turn
+simply stops, leaving nothing but a garbage-collection-time "Task exception was
+never retrieved" message and a failure indistinguishable from the agent going
+quiet.
 
-That made the failure indistinguishable from the agent going quiet. A babysit
-loop polling a pull request reaches the ceiling routinely — ten review rounds
-at roughly five minutes of waiting each, plus the tool time in between — so
-this was an ordinary outcome of long-running work, not a rare edge case, and
-its symptom was "the agent abandoned my PR without saying anything".
+The ceiling is an ordinary outcome of long-running work, not a rare edge case: a
+babysit loop polling a pull request reaches it routinely — ten review rounds at
+roughly five minutes of waiting each, plus the tool time in between.
 
 This module owns the one dispatch path. Keeping the ceiling, the clamp against
 the transport's own timeout, and the visible-card guarantee together here is
-deliberate: they were previously re-derived at each of several call sites, so a
-new site could silently reintroduce the silent death by copying the old
-``add_done_callback(discard)`` shape.
+deliberate: re-deriving them at each call site lets a new site silently
+reintroduce the silent death by copying an ``add_done_callback(discard)`` shape.
 """
 
 from __future__ import annotations
@@ -69,7 +65,7 @@ def _acp_prompt_ceiling() -> float:
     """The transport's own per-prompt timeout.
 
     Resolves through :func:`~kiro_crew.acp.client.resolve_prompt_timeout`, which
-    follows a configured ceiling ABOVE the 2h default (plus a margin so this
+    follows a configured ceiling ABOVE the 4h default (plus a margin so this
     module's card always fires before the transport cut). The clamp in
     :func:`chat_turn_timeout_secs` therefore no longer fires in normal operation;
     it stays as the fail-safe for a resolver that could not read config.
@@ -195,10 +191,10 @@ def format_approval_no_budget_card() -> str:
 def format_approval_timeout_card(timeout_secs: float) -> str:
     """User-facing text for an approval prompt nobody answered in time.
 
-    Deliberately distinct from :func:`format_turn_timeout_card`: the two used to
-    be indistinguishable to the user because the approval window outlived the
-    turn, so an unanswered prompt always surfaced as a generic turn timeout and
-    the actual cause — and the fix, resending — was never stated.
+    Deliberately distinct from :func:`format_turn_timeout_card`: the approval
+    window can outlive the turn, and one shared card would surface an unanswered
+    prompt as a generic turn timeout, stating neither the actual cause nor the
+    fix, which is resending.
     """
     if timeout_secs >= 3600:
         waited = f"{timeout_secs / 3600:.1f}".rstrip("0").rstrip(".") + " hours"

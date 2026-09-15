@@ -13,8 +13,8 @@
  *       corrected afterwards has already written to memory by then;
  *   (4) neither entry smuggles the `defaultAutopilot` preference in as
  *       'orchestrator' — these entries name a memory mode, not a run mode — and
- *       the plain "New chat" entry still carries NO memory_mode, so adding the
- *       submenu cannot make the ordinary path ephemeral.
+ *       the plain "New chat" entry carries the configured default while the
+ *       explicit submenu choices remain pinned.
  *
  * Radix DropdownMenu cannot be opened by mouse in jsdom (needs PointerEvent),
  * so the trigger is activated by keyboard — the path jsdom does handle. Submenus
@@ -103,7 +103,7 @@ Object.defineProperty(window, 'matchMedia', {
 import ChatSidebar from '../pages/ChatSidebar'
 
 const DEFAULT_AGENT = 'kirocrew'
-// api.createChatSlot(name, agent, model, mode, memory_mode, title, clean_mode, artifact, folder_id)
+// api.createChatSlot(name, agent, model, mode, memory_mode, title, artifact, folder_id)
 const ARG_AGENT = 1
 const ARG_MODE = 3
 const ARG_MEMORY_MODE = 4
@@ -201,15 +201,14 @@ describe('create-button caret menu: ephemeral chats', () => {
     expect(call[ARG_AGENT]).toBe(DEFAULT_AGENT)
   })
 
-  it('leaves the plain "New chat" entry persistent', async () => {
-    // Regression guard: an ephemeral mode leaking onto the ordinary entry would
-    // silently stop writing the user's sessions to memory, with nothing on the
-    // menu to say so.
+  it('applies the configured fallback to the plain "New chat" entry', async () => {
+    // This file's API proxy returns no configured value, so the shared thunk
+    // must preserve the factory default rather than omit the mode.
     renderSidebar()
     openCreateMenu()
     fireEvent.click(await screen.findByText('New chat'))
     await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalledTimes(1))
-    expect(mocks.createChatSlot.mock.calls[0][ARG_MEMORY_MODE]).toBeUndefined()
+    expect(mocks.createChatSlot.mock.calls[0][ARG_MEMORY_MODE]).toBe('persistent')
   })
 
   it('lists both modes inline under a caption at phone width, with no flyout to open', async () => {

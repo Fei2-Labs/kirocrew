@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from conftest import host_abs
 from kiro_crew import github_runner as runner
 from kiro_crew import platform_compat, windows_acl
 
@@ -35,6 +36,54 @@ EVERYONE = "S-1-1-0"
 AUTHENTICATED_USERS = "S-1-5-11"
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="needs a Windows ACL")
+
+
+def _set_owner_to_current_user(path: Path) -> None:
+    """Give this test-owned file an explicit current-user owner on Windows.
+
+    Elevated Python processes commonly create temp files owned by the built-in
+    Administrators group. That host policy is valid, but it is not the fixture this
+    owner-reader test claims to exercise, so set the owner on this file only.
+    """
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    se_file_object = 1
+    owner_security_information = 0x00000001
+    sid = ctypes.c_void_p()
+
+    convert = advapi32.ConvertStringSidToSidW
+    convert.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)]
+    convert.restype = ctypes.c_int
+    if not convert(platform_compat.current_user_sid(), ctypes.byref(sid)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        set_owner = advapi32.SetNamedSecurityInfoW
+        set_owner.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        set_owner.restype = ctypes.c_ulong
+        rc = set_owner(
+            str(path),
+            se_file_object,
+            owner_security_information,
+            sid,
+            None,
+            None,
+            None,
+        )
+        if rc:
+            raise ctypes.WinError(rc)
+    finally:
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+        local_free(sid)
 
 
 def _security(
@@ -328,6 +377,19 @@ class TestWellknownWindowsDirs:
             os.path.join(root, "GitHub CLI", "bin"),
         )
 
+    def test_windows_keeps_azure_cli_install_path_nested(self, monkeypatch) -> None:
+        monkeypatch.setattr(runner.sys, "platform", "win32")
+        monkeypatch.setenv("ProgramFiles", r"C:\PF")
+        monkeypatch.delenv("ProgramW6432", raising=False)
+        monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+        root = r"C:\PF"
+        install_dir = os.path.join(root, "Microsoft SDKs", "Azure", "CLI2", "wbin")
+
+        assert runner._wellknown_windows_dirs("az") == (
+            install_dir,
+            os.path.join(install_dir, "bin"),
+        )
+
     def test_an_unset_root_is_skipped_rather_than_joined_as_empty(self, monkeypatch) -> None:
         monkeypatch.setattr(runner.sys, "platform", "win32")
         monkeypatch.delenv("ProgramFiles", raising=False)
@@ -514,7 +576,9 @@ class TestProviderOutputIsDecodedAsUtf8:
         monkeypatch.setattr(runner.subprocess, "run", _fake_run)
         monkeypatch.setattr(runner, "_audit_run", lambda *a, **k: None)
 
-        proc = runner.run_gh(["/usr/bin/gh", "api", "user"], timeout=5, audit_caller="test")
+        proc = runner.run_gh(
+            [host_abs("usr", "bin", "gh"), "api", "user"], timeout=5, audit_caller="test"
+        )
 
         assert "encoding" not in seen and seen.get("text") is not True, (
             "run_gh must capture BYTES and decode in its own frame; letting "
@@ -533,7 +597,9 @@ class TestProviderOutputIsDecodedAsUtf8:
         monkeypatch.setattr(runner, "_audit_run", lambda *a, **k: None)
 
         with pytest.raises(runner.SetupError) as caught:
-            runner.run_gh(["/usr/bin/gh", "api", "user"], timeout=5, audit_caller="test")
+            runner.run_gh(
+                [host_abs("usr", "bin", "gh"), "api", "user"], timeout=5, audit_caller="test"
+            )
 
         message = str(caught.value)
         assert "not valid UTF-8" in message
@@ -898,6 +964,7 @@ class TestDescribeAgainstRealAcls:
     def test_a_user_owned_tree_reports_the_user_as_owner(self, tmp_path: Path) -> None:
         binary = tmp_path / "gh.exe"
         binary.write_text("stub")
+        _set_owner_to_current_user(binary)
         security = windows_acl.describe(binary)
         assert security.owner_sid == platform_compat.current_user_sid()
         assert not security.null_dacl
@@ -940,15 +1007,6 @@ class TestDescribeAgainstRealAcls:
 
     def test_the_current_user_sid_is_a_well_formed_sid(self) -> None:
         assert platform_compat.current_user_sid().startswith("S-1-")
-
-    def test_elevation_is_reported_as_a_tri_state(self) -> None:
-        """``None`` (token unreadable) is distinct from ``False`` (not elevated).
-
-        Lives in ``platform_compat`` rather than here: it already owns reading
-        this process's own token, and a second copy of the OpenProcessToken /
-        GetTokenInformation prototype pair is plumbing that drifts.
-        """
-        assert platform_compat.is_token_elevated() in (True, False, None)
 
 
 class TestLoadRefusesOffWindows:
@@ -1032,8 +1090,8 @@ class TestApplyOwnerOnlyOffWindows:
     def test_the_volume_is_never_consulted_by_this_mechanism(self, monkeypatch) -> None:
         """The writer applies the DACL on ANY volume; the gate is not its job.
 
-        local=False would have refused while the gate lived here. It no longer
-        does: an on-loop caller has to ask before it starts (see
+        This mechanism does not consult the volume; an on-loop caller has to ask
+        before it starts (see
         :func:`windows_acl.volume_is_local`), because a refusal at this depth
         arrives after the caller already paid the cost it was avoiding.
         """

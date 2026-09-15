@@ -45,6 +45,11 @@ export interface AppInfo {
   name: string
   version: string
   permissions: AppPermissions
+  /** Whether the app's host surface is currently visible. A routed page is
+   *  always the visible surface (`true`); a body-owning side-panel tab stays
+   *  mounted while hidden and reads this to pause polling or release global
+   *  keys. Absent on hosts that predate the flag — treat `undefined` as `true`. */
+  active?: boolean
 }
 
 export interface AppTheme {
@@ -384,7 +389,7 @@ export function useChatLauncher(): {
 // adding it to the top-level imports (apps get React from import map)
 import React from 'react'
 
-function createScopedApi(allowedPaths: string[], appName: string): AppApi {
+function createScopedApi(allowedPaths: string[], appName: string, sessionKey?: string): AppApi {
   const check = (path: string): string => {
     // Reject absolute and protocol-relative URLs to prevent SSRF. Backslashes
     // are rejected too: the URL parser treats `\` like `/`, so `/\evil.com` or
@@ -405,7 +410,18 @@ function createScopedApi(allowedPaths: string[], appName: string): AppApi {
 
   const jsonFetch = async <T,>(path: string, init?: RequestInit): Promise<T> => {
     const safePath = check(path)
-    const res = await fetch(safePath, init)
+    // Carry the session identity on every scoped request when the host knows it.
+    // The backend's restricted-session guard (`_is_restricted_session`) reads
+    // `X-Session-Key` and FAILS OPEN on absence — no header is read as "not
+    // restricted" — so a control mounted in an incognito or guest chat would
+    // otherwise be permitted exactly the persistent writes that mode exists to
+    // prevent. `Headers` rather than an object spread because `init.headers` may
+    // be either shape, and a caller-supplied header is left alone.
+    const headers = new Headers(init?.headers)
+    if (sessionKey && !headers.has('X-Session-Key')) {
+      headers.set('X-Session-Key', sessionKey)
+    }
+    const res = await fetch(safePath, { ...init, headers })
     if (!res.ok) {
       const text = await res.text().catch(() => res.statusText)
       // A stale pre-owner session denial raises the dashboard's re-auth prompt
@@ -456,34 +472,49 @@ export function AppApiProvider({
   appVersion = '0.0.0',
   allowedApiPaths,
   allowedEvents,
+  active = true,
   subscribeFn,
   navigateFn,
   notifyFn,
+  sessionKey,
   children,
 }: {
   appName: string
   appVersion?: string
   allowedApiPaths: string[]
   allowedEvents: string[]
+  active?: boolean
   subscribeFn: (event: string, cb: (data: unknown) => void) => () => void
   navigateFn: (path: string) => void
   notifyFn: (message: string, opts?: { type?: 'info' | 'success' | 'error' }) => void
+  /**
+   * Session the hosted surface is scoped to, sent as `X-Session-Key` on every
+   * scoped request.
+   *
+   * Optional because a full-page app surface is not session-scoped and has
+   * nothing to send. Where the host DOES know the session — a composer session
+   * control — passing it is what lets the backend's restricted-session guard
+   * fire: that guard fails open on a missing header, so omitting it silently
+   * grants an incognito chat the persistent writes it is meant to be denied.
+   */
+  sessionKey?: string
   children: ReactNode
 }) {
   const apiKey = JSON.stringify(allowedApiPaths)
   const eventsKey = JSON.stringify(allowedEvents)
   const value = React.useMemo<AppSdkContextValue>(() => ({
-    api: createScopedApi(allowedApiPaths, appName),
+    api: createScopedApi(allowedApiPaths, appName, sessionKey),
     info: {
       name: appName,
       version: appVersion,
       permissions: { api: allowedApiPaths, events: allowedEvents },
+      active,
     },
     subscribe: subscribeFn,
     navigate: navigateFn,
     notify: notifyFn,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [appName, appVersion, apiKey, eventsKey, subscribeFn, navigateFn, notifyFn])
+  }), [appName, appVersion, apiKey, eventsKey, sessionKey, active, subscribeFn, navigateFn, notifyFn])
 
   return React.createElement(AppSdkContext.Provider, { value }, children)
 }

@@ -148,7 +148,7 @@ function renderSidebar(opts: {
     chat: {
       ...defaults.chat,
       activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {},
-      goalLoops: {}, workflowRuns: {}, subagentQueued: {}, slotHistory: [],
+      automations: {}, workflowRuns: {}, subagentQueued: {}, slotHistory: [],
       revealRequest: opts.revealRequest ?? null,
       revealNonce: opts.revealRequest?.nonce ?? 0,
     } as unknown as RootState['chat'],
@@ -401,7 +401,11 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     fireEvent.click(await screen.findByText('Switch to board view'))
     const banner = await screen.findByTestId('lane-seed-error')
     expect(banner.textContent).toContain('Could not add the automatic columns')
-    expect(banner.textContent).toContain('Try again')
+    expect(banner.textContent).toContain('persist failed')
+    // The notice is the shared ErrorNotice (hand-off inside); the retry is a
+    // separate control beside it, not text inside the banner.
+    expect(within(banner).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
   })
 
   it('gives back the pre-board width when switching to list view', async () => {
@@ -587,6 +591,24 @@ describe('ChatSidebar — Older Sessions pane', () => {
     fireEvent.change(screen.getByPlaceholderText('Search older sessions…'), { target: { value: 'W' } })
     expect(screen.getByText('Week history')).toBeTruthy()
     expect(screen.queryByText('Fresh history')).toBeNull()
+  })
+
+  it('carries the main session search into Older Sessions and keeps following it', async () => {
+    renderSidebar({ history: HISTORY })
+    const sessionSearch = screen.getByPlaceholderText('Search sessions…')
+
+    fireEvent.change(sessionSearch, { target: { value: 'Week' } })
+    openHistory()
+
+    const historySearch = screen.getByPlaceholderText('Search older sessions…')
+    expect(historySearch).toHaveValue('Week')
+    expect(screen.getByText('Week history')).toBeTruthy()
+    expect(screen.queryByText('Fresh history')).toBeNull()
+
+    fireEvent.change(screen.getByPlaceholderText('Search sessions…'), { target: { value: 'Fresh' } })
+    await waitFor(() => expect(screen.getByPlaceholderText('Search older sessions…')).toHaveValue('Fresh'))
+    expect(screen.getByText('Fresh history')).toBeTruthy()
+    expect(screen.queryByText('Week history')).toBeNull()
   })
 
   it('groups backend search results by folder and collapses a group', async () => {

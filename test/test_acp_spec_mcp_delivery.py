@@ -201,7 +201,7 @@ class TestTheArrayHasOneOwner:
         client = _client(ACP_BACKEND_KIRO, tmp_path)
         pooled = [{"name": "stub", "command": "c", "args": [], "env": []}]
         with patch.object(client, "_pooled_mcp_servers", return_value=pooled):
-            assert await client._session_mcp_servers() == pooled
+            assert await client._gated_session_mcp_servers() == pooled
 
     @pytest.mark.asyncio
     async def test_a_spec_adapter_gets_managed_plus_pooled_once(self, tmp_path) -> None:
@@ -218,7 +218,7 @@ class TestTheArrayHasOneOwner:
                 "kiro_crew.acp.tool_gate.resolve_verdict",
                 return_value=(Verdict.ROUTED, "delegates"),
             ):
-                out = await client._session_mcp_servers()
+                out = await client._gated_session_mcp_servers()
         names = [e["name"] for e in out]
         assert len(names) == len(set(names)), f"duplicate server names: {names}"
         assert "stub" in names
@@ -241,7 +241,7 @@ class TestTheArrayHasOneOwner:
             patch.object(client, "_pooled_mcp_servers", return_value=[]),
             patch.object(client, "_spec_session_mcp_delivery", side_effect=delivery),
         ):
-            await client._session_mcp_servers()
+            await client._gated_session_mcp_servers()
 
         assert seen
         assert all(thread is not loop_thread for thread in seen)
@@ -253,7 +253,7 @@ class TestTheArrayHasOneOwner:
         client = _client(backend, tmp_path)
         pooled = [{"name": "stub", "command": "c", "args": [], "env": []}]
         with patch.object(client, "_pooled_mcp_servers", return_value=pooled):
-            assert await client._session_mcp_servers() == []
+            assert await client._gated_session_mcp_servers() == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("verdict", [Verdict.INDETERMINATE, Verdict.BYPASSED])
@@ -266,7 +266,7 @@ class TestTheArrayHasOneOwner:
                 "kiro_crew.acp.tool_gate.resolve_verdict",
                 return_value=(verdict, "not routed"),
             ):
-                assert await client._session_mcp_servers() == []
+                assert await client._gated_session_mcp_servers() == []
 
     def test_the_historical_seam_name_still_binds(self, tmp_path) -> None:
         """An internal companion overrides _claude_session_mcp_servers by name."""

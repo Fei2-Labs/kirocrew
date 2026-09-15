@@ -14,9 +14,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { Clock, Pause, Play, Zap, ExternalLink, AlarmClockOff, TriangleAlert, Plus, X } from 'lucide-react'
+import { Clock, Pause, Play, Zap, ExternalLink, AlarmClockOff, Plus, X } from 'lucide-react'
 import { api } from '../api/client'
 import { Badge, Btn, IconButton, SendBtn, Skeleton } from './ui'
+import ErrorNotice from './ErrorNotice'
 import { timeAgo } from '../utils/timeAgo'
 import { fmtRelative } from '../i18n/format'
 import type { CronJob } from '../types'
@@ -56,6 +57,7 @@ function WakeRow({ job, onChanged }: { job: CronJob; onChanged: () => void }) {
           </Badge>
           <div className="min-w-0 flex-1">
             <div className="truncate text-[12.5px] text-text-strong">{job.name}</div>
+            {!job.member_id && <span className="text-[11px] text-muted">{i18nT('pages.kiroCrewAgentsPage.uses_global_memory_v1')}</span>}
             {(last || next) && (
               <div className="text-[10.5px] text-muted">
                 {[last, next].filter(Boolean).join(' · ')}
@@ -95,15 +97,21 @@ function WakeRow({ job, onChanged }: { job: CronJob; onChanged: () => void }) {
           </div>
         </div>
       </div>
-      {rowError && (
-        <div className="mt-1 pl-1 text-[11px] text-danger" role="alert">{rowError}</div>
-      )}
+      {/* No hand-off: the section can host the inline create JobForm (`creating`
+          in CrewWakeSection), whose unsaved fields this row cannot see. */}
+      <ErrorNotice
+        variant="inline"
+        className="mt-1 pl-1"
+        testId="crew-wake-row-error"
+        message={rowError}
+      />
     </div>
   )
 }
 
-export default function CrewWakeSection({ crew, isDefaultCrew, onDraftChange, onSavingChange, onRequestCancel }: {
+export default function CrewWakeSection({ crew, agentTemplate, isDefaultCrew, onDraftChange, onSavingChange, onRequestCancel }: {
   crew: string
+  agentTemplate?: string
   isDefaultCrew: boolean
   /** Reports whether the create form holds unsaved TYPED work, so the host
    *  editor can fold it into its own unsaved-state accounting (dirty dot,
@@ -192,9 +200,18 @@ export default function CrewWakeSection({ crew, isDefaultCrew, onDraftChange, on
     ? <Skeleton className="h-12" />
     : isError
       ? (
-        <div className="flex items-center gap-2 rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted" role="alert">
-          <TriangleAlert className="lucide-inline shrink-0" aria-hidden="true" />
-          {i18nT('components.crewWakeSection.could_not_load_this_crew_s_schedules_so_what_wak')}
+        // No hand-off while `creating`: the inline JobForm's unsaved fields
+        // would be lost. With the form closed nothing in the section is a
+        // draft, so the read failure gets the hand-off. Retry sits beside it,
+        // matching the sibling webhooks section on the same page.
+        <div className="flex items-center gap-2">
+          <ErrorNotice
+            askAgent={!creating}
+            testId="crew-wake-load-error"
+            className="flex-1"
+            message={i18nT('components.crewWakeSection.could_not_load_this_crew_s_schedules_so_what_wak')}
+          />
+          <Btn onClick={() => { void refetch() }}>{i18nT('components.crewWakeSection.retry')}</Btn>
         </div>
       )
       : jobs.length === 0
@@ -303,6 +320,8 @@ export default function CrewWakeSection({ crew, isDefaultCrew, onDraftChange, on
             agents={[]}
             defaultAgent=""
             lockedAgent={crew}
+            memberId={crew === 'default' ? undefined : crew}
+            providerAgent={agentTemplate}
             onSaved={onCreated}
             externalSubmit
             submitRef={submitRef}

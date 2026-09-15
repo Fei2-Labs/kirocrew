@@ -7,7 +7,7 @@
  * release loses the work and the review history; shipping it visible releases
  * an unpolished page. A preview flag keeps the code on `main`, keeps the route
  * routable, and simply does not advertise the surface anywhere in the UI until
- * the operator turns it on from Developer > Feature Previews.
+ * the operator turns it on from Settings > Developer > Feature Previews.
  *
  * Deliberately localStorage, not backend config: this is a per-device "show me
  * the unfinished thing" switch with no server behavior attached (the surface's
@@ -17,8 +17,13 @@
  *
  * Retiring a flag is the goal, not an afterthought: when the surface is
  * polished, delete its `previewFlag` from the registry entry and its card from
- * Developer > Feature Previews. The stale localStorage key then reads as an
- * ordinary unused key and no longer gates anything.
+ * Settings > Developer > Feature Previews. The stale localStorage key then reads as an
+ * ordinary unused key and no longer gates anything. The card's "See what it
+ * looks like" intro goes with it: its builder in `FeaturePreviewsSection.tsx`,
+ * its captures under `public/app-assets/feature-previews/`, its
+ * `pages.developer.featurePreviewsTab.intro.*` keys in every catalog, and its
+ * `shoot` step in `scripts/capture-feature-previews.mjs` — the media is the
+ * heaviest thing a flag ships, so it must not outlive the flag.
  */
 import { safeGetItem, safeSetItem } from './safeStorage'
 
@@ -68,17 +73,19 @@ export const PREVIEW_ACP_BACKENDS = `${PREVIEW_FLAG_PREFIX}acp-backends`
 /**
  * Crew: the Crew Members page (`/members`) and the "New Crew Mode chat" entry in
  * the sidebar's create menu.
+ * Crew Members: the Crew Members page (`/members`) and its rail item.
  *
- * ONE flag over both, not one each: they are two doors into the same unfinished
- * feature, and a user who reaches crew through the door that was left open hits
- * the same rough edges either way — so a per-door flag would only let the
- * feature half-ship. The two surfaces stay separate code; the flag is what says
- * "crew is not released yet".
+ * This flag used to hold a second door too — the "New Crew Mode chat" entry in
+ * the sidebar's create menu. Crew Mode retired in favour of the Members page,
+ * and that menu entry is now "Crew Members": rendered whatever this flag says,
+ * it opens `/members` when the flag is on and, when off, the Settings card that
+ * turns it on (`ChatSidebar.openCrewMembers`). The flag therefore gates only the
+ * page and where the entry lands, never whether the entry exists — a user who
+ * has not opted in still finds the door and is walked to the switch.
  *
- * Gating the INGRESS only. A session already created in crew mode keeps working,
- * keeps its `Crew` row badge, and its route stays registered, so turning the
- * flag off does not orphan existing work — it stops advertising the feature to
- * someone who has not opted in.
+ * Gating the INGRESS only. Turning the flag off hides the rail item and reroutes
+ * the menu entry; it does not orphan existing work — it stops advertising the
+ * page to someone who has not opted in.
  */
 export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
 
@@ -87,19 +94,18 @@ export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
  * entry in the sidebar's create menu.
  *
  * Its own flag, deliberately NOT {@link PREVIEW_CREW}. The word "crew" carries
- * two unrelated meanings here: `PREVIEW_CREW` holds Crew Mode (parallel
- * sub-sessions) and the Crew Members page, while this holds sessions dispatched
- * to another MACHINE over the instances tunnel. Sharing one key would release or
- * hold both at once, which is the same half-ship failure `PREVIEW_CREW`'s own
- * one-flag-two-doors reasoning exists to prevent — in the opposite direction.
+ * two unrelated meanings here: `PREVIEW_CREW` holds the Crew Members page, while
+ * this holds sessions dispatched to another MACHINE over the instances tunnel.
+ * Sharing one key would release or hold both at once, which is the same
+ * half-ship failure a per-feature flag exists to prevent.
  *
  * Held because the LANDING is unfinished, not the dispatch: the session really is
  * created on the peer, but there is no native remote chat view yet, so it opens
  * by switching to that crew's pane, and the local session list does not show
  * live remote sessions — so the session is hard to return to afterwards.
  *
- * Its toggle lives in Developer > Feature Previews, alongside every other
- * unreleased surface, and NOT on Settings > Remote crews where it started: a
+ * Its toggle lives in Settings > Developer > Feature Previews, alongside every other
+ * unreleased surface, and NOT on Settings > Remote Instances where it started: a
  * held feature is found by looking at the one page that lists held features, so
  * scattering an opt-in onto the page it happens to act on hides it from the only
  * reader who wants it. It keeps its own card there rather than sharing
@@ -110,6 +116,16 @@ export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
  * off only stops offering the menu entry.
  */
 export const PREVIEW_REMOTE_CREW_CHAT = `${PREVIEW_FLAG_PREFIX}remote-crew-chat`
+
+/**
+ * A connected remote instance's live sessions, merged into the Sessions list.
+ *
+ * Gates a surface INSIDE `ChatSidebar`, which every dashboard user renders — so
+ * unlike a route-level gate, this flag is also what keeps the per-instance slot
+ * queries off the wire for anyone who has not opted in. Read it in the sidebar
+ * and skip the fetch, rather than fetching and hiding the rows.
+ */
+export const PREVIEW_INSTANCE_SESSIONS = `${PREVIEW_FLAG_PREFIX}instance-sessions`
 
 /**
  * Read a preview flag. Absent, unparseable, or storage-denied all mean OFF —

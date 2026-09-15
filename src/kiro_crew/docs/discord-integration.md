@@ -145,7 +145,7 @@ Portal or clear the thread allow-list and restart in DM-only mode.
 | Bot can read but cannot reply in a thread | Missing guild permission or private-thread membership | Grant View Channel, Read Message History, Send Messages in Threads; add the bot to private threads |
 | Logs are silent on successful connection | `agent.log_level` is `WARNING` | Trust the Connected badge or lower the log level |
 
-## Security model
+## Access control
 
 - **Two allow-lists for threads.** A server-thread turn runs only when both the
   sender and exact thread are approved. An empty user list denies all traffic;
@@ -193,7 +193,7 @@ works, including before the `applications.commands` scope is installed.
 | `!compact` | Compress the current conversation context |
 | `!model` / `!models` | Pick the model from a button list of what your account can use |
 | `!status` | Show runtime stats, the active agent, and whether auto-approve is on |
-| `!sessions` / `!session` | In a DM, pick a recent dashboard session and continue it here (owner only) |
+| `!sessions` / `!session` | In a DM, pick a recent dashboard or same-DM session and continue it here (owner only) |
 | `!link` / `!unlink` | Resume or stop mirroring dashboard replies here (on by default) |
 | `!stop` / `!cancel` | Stop the current reply and clear its queue |
 | `!help` | Show commands |
@@ -215,14 +215,17 @@ last exactly until your next message, since a conversation with no binding is
 indistinguishable from one that was never linked. `!link` re-enables it. Neither
 touches a binding you set explicitly from the dashboard to some other target.
 
-### Continuing a dashboard session from Discord
+### Continuing an earlier session from Discord
 
-In a DM, `!sessions` lists your 10 most recent dashboard conversations as buttons. Tap
-one and that session continues in this Discord conversation: the last five
-messages are replayed for context, and everything you send afterwards goes to
-that session instead of your own Discord conversation. `!unlink` releases it and
-returns you to your Discord conversation; `!new` releases it and starts a fresh
-Discord conversation.
+In a DM, `!sessions` lists your 10 most recent dashboard conversations plus earlier
+generations of this same Discord DM. It never exposes native sessions belonging to
+another Discord user, agent, shared thread, or messaging channel. Tap one and that
+session continues in this Discord conversation: the last five messages are replayed
+for context, and everything you send afterwards goes to that session instead of your
+own Discord conversation. `!unlink` releases it and returns you to your Discord
+conversation; `!new` releases it and starts a fresh Discord conversation. `!new`
+persists the new generation before replying, so a gateway restart cannot return the
+next message to the old conversation. The first real turn adds it to `!sessions`.
 
 While a session is resumed, `!compact` compresses **that** session's context and
 `!stop` cancels **its** running turn. Replies from the dashboard for a resumed
@@ -251,8 +254,8 @@ another channel, Kiro Crew refuses and tells you where it lives, rather than
 moving it silently.
 
 `!sessions` is **owner-only and requires exactly one entry in
-`discord.allowed_user_ids`**. Session listing and resume are global operations —
-they can reach any dashboard conversation, not just Discord ones — so with two
+`discord.allowed_user_ids`**. Session listing and resume can reach any dashboard
+conversation plus this DM's native generations, so with two
 or more allowed users Kiro Crew cannot tell which one owns the workspace and
 refuses the command instead of guessing. Incognito and temporary sessions are
 never listed, and session titles plus replayed messages are scrubbed of
@@ -261,3 +264,9 @@ credentials and suspicious URLs before they reach Discord.
 While a reply is running, prefix a message with `!steer` to fold it into the
 running turn or `!queue` to answer it afterward. `[OPTIONS:]` choices render as
 buttons, and interactive tool approvals render as Approve/Deny buttons.
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables

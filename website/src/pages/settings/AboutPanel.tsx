@@ -15,6 +15,7 @@ import SegmentedControl from '../../components/SegmentedControl'
 import ReportProblemCard from './ReportProblemCard'
 import { api, ApiError } from '../../api/client'
 import { copyToClipboard } from '../../utils/clipboard'
+import ErrorNotice from '../../components/ErrorNotice'
 
 import { i18nT } from '../../i18n/t'
 import { fmtDateTimeNumeric, fmtList, fmtRelative } from '../../i18n/format'
@@ -121,52 +122,8 @@ function updateErrorText(st: UpdateState | null | undefined): string {
   }
 }
 
-type UpdateInfo = {
-  version?: string
-  channel?: string
-  stampedChannel?: string | null
-  channelSwitchable?: boolean
-  channelPreference?: string
-  /**
-   * Whether a discovered update downloads without a click. ON by default in the
-   * desktop shell; `undefined` from a shell that predates the preference, which
-   * is why the toggle reads it as `!== false` rather than truthy.
-   */
-  autoDownload?: boolean
-  platform?: string
-  /** Manual-reinstall permalink from the main process; absent when no lane. */
-  downloadUrl?: string | null
-  packaged?: boolean
-  disabled?: string
-  /** Externally-managed metadata; both empty on a self-updating install. */
-  managedBy?: string
-  updateCommand?: string
-  /**
-   * What the FOLLOWED channel's feed last reported, and whether these bytes are
-   * ahead of it (that lane never published this build, so the install is not on
-   * it). Both come from the feed, because `stampedChannel` cannot answer it: a
-   * promoted stable release ships the soaked candidate's bytes unchanged, so its
-   * version keeps an insider stamp. `''` / `null` / `undefined` = no check has
-   * completed yet, which consumers must treat as UNKNOWN, never as "ahead".
-   */
-  laneVersion?: string
-  runningAheadOfLane?: boolean | null
-}
-
-type UpdateAPI = {
-  onState: (cb: (payload: UpdateState) => void) => (() => void)
-  check: () => Promise<unknown>
-  download: () => Promise<unknown>
-  install: () => Promise<unknown>
-  getInfo: () => Promise<UpdateInfo>
-  setChannel?: (channel: string) => Promise<{ ok: boolean; error?: string }>
-  // Optional so the panel still renders against an older desktop shell whose
-  // preload has no such bridge: the toggle is hidden rather than throwing.
-  setAutoDownload?: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>
-}
-
 function getUpdateApi(): UpdateAPI | undefined {
-  return (window as unknown as { updateAPI?: UpdateAPI }).updateAPI
+  return window.updateAPI
 }
 
 // Subtle accent tint for the version pill + build chips (works with any theme's
@@ -200,6 +157,36 @@ const REPORT_ISSUE_URL = 'https://github.com/kirodotdev/KiroCrew/issues/new'
  * later.
  */
 const ARM_TIMEOUT_MS = 5000
+
+/**
+ * Consecutive `armStatus` poll failures before the armed panel says so. One or
+ * two misses are the normal cost of a 5s poll on a flaky link and the local
+ * countdown covers them; a run of them means the approval landing can no
+ * longer be observed, which the user must hear rather than wait on forever.
+ */
+const ARM_POLL_FAILURE_THRESHOLD = 3
+
+/**
+ * Copy a command and report the OUTCOME. `copyToClipboard` resolves `false`
+ * when the legacy fallback fails without throwing (plain-HTTP remote gateway —
+ * exactly the deployment these commands target) and rejects when both paths
+ * are dead; either way painting "Copied" would tell the user their shell paste
+ * is ready when the clipboard still holds something else.
+ */
+async function copyCommand(
+  text: string,
+  setCopied: (v: boolean) => void,
+  setFailed: (v: boolean) => void,
+): Promise<void> {
+  let ok = false
+  try {
+    ok = await copyToClipboard(text)
+  } catch {
+    ok = false
+  }
+  setCopied(ok)
+  setFailed(!ok)
+}
 
 /**
  * Last-resort prerelease test for an info payload with NO channel fields.
@@ -319,7 +306,13 @@ export function resolveUnarmedPhase(deadlineMs: number, now: number): 'expired' 
   return now >= deadlineMs ? 'expired' : 'applying'
 }
 
-function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
+export function InAppUpdateFlow({
+  version,
+  manualCommand,
+  isChannelMove,
+  onHandoff,
+  askAgent = true,
+}: {
   /**
    * DISPLAY ONLY — the label on the Arm button. `armUpdate()` sends no version
    * (the gateway arms against its own cached raw `latest_version`), so this is
@@ -337,6 +330,10 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
    * same direction-blind copy this change exists to remove.
    */
   isChannelMove?: boolean
+  /** Close an overlay host after Ask Agent successfully navigates to chat. */
+  onHandoff?: () => void
+  /** Disable hand-off where an enforcement overlay must remain visible. */
+  askAgent?: boolean
 }) {
   const [phase, setPhase] = useState<'idle' | 'armed' | 'applying' | 'failed' | 'expired'>('idle')
   const [armed, setArmed] = useState<{
@@ -355,6 +352,7 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
     armedRef.current = armed
   }, [armed])
   const [cmdCopied, setCmdCopied] = useState(false)
+  const [cmdCopyFailed, setCmdCopyFailed] = useState(false)
   const [armError, setArmError] = useState('')
   // The gateway's apply narrates over the shared update-progress push; render
   // it inline so the armed copy's "progress appears here" is literally true.
@@ -381,7 +379,9 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
         setArmError(res.error || i18nT('pages.settings.aboutPanel.update_failed'))
       }
     },
-    onError: (e: unknown) => setArmError(e instanceof ApiError ? e.message : String(e)),
+    onError: (e: unknown) => setArmError(
+      e instanceof ApiError ? e.message : i18nT('pages.settings.aboutPanel.update_failed'),
+    ),
   })
   // Countdown + liveness poll while ARMED. The count is cosmetic (the server
   // enforces the TTL); the poll is what notices the request being consumed —
@@ -403,8 +403,10 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
     return () => clearInterval(tick)
   }, [isArmed])
   // Liveness poll through react-query, enabled only while armed: a consumed
-  // request (armed: false) is the approval landing. Errors are left to retry
-  // on the next interval — the local countdown keeps running regardless.
+  // request (armed: false) is the approval landing. A single error is left to
+  // retry on the next interval — the local countdown keeps running regardless —
+  // but a run of ARM_POLL_FAILURE_THRESHOLD consecutive failures is surfaced
+  // in the armed panel, because past that point the approval can land unseen.
   const armStatusQuery = useQuery({
     queryKey: ['update-arm-status'],
     queryFn: () => api.armStatus(),
@@ -441,103 +443,144 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
     if (phase !== 'applying' && phase !== 'armed') return
     if (progressStep === 'failed' || progressStep === 'error') setPhase('failed')
   }, [progressStep, phase])
-  if (phase === 'applying') {
-    return (
-      <div className="flex flex-col gap-2" data-testid="in-app-update-applying">
-        <p className="text-[13px] text-text flex items-center gap-1.5">
-          <RefreshCw size={13} className="lucide-inline animate-spin text-accent" />
-          {i18nT('pages.settings.aboutPanel.applying_update')}
-        </p>
-        {progress?.detail && (
-          <p className="text-[12px] text-muted font-mono break-all" data-testid="apply-progress">
-            {progress.detail}
-          </p>
-        )}
-        <p className="text-[12px] text-muted">
-          {i18nT('pages.settings.aboutPanel.applying_restart_note')}
-        </p>
-      </div>
-    )
+  const resetFailure = () => {
+    setPhase('idle')
+    setArmed(null)
+    setCmdCopied(false)
+    setCmdCopyFailed(false)
   }
-  if (phase === 'failed') {
-    return (
-      <div className="flex flex-col gap-2" data-testid="in-app-update-failed">
-        <span className="text-[12px] text-danger flex items-start gap-1.5">
-          <AlertCircle size={13} className="lucide-inline shrink-0" />
-          {progress?.detail || i18nT('pages.settings.aboutPanel.update_failed')}
-        </span>
-        <div>
-          <Btn onClick={() => { setPhase('idle'); setArmed(null); setCmdCopied(false) }}>
-            {i18nT('pages.settings.aboutPanel.try_again')}
-          </Btn>
-        </div>
-      </div>
-    )
+  const runAction = () => {
+    if (phase === 'armed' && armed) {
+      void copyCommand(armed.approveCommand, setCmdCopied, setCmdCopyFailed)
+      return
+    }
+    if (phase === 'failed') {
+      resetFailure()
+      return
+    }
+    if (phase !== 'applying') arm.mutate()
   }
-  if (phase !== 'armed' || !armed) {
-    return (
-      <div className="flex flex-col gap-2" data-testid="in-app-update">
-        {phase === 'expired' && (
-          <p className="text-[12px] text-muted" data-testid="arm-expired-note">
-            {i18nT('pages.settings.aboutPanel.approval_window_expired')}
+  const rootTestId = phase === 'armed'
+    ? 'in-app-update-armed'
+    : phase === 'applying'
+      ? 'in-app-update-applying'
+      : phase === 'failed'
+        ? 'in-app-update-failed'
+        : 'in-app-update'
+  const canStart = phase === 'idle' || phase === 'expired'
+
+  return (
+    <div className="flex flex-col gap-2" data-testid={rootTestId}>
+      {phase === 'applying' && (
+        <>
+          {progress?.detail && (
+            <p className="text-[12px] text-muted font-mono break-all" data-testid="apply-progress">
+              {progress.detail}
+            </p>
+          )}
+          <p className="text-[12px] text-muted">
+            {i18nT('pages.settings.aboutPanel.applying_restart_note')}
           </p>
-        )}
-        <p className="text-[13px] text-muted">
-          {i18nT(isChannelMove
-            ? 'pages.settings.aboutPanel.in_app_channel_move_intro'
-            : 'pages.settings.aboutPanel.in_app_update_intro')}
-        </p>
-        <div>
-          <Btn primary onClick={() => arm.mutate()} disabled={arm.isPending}>
-            {/* A lane move rolls the version BACK, so the primary action that
-                performs it must not wear an upgrade arrow. */}
-            {isChannelMove
+        </>
+      )}
+
+      {phase === 'failed' && (
+        <ErrorNotice
+          message={progress?.detail || i18nT('pages.settings.aboutPanel.update_failed')}
+          askAgent={askAgent}
+          onHandoff={onHandoff}
+        />
+      )}
+
+      {canStart && (
+        <>
+          {phase === 'expired' && (
+            <p className="text-[12px] text-muted" data-testid="arm-expired-note">
+              {i18nT('pages.settings.aboutPanel.approval_window_expired')}
+            </p>
+          )}
+          <p className="text-[13px] text-muted">
+            {i18nT(isChannelMove
+              ? 'pages.settings.aboutPanel.in_app_channel_move_intro'
+              : 'pages.settings.aboutPanel.in_app_update_intro')}
+          </p>
+          <ErrorNotice message={armError} askAgent={askAgent} onHandoff={onHandoff} testId="arm-error" />
+          {manualCommand && (
+            <details className="text-[12px] text-muted">
+              <summary className="cursor-pointer">{i18nT('pages.settings.aboutPanel.or_update_manually')}</summary>
+              <div className="mt-2 p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all">
+                {manualCommand}
+              </div>
+            </details>
+          )}
+        </>
+      )}
+
+      {phase === 'armed' && armed && (
+        <>
+          <p className="text-[13px] text-muted">
+            {i18nT('pages.settings.aboutPanel.armed_run_on_host')}
+          </p>
+          <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
+            data-testid="approve-command">
+            {armed.approveCommand}
+          </div>
+          <span className="text-[12px] text-muted" data-testid="arm-countdown">
+            {i18nT('pages.settings.aboutPanel.armed_expires_in', {
+              time: `${Math.floor(armed.expiresIn / 60)}:${String(armed.expiresIn % 60).padStart(2, '0')}`,
+            })}
+          </span>
+          {cmdCopyFailed && (
+            <ErrorNotice
+              variant="inline"
+              message={i18nT('pages.settings.aboutPanel.copy_failed_select_the_command_and_copy_it_manually')}
+              askAgent={askAgent}
+              onHandoff={onHandoff}
+              testId="arm-copy-error"
+            />
+          )}
+          {armStatusQuery.failureCount >= ARM_POLL_FAILURE_THRESHOLD && (
+            <ErrorNotice
+              variant="inline"
+              message={i18nT('pages.settings.aboutPanel.arm_status_poll_failing')}
+              askAgent={askAgent}
+              onHandoff={onHandoff}
+              testId="arm-poll-error"
+            />
+          )}
+          <p className="text-[12px] text-muted">
+            {i18nT('pages.settings.aboutPanel.armed_waiting_note')}
+          </p>
+        </>
+      )}
+
+      <div>
+        <Btn
+          key="update-action"
+          data-testid="in-app-update-action"
+          primary={canStart}
+          onClick={runAction}
+          disabled={arm.isPending || phase === 'applying'}
+        >
+          {phase === 'applying' ? (
+            <><RefreshCw size={13} className="lucide-inline animate-spin" /> {i18nT('pages.settings.aboutPanel.applying_update')}</>
+          ) : phase === 'armed' ? (
+            <><Copy size={13} className="lucide-inline" /> {cmdCopied
+              ? i18nT('pages.settings.aboutPanel.copied')
+              : i18nT('pages.settings.aboutPanel.copy_command')}</>
+          ) : phase === 'failed' ? (
+            i18nT('pages.settings.aboutPanel.try_again')
+          ) : (
+            <>{isChannelMove
               ? <GitBranch size={13} className="lucide-inline" />
               : <ArrowUp size={13} className="lucide-inline" />} {version
               ? i18nT(isChannelMove
                 ? 'pages.settings.aboutPanel.switch_to_version'
                 : 'pages.settings.aboutPanel.update_to_version', { version })
-              : i18nT('pages.settings.aboutPanel.update_now')}
-          </Btn>
-        </div>
-        {armError && (
-          <span className="text-[12px] text-danger flex items-start gap-1.5" data-testid="arm-error">
-            <AlertCircle size={13} className="lucide-inline shrink-0" /> {armError}
-          </span>
-        )}
-        <details className="text-[12px] text-muted">
-          <summary className="cursor-pointer">{i18nT('pages.settings.aboutPanel.or_update_manually')}</summary>
-          <div className="mt-2 p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all">
-            {manualCommand}
-          </div>
-        </details>
-      </div>
-    )
-  }
-  return (
-    <div className="flex flex-col gap-2" data-testid="in-app-update-armed">
-      <p className="text-[13px] text-muted">
-        {i18nT('pages.settings.aboutPanel.armed_run_on_host')}
-      </p>
-      <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
-        data-testid="approve-command">
-        {armed.approveCommand}
-      </div>
-      <div className="flex items-center gap-2 flex-wrap">
-        <Btn onClick={async () => { await copyToClipboard(armed.approveCommand); setCmdCopied(true) }}>
-          <Copy size={13} className="lucide-inline" /> {cmdCopied
-            ? i18nT('pages.settings.aboutPanel.copied')
-            : i18nT('pages.settings.aboutPanel.copy_command')}
+              : i18nT('pages.settings.aboutPanel.update_now')}</>
+          )}
         </Btn>
-        <span className="text-[12px] text-muted" data-testid="arm-countdown">
-          {i18nT('pages.settings.aboutPanel.armed_expires_in', {
-            time: `${Math.floor(armed.expiresIn / 60)}:${String(armed.expiresIn % 60).padStart(2, '0')}`,
-          })}
-        </span>
       </div>
-      <p className="text-[12px] text-muted">
-        {i18nT('pages.settings.aboutPanel.armed_waiting_note')}
-      </p>
     </div>
   )
 }
@@ -572,9 +615,9 @@ export function AboutPanel() {
   const isDesktop = !!desktopApi
 
   // Desktop (Electron) app info (version, channel, platform)
-  const { data: info } = useQuery({
+  const { data: info, isError: infoError } = useQuery({
     queryKey: ['update-info'],
-    queryFn: () => desktopApi!.getInfo(),
+    queryFn: () => desktopApi!.getInfo!(),
     enabled: isDesktop,
     staleTime: Infinity, // static per session
   })
@@ -595,7 +638,7 @@ export function AboutPanel() {
   })
   // Explicit consent actions (macOS Software Update semantics): downloading
   // and installing each happen only when the user clicks.
-  const downloadMutation = useMutation({ mutationFn: () => desktopApi!.download() })
+  const downloadMutation = useMutation({ mutationFn: () => desktopApi!.download!() })
   const installMutation = useMutation({ mutationFn: () => desktopApi!.install() })
   // Install is a ONE-WAY door, so the control must never become actionable
   // again. Note isSuccess, not just isPending: `update:install` resolves as soon
@@ -613,13 +656,25 @@ export function AboutPanel() {
     mutationFn: (next: string) => desktopApi!.setChannel!(next),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['update-info'] }),
   })
+  // A refused switch arrives either as a rejection or as a RESOLVED
+  // `{ ok: false, error }` — the bridge's contract — so both count as failed.
+  // The shell's reason, when it gave one, is the only actionable detail.
+  const desktopChannelFailed = channelMutation.isError
+    || (channelMutation.data !== undefined && !channelMutation.data.ok)
+  const desktopChannelReason = channelMutation.data && !channelMutation.data.ok
+    ? (channelMutation.data.error || '')
+    : ''
   // Auto-download opt-out. The toggle renders from info.autoDownload, so the
   // invalidate is what moves it -- there is no local optimistic state to roll
-  // back, and a failed write simply leaves the switch where it was.
+  // back, and a failed write leaves the switch where it was, which is why the
+  // failure is reported next to it below (a switch that silently refuses to
+  // move reads as broken, not as refused).
   const autoDownloadMutation = useMutation({
     mutationFn: (next: boolean) => desktopApi!.setAutoDownload!(next),
     onSettled: () => queryClient.invalidateQueries({ queryKey: ['update-info'] }),
   })
+  const autoDownloadFailed = autoDownloadMutation.isError
+    || (autoDownloadMutation.data !== undefined && !autoDownloadMutation.data.ok)
 
   // The version chip's DISPLAY text. For a gateway install the fold is the
   // backend's (`version_display`, raw `version` fallback for a gateway that
@@ -732,7 +787,25 @@ export function AboutPanel() {
   } else if (updateState?.state === 'error' && updateState.phase !== 'download' && updateState.phase !== 'install') {
     // Download failures are NOT rendered here: they render inside the update
     // card so the found version stays on screen and can be retried.
-    status = <span className="text-danger flex items-center gap-1.5"><AlertCircle size={13} className="lucide-inline" /> {i18nT('pages.settings.aboutPanel.couldn_t_check_for_updates')}: {updateErrorText(updateState)}</span>
+    // askAgent on: a status line; the Check button above is the retry.
+    status = (
+      <ErrorNotice
+        variant="inline"
+        message={`${i18nT('pages.settings.aboutPanel.couldn_t_check_for_updates')}: ${updateErrorText(updateState)}`}
+        askAgent
+      />
+    )
+  } else if (checkMutation.isError) {
+    // The IPC call itself rejected, so no updater push will ever describe this
+    // failure — without this branch the click simply does nothing visible.
+    status = (
+      <ErrorNotice
+        variant="inline"
+        message={`${i18nT('pages.settings.aboutPanel.couldn_t_check_for_updates')}: ${i18nT(UPDATE_ERROR_KEYS.unknown)}`}
+        askAgent
+        testId="check-request-failed"
+      />
+    )
   }
 
   // Update card: shown whenever an update is found / downloading / ready.
@@ -808,11 +881,35 @@ export function AboutPanel() {
           </span>
         </>
       )}
+      {/* askAgent on: the card is the retry surface (Retry / manual link stay
+          siblings), and a download holds no user input to lose. */}
       {cardFailed && (
-        <span className="text-[12px] text-danger flex items-start gap-1.5" data-testid="update-download-error">
-          <AlertCircle size={13} className="lucide-inline shrink-0" />
-          <span>{i18nT(cardInstallFailed ? 'pages.settings.aboutPanel.install_failed' : 'pages.settings.aboutPanel.download_failed')}: {updateErrorText(updateState)}</span>
-        </span>
+        <ErrorNotice
+          variant="inline"
+          message={`${i18nT(cardInstallFailed ? 'pages.settings.aboutPanel.install_failed' : 'pages.settings.aboutPanel.download_failed')}: ${updateErrorText(updateState)}`}
+          askAgent
+          testId="update-download-error"
+        />
+      )}
+      {/* The IPC call rejected before the updater ever emitted a failure state,
+          so no `cardFailed` row describes it: the button would just re-arm with
+          no message. Gated on !cardFailed so a real updater failure is never
+          reported twice. */}
+      {!cardFailed && downloadMutation.isError && (
+        <ErrorNotice
+          variant="inline"
+          message={`${i18nT('pages.settings.aboutPanel.download_failed')}: ${i18nT(UPDATE_ERROR_KEYS.unknown)}`}
+          askAgent
+          testId="update-download-request-error"
+        />
+      )}
+      {!cardFailed && installMutation.isError && (
+        <ErrorNotice
+          variant="inline"
+          message={`${i18nT('pages.settings.aboutPanel.install_failed')}: ${i18nT(UPDATE_ERROR_KEYS.installUnknown)}`}
+          askAgent
+          testId="update-install-request-error"
+        />
       )}
       {cardReady && (
         <span className="text-[12px] text-muted">
@@ -891,12 +988,14 @@ export function AboutPanel() {
   const [gwChannelError, setGwChannelError] = useState('')
   const [gwCommand, setGwCommand] = useState('')
   const [gwCommandCopied, setGwCommandCopied] = useState(false)
+  const [gwCommandCopyFailed, setGwCommandCopyFailed] = useState(false)
   const [managedCmdCopied, setManagedCmdCopied] = useState(false)
+  const [managedCmdCopyFailed, setManagedCmdCopyFailed] = useState(false)
   const [showConfirm, setShowConfirm] = useState(false)
   const [applyError, setApplyError] = useState('')
   const [restarting, setRestarting] = useState(false)
   const [autoUpdate, setAutoUpdate] = useState(true)
-  const { data: mcCfg } = useQuery({ queryKey: ['mc-config-autoupdate'], queryFn: () => api.kirocrewConfig() })
+  const { data: mcCfg, isError: mcCfgError } = useQuery({ queryKey: ['mc-config-autoupdate'], queryFn: () => api.kirocrewConfig() })
   useEffect(() => {
     const v = (mcCfg as { auto_update?: boolean } | undefined)?.auto_update
     if (typeof v === 'boolean') setAutoUpdate(v)
@@ -934,6 +1033,7 @@ export function AboutPanel() {
         typeof d?.remediation?.command === 'string' ? d.remediation.command : ''
       )
       setGwCommandCopied(false)
+      setGwCommandCopyFailed(false)
       if (typeof d?.can_apply === 'boolean') setGwSelfUpdatable(d.can_apply)
       if (typeof d?.auto_update === 'boolean') setAutoUpdate(d.auto_update)
     },
@@ -999,6 +1099,7 @@ export function AboutPanel() {
       setGwError(typeof d?.error_code === 'string' ? d.error_code : '')
       setGwCommand(typeof d?.update_command === 'string' ? d.update_command : '')
       setGwCommandCopied(false)
+      setGwCommandCopyFailed(false)
       setGwTarget(typeof d?.latest_version === 'string' ? d.latest_version : '')
       setGwTargetDisplay(typeof d?.latest_version_display === 'string' ? d.latest_version_display : '')
       if (typeof d?.can_apply === 'boolean') setGwSelfUpdatable(d.can_apply)
@@ -1127,6 +1228,9 @@ export function AboutPanel() {
   // whole branch — installer command included — rendered forever.
   const channelMovePending = !isDesktop && gwChannelMovePending
   const showManualUpdate = (showUpdate || channelMovePending) && !gwSelfUpdate
+  const effectiveGwCanArm = typeof gwCheck.data?.can_arm === 'boolean'
+    ? gwCheck.data.can_arm
+    : gwCanArm
 
   // Escape closes the confirm dialog (unless an apply/restart is in flight).
   useEffect(() => {
@@ -1233,6 +1337,18 @@ export function AboutPanel() {
                 })}
               </div>
             )}
+            {/* getInfo() rejected: the version chip above fell back to the
+                gateway's figure and the channel row is missing, with nothing
+                to say why. askAgent on: a read failure on a status card. */}
+            {infoError && (
+              <ErrorNotice
+                variant="inline"
+                className="mt-1"
+                message={i18nT('pages.settings.aboutPanel.update_info_unavailable')}
+                askAgent
+                testId="update-info-error"
+              />
+            )}
           </div>
         </div>
 
@@ -1316,6 +1432,19 @@ export function AboutPanel() {
                   </span>
                 </div>
               )}
+              {/* Mirrors the gateway switcher's error line: a refused switch used
+                  to leave the control silently sitting on the old lane. The
+                  bridge reports a refusal either as a rejection or as
+                  `{ ok: false, error }`, so both are read. askAgent on: the
+                  preference is persisted by the shell, nothing here is a draft. */}
+              {desktopChannelFailed && (
+                <ErrorNotice
+                  title={desktopChannelReason ? i18nT('pages.settings.aboutPanel.channel_switch_failed') : undefined}
+                  message={desktopChannelReason || i18nT('pages.settings.aboutPanel.channel_switch_failed')}
+                  askAgent
+                  testId="channel-error"
+                />
+              )}
             </div>
           ) : (
             <Row label={i18nT('pages.settings.aboutPanel.update_channel')}>{channel}</Row>
@@ -1395,14 +1524,18 @@ export function AboutPanel() {
                 </span>
               </div>
             )}
+            {/* askAgent on: the switch persists server-side or not at all; the
+                control still shows the lane actually followed. The 409 reason,
+                when given, is the message (and the journal key); the generic
+                line becomes a bold lead in front of it rather than a prefix
+                concatenated into it. */}
             {gwChannelMutation.isError && (
-              <span className="text-[12px] text-danger flex items-start gap-1.5" data-testid="gateway-channel-error">
-                <AlertCircle size={13} className="lucide-inline shrink-0" />
-                <span>
-                  {i18nT('pages.settings.aboutPanel.channel_switch_failed')}
-                  {gwChannelError ? `: ${gwChannelError}` : ''}
-                </span>
-              </span>
+              <ErrorNotice
+                title={gwChannelError ? i18nT('pages.settings.aboutPanel.channel_switch_failed') : undefined}
+                message={gwChannelError || i18nT('pages.settings.aboutPanel.channel_switch_failed')}
+                askAgent
+                testId="gateway-channel-error"
+              />
             )}
             {/* Switching re-points the FEED; it installs nothing. The segmented
                 control highlights the new lane the moment the switch succeeds, so
@@ -1511,12 +1644,20 @@ export function AboutPanel() {
                     data-testid="managed-update-command">
                     {info.updateCommand}
                   </div>
-                  <div>
-                    <Btn onClick={async () => { await copyToClipboard(info.updateCommand!); setManagedCmdCopied(true) }}>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <Btn onClick={() => copyCommand(info.updateCommand!, setManagedCmdCopied, setManagedCmdCopyFailed)}>
                       <Copy size={13} className="lucide-inline" /> {managedCmdCopied
                         ? i18nT('pages.settings.aboutPanel.copied')
                         : i18nT('pages.settings.aboutPanel.copy_command')}
                     </Btn>
+                    {/* askAgent on: the command is still on screen above. */}
+                    {managedCmdCopyFailed && (
+                      <ErrorNotice
+                        variant="inline"
+                        message={i18nT('pages.settings.aboutPanel.copy_failed_select_the_command_and_copy_it_manually')}
+                        askAgent
+                      />
+                    )}
                   </div>
                 </>
               )}
@@ -1608,6 +1749,16 @@ export function AboutPanel() {
                     checked={info?.autoDownload !== false}
                     onChange={next => autoDownloadMutation.mutate(next)}
                   />
+                  {/* askAgent on: the switch already shows the value still in
+                      effect (it re-reads getInfo), so nothing is lost by leaving. */}
+                  {autoDownloadFailed && (
+                    <ErrorNotice
+                      variant="inline"
+                      message={i18nT('pages.settings.aboutPanel.auto_download_save_failed')}
+                      askAgent
+                      testId="auto-download-error"
+                    />
+                  )}
                 </div>
               )}
             </div>
@@ -1622,7 +1773,7 @@ export function AboutPanel() {
                   </p>
                 )}
                 {showManualUpdate ? (
-                  gwCanArm ? (
+                  effectiveGwCanArm ? (
                     <InAppUpdateFlow
                       version={gwTargetDisplay || gwStatusLatestDisplay || gwTarget || gwStatusLatest}
                       manualCommand={effectiveCommand || ''}
@@ -1664,7 +1815,7 @@ export function AboutPanel() {
                               and flipping the label regardless would tell the user
                               their shell paste is ready when the clipboard still
                               holds something else. Await it, then confirm. */}
-                          <Btn onClick={async () => { await copyToClipboard(effectiveCommand); setGwCommandCopied(true) }}>
+                          <Btn onClick={() => copyCommand(effectiveCommand, setGwCommandCopied, setGwCommandCopyFailed)}>
                             <Copy size={13} className="lucide-inline" /> {gwCommandCopied
                               ? i18nT('pages.settings.aboutPanel.copied')
                               : i18nT('pages.settings.aboutPanel.copy_command')}
@@ -1682,14 +1833,24 @@ export function AboutPanel() {
                             testId="gateway-restart"
                           />
                         </div>
+                        {/* Below the Copy/Restart row, not inside it: the hand-off
+                            link counts as a third action there
+                            (max-two-buttons-per-row). askAgent on: the command is
+                            still on screen above. */}
+                        {gwCommandCopyFailed && (
+                          <ErrorNotice
+                            variant="inline"
+                            message={i18nT('pages.settings.aboutPanel.copy_failed_select_the_command_and_copy_it_manually')}
+                            askAgent
+                            testId="manual-update-copy-error"
+                          />
+                        )}
                         <p className="text-[12px] text-muted">
                           {i18nT('pages.settings.aboutPanel.restart_after_installer_note')}
                         </p>
-                        {applyError && (
-                          <span className="text-[12px] text-danger flex items-start gap-1.5">
-                            <AlertCircle size={13} className="lucide-inline shrink-0" /> {applyError}
-                          </span>
-                        )}
+                        {/* askAgent on: a refused restart leaves nothing unsaved —
+                            the installer already ran in the user's terminal. */}
+                        <ErrorNotice message={applyError} askAgent testId="manual-update-restart-error" />
                       </>
                     )}
                   </div>
@@ -1755,8 +1916,14 @@ export function AboutPanel() {
                 {gwCheck.isSuccess && !!gwUnavailableReason && (
                   <span className="text-muted text-[13px] flex items-center gap-1.5" data-testid="check-not-applicable"><Package size={13} className="lucide-inline" /> {gwCheckErrorText(gwUnavailableReason)}</span>
                 )}
+                {/* askAgent on: a failed read; the Check button above is the retry. */}
                 {(gwCheck.isError || (gwCheck.isSuccess && !!gwError)) && (
-                  <span className="text-danger text-[13px] flex items-center gap-1.5" data-testid="check-failed"><AlertCircle size={13} className="lucide-inline" /> {i18nT('pages.settings.aboutPanel.couldn_t_check_for_updates_2')}{gwError ? `: ${gwCheckErrorText(gwError)}` : ''}</span>
+                  <ErrorNotice
+                    variant="inline"
+                    message={`${i18nT('pages.settings.aboutPanel.couldn_t_check_for_updates_2')}${gwError ? `: ${gwCheckErrorText(gwError)}` : ''}`}
+                    askAgent
+                    testId="check-failed"
+                  />
                 )}
               </>
             )}
@@ -1779,6 +1946,17 @@ export function AboutPanel() {
                 : i18nT('pages.settings.aboutPanel.notify_when_an_update_is_available')}
                 onChange={async next => { setAutoUpdate(next); try { await api.setAutoUpdate(next) } catch { setAutoUpdate(!next) } }} />
             </div>
+            {/* The config read failed, so the switch above shows its default
+                (on) rather than the persisted value. askAgent on: a read failure;
+                the toggle itself persists on each flip. */}
+            {mcCfgError && (
+              <ErrorNotice
+                variant="inline"
+                message={i18nT('pages.settings.aboutPanel.auto_update_setting_unavailable')}
+                askAgent
+                testId="auto-update-config-error"
+              />
+            )}
 
             {/* Standing maintenance action, NOT gated on an update being
                 available. Restarting is how this install picks up code that
@@ -1818,10 +1996,10 @@ export function AboutPanel() {
                 instead left a self-updatable install with a pending update showing
                 the row while swallowing its error, so a rejected restart gave the
                 user no feedback whatsoever. */}
-            {applyError && !showManualUpdate && (
-              <span className="text-[12px] text-danger flex items-start gap-1.5" data-testid="gateway-restart-error">
-                <AlertCircle size={13} className="lucide-inline shrink-0" /> {applyError}
-              </span>
+            {/* askAgent on: a refused restart of a standing action; nothing on
+                this card is a draft. */}
+            {!showManualUpdate && (
+              <ErrorNotice message={applyError} askAgent testId="gateway-restart-error" />
             )}
           </div>
         )}
@@ -1881,7 +2059,11 @@ export function AboutPanel() {
             {!gwDiverged && (
               <p className="text-[12px] text-muted mb-3">{i18nT('pages.settings.aboutPanel.updating_restarts_the_gateway_active_sessions_wi')}</p>
             )}
-            {applyError && <div className="text-[13px] text-danger mb-3 flex items-center gap-1.5"><AlertCircle size={13} className="lucide-inline" /> {applyError}</div>}
+            {/* askAgent on: the apply's inputs are all server-side (a 409 dirty
+                tree, a 400) and this dialog holds no draft. `ErrorNotice` exposes
+                no onHandoff, but the hand-off navigates away and unmounts this
+                panel — modal included — so nothing is left sitting over the chat. */}
+            <ErrorNotice className="mb-3" message={applyError} askAgent testId="update-apply-error" />
             {restarting ? (
               <div className="text-[13px] text-accent flex items-center justify-center gap-1.5 py-2" role="status">
                 <RefreshCw size={13} className="lucide-inline animate-spin" /> {i18nT('pages.settings.aboutPanel.updating_gateway_restarting')}

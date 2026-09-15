@@ -35,7 +35,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-from kiro_crew.constants import OPTIONS_RE_TRAILER
+from kiro_crew.constants import (
+    MARKER_CLOSERS,
+    OPTIONS_RE_TRAILER,
+    _leading_wrapper_start,
+    strip_control_comments,
+)
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.tables import render_tables, render_tables_with_metadata
 from kiro_crew.messaging.transport import TransportCapabilities
@@ -96,7 +101,7 @@ class OutputEvent:
 
 
 def chunk_text(text: str, max_chars: int) -> list[str]:
-    """Split ``text`` into chunks no longer than ``max_chars``.
+    """Split ``text`` into chunks of at most ``max_chars`` characters.
 
     Pure helper used by Renderers to honor ``capabilities.max_message_chars``.
     Returns ``[]`` for empty input. A non-positive ``max_chars`` disables
@@ -178,8 +183,13 @@ def display_safe_for(text: str, capabilities: TransportCapabilities) -> str:
     uncopyable. Its own renderer already avoids that (``webex_display_safe``); the
     neutral sinks read the declaration instead of importing a channel symbol,
     which is what keeps them neutral.
+
+    Control-tag comments are stripped first, same as :func:`display_safe` —
+    the deterministic backstop against a dashboard-authored control tag
+    reaching channel users as literal text.
     """
-    safe, _ = redact_for_display(text or "", _default_redactor)
+    text = strip_control_comments(text or "")
+    safe, _ = redact_for_display(text, _default_redactor)
     if not capabilities.mention_grammars:
         return safe
     return safe.replace("@", "@\u200b").replace("<!", "<\u200b!")
@@ -248,8 +258,16 @@ def display_safe(text: str) -> str:
     The defang covers both mention grammars because the callers are
     channel-neutral: ``@`` for Discord/Telegram users and ``@everyone``, ``<!``
     for Slack's ``<!channel>``.
+
+    Control-tag comments are stripped first (fence/inline-code aware): channel
+    formatters render HTML comments literally, so a dashboard-authored
+    ``<!-- keep-visible -->`` or ``deliver:``/``plan_task_id:`` tag
+    delivered to a channel would otherwise reach end users as visible text.
+    The prompt rule only contains the emitter; this is the deterministic
+    backstop on the message itself.
     """
-    safe, _ = redact_for_display(text or "", _default_redactor)
+    text = strip_control_comments(text or "")
+    safe, _ = redact_for_display(text, _default_redactor)
     return safe.replace("@", "@\u200b").replace("<!", "<\u200b!")
 
 
@@ -425,7 +443,12 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
       status frame). The text is still arriving, so a partial marker really may be
       a marker mid-flight, and showing reserved protocol as raw text is the cost
       being avoided. Safe there precisely because the frame is transient: the next
-      frame, or the sealed answer, re-renders from the full buffer.
+      frame, or the sealed answer, re-renders from the full buffer. Held back is
+      only a tail that can still BECOME the trailer -- ``[OPTIONS`` as the final
+      bytes, or ``[OPTIONS:`` with its content still open. A tail where any other
+      byte follows ``[OPTIONS`` is grammar-dead (the trailer opens ``[OPTIONS:``),
+      so it is quoted prose and is kept even here: cutting it would be the
+      permanent loss described below, wearing a streaming excuse.
     * ``False`` -- a BUFFERED surface that sends once (Slack's extraction, Webex's
       final answer, and this module's own zero-widget path). Such a caller cannot
       tell a live fragment from the assistant's prose, and cutting prose is
@@ -443,12 +466,53 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
     """
     match = OPTIONS_RE_TRAILER.search(text)
     if match:
-        choices = [c.strip() for c in match.group(1).split("|") if c.strip()]
+        choices = [c.strip() for c in match.group("labels").split("|") if c.strip()]
         return text[: match.start()].rstrip(), choices
     if hide_partial:
         idx = text.rfind("[OPTIONS")
-        if idx != -1 and "]" not in text[idx:]:
-            return text[:idx].rstrip(), []
+        # "Holds no CLOSER at all", over the whole ``MARKER_CLOSERS`` set rather
+        # than ASCII ``]`` alone. A tail that already holds a closer is not in
+        # flight: either it reads as a marker, in which case the search above
+        # took it, or the grammar declined it and it is PROSE -- which is the
+        # rule ``test_hide_partial_does_not_touch_a_closed_bracket_elsewhere``
+        # already pins for ASCII. Spelling it ASCII-only made that rule miss a
+        # marker whose only closers are lookalikes (``[OPTIONS: 【重要】修复 |
+        # 跳过】``), and the cut there is the permanent kind described below:
+        # WeCom's sealed frame and its persisted history entry, and the Discord
+        # and Telegram ``self._buf = [body]`` reseat, would show the leading
+        # prose with the entire option list deleted and no pills to recover it
+        # from. Widening here can only ever KEEP more text, never cut more.
+        #
+        # Not the same question as ``split_trailing_protocol_suffix``'s probe,
+        # which asks "is this tail COMPLETE?" and must stay ASCII-only (see the
+        # comment there): presence of a closer is not completeness, but it is
+        # conclusive evidence of not-in-flight, and only the latter is asked
+        # here. The two checks differ because the questions differ.
+        if idx != -1 and not any(c in text[idx:] for c in MARKER_CLOSERS):
+            # Judge the fragment against the grammar it would have to satisfy,
+            # not by substring presence alone. :data:`OPTIONS_RE_TRAILER` opens
+            # ``[OPTIONS:`` -- once any byte other than ``:`` follows the
+            # substring, no later bytes can complete a marker there, so the
+            # fragment is the assistant's PROSE and holding it back protects
+            # nothing. It costs plenty: the trim point is wherever the quoted
+            # token sits, everything after it to buffer end goes with it, and
+            # when no ``]`` ever arrives the sealed frame re-trims too, so the
+            # transient-frame consolation above does not apply. Locating a
+            # marker by substring without asking whether it READS as one is
+            # the bug fixed at the directive seam; this is the same
+            # rule at the trailer seam. Only the tail-most occurrence can be
+            # mid-flight -- a stream appends, so text after an opener means
+            # that opener was never in flight -- which is why one viability
+            # check here beats walking earlier occurrences.
+            tail = text[idx + len("[OPTIONS") :]
+            if not tail or tail.startswith(":"):
+                # A LINE-LEADING Markdown wrapper run abutting the fragment is
+                # part of the marker-to-be (``**[OPTIONS: A``): cutting at the
+                # ``[`` alone publishes a stray ``**`` on this frame. Widen the
+                # cut with the same rule the grammar and
+                # ``split_trailing_protocol_suffix`` apply, so every backend
+                # partial path agrees; a mid-line run is prose and stays.
+                return text[: _leading_wrapper_start(text, idx)].rstrip(), []
     return text, []
 
 
@@ -705,7 +769,7 @@ class SilentRenderer(Renderer):
     ``on_prompt_choice`` is dropped like the rest, matching the Slack gate that
     withholds the linked approval prompt from a disconnected thread: the
     dashboard renders the same prompt, and soliciting a decision in the
-    conversation the user just left would ask where they are no longer looking.
+    conversation the user just left would ask where they are not looking.
     """
 
     def __init__(self, capabilities: Any = None, channel_type: str = "") -> None:

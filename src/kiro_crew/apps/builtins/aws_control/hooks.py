@@ -8,8 +8,14 @@ a log line, never an unconfirmed charge), and the drive is tag-discovered
 per run rather than trusted from memory.
 
 The loop runs against the REGISTRY DEFAULT account only — the same account
-the consent card confirms. Multi-account nightly schedules arrive with the
-per-account grant store (spec §9).
+the consent card confirms, resolved through the same healthy-first policy, so
+the grant it checks names the key it runs under. Multi-account nightly
+schedules arrive with the per-account grant store (spec §9).
+
+Several INSTALLS pointed at one account is a different axis and is supported
+rather than refused: each writes under its own ``<install>`` prefix, so the loop
+records that the drive is shared and proceeds. Making the schedule single-owner
+would leave one machine silently un-backed-up, which is the worse failure.
 """
 
 from __future__ import annotations
@@ -20,9 +26,9 @@ import logging
 from typing import Any
 
 from kiro_crew import aws_consent
+from kiro_crew.apps.builtins.aws_control.backend import accounts as accounts_mod
 from kiro_crew.apps.builtins.aws_control.backend import backup as backup_mod
 from kiro_crew.apps.builtins.aws_control.backend import storage as storage_mod
-from kiro_crew.deploy import profiles as deploy_profiles
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -53,15 +59,75 @@ def _audit(operation: str, resources: str, outcome: str, *, error: str = "") -> 
         logger.debug("aws-control nightly SEL audit failed", exc_info=True)
 
 
+async def _note_shared_drive(profile: str, region: str, bucket: str, account: str) -> None:
+    """Record that another install also backs up here. Then carry on.
+
+    A NOTICE, not a gate, and that is a deliberate departure from the reported
+    issue's own suggestion that the loop refuse. Refusing would make the drive
+    single-owner, and single-owner scheduling means exactly one machine keeps
+    getting backed up while the other silently stops -- discovering that at
+    restore time is worse than the unattributed pile this change replaces. Once
+    the keys carry an install id there is nothing left to collide: two installs
+    write to two prefixes, and two machines each keeping their own memory backed
+    up is what the owner asked for by pointing both at one account.
+
+    So the value here is EVIDENCE, and specifically evidence a later panel view
+    cannot reconstruct. The console's ``others`` count is LIVE: it says what the
+    drive looks like when a human opens the page. This record says what the
+    UNATTENDED run observed at the moment it spent the owner's money -- and the
+    nightly is the one path in this app that spends it with nobody present, so "at
+    this run, the drive already held another install's archives" is an audit fact
+    about that spend rather than a line for someone to read. The consumer is a human
+    after the fact, which is what the whole SEL trail is for.
+
+    ONE list call, against the snapshot prefix only. This loop uploads snapshots
+    and nothing else, so sweeping the sessions prefix too would have cost a second
+    paid call per scheduled run to answer a question about a run that is not
+    happening.
+
+    Never raises. A listing failure must not stop the backup it was only
+    annotating; the outcome is one less log line, not a missed nightly.
+    """
+    try:
+        others = await asyncio.to_thread(
+            backup_mod.other_install_ids, profile, region, bucket, account=account
+        )
+    except Exception:
+        logger.debug("aws-control nightly: shared-drive check failed", exc_info=True)
+        return
+    if not others:
+        return
+    logger.warning(
+        "aws-control nightly: %d other install(s) also back up to this drive (%s); "
+        "each writes under its own prefix, so this run proceeds -- restore attributes "
+        "archives by that prefix",
+        len(others),
+        ", ".join(others[:5]),
+    )
+    _audit("backup_shared_drive", f"installs={len(others)}", "invoked")
+
+
 async def _run_once() -> None:
     """One due-check + backup attempt. Every failure is a log line, not a crash."""
-    resolved = await asyncio.to_thread(deploy_profiles.resolve_profile, "")
+    # Same resolution the consent card and the HTTP handlers use, so the key this
+    # unattended loop runs under is the key the grant was recorded for. A raw
+    # registry-default read would pick an unhealthy default over the account's
+    # working sibling, and then skip on every wake -- silently, since nobody is
+    # watching a 03:00 loop. The STRICT variant: with no working key there is
+    # nothing to back up, so the loop stops rather than naming one it cannot use.
+    # Costs one probe sweep per wake (free STS calls, concurrency-bounded,
+    # snapshot-cached); the correct key is worth it.
+    resolved = await accounts_mod.resolve_default_account_profile()
     if resolved is None:
-        logger.info("aws-control nightly: no registered profile; skipping")
+        # Covers both "nothing registered" and "the default account has no
+        # working key"; the accounts pane is where the difference is visible.
+        logger.info("aws-control nightly: no healthy registered key; skipping")
         return
     profile, region = resolved
     # Backup state is keyed per account, so the loop resolves which
-    # account the default profile is actually pointing at right now.
+    # account the default profile is actually pointing at right now. The snapshot
+    # above has a TTL, so this live probe is what the account id may be trusted
+    # from -- the same rule the HTTP path's ``_resolve_target`` follows.
     identity = await aws_consent.probe_identity(profile, region)
     if not identity.ok or not identity.account:
         logger.info("aws-control nightly: account unresolved; skipping")
@@ -79,6 +145,7 @@ async def _run_once() -> None:
         if not bucket:
             logger.info("aws-control nightly: no drive bucket yet; skipping")
             return
+        await _note_shared_drive(profile, region, bucket, account)
         # The nightly path never touches an HTTP handler, so the audit the
         # dashboard layer adds to every owner-driven mutation is simply absent
         # here -- an unattended export would leave no SEL trace of having run,
@@ -197,7 +264,7 @@ async def on_shutdown(ctx: Any) -> None:  # noqa: ARG001 — kept for the hook A
     The residual is one in-flight object: an ``aws s3 cp`` already mid-stream
     finishes, into the owner's own bucket, and the SEL record above says it did.
     Revoking that would mean tracking and terminating the CLI subprocess itself,
-    which is the same containment work tracked in #5430.
+    which this hook does not do.
     """
     global _task
     backup_mod.signal_stop()

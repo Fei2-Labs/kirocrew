@@ -21,6 +21,7 @@ from kiro_crew.acp.kas_agents import (
     KAS_MAX_CUSTOM_AGENTS,
     KasAgentTranslationError,
     build_kas_custom_agents,
+    load_agent_spec,
     resolve_prompt,
     to_client_custom_agent,
 )
@@ -101,7 +102,7 @@ class TestDeliberateOmissions:
 
     ``model`` would compete with the dedicated model verb. ``permissions`` is NOT
     in this list — see :class:`TestPermissionsProjection`; it is absent only when
-    the spec gives nothing to derive it from. ``mcpServers`` is no longer in this
+    the spec gives nothing to derive it from. ``mcpServers`` is not in this
     list either: omitting it left a KAS session with ``@server`` refs naming
     nothing — see :class:`TestMcpServersProjection`.
     """
@@ -120,9 +121,7 @@ class TestOptionalPassThrough:
 
     def test_include_mcp_json_is_a_bool_passthrough(self):
         assert to_client_custom_agent("a", _spec(), "p")["includeMcpJson"] is False
-        assert "includeMcpJson" not in to_client_custom_agent(
-            "a", _spec(includeMcpJson="no"), "p"
-        )
+        assert "includeMcpJson" not in to_client_custom_agent("a", _spec(includeMcpJson="no"), "p")
 
     def test_resources_and_excluded_tools_when_non_empty(self):
         out = to_client_custom_agent(
@@ -206,12 +205,8 @@ class TestTheCeilingIsReAskedAtProjectionTime:
     """
 
     def test_a_withheld_entry_is_dropped_from_the_projected_policy(self, monkeypatch):
-        monkeypatch.setattr(
-            kas_agents, "may_skip_gate_now", lambda ref: ref != "@denied-srv"
-        )
-        out = to_client_custom_agent(
-            "a", _spec(allowedTools=["@denied-srv", "@ok-srv"]), "p"
-        )
+        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: ref != "@denied-srv")
+        out = to_client_custom_agent("a", _spec(allowedTools=["@denied-srv", "@ok-srv"]), "p")
         assert _rule(out["permissions"], "mcp")["match"] == ["ok-srv/*"]
 
     def test_withholding_everything_omits_the_field(self, monkeypatch):
@@ -248,9 +243,7 @@ class TestTheCeilingIsReAskedAtProjectionTime:
         monkeypatch.setattr(
             kas_agents,
             "sel",
-            lambda: types.SimpleNamespace(
-                log_api_access=lambda **kw: events.append(kw)
-            ),
+            lambda: types.SimpleNamespace(log_api_access=lambda **kw: events.append(kw)),
         )
 
         to_client_custom_agent("kirocrew", _spec(allowedTools=["@denied-srv"]), "p")
@@ -267,9 +260,7 @@ class TestTheCeilingIsReAskedAtProjectionTime:
         monkeypatch.setattr(
             kas_agents,
             "sel",
-            lambda: types.SimpleNamespace(
-                log_api_access=lambda **kw: events.append(kw)
-            ),
+            lambda: types.SimpleNamespace(log_api_access=lambda **kw: events.append(kw)),
         )
 
         to_client_custom_agent("a", _spec(allowedTools=["web_fetch"]), "p")
@@ -387,9 +378,7 @@ class TestPromptResolution:
 
     def test_relative_prompt_escaping_the_agents_dir_is_refused(self, tmp_path):
         with pytest.raises(KasAgentTranslationError, match="escapes"):
-            resolve_prompt(
-                {"prompt": "file://../../etc/passwd"}, agent_id="a", agents_dir=tmp_path
-            )
+            resolve_prompt({"prompt": "file://../../etc/passwd"}, agent_id="a", agents_dir=tmp_path)
 
     @pytest.mark.parametrize("bad", [None, "", "   "])
     def test_empty_prompt_falls_back_to_the_kas_constant(self, bad, tmp_path, caplog):
@@ -425,7 +414,8 @@ class TestPromptResolution:
         (tmp_path / "kirocrew-lite.json").write_text(
             json.dumps({"name": "kirocrew-lite", "tools": [], "prompt": ""}), encoding="utf-8"
         )
-        agents = build_kas_custom_agents(tmp_path, "kirocrew-lite")
+        spec = load_agent_spec(tmp_path, "kirocrew-lite")
+        agents = build_kas_custom_agents(tmp_path, "kirocrew-lite", spec)
         assert agents[0]["prompt"] == _KAS_FALLBACK_PROMPT
         # Tool restriction is preserved — the fallback only supplies a prompt.
         assert agents[0]["tools"] == []
@@ -569,11 +559,7 @@ class TestMcpServersProjection:
         read a different data home than the gateway."""
         out = to_client_custom_agent(
             "a",
-            _spec(
-                mcpServers={
-                    "kirocrew-core": {"command": "x", "env": {"KIROCREW_HOME": "/h"}}
-                }
-            ),
+            _spec(mcpServers={"kirocrew-core": {"command": "x", "env": {"KIROCREW_HOME": "/h"}}}),
             "p",
         )
         assert out["mcpServers"]["kirocrew-core"]["env"] == {"KIROCREW_HOME": "/h"}
@@ -697,9 +683,7 @@ class TestMcpServersProjection:
         ``mcp_cleanup`` already ratchet-pins to ``agent._MANAGED_MCP_SERVERS``."""
         from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 
-        assert kas_agents.MANAGED_MCP_SERVER_NAMES == frozenset(
-            KIROCREW_BIN_MCP_SERVERS
-        )
+        assert kas_agents.MANAGED_MCP_SERVER_NAMES == frozenset(KIROCREW_BIN_MCP_SERVERS)
 
 
 class TestRuntimeSuppliesTheStubbedSet:
@@ -719,24 +703,35 @@ class TestRuntimeSuppliesTheStubbedSet:
         rt._acp_backend = runtime_mod.ACP_BACKEND_KAS
         rt._mcp_gateway_overlay = overlay
 
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda _a: None)
-        monkeypatch.setattr(runtime_mod, "kiro_agents_dir", lambda: Path("/agents"))
+        import kiro_crew.acp.kas_agents as kas_agents_mod
+        import kiro_crew.agent as agent_mod
+        import kiro_crew.config.paths as paths_mod
 
-        def _capture(_dir, agent, *, stub_server_names=frozenset(), member_dispatch=False):
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda _a: None)
+        monkeypatch.setattr(paths_mod, "kiro_agents_dir", lambda: Path("/agents"))
+        # The projection is handed the spec the harness read under the gate, so the read
+        # is the harness's own and is stubbed here rather than inside the builder.
+        monkeypatch.setattr(
+            kas_agents_mod, "load_agent_spec", lambda _dir, agent: {"name": agent, "prompt": "p"}
+        )
+
+        def _capture(_dir, agent, _spec, *, stub_server_names=frozenset(), member_dispatch=False):
             seen.append(stub_server_names)
             return [{"id": agent}]
 
-        monkeypatch.setattr(runtime_mod, "build_kas_custom_agents", _capture)
+        monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _capture)
         return rt
 
     @pytest.mark.asyncio
     async def test_the_overlay_set_is_forwarded(self, monkeypatch):
-        from kiro_crew.acp import runtime as runtime_mod
-
         seen: list[frozenset] = []
         rt = self._runtime(monkeypatch, "/overlay", seen)
+        import kiro_crew.mcp_gateway.session_servers as session_servers_mod
+
         monkeypatch.setattr(
-            runtime_mod, "injection_server_names", lambda _o, _a: frozenset({"kirocrew-core"})
+            session_servers_mod,
+            "injection_server_names",
+            lambda _o, _a: frozenset({"kirocrew-core"}),
         )
 
         await rt._kas_custom_agents("kirocrew")
@@ -746,11 +741,13 @@ class TestRuntimeSuppliesTheStubbedSet:
     @pytest.mark.asyncio
     async def test_no_overlay_forwards_an_empty_set(self, monkeypatch):
         """The default install: nothing stubbed, so nothing is subtracted."""
-        from kiro_crew.acp import runtime as runtime_mod
-
         seen: list[frozenset] = []
         rt = self._runtime(monkeypatch, None, seen)
-        monkeypatch.setattr(runtime_mod, "injection_server_names", lambda _o, _a: frozenset())
+        import kiro_crew.mcp_gateway.session_servers as session_servers_mod
+
+        monkeypatch.setattr(
+            session_servers_mod, "injection_server_names", lambda _o, _a: frozenset()
+        )
 
         await rt._kas_custom_agents("kirocrew")
 
@@ -761,17 +758,17 @@ class TestRuntimeSuppliesTheStubbedSet:
         """Fail toward declaring too much, never toward an agent with no servers:
         a double declaration is harmless (the injection outranks it), while
         withholding a server nothing else supplies is the bug being fixed."""
-        from kiro_crew.acp import runtime as runtime_mod
-
         seen: list[frozenset] = []
         rt = self._runtime(monkeypatch, "/overlay", seen)
 
         def _boom(_o, _a):
             raise OSError("overlay unreadable")
 
-        monkeypatch.setattr(runtime_mod, "injection_server_names", _boom)
+        import kiro_crew.mcp_gateway.session_servers as session_servers_mod
+
+        monkeypatch.setattr(session_servers_mod, "injection_server_names", _boom)
 
         out = await rt._kas_custom_agents("kirocrew")
 
         assert seen == [frozenset()]
-        assert out == [{"id": "kirocrew"}]
+        assert out.custom_agents == [{"id": "kirocrew"}]

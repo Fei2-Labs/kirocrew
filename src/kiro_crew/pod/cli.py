@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -22,8 +23,10 @@ from kiro_crew.pod import provision as prov
 from kiro_crew.pod import runtime as rt
 from kiro_crew.pod.config import PodConfig
 from kiro_crew.sel import sel
+from kiro_crew.tips_text import truncate_summary
 
 logger = logging.getLogger(__name__)
+_SCENARIOS_TABLE_WIDTH = 100
 
 # A verb handler: (config, parsed args) -> None.
 PodHandler = Callable[[PodConfig, argparse.Namespace], None]
@@ -52,7 +55,62 @@ def _die(msg: str) -> NoReturn:
     sys.exit(1)
 
 
-def _wait_healthy(cfg: PodConfig, name: str, port: int, tries: int = 45) -> int:
+# Default health-wait budget for `pod up`, in seconds. A first pod boot does
+# real extra work beyond serving /api/health -- config migration, staging CLI
+# files, minting a fresh .local_secret -- and on a loaded host a healthy
+# gateway was measured needing well past the old 45s wall, so the default is
+# twice that. Override per-run with `pod up --wait-secs` or the env var below.
+POD_HEALTH_WAIT_SECS_DEFAULT = 90
+POD_HEALTH_WAIT_SECS_ENV = "KIROCREW_POD_HEALTH_SECS"
+# Floor so a misconfigured tiny value cannot make every boot fail before the
+# gateway has any chance to answer; ceiling so an absurd value cannot wedge
+# `pod up` for hours or overflow float arithmetic on the deadline.
+_POD_HEALTH_WAIT_FLOOR_SECS = 5
+_POD_HEALTH_WAIT_CEIL_SECS = 3600
+
+
+def _health_wait_secs(args: argparse.Namespace) -> int:
+    """Resolve the `pod up` health-wait budget in seconds: flag > env > default.
+
+    The env var must parse as a positive integer; a malformed value warns on
+    stderr and falls back to the default rather than raising, so a typo in a
+    profile cannot make `pod up` unbootable. The result is clamped to a small
+    floor for the same reason in the other direction.
+    """
+    secs = getattr(args, "wait_secs", None)
+    if secs is not None:
+        if secs <= 0:
+            # The warning promises the default, so the default is what applies:
+            # an invalid explicit flag does not fall through to the env var.
+            print(
+                f"pod: ignoring --wait-secs {secs} (not a positive integer); "
+                f"using the default {POD_HEALTH_WAIT_SECS_DEFAULT}s",
+                file=sys.stderr,
+            )
+            secs = POD_HEALTH_WAIT_SECS_DEFAULT
+    else:
+        raw = os.environ.get(POD_HEALTH_WAIT_SECS_ENV, "").strip()
+        if raw:
+            try:
+                secs = int(raw)
+                if secs <= 0:
+                    raise ValueError(raw)
+            except ValueError:
+                print(
+                    f"pod: ignoring {POD_HEALTH_WAIT_SECS_ENV}={raw!r} (not a "
+                    f"positive integer); using the default "
+                    f"{POD_HEALTH_WAIT_SECS_DEFAULT}s",
+                    file=sys.stderr,
+                )
+                secs = POD_HEALTH_WAIT_SECS_DEFAULT
+    if secs is None:
+        secs = POD_HEALTH_WAIT_SECS_DEFAULT
+    return min(max(secs, _POD_HEALTH_WAIT_FLOOR_SECS), _POD_HEALTH_WAIT_CEIL_SECS)
+
+
+def _wait_healthy(
+    cfg: PodConfig, name: str, port: int, tries: int = POD_HEALTH_WAIT_SECS_DEFAULT
+) -> int:
     """Poll until the pod itself serves (200/401/403), or bail fast on failure.
 
     Returns the HTTP code on success, or a negative sentinel on early failure:
@@ -62,7 +120,16 @@ def _wait_healthy(cfg: PodConfig, name: str, port: int, tries: int = 45) -> int:
       ``rt.HEALTH_FOREIGN`` = the port answers, but another process owns it, so
            this pod's gateway cannot have bound it.
     A pod IS the worktree's gateway, so a dead gateway is a real, expected signal —
-    we just want it fast and clearly attributed, not a silent 45s timeout.
+    we just want it fast and clearly attributed, not a silent timeout. ``tries``
+    is the WALL-CLOCK budget in seconds, enforced by a monotonic deadline
+    (default ``POD_HEALTH_WAIT_SECS_DEFAULT``, overridable via `pod up
+    --wait-secs` or ``KIROCREW_POD_HEALTH_SECS``): polls run about once per
+    second when the port answers fast, and a slow probe (a bound-but-silent
+    socket eats the probe's own timeout) shortens the remaining sleeps rather
+    than stretching the budget, so the total overrun is at most one probe.
+    The exhausted-budget return is 0 only when NOTHING ever answered the
+    port: a real HTTP status (the last polled one, or the last one seen
+    before the port went silent) is returned whenever the gateway spoke.
 
     A foreign responder does NOT end the wait on sight. The pod may still be
     starting, and its own gateway may be moments from winning the port back after
@@ -73,21 +140,27 @@ def _wait_healthy(cfg: PodConfig, name: str, port: int, tries: int = 45) -> int:
     journal that only says "address already in use".
     """
     saw_foreign = False
-    for _ in range(tries):
+    last_http = 0
+    deadline = time.monotonic() + max(tries, 1)
+    while True:
         code = rt.health(cfg, name, port)
         if code in (200, 401, 403):
             return code
         if code == rt.HEALTH_FOREIGN:
             saw_foreign = True
+        elif code > 0:
+            # Any real HTTP answer is remembered: a gateway that served an
+            # error and then went silent DID answer, and reporting 0 for it
+            # would misattribute a broken health route as a slow boot.
+            last_http = code
         state, restarts = rt.unit_state(cfg, name)
         # failed = exited non-zero and not restarting; restarts>0 = crash-looping.
         if state == "failed" or restarts > 0:
             return rt.HEALTH_FOREIGN if saw_foreign else -1
-        time.sleep(1)
-    final = rt.health(cfg, name, port)
-    if final in (200, 401, 403):
-        return final
-    return rt.HEALTH_FOREIGN if (saw_foreign or final == rt.HEALTH_FOREIGN) else final
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return rt.HEALTH_FOREIGN if saw_foreign else (code or last_http)
+        time.sleep(min(1.0, remaining))
 
 
 def _resolve_or_die(cfg: PodConfig, name: str) -> Path:
@@ -203,6 +276,10 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
         if crons:
             env_updates["CRONS"] = "1"
             boot_flags.append("--crons")
+        no_embeddings = bool(getattr(args, "no_embeddings", False))
+        if no_embeddings:
+            env_updates["EMBEDDINGS"] = "0"
+            boot_flags.append("--no-embeddings")
 
         # Read the unit's state BEFORE choosing a port, and inside the mutex: the
         # two questions are one decision. An `up` against an already-active pod is
@@ -297,21 +374,38 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
                     f"(kirocrew pod down {name} && kirocrew pod up {name} {joined}).",
                     file=sys.stderr,
                 )
-        # Record boot-time settings: a pod in `yolo` auto-approves every tool and
-        # one with the scheduler on runs work unattended, so the audit trail must
-        # say so rather than recording only that a pod came up. Mark the
+        # Record boot-time settings: a pod in `yolo` auto-approves every tool, one
+        # with the scheduler on runs work unattended, and one without embeddings
+        # answers search from a different index than a normal pod -- so the audit
+        # trail must say so rather than recording only that a pod came up. Mark the
         # requested-but-not-yet-effective case: `boot` reads these once at start,
         # so a setting recorded against a live pod has not applied yet.
+        # `embeddings=off` is keyed on what the pod boots WITH, not on this command's
+        # flag. The merge-preserving env file keeps EMBEDDINGS=0 from an earlier `up`,
+        # so a re-up without the flag boots the same embedding-light pod; and a
+        # KIROCREW_SKIP_MODEL_DOWNLOAD=1 already in this environment is what
+        # pod_context hands every `pod exec` and what an inheriting boot carries,
+        # with no key ever written. Either pod answers search from a different
+        # index, and a row that said nothing would contradict the journal line
+        # `boot` prints for both (it keys on the effective env the same way).
+        embeddings_off = (
+            no_embeddings
+            or rt.embeddings_disabled(rt.read_env_file(cfg, name))
+            or os.environ.get(rt.SKIP_MODEL_DOWNLOAD_ENV) == "1"
+        )
         resources = f"name={name} port={port}"
         if approval:
             resources += f" approval={approval}"
         if crons:
             resources += " crons=on"
+        if embeddings_off:
+            resources += " embeddings=off"
         if boot_flags and was_active:
             resources += " applied=next_boot"
         _audit("pod.up", "allowed", resources)
 
-        code = _wait_healthy(cfg, name, port)
+        wait_secs = _health_wait_secs(args)
+        code = _wait_healthy(cfg, name, port, tries=wait_secs)
         if code not in (200, 401, 403):
             # A pod IS the worktree's own gateway. If it won't boot, that's a broken
             # worktree build (bad import / config / unbuilt dist) — NOT a pod-tooling
@@ -326,6 +420,19 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
             # started.
             tail = rt.recent_journal(cfg, name, 30)
             print(tail, file=sys.stderr)
+            # Attribution must be read BEFORE stop_pod tears the unit down:
+            # after the stop, unit_state cannot tell a slow boot from a dead
+            # gateway. Positive evidence only, on BOTH axes: code == 0 means
+            # nothing ever answered the port (a real HTTP error like 404/5xx
+            # means the gateway IS serving and its health route is broken --
+            # more wait can never fix that, so it keeps the legacy verdict),
+            # and an active/activating unit with zero restarts is the inverse
+            # of the crash signal _wait_healthy returns -1 on;
+            # "unknown"/"inactive" also keeps the legacy verdict.
+            still_starting = False
+            if code == 0:
+                state, restarts = rt.unit_state(cfg, name)
+                still_starting = state in ("active", "activating") and restarts == 0
             rt.stop_pod(cfg, name)
             if code == rt.HEALTH_FOREIGN:
                 # Reported ahead of the crash verdict: the port being taken is
@@ -352,6 +459,23 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
                 _die(
                     f"{name}: the worktree's gateway failed to start (see journal above). "
                     f"This is the worktree build, not pod — fix it, then `kirocrew pod up {name}` again."
+                )
+            if still_starting:
+                # Slow boot, not a dead gateway: the process is alive and simply
+                # has not answered /api/health inside the budget. Stopping the pod
+                # stays (the caller contract is 'up means healthy'); only the
+                # attribution and the remedy change.
+                _audit(
+                    "pod.up",
+                    "failure",
+                    f"name={name} port={port}",
+                    error="health wait exhausted while gateway alive",
+                )
+                _die(
+                    f"{name}: gateway still starting after {wait_secs}s on :{port} "
+                    f"(process alive, /api/health not yet answering). Raise the wait "
+                    f"with `kirocrew pod up {name} --wait-secs {wait_secs * 2}` or "
+                    f"{POD_HEALTH_WAIT_SECS_ENV}={wait_secs * 2}."
                 )
             _die(
                 f"{name}: gateway never became healthy on :{port} within timeout "
@@ -451,8 +575,10 @@ def _down(cfg: PodConfig, args: argparse.Namespace) -> None:
         # fatal: a reclaim that could not finish must not report success.
         # On macOS it is always fatal, because a loaded-but-dead agent has no pid
         # (was_up False) yet still needs its unload CONFIRMED before anything is
-        # torn down.
-        if cp.returncode != 0 and (was_up or had_home or rt.IS_MACOS):
+        # torn down. Windows is the same shape: a task whose gateway already died
+        # leaves no supervised pid, so `was_up` is False while the task itself is
+        # still registered and must be deleted before the HOME is reclaimed.
+        if cp.returncode != 0 and (was_up or had_home or rt.IS_MACOS or rt.IS_WINDOWS):
             _audit("pod.down", "failure", f"name={name}", error=f"stop rc={cp.returncode}")
             _die(f"stopping pod {name} failed: {(cp.stderr or '').strip()}")
         if rt.RECLAIMED_MARKER in (cp.stdout or ""):
@@ -515,7 +641,41 @@ def _ls(cfg: PodConfig, args: argparse.Namespace) -> None:
             print(f"{n:<28} {p:<7} {_health_label(rt.health(cfg, n, p))}")
     else:
         print("no pods running")
+    _print_refusals(cfg)
     _print_orphans(cfg, orphans)
+
+
+def _print_refusals(cfg: PodConfig) -> None:
+    """Report pods whose LAST boot refused terminally.
+
+    ``PodConfig.refusal_file``'s whole justification is that a terminal refusal is
+    visible in different amounts on the two service managers -- systemd leaves the
+    unit ``failed``, while launchd sees the exit-0 that stops its restart loop and
+    reads it as an ordinary clean exit -- and that ``pod ls`` should report the same
+    fact either way. It did not: a refused pod is not running, so it fell out of the
+    listing entirely and ``ls`` printed "no pods running". The note existed with no
+    reader, and a pod that silently vanishes from ``ls`` is exactly how a boot
+    failure hides.
+
+    Rendered as its own section rather than a row in the main table, mirroring
+    :func:`_print_orphans`: a refused pod has no port and no health, so a table row
+    would have to invent both.
+    """
+    try:
+        names = sorted(p.name[: -len(".refused")] for p in cfg.pods_dir.glob("*.refused"))
+    except OSError:
+        return
+    refused = [(n, rt.refusal_reason(cfg, n)) for n in names]
+    refused = [(n, why) for n, why in refused if why]
+    if not refused:
+        return
+    print(
+        f"\n{len(refused)} pod(s) REFUSED to boot — the last attempt stopped on a "
+        "safety check and did not start a gateway:"
+    )
+    for name, why in refused:
+        print(f"  {name:<26} {why}")
+        print(f"  {'':<26} clear: kirocrew pod down {name}")
 
 
 def _print_orphans(cfg: PodConfig, orphans: list[str]) -> None:
@@ -633,7 +793,9 @@ def _prune(cfg: PodConfig, args: argparse.Namespace) -> None:
             threshold = time.time() - _parse_older_than(args.older_than)
         orphans = rt.orphan_homes(cfg)
     except rt.PodError as exc:
-        _audit("pod.prune", "denied", f"older_than={args.older_than or 'all'}", error=str(exc)[:120])
+        _audit(
+            "pod.prune", "denied", f"older_than={args.older_than or 'all'}", error=str(exc)[:120]
+        )
         raise
     dry_run = bool(getattr(args, "dry_run", False))
     results: list[dict[str, str]] = []
@@ -769,8 +931,11 @@ def _prune_one_decide(cfg: PodConfig, name: str) -> tuple[str, str, str, str]:
                 )
             # macOS: a per-pod plist means "installed" (a name mid-`up`), not
             # orphaned — same predicate orphan_homes applies, re-checked at
-            # delete time for writers that bypass the mutex.
+            # delete time for writers that bypass the mutex. Windows: its
+            # per-pod `.cmd` wrapper carries exactly the same meaning.
             if rt.IS_MACOS and rt.launchd.plist_path(cfg, name).exists():
+                return "skipped", "pod is now installed", "denied", "pod is now installed"
+            if rt.IS_WINDOWS and rt.win_backend.task_script_path(cfg, name).exists():
                 return "skipped", "pod is now installed", "denied", "pod is now installed"
             cp = rt.stop_pod(cfg, name)
             if cp.returncode != 0:
@@ -843,14 +1008,102 @@ def _exec(cfg: PodConfig, args: argparse.Namespace) -> None:
     sys.exit(rt.exec_in_pod(cfg, name, argv))
 
 
+def _api_body(raw: str) -> object:
+    """Decode a pod response body without ever raising.
+
+    The fixed-key envelope is this command's output contract, so a body that
+    cannot be parsed degrades to its (already scrubbed) text instead of
+    replacing the envelope with a traceback. Deciding that per exception TYPE is
+    what keeps failing: `json.loads` recurses once per nesting level, so a deep
+    response raises RecursionError — a RuntimeError, not the ValueError a
+    malformed body raises. Any decode failure is a body problem, never a reason
+    to abandon the envelope.
+    """
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def _api_envelope(name: str, method: str, path: str, status: int, ok: bool, body: object) -> str:
+    """Render the envelope, degrading a body that cannot be serialized.
+
+    Serialization is the command's last exit, so it must not raise either:
+    encoding recurses per nesting level too, and a body deep enough to decode
+    but not re-encode would otherwise take the envelope down after the request
+    had already succeeded. The fallback document has a fixed shape and depth,
+    so it cannot fail in turn.
+    """
+    document: dict[str, object] = {
+        "name": name,
+        "method": method,
+        "path": path,
+        "status": status,
+        "ok": ok,
+        "body": body,
+    }
+    try:
+        return json.dumps(document, indent=2)
+    except Exception:
+        document["body"] = "<body omitted: not serializable>"
+        return json.dumps(document, indent=2)
+
+
+def _api(cfg: PodConfig, args: argparse.Namespace) -> None:
+    """Make one authenticated pod request and print a stable JSON document.
+
+    Every exit from this function is the envelope. The request, the decode and
+    the render all sit inside one guarded region whose handlers cover any
+    Exception, so a failure mode nobody enumerated degrades the body rather than
+    escaping as a traceback on stdout — which an agent parsing this output reads
+    as a protocol violation, not as an error it can act on.
+    """
+    name = str(args.name)
+    method = str(args.method).upper()
+    normalized = "/api/<invalid>"
+    status = 0
+    body: object = ""
+    ok = False
+    error = ""
+    try:
+        name = rt.validate_name(name)
+        normalized = rt.api_path(args.path)
+        status, raw = rt.pod_api(
+            cfg,
+            name,
+            method,
+            normalized,
+            data=getattr(args, "data", "") or "",
+            allow_write=bool(getattr(args, "allow_write", False)),
+        )
+        body = _api_body(raw)
+        ok = 200 <= status < 300
+        error = "" if ok else f"status={status}"
+    except rt.PodError as exc:
+        body = str(exc)
+        error = type(exc).__name__
+    except Exception as exc:
+        body = f"pod api failed ({type(exc).__name__})"
+        error = type(exc).__name__
+    resources = f"name={name} method={method} path={normalized} status={status}"
+    if method not in rt.API_READ_METHODS:
+        resources += " write=1"
+    _audit("pod.api", "allowed" if ok else "failure", resources, error=error)
+    print(_api_envelope(name, method, normalized, status, ok, body))
+    if not ok:
+        sys.exit(1)
+
+
 def _logs(cfg: PodConfig, args: argparse.Namespace) -> None:
     name = rt.validate_name(args.name)
     # Gate before exec'ing the log mechanism — on an unsupported host this would
     # otherwise raise a bare FileNotFoundError instead of the documented refusal.
     rt.require_backend()
-    if rt.IS_MACOS:
-        # launchd has no journal; the plist routes stdout/stderr to files and
-        # recent_journal tails them.
+    if rt.IS_MACOS or rt.IS_WINDOWS:
+        # Neither launchd nor Task Scheduler has a journal; the plist / the .cmd
+        # wrapper route stdout/stderr to files and recent_journal tails them.
         print(rt.recent_journal(cfg, name, args.lines))
         return
     subprocess.run(
@@ -900,8 +1153,27 @@ def _run_internal(cfg: PodConfig, args: argparse.Namespace) -> None:
     # Audit BEFORE boot — boot() exec()s the gateway and never returns on success.
     _audit("pod.boot", "allowed", f"name={args.name}")
     rc = rt.boot(cfg, args.name)
+    # Audit the HONEST code, before any service-manager translation below.
     _audit("pod.boot", "failure", f"name={args.name}", error=f"exit={rc}")
-    sys.exit(rc)
+    # launchd has no RestartPreventExitStatus: its only restart discriminator is
+    # the success/failure axis, and this backend's KeepAlive restarts on NON-ZERO.
+    # A terminal refusal must therefore exit 0 or launchd re-runs it every 5s.
+    # ``rt.terminal_exit_code`` is the record-CONDITIONAL gate -- it translates only
+    # when the refusal note actually landed, so a refusal that could not be recorded
+    # keeps its honest non-zero instead of looking like a clean exit. Do NOT call
+    # ``launchd.launchd_exit_code`` directly here; it states the platform semantics
+    # but knows nothing about whether the record exists. Windows needs no
+    # translation at all: Task Scheduler never restarts a non-zero exit, so the
+    # honest code is already the terminal one. The branch below says so, and
+    # `test_the_runtime_wrapper_does_not_translate_on_windows` pins it there --
+    # which is where a change that adds a restart policy would have to look.
+    exit_code = rt.terminal_exit_code(cfg, args.name, rc)
+    if exit_code != rc:
+        print(
+            f"kirocrew-pod: exiting 0 instead of {rc} so launchd does not restart "
+            f"into the same refusal every 5s; recorded at {cfg.refusal_file(args.name)}"
+        )
+    sys.exit(exit_code)
 
 
 def _cleanup_internal(cfg: PodConfig, args: argparse.Namespace) -> None:
@@ -920,6 +1192,18 @@ def _cleanup_internal(cfg: PodConfig, args: argparse.Namespace) -> None:
     sys.exit(rc)
 
 
+def _scenario_table_description(description: str, width: int) -> str:
+    """Shorten *description* to *width* for one table row, never cutting mid-word.
+
+    Sentence detection lives in ``truncate_summary`` alone. It prefers the last
+    complete sentence that fits, which on a description whose second sentence
+    does not fit IS the first sentence — so a separate first-sentence pass here
+    would be a second spelling of the same rule that discards a second sentence
+    the row had room for.
+    """
+    return truncate_summary(" ".join(description.split()), width)
+
+
 def _scenarios(cfg: PodConfig, args: argparse.Namespace) -> None:
     """List the named fixtures accepted by ``pod up --seed``."""
     from kiro_crew import seed as seed_mod
@@ -936,10 +1220,12 @@ def _scenarios(cfg: PodConfig, args: argparse.Namespace) -> None:
         return
 
     width = max(len("SCENARIO"), *(len(str(row["name"])) for row in rows))
+    description_width = _SCENARIOS_TABLE_WIDTH - width - 2
     print(f"{'SCENARIO':<{width}}  DESCRIPTION")
     for row in rows:
         name = str(row["name"])
         description = str(row["description"] or "(no description)")
+        description = _scenario_table_description(description, description_width)
         print(f"{name:<{width}}  {description}")
     print(f"\nseed one with: kirocrew pod up <worktree> --seed {rows[0]['name']}")
 
@@ -953,6 +1239,7 @@ _VERBS: dict[str, PodHandler] = {
     "token": _token,
     "url": _url,
     "scenarios": _scenarios,
+    "api": _api,
     "logs": _logs,
     "install": _install,
     "provision": _provision,
@@ -967,7 +1254,7 @@ def dispatch(args: argparse.Namespace) -> None:
     if not action:
         print(
             "Usage: kirocrew pod "
-            "{up|down|ls|prune|status|token|url|scenarios|logs|exec|install|provision} …"
+            "{up|down|ls|prune|status|token|url|scenarios|api|logs|exec|install|provision} …"
         )
         sys.exit(2)
     cfg = PodConfig.load()

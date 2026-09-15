@@ -192,7 +192,7 @@ class TestRunCommandSandboxed:
         fake_key = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
         # Sized so the 1000-char tail window starts 2 chars into the credential:
         # a slice-then-redact order keeps "IA" + all 16 B's but drops the
-        # "AK" prefix, so the pattern no longer matches and the tail leaks.
+        # "AK" prefix, so the pattern does not match and the tail leaks.
         padding = "p" * 100
         trailing = "e" * 982
         stderr_text = padding + fake_key + trailing
@@ -514,7 +514,7 @@ class TestRunScriptSandboxed:
 
         If the suffix is sliced first, a credential that straddles the cut
         point loses its leading characters before ``redact`` runs — and the
-        surviving fragment no longer matches any credential pattern, so it
+        surviving fragment does not match any credential pattern, so it
         reaches logs and the persisted ``last_error`` unmasked.
 
         Byte layout (written verbatim, ``os._exit`` so no traceback shifts
@@ -1006,13 +1006,18 @@ class TestMcpToolClient:
     def test_init_drops_reserved_kirocrew_namespace_from_spec_env(self, monkeypatch):
         """SECURITY regression: a spec ``env`` must not forge caller identity.
 
-        The server this bridge most often spawns is ``kirocrew-cron`` itself, and
-        ``mcp_cron._caller_is_cli()`` is just ``os.environ.get("KIROCREW_CLI") ==
-        "1"`` -- a true return makes every cron tool skip per-session ownership.
-        So a ``KIROCREW_CLI: "1"`` in that server's ``env`` block would let a
-        SCRIPT CRON present itself as the admin CLI and call ``cron_remove_all``
-        over every session's jobs, plus read every session's rows through
-        ``cron_list``.
+        The server this bridge most often spawns is ``kirocrew-cron`` itself,
+        whose ownership checks resolve the calling session from
+        ``KIROCREW_SESSION_KEY``/``KIROCREW_HOST_PID`` when no gateway caller
+        block is present. So one of those in that server's ``env`` block would let
+        a SCRIPT CRON name itself another session and reach that session's jobs --
+        ``cron_remove_all`` over its rows, ``cron_list`` over its contents.
+
+        ``KIROCREW_CLI`` is asserted here too, as an inert subject rather than a
+        live consumer: it is an ambient admin flag that skips ownership outright,
+        and it has no producer in ``src/`` and its consumer is gone, so nothing
+        sets or reads it. The deny stays because the CLASS is
+        live -- the next identity key somebody adds is the reason.
 
         Neither existing filter stops it: ``_CRON_ENV_DENY`` covers secrets and
         ``KIROCREW_OWNER_ID``, and the loader prefixes cover ``LD_*``/``PYTHON*``.
@@ -1063,41 +1068,48 @@ class TestMcpToolClient:
         assert passed_env["PATH"] == "/opt/helper/bin"
         assert passed_env["MCP_TOKEN"] == "keep-me"
 
-    def test_caller_is_cli_cannot_be_forged_through_a_cron_spec_env_block(
+    def test_an_identity_key_cannot_be_forged_through_a_cron_spec_env_block(
         self, monkeypatch
     ):
         """The end of the attack path, asserted where it actually decides.
 
         The test above proves the key never reaches the child env. This one runs
-        the real consumer against that env: ``_caller_is_cli()`` evaluated in the
-        environment the spawned server would have started with must be False, so
-        the admin bypass is unreachable from a cron spec's ``env`` block even if
-        some future refactor changes which filter drops the key.
+        the real consumer against that env: the strict session resolver evaluated
+        in the environment the spawned server would have started with must not
+        return the forged session, so a spec's ``env`` block cannot name another
+        session even if some future refactor changes which filter drops the key.
+
+        ``KIROCREW_CLI`` is not the key under test: it is an ambient admin flag
+        with no producer in ``src/`` and no consumer, so there is no claim to
+        re-ground. ``KIROCREW_SESSION_KEY`` is the right
+        successor subject precisely because it DOES have legitimate producers
+        (the ACP spawn path, this bridge), so for it the filter is load-bearing
+        rather than belt-and-braces over a dead name.
 
         SCOPE, deliberately narrow: this covers the ``env`` block only, which is
         the channel ``sanitize_spec_env`` controls. The same spec's ``command``
         field is equally config-authored and reaches the identical consumer
-        (``sh -c 'KIROCREW_CLI=1 exec kirocrew-cron'``), so it is a sibling
-        forgery channel this filter does not close and this test does not claim
-        to -- confinement bounds what the child may touch, not whose jobs Kiro
-        Crew believes it owns. Closing it needs consumer-side vouching rather
-        than another deny-list, which is a separate change; naming the boundary
-        here keeps the assertion honest about which half is proven.
+        (``sh -c 'KIROCREW_SESSION_KEY=... exec kirocrew-cron'``), so it is a
+        sibling forgery channel this filter does not close and this test does not
+        claim to -- confinement bounds what the child may touch, not whose jobs
+        Kiro Crew believes it owns. Closing it needs consumer-side vouching
+        rather than another deny-list; naming the boundary here keeps the
+        assertion honest about which half is proven.
         """
         from kiro_crew.cron_script import McpToolClient, _resolve_mcp_server
-        from kiro_crew.mcp_cron import _caller_is_cli
+        from kiro_crew.mcp_core import _resolve_session_key_strict
 
         _resolve_mcp_server.cache_clear()
-        monkeypatch.delenv("KIROCREW_CLI", raising=False)
-        # Baseline: the flag really is the bypass, so a False below means the
-        # filter worked rather than that the flag never mattered.
-        monkeypatch.setenv("KIROCREW_CLI", "1")
-        assert _caller_is_cli() is True
-        monkeypatch.delenv("KIROCREW_CLI")
+        forged = "dashboard:victim"
+        # Baseline: the key really is an identity source, so a miss below means
+        # the filter worked rather than that the key never mattered.
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", forged)
+        assert _resolve_session_key_strict() == forged
+        monkeypatch.delenv("KIROCREW_SESSION_KEY")
 
         with patch(
             "kiro_crew.cron_script._resolve_mcp_server",
-            return_value=(("some-mcp",), {"KIROCREW_CLI": "1"}),
+            return_value=(("some-mcp",), {"KIROCREW_SESSION_KEY": forged}),
         ), patch(
             "kiro_crew.cron_script.wrap_argv", return_value=(["some-mcp"], None)
         ), patch(
@@ -1110,7 +1122,7 @@ class TestMcpToolClient:
 
         child_env = mock_popen.call_args.kwargs["env"]
         with patch.dict("os.environ", child_env, clear=True):
-            assert _caller_is_cli() is False
+            assert _resolve_session_key_strict() != forged
 
     def test_rpc_disconnect_includes_rc_and_stderr_tail(self, tmp_path):
         """a handshake EOF must surface exit code + stderr tail."""
@@ -1755,7 +1767,7 @@ class TestRunScriptSandboxedErrorPaths:
         """A credential straddling the 200-char boundary must not leak its head.
 
         Redaction must run on the WHOLE stdout before the head slice: slicing
-        first can cut a secret mid-pattern, so redaction no longer matches and
+        first can cut a secret mid-pattern, so redaction does not match and
         the raw head reaches the diagnostic.
         """
         # Built at runtime so no credential-shaped literal lands in the repo.
@@ -2224,3 +2236,95 @@ class TestPostKillDrainTimeoutHardening:
         }
         mock_proc.stdout.close.assert_called_once()
         mock_proc.stderr.close.assert_called_once()
+
+
+class TestCronSpawnTiersAreAligned:
+    """The two cron spawn paths must ask for the SAME sandbox tier.
+
+    A script body is agent-written and a command body is a fixed string the vet
+    already narrowed, so the script path is the HIGHER-capability surface of the
+    two. It nonetheless ran ``standard`` while the command path ran ``cc``,
+    leaving ``~/.aws/credentials``, the SSO cache, ``~/.kube``, ``~/.netrc``,
+    ``~/.git-credentials``, ``~/.npmrc`` and ``~/.pypirc`` readable by the more
+    capable child. These tests pin the alignment rather than the literal, so a
+    later change that moves ONE path re-fails here instead of silently
+    re-opening the gap.
+    """
+
+    def _capture_mode(self, monkeypatch):
+        """Record the ``mode`` each wrap_argv call asks for."""
+        seen: list[str] = []
+
+        def _fake(argv, **kwargs):
+            seen.append(kwargs.get("mode", "<default>"))
+            return (list(argv), None)
+
+        monkeypatch.setattr("kiro_crew.cron_script.wrap_argv", _fake)
+        return seen
+
+    def test_an_ungranted_script_asks_for_the_same_tier_as_a_command(
+        self, tmp_path, monkeypatch, posix_test_shell
+    ):
+        """The alignment itself: neither path may be wider than the other."""
+        monkeypatch.setattr(
+            "kiro_crew.cron_script._resolve_command_shell", lambda: posix_test_shell
+        )
+        monkeypatch.setattr("kiro_crew.cron_script.Path.home", lambda: tmp_path)
+        crons_dir = tmp_path / ".kirocrew" / "crons"
+        crons_dir.mkdir(parents=True)
+        script = crons_dir / "aligned.py"
+        script.write_text("def run(ctx):\n    return None\n")
+
+        script_modes = self._capture_mode(monkeypatch)
+        run_script_sandboxed(f"{script}:run", job_id="job-align", timeout=10)
+
+        command_modes = self._capture_mode(monkeypatch)
+        run_command_sandboxed("true", timeout=10)
+
+        assert script_modes, "the script path never reached wrap_argv"
+        assert command_modes, "the command path never reached wrap_argv"
+        # The ungranted script spawn is the LAST wrap_argv call the script path
+        # makes (a shell probe may precede it); same for the command path.
+        assert script_modes[-1] == command_modes[-1]
+
+    def test_an_ungranted_script_is_not_handed_the_wide_profile(self, tmp_path, monkeypatch):
+        """``standard`` leaves every credential store open — never the default here."""
+        monkeypatch.setattr("kiro_crew.cron_script.Path.home", lambda: tmp_path)
+        crons_dir = tmp_path / ".kirocrew" / "crons"
+        crons_dir.mkdir(parents=True)
+        script = crons_dir / "narrow.py"
+        script.write_text("def run(ctx):\n    return None\n")
+
+        modes = self._capture_mode(monkeypatch)
+        run_script_sandboxed(f"{script}:run", job_id="job-narrow", timeout=10)
+
+        assert modes[-1] == "cc"
+        assert "standard" not in modes
+
+    def test_a_secret_granted_script_still_takes_the_narrowest_tier(self, tmp_path, monkeypatch):
+        """A grant is the operator-approved route, and it tightens rather than widens.
+
+        This is the escape hatch a script needing a host credential uses, so it
+        must keep running ``strict`` — the alignment above must not have widened
+        the granted branch to ``cc``.
+        """
+        monkeypatch.setattr("kiro_crew.cron_script.Path.home", lambda: tmp_path)
+        crons_dir = tmp_path / ".kirocrew" / "crons"
+        crons_dir.mkdir(parents=True)
+        script = crons_dir / "granted.py"
+        script.write_text("def run(ctx):\n    return None\n")
+
+        modes = self._capture_mode(monkeypatch)
+        monkeypatch.setattr(
+            "kiro_crew.cron_script._secret_env_precheck",
+            lambda *a, **k: ({"TOKEN": "v"}, ""),
+        )
+        run_script_sandboxed(
+            f"{script}:run",
+            job_id="job-granted",
+            timeout=10,
+            secret_env={"TOKEN": "vault:t"},
+            secret_env_pin="pin",
+        )
+
+        assert modes[-1] == "strict"

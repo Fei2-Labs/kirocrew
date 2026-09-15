@@ -56,6 +56,7 @@ FORWARD_DECLARED_ENV_DEFAULT
 FeishuConfig
 HeartbeatConfig
 IMESSAGE_SERVICES
+IMPORT_CHUNK_BUDGET_MAX
 IMessageConfig
 InstancesConfig
 JAIL_MODE_AUTO
@@ -114,6 +115,7 @@ TelegramAccountConfig
 TelegramConfig
 TelemetryConfig
 TunnelConfig
+WakaTimeConfig
 WatchdogConfig
 WeComConfig
 WebexConfig
@@ -171,6 +173,8 @@ _port_or_unset
 _read_auto_add_documents
 _read_skip_permissions
 _resolve_stt_model
+_resolve_stub_overrides
+_resolve_stub_roster
 _resolve_stub_servers
 _safe_bool
 _safe_color

@@ -16,7 +16,7 @@ from kiro_crew.acp.runtime import AcpRuntimeDead
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import AcpEvent
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
-from kiro_crew.subagent import SubagentManager
+from kiro_crew.subagent import SubagentInfo, SubagentManager
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
 # looks short of memory, which is the runner's state, not this test's input.
@@ -141,6 +141,14 @@ def _cfg_patch(session_sharing: bool = True):
 
 class TestSessionSharingDecision:
     """Tests for _should_use_session_sharing decision logic."""
+
+    def test_private_crew_target_cannot_share_a_global_parent(self):
+        sessions = _mock_sessions(sharing_eligible=True)
+        manager = SubagentManager(sessions=sessions, ctx_builder=_mock_ctx_builder_auto(), is_yolo=lambda: True)
+        info = SubagentInfo(id="private-review", task="review", parent_session_key="dashboard:global", memory_store="member-review")
+        with _cfg_patch(session_sharing=True):
+            assert manager._should_use_session_sharing(info) is False
+        sessions.is_session_sharing_eligible.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_session_sharing_on_eligible_parent(self):
@@ -280,6 +288,125 @@ class TestSessionSharingSpawn:
         assert info._session_sharing is True
         assert info._shared_provider is not None
         assert isinstance(info._shared_provider, AcpSessionProvider)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "identity_error",
+        [
+            OSError("sidecar unavailable"),
+            ValueError("malformed protected record"),
+            RecursionError("nested protected record"),
+        ],
+    )
+    async def test_shared_identity_persistence_failure_keeps_live_handle(
+        self, identity_error: Exception
+    ):
+        sessions = _mock_sessions(sharing_eligible=True)
+        manager = SubagentManager(
+            sessions=sessions,
+            ctx_builder=_mock_ctx_builder_auto(),
+            is_yolo=lambda: True,
+        )
+        info = SubagentInfo(
+            id="shared-persist-fail",
+            task="t",
+            parent_session_key="dashboard:slot1",
+        )
+
+        async def fail_identity_write(func, /, *args, **kwargs):
+            if func.__name__ == "private_memory_store_for_session":
+                return ""
+            raise identity_error
+
+        with patch(
+            "kiro_crew.subagent.asyncio.to_thread",
+            AsyncMock(side_effect=fail_identity_write),
+        ), patch("kiro_crew.subagent.update_state", side_effect=OSError("disk full")):
+            provider = await manager._create_shared_session(
+                info,
+                "subagent:shared-persist-fail",
+                "kirocrew",
+            )
+
+        assert info._session_sharing is True
+        assert info._shared_provider is provider
+        assert info._session_id == "shared-session-abc"
+        assert info._session_provider == "acp"
+        assert info._pid == 12345
+        sessions.get_or_create.assert_not_awaited()
+        runtime = await sessions.get_subagent_runtime("dashboard:slot1")
+        runtime.create_session.assert_awaited_once()
+        await provider.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_identity_writer_still_tombstones_live_session(self):
+        from kiro_crew.subagent_persistence import (
+            _cleanup_identities_path,
+            create_agent_folder,
+            read_tombstone,
+        )
+
+        sessions = _mock_sessions(sharing_eligible=True)
+        manager = SubagentManager(
+            sessions=sessions,
+            ctx_builder=_mock_ctx_builder_auto(),
+            is_yolo=lambda: True,
+        )
+        info = SubagentInfo(
+            id="shared-persist-cancel",
+            task="t",
+            parent_session_key="dashboard:slot1",
+        )
+        create_agent_folder(info.id, task=info.task)
+
+        # Model executor saturation: outer cancellation lands after the durable
+        # writer is submitted but before it starts. The awaiter must shield and
+        # drain that worker before propagating cancellation.
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_to_thread(func, /, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if func.__name__ == "private_memory_store_for_session":
+                return ""
+            entered.set()
+            await release.wait()
+            return func(*args, **kwargs)
+
+        with patch(
+            "kiro_crew.subagent.asyncio.to_thread",
+            side_effect=gated_to_thread,
+        ):
+            task = asyncio.ensure_future(
+                manager._create_shared_session(
+                    info,
+                    "subagent:shared-persist-cancel",
+                    "kirocrew",
+                )
+            )
+            await entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done(), "identity writer detached on cancellation"
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert _cleanup_identities_path(info.id).exists()
+        assert info._session_sharing is True
+        assert info._shared_provider is not None
+        manager._agents[info.id] = info
+        manager._tasks[info.id] = MagicMock(done=MagicMock(return_value=False))
+        manager._tasks[info.id].cancel = MagicMock()
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            await manager._force_reap(info.id, info, 1.0, reason="reaped")
+
+        tombstone = read_tombstone(info.id) or {}
+        assert tombstone["session_id"] == "shared-session-abc"
+        assert tombstone["provider"] == "acp"
+        runtime = await sessions.get_subagent_runtime("dashboard:slot1")
+        handle = runtime.create_session.return_value
+        handle.destroy.assert_awaited_once()
+        sessions.reset.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_shared_session_cleanup_destroys_handle(self):
@@ -626,8 +753,8 @@ class TestSessionSharingParentReset:
     async def test_get_subagent_runtime_retries_once_on_spawn_failure(self, monkeypatch):
         """get_subagent_runtime retries spawn once on AcpRuntimeDead (parity with
         get_bg_session): the first spawn dies, the second succeeds -> live runtime.
-        Regression guard: the retry loop was previously dead code (spawn raised
-        straight through without being caught, so max_retries had no effect)."""
+        The retry loop must catch the failure: a spawn that raised straight
+        through without being caught would leave max_retries with no effect."""
         from kiro_crew.acp.runtime import AcpRuntimeDead
         from kiro_crew.config.loader import KiroCrewConfig
         from kiro_crew.session import SessionManager

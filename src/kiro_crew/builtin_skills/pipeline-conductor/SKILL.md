@@ -1,6 +1,6 @@
 ---
 name: pipeline-conductor
-description: Operating procedure for the kirocrew-pipeline-conductor agent - run one issue/PR pipeline on one repository as a supervised fleet. Auto-pick items, preflight every candidate to one deterministic claim verdict, stand up one worker session per item in a dedicated folder, probe them each cycle with one script call, verify claimed greens independently, intervene when a worker loops or stalls, adjudicate blocked items under the override protocol, throttle admission on delivery capacity, enforce per-item credit budgets, track the conductor's own obligations in a status file, digest verified greens to the human, and clean up on merge. Use when a pipeline conductor session is being seeded, or when inspecting/debugging one.
+description: Use when a pipeline conductor session is being seeded, or when inspecting/debugging one. Operating procedure for the kirocrew-pipeline-conductor agent - run one issue/PR pipeline on one repository as a supervised fleet. Auto-pick items, preflight every candidate to one deterministic claim verdict, stand up one worker session per item in a dedicated folder, probe them each cycle with one script call, verify claimed greens independently, intervene when a worker loops or stalls, adjudicate blocked items under the override protocol, throttle admission on delivery capacity, enforce per-item credit budgets, track the conductor's own obligations in a status file, digest verified greens to the human, and clean up on merge.
 ---
 
 # Pipeline Conductor
@@ -16,11 +16,13 @@ is not assumed: check at first use, and treat an absent script as `UNKNOWN`
 rather than permission.
 
 - `scripts/claim_preflight.py` — one verdict per candidate item before you
-  dispatch it: `CLAIM` / `SKIP` / `CLOSE` / `UNKNOWN`.
+  dispatch it: `CLAIM` / `SKIP` / `CLOSE` / `REVIEW` / `UNKNOWN`.
 - `scripts/fleet_probe.py` — batch worker-tail classification + idle age +
   error tails + banned-process scan + host load + delivery counters, in ONE
   call per cycle.
 - `scripts/credit_spend.py` — per-item credit rollup + budget verdict.
+- `scripts/spec_check.py` — the spec's closed-value fields, checked once at
+  startup. Exit 2 refuses the run.
 
 A decision this procedure states as prose rots silently; a decision a script
 computes can be tested. So anything below that cites a script is that script's
@@ -38,7 +40,9 @@ The operator's seed message names a spec file (JSON). Fields you consume now:
   "work_source": {"kind": "gh_issues", "select_labels": ["auto-fixable"],
                    "skip_signals": ["claimed", "in-progress"]},
   "worker_contract": {"branch_pattern": "fix/{slug}-{n}",
-                       "worktree_pattern": "../{repo_name}-fix-{n}"},
+                       "worktree_pattern": "../{repo_name}-fix-{n}",
+                       "max_commits": 2},
+  "verifier": {"repro_gate": "best_effort"},
   "governance": {"max_in_flight": 32, "max_per_cycle": 3,
                   "idle_alert_secs": 900, "session_ceiling": 30,
                   "credit_budget_per_item": 100, "topup_ceiling": 2},
@@ -50,11 +54,59 @@ Anything the spec does not set has the default shown above. Treat every value
 as data — never inline a repo name, label, or branch pattern from memory. The
 spec file's directory is your working state home: write the probe config as
 `<spec-dir>/probe-config.json` and let the probe own
-`<spec-dir>/probe-config.json.state.json` (the handled-set).
+`<spec-dir>/probe-config.json.state.json` (the handled-set). Set
+`fleet_worktrees` to the absolute worktree roots this fleet owns: it is optional
+in the config and it is what makes `cwd=fleet` reachable, so leaving it out
+classifies every banned line as `foreign` or `unknown` and the enforcing row of
+the banned-ops table never fires.
+
+`verifier.repro_gate` has two values, and exactly two — `spec_check.py` refuses
+the run on anything else (`malformed spec: verifier.repro_gate 'pod-required':
+expected 'best_effort' or 'pod_required'`), because a third value engages neither
+branch below and would leave the generic contract in force under a spec that
+reads as gated:
+
+- `best_effort` (default) keeps the generic pipeline behavior: reproduce where
+  cheap, and let the worker justify the narrowest honest verification when a
+  live system adds no signal.
+- `pod_required` is a HARD ADMISSION GATE for a pod-verification campaign. The
+  item is not implementation-eligible until the UNMODIFIED worktree reproduces
+  the reported failure in a live pod running that worktree's code. A unit or
+  structural test, a direct module call, a simulated exception, source reading,
+  or a note that a pod *could* verify the change later does NOT satisfy the
+  gate. No source, test, or documentation edit may precede the live red trace.
+  If the necessary scenario, product route, caller identity, host capability,
+  or externally drivable trigger is absent, the worker reports
+  `STANDDOWN: pod-repro-ineligible — <evidence>; missing=<capability>` without a
+  commit or PR, the conductor releases the claim with that evidence, and the
+  queue advances to the next candidate. After admission, the same live trace
+  must turn green before the worker may report `GREEN`.
+
+A pipeline using `pod_required` is measured by the number of admitted issues,
+not by the number inspected. An issue fixed with unit evidence but no admitted
+pod repro is useful work in another campaign and a FAILED sample in this one;
+never relabel it success in the friction report.
 
 ## Startup (once per run)
 
-1. Read the spec. `chat_folder_create` the pipeline folder.
+1. Run the checker through Kiro Crew's runtime interpreter before reading the
+   spec yourself or doing anything else. On POSIX run
+   `"$KIROCREW_RUNTIME_PYTHON" -I -B "<skill-dir>/scripts/spec_check.py" --spec <path>`;
+   on PowerShell run
+   `& $env:KIROCREW_RUNTIME_PYTHON -I -B "<skill-dir>/scripts/spec_check.py" --spec <path>`.
+   `-I` keeps the current directory, script directory, user site, and inherited
+   Python environment out of the import path before `safe_read_file` loads;
+   `-B` preserves the desktop bundle's no-bytecode-write rule even though
+   isolated mode ignores its `PYTHONDONTWRITEBYTECODE` environment setting.
+   Never substitute bare `python` or `python3`: desktop installs carry their own
+   interpreter and do not require either name on `PATH`. Exit 2 is a REFUSAL TO
+   START, not a warning: it means a field with a closed value set carries a value
+   that is neither of its options, and every such value engages no branch at all
+   — so the mode the operator asked for is silently off while the spec says it is
+   on. Report the message verbatim and stop; do not guess a default, and do not
+   open the folder or claim an item first, because a run that has already
+   dispatched a worker cannot un-dispatch it. Only after exit 0 may you read the
+   spec and use its values. Then `chat_folder_create` the pipeline folder.
 2. Build the queue from the work source (or adopt the operator's seeded
    backlog). **Record the backlog at whatever size it is** — as the queue's
    PROVENANCE, one entry: the work source, its selector, the count, and the item
@@ -66,10 +118,12 @@ spec file's directory is your working state home: write the probe config as
    provenance entry and for the whole-map write rule.
 3. Open your own status file beside the spec — `conductor-status/v1`, schema
    below. The ledger tracks the items; the status file tracks YOU.
-4. Arm the patrol: `monitor_start` (interval ~90s) with the standing
-   instruction below. **Patrol with `monitor_start`, never `wait`.** Call
-   `autonudge_stop` yourself when the exit condition fires — coasting into the
-   cycle cap is a failure, not a finish.
+4. Arm the patrol with `monitor_start` using an interval near 90 seconds, an
+   explicit `max_cycles=960`, and an explicit `max_runtime_secs=259200`. **Patrol
+   with `monitor_start`, never `wait`.** If live work needs a larger or renewed
+   bound, raise it with `monitor_update` before it expires; `monitor_start` is
+   create-only. Call `autonudge_stop` yourself when the exit condition fires —
+   coasting into the cycle cap is a failure, not a finish.
 
 Standing patrol instruction template (keep it CURRENT — steering edits go here
 via `monitor_update`, see "Live steering"):
@@ -80,9 +134,8 @@ via `monitor_update`, see "Live steering"):
 > THEN PROBE: one `fleet_probe.py --config <path>` call. Act only on 🔔/BANNED
 > lines: ERR → batch resume; PR → record; GREEN → verify independently then
 > digest + backfill; STANDDOWN/PROPOSAL → disposition + backfill; TERMINAL →
-> close it out, never nudge; BLOCKED → adjudicate; IDLE → intervention ladder.
-> Diff each fired line's `i=` against the recorded one: unchanged index is no
-> progress. Mark each acted signal handled.
+> close it out, never nudge; BLOCKED → adjudicate; IDLE → intervention ladder;
+> NOPROGRESS → check the EFFECT, never liveness. Mark each acted signal handled.
 > Write every item change back as the WHOLE `artifacts` map in ONE
 > `session_ledger_record` call — a partial write ages an active item out — and
 > RECLAIM BEFORE YOU ADMIT: collapse settled entries and drop tally-covered ones
@@ -285,6 +338,7 @@ python3 scripts/claim_preflight.py --repo <owner/repo> --item <N> \
 | 0 | `CLAIM` | Dispatch it. `risk=high` on the line means self-claim collision risk: that item is NOT batched — it goes to the live recheck on its own, immediately before claiming. |
 | 10 | `SKIP` | Covered, or not workable. Leave it alone; record the reason. |
 | 11 | `CLOSE` | Triage debt, not work. Close the item with the evidence the script printed. |
+| 13 | `REVIEW` | A closure request was READ in the item's prose. **Do not dispatch and do not close.** Open the comment the line names, decide yourself whether the item is really done, and then either close it or dispatch it. This verdict exists because prose is the weakest evidence the preflight collects and closing is the strongest response it had. |
 | 2 | malformed | YOUR arguments or config are wrong. Fix the call — a bad call is not a verdict about the item. |
 | 3 | `UNKNOWN` | A check could not be answered (forge unreachable, rate limited). **Never treat this as permission.** Re-run it later or park the item. |
 
@@ -304,14 +358,24 @@ precedence list:
    treating it as coverage closes live work and treating it as a claim starves an
    item whose fix was only partial.
 2. `open_prs` — any open PR referencing it, **fork PRs included** → **SKIP**
-   `open-pr`.
+   `open-pr`. A fork PR from someone with no standing still SKIPs, but the line
+   carries `risk=high` and an `untrusted-fork` marker — treat that as a triage
+   signal to review rather than an item that simply left the queue, because
+   opening a fork PR needs no permission and is therefore a suppression channel.
 3. `prose_claim` — a closure request in the body or the last comment ("this is
    resolved", "please close") **from the item's own reporter or a repository
-   insider** → **CLOSE** `reporter-asked-close`. The authorization condition is
-   load-bearing, not decoration: anyone can comment on a public item, closing one
-   is a WRITE, and this verdict would otherwise let ingested untrusted text drive
-   that write on an unattended cycle. A closure phrase from anybody else is not a
-   closure request — it falls through to the remaining checks.
+   insider** → **REVIEW** `reporter-asked-close` at `risk=high`. **Prose never
+   closes anything.** It is the weakest evidence this script collects — nine
+   separate false-CLOSE paths reached review in one change, and a ratchet that
+   stops a new unguarded PATTERN cannot stop the next unguarded PHRASING of a
+   pattern already guarded, because the space of English that accidentally means
+   "close this" has no edge. So the detection stays and the response is withheld:
+   you read the comment the line names and you decide. The authorization
+   condition stays too, for a different reason than it had — `REVIEW` writes
+   nothing, but it does withhold a dispatch, and a suppression any passer-by can
+   cast is the same denial-of-work channel rule 4 refuses to open. A closure
+   phrase from anybody else is not a closure request — it falls through to the
+   remaining checks.
 4. `prose_claim` — a self-claim ("I'm claiming this", "working on this") **from
    the item's reporter or a repository insider** → **SKIP** `prose-claim`. A claim
    written in prose is invisible to every label and field query that exists, which
@@ -322,6 +386,12 @@ precedence list:
    pipeline would ever report that it had been suppressed. Downgrading keeps the
    collision protection where the claim is credible without handing an arbitrary
    commenter a mute button.
+
+   A claim is retired by a later withdrawal from the same author ("dropping
+   this"), including one written in the issue BODY — otherwise a claim nobody is
+   honouring suppresses the item forever. Bot comments never claim and never
+   close. Ownership is read from the newest STANDING claim, not from the last
+   comment, so a passer-by's "any update?" does not clear a claim.
 5. `symbol_on_base` — a symbol the item names is absent from
    `{default_branch}`. **Absence alone is not a SKIP.** Corroborated as
    bug-class, it is **SKIP** `symbol-absent`: the target code lives only on an
@@ -335,8 +405,10 @@ precedence list:
 
 **`risk=high` is a decision, not a note.** A high-risk `CLAIM` is NOT batched:
 it goes to the live per-item recheck immediately before the atomic claim, on its
-own. An annotation nothing acts on is the same defect as a prose predicate — it
-reads as caution and changes nothing.
+own. A `REVIEW` is always high-risk and is not a dispatch at all: it goes on your
+own list, and it clears only when you have read the named comment and either
+closed the item or dispatched it. An annotation nothing acts on is the same
+defect as a prose predicate — it reads as caution and changes nothing.
 
 **A batch snapshot is never the authority.** Preflighting a batch is how you
 order a queue; a per-item live recheck immediately before the atomic claim stays
@@ -348,6 +420,9 @@ item.** Its verdict is CLOSE with the landing-commit evidence, and closing it IS
 the work. Dispatching a worker to rediscover that the work does not exist spends
 a whole session — create, seed, preflight, stand down, unclaim — to learn
 nothing, and leaves claim churn on a repository other operators are reading.
+**An item that merely READS as already fixed is not the same item.** A merged
+commit that is an ancestor of the base is evidence; a sentence saying so is a
+reading, and it comes back as `REVIEW` for you to confirm.
 
 ### Dispatch mechanics
 
@@ -357,8 +432,11 @@ nothing, and leaves claim churn on a repository other operators are reading.
   edit files.
 - Validate with ONE canary dispatch before a batch. A wrong agent or a broken
   brief costs one session that way, and the whole batch otherwise.
-- Respect the session-create rate limit: dispatch in small batches with other
-  work interleaved, never the whole queue at once.
+- Respect the session-create rate limit: 20 `session_create` calls per 5-minute
+  window per caller (folders: 10). `max_in_flight` defaults to 32, so a
+  full-width dispatch round CANNOT complete inside one window — plan two rounds,
+  and remember that a create refused by the limiter is a post-claim failure, so
+  unclaim per the rule above.
 - Worker sessions must be granted **trust mode before seeding** — an unattended
   session stuck on an approval prompt runs zero turns; if you cannot grant it,
   tell the operator instead of seeding sessions that will hang.
@@ -397,7 +475,25 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > PREFLIGHT (mandatory): view the item; check open PRs and worktrees for
 > overlap — if anything already covers it, reply `STANDDOWN: <reason>` and
 > stop. Never adopt another session's WIP.
-> CONFIRM the mechanism before fixing: reproduce where cheap; wrong premise →
+> REPRO ADMISSION (`{verifier.repro_gate}`): expand this clause from the spec.
+> In `pod_required` mode, keep the worktree byte-clean and run `kirocrew pod
+> scenarios`, choose the closest shipped state, boot the UNMODIFIED worktree in
+> that scenario, and drive the externally visible failing behavior through
+> `pod api`, pod-e2e/Playwright, or another real product route. Run pod
+> status/token/API commands through the worktree's `./.venv/bin/kirocrew` after
+> provisioning: the globally installed binary may be sandbox-blind to the pod
+> process's sockets and fail closed on ownership proof. If `playwright-cli`
+> cannot launch on the host, the repository's own Playwright runner against the
+> same live pod is equivalent evidence; record the engine and launch flags, and
+> treat a missing REQUIRED engine (for example Safari/WebKit-specific behavior)
+> as `missing=<capability>` rather than silently substituting Chromium.
+> Record the scenario, exact probe, and failing observable. A unit test, direct
+> import, simulated error, or post-fix friction note is NOT admission. No live pod red →
+> `STANDDOWN: pod-repro-ineligible — <evidence>; missing=<capability>` and STOP
+> with no edit, commit, or PR. Live red admitted → implement, then run the SAME
+> pod trace green and tear the pod down to zero residue before `GREEN`.
+> CONFIRM the mechanism before fixing: in `best_effort` mode, reproduce where
+> cheap; wrong premise →
 > `STANDDOWN: premise disproven — <evidence>`. A design decision →
 > `PROPOSAL: <link>` (write the proposal on the item; do not build).
 > IMPLEMENT in your own worktree (`{worktree_pattern}`, branch
@@ -406,7 +502,10 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > PATH, and nothing else. Name the ban rather than implying it — no `make test`,
 > no `tox`, no `nox`, no `run-tests`/`local-gate`/"run the gates" wrapper of any
 > kind: a wrapper that escalates to the full suite satisfies the letter of a
-> targeted-only brief. Pass `-n0` **explicitly** on every run: omitting `-n`
+> targeted-only brief. The ban is on suite wrappers, NOT on the push gate
+> below — `preflight.py` and `push_guard.py` shell out only to `git` and `gh`
+> and run no test at all, so a targeted-test brief never licenses an unguarded
+> push. Pass `-n0` **explicitly** on every run: omitting `-n`
 > does not mean single process, it inherits whatever the project's pytest
 > `addopts` sets, and `-n auto` is a common default. Canonical line —
 > `timeout 900 python3 -m pytest -n0 <test file> -x -q </dev/null`. Do not
@@ -418,6 +517,35 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > on an interactive prompt indefinitely. If a push exceeds ~2 minutes, time the
 > actual pre-push hook over the real payload before naming a cause: process
 > liveness cannot distinguish a credential prompt from a slow hook.
+> PUSH GATE (mandatory, every push): the scripts live in `<gate>` =
+> `<crew-home>/skills/kirocrew-dev/prepare-pr/scripts`, where `<crew-home>` is
+> `KIROCREW_HOME` when set and `$HOME/.kiro/crew` otherwise. Invoke them through
+> Kiro Crew's runtime interpreter the way Startup invokes `spec_check.py`, and
+> quote the resolved path: on POSIX `"$KIROCREW_RUNTIME_PYTHON" -B
+> "<gate>/preflight.py"`, on PowerShell `& $env:KIROCREW_RUNTIME_PYTHON -B
+> "<gate>/preflight.py"`. `-B` preserves the desktop bundle's no-bytecode-write
+> rule. Do NOT add `-I` here even though Startup passes it: `preflight.py` imports
+> its sibling `push_guard`, and isolated mode drops the script's own directory
+> from the import path, so `-I` turns the gate into a `ModuleNotFoundError` on
+> every push.
+> Run `preflight.py` before the first commit. Then before EVERY push confirm
+> `git status --porcelain` is empty and run `<gate>/push_guard.py
+> --base {default_branch} --max-ahead {max_commits}`, which refuses a stale base
+> or a replayed upstream commit. Pass `--max-ahead` explicitly and fill it from
+> the spec, never from memory: the script defaults to 5, which is looser than
+> most repositories' own PR commit-count gate, so omitting it lets a branch read
+> `SAFE TO PUSH` and then fail that gate. Add `--require-single-on-base` only
+> when you actually squashed to one commit; it asserts `HEAD~1 ==
+> origin/<base>` and refuses a legitimate multi-commit branch.
+> Read the exit code, do not just test for zero: `0` proceed; `30`/`40` the gate
+> REFUSED, so do not push and report the code with the branch state; `2` the gate
+> could not RUN — an environment error, not a verdict — so do not push and report
+> `BLOCKED: push gate inoperative` with the code and stderr, because a worker
+> whose sandbox cannot reach the scripts has to surface that once instead of
+> stalling every item silently. A non-empty `git status --porcelain` is also a
+> stop.
+> Unstaged work and a stale base are what otherwise reach the
+> PR and cost a review round to find what a git-only check catches in a second.
 > PR: English body (What/Why/How/Tests/Other), `Closes #{n}`, full URL in
 > your reply. Babysit to green (`monitor_start` ~300s, staggered off a round
 > number so a dozen loops do not poll in lockstep, preferring REST over
@@ -450,9 +578,18 @@ carry **metadata only** — the probe never emits transcript text:
 
 ```
 🔔 <key>  <age>s <TAG> i=<index> d=<digest12>
-BANNED pid=<pid> rule=<regex> cwd=fleet|unknown
+BANNED pid=<pid> rule=<regex> cwd=fleet|unknown age=<secs|?>s
 OK <n> watched, <m> fired | load/cpu <x> (ok|hot) | mem <n>G | banned <n> | foreign <n> | deliver init-timeout <a>, watchdog <b>
 ```
+
+A tail with no protocol tag reads as `-` and never fires on its own, and a
+protocol word inside a tool card is quoted text rather than a report — so a worker
+whose only "status" is in a tool call is silent as far as the probe is concerned,
+and ages into `IDLE`.
+
+The handled set keeps the last dispositioned PAYLOAD report as `settled`, so a
+later `IDLE` or `NOPROGRESS` mark on the same session cannot resurrect a ruling
+you already delivered. You do not maintain this — it is written on every mark.
 
 When a ruling needs content, read that one session through the
 workspace-authorized session tools. Act, then `--mark-handled KEY TAG DIGEST`
@@ -479,14 +616,15 @@ is read from disk — the read loads the whole transcript either way. The index 
 carried into the handled-set entry as well, so the comparison is available next
 cycle without you having to hold it.
 
-**An unchanged index across two probes is no progress**, whether or not a turn
-is open — it is the one discriminator a self-deadlocked worker cannot fake,
-because producing a message is the thing it cannot do. When the index has not
-moved, check the EFFECT and never liveness: did the artifact appear, did the
-remote head move, is there a new commit. "Still working" is not something the
-probe can tell you at all — that reading comes from `session_read_message`'s
-running flag, and an open turn is satisfied by a shell deadlocked on its own
-child just as well as by real work.
+**An unchanged index since you last acted is no progress**, whether or not a
+turn is open — it is the one discriminator a self-deadlocked worker cannot fake,
+because producing a message is the thing it cannot do. The probe makes that
+comparison itself and fires `NOPROGRESS`, so read the tag and **never diff two
+cycles by eye**: a comparison that lives in this document is enforced by
+nothing, so it may simply never happen. `i=` is the corroborating number, not
+the test. "Still working" is not something the probe can tell you at all — that
+reading comes from `session_read_message`'s running flag, and an open turn is
+satisfied by a shell deadlocked on its own child just as well as by real work.
 
 **One-time degradation on the first probe after an upgrade.** The fired-line
 digest is keyed on the classified tail text, so any change to what gets
@@ -505,8 +643,9 @@ digest keying, not a defect, and it does not recur.
 | `STANDDOWN` / `PROPOSAL` | Verify the evidence is stated; record the disposition; unclaim with an evidence comment; close or re-queue; backfill. |
 | `TERMINAL` | The last dispositioned protocol report was terminal and the session has gone quiet since. **Close it out** — confirm the disposition landed, release the claim, `session_close`. Do NOT nudge: a finished worker has nothing to re-arm, and a monitor loop is only correct while something EXTERNAL can still change. |
 | `IDLE` | Intervention ladder (below). |
+| `NOPROGRESS` | The session has produced nothing — no message, no tool row — since you last acted on it, and that mark is at least one `idle_alert_secs` old. Check the **EFFECT, never liveness**: did the artifact appear, did the remote head move, is there a new commit. Effect present → healthy-slow; extend and name the expected completion signal. Effect absent → **route on the line's own age**, because two paths reach this tag and they do not mean the same thing. Within `idle_alert_secs` the transcript is WARM — held alive by inbound traffic the session never answers — and the first move is **not a nudge**, since a nudge is more of the input that produced the reading: enter the intervention ladder at its **Inspect** step. Past `idle_alert_secs` the session is cold as well as unproductive, so `IDLE`'s ladder applies from the top: the classifier ranks this tag below the clock, but the suppression fallback substitutes it for an already-dispositioned report with no age test, so a cold line can carry it. |
 | `GONE` | Transcript missing — treat as reclaim: re-queue the item with evidence. |
-| `BANNED pid=…` | Banned-ops response (below), keyed by the line's OWNERSHIP CLASS: every class is recorded, and a stop is reserved for `cwd=fleet`. Never read this as a single actionable-or-not decision. |
+| `BANNED pid=…` | Banned-ops response (below), keyed by the line's OWNERSHIP CLASS: every class is recorded, and a stop is reserved for `cwd=fleet`. Never read this as a single actionable-or-not decision. Read `age=` to tell the SAME line apart across cycles: an age that GROWS between cycles is one process you have not managed to stop, while a small age under a re-appearing pid is a fresh violation on a recycled number — a bare pid cannot separate those. `age=?s` means the age is unavailable: the process already exited (the expected reading for a short-lived runner), the pid was recycled between the probe's reads (in which case the whole record is stale and `cwd` also drops to `unknown`), or the platform has no `/proc`/`sysconf` to read it from. It never means the process is new. |
 
 The `OK` line's `deliver init-timeout <a>, watchdog <b>` counters are the
 admission instrument, not fleet trivia — see governance.
@@ -560,11 +699,13 @@ Signals: `IDLE` twice in a row; same tag across ~5 cycles with rising turn
 count; credit burn with no ledger transition; ERR recurring after resume.
 
 1. **Nudge** (`session_send`): restate the next step + protocol requirement.
-2. **Inspect** — `spawn_run` ONE bounded inspector with an ENFORCED read-only
-   toolset: pass `allowed_tools` limited to reads (`fs_read`, `web_fetch`,
-   `@kirocrew-dashboard/session_read_message`) so "read-only" is a property of
-   the spawn, not a hope in the prompt — never grant it `execute_bash` or any
-   write tool. Task: *"Read the tail of session {key}
+2. **Inspect** — `spawn_run` ONE bounded inspector and bound it in the TASK
+   TEXT. `spawn_run` takes no `allowed_tools` parameter, and the underlying
+   field is ignored for ACP-backed agents, so read-only cannot be a property of
+   the spawn. Pin a read-only AGENT instead (`agent=` a spec with no write
+   tool), say "read only; modify nothing" explicitly, and treat any write the
+   inspector reports as an escaped constraint to raise with the operator. Task:
+   *"Read the tail of session {key}
    (session_read_message) and the state of PR #{n} on {repo} (web_fetch the PR
    page). Return one verdict — healthy-slow | looping | blocked-misclassified
    | premise-wrong — plus two sentences of evidence. Do not modify anything."*
@@ -679,7 +820,7 @@ a silent drop. Key it on the class instead:
 | Class | Response |
 | --- | --- |
 | `cwd=fleet` | The heavy response: `session_stop` that worker, a ~5min cooldown, then restart it with the targeted-tests directive re-injected in the seed. |
-| `cwd=unknown` | The probe classified, but this one pid's cwd was unreadable. NON-stopping: re-inject the directive to the owning session WITHOUT stopping it, and record the line. Never a stop, never a silent drop. |
+| `cwd=unknown` | The probe could not attribute this line to the fleet: either the pid's cwd was unreadable, or the process incarnation changed between the probe's reads (a recycled pid), so the record's fields cannot be trusted as one process. NON-stopping: re-inject the directive to the owning session WITHOUT stopping it, and record the line. Never a stop, never a silent drop — a stale record can never trigger a stop against an innocent worker. |
 | no `cwd=` field at all | The probe predates classification, so the line carries no ownership. Attempt attribution ONCE at action time (read that pid's cwd): resolved inside a fleet worktree → treat it as `cwd=fleet` and take the stop response above; not resolved → record the count and re-inject the directive fleet-wide as a reminder, stopping nobody. See the legacy-line fallback below. |
 | `cwd=foreign` | Count only. Not the fleet's process to police, and never grounds for stopping a session. |
 
@@ -771,8 +912,11 @@ Roughly every 5 cycles, for items with open sessions:
     history.
 - `unmetered` → treat spend as UNKNOWN, not zero — say so in the ledger and
   lean on the time-based signals instead.
-- `truncated` (only if you passed `--max-shards`) → re-run without the bound;
-  an under-budget answer from a partial scan is not a verdict.
+- `truncated` → the under-budget answer is incomplete: older shards were skipped
+  (`--max-shards`), a shard was unreadable, or a matched row was corrupt. Re-run
+  without the bound; if it persists without one, the usage data itself is
+  damaged — treat spend as UNKNOWN like `unmetered`, and do not read it as within
+  budget.
 
 ## Live steering
 
@@ -836,9 +980,13 @@ terminal — see "How the ledger behaves".
 
 ## Known limits (state them, don't hide them)
 
-- `session_send` / `session_stop` / `spawn_run` (the inspector) are mounted but
-  not auto-approved: unattended operation requires the operator to arm THIS
-  session in trust mode (same "trust before seed" rule as the workers).
+- `execute_bash` (which is EVERY script call — preflight, probe, credit rollup),
+  `session_send`, `session_stop`, `session_close` and `spawn_run` (the inspector)
+  are mounted but never auto-approved: `allowedTools` cannot match arguments, so
+  trusting the bundled scripts would mean trusting arbitrary shell. Unattended
+  operation therefore requires the operator to arm THIS session in trust mode
+  (same "trust before seed" rule as the workers) — without it the patrol stalls
+  on its first probe, not on its first intervention.
 - Credit metering covers dashboard-session turns; `spawn_run` inspector turns
   and non-chat sessions burn invisibly (`unmetered` verdict exists for a
   reason).

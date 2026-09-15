@@ -388,6 +388,28 @@ describe('WebexPanel save payload', () => {
     ).toBeInTheDocument()
   })
 
+  it('omits the restart hint when a verified save applied live', async () => {
+    // restart_required=false is the hot-reload path: the credential verified AND
+    // the channel is already running it, so a restart claim would be a lie.
+    const { save } = seed({}, { save: { ok: true, restart_required: false, verify_warning: '' } })
+    await hydrated()
+
+    fireEvent.change(screen.getByLabelText('Webex bot token'), {
+      target: { value: 'not-a-real-webex-token' },
+    })
+    fireEvent.click(saveBtn())
+
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    expect(
+      await screen.findByText('Verified with Webex and saved.', undefined, { timeout: 5_000 }),
+    ).toBeInTheDocument()
+    // the restart-flavoured verified text must not also render (a separate
+    // channel-not-running banner may legitimately mention a restart)
+    expect(
+      screen.queryByText('Verified with Webex and saved. Restart the gateway to connect.'),
+    ).not.toBeInTheDocument()
+  })
+
   it('reports a restart-only save when no credential was submitted', async () => {
     seed({}, { save: { ok: true, restart_required: true, verify_warning: '' } })
     await hydrated()
@@ -492,7 +514,7 @@ describe('WebexPanel save failure', () => {
     expect(await screen.findByText(body, undefined, { timeout: 5_000 })).toBeInTheDocument()
   })
 
-  it('shows a non-JSON error message verbatim and retires it after eight seconds', async () => {
+  it('shows a non-JSON error message verbatim and keeps it up until the next attempt', async () => {
     seed({}, { save: { reject: new Error('502 Bad Gateway') } })
     await hydrated()
 
@@ -501,8 +523,10 @@ describe('WebexPanel save failure', () => {
       await screen.findByText('502 Bad Gateway', undefined, { timeout: 5_000 }),
     ).toBeInTheDocument()
 
+    // No timer retires it: the rejected token draft is still in the field, and a
+    // notice that erased itself left a quiet form that read as saved.
     await act(async () => { vi.advanceTimersByTime(8_100) })
-    expect(screen.queryByText('502 Bad Gateway')).not.toBeInTheDocument()
+    expect(screen.getByText('502 Bad Gateway')).toBeInTheDocument()
   })
 
   it('falls back to the gateway hint when the rejection is not an Error', async () => {

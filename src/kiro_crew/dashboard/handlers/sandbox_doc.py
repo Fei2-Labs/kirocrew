@@ -1,8 +1,8 @@
 """Serve model-authored HTML to a sandboxed iframe from a real URL.
 
 Two dashboard surfaces render HTML the model wrote — saved artifacts
-(``ArtifactBody``) and inline chat widgets (``WidgetFrame``) — and both used to
-hand the frame a ``blob:`` URL built in the browser. That works in Chromium and
+(``ArtifactBody``) and inline chat widgets (``WidgetFrame``) — and neither may
+hand the frame a ``blob:`` URL built in the browser: that works in Chromium and
 fails in some WebKit-based in-app browsers, which refuse the load outright
 ("invalid url or response") and can take the whole page down with it. ``srcdoc``
 is not the way out either: a sandboxed ``srcdoc`` frame blank-renders on WebKit.
@@ -150,8 +150,8 @@ async def api_stash_sandbox_doc(request: web.Request) -> web.Response:
 
     # Encode HERE, not at serve time. A document carrying a lone surrogate is
     # representable in JSON and in a Python str but NOT in UTF-8, and encoding it
-    # after the single-use pop turned that into a 500 plus a document that could
-    # never be fetched again. Rejecting at the mint is the honest place: the
+    # after the single-use pop would turn that into a 500 plus a document that
+    # could never be fetched again. Rejecting at the mint is the honest place: the
     # caller still holds the bytes and gets a reason.
     try:
         raw = html.encode("utf-8")
@@ -218,21 +218,20 @@ async def serve_sandbox_doc(request: web.Request) -> web.Response:
         raise web.HTTPNotFound()
     _audit("allowed", doc_id[:8])
 
-    # Already bytes: the encode happened at MINT time, so serving cannot raise.
-    # It used to encode here, which meant a document carrying a lone surrogate
+    # Already bytes: the encode happens at MINT time, so serving cannot raise.
+    # Encoding here instead would let a document carrying a lone surrogate
     # (JSON accepts "\ud800", Python holds it in a str, UTF-8 cannot represent it)
-    # popped the entry and THEN raised — a 500 for the frame and a document lost
-    # to the single-use pop, with no way to ask for it again.
+    # pop the entry and THEN raise — a 500 for the frame and a document lost to
+    # the single-use pop, with no way to ask for it again.
     resp = web.Response(body=entry[1], content_type="text/html", charset="utf-8")
-    # The load form changed; the trust level must not. `sandbox` gives the
+    # Serving from a real URL must not raise the trust level. `sandbox` gives the
     # document an opaque origin even opened top-level, and the flags are exactly
     # those the embedding frames grant — no more. `allow-forms` in particular is
     # NOT granted: neither ArtifactBody nor WidgetFrame allows it, so including it
     # here would let a document opened top-level submit forms that the same
     # document cannot submit inside the frame. No `default-src` is added on
-    # purpose: these documents could previously reach the network from a blob:
-    # origin, and silently cutting that off would break existing widgets rather
-    # than fix them.
+    # purpose: these documents can reach the network, and silently cutting that
+    # off would break existing widgets rather than fix them.
     #
     # `frame-ancestors` is `'self'` PLUS the ancestors `'self'` cannot express.
     # `'self'` is resolved by the browser against the frame's real URL, so it stays

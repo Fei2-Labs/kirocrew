@@ -322,14 +322,14 @@ class TestRepoScope:
     """``repo_scope:`` frontmatter mechanically suppresses a skill unless the
     SESSION's active project directory (or an ancestor) contains the named
     relative path — the loader-enforced gate for repo-specific skills with
-    destructive instructions (PR #353 arbiter: prose scope guards are
+    destructive instructions (prose scope guards are
     probabilistic; containment must be mechanical before shipping to every
     install).
 
     The gate is keyed on the project, never on the process working directory:
     this runs in the gateway while it assembles context, so ``Path.cwd()`` is
     the gateway's own directory and answers by install shape rather than by the
-    work the session is doing (issue #4322)."""
+    work the session is doing."""
 
     def _write_skill(
         self, root: Path, name: str, scope: str | None, always: bool = False
@@ -471,7 +471,7 @@ class TestRelocatedSkillCleanup:
     """Skills moved into skills/kirocrew-dev/ must have their old FLAT copies
     removed from loader discovery on existing installs — otherwise an upgrade
     leaves two divergent copies matched nondeterministically by trigger overlap
-    (the dual-copy drift PR #353's arbiter blocked). The flat copy may carry
+    (the dual-copy drift this prevents). The flat copy may carry
     USER EDITS (the mtime-preserving sync deliberately protects those), so it
     is never deleted: its SKILL.md is renamed to SKILL.md.pre-relocation —
     undiscoverable, but every byte preserved. Quarantine only happens when the
@@ -492,7 +492,7 @@ class TestRelocatedSkillCleanup:
 
         _ensure_builtin_skills(base)
 
-        # No longer discoverable as a skill...
+        # Not discoverable as a skill...
         assert not (old / "SKILL.md").exists()
         # ...but nothing was deleted: user edits and scripts preserved on disk.
         quarantined = old / "SKILL.md.pre-relocation"
@@ -722,6 +722,49 @@ class TestSkillsCRUD:
         assert loader.create_skill("", "# bad") is False
         # Nested paths are now allowed
         assert loader.create_skill("foo/bar", "# nested") is True
+
+    def test_rooted_name_load(self, tmp_path):
+        """Rooted names must be rejected: a pathlib join with an absolute
+        segment discards the base directory, escaping the skills root."""
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        # POSIX-absolute (payload scoped under tmp_path so a guard regression
+        # is contained rather than acted on against the host)
+        assert loader.load_skill(str(tmp_path / "escape")) is None
+        assert loader.load_skill("/foo") is None
+        # Windows drive-qualified, forward-slash spelling
+        assert loader.load_skill("C:/Windows/System32") is None
+        # Windows drive-relative (no root, still re-anchors the join)
+        assert loader.load_skill("C:evil") is None
+        # Forward-slash UNC prefix
+        assert loader.load_skill("//server/share/skill") is None
+        # Backslash spellings stay rejected by the existing backslash rule
+        assert loader.load_skill("C:\\Windows\\evil") is None
+        assert loader.load_skill("\\\\server\\share\\skill") is None
+        # Dot-only spellings collapse the join back onto the skills root
+        assert loader.load_skill(".") is None
+        assert loader.load_skill("./") is None
+        assert loader.load_skill(".//.") is None
+
+    def test_rooted_name_create_update_delete(self, tmp_path):
+        """Skill CRUD must refuse rooted or dot-only names but accept
+        relative ones. Absolute payloads live under tmp_path so a guard
+        regression surfaces as a containment failure, not a host mutation."""
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        escape = tmp_path / "escape"
+        for rooted in (str(escape), "C:/abs", "C:abs", "//server/share/x", ".", "./"):
+            assert loader.create_skill(rooted, "# bad") is False
+            assert loader.update_skill(rooted, "# bad") is False
+            assert loader.delete_skill(rooted) is False
+        assert not escape.exists()
+        # delete_skill(".") must not have collapsed onto the skills root
+        assert skills_dir.is_dir()
+        # Normal relative names keep working: single-segment and nested
+        assert loader.create_skill("plain", "# ok") is True
+        assert loader.create_skill("nested/child", "# ok") is True
 
     def test_create_then_list(self, tmp_path):
         skills_dir = tmp_path / "skills"
@@ -1931,7 +1974,7 @@ class TestSearchSkills:
 
 
 class TestDisabledAppSkillsAreNotTriggered:
-    """Disabling an app must actually stop its bundled skills loading (#4023).
+    """Disabling an app must actually stop its bundled skills loading.
 
     The skill tree an app bundles under ``skills/<app>/`` was never gated on the
     app's enabled state, so a disabled app's skills stayed in the matching index
@@ -2050,7 +2093,7 @@ class TestDisabledAppSkillsAreNotTriggered:
         return "auto-improvement"
 
     def test_a_disabled_builtins_package_tree_skill_is_gated(self, tmp_path, monkeypatch):
-        """The headline case (#4023): a shipped builtin registers its skills
+        """A shipped builtin registers its skills
         straight out of the package tree, and the flat link -- whose name says
         nothing -- can be the registration the walk keeps. Ownership must resolve
         through the builtin's manifest, not only the data-home apps root."""
@@ -2077,7 +2120,7 @@ class TestDisabledAppSkillsAreNotTriggered:
         assert loader.get_triggered_skills("find hotspots for me") == ["ai-discover"]
 
     def test_disabled_app_skills_excluded_from_list_skills_and_context(self, tmp_path, monkeypatch):
-        """#5781: Disabled app skills must not appear in list_skills or get_context index."""
+        """Disabled app skills must not appear in list_skills or get_context index."""
         skills = tmp_path / "skills"
         self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
         self._write_app_skill(skills, "ops_mc", "ops-mission-control", "deploy")
@@ -2097,7 +2140,7 @@ class TestDisabledAppSkillsAreNotTriggered:
         assert "ops-mission-control" in context
 
     def test_disabled_app_always_skill_is_excluded(self, tmp_path, monkeypatch):
-        """#5781: Disabled app skills with always: true must not be injected."""
+        """Disabled app skills with always: true must not be injected."""
         skills = tmp_path / "skills"
         d = skills / "deploy_web" / "always-helper"
         d.mkdir(parents=True)
@@ -2118,7 +2161,7 @@ class TestDisabledAppSkillsAreNotTriggered:
         assert loader.get_always_skills() == ["deploy_web/always-helper"]
 
     def test_disabled_app_dollar_skill_is_not_resolved(self, tmp_path, monkeypatch):
-        """#5781: Explicit $skill invocation must not resolve a disabled app's skill."""
+        """Explicit $skill invocation must not resolve a disabled app's skill."""
         skills = tmp_path / "skills"
         self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
         self._apps(monkeypatch, deploy_web=False)
@@ -2137,7 +2180,7 @@ class TestDisabledAppSkillsAreNotTriggered:
         assert res[0][1] == "deploy_web/artifact-deploy"
 
     def test_disabled_app_skill_is_excluded_from_search(self, tmp_path, monkeypatch):
-        """#5781: skill_search must not return results from disabled apps."""
+        """skill_search must not return results from disabled apps."""
         skills = tmp_path / "skills"
         self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
         self._apps(monkeypatch, deploy_web=False)
@@ -2157,7 +2200,7 @@ class TestDisabledAppSkillsAreNotTriggered:
 
 
 class TestStripFrontmatterCloserParity:
-    """#6182: strip_frontmatter's closer must accept everything the display
+    """strip_frontmatter's closer must accept everything the display
     parser's ``column0_fence`` grammar accepts. A closer the parser tolerates
     but the stripper rejects shows parsed metadata in the UI while the whole
     frontmatter block leaks to the model."""
@@ -2230,7 +2273,7 @@ class TestStripFrontmatterCloserParity:
         If the display dialect ever goes lenient on the opener (e.g.
         switching SKILL_LOADER to leading_ws_fence), the premise assertion
         here goes red, forcing the stripper's opener to be revisited in the
-        same change instead of silently reopening the #6182 leak."""
+        same change instead of silently reopening the leak."""
         from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
 
         doc = f" ---\ndescription: test skill\n---\n{self.BODY}"

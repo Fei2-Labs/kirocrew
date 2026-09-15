@@ -28,13 +28,14 @@ from kiro_crew.mcp_discovery import (
 #: Managed server name -> the function that starts its stdio loop. Separate from
 #: the discovery map because that map points at the module whose ``_list_tools``
 #: is read; this names the entry point whose argument is the fact under test.
-#: ``kirocrew-core`` is the odd one out — the other three all call theirs
+#: ``kirocrew-core`` is the odd one out — the others all call theirs
 #: ``run_mcp_server``.
 _SERVE_ENTRY = {
     "kirocrew-core": "run_mcp_core_server",
     "kirocrew-cron": "run_mcp_server",
     "kirocrew-computer": "run_mcp_server",
     "kirocrew-dashboard": "run_mcp_server",
+    "kirocrew-work": "run_mcp_server",
 }
 
 
@@ -114,13 +115,15 @@ def test_the_concrete_verdicts_are_spelled_out() -> None:
     """The concrete answers the dashboard renders, spelled out.
 
     Kept alongside the derived checks above because those pass just as happily if
-    every managed server flipped at once. ``kirocrew-core``, ``kirocrew-cron``
-    and ``kirocrew-dashboard`` consume the injected caller block and refuse or
-    safely namespace an unidentified caller, so none is session-bound.
-    ``kirocrew-computer`` also advertises and consumes the block (#4659 — its
-    pooled attribution is correct for every caller the gateway can name), but
-    it stays session-bound DELIBERATELY, and #5322 did not change that on its
-    own: the per-connection nonce removes the namespace collision on a CURRENT
+    every managed server flipped at once. ``kirocrew-core``, ``kirocrew-cron``,
+    ``kirocrew-dashboard`` and ``kirocrew-work`` consume the injected caller block
+    and refuse or safely namespace an unidentified caller, so none is
+    session-bound — ``kirocrew-work`` refuses outright, since a work-ledger tool
+    with no verifiable session has no ledger and no binding to reach.
+    ``kirocrew-computer`` also advertises and consumes the block (its pooled
+    attribution is correct for every caller the gateway can name), but it stays
+    session-bound DELIBERATELY: the per-connection nonce removes the namespace
+    collision on a CURRENT
     gateway, while this classification is what ``seed.py`` turns into a config
     write, and the daemon serving those shared frames may be a pre-nonce one
     ``manager.py`` adopted across an upgrade. Promotion waits on a negotiated
@@ -130,6 +133,7 @@ def test_the_concrete_verdicts_are_spelled_out() -> None:
     assert managed_server_is_session_bound("kirocrew-cron") is False
     assert managed_server_is_session_bound("kirocrew-computer") is True
     assert managed_server_is_session_bound("kirocrew-dashboard") is False
+    assert managed_server_is_session_bound("kirocrew-work") is False
 
 
 def test_a_third_party_server_is_not_claimed_either_way() -> None:

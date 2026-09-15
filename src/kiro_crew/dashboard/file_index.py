@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 # into, by either search path. This is the SINGLE source of truth: the walk
 # fallback in dashboard/handlers/files.py imports it, so the indexed fast path
 # and the fallback cannot diverge. Dot-prefixed noise dirs (.git, .cache,
-# .venv) are listed EXPLICITLY here -- the candidate collection no longer
-# filters on a leading dot (that would hide the .github/.kiro/.claude dirs
-# issue #5677 wants offered), so each dot-dir to suppress must be named.
+# .venv) are listed EXPLICITLY here -- the candidate collection does not filter
+# on a leading dot, which would hide the .github/.kiro/.claude dirs that must be
+# offered, so each dot-dir to suppress must be named.
 _SKIP_DIRS = frozenset(
     {
         ".git",
@@ -138,8 +138,8 @@ class FileIndex:
         for dirpath, dirnames, filenames in os.walk(self.root):
             # A dot-prefixed directory (.github, .kiro, .claude) should be
             # OFFERED as a search candidate even though we must not DESCEND into
-            # it -- the two concerns were previously conflated by pruning
-            # ``dirnames`` in place before the collection loop below.
+            # it -- pruning ``dirnames`` in place before the collection loop below
+            # would conflate the two concerns.
             #
             # Build the candidate list (what we offer AND stat) first, then
             # derive the narrower descent list from it. Both must honour:

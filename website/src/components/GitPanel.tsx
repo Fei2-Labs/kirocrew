@@ -3,6 +3,8 @@ import { useQuery } from '@tanstack/react-query'
 import { FolderGit2, GitBranch, RefreshCw } from 'lucide-react'
 import { api } from '../api/client'
 import DetailPanel from './DetailPanel'
+import ErrorNotice from './ErrorNotice'
+import { errMessage } from '../utils/thunkError'
 import { i18nT } from '../i18n/t'
 import { fmtUnit } from '../i18n/format'
 
@@ -55,7 +57,7 @@ export default function GitPanel({ projectDir, onFileOpen, onClose }: GitPanelPr
   const prevBranch = useRef<string | undefined>(undefined)
   const forceFresh = useRef(false)
 
-  const { data: status, refetch: refetchStatus, isLoading: statusLoading } = useQuery({
+  const { data: status, refetch: refetchStatus, isLoading: statusLoading, error: statusError } = useQuery({
     queryKey: ['git-status', projectDir],
     queryFn: () => {
       const fresh = forceFresh.current
@@ -68,13 +70,19 @@ export default function GitPanel({ projectDir, onFileOpen, onClose }: GitPanelPr
     retry: 1,
   })
 
-  const { data: log, refetch: refetchLog } = useQuery({
+  const { data: log, refetch: refetchLog, error: logError } = useQuery({
     queryKey: ['git-log', projectDir],
     queryFn: () => api.projectGitLog(projectDir),
     enabled: !!projectDir,
     staleTime: 30_000,
     retry: 1,
   })
+
+  // A failing git backend used to render an EMPTY panel — no changes, no
+  // commits — indistinguishable from a clean repo with no history. Each read
+  // failure now names itself; the panel holds no draft, so the agent hand-off
+  // is offered (a git that is missing or a dir that is not a repo is exactly
+  // what it can diagnose).
 
   // Refetch log when the branch changes or the branch moves ahead of its
   // upstream (a new local commit) — otherwise the Commits list goes stale
@@ -149,6 +157,26 @@ export default function GitPanel({ projectDir, onFileOpen, onClose }: GitPanelPr
       }
     >
       <div className="overflow-y-auto flex-1 text-[12px]">
+        {(statusError || logError) && (
+          <div className="flex flex-col gap-2 p-3">
+            {statusError && (
+              <ErrorNotice
+                title={errMessage(statusError) ? i18nT('components.gitPanel.status_failed') : undefined}
+                message={errMessage(statusError) || i18nT('components.gitPanel.status_failed')}
+                askAgent
+                testId="git-panel-status-error"
+              />
+            )}
+            {logError && (
+              <ErrorNotice
+                title={errMessage(logError) ? i18nT('components.gitPanel.log_failed') : undefined}
+                message={errMessage(logError) || i18nT('components.gitPanel.log_failed')}
+                askAgent
+                testId="git-panel-log-error"
+              />
+            )}
+          </div>
+        )}
         {/* ── CHANGES section ── */}
         {(!isClean || status?.reposTruncated || status?.refused || groups.some(g => g.refused)) && (
           <section className="py-2">

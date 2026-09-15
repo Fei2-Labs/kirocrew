@@ -75,8 +75,13 @@ import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { serveDist } from './lib/serve-dist.mjs'
 import { stubDashboardApi, logPageProblems, json } from './lib/stub-dashboard-api.mjs'
-import { SURFACES, LOCALES, VIEWPORTS, FIXTURE_DETAIL_APP } from './lib/i18n-surfaces.mjs'
+import { SURFACES, LOCALES, VIEWPORTS, FIXTURE_DETAIL_APP, FIXTURE_DETAIL_DESCRIPTION, partitionBaseSurfaces } from './lib/i18n-surfaces.mjs'
 import { browserBundle } from './lib/render-scan.mjs'
+import {
+  SETTLE_POLL_MS,
+  SETTLE_TIMEOUT_MS,
+  createSettleTracker,
+} from './lib/render-settle.mjs'
 import {
   BUCKETS,
   BUCKET_MEANING,
@@ -290,7 +295,7 @@ const FIXTURE_APPS = [
       name: FIXTURE_DETAIL_APP,
       version: '1.0.0',
       displayName: 'Fixture Research Lab',
-      description: 'Runs research campaigns unattended.',
+      description: FIXTURE_DETAIL_DESCRIPTION,
       author: '0008',
       tags: ['research', 'automation'],
       highlights: [
@@ -340,6 +345,25 @@ const FIXTURE_OVERRIDES = async (language, path, route) => {
   if (path === '/api/auth/me') return done({ user: '0000', app: '' })
   if (path === '/api/agents' || path === '/api/chat/agents') {
     return done([{ name: '0001', source: 'builtin' }])
+  }
+  if (path === '/api/memory/stores') {
+    return done({
+      active: 'default',
+      stores: [
+        { name: 'default', is_default: true, exists: true, lineage: 'v1', memory_version: 1, semantic_count: 0, episodic_count: 0, lessons_count: 0 },
+        { name: 'member-fixture-0011', owner_member: '0011', is_default: false, exists: true, lineage: 'crew', memory_version: 2, semantic_count: 1, episodic_count: 1, lessons_count: 0, facets_supported: true, backup_count: 0, newest_backup: null },
+      ],
+    })
+  }
+  if (path === '/api/memory/records') {
+    return done({
+      entries: [
+        { kind: 'fact', id: '0011', key: '0011', text: '0011', value_json: '0011', source: 'user_explicit', revision: '1111111111111111111111111111111111111111111111111111111111111111', updated_at: '2026-01-01T00:00:00Z' },
+        { kind: 'episode', id: 'fixture-episode', text: '0012', source: 'member_session', revision: '2222222222222222222222222222222222222222222222222222222222222222', updated_at: '2026-01-02T00:00:00Z' },
+      ],
+      total: 2,
+      has_more: false,
+    })
   }
   if (path === '/api/recent-projects') return done({ dirs: ['/0002'] })
   if (path === '/api/dashboard/branding') return done({ bot_name: 'Kiro', avatar: '' })
@@ -772,6 +796,11 @@ async function main() {
   const locales = ONLY_LOCALE ? LOCALES.filter(l => l.code === ONLY_LOCALE) : LOCALES
   if (!surfaces.length) die(`unknown --surface ${ONLY_SURFACE}`)
   if (!locales.length) die(`unknown --locale ${ONLY_LOCALE}`)
+  for (const surface of surfaces) {
+    if (surface.sourceFile && !existsSync(join(REPO, 'website', surface.sourceFile))) {
+      die(`surface ${surface.id} requires missing HEAD source ${surface.sourceFile}`)
+    }
+  }
 
   const browser = await chromium.launch()
   let head
@@ -789,12 +818,14 @@ async function main() {
       const { dist: baseDist, baseWeb } = buildBaseBundle(scope.sha)
       const baseIds = baseSurfaceIds(baseWeb)
       const unregistered = surfaces.map(x => x.id).filter(id => !baseIds.has(id))
-      // Deliberately the SAME scanScript, surfaces and locales as the HEAD run —
+      const basePlan = partitionBaseSurfaces(surfaces, baseIds,
+        sourceFile => existsSync(join(baseWeb, sourceFile)))
+      // Deliberately the SAME scanScript, surface definitions and locales as HEAD.
       // they come from this checkout, not from the base tree. Only the BUNDLE is
       // base's. If the base tree's own scanner were used instead, any change to the
       // detector would read as a product regression (or mask one).
       const baseSweep = await sweep(browser, baseDist, {
-        scanScript, dnt, surfaces, locales, label: `base ${scope.sha.slice(0, 8)}`,
+        scanScript, dnt, surfaces: basePlan.measurable, locales, label: `base ${scope.sha.slice(0, 8)}`,
       })
       baseAll = baseSweep.all
       // A surface is NEW — base 0 — only when the base bundle had no route for its
@@ -810,15 +841,15 @@ async function main() {
       // (`BuiltinAppRoute` -> `<Navigate to="/chat">`, or `ChatRedirect`), so a
       // final URL that is not the requested one is proof the route was absent.
       //
-      // Residual gap, stated: a query-param surface (`/settings?tab=x`) whose tab
-      // the base does not know renders the DEFAULT panel at the same URL, so it
-      // reads as resolved and its base count describes the wrong panel. Adding such
-      // a surface in the same commit as the tab it addresses is what avoids that;
-      // the redirect check cannot see it.
-      newSurfaces = new Set(unregistered.filter(id => baseSweep.unresolved.has(id)))
-      const measured = unregistered.filter(id => !baseSweep.unresolved.has(id))
+      // A new query-param panel may keep its URL while displaying the old default
+      // panel. Its required source file plus missing registration establishes
+      // absence before any HEAD-only readyText assertion can time out on the base.
+      // Panels without that source declaration still use the redirect signal.
+      newSurfaces = new Set([...basePlan.absent,
+        ...unregistered.filter(id => baseSweep.unresolved.has(id))])
+      const measured = unregistered.filter(id => !newSurfaces.has(id))
       if (newSurfaces.size) {
-        out(`[i18n-render] [vs-base] ${newSurfaces.size} surface(s) have no route on the base`
+        out(`[i18n-render] [vs-base] ${newSurfaces.size} surface(s) have no route or panel implementation on the base`
           + ` — their base count is 0, not measured: ${[...newSurfaces].join(', ')}`)
       }
       if (measured.length) {
@@ -900,6 +931,14 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
         // (exit 2) rather than as findings.
         const pageErrors = []
         page.on('pageerror', err => pageErrors.push(String(err.message || err)))
+        // Cumulative counters, deliberately never reset per surface. A request that
+        // outlives the surface that started it still settles, so the difference
+        // stays honest across the loop; resetting would strand those stragglers and
+        // leave the count permanently short.
+        const net = { started: 0, settled: 0, get inflight() { return this.started - this.settled } }
+        page.on('request', () => { net.started += 1 })
+        page.on('requestfinished', () => { net.settled += 1 })
+        page.on('requestfailed', () => { net.settled += 1 })
         await stubDashboardApi(page, {
           theme: 'dark',
           extra: (path, route) => FIXTURE_OVERRIDES(locale.code, path, route),
@@ -933,9 +972,21 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
               + 'the wrong shape for this surface (see lib/boot-api.mjs for the two shapes that '
               + 'error-boundary the whole shell). Re-run with --verbose to see the page errors.')
           }
-          // Panels that fetch after mount need a beat more; a half-rendered surface
-          // under-reports rather than failing loudly.
-          await page.waitForTimeout(surface.settle || 250)
+          // Shell text does not prove a fetched panel is ready. App Details
+          // resolves several requests before mounting its manifest; comparing a
+          // loading frame with a populated frame invents a branch regression.
+          if (surface.readyText) {
+            await page.getByText(surface.readyText, { exact: true }).waitFor({ state: 'visible', timeout: 15000 })
+          }
+          // Panels that fetch after mount need a beat more. `settle` stays as the
+          // FLOOR for that beat, but it is no longer the whole of it: a fixed sleep
+          // made the wait a race whose loss was silent, so the surface now has to
+          // actually go quiet before it is scanned (lib/render-settle.mjs has the
+          // two conditions and the `app-detail` regression that came from checking
+          // neither). The floor and the quiet window OVERLAP rather than stack, so a
+          // surface that was already settled during its old sleep waits no longer
+          // than it did before.
+          await waitForSurfaceQuiet(page, net, surface, label)
           // Every width this gate reports is a text measurement, and text measures
           // differently in the fallback face than in the real one. Scanning before
           // the webfonts land made the layout bucket differ by 2 between identical
@@ -995,6 +1046,47 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
   // required a real locale precisely so this assertion could not go quiet; that
   // requirement now belongs to that script, which the i18n runner fails closed on.
   return { all, unresolved }
+}
+
+/**
+ * Hold until the surface stops changing, or fail saying it never did.
+ *
+ * The old wait was `surface.settle` milliseconds and nothing else, which made every
+ * post-mount fetch a race the gate could lose without saying so -- the scan just
+ * measured the loading skeleton and charged the surface a smaller number. `[vs-base]`
+ * then read one lost race on the base sweep as findings the branch had added.
+ *
+ * `settle` survives as a MINIMUM, because a page that has not dispatched its fetch
+ * yet is indistinguishable from one that never will. It runs CONCURRENTLY with the
+ * quiet window rather than ahead of it: sampling starts immediately, so a surface
+ * that settles inside its old sleep returns at the same moment it always did, and
+ * only a surface that needed longer costs longer.
+ *
+ * Reaching the cap is INFRASTRUCTURE broken, in the same sense as a surface that
+ * never painted: a page that keeps mutating cannot be measured twice and compared,
+ * so the run must say which surface it was rather than quietly scan it mid-flight.
+ */
+async function waitForSurfaceQuiet(page, net, surface, label) {
+  const tracker = createSettleTracker()
+  const started = Date.now()
+  const floor = started + (surface.settle || 250)
+  const deadline = started + SETTLE_TIMEOUT_MS
+  for (;;) {
+    const shot = await page.evaluate(() => ({
+      chars: document.body.innerText.trim().length,
+      nodes: document.querySelectorAll('*').length,
+    }))
+    const quiet = tracker.observe({ ...shot, inflight: net.inflight })
+    if (quiet && Date.now() >= floor) return
+    if (Date.now() >= deadline) break
+    await page.waitForTimeout(SETTLE_POLL_MS)
+  }
+  const seen = tracker.last || { chars: 0, nodes: 0 }
+  die(`[${label}] ${surface.url} never went quiet in ${SETTLE_TIMEOUT_MS}ms `
+    + `(${net.inflight} request(s) in flight, ${seen.chars} chars, ${seen.nodes} nodes). `
+    + 'A surface that keeps changing cannot be compared against a second sweep. Give it a '
+    + 'deterministic fixture in FIXTURE_OVERRIDES, or drop it from lib/i18n-surfaces.mjs '
+    + 'with a comment saying why.')
 }
 
 /**

@@ -97,8 +97,9 @@ current node but off to the side.
 - **Offer to fold findings in:** when the discussion yields something worth
   keeping (and again when it ends), tell the user they can (a) **add** a new
   branch — emit an `ask` (+`answer`) event, (b) **remove** a node — emit a `prune`
-  event, or (c) keep it as discussion-only. Emit those events **only on their
-  explicit say-so.**
+  event, which is refused if the node is the current focus or an ancestor of it
+  (`focus` elsewhere first), or (c) keep it as discussion-only. Emit those events
+  **only on their explicit say-so.**
 - **Exit:** the user says "end discussion" / "resume 5 whys". Append a `discuss`
   summary line, apply any approved `ask`/`prune` events, then **resume the main
   loop exactly where it paused** — the last `focus` event in the log is the cursor.
@@ -111,6 +112,10 @@ dir if there is no project). **The log IS the state.** You never rewrite it and
 never keep a separate hand-maintained tree — the tree, the current question, the
 open branches and the report are all **projections you fold from the log** when
 you need them, so they can never drift out of sync.
+
+That path is a convention of this skill: the script never derives it. `<log>` is
+a required positional on every subcommand, and finding an existing log to resume
+is your own step — list `five-whys/` yourself before starting a new one.
 
 Every line: `{"ts": <ISO-8601>, "type": <type>, ...}`. The types:
 
@@ -167,21 +172,18 @@ python3 scripts/five_whys.py validate <log>      # schema + integrity gate, exit
 ```
 
 The script allocates ids, so you never invent them; `prune` cascades to
-descendants; unknown (plugin) event types validate fine and are ignored by the
-core folds. `report` prints the finished markdown — close-out is one command.
+descendants, and it REFUSES when the target is the current focus or an ancestor
+of it — `focus` another node first, otherwise resume would land on a pruned node.
+Unknown (plugin) event types validate fine and are ignored by the core folds.
+`report` prints the finished markdown — close-out is one command.
 
-**Free text never rides the shell command line.** A question, answer, note,
-citation, title, or plugin-event JSON can contain `$(...)`, backticks or quotes,
-which the shell would execute or mangle. So for every command that carries free
-text, write the field(s) to a **unique** temp file with the write tool — a fresh
-path per write (e.g. via `mktemp`), never a fixed shared path two concurrent
-dives could clobber — as **one JSON object**, and pass `--stdin-json`, feeding it
-on stdin: `... ask <log> --parent 1 --stage what --stdin-json < <unique>.json`
-where the file is `{"q": "..."}`. All of a command's free text (an answer and its
-`source`, or the whole plugin event) travels in that single object — so no free
-text is ever a shell argument, and two untrusted fields share one read. Short,
-safe values (`--parent`, `--stage`, `--id`, `--kind`, `--origin`, `--anchor`)
-stay as ordinary flags.
+**Free text never rides the shell command line.** Write every command's free-text
+fields (including `source`, title, or the whole plugin event) as one JSON object
+using the write tool in a fresh, unique temp file (e.g. allocated with `mktemp`).
+Feed it on stdin with `--stdin-json` as shown above; never use a fixed shared path.
+This prevents concurrent-session clobber and shell execution of `$(...)`, backticks
+or quotes. Only safe values for `--parent`, `--stage`, `--id`, `--kind`, `--origin`
+and `--anchor` stay as ordinary flags.
 
 ## Capabilities (plugins)
 
@@ -252,11 +254,8 @@ Example capabilities:
 - **Never hand-write or hand-fold JSONL.** Every read and write goes through
   `scripts/five_whys.py` — it validates, allocates ids, and folds deterministically,
   so the tree and report can't drift from the log.
-- **Never interpolate free text or plugin JSON into the shell command.** Put all
-  of a command's free text in one `--stdin-json` JSON object, written to a
-  **unique** temp file with the write tool and fed on stdin (see The mechanical
-  core); a fixed path risks a concurrent-session clobber, and text with `$(...)`,
-  backticks or quotes would otherwise be executed or corrupt the command.
+- Use the **free-text stdin contract** in The mechanical core for every command
+  carrying text or plugin JSON.
 - **Don't dump — drip.** Resist answering the whole topic in one turn; the value
   is the one-step-at-a-time ladder. Short answer + a menu, then wait.
 - **The user's own question always branches** — never redirect it back to your menu.

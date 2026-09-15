@@ -238,7 +238,7 @@ def atomic_write_locked(path: str | os.PathLike, data: bytes) -> None:
     Pinning collapses those three resolutions into one: the parent is opened as a
     descriptor and the create, the rename and any cleanup are all relative to
     that inode, so a swap AFTER the pin cannot redirect them -- it renames a
-    directory the descriptor no longer names. ``O_NOFOLLOW`` on the pin also
+    directory the descriptor does not name. ``O_NOFOLLOW`` on the pin also
     refuses a parent that is itself a link.
 
     What remains is the ANCESTOR CHAIN: ``mkdir(parents=True)`` and the pin's own
@@ -448,10 +448,10 @@ def data_dir(root: Path | None = None) -> Path:
 
 # --- Per-run scratch ---------------------------------------------------------
 # Every review run owns a private subtree, ``data/runs/<run-id>/``, holding its
-# result records and its report. Runs used to share one ``data/results`` dir and
-# one ``data/reports`` index, which forced the backend to serialize whole runs
-# (an overlapping run would clear the records the other was still writing) and
-# left only the newest report readable. Per-run isolation is what lets several
+# result records and its report. Sharing one ``data/results`` dir and one
+# ``data/reports`` index across runs forces the backend to serialize whole runs
+# (an overlapping run clears the records the other is still writing) and leaves
+# only the newest report readable. Per-run isolation is what lets several
 # reviews run at once AND keeps each finished report retrievable by run id.
 #
 # What stays GLOBAL (deliberately, do not move under a run): ``config.json``,
@@ -526,7 +526,7 @@ def remove_run_dir(run_id: str, root: Path | None = None) -> bool:
 
 
 def list_run_ids(root: Path | None = None) -> list[str]:
-    """Run ids that currently have an on-disk subtree (used to reap orphans)."""
+    """Run ids that currently have an on-disk subtree (the input for orphan reaping)."""
     rr = runs_root(root)
     if not rr.is_dir():
         return []
@@ -546,8 +546,16 @@ def ensure_layout(root: Path | None = None) -> dict[str, str]:
     results = data / "results"
     reports = data / "reports"
     runs = data / "runs"          # per-run scratch: runs/<run-id>/{results,report}
+    # Scratch the review/consolidation WORKER writes into before handing a path to
+    # a `learning.py` subcommand. It exists so the skills can name a temp path that
+    # is real on every platform: a POSIX literal like `/tmp/pattern.json` resolves
+    # on Windows to a `\tmp\` directory that normally does not exist, so the
+    # worker's write raises FileNotFoundError and the staged learning is lost
+    # silently. Inside the app root, so it is also covered by the app's own
+    # owner-only lockdown rather than living in a world-writable directory.
+    tmp = data / "tmp"
 
-    for d in (data, learnings, common, repos, namespaces, results, reports, runs):
+    for d in (data, learnings, common, repos, namespaces, results, reports, runs, tmp):
         d.mkdir(parents=True, exist_ok=True)
 
     # Warm-start common layer (empty but present so brand-new repos inherit it).
@@ -576,6 +584,7 @@ def ensure_layout(root: Path | None = None) -> dict[str, str]:
         "reposDir": str(repos),
         "resultsDir": str(results),
         "reportsIndex": str(index),
+        "tmpDir": str(tmp),
         "configPath": str(data / "config.json"),
     }
 

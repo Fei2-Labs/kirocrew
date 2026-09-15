@@ -25,7 +25,11 @@ Lark).
    its **App ID** and **App Secret** from *Credentials & Basic Info*.
 2. **Add the bot capability** — *Add features → Bot*.
 3. **Grant permissions** — under *Permissions & Scopes*, add
-   `im:message` (receive) and `im:message:send_as_bot` (reply).
+   `im:message.p2p_msg:readonly` (receive DMs) and
+   `im:message:send_as_bot` (reply). If you enable group chats, also add
+   `im:message.group_at_msg.include_bot:readonly` (receive group messages that
+   @-mention the bot). The broader `im:message` grant does not replace the
+   explicit p2p event scope in the current Feishu console.
 4. **Use long connection** — under *Events & Callbacks*, choose
    **Long connection** (not a request URL), then subscribe to
    `im.message.receive_v1`.
@@ -72,7 +76,7 @@ session, editing the files on the gateway's own machine is the way in.
 
 </details>
 
-## Who can reach it
+## Access control
 
 Deny-by-default, in both directions:
 
@@ -113,7 +117,7 @@ Deny-by-default, in both directions:
   would reset the conversation on a message you addressed to a colleague, and
   that is not recoverable, so anything ambiguous is treated as a prompt.
 
-## Settings
+## Settings reference
 
 | Key | Default | What it does |
 | --- | --- | --- |
@@ -144,7 +148,7 @@ masked preview: a saved secret can be **replaced or cleared, never read back**.
 
 Anything else is a prompt.
 
-## What this channel can and cannot do
+## Limits
 
 Feishu v1 is deliberately single-shot: the agent's answer is buffered and sent
 as **one reply** when the turn completes, rather than streamed. There are no
@@ -172,11 +176,21 @@ Known gaps, all follow-up work rather than defects:
   internally; if it gives up, the gateway logs that the receiver is down and you
   restart.
 
+### Bot doesn’t receive direct messages
+
+- Confirm `im:message.p2p_msg:readonly` is granted. A green
+  `im:message.group_at_msg.include_bot:readonly` grant covers group @-mentions,
+  not private messages.
+- Publish a new app version after changing permissions; a draft permission does
+  not affect the installed bot.
+- Confirm `im.message.receive_v1` appears in the subscribed-event list, not only
+  that long connection is selected.
+
 ## How it fits together
 
 The channel is a thin transport over the shared messaging core — the same
 `TurnDriver` (credential redaction, tool-approval ladder, SEL audit) every other
-channel uses. See [messaging-transport.md](messaging-transport.md).
+channel uses.
 
 | File | Role |
 | --- | --- |
@@ -185,3 +199,9 @@ channel uses. See [messaging-transport.md](messaging-transport.md).
 | `feishu/renderer.py` | Buffers the turn, sends one reply |
 | `feishu/transport_dispatch.py` | Drives `TurnDriver`, handles `/new` `/compact` |
 | `feishu/gateway.py` | `maybe_start_feishu()` boot entry point |
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables

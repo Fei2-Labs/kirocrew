@@ -17,26 +17,34 @@ from __future__ import annotations
 # bounds memory/socket usage; least-recently-used instances beyond the cap are
 # lazily evicted and reconnected on demand.
 #
-# ``WARM_SET_CAP_AUTO`` (0) is the default and means "as many as are connected":
-# the cap is resolved per request from the live connected count (see
-# ``kiro_crew.instances.warm_set.resolve_warm_set_cap``), so a crew the operator
-# deliberately connected is never evicted.
+# ``WARM_SET_CAP_AUTO`` (0) is the default and means "as many as are registered,
+# up to ``WARM_SET_CAP_AUTO_CEILING``": the cap is resolved per request from the
+# number of crews in the registry (see
+# ``kiro_crew.instances.warm_set.resolve_warm_set_cap``), so below that ceiling no
+# crew the operator configured is evicted, and adding one widens the cap by
+# itself. Past the ceiling eviction resumes -- see its own comment below.
 #
 # Auto is the default because eviction is INDISTINGUISHABLE FROM A DISCONNECT at
 # the pane: the iframe is unmounted, the token is re-minted and the remote SPA
 # cold-boots on the next click (surfacing the error panel outright if readiness
-# misses its timeout). A fixed cap below the connected count therefore turns
+# misses its timeout). A cap below the number of crews in use therefore turns
 # ordinary tab switching into an apparent connection flap, and the operator has
-# no way to attribute it -- the tunnel is up the whole time. Tracking the
-# connected count removes that class of misconfiguration rather than asking
-# anyone to keep two numbers in sync by hand.
+# no way to attribute it -- the tunnel is up the whole time. Tracking the registry
+# removes that class of misconfiguration rather than asking anyone to keep two
+# numbers in sync by hand.
+#
+# REGISTERED, not connected. Counting connected (a live count) races
+# tunnel startup: a crew that finishes connecting a moment after the dashboard
+# polls falls outside the cap and has its pane evicted. Exactly one crew looks
+# broken, and which one depends on connection order -- so it moves on every
+# restart and reads as a random failure rather than as a cap.
 WARM_SET_CAP_AUTO: int = 0
 DEFAULT_WARM_SET_CAP: int = WARM_SET_CAP_AUTO
 
-# Upper bound on the AUTO-resolved warm set. Auto follows the connected count,
+# Upper bound on the AUTO-resolved warm set. Auto follows the registered count,
 # which is a statement of user intent and not a resource budget -- a fleet of 30
-# connected crews would otherwise mount 30 dashboard SPAs in one renderer.
-# Beyond this many connected crews eviction resumes, so the worst case stays
+# configured crews would otherwise mount 30 dashboard SPAs in one renderer.
+# Beyond this many registered crews eviction resumes, so the worst case stays
 # bounded while the common small-fleet case (the reason auto exists) never
 # evicts. An EXPLICIT integer cap is honoured verbatim and is deliberately not
 # clamped by this: an operator who names a number has made the budget decision
@@ -230,6 +238,49 @@ DEFAULT_SEARCH_PROXY_TIMEOUT_SECS: float = 6.0
 # limit at 200 rows and every string field is clamped to 2 KiB downstream, so
 # a truthful worst case is well under 1 MiB; 4 MiB only ever bites on garbage.
 SEARCH_REPLY_MAX_BYTES: int = 4 * 1024 * 1024
+
+# Timeout (secs) for one peer capability read over an already-open tunnel (GET
+# the peer's /api/version, /api/agents, /api/models, /api/effort-levels or
+# /api/workspaces — no SSH spawn). Larger than the token probe (2s) because the
+# peer does real work for some of these (the model list can round-trip to its
+# own provider), and kept as short as that work allows because a capability read
+# blocks a chat header from rendering: a user watching an empty model picker is
+# better served by a fast "peer did not answer" than by a long wait. It is the
+# one peer budget ABOVE the federated-search timeout (6s), which fans out reads
+# that a partial result set can absorb; a missing capability read has no partial
+# form — the picker is simply empty — so it is the one worth waiting out.
+# The reads run concurrently, so this is the worst-case latency for the set.
+DEFAULT_CAPABILITY_PROXY_TIMEOUT_SECS: float = 8.0
+
+# Byte ceiling for one peer capability reply, enforced BEFORE JSON decoding for
+# the same reason as the search cap above. Sized for the largest honest payload
+# by a wide margin: the agent roster and the model list are the big ones and are
+# tens of KiB each even on a heavily-configured gateway, so 2 MiB only ever
+# bites on a hostile or broken peer.
+CAPABILITY_REPLY_MAX_BYTES: int = 2 * 1024 * 1024
+
+# Byte ceiling for one peer's live-slots reply, enforced BEFORE JSON decoding for
+# the same reason as the two caps above. The peer answers with a full slot
+# projection per OPEN session — a few KiB each — so even a gateway holding a
+# hundred open sessions lands well under 1 MiB; 4 MiB only ever bites on a
+# hostile or broken peer.
+#
+# Its OWN constant rather than borrowing CAPABILITY_REPLY_MAX_BYTES, and 4 MiB
+# rather than that cap's 2 MiB, because the two bound different payload SHAPES —
+# which is the same split that already separates the two caps above. A capability
+# reply is fixed-shape: one agent roster, one model list, sized by how the peer is
+# configured and not by how much it is being used. This reply and the federated
+# search one are UNBOUNDED-CARDINALITY lists — N open sessions, N search hits —
+# whose honest size scales with a peer's workload, so they carry the looser bound
+# and the search cap's 4 MiB is the precedent this follows.
+#
+# Sharing one constant across endpoints that differ that way is the actual hazard:
+# each of these comments records the specific honest payload its number was sized
+# against, and one symbol cannot hold three such rationales. A later change
+# raising the capability cap for a grown model list would silently loosen this
+# read too, and tightening this one after a memory incident would break the model
+# picker — neither of which the changing author would see.
+PEER_SLOTS_REPLY_MAX_BYTES: int = 4 * 1024 * 1024
 
 
 # Accepted shape for a dashboard-token lifetime: a positive integer of at most

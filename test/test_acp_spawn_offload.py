@@ -89,11 +89,18 @@ class TestClientSpawnOffLoop:
         # thread identity alone does not name the regressing call site.
         mkdir_stacks: list[str] = []
 
-        def _rec_mkdir(*a, **kw):
+        # ``patch("pathlib.Path.mkdir")`` installs a plain MagicMock, which is not
+        # a descriptor, so the recorder never receives ``self`` and cannot create
+        # anything. autospec hands it the Path; calling through keeps the
+        # directories the spawn prelude promises to create.
+        real_mkdir = Path.mkdir
+
+        def _rec_mkdir(self, *a, **kw):
             t = threading.current_thread()
             mkdir_threads.append(t)
             if t is loop_thread:
                 mkdir_stacks.append("".join(traceback.format_stack()))
+            return real_mkdir(self, *a, **kw)
 
         client = AcpClient(work_dir=tmp_path / "workspace", session_key="k")
 
@@ -151,8 +158,10 @@ class TestClientSpawnOffLoop:
                 "inject_xdist_auto_cap",
                 side_effect=lambda env: xdist_threads.append(threading.current_thread()),
             ),
-            patch(
-                "pathlib.Path.mkdir",
+            patch.object(
+                Path,
+                "mkdir",
+                autospec=True,
                 side_effect=_rec_mkdir,
             ),
         ):
@@ -211,9 +220,7 @@ class TestClientSpawnPidTrackingOffLoop:
             ),
             patch(
                 "kiro_crew.session._track_session_pid",
-                side_effect=lambda pid: session_track_threads.append(
-                    threading.current_thread()
-                ),
+                side_effect=lambda pid: session_track_threads.append(threading.current_thread()),
             ),
             # PID 12345 may be a real host process; an empty scan keeps the
             # early-descendant branch (and its own tracking write) out of
@@ -288,11 +295,20 @@ class TestRuntimeSpawnOffLoop:
             cgroup_threads.append(threading.current_thread())
             return argv
 
-        monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
-        monkeypatch.setattr(
-            runtime_mod, "wrap_argv", lambda argv, mode, **kw: (list(argv), None)
-        )
+        # See the note in TestClientSpawnOffLoop: the recorder must receive
+        # ``self`` and call through, or the work dir it claims to observe is
+        # never created and the macOS-only spawn guard stats a missing path.
+        real_mkdir = Path.mkdir
+
+        def _rec_mkdir(self, *a, **kw):
+            mkdir_threads.append(threading.current_thread())
+            return real_mkdir(self, *a, **kw)
+
+        monkeypatch.setattr(client_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda agent: None)
+        monkeypatch.setattr(runtime_mod, "wrap_argv", lambda argv, mode, **kw: (list(argv), None))
         monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", _rec_cgroup)
         monkeypatch.setattr(
             runtime_mod,
@@ -308,9 +324,11 @@ class TestRuntimeSpawnOffLoop:
 
         runtime = AcpRuntime(work_dir=tmp_path / "workspace")
         with (
-            patch(
-                "pathlib.Path.mkdir",
-                side_effect=lambda *a, **kw: mkdir_threads.append(threading.current_thread()),
+            patch.object(
+                Path,
+                "mkdir",
+                autospec=True,
+                side_effect=_rec_mkdir,
             ),
             pytest.raises(_StopSpawn),
         ):
@@ -338,9 +356,7 @@ class TestSpawnCancellationSandboxCleanup:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("raise_in", ["cgroup", "env"])
-    async def test_client_spawn_cancel_unlinks_sandbox_file(
-        self, tmp_path, raise_in
-    ) -> None:
+    async def test_client_spawn_cancel_unlinks_sandbox_file(self, tmp_path, raise_in) -> None:
         sandbox_file = self._sandbox_file(tmp_path)
         client = AcpClient(work_dir=tmp_path / "workspace", session_key="k")
 
@@ -386,8 +402,10 @@ class TestSpawnCancellationSandboxCleanup:
         def _krb5(env):
             raise asyncio.CancelledError()
 
-        monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
+        monkeypatch.setattr(client_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda agent: None)
         monkeypatch.setattr(
             runtime_mod,
             "wrap_argv",
@@ -543,8 +561,10 @@ class TestRuntimeShieldSurvivesAFailedAppend:
         async def resolve_bin(*, environ=None, home=None) -> str:
             return "/usr/bin/kiro-cli"
 
-        monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
+        monkeypatch.setattr(client_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda agent: None)
         monkeypatch.setattr(runtime_mod, "wrap_argv", lambda argv, mode, **kw: (list(argv), None))
         monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: list(argv))
         monkeypatch.setattr(runtime_mod, "resolve_krb5_ccname", lambda env: None)
@@ -564,7 +584,7 @@ class TestRuntimeShieldSurvivesAFailedAppend:
         """The sibling of the client-side window. ``finish_suspended_spawn``
         documents its own resume failure as FATAL and ``_get_start_time`` can
         raise, and every ``runtime.spawn()`` caller catches only
-        ``AcpRuntimeError`` / ``AcpRuntimeDead`` -- so an ``OSError`` here used to
+        ``AcpRuntimeError`` / ``AcpRuntimeDead`` -- so an ``OSError`` here would
         propagate with a live, unrecorded process behind it."""
         mock_proc = MagicMock()
         mock_proc.pid = 5151

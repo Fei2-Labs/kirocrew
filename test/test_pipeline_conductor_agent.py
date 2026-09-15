@@ -150,11 +150,37 @@ class TestPipelineConductorInstaller:
         assert "@kirocrew-core" in data["tools"]
 
     def test_mcp_servers_are_narrowed(self, tmp_path, monkeypatch):
-        """Only kirocrew-core and the hand-built kirocrew-dashboard entry ship;
-        inherited third-party servers are dropped from this spec."""
+        """Only kirocrew-core and the one hand-built opt-in entry ship; inherited
+        third-party servers are dropped from this spec.
+
+        ``kirocrew-work`` is NOT among them. It was mounted here briefly and the
+        mount is retracted, because the work-ledger flow is a different dispatch
+        and patrol procedure and this agent ships its own — see
+        ``kirocrew-conductor``. Negative rather than deleted so the mount
+        cannot return unnoticed.
+        """
         data = self._install(tmp_path, monkeypatch)
-        assert set(data["mcpServers"]) == {"kirocrew-core", "kirocrew-dashboard"}
+        assert set(data["mcpServers"]) == {
+            "kirocrew-core",
+            "kirocrew-dashboard",
+        }
         assert data["mcpServers"]["kirocrew-dashboard"]["args"] == ["mcp-dashboard"]
+        assert "kirocrew-work" not in data["mcpServers"]
+
+    def test_no_work_ledger_surface_anywhere_in_the_spec(self, tmp_path, monkeypatch):
+        """The retraction has to hold on all four surfaces, not just ``mcpServers``.
+
+        A mount left in ``tools``, a grant left in ``allowedTools``, a rule left in
+        the derived KAS block, or a procedure left in the prompt would each
+        re-introduce the flow on its own — the KAS one silently, on the backend
+        where nothing reads ``allowedTools``.
+        """
+        data = self._install(tmp_path, monkeypatch)
+        assert "@kirocrew-work" not in data["tools"]
+        assert not [ref for ref in data["allowedTools"] if "kirocrew-work" in ref]
+        assert not [m for m in data["permissions"]["rules"][0]["match"] if "kirocrew-work" in m]
+        for token in ("work_ledger", "work_brief", "work_report", "kirocrew-work"):
+            assert token not in data["prompt"], token
 
     def test_governed_host_withholds_and_audits(self, tmp_path, monkeypatch):
         """A ceiling that strips a grant must leave an audit record naming THIS
@@ -264,10 +290,9 @@ class TestFleetProbe:
 
     def test_a_protocol_word_in_prose_is_not_a_report(self, tmp_path, capsys, monkeypatch):
         """The protocol is ``<WORD>:``. A line that merely OPENS with a protocol
-        word -- ``PR #6580 is green ...`` -- is prose, and tagging it invents a
-        report nobody filed. Measured over the 60 most recent transcripts on the
-        development host, 20 of the 94 assistant rows that matched the old
-        ``^<WORD>\\b`` form were prose, 13 of them a bare ``PR #<n>``."""
+        word -- ``PR #<n> is green ...`` -- is prose, and tagging it invents a
+        report nobody filed. Among assistant rows matching a bare ``^<WORD>\\b``
+        form, many are prose, and a bare ``PR #<n>`` is the common shape."""
         mod = self._mod()
         cfg = self._config(tmp_path, monkeypatch, ["s-prose"])
         self._session(
@@ -394,6 +419,33 @@ class TestFleetProbe:
         capsys.readouterr()
         assert "GREEN" in self._run(mod, cfg, capsys)  # unseen payload still fires
 
+    def _exe_agrees_with_argv0(self, mod, monkeypatch, proc) -> None:
+        """Make the fake /proc answer ``exe`` consistently with ``argv[0]``.
+
+        A real host resolves ``/proc/<pid>/exe`` to the binary the process is
+        actually running, which for every honest process is what ``argv[0]`` names.
+        The wrapper exemption requires that kernel answer and rejects
+        ``argv[0]`` alone, so a fake /proc that omits ``exe`` now models a process
+        hiding its identity rather than an ordinary one -- which would make the
+        option-parsing tests assert the spoof path instead of the case they are
+        about.
+
+        Fakes ``os.readlink`` rather than creating symlinks: creating one needs a
+        privilege this host withholds, the same restriction behind the WinError 1314
+        failures in this file.
+        """
+        real = os.readlink
+
+        def fake_readlink(path, *a, **kw):
+            text = str(path)
+            if text.endswith("exe"):
+                pid_dir = Path(text).parent
+                argv0 = (pid_dir / "cmdline").read_bytes().decode("utf-8", "replace").split("\0")[0]
+                return argv0 if argv0.startswith("/") else f"/bin/{argv0}"
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(mod.os, "readlink", fake_readlink)
+
     def test_banned_process_scan_reports_matches(self, tmp_path, capsys, monkeypatch):
         mod = self._mod()
         proc = tmp_path / "proc"
@@ -441,6 +493,522 @@ class TestFleetProbe:
         for quiet in ("pid=11", "pid=12", "pid=13", "pid=15", "pid=16", "pid=17"):
             assert quiet not in out, quiet
         assert "pid=14" in out  # -n auto is the unbounded case
+
+    def test_a_shell_running_a_command_string_is_not_the_tool_it_names(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """``bash -c 'cd x && pytest -q y.py'`` is a shell, and reporting it as a
+        pytest violation points the conductor at a pid that is not the offender.
+
+        No coverage is lost by dropping the wrapper: the probe walks EVERY entry
+        under /proc, so a wrapped tool that is genuinely running has its own pid
+        and is caught there on its own merits. Every spelling the fleet actually
+        produces is asserted -- a bare program name, an absolute path, a
+        non-bash shell, busybox, and a ``.exe`` suffix -- because the check is a
+        basename comparison and any one of those could fall out of it silently.
+
+        Every ``exe`` here resolves into a system binary directory, which the
+        exemption now requires in addition to the shell name; the
+        untrusted-directory case has a test of its own."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("21", b"bash\x00-c\x00cd /x && pytest -q test/y.py\x00"),
+            ("22", b"/bin/bash\x00-c\x00pytest test/y.py\x00"),
+            ("23", b"sh\x00-c\x00vitest run\x00"),
+            ("24", b"/usr/bin/busybox\x00-c\x00pytest\x00"),
+            ("25", b"/usr/bin/bash.exe\x00-c\x00pytest -q\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        self._exe_agrees_with_argv0(mod, monkeypatch, proc)
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED" not in out
+        assert "banned 0" in out
+        for quiet in ("pid=21", "pid=22", "pid=23", "pid=24", "pid=25"):
+            assert quiet not in out, quiet
+
+    def test_a_clustered_shell_option_carries_a_command_string_too(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """``bash -lc 'pytest -q'`` is the same misattribution as ``bash -c``.
+
+        A shell takes its flags GROUPED, so an equality test against ``-c`` let the
+        commonest spelling of all straight through -- a login shell -- and the
+        conductor would stop a healthy worker on the strength of it. Every cluster
+        the fleet plausibly produces is asserted, plus ``--noprofile`` ahead of the
+        cluster, because a long option must not end the scan of leading options."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("41", b"bash\x00-lc\x00pytest -q test/y.py\x00"),
+            ("42", b"bash\x00-ic\x00pytest test/y.py\x00"),
+            ("43", b"sh\x00-euxc\x00vitest run\x00"),
+            ("44", b"/bin/bash\x00--noprofile\x00-lc\x00pytest\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        self._exe_agrees_with_argv0(mod, monkeypatch, proc)
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED" not in out
+        assert "banned 0" in out
+        for quiet in ("pid=41", "pid=42", "pid=43", "pid=44"):
+            assert quiet not in out, quiet
+
+    def test_a_dash_c_inside_the_carried_command_string_does_not_decide_it(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Only the LEADING option run may suppress, never the shell's payload.
+
+        ``bash /tmp/run.sh -c`` is a shell running a SCRIPT FILE, and the ``-c``
+        belongs to that script, not to bash -- so the arg-shaped rule still applies
+        to it. Scanning the whole cmdline for ``-c`` would quietly exempt it, which
+        is the opposite error to the one the cluster fix repairs."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "51").mkdir(parents=True)
+        (proc / "51" / "cmdline").write_bytes(b"bash\x00/tmp/run.sh\x00-c\x00pytest\x00")
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        self._exe_agrees_with_argv0(mod, monkeypatch, proc)
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=51" in out
+
+    def test_a_busybox_applet_and_an_option_with_an_operand_still_suppress(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The two spellings a leading-option scan alone gets wrong.
+
+        ``busybox sh -c '...'`` names its APPLET in argv[1], where every other
+        shell would put an option, so a scan that stops at the first non-option
+        entry never reaches the ``-c``. And ``-o`` consumes the next entry as its
+        operand, so ``bash -o pipefail -c '...'`` stopped on ``pipefail``. Both
+        left a healthy worker misattributed to the tool its command string names,
+        which is what makes the conductor stop the wrong pid."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("61", b"busybox\x00sh\x00-c\x00pytest -q test/y.py\x00"),
+            ("62", b"/bin/busybox\x00ash\x00-c\x00vitest run\x00"),
+            ("63", b"bash\x00-o\x00pipefail\x00-c\x00pytest test/y.py\x00"),
+            ("64", b"bash\x00-o\x00pipefail\x00-lc\x00pytest\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        self._exe_agrees_with_argv0(mod, monkeypatch, proc)
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED" not in out
+        assert "banned 0" in out
+        for quiet in ("pid=61", "pid=62", "pid=63", "pid=64"):
+            assert quiet not in out, quiet
+
+    def test_a_symlink_invoked_busybox_applet_is_judged_as_the_applet(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The standard busybox form must not buy the shell exemption.
+
+        A busybox applet is normally reached through a symlink: ``argv[0]`` is the
+        applet and ``/proc/<pid>/exe`` resolves to busybox itself. Reading the
+        applet out of argv[1] -- correct only for explicit ``busybox <applet>``
+        dispatch -- left ``base`` as ``busybox``, a shell, so a banned applet whose
+        own flag happens to be ``-c`` (``wget -c URL``) was read as a shell holding
+        a command string and vanished from the scan with no BANNED line. Explicit
+        dispatch of the same applet must report too.
+
+        pid 103 IS a genuine ``busybox sh -c`` wrapper and reports anyway, because
+        the rule that matched it is a CUSTOM one -- see
+        ``test_a_custom_banned_rule_does_not_exempt_the_shell_that_wraps_it``. That
+        the applet scan still buys the exemption where it is earned is asserted in
+        ``test_a_busybox_shell_wrapper_is_exempt_under_a_built_in_rule``."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            # Symlink form: the applet is argv[0], `-c` is wget's own continue flag.
+            ("101", b"/usr/bin/wget\x00-c\x00https://example.invalid/x\x00"),
+            # Explicit multi-call dispatch of the same banned applet.
+            ("102", b"busybox\x00wget\x00-c\x00https://example.invalid/x\x00"),
+            # A genuine wrapper: the command string is the shell's payload.
+            ("103", b"busybox\x00sh\x00-c\x00wget -c https://example.invalid/x\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        real = os.readlink
+
+        def fake_readlink(path, *a, **kw):
+            if str(path).endswith("exe"):
+                return "/bin/busybox"  # every one of them IS busybox
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(mod.os, "readlink", fake_readlink)
+        cfg = self._config(tmp_path, monkeypatch, [], banned_process_res=[r"\bwget\b"])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=101" in out, out
+        assert "BANNED pid=102" in out, out
+        assert "BANNED pid=103" in out, out
+
+    def test_a_busybox_shell_wrapper_is_exempt_under_a_built_in_rule(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The applet scan still buys the exemption where it is earned.
+
+        ``busybox sh -c 'pytest -q'`` names its applet in argv[1], and resolving it
+        is what tells the probe this pid is a shell rather than the pytest its
+        command string names. The previous test asserts the same shape REPORTS under
+        a custom rule; both directions have to hold, or the applet scan and the
+        rule-origin gate cannot be told apart."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "104").mkdir(parents=True)
+        (proc / "104" / "cmdline").write_bytes(b"busybox\x00sh\x00-c\x00pytest -q test/y.py\x00")
+        real = os.readlink
+
+        def fake_readlink(path, *a, **kw):
+            if str(path).endswith("exe"):
+                return "/bin/busybox"
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(mod.os, "readlink", fake_readlink)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "pid=104" not in out, out
+        assert "banned 0" in out, out
+
+    def test_a_custom_banned_rule_does_not_exempt_the_shell_that_wraps_it(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """A custom rule can name a command too short-lived to be sampled on its own pid.
+
+        The exemption's premise is that dropping the wrapper costs nothing, because
+        the wrapped tool has its own pid at the next ``/proc`` walk. That holds for
+        the two built-in rules, both of which name a long-running test runner. It
+        does not hold for an operator's rule: ``\\bcurl\\b`` against a shell that
+        sleeps two minutes and then makes one request is visible for two minutes as
+        the shell and for milliseconds as ``curl``, so exempting the shell discards
+        the only sample the probe was ever going to get and the operation the
+        operator banned completes with no BANNED event."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("81", b"bash\x00-c\x00sleep 120; curl https://example.invalid/x\x00"),
+            ("82", b"/bin/bash\x00-lc\x00curl https://example.invalid/x\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [], banned_process_res=[r"\bcurl\b"])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        self._exe_agrees_with_argv0(mod, monkeypatch, proc)
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=81" in out, out
+        assert "BANNED pid=82" in out, out
+
+    def test_a_built_in_rule_still_exempts_its_wrapper_when_custom_rules_exist(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Rule ORIGIN decides the exemption, not the mere presence of custom rules.
+
+        A custom list currently REPLACES the built-in one, so this asserts the gate
+        is written against the rule that MATCHED rather than against
+        ``cfg["banned_process_res"]`` being set at all -- if that config ever becomes
+        additive, the built-in rules keep the fix instead of silently losing it."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "83").mkdir(parents=True)
+        (proc / "83" / "cmdline").write_bytes(b"bash\x00-c\x00cd /x && pytest -q test/y.py\x00")
+        cfg = self._config(
+            tmp_path,
+            monkeypatch,
+            [],
+            banned_process_res=[r"\bcurl\b", *mod.DEFAULT_BANNED_RES],
+        )
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        self._exe_agrees_with_argv0(mod, monkeypatch, proc)
+        out = self._run(mod, cfg, capsys)
+        assert "pid=83" not in out, out
+        assert "banned 0" in out, out
+
+    def test_a_long_option_with_an_operand_does_not_hide_the_command_string(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """``bash --rcfile /dev/null -c '...'`` is still a wrapper.
+
+        A ``--long`` option is skipped rather than ending the option run, but two
+        of bash's long options take an OPERAND, and skipping only the option left
+        the operand to be read as the command string -- so the scan stopped on the
+        path and never reached the ``-c``. That is the same false ``BANNED``
+        reading the short ``-o pipefail`` case had, and it stops a live session.
+        The ``--opt=value`` spelling is a single entry and must keep working."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("81", b"bash\x00--rcfile\x00/dev/null\x00-c\x00pytest -q test/y.py\x00"),
+            ("82", b"/bin/bash\x00--init-file\x00/tmp/rc\x00-lc\x00vitest run\x00"),
+            ("83", b"bash\x00--rcfile=/dev/null\x00-c\x00pytest\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        self._exe_agrees_with_argv0(mod, monkeypatch, proc)
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED" not in out
+        assert "banned 0" in out
+        for quiet in ("pid=81", "pid=82", "pid=83"):
+            assert quiet not in out, quiet
+
+    def test_an_argument_containing_a_space_does_not_forge_an_option(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Why the check reads real argv instead of the joined cmdline.
+
+        A single argv entry may CONTAIN spaces. Joined with spaces it is
+        indistinguishable from several entries, so a command string that happens to
+        start with ``-c`` could pose as the shell's own flag. Here the shell is
+        handed one script-path operand whose text embeds ``-c``, and it must still
+        be judged a non-wrapper: argv keeps them separable, a joined string does
+        not."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "71").mkdir(parents=True)
+        (proc / "71" / "cmdline").write_bytes(b"bash\x00/tmp/a b -c pytest\x00")
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        self._exe_agrees_with_argv0(mod, monkeypatch, proc)
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=71" in out
+
+    def test_a_spoofed_argv0_cannot_disguise_a_real_pytest_as_a_shell(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """``exec -a bash`` must not buy an exemption.
+
+        argv[0] is chosen by the process, so a genuine unbounded pytest can call
+        itself `bash` and the wrapper check would drop it -- the offender then runs
+        on unstopped. `/proc/<pid>/exe` is kernel-maintained, so it decides instead.
+
+        `os.readlink` is monkeypatched rather than creating a real symlink: making
+        one needs a privilege this host withholds (the same restriction that fails
+        8 unrelated tests here), and the point under test is which ANSWER is
+        trusted, not whether the filesystem can model /proc."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        # argv[0] claims bash and carries a -c, so the pre-fix check exempted it.
+        (proc / "91").mkdir(parents=True)
+        (proc / "91" / "cmdline").write_bytes(b"bash\x00-c\x00pytest -n auto test/y.py\x00")
+        real = os.readlink
+
+        def fake_readlink(path, *a, **kw):
+            if str(path).endswith("exe"):
+                return "/usr/bin/python3.12"  # what it ACTUALLY is
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(mod.os, "readlink", fake_readlink)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "pid=91" in out, out
+
+    def test_a_genuine_shell_is_still_exempt_when_the_kernel_confirms_it(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The negative control: trusting `exe` must not start reporting real wrappers.
+
+        Without it, 'consult exe' could be satisfied by simply reporting everything."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "92").mkdir(parents=True)
+        (proc / "92" / "cmdline").write_bytes(b"bash\x00-c\x00pytest -n auto test/y.py\x00")
+        real = os.readlink
+
+        def fake_readlink(path, *a, **kw):
+            if str(path).endswith("exe"):
+                return "/usr/bin/bash"
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(mod.os, "readlink", fake_readlink)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "pid=92" not in out, out
+
+    def test_an_unreadable_exe_reports_instead_of_being_exempted(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """An unreadable `exe` buys NO exemption -- that fallback was the spoof.
+
+        A process can hide its own `exe` link by going non-dumpable
+        (`prctl(PR_SET_DUMPABLE, 0)`), so "exe unreadable, therefore trust argv[0]"
+        handed the exemption to exactly the process that arranged for there to be no
+        evidence: a real unbounded pytest could call itself `bash`, add a `-c`, and
+        drop off the scan. The exemption now requires the kernel to positively name
+        a shell, so with no `exe` this reports.
+
+        The cost is bounded and lands on the right side. A pid this uid genuinely
+        cannot inspect is usually another user's, and `_owner_class` already sorts
+        those into `foreign`/`unknown` rather than raising a fleet violation."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "93").mkdir(parents=True)
+        (proc / "93" / "cmdline").write_bytes(b"bash\x00-c\x00pytest -n auto test/y.py\x00")
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        # No `exe` entry, so readlink raises OSError exactly as it does for a process
+        # that made itself non-dumpable.
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=93" in out, out
+
+    def test_a_shell_named_file_outside_a_system_bin_dir_is_not_a_shell(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """A shell BASENAME is a claim about a filename, not about a program.
+
+        Copy any interpreter to a path called `bash` and every basename test agrees
+        it is bash. Give it a `-c` carrying a banned command and the wrapper
+        exemption dropped it from the scan entirely -- no `BANNED` line, every
+        cycle, for as long as the run lasted. The exemption now also requires the
+        kernel's `exe` to resolve INTO a system binary directory, where writing
+        needs root.
+
+        Both spellings of the same trick are asserted: a copy under `/tmp` and one
+        under a home directory. A genuine `/usr/bin/bash` doing the identical thing
+        must stay exempt, or the fix would simply have retired the exemption."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        exes = {
+            "111": "/tmp/bash",  # an interpreter copied to a shell-shaped path
+            "112": "/home/user/.local/bin/sh",  # same trick, writable without root
+            "113": "/usr/bin/bash",  # the real thing: still exempt
+        }
+        for pid, argv in (
+            ("111", b"bash\x00-c\x00pytest -n auto test/y.py\x00"),
+            ("112", b"sh\x00-c\x00pytest test/y.py\x00"),
+            ("113", b"bash\x00-c\x00pytest -n auto test/y.py\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        real = os.readlink
+
+        def fake_readlink(path, *a, **kw):
+            text = str(path)
+            if text.endswith("exe"):
+                return exes[Path(text).parent.name]
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(mod.os, "readlink", fake_readlink)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=111" in out, out
+        assert "BANNED pid=112" in out, out
+        assert "pid=113" not in out, out
+
+    def test_a_shell_upgraded_mid_session_keeps_its_wrapper_exemption(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """procfs marks an unlinked binary, and the marker must not cost the exemption.
+
+        Upgrading the `bash` package during a long fleet session unlinks the running
+        binary, and the kernel then answers `/proc/<pid>/exe` with
+        `/usr/bin/bash (deleted)`. The directory gate still passes, but the basename
+        becomes `bash (deleted)`, which is in no `SHELL_PROGRAMS` entry -- so the
+        wrapper exemption was lost and a live `bash -c '… pytest …'` in a worktree
+        raised a false `BANNED`, which the conductor answers by stopping the owner and
+        discarding its in-flight work.
+
+        The strip must NARROW only that direction, so the two ways it could widen the
+        exemption are asserted too: the name behind the marker still has to be a
+        shell (a deleted `pytest` is still reported), and it still has to sit in a
+        trusted directory (a deleted `/tmp/bash` is still reported)."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        exes = {
+            "114": "/usr/bin/bash (deleted)",  # upgraded mid-session: still a shell
+            "115": "/usr/bin/pytest (deleted)",  # not a shell, marker or not
+            "116": "/tmp/bash (deleted)",  # marker must not bypass the dir gate
+        }
+        for pid, argv in (
+            ("114", b"bash\x00-c\x00pytest -n auto test/y.py\x00"),
+            ("115", b"pytest\x00test/y.py\x00"),
+            ("116", b"bash\x00-c\x00pytest -n auto test/y.py\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        real = os.readlink
+
+        def fake_readlink(path, *a, **kw):
+            text = str(path)
+            if text.endswith("exe"):
+                return exes[Path(text).parent.name]
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(mod.os, "readlink", fake_readlink)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "pid=114" not in out, out
+        assert "BANNED pid=115" in out, out
+        assert "BANNED pid=116" in out, out
+
+    def test_an_interior_empty_argv_entry_is_not_silently_dropped(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """`cmdline` is NUL-TERMINATED, so only the LAST split element is an artefact.
+
+        An interior empty entry is a real argument. Dropping it re-spaces the joined
+        string that a custom `banned_process_res` pattern is matched against, so a
+        rule an operator wrote against the real command line quietly stops matching.
+        Here the rule needs the double space that the empty entry produces."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "94").mkdir(parents=True)
+        # argv = ["mytool", "", "--full"] -> joined "mytool  --full" (two spaces).
+        (proc / "94" / "cmdline").write_bytes(b"mytool\x00\x00--full\x00")
+        cfg = self._config(tmp_path, monkeypatch, [], banned_process_res=[r"mytool\s\s--full"])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=94" in out, out
+
+    def test_an_unbounded_pytest_run_directly_still_fires(self, tmp_path, capsys, monkeypatch):
+        """Skipping shell wrappers must not quiet the case the rule exists for.
+        A pytest whose worker count nobody chose is reported whether it was
+        spawned as the program itself or through the interpreter."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        for pid, argv in (
+            ("31", b"pytest\x00-q\x00test/y.py\x00"),
+            ("32", b"python\x00-m\x00pytest\x00test/y.py\x00"),
+        ):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(argv)
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=31" in out
+        assert "BANNED pid=32" in out
+
+    def test_a_bare_full_suite_vitest_run_still_fires(self, tmp_path, capsys, monkeypatch):
+        """``\\bvitest\\b\\s+run\\s*$`` is a statement about the ARGUMENTS -- what
+        makes the run a full-suite one is the absence of file arguments after
+        ``run``. It stays matched against the whole cmdline, so narrowing the scan
+        to program paths is not an option and the rule keeps working."""
+        mod = self._mod()
+        proc = tmp_path / "proc"
+        (proc / "41").mkdir(parents=True)
+        (proc / "41" / "cmdline").write_bytes(b"vitest\x00run\x00")
+        (proc / "42").mkdir(parents=True)
+        (proc / "42" / "cmdline").write_bytes(b"vitest\x00run\x00src/x.test.ts\x00")
+        cfg = self._config(tmp_path, monkeypatch, [])
+        monkeypatch.setenv("KIROCREW_PROBE_PROC_ROOT", str(proc))
+        out = self._run(mod, cfg, capsys)
+        assert "BANNED pid=41" in out
+        assert "pid=42" not in out  # a named file is a scoped run
 
     def test_raw_slot_key_matches_surface_prefixed_transcript(self, tmp_path, capsys, monkeypatch):
         """session_create answers slot keys while the store writes
@@ -1010,9 +1578,9 @@ class TestFleetProbe:
     def test_a_non_protocol_disposition_does_not_erase_the_terminal_tag(
         self, tmp_path, capsys, monkeypatch
     ):
-        """The defect 2b closes: the handled set keeps ONE entry per key, so a
-        later IDLE or GONE disposition used to overwrite the terminal report and
-        the finished worker read as wedged again on the next cycle."""
+        """The handled set keeps ONE entry per key, so a later IDLE or GONE
+        disposition must not overwrite the terminal report; otherwise the
+        finished worker reads as wedged again on the next cycle."""
         mod = self._mod()
         cfg = self._config(tmp_path, monkeypatch, ["s-done"], idle_alert_secs=100)
         sessions = tmp_path / "sessions"
@@ -1132,10 +1700,22 @@ class TestFleetProbe:
 
     def _proc(self, tmp_path: Path, pid: str, argv: bytes, cwd: Path | None) -> Path:
         """One fake ``/proc/<pid>``. ``cwd`` is written as a SYMLINK because that
-        is what the kernel exposes and what the probe reads."""
+        is what the kernel exposes and what the probe reads.
+
+        A ``stat`` file is always written: every live process on a real system
+        has one, and the probe reads its ``starttime`` (field 22) as the process
+        incarnation token that brackets the per-pid reads. A stable ``stat`` here
+        means one incarnation across the scan, so cwd classification is exercised
+        as it is in production; omitting it would model a process that exited
+        mid-scan, which is a different case with its own tests.
+        """
         proc = tmp_path / "proc"
         (proc / pid).mkdir(parents=True, exist_ok=True)
         (proc / pid / "cmdline").write_bytes(argv)
+        # field 1 pid, field 2 comm, field 3 state, then starttime is field 22 --
+        # index 19 in the split after ') ', where index 0 is the state field.
+        stat_tail = ["0"] * 18 + ["1000"] + ["0"] * 30
+        (proc / pid / "stat").write_text(f"{pid} (proc) R " + " ".join(stat_tail) + "\n", "ascii")
         if cwd is not None:
             cwd.mkdir(parents=True, exist_ok=True)
             os.symlink(str(cwd), str(proc / pid / "cwd"))
@@ -1220,7 +1800,7 @@ class TestFleetProbe:
         self._run(
             mod, cfg, capsys, "--mark-handled", "s-gone", "GREEN", self._digest_of(out, "s-gone")
         )
-        # The report is no longer in the window; only the state file knows.
+        # The report is not in the window; only the state file knows.
         self._session(sessions, "s-gone", "trailing chatter with no prefix", age_secs=500)
         out = self._run(mod, cfg, capsys)
         assert "TERMINAL" in out
@@ -1911,10 +2491,10 @@ class TestFleetProbe:
         """An answered report must not re-present because a later tag was marked.
 
         The handled set holds ONE entry per key, so marking a condition tag
-        (``IDLE``/``NOPROGRESS``) over an answered payload tag used to overwrite
-        the record that the payload was dealt with -- and the answered ruling then
-        fired again, sending the conductor to re-adjudicate something it had
-        already decided. The payload disposition is now preserved beside the new
+        (``IDLE``/``NOPROGRESS``) over an answered payload tag must not overwrite
+        the record that the payload was dealt with -- otherwise the answered ruling
+        fires again, sending the conductor to re-adjudicate something it has
+        already decided. The payload disposition is preserved beside the new
         entry, which is the shape ``proto`` already uses for the terminal reading.
         """
         mod = self._mod()

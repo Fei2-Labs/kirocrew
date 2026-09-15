@@ -2,7 +2,7 @@
 
 The path tier (``handlers/terminal.py``) answers "which FILE did you mean". This
 module answers "which SUBCOMMAND or FLAG did you mean" — the ``gh pr cre⎸`` case,
-where the panel previously offered nothing and the user had to go read ``--help``.
+where the alternative is the user going to read ``--help``.
 
 Authority model
 ---------------
@@ -705,8 +705,8 @@ def _probe_env() -> dict[str, str]:
     forever on a pager with no tty.
 
     One deliberate consequence: without ``HOME`` git cannot read ``~/.gitconfig``,
-    so user ALIASES no longer appear in the subcommand listing. That is coherent
-    with removing the alias-executing flag probe rather than a separate loss.
+    so user ALIASES do not appear in the subcommand listing. That is coherent with
+    running no alias-executing flag probe rather than a separate loss.
     """
     env = {
         "TERM": "dumb",

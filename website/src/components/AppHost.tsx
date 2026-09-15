@@ -16,6 +16,8 @@ import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, RefreshCw, PowerOff, AlertTriangle, Package, Bot } from 'lucide-react'
 import { AppApiProvider } from '../app-sdk'
 import { ContentSkeleton, Btn, PageHeader } from './ui'
+import ErrorNotice from './ErrorNotice'
+import { errMessage } from '../utils/thunkError'
 
 import { i18nT } from '../i18n/t'
 import { appDisplayName, appDescription } from './appstore/appManifest'
@@ -46,6 +48,22 @@ export interface AppHostProps {
       }
     }
   }
+  /** Bundle to mount, overriding `manifest.ui.entry`. Resolved against the app's
+   *  `ui/` directory (`/apps/<name>/ui/<entry>`), the same base that override
+   *  uses. A side-panel tab (`contributes.panelTabs[].entry`) mounts its own
+   *  entry through this host rather than the app's default page bundle. */
+  entry?: string
+  /** Whether this host is the visible surface. A body-owning host (a side-panel
+   *  tab) stays mounted while hidden, so it is handed `active` to pause polling
+   *  or release global keys; defaults to visible for the routed-page case. */
+  active?: boolean
+  /** The chat identity this host's requests act under, sent as `X-Session-Key` on
+   *  every scoped call the app makes. Without it the backend's restricted-session
+   *  guard fails open, so an app mounted inside an incognito chat would be allowed
+   *  the persistent writes incognito exists to deny -- the same reason
+   *  `SessionControlHost` passes it. Omitted for the routed `/apps/<name>` page,
+   *  which is not scoped to a chat at all. */
+  sessionKey?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -102,10 +120,16 @@ function AppCrashFallback({
         <div className="text-center max-w-md">
           <AlertTriangle size={48} className="text-danger mx-auto mb-4" />
           <h3 className="text-text font-medium mb-2">{appName} {i18nT('components.appHost.encountered_an_error')}</h3>
-          <p className="text-sm text-muted mb-2">{error.message}</p>
-          <p className="text-[12px] text-muted/60 mb-6 font-mono break-all max-h-24 overflow-y-auto">
-            {error.stack?.split('\n').slice(0, 4).join('\n')}
-          </p>
+          {/* Crash fallback: the app tree is already gone, so the hand-off loses
+              nothing. The message is the whole visible error — the stack stays
+              in the console and in the journal the hand-off carries; a second,
+              hand-written `<p>` of error text would bypass the shared surface. */}
+          <ErrorNotice
+            askAgent
+            testId="app-host-crash-error"
+            className="mb-6 text-left"
+            message={error.message || error.name}
+          />
           <div className="flex gap-2 justify-center">
             <Btn onClick={onRetry}><RefreshCw size={14} /> {i18nT('components.appHost.retry')}</Btn>
             <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('components.appHost.apps')}</Btn>
@@ -196,7 +220,7 @@ function AppNoUI({ app }: { app: AppHostProps['app'] }) {
 // AppHost
 // ---------------------------------------------------------------------------
 
-function AppHostInner({ app }: AppHostProps) {
+function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: AppHostProps) {
   const navigate = useNavigate()
   const [resetKey, setResetKey] = useState(0)
 
@@ -217,7 +241,7 @@ function AppHostInner({ app }: AppHostProps) {
     return () => window.removeEventListener('mc:app-reload', handler)
   }, [app.name])
 
-  const entry = app.manifest?.ui?.entry
+  const entry = entryOverride || app.manifest?.ui?.entry
   const permissions = app.manifest?.permissions || {}
   const allowedApi = permissions.api || []
   const allowedEvents = permissions.events || []
@@ -236,7 +260,13 @@ function AppHostInner({ app }: AppHostProps) {
               <div className="text-center max-w-md">
                 <AlertTriangle size={48} className="text-danger mx-auto mb-4" />
                 <h3 className="text-text font-medium mb-2">{i18nT('components.appHost.failed_to_load')} {appDisplayName(app)}</h3>
-                <p className="text-sm text-muted mb-4">{err.message}</p>
+                {/* Bundle load failure: nothing rendered yet, so the hand-off loses nothing. */}
+                <ErrorNotice
+                  askAgent
+                  testId="app-host-load-error"
+                  className="mb-4 text-left"
+                  message={errMessage(err) || String(err)}
+                />
                 <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('components.appHost.apps')}</Btn>
               </div>
             </div>
@@ -271,9 +301,11 @@ function AppHostInner({ app }: AppHostProps) {
         appVersion={app.manifest?.version || app.version}
         allowedApiPaths={allowedApi}
         allowedEvents={allowedEvents}
+        active={active}
         subscribeFn={subscribeFn}
         navigateFn={navigateFn}
         notifyFn={notifyFn}
+        sessionKey={sessionKey}
       >
         <Suspense fallback={<AppLoadingSkeleton appName={appDisplayName(app)} />}>
           <LazyApp />
@@ -283,13 +315,14 @@ function AppHostInner({ app }: AppHostProps) {
   )
 }
 
-export default function AppHost({ app }: AppHostProps) {
+export default function AppHost({ app, entry, active, sessionKey }: AppHostProps) {
   // Guard: not installed
   if (!app) return <AppNotFound name="unknown" />
   // Guard: disabled
   if (app.enabled === false) return <AppDisabled app={app} />
-  // Guard: no UI bundle
-  if (!app.manifest?.ui?.entry) return <AppNoUI app={app} />
+  // Guard: no UI bundle. An explicit `entry` (a panel-tab body) is its own
+  // bundle, so it does not require the app to also declare a routed `ui.entry`.
+  if (!entry && !app.manifest?.ui?.entry) return <AppNoUI app={app} />
 
-  return <AppHostInner app={app} />
+  return <AppHostInner app={app} entry={entry} active={active} sessionKey={sessionKey} />
 }

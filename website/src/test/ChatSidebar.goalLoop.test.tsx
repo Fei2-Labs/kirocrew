@@ -18,6 +18,7 @@ import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
+import type { StructuredMonitor } from '../monitoring/automation'
 
 // Render framer-motion elements as plain DOM (jsdom can't run projection).
 vi.mock('framer-motion', async () => {
@@ -41,6 +42,7 @@ vi.mock('framer-motion', async () => {
   const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
   return {
     motion,
+    useReducedMotion: () => false,
     AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
     LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
@@ -83,6 +85,16 @@ function renderSidebar(
   chat: Record<string, unknown>,
   { activeSlotProp = null, unreadSlots = [] }: { activeSlotProp?: string | null; unreadSlots?: string[] } = {},
 ) {
+  const legacyFixtures = chat.goalLoops as Record<string, { cycle_count: number; max_cycles: number }> | undefined
+  const { goalLoops: _legacyFixtures, ...chatState } = chat
+  const migratedLegacy = Object.fromEntries(Object.entries(legacyFixtures ?? {}).map(([slotKey, loop]) => [
+    slotKey,
+    {
+      kind: 'legacy_goal_loop', id: `loop-${slotKey}`, slotKey, message: '', idleSecs: 60,
+      maxCycles: loop.max_cycles, cycleCount: loop.cycle_count, active: true,
+      lastFireAt: 0, stoppedReason: '',
+    },
+  ]))
   const store = createTestStore({
     dashboard: {
       status: {}, connected: true, slots, approvalMode: 'normal',
@@ -91,7 +103,11 @@ function renderSidebar(
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
     } as unknown as RootState['dashboard'],
-    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, goalLoops: {}, ...chat } as unknown as RootState['chat'],
+    chat: {
+      activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {},
+      ...chatState,
+      automations: { ...migratedLegacy, ...((chatState.automations as object) ?? {}) },
+    } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], [])
@@ -110,6 +126,18 @@ function renderSidebar(
     </QueryClientProvider>,
   )
 }
+
+const structuredMonitor = (overrides: Partial<StructuredMonitor> = {}): StructuredMonitor => ({
+  kind: 'structured_monitor', id: 'monitor-1', slotKey: 'k', active: true,
+  actionable: true, version: 1, monitorKind: 'github_pull_request', objective: 'review_ready',
+  target: 'https://github.com/kirodotdev/KiroCrew/pull/42', cadenceSecs: 300,
+  nextProbeAt: 1_800_000_300, wakeInstructions: '',
+  budgets: { maxRuntimeSecs: 14_400, maxAgentTurns: 8, maxTokens: 250_000, maxProviderErrors: 3 },
+  latest: { classification: 'actionable', reasonCode: 'review_feedback', observedAt: 1_800_000_000, decision: 'wake_actionable' },
+  usage: { probes: 5, wakes: 2, agentTurns: 1, inputTokens: 100, outputTokens: 20, providerErrors: 0, tokenUsageKnown: true },
+  action: { wakeInFlight: true, wakeDelivery: 'dispatched' }, terminal: null,
+  ...overrides,
+})
 
 beforeEach(() => localStorage.clear())
 afterEach(() => vi.clearAllMocks())
@@ -200,6 +228,104 @@ describe('chat sidebar — goal-loop progress subtitle', () => {
   })
 })
 
+describe('chat sidebar — structured monitor status', () => {
+  it('action-running outranks foreground work and uses the motion pulse path', () => {
+    const slots = [{ key: 'k', title: 'monitor', running: true, messages: 5 }]
+    const { getByText, queryByText, container } = renderSidebar(slots, {
+      automations: { k: structuredMonitor() },
+      slotStatusDetail: { k: { text: 'Reading gateway.log' } },
+    }, { activeSlotProp: 'k' })
+
+    expect(getByText('Monitor · action running')).toBeTruthy()
+    expect(queryByText(/Reading gateway\.log/)).toBeNull()
+    expect(container.querySelector('[data-monitor-action-pulse="true"]')).toBeTruthy()
+    expect(container.querySelector('.lucide-radar.animate-pulse')).toBeNull()
+  })
+
+  it('lets a retained terminal monitor yield the row to its last message', () => {
+    const slots = [{
+      key: 'k', title: 'monitor', running: false, messages: 5, last_message: 'final answer',
+    }]
+    const { getByText, queryByText, container } = renderSidebar(slots, {
+      automations: { k: structuredMonitor({
+        active: false,
+        action: { wakeInFlight: false, wakeDelivery: '' },
+        terminal: { outcome: 'budget', reason: 'token_budget', stoppedAt: 1_800_000_100 },
+      }) },
+    })
+
+    expect(getByText('final answer')).toBeTruthy()
+    expect(queryByText(/Monitor/)).toBeNull()
+    expect(container.querySelector('.lucide-radar.animate-pulse')).toBeNull()
+  })
+
+  it('ranks a scheduled monitor below a foreground turn', () => {
+    const slots = [{ key: 'k', title: 'monitor', running: true, messages: 5 }]
+    const { getByText, queryByText } = renderSidebar(slots, {
+      automations: { k: structuredMonitor({
+        action: { wakeInFlight: false, wakeDelivery: '' },
+        latest: { classification: 'stable', reasonCode: 'no_change', observedAt: 1_800_000_000, decision: 'continue' },
+      }) },
+      slotStatusDetail: { k: { text: 'Reading gateway.log' } },
+    }, { activeSlotProp: 'k' })
+
+    expect(getByText(/Reading gateway\.log/)).toBeTruthy()
+    expect(queryByText(/Monitor/)).toBeNull()
+  })
+
+  it('ranks a scheduled monitor below live subagents', () => {
+    const slots = [{ key: 'k', title: 'monitor', running: false, messages: 5 }]
+    const { getByText, queryByText } = renderSidebar(slots, {
+      automations: { k: structuredMonitor({
+        action: { wakeInFlight: false, wakeDelivery: '' },
+        latest: { classification: 'stable', reasonCode: 'no_change', observedAt: 1_800_000_000, decision: 'continue' },
+      }) },
+      slotActivity: { k: { toolLog: [], subagents: { a: sa('running') } } },
+    })
+
+    expect(getByText('1 agent running')).toBeTruthy()
+    expect(queryByText(/Monitor/)).toBeNull()
+  })
+
+  it('ranks a terminal monitor below a live workflow', () => {
+    const slots = [{ key: 'k', title: 'monitor', running: false, messages: 5 }]
+    const { getByText, queryByText } = renderSidebar(slots, {
+      automations: { k: structuredMonitor({
+        active: false,
+        action: { wakeInFlight: false, wakeDelivery: '' },
+        terminal: { outcome: 'success', reason: 'review_ready', stoppedAt: 1_800_000_100 },
+      }) },
+      workflowRuns: {
+        wf_1: {
+          run_id: 'wf_1', name: 'review-fixes', phase: 'verify', lastLog: '',
+          status: 'running', sessionKey: 'dashboard:k',
+        },
+      },
+    })
+
+    expect(getByText('review-fixes · verify')).toBeTruthy()
+    expect(queryByText(/Monitor/)).toBeNull()
+  })
+
+  it('lets unread reclaim a terminal row instead of suppressing the inbox marker', () => {
+    const slots = [{
+      key: 'k', title: 'monitor', running: false, messages: 5, last_message: 'final answer',
+    }]
+    const chat = {
+      automations: { k: structuredMonitor({
+        active: false,
+        action: { wakeInFlight: false, wakeDelivery: '' },
+        terminal: { outcome: 'success', reason: 'review_ready', stoppedAt: 1_800_000_100 },
+      }) },
+    }
+    const unread = renderSidebar(slots, chat, { unreadSlots: ['k'] })
+
+    expect(unread.queryByTitle(UNREAD_DOT_TITLE)).toBeTruthy()
+    expect(unread.getByText('final answer')).toBeTruthy()
+    expect(unread.queryByText(/Monitor/)).toBeNull()
+  })
+})
+
 describe('chat sidebar — interrupted goal loop', () => {
   const STALLED_TITLE = 'Goal loop armed — last turn was interrupted; resume the chat or wait for the next cycle'
 
@@ -253,5 +379,77 @@ describe('chat sidebar — interrupted goal loop', () => {
     // The loop outranks the sub-agent count in the gutter, and a running child
     // means the loop is working — so the gutter Goal glyph pulses.
     expect(container.querySelector('.lucide-goal.animate-pulse')).toBeTruthy()
+  })
+})
+
+describe('chat sidebar — interrupted ordinary session', () => {
+  it('flags an idle interrupted turn as needing manual attention', () => {
+    const slots = [{
+      key: 'k', title: 'deployment follow-up', running: false, messages: 5,
+      interrupted: true, last_message: 'Checking the deployment',
+    }]
+    const { getByTitle, queryByTitle, container } = renderSidebar(
+      slots,
+      {},
+      { unreadSlots: ['k'] },
+    )
+
+    const row = container.querySelector('[data-session-row="k"]')
+    expect(row?.textContent).toContain('Turn interrupted · Resume')
+    expect(getByTitle('Turn interrupted · Resume')).toBeTruthy()
+    expect(container.querySelector('.lucide-triangle-alert.text-danger')).toBeTruthy()
+    // The specific attention state replaces the generic unread marker.
+    expect(queryByTitle(UNREAD_DOT_TITLE)).toBeNull()
+  })
+
+  it('keeps live subagent activity above stale parent-turn interruption', () => {
+    const slots = [{ key: 'k', title: 'delegated work', running: false, messages: 5, interrupted: true }]
+    const { getByText, queryByText } = renderSidebar(slots, {
+      slotActivity: { k: { toolLog: [], subagents: { a: sa('running') } } },
+    })
+
+    expect(getByText(/1 agent running/)).toBeTruthy()
+    expect(queryByText('Turn interrupted')).toBeNull()
+  })
+
+  it('trusts snapshot child activity before reconnect details hydrate', () => {
+    const slots = [
+      {
+        key: 'plain', title: 'delegated work', running: false, messages: 5,
+        interrupted: true, subagents_running: true, last_message: 'Delegating',
+      },
+      {
+        key: 'loop', title: 'loop work', running: false, messages: 5,
+        interrupted: true, subagents_running: true, last_message: 'Delegating',
+      },
+      {
+        key: 'orchestrating', title: 'planning', running: false, messages: 5,
+        interrupted: true, orchestrating: true, last_message: 'Planning',
+      },
+      {
+        key: 'queued', title: 'queued turn', running: false, messages: 5,
+        interrupted: true, queue_depth: 1, last_message: 'Queued',
+      },
+    ]
+    const { container } = renderSidebar(slots, {
+      goalLoops: { loop: { cycle_count: 9, max_cycles: 24 } },
+    })
+
+    expect(container.querySelector('[data-session-row="plain"]')?.textContent).not.toContain('Turn interrupted')
+    expect(container.querySelector('[data-session-row="plain"]')?.textContent).toContain('In progress')
+    expect(container.querySelector('[data-session-row="loop"]')?.textContent).not.toContain('interrupted')
+    expect(container.querySelector('[data-session-row="loop"]')?.textContent).toContain('In progress')
+    expect(container.querySelector('[data-session-row="orchestrating"]')?.textContent).not.toContain('Turn interrupted')
+    expect(container.querySelector('[data-session-row="orchestrating"]')?.textContent).toContain('In progress')
+    expect(container.querySelector('[data-session-row="queued"]')?.textContent).not.toContain('Turn interrupted')
+    expect(container.querySelector('[data-session-row="queued"]')?.textContent).toContain('In progress')
+  })
+
+  it('leaves completed ordinary sessions unflagged', () => {
+    const slots = [{ key: 'k', title: 'complete', running: false, messages: 5, interrupted: false, last_message: 'Done' }]
+    const { getByText, queryByText } = renderSidebar(slots, {})
+
+    expect(getByText('Done')).toBeTruthy()
+    expect(queryByText('Turn interrupted')).toBeNull()
   })
 })

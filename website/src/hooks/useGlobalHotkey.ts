@@ -2,8 +2,6 @@ import { useQuery } from '@tanstack/react-query'
 import { isElectron } from '../lib/electron'
 import type { GlobalHotkeyInfo } from '../lib/globalHotkey'
 
-type HotkeyBridge = { getGlobalHotkey?: () => Promise<GlobalHotkeyInfo> }
-
 /**
  * The desktop shell's system-wide summon hotkey, as ACTUALLY bound by the main
  * process (registration can degrade to the platform default or to nothing when
@@ -15,7 +13,7 @@ type HotkeyBridge = { getGlobalHotkey?: () => Promise<GlobalHotkeyInfo> }
  * lifetime (registered once on app ready), hence `staleTime: Infinity`.
  */
 export function useGlobalHotkey(): GlobalHotkeyInfo | null {
-  const api = (window as Window & { electronAPI?: HotkeyBridge }).electronAPI
+  const api = window.electronAPI
   const available = isElectron && typeof api?.getGlobalHotkey === 'function'
   const { data } = useQuery({
     queryKey: ['global-hotkey'],

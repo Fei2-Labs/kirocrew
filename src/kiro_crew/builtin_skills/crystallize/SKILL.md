@@ -79,7 +79,9 @@ a session that touched credentials / sensitive paths. Being asked does not make 
    **(a) Candidate — the default.** For "crystallize", "create a skill",
    "save this as a skill", "make this reusable" and every other phrasing, stage
    to the pending queue so a human approves before anything loads. Create
-   `<skills-dir>/auto/.pending/<slug>/` (`<slug>` kebab-case, 3–60 chars) with
+   `<skills-dir>/auto/.pending/<slug>/` (`<slug>` kebab-case, 3–64 chars,
+   starting and ending with a letter or digit — a name outside that shape is
+   silently skipped by the pending list and cannot be approved) with
    `SKILL.md`:
 
    ```
@@ -108,38 +110,35 @@ a session that touched credentials / sensitive paths. Being asked does not make 
    shows blank in **Skills → Pending review** and dedup loses its match data:
    `{"slug": "<slug>", "name": "auto/<slug>", "source": "crystallize",
    "created_at": "<ISO>", "description": "...", "triggers": "...",
-   "has_scripts": <bool>, "scripts": [...]}`.
+   "has_scripts": <bool>, "scripts": [...], "kind": "new"}`.
    Only `scripts/` is conditional: if you generated a script, put it under
    `scripts/<name>.py` in that folder, set `"has_scripts": true`, and list it in
    `scripts`; for a prose-only candidate use `"has_scripts": false, "scripts": []`.
 
-   **(b) Live — ONLY on an explicit "create a live skill" / "create an active
-   skill".** The user must actually say "live" or "active" (or confirm it when
-   asked) — never take this path by inference. Write directly to a top-level
-   live directory `<skills-dir>/<slug>/SKILL.md` — no `auto/` prefix, no
-   `.meta.json`, no pending stage — using this frontmatter:
+   **Freshening an existing live auto-skill is an UPDATE candidate, not a new
+   one.** Same pending folder, but set `"kind": "update"`, `"target":
+   "<the live slug>"` and `"base_version": "<the version you merged from>"`.
+   Approving an update snapshots the live file to
+   `auto/<slug>/.versions/v<N>-SKILL.md` before overwriting it and keeps the 20
+   newest snapshots, so the human can roll back.
 
-   ```
-   ---
-   name: <slug>
-   description: <=150 chars, starts with a verb
-   triggers: <3-8 comma-separated keywords/phrases>
-   source: crystallize
-   ---
+   Staging a candidate whose slug is already PENDING is safe: the loader claims a
+   distinct slug (`<slug>-2`, `<slug>-3`, …) and stages beside the existing
+   candidate rather than overwriting it. That guard covers the pending path only —
+   the live path in (b) has none.
 
-   # <slug>
+   **(b) Live: ONLY when the user explicitly says "live" / "active" or confirms
+   it when asked.** Write `<skills-dir>/<slug>/SKILL.md` directly, with no
+   `auto/` prefix, `.meta.json`, or pending stage.
 
-   ## When to use
-   ...
-   ## Steps
-   ...
-   ## Gotchas
-   ...
-   ```
+   Reuse (a)'s template with `name: <slug>`, `source: crystallize`, and title
+   `# <slug>`; omit `session_key` and `created_at`. Keep the same description,
+   triggers, and When to use / Steps / Gotchas sections.
 
    **Do not overwrite an existing skill:** if `<skills-dir>/<slug>/` already
    exists (a live or builtin skill), pick a different slug or ask the user —
-   the live path has no collision guard, so writing blindly clobbers it. Put
+   the live path has no collision guard, so writing blindly clobbers it, and
+   unlike the pending path nothing claims a distinct slug for you. Put
    any script under `scripts/<name>.py` and, since no approval step runs for
    you, mark it executable yourself — on POSIX, `chmod +x`; skip that on
    Windows, where the executable bit is a no-op.

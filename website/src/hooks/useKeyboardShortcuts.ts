@@ -1,9 +1,11 @@
 import { useEffect, useCallback, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAppDispatch, useAppStore } from '../store'
-import { switchSlot, deleteSlot, openActivityToTab } from '../store/chatSlice'
+import { switchSlot, deleteSlot, openActivityToTab, selectSidebarSubagentCounts, selectSidebarApprovalCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys } from '../store/chatSlice'
+import { inferLane } from '../pages/chat/sessionLane'
+import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { loadChatConfig } from '../pages/chat/ChatSettings'
-import { queryComposer, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
+import { queryComposerOrExpand, queryPendingApprovalAction, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { reportSeamCollision } from '../apps/seamCollision'
 import {
   loadPanelToggleOverrides,
@@ -14,7 +16,33 @@ import {
   type PanelToggleId,
   type PanelToggleOverrides,
 } from '../lib/panelToggleShortcuts'
+import {
+  SHORTCUT_GROUPS,
+  SHORTCUT_OVERRIDES_EVENT,
+  SHORTCUT_OVERRIDES_KEY,
+  SHORTCUT_REGISTRY,
+  chordMatchesEvent,
+  loadShortcutOverrides,
+  matchShortcutEvent,
+  resolveShortcuts,
+  shortcutEntry,
+  type Chord,
+  type ResolvedShortcut,
+  type ShortcutEntry,
+  type ShortcutGroup,
+  type ShortcutOverrides,
+  type ShortcutPlatform,
+} from '../lib/shortcutRegistry'
 import { i18nT } from '../i18n/t'
+import { canGoBack, canGoForward } from '../lib/routeHistoryPosition'
+import { useGuardedHistoryStep } from '../components/NavigationLeaveGuard'
+import { MOBILE_BREAKPOINT } from './useIsMobile'
+
+/**
+ * Group ids + ordering live in the registry (`lib/shortcutRegistry`); re-exported
+ * here because every display surface imports them from this hook.
+ */
+export { SHORTCUT_GROUPS, type ShortcutGroup }
 
 export const SHORTCUTS_ENABLED_KEY = 'mc-keyboard-shortcuts'
 export const SHORTCUTS_ENABLED_EVENT = 'mc-keyboard-shortcuts-changed'
@@ -101,30 +129,20 @@ export function useDigitModifierHeld(): boolean {
 }
 
 /**
- * Which section of the shortcuts reference an entry belongs to.
- *
- * A STABLE, NON-LOCALISED ID — deliberately not the displayed heading. The value is
- * a discriminant first and a label never: `INSTANCE_SHORTCUTS` below and
- * `groupShortcuts()` in ShortcutsModal both select entries by comparing it, so a
- * localised value would make every one of those comparisons miss in every
- * non-English locale and silently render an empty shortcuts modal. The heading text
- * lives in `SHORTCUT_GROUP_LABEL_KEY` and resolves per render.
+ * A shortcut as the display surfaces and the legacy handler branches see it:
+ * the registry entry's chord for THIS platform, flattened to the field shape the
+ * modal, Settings → Shortcuts, the nav hover hint and their tests have always
+ * read. `meta` is the ⌘-on-Mac/Ctrl-elsewhere primary (`Chord.mod`); `ctrl` is
+ * literal Control. Derived by {@link toShortcutDef} — never hand-written.
  */
-export type ShortcutGroup = 'chat-navigation' | 'panel-navigation' | 'actions' | 'remote-crews'
-
-/** Shortcut groups in display order — the canonical id set and ordering. */
-export const SHORTCUT_GROUPS: readonly ShortcutGroup[] = [
-  'chat-navigation', 'panel-navigation', 'actions', 'remote-crews',
-]
-
 export interface ShortcutDef {
   id: string
   key: string
   alt?: boolean
   // Literal Ctrl on EVERY platform (rendered ⌃ on Mac, "Ctrl" elsewhere — see
-  // formatShortcut). The chat-jump digits set this to `IS_MAC` so that Mac alone
-  // uses Ctrl instead of Option; a chord that sets it unconditionally (agent
-  // monitor) is Ctrl everywhere. For the ⌘-on-Mac/Ctrl-elsewhere shape use `meta`.
+  // formatShortcut). The chat-jump digits set this on Mac alone so that Mac uses
+  // Ctrl instead of Option; a chord that sets it unconditionally (agent monitor)
+  // is Ctrl everywhere. For the ⌘-on-Mac/Ctrl-elsewhere shape use `meta`.
   ctrl?: boolean
   meta?: boolean  // Cmd on Mac, Ctrl on Windows/Linux
   shift?: boolean
@@ -142,71 +160,54 @@ export interface ShortcutDef {
    */
   n?: number
   group: ShortcutGroup
+  /** Legacy chords still accepted for one release; rendered muted after the primary. */
+  aliases?: readonly Chord[]
+  /** Browsers never deliver this chord to the page — see the registry module doc. */
+  browserReserved?: boolean
 }
 
-export const DEFAULT_SHORTCUTS: ShortcutDef[] = [
-  // Chat navigation — digits use Ctrl on Mac (Option+number produces characters on non-US keyboards)
-  { id: 'chat-1', key: '1', alt: !IS_MAC, ctrl: IS_MAC, n: 1, group: 'chat-navigation' },
-  { id: 'chat-2', key: '2', alt: !IS_MAC, ctrl: IS_MAC, n: 2, group: 'chat-navigation' },
-  { id: 'chat-3', key: '3', alt: !IS_MAC, ctrl: IS_MAC, n: 3, group: 'chat-navigation' },
-  { id: 'chat-4', key: '4', alt: !IS_MAC, ctrl: IS_MAC, n: 4, group: 'chat-navigation' },
-  { id: 'chat-5', key: '5', alt: !IS_MAC, ctrl: IS_MAC, n: 5, group: 'chat-navigation' },
-  { id: 'chat-6', key: '6', alt: !IS_MAC, ctrl: IS_MAC, n: 6, group: 'chat-navigation' },
-  { id: 'chat-7', key: '7', alt: !IS_MAC, ctrl: IS_MAC, n: 7, group: 'chat-navigation' },
-  { id: 'chat-8', key: '8', alt: !IS_MAC, ctrl: IS_MAC, n: 8, group: 'chat-navigation' },
-  { id: 'chat-9', key: '9', alt: !IS_MAC, ctrl: IS_MAC, n: 9, group: 'chat-navigation' },
-  // Sessions 10+ get letters (a–z minus letters other chords own — see
-  // jumpLetters). One summarizing modal row instead of ~20 near-identical ones.
-  { id: 'chat-letters', key: 'a…z', alt: !IS_MAC, ctrl: IS_MAC, group: 'chat-navigation' },
-  { id: 'chat-prev', key: 'ArrowLeft', alt: true, group: 'chat-navigation' },
-  { id: 'chat-next', key: 'ArrowRight', alt: true, group: 'chat-navigation' },
-  { id: 'chat-prev-bracket', key: '[', meta: true, group: 'chat-navigation' },
-  { id: 'chat-next-bracket', key: ']', meta: true, group: 'chat-navigation' },
-  { id: 'chat-mru', key: '`', alt: true, group: 'chat-navigation' },
-  { id: 'chat-mru-back', key: '`', alt: true, shift: true, group: 'chat-navigation' },
-  // Panel navigation
-  { id: 'nav-chat', key: 'c', alt: true, group: 'panel-navigation' },
-  { id: 'nav-notifications', key: 'n', alt: true, group: 'panel-navigation' },
-  { id: 'nav-projects', key: 'p', alt: true, group: 'panel-navigation' },
-  { id: 'nav-schedule', key: 's', alt: true, group: 'panel-navigation' },
-  // Actions
-  { id: 'focus-input', key: 'Enter', alt: true, group: 'actions' },
-  { id: 'new-chat', key: 'n', alt: true, shift: true, group: 'actions' },
-  { id: 'close-chat', key: 'w', alt: true, shift: true, group: 'actions' },
-  { id: 'shortcuts-modal', key: 'k', alt: true, group: 'actions' },
-  { id: 'open-settings', key: ',', alt: !IS_MAC, meta: IS_MAC, group: 'actions' },
-  { id: 'cycle-agent', key: 'a', alt: true, shift: true, group: 'actions' },
-  { id: 'cycle-prev-agent', key: 'z', alt: true, shift: true, group: 'actions' },
-  { id: 'cycle-reasoning', key: 'd', alt: true, shift: true, group: 'actions' },
-  { id: 'cycle-prev-reasoning', key: 'c', alt: true, shift: true, group: 'actions' },
-  { id: 'cycle-approval', key: 'f', alt: true, shift: true, group: 'actions' },
-  { id: 'cycle-prev-approval', key: 'v', alt: true, shift: true, group: 'actions' },
-  { id: 'cycle-model', key: 's', alt: true, shift: true, group: 'actions' },
-  { id: 'cycle-prev-model', key: 'x', alt: true, shift: true, group: 'actions' },
-  // Deliberately not a macOS dead key. Option+E/I/U/N compose an accent, and
-  // keydown.preventDefault() cannot cancel a composed character (see
-  // suppressNextInputRef) — this chord fires from inside the composer, so it
-  // must not be able to leave one behind.
-  { id: 'toggle-focus-mode', key: 'm', alt: true, shift: true, group: 'actions' },
-  { id: 'optimize-prompt', key: 'Enter', meta: true, shift: true, group: 'actions' },
-  // Literal Ctrl on every platform — see isAgentMonitorChord for why this one
-  // does NOT follow the ⌘-on-Mac convention.
-  { id: 'agent-monitor', key: 'g', ctrl: true, group: 'actions' },
-  // Stop in-progress voice read-back. Bare Escape, handled by the capture-phase
-  // listener (see the voice-stop effect); listed here so it appears in the
-  // shortcuts modal / Settings -> Shortcuts. Label lives in SHORTCUT_LABEL_KEY.
-  { id: 'stop-speaking', key: 'Escape', group: 'actions' },
-  // Instance switcher — Cmd on Mac / Ctrl on Win-Linux. 1 = Local, 2..6 = the
-  // 1st..5th remote instance, matching the InstanceTabBar left-to-right order.
-  // Handled by useInstanceShortcuts (not the Alt-based handler below); listed
-  // here so they appear in the shortcuts modal + Settings → Shortcuts.
-  { id: 'instance-1', key: '1', meta: true, group: 'remote-crews' },
-  { id: 'instance-2', key: '2', meta: true, n: 1, group: 'remote-crews' },
-  { id: 'instance-3', key: '3', meta: true, n: 2, group: 'remote-crews' },
-  { id: 'instance-4', key: '4', meta: true, n: 3, group: 'remote-crews' },
-  { id: 'instance-5', key: '5', meta: true, n: 4, group: 'remote-crews' },
-  { id: 'instance-6', key: '6', meta: true, n: 5, group: 'remote-crews' },
-]
+/** The registry platform for a `mac` flag. */
+export function shortcutPlatform(mac: boolean = IS_MAC): ShortcutPlatform {
+  return mac ? 'mac' : 'other'
+}
+
+/** A `ShortcutDef` chord shape from a registry chord (or `null` for unbound → no key). */
+export function shortcutDefFromChord(base: Pick<ShortcutDef, 'id' | 'group' | 'n' | 'label'>, chord: Chord): ShortcutDef {
+  const def: ShortcutDef = { id: base.id, key: chord.key, group: base.group }
+  if (chord.mod) def.meta = true
+  if (chord.ctrl) def.ctrl = true
+  if (chord.alt) def.alt = true
+  if (chord.shift) def.shift = true
+  if (base.n !== undefined) def.n = base.n
+  if (base.label !== undefined) def.label = base.label
+  return def
+}
+
+/**
+ * Flatten one registry entry for `platform`. An entry with no chord on this
+ * platform yields `null` and is not listed. Aliases and the browser-reserved
+ * flag ride along so the modal can render them.
+ */
+export function toShortcutDef(entry: ShortcutEntry, platform: ShortcutPlatform = shortcutPlatform()): ShortcutDef | null {
+  const chord = entry.defaults[platform]
+  if (!chord) return null
+  const def = shortcutDefFromChord(entry, chord)
+  const aliases = entry.aliases?.[platform]
+  if (aliases && aliases.length > 0) def.aliases = aliases
+  if (entry.browserReserved) def.browserReserved = true
+  return def
+}
+
+/**
+ * The built-in shortcuts for THIS platform, derived from the registry at module
+ * load (IS_MAC is frozen; see its comment). A mutable array on purpose:
+ * `registerPanelShortcut` appends a downstream edition's panel chords. The
+ * handler below no longer reads chords from here — it asks the registry — so this
+ * is the DISPLAY list, and the registry is the source of truth.
+ */
+export const DEFAULT_SHORTCUTS: ShortcutDef[] = SHORTCUT_REGISTRY
+  .map(e => toShortcutDef(e))
+  .filter((d): d is ShortcutDef => d !== null)
 
 /**
  * Catalog KEY for each entry's display label, by `ShortcutDef.id`.
@@ -250,7 +251,12 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'nav-notifications': 'hooks.useKeyboardShortcuts.notifications_panel',
   'nav-projects': 'hooks.useKeyboardShortcuts.projects_panel',
   'nav-schedule': 'hooks.useKeyboardShortcuts.schedule_panel',
+  // Reused: the same commands as the top-bar arrows, so the reference list and
+  // the buttons cannot drift apart.
+  'history-back': 'app.nav_back',
+  'history-forward': 'app.nav_forward',
   'focus-input': 'hooks.useKeyboardShortcuts.focus_text_input',
+  'focus-approval': 'hooks.useKeyboardShortcuts.focus_pending_approval',
   // Reused: the same command as the chat sidebar's own New chat / Close session
   // controls, so the reference list and the buttons cannot drift apart.
   'new-chat': 'pages.chatSidebar.new_chat',
@@ -367,38 +373,53 @@ export const RESERVED_PANEL_CODES: ReadonlySet<string> = new Set<string>([
 ])
 
 /**
- * Letters usable for chat-jumps 10+ (digit 1–9 stay digits; the 10th session
- * onward gets a letter). a–z minus every letter another unshifted chord owns,
- * so a jump letter can never shadow an existing shortcut:
- *  - c/n/p/s — core panel navigation (CORE_PANEL_MAP)
- *  - k       — shortcuts modal (Alt+K)
- *  - g       — agent monitor (Ctrl+G is literal Ctrl on EVERY platform, so it
- *              collides with the Mac Ctrl-jump mode; excluded uniformly rather
- *              than per-platform so the same session always shows the same
- *              letter on every OS)
- *  - runtime — any code a downstream edition registered via
- *              registerPanelShortcut (EXTRA_PANEL_ROUTES); registration
- *              happens at module init, before any keypress or badge render,
- *              and panels always win over jump letters.
- * Computed per call (not a constant) so the runtime exclusions are honored.
+ * Letters a jump chord must avoid for a reason OTHER than pre-panel routing, so
+ * they are absent from RESERVED_PANEL_CODES and cannot be derived from it: global
+ * Ctrl/⌘ chords that reach hasCommandModifier via plain Ctrl on macOS and would
+ * double-fire with the Mac Ctrl-jump branch. Each is an independent document
+ * listener, so an unexcluded letter fires both actions at once; excluded
+ * uniformly across platforms so a session shows the same letter on every OS.
+ *  - a — select-all in a focusable list (Ctrl/⌘+A)
+ *  - d — split the focused pane (Ctrl/⌘+D)
+ *  - f — message search / Markdown find (Ctrl/⌘+F)
+ *  - g — agent monitor (Ctrl+G, literal Ctrl on every platform)
+ *  - t/w — file-explorer new-folder-tab / close-tab (Ctrl/⌘+T, Ctrl/⌘+W)
  */
-// a: Ctrl/⌘+A select-all (knowledge list, pages/knowledge/index.tsx; plus the
-//    OS-level select-all expectation in any focusable list). d: Ctrl/⌘+D splits
-//    the focused pane (ChatPage.tsx + SessionGridView.tsx). Both collide with
-//    the Mac Ctrl jump branch — and since each is an independent document
-//    listener, an unexcluded chord would fire BOTH actions at once. Excluded
-//    uniformly (like g) so letter assignments match across platforms.
-// f: message search + Markdown find (useMessageSearch.ts, MarkdownPanel.tsx).
-// t/w: file-explorer new-folder-tab / close-tab (FileExplorerPage.tsx). All
-//    three listen via hasCommandModifier — an XOR (metaKey !== ctrlKey), so a
-//    plain Ctrl+letter satisfies it on macOS and would double-fire with the
-//    Mac Ctrl-jump branch. Same class and same fix as a/d above.
-const JUMP_LETTER_STATIC_EXCLUDE = new Set(['a', 'c', 'd', 'f', 'g', 'k', 'n', 'p', 's', 't', 'w'])
+const JUMP_LETTER_GLOBAL_EXCLUDE = new Set(['a', 'd', 'f', 'g', 't', 'w'])
+
+/**
+ * Lowercase letters a pre-panel chord owns, read straight from
+ * RESERVED_PANEL_CODES so the two never drift: a panel or pre-panel Alt+<letter>
+ * chord added to that set — which the extension-seams drift test already forces —
+ * drops its jump letter in the same edit instead of being silently shadowed by
+ * one. Only single-letter Key* codes name a jump letter; the Comma, Enter,
+ * Backquote, Arrow, and Digit codes are not letters and contribute nothing here.
+ */
+function reservedPanelLetters(): Set<string> {
+  const out = new Set<string>()
+  for (const code of RESERVED_PANEL_CODES) {
+    const m = /^Key([A-Z])$/.exec(code)
+    if (m) out.add(m[1].toLowerCase())
+  }
+  return out
+}
+
+/**
+ * Letters usable for chat-jumps 10+ (digit 1–9 stay digits; the 10th session
+ * onward gets a letter). a–z minus every letter another unshifted chord owns —
+ * the pre-panel chords (`reservedPanelLetters`), the global editor chords
+ * (`JUMP_LETTER_GLOBAL_EXCLUDE`), and any code a downstream edition registered
+ * via registerPanelShortcut (`EXTRA_PANEL_ROUTES`, resolved at module init before
+ * any keypress or badge render, panels winning over jump letters). Computed per
+ * call, not a constant, so the runtime exclusions are honored.
+ */
 export function jumpLetters(): string[] {
+  const panelLetters = reservedPanelLetters()
   const out: string[] = []
   for (let i = 0; i < 26; i++) {
     const ch = String.fromCharCode(97 + i)
-    if (JUMP_LETTER_STATIC_EXCLUDE.has(ch)) continue
+    if (panelLetters.has(ch)) continue
+    if (JUMP_LETTER_GLOBAL_EXCLUDE.has(ch)) continue
     if (('Key' + ch.toUpperCase()) in EXTRA_PANEL_ROUTES) continue
     out.push(ch)
   }
@@ -473,29 +494,37 @@ export function registerPanelShortcut(entry: { code: string; path: string; label
 // (Mac detection: use isMacPlatform() — the file's single live detector.)
 
 /**
- * True when `e` is the platform's "open Settings" chord.
+ * True when `e` is the platform's "open Settings" chord, as the registry defines
+ * it: ⌘, on macOS / Ctrl+, on Windows-Linux, plus the Option/Alt+, alias.
  *
- * macOS uses ⌘+, — the OS-standard Preferences chord, and the same one the
- * desktop app's "Settings…" menu item advertises (electron/app-menu.js binds
- * `CmdOrCtrl+,`). Windows/Linux uses Alt+,, matching every other in-page
- * shortcut there.
+ * ⌘, is the OS-standard Preferences chord on macOS, and the one the desktop app's
+ * "Settings…" menu item advertises (electron/app-menu.js binds `CmdOrCtrl+,`);
+ * Ctrl+, is the VS Code convention on Windows/Linux. In the desktop shell the
+ * menu accelerator fires first there, which is fine — same destination.
  *
- * Option+, remains accepted on macOS, unadvertised: a Mac browser can claim
- * ⌘+, as its own Preferences accelerator before the page ever sees the keydown,
- * so dropping the Option chord would leave those users with no keyboard route
- * to Settings. Exactly one primary modifier is required either way, so the
- * chord can't fire from ⌘⌥, or ⌃, misses.
+ * Option/Alt+, stays accepted everywhere, rendered as an alias: a Mac browser can
+ * claim ⌘, as its own Preferences accelerator before the page ever sees the
+ * keydown, so dropping the Option chord would leave those users with no keyboard
+ * route to Settings. Exactly one primary modifier either way, so the chord can't
+ * fire from ⌘⌥, or ⌃, misses.
  *
- * `mac` is injectable so both platform behaviours are testable without
- * reloading the module (IS_MAC is fixed at module load).
+ * Reads the FACTORY defaults, not user overrides: the caller that needs overrides
+ * (the keydown handler) goes through `matchShortcutEvent`. `mac` is injectable so
+ * both platform behaviours are testable without reloading the module (IS_MAC is
+ * fixed at module load).
  */
 export function isSettingsChord(
   e: Pick<KeyboardEvent, 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'>,
   mac: boolean = IS_MAC,
 ): boolean {
-  if (e.code !== 'Comma' || e.shiftKey || e.ctrlKey) return false
-  const altOnly = e.altKey && !e.metaKey
-  return mac ? (e.metaKey && !e.altKey) || altOnly : altOnly
+  if (e.code !== 'Comma') return false
+  const entry = shortcutEntry('open-settings')
+  if (!entry) return false
+  const platform = shortcutPlatform(mac)
+  const ev = { ...e, key: ',' }
+  const primary = entry.defaults[platform]
+  if (primary && chordMatchesEvent(ev, primary, platform)) return true
+  return (entry.aliases?.[platform] ?? []).some(a => chordMatchesEvent(ev, a, platform))
 }
 
 /**
@@ -575,6 +604,14 @@ function isTerminalTarget(target: EventTarget | null): boolean {
   return !!el && typeof el.closest === 'function' && !!el.closest('.xterm')
 }
 
+/** The layout condition that hides the top-bar history arrows, read LIVE at
+ *  keypress so the handler's document listener never re-registers on resize.
+ *  Same breakpoint as `useIsMobile` — one source of truth for "narrow". */
+function isNarrowViewport(): boolean {
+  return typeof window.matchMedia === 'function'
+    && window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`).matches
+}
+
 export function formatShortcut(def: ShortcutDef): string {
   const mac = isMacPlatform()
   const parts: string[] = []
@@ -585,6 +622,52 @@ export function formatShortcut(def: ShortcutDef): string {
   const keyLabel = def.key === 'ArrowLeft' ? '\u2190' : def.key === 'ArrowRight' ? '\u2192' : def.key === '`' ? '`' : def.key === 'Enter' ? (mac ? '\u23ce' : 'Enter') : def.key === ',' ? ',' : def.key === 'Escape' ? '\u238b' : def.key.toUpperCase()
   parts.push(keyLabel)
   return parts.join(mac ? '' : ' + ')
+}
+
+/**
+ * Display caps for a registry chord — {@link formatShortcut} for a `Chord`, so
+ * an alias renders with exactly the glyphs its primary does. Split on the same
+ * separator the surfaces already split `formatShortcut` output on.
+ */
+export function formatChordCaps(chord: Chord, id = ''): string[] {
+  return formatShortcut(shortcutDefFromChord({ id, group: 'actions' }, chord)).split(' + ')
+}
+
+/**
+ * The live display entry for a registry id: the user's override when one is
+ * stored, else the platform default with its aliases. `null` when the id is
+ * unknown or currently unbound. Reads storage once per call — for a reactive
+ * surface use {@link useShortcutBindings}.
+ */
+export function resolveShortcutDef(id: string, overrides: ShortcutOverrides = loadShortcutOverrides()): ShortcutDef | null {
+  const entry = shortcutEntry(id)
+  if (!entry) return null
+  const r = resolveShortcuts(overrides, shortcutPlatform())[id]
+  if (!r?.primary) return null
+  const def = shortcutDefFromChord(entry, r.primary)
+  if (r.aliases.length > 0) def.aliases = r.aliases
+  if (entry.browserReserved) def.browserReserved = true
+  return def
+}
+
+/**
+ * The resolved bindings for every registry id, re-read when Settings (P3) or
+ * another tab writes an override. The keydown handler and the display surfaces
+ * both hold this shape so they cannot disagree about what a chord does.
+ */
+export function useShortcutBindings(): Record<string, ResolvedShortcut> {
+  const [overrides, setOverrides] = useState<ShortcutOverrides>(() => loadShortcutOverrides())
+  useEffect(() => {
+    const refresh = () => setOverrides(loadShortcutOverrides())
+    const onStorage = (e: StorageEvent) => { if (e.key === SHORTCUT_OVERRIDES_KEY) refresh() }
+    window.addEventListener(SHORTCUT_OVERRIDES_EVENT, refresh)
+    window.addEventListener('storage', onStorage)
+    return () => {
+      window.removeEventListener(SHORTCUT_OVERRIDES_EVENT, refresh)
+      window.removeEventListener('storage', onStorage)
+    }
+  }, [])
+  return useMemo(() => resolveShortcuts(overrides, shortcutPlatform()), [overrides])
 }
 
 interface UseKeyboardShortcutsOpts {
@@ -617,6 +700,7 @@ interface UseKeyboardShortcutsOpts {
 export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, disabled }: UseKeyboardShortcutsOpts) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
+  const guardedHistoryStep = useGuardedHistoryStep()
   const appStore = useAppStore()
   const mruIndexRef = useRef(-1)
   // Set true right after a char-producing Alt shortcut (Alt+`) fires inside a
@@ -628,6 +712,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
   const [ctrlDigits, setCtrlDigits] = useState(() => getCtrlDigitsEnabled())
   // In state, not read per keystroke, to keep the hot keydown path off localStorage.
   const [panelBindings, setPanelBindings] = useState<PanelToggleOverrides>(() => loadPanelToggleOverrides())
+  // The registry's resolved chords (defaults + user overrides), same reasoning.
+  const bindings = useShortcutBindings()
 
   // Listen for toggle changes from Settings
   useEffect(() => {
@@ -724,7 +810,7 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       // the leaked flag would blur the composer with no refocus AND silently
       // eat the NEXT pointer-driven switch's autofocus.
       if (isMacPlatform() && key !== activeSlot) releaseComposerForKeyboardSwitch()
-      dispatch(switchSlot(key))
+      dispatch(switchSlot({ key, announceOnMissing: true }))
       navigate('/chat')
     }
 
@@ -736,6 +822,28 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     // text-editing meaning, and that has been the behavior since #4727).
     // Check for that first, before the Alt-based gate.
     const code = e.code
+    // Which registry shortcut this keystroke is, if any — primary or alias, with
+    // the user's overrides applied. `code` FAMILIES (digit/letter jumps, MRU walk,
+    // Alt+arrows, panel nav, the bracket cycle, the instance switcher) never match
+    // here; their branches below own them. A ⌘/Ctrl chord aimed at an embedded
+    // terminal is the PTY's (Ctrl+W is kill-word, Ctrl+N next-history), so it is
+    // not ours to claim — the same rule the bracket and agent-monitor chords apply.
+    // Likewise a ⌘/Ctrl chord a focused editor already claimed (`defaultPrevented`
+    // — CodeMirror's Ctrl+/ toggle-comment, the Pierre editor's ⌘S) stays with the
+    // editor, as the panel toggles already defer. The Option/Alt aliases keep their
+    // shipped behaviour and are not subject to either rule.
+    let hit = matchShortcutEvent(e, bindings, shortcutPlatform())
+    if (hit && (e.ctrlKey || e.metaKey) && (e.defaultPrevented || isTerminalTarget(e.target))) hit = null
+    // The history chords are UN-CLAIMED (nulled, falling through) for TEXT
+    // FIELDS only: there ⌘←/→ is caret line-start/line-end on macOS and
+    // Ctrl+←/→ is word-jump elsewhere, the field consumes the keystroke, and
+    // no browser navigation happens. The narrow-viewport gate is NOT an
+    // unclaim — see the map entries: on macOS an unclaimed ⌘← is the
+    // browser's own Back, which would pop PAST the draft guard whenever its
+    // trap is unarmed (post-reload) and unmount a dirty editor. Narrow
+    // viewports claim the chord and do nothing.
+    if ((hit === 'history-back' || hit === 'history-forward') && isInput) hit = null
+
     if (ctrlDigits && e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
       const jumpIdx = jumpIndexForCode(code)
       // A LETTER is claimed only when it currently maps to a session
@@ -753,17 +861,17 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       }
     }
 
-    // Settings — ⌘+, on macOS, Alt+, on Windows/Linux (see isSettingsChord for
-    // why, and for the Option+, fallback Mac browsers still need). Handled
-    // BEFORE the Alt gate below because the Mac chord carries no Alt. Fires
-    // even when shortcuts are globally disabled, so the user can always reach
-    // the toggle that re-enables them. The `code` test is the cheap fast path
-    // that keeps the predicate off the hot keystroke path.
-    if (code === 'Comma' && isSettingsChord(e)) {
+    // Settings — ⌘, on macOS, Ctrl+, on Windows/Linux, Option/Alt+, alias
+    // everywhere (see the registry entry for why). Handled BEFORE the Alt gate
+    // below because the primary chord carries no Alt. Fires even when shortcuts
+    // are globally disabled, so the user can always reach the toggle that
+    // re-enables them.
+    if (hit === 'open-settings') {
       e.preventDefault()
       navigate('/settings')
       return
     }
+
 
     // ⌘[ / ⌘] on macOS, Ctrl+[ / Ctrl+] on Windows-Linux: step to the
     // previous/next session in sidebar order, wrapping at both ends — the same
@@ -827,86 +935,119 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       return
     }
 
-    // All other shortcuts use Alt (Option on Mac)
-    if (!e.altKey || e.ctrlKey || e.metaKey) return
-
-    // Alt+K: Shortcuts modal — always works, even when disabled or in input
-    if (code === 'KeyK' && !e.shiftKey) {
+    // Shortcuts reference (⌘/ / Ctrl+/, alias Option/Alt+K) — always works, even
+    // when disabled or in an input, so the user can always reach the toggle that
+    // re-enables shortcuts, and can close the modal with the chord that opened it.
+    if (hit === 'shortcuts-modal') {
       e.preventDefault()
       onToggleShortcutsModal()
       return
     }
+
+    // Registry-dispatched actions — the ⌘/Ctrl chords and their Option/Alt
+    // aliases. All of them fire INSIDE text fields on purpose: they are chords
+    // you reach for mid-sentence in the composer (cycle the model, hide the
+    // chrome, start a fresh session), none has a text-editing meaning, and an
+    // isInput bail-out would make each one dead exactly where it is wanted. All
+    // are gated by the global enable and by `disabled` (the modal is open).
+    if (hit !== null) {
+      if (!enabled || disabled) return
+      const actions: Record<string, () => void> = {
+        // Route-history Back/Forward — the keyboard twin of the top-bar arrows
+        // (#8258), through the same guarded step so NavigationBackGuard's draft
+        // trap applies to both identically. Claimed even with nowhere to go,
+        // and claimed on a NARROW viewport as a deliberate no-op: on macOS
+        // browsers ⌘←/⌘→ is ALSO native history back/forward, so an unclaimed
+        // press would pop past the draft guard whenever its trap is unarmed
+        // (post-reload) and unmount a dirty editor — the arrows are hidden
+        // there (drill-ins navigate by component state), and a keystroke that
+        // walked a stack the visible UI does not reflect is the same wrong in
+        // native form. Only the text-field gate unclaims (see the hit-null
+        // above): the field consumes the caret chord and never navigates.
+        'history-back': () => { if (!isNarrowViewport() && canGoBack()) guardedHistoryStep(-1) },
+        'history-forward': () => { if (!isNarrowViewport() && canGoForward()) guardedHistoryStep(1) },
+        'cycle-agent': () => onCycleAgent?.(),
+        'cycle-prev-agent': () => onCyclePrevAgent?.(),
+        'cycle-reasoning': () => onCycleReasoningEffort?.(),
+        'cycle-prev-reasoning': () => onCyclePrevReasoningEffort?.(),
+        'cycle-approval': () => onCycleApprovalMode?.(),
+        'cycle-prev-approval': () => onCyclePrevApprovalMode?.(),
+        'cycle-model': () => onCycleModel?.(),
+        'cycle-prev-model': () => onCyclePrevModel?.(),
+        'toggle-focus-mode': () => onToggleFocusMode?.(),
+        // Focus the pending tool-approval row. Firing while typing is safe HERE
+        // ONLY BECAUSE IT MOVES FOCUS AND NOTHING ELSE — the decision still costs
+        // a second, deliberate press on a control the user can now see is
+        // focused. A chord that ANSWERED the prompt would be a one-keystroke path
+        // to running a tool call nobody read, which is why this one stops at
+        // focus; see queryPendingApprovalAction. Claimed even with no approval
+        // pending: the chord collides with no browser binding, so swallowing it
+        // avoids a stray newline in the draft; nothing is focused in that case.
+        'focus-approval': () => queryPendingApprovalAction()?.focus(),
+        // Focus text input — works even from other inputs. Unguarded on purpose:
+        // a pressed keyboard shortcut proves a keyboard exists —
+        // `focusComposer`'s touch-device skip would wrongly no-op it. Still
+        // synchronous whenever the composer is on screen: the resolver runs its
+        // callback inline in that case. It defers a single frame only when the
+        // composer was COLLAPSED and had to be asked back — without that, "focus
+        // text input" silently did nothing for as long as the user left it
+        // collapsed, which outlives a reload.
+        'focus-input': () => queryComposerOrExpand(ta => ta.focus()),
+        // ⌘N / Ctrl+N (alias Option/Alt+Shift+N): new session.
+        'new-chat': () => onNewChat(),
+        // ⌘W / Ctrl+W (alias Option/Alt+Shift+W): close the current session —
+        // same semantics as the header-menu close (gated by confirmCloseSession,
+        // dispatches deleteSlot). One addition for the NEW chord surface: a
+        // session that is not IDLE always confirms. ⌘W/Ctrl+W is the most
+        // habitual chord there is (it closed the WINDOW in the previous desktop
+        // release on Windows/Linux), and `confirmCloseSession` defaults off — a
+        // default calibrated for the hard-to-mispress ⌥⇧W. An idle session is
+        // losslessly reopenable from the sidebar's older-sessions list, so it
+        // keeps the user's confirm setting; anything else is where a stray
+        // keystroke costs work, so it asks.
+        //
+        // "Not idle" is the sidebar's own lane inference, not `slot.running`: that
+        // flag covers only the slot's own turn and reads FALSE between the cycles
+        // of an armed goal loop, during a dynamic workflow, and while background
+        // sub-agents run — all of which `deleteSlot` retires. Reusing `inferLane`
+        // with the same extras the sidebar computes keeps this gate and the
+        // Working/Waiting/Needs-approval lanes from ever disagreeing.
+        'close-chat': () => {
+          if (!activeSlot) return
+          const slot = slots.find(s => s.key === activeSlot)
+          const state = appStore.getState()
+          const subagentsRunning = selectSidebarSubagentCounts(state)[activeSlot] || 0
+          const lane = slot ? inferLane(slot, {
+            subagentAwaiting: Math.min(selectSidebarApprovalCounts(state)[activeSlot] || 0, subagentsRunning),
+            workflowActive: normalizeRunSessionKey(activeSlot) in selectSidebarWorkflowActive(state),
+            goalLoopActive: selectSidebarAutomationRunningKeys(state).includes(activeSlot),
+            detailedSubagentsRunning: subagentsRunning > 0,
+          }) : 'idle'
+          const modChord = e.metaKey || e.ctrlKey
+          const mustConfirm = loadChatConfig().confirmCloseSession || (modChord && lane !== 'idle')
+          if (!mustConfirm || confirm(i18nT('hooks.useKeyboardShortcuts.close_this_session'))) {
+            dispatch(deleteSlot(activeSlot))
+          }
+        },
+      }
+      // Every `registry` entry has an action here (shortcutRegistry.test pins the
+      // two sets). An id without one is left unclaimed rather than swallowed.
+      const action = Object.prototype.hasOwnProperty.call(actions, hit) ? actions[hit] : undefined
+      if (action) {
+        e.preventDefault()
+        action()
+        return
+      }
+    }
+
+    // The code-driven families below all use Alt (Option on Mac)
+    if (!e.altKey || e.ctrlKey || e.metaKey) return
 
     // Suppress all shortcuts when globally disabled via settings
     if (!enabled) return
 
     // Suppress all other shortcuts when disabled (e.g. modal open)
     if (disabled) return
-
-    // Alt+Shift+A: Cycle agent
-    if (e.shiftKey && code === 'KeyA') {
-      e.preventDefault()
-      onCycleAgent?.()
-      return
-    }
-
-    // Alt+Shift+Z: Previous agent
-    if (e.shiftKey && code === 'KeyZ') { e.preventDefault(); onCyclePrevAgent?.(); return }
-
-    // Alt+Shift+D: Cycle reasoning effort
-    if (e.shiftKey && code === 'KeyD') {
-      e.preventDefault()
-      onCycleReasoningEffort?.()
-      return
-    }
-
-    // Alt+Shift+C: Previous reasoning effort
-    if (e.shiftKey && code === 'KeyC') { e.preventDefault(); onCyclePrevReasoningEffort?.(); return }
-
-    // Alt+Shift+F: Cycle approval mode
-    if (e.shiftKey && code === 'KeyF') { e.preventDefault(); onCycleApprovalMode?.(); return }
-
-    // Alt+Shift+V: Previous approval mode
-    if (e.shiftKey && code === 'KeyV') { e.preventDefault(); onCyclePrevApprovalMode?.(); return }
-
-    // Alt+Shift+S: Cycle model
-    if (e.shiftKey && code === 'KeyS') { e.preventDefault(); onCycleModel?.(); return }
-    // Alt+Shift+X: Previous model
-    if (e.shiftKey && code === 'KeyX') { e.preventDefault(); onCyclePrevModel?.(); return }
-
-    // Alt+Shift+M: Toggle focus mode. Sits with the other Alt+Shift chords, i.e.
-    // BEFORE the isInput gate, on purpose — hiding the chrome is something you
-    // reach for mid-sentence in the composer, so a bail-out there would make the
-    // chord dead exactly where it is wanted.
-    if (e.shiftKey && code === 'KeyM') { e.preventDefault(); onToggleFocusMode?.(); return }
-
-    // Alt+Enter: Focus text input — works even from other inputs
-    if (code === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      // Synchronous and unguarded on purpose: no state change precedes this, so
-      // there is no next-frame commit to wait for, and a pressed keyboard
-      // shortcut proves a keyboard exists — the helper's touch-device skip
-      // would wrongly no-op it.
-      queryComposer()?.focus()
-      return
-    }
-
-    // Alt+Shift+N: New chat (check before Alt+N panel nav)
-    if (e.shiftKey && code === 'KeyN') {
-      e.preventDefault()
-      onNewChat()
-      return
-    }
-
-    // Alt+Shift+W: Close current session (same semantics as the header-menu
-    // close — gated by confirmCloseSession, dispatches deleteSlot)
-    if (e.shiftKey && code === 'KeyW') {
-      e.preventDefault()
-      if (activeSlot && (!loadChatConfig().confirmCloseSession || confirm(i18nT('hooks.useKeyboardShortcuts.close_this_session')))) {
-        dispatch(deleteSlot(activeSlot))
-      }
-      return
-    }
 
     // Alt+Shift+`: Walk back MRU history
     if (e.shiftKey && code === 'Backquote') {
@@ -984,7 +1125,7 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       navigate(panelMap[code])
       return
     }
-  }, [dispatch, navigate, appStore, onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, panelToggleActions, disabled, enabled, ctrlDigits, panelBindings])
+  }, [dispatch, navigate, guardedHistoryStep, appStore, onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, panelToggleActions, disabled, enabled, ctrlDigits, panelBindings, bindings])
 
   // Escape stops in-progress voice read-back. CAPTURE phase so it runs before the command palette's bubble-phase Escape
   // handler, which stopPropagation()s and would otherwise close the palette while

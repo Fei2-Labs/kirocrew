@@ -65,6 +65,59 @@ loses nothing — existence is confirmed read-only under the folder-store lock
 only after the filing has landed, so a refused create leaves no folder-tree
 mutation behind.
 
+### What a created child inherits
+
+Creation copies two different kinds of state, and the split is deliberate.
+
+**Identity** — the child is created in the caller's workspace (the memory
+boundary; a child left in `default` would be both a boundary crossing and
+unaddressable by its own creator), inherits the caller's agent when none is
+named, takes that workspace's project directory as its cwd, and is attributed to
+the caller via `created_by` so the per-creator slot ceiling is countable.
+
+**Approval posture** — the caller's `_trust` and `_trust_reads` transfer, so a
+trusted operator's dispatched worker does not stall on a prompt nobody is
+watching. This is the posture `parent_trusted` already gives a `spawn_run`
+subagent, which reads the parent's stored `"auto"` policy; a `session_create`
+child previously started from `_ChatSlot.__init__`'s empty defaults, so the same
+delegation behaved differently depending only on whether it got a sidebar tab.
+No session-store write happens at creation: the child has no ACP session yet
+(`set_approval_policy` no-ops on a missing session), and `chat_runner` already
+derives the persistable policy from `_trust` on every session create/resume, so
+the subagent spawn gate sees it from the child's first turn.
+
+Two grants are excluded, and the exclusions are load-bearing:
+
+| Not inherited | Why |
+|---|---|
+| `_trusted_patterns` | Per-command grants ("`npm test` is fine"), not a posture. A pattern is judged against the session the operator was LOOKING at, while a dispatched worker runs model-authored work they have not seen, so the same glob can admit a command the grant was never asked about. Inheriting them also pays for itself in neither direction: with `_trust` set the child already auto-approves via `_slot_is_trusted`, so the list is dead weight, and because `chat_runner` matches patterns independently of `_trust` it changes an outcome only when the operator withheld session trust and approved single commands instead — the case that must keep asking |
+| `_trust_scope` | A TTL-bounded, SEL-audited `SafetyOverride` scope, re-checked on every approval. Forking the key would hand a second session a credential whose revocation this path cannot observe, so the child would keep auto-approving after the scope that justified it is gone. An unattended worker that needs one gets its own, from whatever owns its lifecycle |
+
+The posture that transfers is the one held at **allocation**, read off the
+re-resolved caller in the synchronous window after the last gate — not the one
+read on entry. Creation suspends three times before the slot exists (project
+directory, config load, folder confirmation), and an operator selecting `normal`
+in any of those windows would otherwise have a revoked posture resurrected by a
+create already in flight. Revoking mid-call yields an untrusted child.
+
+Nothing about trust is persisted at birth. The birth metadata carries
+`tab_id`, `origin`, `created_at`, `workspace`, `agent`, `project`, `title`,
+`memory_mode`, and `folder_id` / `created_by` when set — no trust field — so a
+restart returns the child to interactive along with its creator.
+
+The create's SEL record carries `agent`, `folder_id`, and what the child was
+born with: `inherited_trust` and `inherited_trust_reads`, present on both
+outcomes so `"false"` is positive evidence the posture did not transfer. That is
+what makes an auto-approved tool call in a dispatched session traceable to the
+creator's posture rather than unexplained.
+
+**Known gap.** Inheritance is transitive — a trusted child is itself an eligible
+creator — and revoking the creator's trust afterwards does not cascade to
+already-born workers, so one click covers a dispatch tree that outlives the
+click's scope. Bounded by the slot caps, by trust being in-memory only, and by
+the global Trust picker (no slot selected), which sets `normal` across every live
+slot. A per-slot revoke that walks `created_by` is tracked in issue #8589.
+
 `kirocrew-dashboard` rather than `kirocrew-core`, because these tools are not a
 capability every session should carry. That server is an **assignable set**: it
 is absent from the default agent's spec and loads only for an agent whose own
@@ -88,21 +141,21 @@ that is out of bounds is visible after the fact even though nothing happened.
 
 | Refusal | Status | Why |
 |---------|--------|-----|
-| Config switch off (`agent.session_control` explicitly `false`) | 403 | Operator withdrew the capability from every agent at once. Defaults to true — the agent's `kirocrew-dashboard` mount is the grant. **Exception:** a crew-member DM slot (`member-*` caller key) bypasses this switch — see "Member callers" below |
+| Config switch off (`agent.session_control` explicitly `false`) | 403 | Operator withdrew the capability from every agent at once. Defaults to true — the agent's `kirocrew-dashboard` mount is the grant. **Exception:** a crew-member DM slot (`member-*` caller key) bypasses this switch while `agent.member_dispatch` is true (its default) — see "Member callers" below |
 | Caller session cannot be identified | 403 | An unidentifiable caller makes the self-target guard blind |
-| Caller is an unattended session (`cron-*`, `workflow-*`) | 403 | A scheduled job acting on live conversations is not a handoff |
+| Caller is an unattended session (`workflow-*`) | 403 | A `workflow-<run_id>` slot exists only once its originating tab is gone, so there is no owning session to fence it to. **Exception:** a cron slot (`cron-*` caller key) is admitted and fenced by creator ownership instead — see "Cron callers" below |
 | Caller is itself incognito, temporary, or app-scoped | 403 | Caller-side isolation — the direction the target-side checks cannot see |
-| Caller is channel-linked (`linked_session_key` set) | 403 | The exfiltration direction: a linked caller's conversation IS a channel thread, so a read would hand a private dashboard transcript to that channel's readers. `CHANNEL_AGENT_BLOCKED_TOOLS` keys on the agent identity; a linked slot is a second route to the same surface |
+| Caller is an APP-owned cron (`created_by` starts `app:`), or a cron whose job cannot be found | 403 | `app_owned_cron_caller` / `cron_owner_unverifiable`. A cron tab is minted without `app=`, so the `_app` check above cannot see an app's own scheduled job; ownership is read from the JOB instead, and an unverifiable owner fails closed — see "Cron callers" below |
+| Caller is channel-linked (`linked_session_key` set) | 403 | The exfiltration direction: a linked caller's conversation IS a channel thread, so a read would hand a private dashboard transcript to that channel's readers. `CHANNEL_AGENT_BLOCKED_TOOLS` keys on the agent identity; a linked slot is a second route to the same surface. **Exception:** a `cron:<job_id>` link, which names the job's own run transcript and republishes to nobody |
 | Caller's own session is no longer open | 403 | Nothing to attribute the operation to |
 | Caller changed workspace while a creation was in flight | 403 | Creation resolves the workspace's project directory off-loop, so it suspends between authorizing the caller and allocating the slot. Both decisions that read the caller's workspace -- the memory boundary the child inherits, and whether the answering agent is bound to that workspace -- are invalidated by a move, and re-deciding the binding here is not available: it needs a config load, which must not run on the event loop |
 | Named agent does not resolve to a configured one | 403 | The resolver falls back to the default agent, which passes the workspace check because it is the caller's own default -- so no boundary is crossed, but the created session would store and advertise a name that is not what answers. `ResolvedBindings.requested_resolved` states that contract for callers that store the requested name. Refused rather than rewritten to the effective agent: nothing exists yet, so a corrected name costs one retry, whereas an existing slot keeps its stored name verbatim so a momentarily stale resolution cannot permanently rebind it |
 | Target is the caller | 403 | A session controlling itself has no exit |
-| Target is unattended (`cron-*`, `workflow-*`) | 403 | A `workflow-<run_id>` slot is display-only and a cron's turns are driven by a schedule |
+| Target is unattended (`cron-*`, `workflow-*`) | 403 | A `workflow-<run_id>` slot is display-only and a cron's turns are driven by a schedule. Not exempted for a cron CALLER: a cron may create and drive its own children, never another job's tab |
 | Target is incognito or temporary | 403 | Never addressable, matching `list_sessions` |
 | Target is app-scoped | 403 | App sessions are the app's, not a peer's |
 | Target is channel-linked (`linked_session_key` set) | 403 | Its conversation is mirrored to Slack/Telegram, so reaching it crosses a surface boundary both ways — and its stop cannot be honoured, because the stop path addresses `dashboard:<slot>` while a linked slot's turns run under its linked key |
 | Target or caller has an outbound channel mirror (`get_mirror_link`) | 403 | The same boundary reached by the other mechanism. `linked_session_key` marks a channel-BORN slot; a dashboard-born slot given a mirror link republishes its turns to a channel just as surely, and the link lives in the session store rather than on the slot, so the slot-side check reads empty on exactly the session that mirrors |
-| Target is a crew-mode session (`mode == "crew"`) | 403 | A crew session's turn lifecycle is not the dashboard's: `/api/chat` routes its input to `state.crew.ingest`, which makes a durable queue entry and fans it out to topic sub-sessions. Refused rather than emulated — a target whose lifecycle differs needs its own handling, not a second copy of the orchestrator's rules |
 | Target is in another workspace | 403 | Workspaces are the memory boundary |
 | Target names no open session | 404 | A mistake, not an authorization failure |
 | Title matches more than one session | 409 | Guessing means acting on the wrong conversation |
@@ -117,8 +170,15 @@ operator configuration. Two rules give it that shape:
 - **The `agent.session_control` switch does not gate a member caller.** Members
   work out of the box — this is the zero-configuration contract, and it is a
   deliberate trade-off: an operator who turned session control off has NOT
-  thereby disabled member dispatch. There is currently no separate switch for
-  it; disabling a member disables its dispatch.
+  thereby disabled member dispatch. The operator ceiling on that bypass is
+  `agent.member_dispatch` (bool, default **true**). Left at its default it
+  reproduces this exactly — the member bypasses the switch. Set to `false`, a
+  member caller stops bypassing and falls back under `agent.session_control`
+  like any ordinary caller, so an operator who withdrew session control can
+  keep member DM threads chat-only without disabling the member itself. The
+  ceiling is read at the switch gate (`member_dispatch_enabled()`) and, like
+  the switch, **fails closed** — an unreadable config withdraws the bypass
+  rather than granting it.
 - **A member caller may only act on sessions it created.** Slot creation records
   `created_by` (the creator's caller key) in the slot's birth metadata; it is
   persisted with the session and rehydrated on restart (both restore paths).
@@ -129,12 +189,44 @@ operator configuration. Two rules give it that shape:
   to member callers unchanged.
 
 Ordinary (non-member) callers are untouched: they still require the switch.
+
+### The fence propagates to what a fenced caller creates
+
+`_caller_is_ownership_fenced` covers three populations, not two: a member DM slot,
+a cron slot, and **anything either of them created**. The third is the one a key
+prefix cannot see, and without it the fence buys nothing. A created child is minted
+with a plain `chat-` key and INHERITS its creator's agent, so a fenced caller
+running a session-control agent would otherwise get an unfenced deputy for free:
+create a child, seed it, and the child — an ordinary caller by key — reads any
+same-workspace session and reports back through the transcript its creator is
+allowed to read.
+
+`_created_by` is the marker, and it needs no lineage walk: `create_session` is its
+ONLY writer, so a non-empty value means "an agent made this session" at any depth.
+A grandchild carries its parent's key there and is fenced by the same test, and a
+chain whose middle slot has been closed cannot fail open because no chain is
+walked. A person's own tab and a fork reach `get_or_create_slot` directly and stay
+unattributed, so ordinary human use is unaffected.
+
+There is deliberately NO attendance exemption. `_ChatSlot._human_seen` looks like
+the right hatch and is not: it records that a human has EVER driven the slot, is
+monotonic and persisted, and says nothing about who authored the turn running now.
+Releasing the fence on it would hand the creator its deputy back for the price of
+the user glancing at the tab once — cron creates the child, the user types into it,
+and from then on every cron-authored turn in that child runs unfenced. The question
+the predicate can answer is "whose authority is this session", not "is a person at
+the keyboard", so a person working in an agent-created session keeps that session's
+reach rather than their own.
 The member-facing tool surface is the ordinary `kirocrew-dashboard` `session_*`
 tool set, mounted **per session** rather than through the on-disk agent
 template: a member DM session's ACP `session/new` **and `session/load`** carry
 the dashboard server as a session-level `mcpServers` entry (built by
 `members.member_dispatch_session_server`, identity via `KIROCREW_SESSION_KEY`
-in the entry's env) — both establishment paths, because `session/load`
+in the entry's env, plus `KIROCREW_BOUND_PORT` — the entry's env is built from
+scratch rather than inherited, and a child left to rediscover the port falls
+through to the run-marker check, which needs an `lsof` view the sandbox's user
+namespace does not have, so a gateway on any non-default port would be dialled
+at the default one) — both establishment paths, because `session/load`
 re-initializes the session's MCP servers, so a resume that skipped the
 injection would strip a member thread of its tools mid-conversation. On the
 KAS backend the wire agent projection additionally grants the server in
@@ -149,11 +241,119 @@ default backend, so a warm hit would skip both the member backend route and
 the mount. The member backend is `agent.member_acp_backend` (default `kas`),
 and requires a wire-capable backend (`ACP_BACKENDS_MEMBER_DISPATCH`: the
 claude seam and KAS); kiro-cli v2 reads its template from disk and exposes no
-per-session channel, so a member session on it runs as plain chat — the tools
-are simply not mounted, never mounted-and-refused. Because the mount is
+per-session channel, so a member session on it runs as plain chat — the
+tools are simply not mounted, never mounted-and-refused. Codex is excluded by a
+scope decision rather than a capability gap: it HAS the per-session mount
+(`providers/mirrors/codex.py`), and its precondition needs no gate of its own —
+`tool_gate.is_enforced` is true for codex because its routing is
+`SESSION_CONFIG`, the one member of `ENFORCED_ROUTINGS`, so
+`_apply_session_permission_routing` refuses the session outright when
+`mode=read-only` cannot be armed. Claude's routing is `SEEDED_SETTINGS`, which
+this core declares and does not enforce, which is why claude must instead OWN
+the `settings.local.json` that decides whether a call asks
+(`_claude_settings_authored`). Mounting session control into a codex DM thread
+is a separate capability and needs its own decision. Because the mount is
 session-scoped, no other session on the same agent template gains the tools,
 preserving the two-part grant for ordinary agents (the switch AND the
 per-agent server assignment).
+
+### Cron callers: unattended admission, bounded by the same fence
+
+A cron job's own slot (`cron-<job_id>`, minted at run start by
+`ensure_cron_slot` so identity exists while the turn runs — with
+`inject_cron_result_to_dashboard` as the idempotent delivery-time fallback
+creator, #8336) is admitted to the surface even though nobody
+is watching it, so a scheduled run can enumerate work and dispatch a session per
+item. Three refusals had to move for that, and one deliberately did not:
+
+- **The unattended caller refusal now covers `workflow-*` only.** What must not
+  happen is a scheduled job reaching the user's OWN conversations, which is a
+  question about scope, not attendance — an unattended job already starts a turn
+  in the session that owns it every time it delivers with
+  `send_message(session="origin")`. A cron can be held to that scope; a workflow
+  result slot cannot, because it is minted only once its originating tab is gone
+  and so has no owner to fence it to. Membership of `UNATTENDED_SLOT_PREFIXES` is
+  the fail direction for any prefix added later: a new unattended surface is
+  refused as a source until it is given a fence of its own.
+- **A `cron:<job_id>` link is exempt from the caller-side channel-link
+  refusals.** Those exist for channel links, where a read lands in front of a
+  Slack or Telegram audience. A cron tab's link names the job's own run
+  transcript and republishes to nobody. The TARGET-side refusal is not exempted.
+- **The `created_by` fence binds a cron caller exactly as it binds a member**
+  (`_caller_is_ownership_fenced` is the single predicate both admissions and the
+  fence read, so they cannot drift). A cron reaches the sessions it created and
+  nothing else, fail-closed on an unowned slot. `unattended_target` still stands,
+  so a cron cannot reach another job's tab.
+- **The global switch still gates a cron.** Unlike a member, a cron gets no
+  bypass: the switch is the user's statement that agents may open and drive
+  sessions at all, and a job running while they are asleep is the last caller
+  that should be exempt from it.
+
+**An APP-owned cron is refused, and ownership is read from the job.** This is the
+one place admitting a cron would otherwise open something. `_app` is how every
+other isolation decision recognises an app, but `inject_cron_result_to_dashboard`
+mints the cron tab WITHOUT `app=`, so an app's own scheduled job arrives with
+`_app == ""` and would pass the check beside it. An app could then create a
+persistent, sidebar-visible session that is not app-scoped, which is exactly the
+confinement escape the `_app` refusal exists to prevent, reached through the app's
+cron instead of its session. `_app_owned_cron_refusal` therefore reads ownership off the job, which has **two
+spellings** because two writers record it differently: the app cron SDK tags
+`created_by = "app:{app_name}"`, while `mcp_cron`'s own `cron_add` records the
+calling session in `session_key` and never writes `created_by` at all — so an
+app-scoped session's job carries its authority only in the second. Both are
+checked, and the second delegates to `_app` on the owning slot (resolved through
+`caller_slot_key`, not a naive `removeprefix`) rather than re-deriving app-ness, so
+there is one definition of "is this an app". **A new job field that can name a
+principal is a hole until it is added to that function.** The refusal code is
+`app_owned_cron_caller`, distinct from `app_scoped_caller` because callers render
+that one with app-session wording that would misdescribe a cron. A job the registry
+cannot produce, or a registry that cannot answer, refuses with
+`cron_owner_unverifiable`: "could not verify the owner" must not read as "has no
+owner", and nothing legitimate is refused by it because a cron whose job is gone is
+not running.
+
+One residual is accepted rather than closed. When `session_key` names a session that
+is no longer open its `_app` cannot be read, and the refusal returns nothing for it.
+Refusing instead would disable dispatch for the ordinary case — a user-created job
+whose authoring tab has since been closed, which is most of them — so the
+fail-closed direction is wrong here in a way it is not for a missing job. What
+bounds the exposure is that the slot has to be gone: while an app's session is live,
+its jobs are refused.
+
+Applied at both
+caller-side sites so the two halves stay mirrors, and scoped to cron callers so no
+other caller pays for the lookup.
+
+In `authorize_target` this refusal sits **before** `_resolve_slot`, unlike the other
+caller-side refusals. A caller refused for its own identity must learn nothing from
+the attempt, and resolving first makes the refusal an existence oracle: a guessed
+target answers `target_not_found` (404) when it does not exist and the refusal (403)
+when it does, so a caller allowed to touch nothing could enumerate the user's
+session keys and titles by the shape of the error. The unattended prefix gate is
+already on that side of the resolution for the same reason. The pre-existing
+caller-side block below the resolution (`app_scoped_caller`, `ephemeral_caller`,
+`linked_session_caller`, `mirrored_caller`) has the same shape and is left as it is
+here: moving those changes refusal precedence for callers that exist today.
+
+A session a cron creates is tagged `SlotOrigin.CRON`, not `USER`. A cron's own
+slot carries that tag so its output stays outside the `slots:user` WS scope, and
+a USER-labelled child would hand it that exposure by the route of creating a
+session and writing there instead. The tag follows the caller's AUTHORITY rather
+than its key prefix, for the same reason the fence does: a child inherits its
+creator's agent, so a cron's child can itself call `create_session`, and a
+prefix-only test mints THAT grandchild `USER` because its caller key is a plain
+`chat-`. `create_session` therefore reads the caller slot's own `_origin` as well,
+which carries the tag transitively to any depth. Only app tokens are filtered by
+origin (`_serialize_for_client` returns the unfiltered payload to a dashboard
+user), so a CRON-origin descendant stays in the sidebar exactly as a cron tab does.
+
+Capability remains bounded per agent, which the slot-key prefix could not see:
+`@kirocrew-dashboard` is an opt-in per-agent server, absent from the default
+agent's spec, so a job whose agent does not mount it never has the verbs at all.
+A cron whose fan-out must run without an approval prompt needs the write verbs in
+its own agent's `allowedTools`; `_CONDUCTOR_DASHBOARD_GRANTS` deliberately
+withholds them, because a conductor agent also runs in dashboard sessions where
+no ownership fence applies.
 
 Two notes on scope:
 
@@ -367,11 +567,36 @@ loop runs with nobody at the keyboard and must not block on an approval no one i
 there to give. An operator who wants folder tools without session control names the
 folder tools individually.
 
+`agent.member_dispatch` (bool, default **true**). The operator ceiling on the
+member switch bypass described under "Member callers". At its default a member DM
+caller bypasses `agent.session_control` — the zero-configuration contract, and
+today's behaviour, so installing this key changes nothing until it is set. Set it
+`false` and a member caller stops bypassing: it falls back under
+`agent.session_control` like any ordinary caller, which lets an operator who
+withdrew session control keep member DM threads chat-only without disabling the
+member. Read at the switch gate via `member_dispatch_enabled()`, and **fails
+closed** everywhere it can go wrong. (1) An unreadable config withdraws the member
+bypass (`member_dispatch_enabled()` returns false on a raising read). (2) A config
+that loads but *discarded the `agent` section* (or the whole file) also withdraws
+it: `load()` does not raise on a malformed section — it drops the section and
+falls back to the permissive `member_dispatch=True` default, recording the loss in
+`degraded_sections`, so `member_dispatch_enabled()` returns false when
+`degraded_sections` names `agent` or the whole-config marker `*`, the same
+"could not read it" vs "was never set" distinction `tailnet_identity_unknown` and
+the publish gate draw. (3) At load time a *missing* key defaults to true (today's
+behaviour) while any *present but malformed* value — including a quoted `"false"`,
+a routine operator quoting mistake — coerces to false BEFORE schema validation, so
+a botched opt-out withdraws the bypass rather than silently leaving it on. This is
+a config-level ceiling, not an enterprise `SCOPE_CATALOG` scope: `session_control`
+itself is a plain `agent.*` bool with no catalog entry, and a scope would need a
+new governance enforcement seam rather than a data-only append, so it is left to a
+follow-up.
+
 ## What is deliberately not here
 
 - **No delivery to a target outside the addressable set.** `session_send` writes
   into another session's conversation, but only one the same `authorize_target`
-  guard admits: a channel-linked, channel-mirrored, crew-mode, incognito,
+  guard admits: a channel-linked, channel-mirrored, incognito,
   app-scoped, unattended or cross-workspace target is refused, so the verb cannot
   reach a conversation other people are party to. The residual is the queued arm's
   second authorization moment, recorded above and tracked as #5911.

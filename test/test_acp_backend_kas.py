@@ -26,6 +26,7 @@ from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
@@ -143,7 +144,7 @@ class TestUnknownBackendRejected:
         assert ACP_BACKEND_KAS in message
         # The message lists what is ACCEPTED, so a known-but-withheld id must not
         # appear in it: naming one would advertise a value the gate then refuses.
-        assert ACP_BACKEND_CODEX not in message
+        assert ACP_BACKEND_GOOSE not in message
 
 
 class TestProviderLabel:
@@ -325,7 +326,6 @@ class TestCompanionRuntimeInheritsBackend:
             "_sandbox_mode",
             "_extra_env",
             "_mcp_gateway_overlay",
-            "_mcp_gateway_settings_mcp_json",
             "_mcp_gateway_socket",
         ):
             setattr(provider.client, attr, None)

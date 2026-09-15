@@ -71,7 +71,10 @@ describe('PierreWorkspaceTree', () => {
     expect(screen.getByRole('status', { name: 'Loading workspace…' })).toBeInTheDocument()
     expect(treeMock.models).toHaveLength(0)
 
-    await waitFor(() => expect(screen.getByTestId('file-tree')).toBeInTheDocument())
+    // `PierreWorkspaceTree` is a `React.lazy` boundary over the `@pierre/trees`
+    // chunk (src/pierre/tree.tsx); the default waitFor timeout (1000ms) races
+    // that dynamic import under a loaded, concurrent run.
+    await waitFor(() => expect(screen.getByTestId('file-tree')).toBeInTheDocument(), { timeout: 5000 })
     expect(screen.queryByRole('status', { name: 'Loading workspace…' })).not.toBeInTheDocument()
   })
 
@@ -85,7 +88,7 @@ describe('PierreWorkspaceTree', () => {
         selectedPath={`${ROOT}/README.md`}
       />,
     ))
-    await waitFor(() => expect(screen.getByTestId('file-tree')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByTestId('file-tree')).toBeInTheDocument(), { timeout: 5000 })
 
     expect(api.projectTree).toHaveBeenCalledWith(ROOT)
     const model = treeMock.last()
@@ -107,6 +110,30 @@ describe('PierreWorkspaceTree', () => {
     await waitFor(() => expect(treeMock.models).toHaveLength(2))
     expect(treeMock.models[0].options).toMatchObject({ initialExpansion: 'closed' })
     expect(treeMock.models[1].options).toMatchObject({ initialExpansion: 'open' })
+  })
+
+  it('remounts a persisting tree when the project directory changes in place', async () => {
+    // The model, the reset guard, and the expansion-capture subscription are
+    // all per-instance: reusing them across projects would leak one project's
+    // expansion into another's view (and into its remembered set), so a
+    // persisting host gets a fresh instance per projectDir.
+    const { rerender } = render(wrap(<PierreWorkspaceTree projectDir={ROOT} persistExpansion />))
+    await waitFor(() => expect(screen.getByTestId('file-tree')).toBeInTheDocument(), { timeout: 5000 })
+    expect(treeMock.models).toHaveLength(1)
+
+    rerender(wrap(<PierreWorkspaceTree projectDir="/repo/other" persistExpansion />))
+    await waitFor(() => expect(treeMock.models).toHaveLength(2))
+  })
+
+  it('keeps one instance across a project change when not persisting', async () => {
+    // Hosts that do not opt into persistence keep the mode-only key — and
+    // with it their exact current single-instance behavior.
+    const { rerender } = render(wrap(<PierreWorkspaceTree projectDir={ROOT} />))
+    await waitFor(() => expect(screen.getByTestId('file-tree')).toBeInTheDocument(), { timeout: 5000 })
+    expect(treeMock.models).toHaveLength(1)
+
+    rerender(wrap(<PierreWorkspaceTree projectDir="/repo/other" />))
+    expect(treeMock.models).toHaveLength(1)
   })
 
   it('defaults to the full-workspace mode', async () => {

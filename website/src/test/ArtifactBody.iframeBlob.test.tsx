@@ -71,6 +71,19 @@ describe('ArtifactBodyIframe document URL lifecycle', () => {
     expect(mintSpy).toHaveBeenCalledWith(HTML_CONTENT)
   })
 
+  it('does not delegate clipboard-write to agent-authored HTML', async () => {
+    // A delegated write permission lets an on-load script overwrite the
+    // clipboard without a Copy action. The injected shim still lets a real
+    // button press fall back to execCommand without widening frame permissions.
+    render(<ArtifactBodyIframe artifact={makeArtifact(HTML_CONTENT)} />)
+    const frame = await waitFor(() => {
+      const el = document.querySelector('iframe')
+      if (!el) throw new Error('frame never mounted')
+      return el as HTMLIFrameElement
+    })
+    expect(frame.hasAttribute('allow')).toBe(false)
+  })
+
   it('builds no blob URL for the frame', async () => {
     render(<ArtifactBodyIframe artifact={makeArtifact(HTML_CONTENT)} />)
     await waitFor(() => expect(mintSpy).toHaveBeenCalled())
@@ -434,9 +447,14 @@ describe('ArtifactBodyIframe surfaces a frame showing something that is not ours
     await waitFor(() => {
       expect(document.querySelector('iframe')?.getAttribute('src'))
         .toBe('/sandbox-doc/fresh/tok')
+      // Same wait, not a synchronous read after it: the notice is cleared in the
+      // commit that registers the fresh document, which can land a frame after
+      // the one that re-pointed `src`. Under load that later frame had not
+      // painted yet and the notice was still on screen -- an assertion against
+      // a state the test had not established (website/docs/testing.md).
+      expect(screen.queryByText(/no longer showing/i)).toBeNull()
     })
     expect(mintSpy).toHaveBeenCalledTimes(2)
-    expect(screen.queryByText(/no longer showing/i)).toBeNull()
   })
 
   it('renders DIFFERENT copy for a failed mint than for a frame that stopped showing', async () => {

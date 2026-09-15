@@ -13,7 +13,7 @@ import platform
 import re
 import shlex
 import shutil
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
+import kiro_crew.config.resolution as _resolution
 from kiro_crew import beacon, platform_compat, stt
 from kiro_crew.acp_backends import selectable_backend_values
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
@@ -36,6 +37,7 @@ from kiro_crew.config.loader import (
     EXTRACTION_POOL_SIZE_MAX,
     EXTRACTION_POOL_SIZE_MIN,
     FOLDER_INGEST_CHUNK_BUDGET_MAX,
+    IMPORT_CHUNK_BUDGET_MAX,
     MAX_SUBAGENTS_FIXED_FLOOR,
     MCP_PROBE_TIMEOUT_MAX,
     MCP_PROBE_TIMEOUT_MIN,
@@ -53,9 +55,12 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_path,
 )
+from kiro_crew.config.sections import STT_LANGUAGE_AUTO
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
+    guard_owner_surface_routes,
+    owner_surface_guard,
     pip_extra_install_command,
     require_owner_dashboard_request,
 )
@@ -68,6 +73,7 @@ from kiro_crew.executors import discovery_executor
 from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
 from kiro_crew.session_workspace import is_valid_id
+from kiro_crew.stt import decoder as stt_decoder
 from kiro_crew.stt import models as stt_models
 from kiro_crew.stt.limits import (
     MAX_IDLE_EVICT_SECS,
@@ -79,8 +85,11 @@ from kiro_crew.stt.limits import (
 from kiro_crew.transcribe import (
     _find_ffmpeg,
     _whisper_language,
+    audio_exceeds_secs,
     availability_detail,
+    batch_duration_cap_secs,
     ensure_ffmpeg_in_path,
+    ffmpeg_source,
     is_available,
 )
 
@@ -106,6 +115,77 @@ _SSE_INTERVAL_SECS = 5
 # distinct from "" so the UI can render a "set (hidden)" placeholder.
 _SENSITIVE_MASK = "••••••••"
 
+# Agent-record fields that carry agent- or package-writable FREE TEXT. An agent
+# can edit ``config.json`` directly, and agent sync copies ``description``
+# straight off a discovered agent spec, so a third-party package controls these
+# strings. They are not schema-``sensitive`` (they are not secrets the OWNER
+# stored), so the schema-driven walk in ``_masked_config_dict`` never touches
+# them — this named list is what closes that gap on the config endpoint.
+#
+# Scope: every ``str`` field of ``KiroCrewAgentConfig`` whose LOAD path does not
+# pin its shape. ``reasoning_effort`` (``coerce_effort`` collapses anything but
+# a known level to ``""``) and ``session_color`` (``_safe_color`` pins to
+# ``#rrggbb``) are excluded because their guards already refuse redactable
+# content; everything else — including fields with only an isinstance-str
+# guard, which constrains type but not content — is in. A test enumerates the
+# dataclass's ``str`` fields against this tuple plus that exception set, so a
+# newly added free-text field fails loudly instead of shipping unmasked.
+#
+# The record KEY (the agent name) is handled separately in the pass below:
+# a suspicious-keyed record is REMOVED from the browser-facing view (masking a
+# key would collide two suspicious records into one entry), and the
+# name-reference fields that could still spell it are masked. The create route
+# does not refuse a credential-shaped name, so this view cannot assume one never
+# arrives.
+_AGENT_UNTRUSTED_TEXT_FIELDS = (
+    "description",
+    "triggers",
+    "kiro_agent",
+    "workspace",
+    "memory_store",
+    "model",
+    "source",
+    "telegram_account",
+)
+
+
+def _mask_agent_free_text(value: object) -> object:
+    """Render ONE agent-record free-text value for the config response.
+
+    Same rule the roster endpoint's rows need: a value the
+    redactors would alter — credential- or exfiltration-URL-shaped text — is
+    replaced WHOLESALE by ``_SENSITIVE_MASK``; a non-string is masked too (it
+    is not renderable content, and ``description`` has no load-time type guard,
+    so one can genuinely arrive here). Benign content passes through
+    byte-identical, so an ordinary stored value renders exactly as written.
+    ``GET /api/agents`` ships these fields verbatim — that half of the class is
+    not this endpoint's.
+
+    A fixed sentinel rather than an in-place scrub: a scrubbed view is a
+    FUNCTION of the stored value, so any future write-side "treat the mask as
+    unchanged" rule would have to recompute the transform and breaks under
+    redaction-chain drift or a stale view; the sentinel is recognizable
+    regardless of either. Named cost: a value containing one credential-shaped
+    token is masked entirely, the same trade ``_masked_config_dict`` already
+    makes for schema-sensitive values.
+
+    Keyed on ``_redact_external`` itself rather than a second detector so this
+    rule and the roster's cannot drift apart. The import is function-local to
+    match this module's handler-import style, not for boot-path weight —
+    ``handlers.agents`` already imports ``discover`` at module level, so it is
+    loaded at handler setup regardless.
+    """
+    from kiro_crew.dashboard.handlers.discover import _redact_external
+
+    if not isinstance(value, str):
+        return _SENSITIVE_MASK
+    # No falsy pre-check on purpose: ``_redact_external`` returns falsy input
+    # unchanged, so ``""`` compares equal and passes through — a ``value and``
+    # guard here would only look like the fail-open bug class without being it.
+    if _redact_external(value) != value:
+        return _SENSITIVE_MASK
+    return value
+
 
 def _masked_config_dict(cfg: KiroCrewConfig) -> dict:
     """Return ``cfg.to_dict()`` with sensitive string values masked.
@@ -117,6 +197,24 @@ def _masked_config_dict(cfg: KiroCrewConfig) -> dict:
     is ever added it MUST treat ``_SENSITIVE_MASK`` as "unchanged" and keep the
     stored value. Sensitivity is schema-driven (``sensitive=True`` field
     metadata), so newly added sensitive fields are masked automatically.
+
+    Two masking passes. The schema walk covers owner-stored secrets
+    (``sensitive=True``). A second pass covers agent-record free text
+    (``_AGENT_UNTRUSTED_TEXT_FIELDS``): those values are agent- and
+    package-writable, so a credential- or exfiltration-URL-shaped one is
+    masked wholesale (``_mask_agent_free_text``) instead of shipping to the
+    browser verbatim. The write-side note above holds for this pass too:
+    neither branch of this endpoint can echo the mask into storage — the
+    PATCH allowlist (``_EDITABLE_CONFIG``) names no ``agents.*`` path, and
+    the PUT branch reads only the singular ``agent`` section against a
+    hardcoded key list. The agents CRUD route is the write path for these
+    fields; its read pair is ``GET /api/agents``, which ships them verbatim —
+    that half of the class needs the same mask plus a mask-means-unchanged
+    write rule this endpoint does not need. Named cost of the wider field set: the overview's config tab renders
+    ``kiro_agent``/``workspace``/``memory_store`` and cross-references the
+    latter two against the workspace and store lists, so a masked value breaks
+    that "used by" row — but only for a record whose value is already
+    credential-shaped, and therefore already meaningless as a reference.
     """
     from kiro_crew.config.schema import JSON_SCHEMA
     from kiro_crew.config.validation import _is_sensitive_path
@@ -135,6 +233,15 @@ def _masked_config_dict(cfg: KiroCrewConfig) -> dict:
     for _extra_key in getattr(cfg, "_extra_sections", {}):
         masked.pop(_extra_key, None)
 
+    # Same reasoning one level down (KiroCrewConfig._extra_keys): an unknown key
+    # captured INSIDE a modelled section — or inside a named agents/workspaces/
+    # memory_stores record — is absent from the schema too, so the sensitivity
+    # walk below cannot recognize it either; a credential a previous build stored
+    # under a since-renamed key (`slack.legacy_bot_token`) would ship verbatim.
+    # Preserving it for save() is the point of the capture; showing it to the
+    # browser is not.
+    _resolution.drop_extra_section_keys(masked, getattr(cfg, "_extra_keys", {}))
+
     def _walk(node: object, prefix: str) -> None:
         if isinstance(node, dict):
             for key, val in list(node.items()):
@@ -149,6 +256,44 @@ def _masked_config_dict(cfg: KiroCrewConfig) -> dict:
                     node[key] = _SENSITIVE_MASK
 
     _walk(masked, "")
+
+    # Second pass: agent-record free text. These fields are absent from the
+    # schema's sensitive set by design (they are not owner secrets), so the walk
+    # above cannot cover them; see _AGENT_UNTRUSTED_TEXT_FIELDS. Both response
+    # sites of this endpoint (the GET body and the PATCH echo) funnel through
+    # this one function, so this pass gives the redaction rule surface coverage
+    # here rather than point coverage.
+    #
+    # The record KEY (the agent name) is handled by REMOVAL, not masking: agent
+    # sync stores a discovered agent's name as this dict's key, so a
+    # credential-shaped package name would ship verbatim as a key — and masking
+    # a key would collide two suspicious records into one entry. Dropping the
+    # record from this browser-facing view (save() still carries it) leaks
+    # nothing and collides nothing; the name-reference fields that could still
+    # spell the removed name (``default_agent``, ``session.pool_agent``) are
+    # masked when they match. Named cost: a suspicious-keyed record is invisible
+    # in the config tab — the same trade the roster's project rows make, and the
+    # name was never renderable content.
+    agents = masked.get("agents")
+    if isinstance(agents, dict):
+        removed: set[object] = set()
+        for name in list(agents.keys()):
+            if not isinstance(name, str) or _mask_agent_free_text(name) != name:
+                agents.pop(name)
+                removed.add(name)
+                continue
+            record = agents[name]
+            if not isinstance(record, dict):
+                continue
+            for field_name in _AGENT_UNTRUSTED_TEXT_FIELDS:
+                if field_name in record:
+                    record[field_name] = _mask_agent_free_text(record[field_name])
+        if removed:
+            if masked.get("default_agent") in removed:
+                masked["default_agent"] = _SENSITIVE_MASK
+            session_section = masked.get("session")
+            if isinstance(session_section, dict) and session_section.get("pool_agent") in removed:
+                session_section["pool_agent"] = _SENSITIVE_MASK
     return masked
 
 
@@ -177,7 +322,7 @@ _DASHBOARD_HTML_NOT_FOUND = (
     " the package before starting the gateway.</p>"
     "<p><strong>Try restarting Kiro Crew.</strong> The exact restart step"
     " depends on your environment: if you installed it as a service use"
-    " <code>kirocrew service restart</code> (systemd / launchd); otherwise"
+    " <code>kirocrew restart</code> (systemd / launchd); otherwise"
     " stop the running <code>kirocrew gateway</code> process and start it"
     " again.</p>"
 )
@@ -320,6 +465,28 @@ async def api_health(request: web.Request) -> web.Response:
     return web.json_response(_liveness_payload(request))
 
 
+async def api_version(request: web.Request) -> web.Response:
+    """GET /api/version — this gateway's exact version, for an authenticated peer.
+
+    Exists because remote execution is fenced by version EQUALITY: a local
+    session may only dispatch its turns to a connected crew running the identical
+    gateway build, since the two ends exchange a wire vocabulary that is not
+    versioned independently. ``/api/health`` cannot answer that question — it
+    reveals ``version`` only to a direct-local caller with a served ``Host``, on
+    purpose, to keep an exact-version fingerprint off the public probe boundary.
+
+    So this route is NOT public. It is deliberately absent from
+    ``token_auth._BYPASS_EXACT`` and from ``origin.PROBE_PATHS``, which means it
+    requires the dashboard credential and a served ``Host`` like any other API
+    route. A peer reads it over its tunnel with the port-scoped cookie the
+    instance manager already mints, exactly as the session-search and
+    session-import carriers do — so nothing is exposed to an anonymous caller
+    that was not exposed before, and the fingerprint decision at
+    :func:`_liveness_payload` stands unchanged.
+    """
+    return web.json_response({"version": kiro_crew.__version__})
+
+
 async def api_live(request: web.Request) -> web.Response:
     """GET /api/live — Kubernetes-style liveness alias for /api/health."""
     return web.json_response(_liveness_payload(request))
@@ -334,11 +501,14 @@ async def api_ready(request: web.Request) -> web.Response:
 
     * **Startup** — before the socket binds, connection failure is the external
       not-ready signal. After bind, ``DashboardState.ready`` remains false and
-      the probe returns 503 while session restoration, channel relaunch, tunnel
-      setup, and other startup work finish.
+      the probe returns 503 while session restoration, tunnel setup, and other
+      pre-ready wiring finishes.
     * **Serving** — the server publishes ``DashboardState.ready = True`` at the
       same final boundary used by the boot-to-ready metric; readiness is then
-      200 while required state is wired and shutdown has not been requested.
+      200 while required control state is wired and shutdown has not been
+      requested. The separately tracked memory preparation task starts at this
+      boundary: memory content routes remain fail-closed and agent turns wait
+      at admission until it settles.
     * **Shutdown requested** — when SIGTERM/SIGINT or ``POST /api/shutdown``
       sets the process-wide ``shutdown_event``, readiness changes to 503 while
       ``/api/live`` remains 200 until the HTTP server exits. Supervisors that
@@ -396,7 +566,7 @@ async def api_ready(request: web.Request) -> web.Response:
 #: non-catalog value degrades gracefully client-side). Membership IS enforced,
 #: but at the point of use: ``context.ui_language_tag`` gates the agent-steer
 #: read path on ``_UI_LANGUAGE_CATALOGS`` so a non-catalog tag is never claimed
-#: to the model as the UI language (#1130). A new backend consumer of
+#: to the model as the UI language. A new backend consumer of
 #: ``dashboard.language`` must route through that resolver rather than reading
 #: the raw field.
 _LANGUAGE_TAG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2}$")
@@ -572,6 +742,9 @@ _CODE_STT_UNAVAILABLE = "stt_unavailable"
 _CODE_STT_MISSING_AUDIO = "stt_missing_audio_field"
 _CODE_STT_AUDIO_TOO_LARGE = "stt_audio_too_large"
 _CODE_STT_FAILED = "stt_transcription_failed"
+#: A decoder fetch asked of a desktop release. Its own payload is the only decoder
+#: it will run, so the remedy is reinstalling the app, not a download.
+_CODE_STT_DECODER_BUNDLED = "stt_decoder_bundled"
 
 #: Background model-download and prewarm tasks, held ONLY so the loop keeps a
 #: strong reference: a task nobody references can be collected mid-await. Both
@@ -775,7 +948,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
             "dictation_panel": cfg.stt.dictation_panel,
             "transcribe_region": cfg.stt.transcribe_region,
             "transcribe_profile": cfg.stt.transcribe_profile,
-            "language_code": cfg.stt.language_code,
+            "language_code": cfg.stt.effective_language_code,
             "silence_ms": cfg.stt.silence_ms,
             "partial_interval_ms": cfg.stt.partial_interval_ms,
             "idle_evict_secs": cfg.stt.idle_evict_secs,
@@ -791,7 +964,10 @@ async def api_stt_config(request: web.Request) -> web.Response:
             # streaming controls on a CAPABILITY rather than on a hardcoded provider
             # name — the latter silently hid the toggle when `apple` was added.
             "streaming_providers": list(_STREAMING_PROVIDERS),
-            "language_codes": list(_STT_LANGUAGE_CODES),
+            "language_codes": (
+                ([STT_LANGUAGE_AUTO] if cfg.stt.provider == PROVIDER_LOCAL else [])
+                + list(_STT_LANGUAGE_CODES)
+            ),
             "prereqs": prereqs,
             # True when no install channel can make Transcribe's import
             # requirement (`boto3` + `amazon-transcribe`) satisfiable in this
@@ -829,7 +1005,7 @@ async def api_stt_status(request: web.Request) -> web.Response:
 
     # availability_detail imports the recogniser (or the AWS client), and each
     # is_present stats a model file: none of it belongs on the loop.
-    def _probe() -> tuple[stt.Availability, list[dict[str, object]], bool]:
+    def _probe() -> tuple[stt.Availability, list[dict[str, object]], bool, str | None]:
         # kiro_crew.stt.engine is imported HERE rather than at module scope: it
         # pulls numpy, and this module is imported on the gateway boot path, where
         # a gateway with speech-to-text switched off would otherwise pay for an
@@ -840,9 +1016,17 @@ async def api_stt_status(request: web.Request) -> web.Response:
             {"name": m.name, "size_bytes": m.size_bytes, "present": stt_models.is_present(m)}
             for m in stt_models.CATALOG
         ]
-        return availability_detail(cfg.stt), catalog, stt_engine.shared_engine().loaded
+        ensure_ffmpeg_in_path()
+        # Resolved on the same thread as the rest: it lists a store directory and,
+        # when a candidate is there, hashes up to 80 MB to authenticate it.
+        return (
+            availability_detail(cfg.stt),
+            catalog,
+            stt_engine.shared_engine().loaded,
+            ffmpeg_source(),
+        )
 
-    detail, catalog, engine_loaded = await asyncio.to_thread(_probe)
+    detail, catalog, engine_loaded, decoder_source = await asyncio.to_thread(_probe)
     present = {str(row["name"]): bool(row["present"]) for row in catalog}
     return web.json_response(
         {
@@ -858,10 +1042,24 @@ async def api_stt_status(request: web.Request) -> web.Response:
             # reader's locale. `present` is why this cannot be a static frontend
             # table: it is per-host state that changes as models are fetched.
             "models": catalog,
-            # Whether a model is resident in this process, which is what decides
-            # between a 30 ms transcription and one that pays a load first.
+            # Residency avoids model loading, but says nothing about decode speed.
             "engine_loaded": engine_loaded,
             "download": dict(stt_models.store().status),
+            # The decoder every compressed input goes through, and what can be
+            # done about it. `source` names WHICH of the three the transcode path
+            # would run, because each one is repaired differently; `auto_fetch`
+            # says whether this host can be fixed in place at all, so the panel
+            # offers a button instead of a shell command; `os`/`arch` are the
+            # GATEWAY's, not the browser's, and are what a hand-off to an agent
+            # session needs in order to name the right remedy.
+            "ffmpeg": {
+                "present": decoder_source is not None,
+                "source": decoder_source,
+                "auto_fetch": _ffmpeg_auto_fetch(),
+                "os": platform.system(),
+                "arch": platform.machine(),
+                "download": dict(stt_decoder.store().status),
+            },
         }
     )
 
@@ -900,6 +1098,63 @@ async def api_stt_prepare(request: web.Request) -> web.Response:
     return web.json_response(
         {"model": model.name, "download": dict(stt_models.store().status)}, status=202
     )
+
+
+#: Values of the status endpoint's ``ffmpeg.auto_fetch``. ``bundled`` is not
+#: "available on a desktop app": a release carries its own authenticated decoder
+#: and repairs itself by being reinstalled, so downloading one there would install
+#: a second decoder the bundled resolver refuses to look at by design.
+AUTO_FETCH_AVAILABLE = "available"
+AUTO_FETCH_UNSUPPORTED = "unsupported"
+AUTO_FETCH_BUNDLED = "bundled"
+
+
+def _ffmpeg_auto_fetch() -> str:
+    """Whether this host's decoder can be fetched, and if not, why not."""
+    if platform_compat.is_bundled_interpreter():
+        return AUTO_FETCH_BUNDLED
+    if stt_decoder.artifact_for() is None:
+        return AUTO_FETCH_UNSUPPORTED
+    return AUTO_FETCH_AVAILABLE
+
+
+async def api_stt_ffmpeg_download(request: web.Request) -> web.Response:
+    """POST /api/stt/ffmpeg/download — start, or join, the decoder fetch.
+
+    Answers 202 with the current transfer state and lets the caller poll
+    ``GET /api/stt/status``, for the same reason ``POST /api/stt/prepare`` does: a
+    ~30 MB wheel is not something to hold a request open behind. Concurrent
+    callers share one transfer through the store's own lock.
+
+    Refused on a bundled interpreter rather than quietly answering 202: a desktop
+    release already carries an authenticated decoder, its resolver deliberately
+    never looks anywhere else, and so a fetch there would spend the operator's
+    bandwidth on a file nothing can use.
+    """
+    denied = _deny_app_token(request, "stt.ffmpeg_download")
+    if denied is not None:
+        return denied
+    auto_fetch = _ffmpeg_auto_fetch()
+    if auto_fetch != AUTO_FETCH_AVAILABLE:
+        return web.json_response(
+            {
+                "error": "no decoder can be fetched for this install",
+                "code": (
+                    stt_decoder.CODE_UNSUPPORTED
+                    if auto_fetch == AUTO_FETCH_UNSUPPORTED
+                    else _CODE_STT_DECODER_BUNDLED
+                ),
+                "auto_fetch": auto_fetch,
+            },
+            status=409,
+        )
+    store = stt_decoder.store()
+    if store.status.get("stage") != stt_decoder.STAGE_DOWNLOADING:
+        # Skipped while a transfer is already running purely so a polling panel
+        # cannot accumulate tasks; the store's lock, not this check, is what makes
+        # concurrent callers safe.
+        _spawn_stt_background(store.ensure())
+    return web.json_response({"download": dict(store.status)}, status=202)
 
 
 async def api_stt_prewarm(request: web.Request) -> web.Response:
@@ -954,7 +1209,19 @@ def _transcribe_extra_importable() -> bool:
 
 
 def _ffmpeg_install_commands() -> list[str]:
-    """System-decoder fallback for source installs without the ``voice`` extra."""
+    """System-decoder commands a source install can actually run, else ``[]``.
+
+    An empty list means "there is nothing a terminal can usefully be told here",
+    and the Settings page then offers the decoder fetch or a hand-off to an agent
+    session instead. It is not the same as "nothing is wrong": ``ffmpeg.present``
+    on ``GET /api/stt/status`` is what says whether a decoder exists.
+
+    There is deliberately no fallback command. A distribution with no FFmpeg
+    package (Amazon Linux, RHEL without EPEL) and no build script in reach gets an
+    empty list rather than ``echo 'Build ffmpeg from source: …'``: a command a user
+    pastes into a terminal only to get a URL echoed back -- one whose only effect is
+    to print a sentence -- is a dead end wearing the costume of an instruction.
+    """
     ensure_ffmpeg_in_path()
     if _find_ffmpeg():
         return []
@@ -965,8 +1232,9 @@ def _ffmpeg_install_commands() -> list[str]:
         return ["winget install --id Gyan.FFmpeg"]
     if shutil.which("apt-get"):
         return ["sudo apt-get install -y ffmpeg"]
-    # Amazon Linux: no ffmpeg in the distro repos — build minimal ffmpeg from
-    # source (the official recommendation).
+    # Amazon Linux: no ffmpeg in the distro repos. A source build is the only
+    # honest answer, and only when the script is actually present -- naming a path
+    # that does not exist is worse than saying nothing.
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
     script = os.path.join(proj, "scripts", "build-ffmpeg.sh") if proj else ""
     if script and os.path.isfile(script):
@@ -975,7 +1243,7 @@ def _ffmpeg_install_commands() -> list[str]:
             " || sudo yum install -y gcc make nasm diffutils",
             f"bash {shlex.quote(script)}",
         ]
-    return ["echo 'Build ffmpeg from source: https://ffmpeg.org/releases/'"]
+    return []
 
 
 def _stt_prereq_commands(provider: str = "local") -> list[str]:
@@ -1074,7 +1342,29 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
                 {"error": "audio too large", "code": _CODE_STT_AUDIO_TOO_LARGE}, status=413
             )
 
-        text = await transcribe_audio(tmp)
+        duration_cap = batch_duration_cap_secs(cfg.stt)
+        if duration_cap is not None:
+            exceeds = await audio_exceeds_secs(tmp, duration_cap, timeout_secs=cfg.stt.timeout_secs)
+            if exceeds is None:
+                return web.json_response(
+                    {
+                        "error": "could not verify audio duration; retry the upload",
+                        "code": "stt_audio_duration_unverified",
+                    },
+                    status=503,
+                )
+            if exceeds:
+                return web.json_response(
+                    {
+                        "error": (
+                            f"audio exceeds the {duration_cap // 60}-minute transcription limit"
+                        ),
+                        "code": "stt_audio_too_long",
+                    },
+                    status=422,
+                )
+
+        text = await transcribe_audio(tmp, cfg.stt)
         if text:
             from kiro_crew.security import (  # noqa: F811
                 redact_credentials,
@@ -1127,8 +1417,8 @@ async def api_sel_verify(request: web.Request) -> web.Response:
 
     ``integrity`` is ``unverifiable`` when the segment dir refused to pin (or
     was swapped mid-verification): the rotated segments were not checked, and
-    the endpoint must not answer ``ok`` over the live log alone (#5051
-    review). ``detail`` carries the reason and is empty when verifiable.
+    the endpoint must not answer ``ok`` over the live log alone. ``detail``
+    carries the reason and is empty when verifiable.
     """
 
     # Same offload rationale as api_sel_events, including deferring _sel() into
@@ -1209,37 +1499,41 @@ async def api_security_posture(_request: web.Request) -> web.Response:
 # caller raising it arbitrarily (e.g. {"subagent_auto_max": 9999}) to bypass
 # the concurrency limit.
 
-# Agent settings whose ENFORCED effect is fixed at gateway startup.
-# ``SubagentManager`` is constructed with ``max_subagents`` and
-# ``subagent_max_turns`` and never re-reads the config afterwards;
-# ``max_concurrent`` is stored once with no setter, and ``subagent_auto_max``
-# only reaches that enforced value as the ``hard_cap`` inside
-# ``compute_max_subagents``, which the same construction calls.
-#
-# Precisely: persisting one of these does NOT change what the running gateway
-# ENFORCES. It is not inert, though — the advisory cap advertised to the model
-# re-resolves from config on each read, so after a write the reported cap can
-# move while the enforced one stays put. That divergence is pre-existing and
-# deliberate (overflow queues, so the advertised number is guidance rather than
-# a limit); this constant describes only the enforced side, which is what the
-# restart is for.
-#
-# ``dynamic-subagent-sizing.md`` states the contract this mirrors: "The cap is
-# computed once per gateway start. Restart to recompute." The ``restart_required``
-# response field is the existing convention for exactly this case — the channel
-# config handlers already return it for settings read at boot, and the frontend
-# API client already types it.
-#
-# ``conductor_skill`` is deliberately absent: it is applied inline by this
-# handler (the skill file is regenerated/removed in-request), so it takes effect
-# immediately and must not raise the restart hint.
-_STARTUP_READ_AGENT_KEYS = frozenset(
-    {
-        "max_subagents",
-        "subagent_max_turns",
-        "subagent_auto_max",
-    }
-)
+
+def _changed_paths_need_restart(changed: Iterable[str]) -> bool:
+    """Whether any of the dotted *changed* paths is declared ``restart=True``.
+
+    The schema metadata is the ONE statement of which fields a running gateway
+    cannot adopt; every other field is hot-applied by the config watcher, so a
+    handler never keeps its own list of boot-only keys. ``changed`` must hold
+    only paths whose value actually moved -- the dashboard sends every setting on
+    each save, so "was applied" is not "was changed".
+    """
+    from kiro_crew.config.schema import requires_restart
+
+    return any(requires_restart(p) for p in changed)
+
+
+async def _hot_apply_after_write() -> None:
+    """Run one watcher cycle so the handler answers after the cycle has dispatched.
+
+    With the watcher started this is the same path a CLI or ``$EDITOR`` write
+    takes, only synchronous. Every applier the cycle awaits has run when this
+    returns; the two that deliberately run off the cycle -- a channel reconnect
+    and a provider switch -- are scheduled by it and may still be in flight when
+    the handler answers. Before boot arms the watcher (or in a test that never
+    did) the loader's cache drop already makes the next ``load()`` see the
+    write, so there is nothing further to do.
+    """
+    from kiro_crew.config import live
+
+    w = live.watch()
+    if not w.started:
+        return
+    try:
+        await w.refresh_now()
+    except Exception:
+        logger.exception("config hot-apply after write failed; next poll retries")
 
 
 async def api_kirocrew_config(request: web.Request) -> web.Response:
@@ -1358,22 +1652,12 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
                 agent["max_subagents"] = val
                 applied.append("max_subagents")
 
-            for key in ("conductor_skill",):
-                if key in agent_settings:
-                    val = agent_settings[key]
-                    if not isinstance(val, bool):
-                        _validation_error.append((f"{key} must be a boolean", 400))
-                        return None
-                    agent[key] = val
-                    applied.append(key)
-
             if not applied:
                 _validation_error.append(("no recognized settings provided", 400))
                 return None
 
-            restart_required = any(
-                key in _STARTUP_READ_AGENT_KEYS and agent.get(key) != before.get(key)
-                for key in applied
+            restart_required = _changed_paths_need_restart(
+                f"agent.{key}" for key in applied if agent.get(key) != before.get(key)
             )
             _result["applied"] = applied
             _result["restart_required"] = restart_required
@@ -1382,11 +1666,7 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
         try:
             async with _get_config_lock():
                 try:
-                    # update_config_locked returns the final config dict (after
-                    # mutation); use it directly rather than re-reading from disk
-                    # (a blocking read on the loop, and it writes the callback's
-                    # output verbatim — there is no concurrent merge to observe).
-                    final = await asyncio.to_thread(
+                    await asyncio.to_thread(
                         update_config_locked, cfg_path, mutate=_mutate_config_put
                     )
                 except ConfigReadError:
@@ -1406,34 +1686,12 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
                     return _deny(msg, status)
 
                 applied: list[str] = _result["applied"]  # type: ignore[assignment]
-                agent = final.get("agent") or {}
                 _sel().log_api_access(
                     caller=caller,
                     operation="config.update",
                     outcome="ok",
                     resources=",".join(applied),
                 )
-                # Regenerate or clean up conductor skill on toggle. Held INSIDE
-                # the lock so a concurrent enable/disable cannot interleave and
-                # leave the persisted flag disagreeing with the skill file on
-                # disk (config says enabled while SKILL.md is absent, or vice
-                # versa).
-                if "conductor_skill" in applied:
-                    if agent.get("conductor_skill"):
-                        from kiro_crew.dashboard.handlers.agents import (  # noqa: F811
-                            _regen_conductor,
-                        )
-
-                        _regen_conductor()
-                    else:
-                        try:
-                            from kiro_crew.skills import SkillsLoader  # noqa: F811
-
-                            p = SkillsLoader()._dir / "conductor" / "SKILL.md"
-                            if p.exists():
-                                p.unlink()
-                        except Exception:
-                            logger.exception("Failed to clean up conductor skill")
         except OSError:
             _sel().log_api_access(
                 caller=caller,
@@ -1447,6 +1705,7 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
             )
 
         restart_required: bool = _result["restart_required"]  # type: ignore[assignment]
+        await _hot_apply_after_write()
         return web.json_response({"ok": True, "restart_required": restart_required})
 
     cfg = KiroCrewConfig.load()
@@ -1497,7 +1756,7 @@ def _validate_role_model(
     reuse the per-session provider guard (rejects display-only canonical keys for
     the active provider), then — when a live advertised set is known — apply the
     SAME entitlement predicate the session-init withhold uses
-    (:func:`model_is_unusable`, #1596) so the picker and the wire cannot disagree.
+    (:func:`model_is_unusable`) so the picker and the wire cannot disagree.
     No advertised set => accept (entitlement unknowable; don't accuse on no
     evidence), matching that predicate's own conservative default.
 
@@ -1556,11 +1815,10 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # Which ACP agent drives a session: "" = kiro-cli, "kas" = kiro-agent.
     # ``values_fn`` rather than a literal, because the set WIDENS after this module
     # is imported: an edition registers a backend from
-    # ``ProviderRegistry.register_acp_backends`` at boot, and the old literal left
-    # it rejected here with a misleading "invalid value". Resolved per request
-    # against the one code owner, so this can no longer drift from what
-    # ``AcpProvider`` will actually serve — which is what the parity test used to
-    # stand in for.
+    # ``ProviderRegistry.register_acp_backends`` at boot, and a literal would
+    # reject it here with a misleading "invalid value". Resolved per request
+    # against the one code owner, so this cannot drift from what ``AcpProvider``
+    # will actually serve.
     "agent.acp_backend": {"type": "enum", "values_fn": _selectable_acp_backends},
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
@@ -1621,6 +1879,8 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     },
     "agent.sandbox": {"type": "enum", "values": ["auto", "off"]},
     "agent.sandbox_allow_no_isolation": {"type": "bool"},
+    "agent.tool_search": {"type": "bool"},
+    "memory.private_provisioning_enabled": {"type": "bool"},
     "agent.completion_keep": {"type": "enum", "values": ["head", "tail", "both"]},
     "agent.completion_keep_chars": {
         "type": "int",
@@ -1634,7 +1894,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     },
     "session.timeout_secs": {"type": "int", "min": SESSION_TIMEOUT_MIN, "max": SESSION_TIMEOUT_MAX},
     # Range shared with the load-time clamp in config/loader.py — one constant
-    # pair, so the write gate and the load path cannot drift (issue #4734).
+    # pair, so the write gate and the load path cannot drift.
     "session.autocompact_pct": {
         "type": "float",
         "min": AUTOCOMPACT_PCT_MIN,
@@ -1684,6 +1944,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # terminal — the save-time check exists to surface a typo immediately in
     # the Settings field.
     "dashboard.terminal.shell": {"type": "str", "max_len": 512},
+    # The Terminal tab's completion popup (Settings → Display → Terminal).
+    # Default on; the completion route reads it per request (handlers/
+    # terminal.py `_completion_disabled`), so a toggle takes effect on the
+    # next keystroke with no restart. The whole-panel `terminal.enabled`
+    # stays config-file-only: it also kills the PTY, which is not a display
+    # preference.
+    "dashboard.terminal.completion.enabled": {"type": "bool"},
     # Keep the host awake while the agent is running a task. Gateway-host
     # behavior (not a display pref), read by the prevent-sleep poll in
     # dashboard/server.py; off by default.
@@ -1730,6 +1997,11 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # empty allowlist stays off; an unrecognised pin_scope falls back to node).
     "dashboard.tailscale.trust_identity": {"type": "bool"},
     "dashboard.tailscale.pin_scope": {"type": "str", "max_len": 8},
+    # Refresh-chain peer binding. Editable here because the only
+    # direction a caller can move it is the one an operator may legitimately
+    # need for roaming, and the loader resolves anything non-boolean back to the
+    # bound default — so a malformed write cannot reopen the replay path.
+    "dashboard.tailscale.bind_refresh_chains": {"type": "bool"},
     # Local OTEL metric collection — the Privacy panel's recording switch. Safe
     # to expose where beacon_endpoint is not: turning this on writes JSONL under
     # ~/.kiro/crew/metrics. It is NOT unconditionally local, though —
@@ -1767,6 +2039,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     },
     "knowledge.dedup_every_n_sweeps": {"type": "int", "min": 0, "max": DEDUP_EVERY_N_SWEEPS_MAX},
     "knowledge.sweep_chunk_budget": {"type": "int", "min": 0, "max": SWEEP_CHUNK_BUDGET_MAX},
+    "knowledge.import_chunk_budget": {"type": "int", "min": 0, "max": IMPORT_CHUNK_BUDGET_MAX},
     "knowledge.embed_rate_limit": {"type": "int", "min": 0, "max": EMBED_RATE_LIMIT_MAX},
     "knowledge.extraction_model": {"type": "str"},
     "knowledge.extraction_pool_size": {
@@ -2323,104 +2596,67 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 
     cfg = verified_cfg or KiroCrewConfig.load()
 
-    # If provider changed, reload the factory so new sessions use the new provider
-    if path_key == "agent.provider":
-        state: DashboardState = request.app["state"]
-        # Refresh agent artifacts so the target provider is immediately usable.
-        # For claude_code this (re)writes ~/.claude/agents/kirocrew.mcp.json —
-        # the MCP registry the claude-agent-acp backend reads at session/new —
-        # picking up any servers installed while on kiro. Best-effort: a failure
-        # here must not block the provider switch (gateway boot also rebuilds).
-        try:
-            from kiro_crew.agent import rebuild_agent_config  # noqa: F811  circular import
+    # One watcher cycle, so a dashboard PATCH, ``kirocrew config set`` and an
+    # ``$EDITOR`` save all apply through the same path. It dispatches the
+    # registered appliers -- the provider switch, the background role-model
+    # rebuild, the log level and the metrics recorder -- so none of those is
+    # re-applied by hand below: doing both would run ``reload_provider_factory``
+    # twice and take live sessions down a second time.
+    await _hot_apply_after_write()
 
-            await asyncio.to_thread(rebuild_agent_config)
-        except Exception:
-            logger.warning("Agent config rebuild after provider switch failed", exc_info=True)
-        await state.sessions.reload_provider_factory()
-        # Clear model on all slots — aliases are provider-specific
-        for slot in state._slots.values():
-            if slot.model:
-                slot.model = ""
-                # Deliberate model change: bump the pick generation so the
-                # fallback restore probe drops any sticky state instead of
-                # restoring a model id from the previous provider.
-                slot._model_pick_gen += 1
-        state.push_slots_update()
-        logger.info(
-            "Provider switched to %s — config rebuilt, factory reloaded, slot models cleared", value
-        )
+    from kiro_crew.config import live
 
+    # The keys below have NO registered applier in this build, so the cycle above
+    # does not reach them and a write would only take effect after a gateway
+    # restart. Each one is applied here until it earns a ``live.subscribe`` owner.
     # The default model and default reasoning effort are captured when the
-    # provider factory is built (at gateway startup), so a config write alone
-    # would not reach new sessions until a restart. refresh_defaults() rebuilds
-    # the factory and drains the warm pool WITHOUT touching live sessions —
+    # provider factory is built (at gateway startup). refresh_defaults() rebuilds
+    # the factory and drains the warm pool WITHOUT touching live sessions --
     # reload_provider_factory() must NOT be used here: it clears _sessions and
-    # shuts every provider down, which is correct for a provider switch but
-    # would kill in-flight turns just because a default changed.
+    # shuts every provider down, which is correct for a provider switch but would
+    # kill in-flight turns just because a default changed.
     if path_key in (
         "agent.model",
         "agent.reasoning_effort",
     ) or path_key.startswith("agent.role_efforts."):
-        state = request.app["state"]
-        await state.sessions.refresh_defaults()
-        logger.info("%s set to %r — session defaults refreshed", path_key, value)
+        state: DashboardState | None = request.app.get("state")
+        if state is not None:
+            await state.sessions.refresh_defaults()
+            logger.info("%s set to %r — session defaults refreshed", path_key, value)
 
-    # A backend switch is the same hazard as the provider switch above, one level
-    # down: a model id is namespaced to the harness that advertised it, so a slot
-    # still holding kiro's id would apply it to the new backend and be refused at
-    # the wire. The provider block clears slot models for exactly this reason;
-    # `agent.acp_backend` needs it too. The provider factory captures the backend
-    # when it is built, so refresh it and drain prewarmed providers before any new
-    # session can inherit the old adapter. refresh_defaults(), NOT
-    # reload_provider_factory(): live sessions keep the adapter they started on,
-    # matching the Settings disclosure. Keyed on `backend_switched` rather than on
-    # the path, so re-saving the current backend costs nothing.
+    # A backend switch is the provider switch's hazard one level down: a model id
+    # is namespaced to the harness that advertised it, so a slot still holding
+    # kiro's id would apply it to the new backend and be refused at the wire. The
+    # provider applier clears slot models for exactly this reason; ``acp_backend``
+    # needs it too. refresh_defaults(), NOT reload_provider_factory(): live
+    # sessions keep the adapter they started on, matching the Settings
+    # disclosure. Keyed on ``backend_switched`` rather than on the path, so
+    # re-saving the current backend costs nothing.
     if backend_switched:
         state_after_switch: DashboardState = request.app["state"]
         await state_after_switch.sessions.refresh_defaults()
-        # Best-effort by design: the config write has ALREADY committed by this
-        # point, so a problem clearing in-memory slot state must not turn a
-        # successful save into a 500 and leave the operator believing the switch
-        # did not happen. The stale slot model is re-cleared on the next switch
-        # and is refused harmlessly at the wire meanwhile.
+        # Best-effort by design: the config write has ALREADY committed, so a
+        # problem clearing in-memory slot state must not turn a successful save
+        # into a 500 and leave the operator believing the switch did not happen.
         try:
             for slot in state_after_switch._slots.values():
                 if slot.model:
                     slot.model = ""
-                    # Match the provider-switch path above: a fallback restore
-                    # probe that started before this clear must not repopulate
-                    # the previous backend's model after the switch commits.
+                    # A fallback restore probe that started before this clear
+                    # must not repopulate the previous backend's model after the
+                    # switch commits.
                     slot._model_pick_gen += 1
             state_after_switch.push_slots_update()
         except Exception:
             logger.warning("Could not clear slot models after backend switch", exc_info=True)
 
-    # The background role model is baked into the lite / heartbeat kiro specs at
-    # agent-build time, so a change must rewrite them to take effect without a
-    # restart. The subagent role is read live at spawn (_subagent_default_model),
-    # so it needs no rebuild. Chat-default inheritance for both roles is picked
-    # up by the refresh_defaults above when agent.model changes.
-    if path_key == "agent.role_models.background":
-        try:
-            from kiro_crew.agent import rebuild_agent_config
-
-            await asyncio.to_thread(rebuild_agent_config)
-            logger.info(
-                "agent.role_models.background set to %r — background agent specs rebuilt", value
-            )
-        except Exception:
-            logger.warning("background-model rebuild failed", exc_info=True)
-
-    # If completion-keep mode or budget changed, propagate to the live
-    # SubagentManager so the next subagent to complete uses the new value.
-    # Without this the manager keeps the values it cached at gateway
-    # startup and the Settings UI change would only take effect after a
-    # gateway restart.
+    # Completion-keep mode and budget are cached by the live SubagentManager at
+    # gateway startup, so the next subagent to complete would otherwise use the
+    # old value until a restart.
     if path_key in ("agent.completion_keep", "agent.completion_keep_chars"):
-        state = request.app["state"]
-        if state.subagents is not None:
-            state.subagents.update_completion_keep(
+        state_keep: DashboardState = request.app["state"]
+        if state_keep.subagents is not None:
+            state_keep.subagents.update_completion_keep(
                 cfg.agent.completion_keep,
                 cfg.agent.completion_keep_chars,
             )
@@ -2430,23 +2666,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                 cfg.agent.completion_keep_chars,
             )
 
-    # The metrics recorder is built once per process and memoized, so a config
-    # write alone would leave the Telemetry panel reporting "on" while every
-    # metric call site stayed a no-op. Dropping the cached recorder makes the next
-    # get_recorder() rebuild from the value just written — collection starts (or
-    # stops, flushing what it had) without a restart. This reaches the gateway
-    # process, which is where the session/turn/HTTP metrics are recorded; other
-    # kirocrew processes pick the value up when they next start.
-    if path_key == "telemetry.enabled":
-        try:
-            # to_thread: shutdown() flushes the exporter and joins the reader
-            # thread, both of which block.
-            await asyncio.to_thread(_metrics_provider.shutdown)
-            logger.info("telemetry.enabled set to %r — metrics recorder rebuilt", value)
-        except Exception:
-            logger.warning("metrics recorder reset after telemetry toggle failed", exc_info=True)
-
-    return web.json_response(_masked_config_dict(cfg))
+    applied = live.snapshot()
+    if applied is None:
+        applied = await asyncio.to_thread(KiroCrewConfig.load)
+    return web.json_response(_masked_config_dict(applied))
 
 
 # ── Local token bootstrap (Electron / local apps) ─────────────────────
@@ -2485,6 +2708,24 @@ async def api_token_local(request: web.Request) -> web.Response:
             resources="invalid-secret",
         )
         return web.json_response({"error": "invalid secret"}, status=403)
+    from kiro_crew.member_memory_auth import local_owner_bootstrap_allowed
+
+    if not await asyncio.to_thread(local_owner_bootstrap_allowed, request):
+        _sel().log_api_access(
+            caller="local-process",
+            operation="token.local",
+            outcome="denied",
+            source="local-bootstrap",
+            resources="unverified-owner-process",
+        )
+        return web.json_response(
+            {
+                "error": "The gateway could not verify this process as the local owner. "
+                "Open the dashboard using its CLI login link on the gateway host.",
+                "code": "member_owner_token_refused",
+            },
+            status=403,
+        )
     ttl = MAX_SESSION_TTL_SECS
     ttl_param = request.query.get("ttl", "")
     if ttl_param:
@@ -2528,8 +2769,8 @@ def _invalid_session_path_id(session_id: str, agent_id: str | None = None) -> we
     set the path join refuses, no wider (a narrower guard would break the ``:``
     in a real key like ``dashboard:slot-3``) and no narrower (a wider one puts
     the 500 back). Shape follows ``cron.py``'s ``_invalid_path_id_response`` --
-    400 with an ``invalid_<name>`` ``code`` -- which is the contract #6301 names
-    and which AGENTS.md's code-field rule requires.
+    400 with an ``invalid_<name>`` ``code`` -- the contract
+    docs/system-specs/common/code-style.md requires of a backend-owned error body.
 
     ``agent_id`` is checked second because that is the order the sinks validate
     in, so the reported code names the half the caller must actually fix.
@@ -2805,3 +3046,18 @@ async def api_app_token(request: web.Request) -> web.Response:
         source="app_auth",
     )
     return web.json_response({"token": token})
+
+
+# The session sub-agent routes are owner surfaces under their own audit labels;
+# any other ``api_session_agent*`` handler is refused to private members under
+# its name.
+guard_owner_surface_routes(
+    globals(),
+    prefix="api_session_agent",
+    member_scoped=frozenset(),
+    resource_scoped={
+        "api_session_agents_list": owner_surface_guard("session.agents.list"),
+        "api_session_agent_result": owner_surface_guard("session.agent.result"),
+        "api_session_agent_stream": owner_surface_guard("session.agent.stream"),
+    },
+)

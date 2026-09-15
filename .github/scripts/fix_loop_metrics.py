@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import statistics
 import subprocess
 import sys
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 FIX_SUBJECT_RE = re.compile(r"^(fix|revert)([(!:]|\b)", re.I)
 # Trailing '(#N)' of a squash-merge subject; the LAST number is the PR.
@@ -81,21 +83,26 @@ def removed_ranges(fix_sha: str) -> dict[str, list[tuple[int, int]]]:
 def dominant_culprit(fix_sha: str, ranges: dict[str, list[tuple[int, int]]]) -> str | None:
     votes: dict[str, int] = {}
     for path, spans in ranges.items():
-        for a, b in spans:
-            out = git(
-                "blame",
-                "-l",
-                "-w",
-                "-M",
-                "-C",
-                f"-L{a},{b}",
-                f"{fix_sha}^",
-                "--",
-                path,
-                check=False,
-            )
-            for sha in BLAME_SHA_RE.findall(out):
-                votes[sha] = votes.get(sha, 0) + 1
+        # ONE blame per file, every removed hunk as its own -L. Blame walks the
+        # file's history once per invocation regardless of how many lines -L
+        # asks for, so the per-hunk form paid that walk again for every hunk of
+        # the same file (256 hunks across 67 files in a 20-fix sample: 2.6x the
+        # wall time for byte-identical culprits). -M/-C stay: dropping copy
+        # detection changes the dominant culprit on ~10% of fixes.
+        out = git(
+            "blame",
+            "-l",
+            "-w",
+            "-M",
+            "-C",
+            *(f"-L{a},{b}" for a, b in spans),
+            f"{fix_sha}^",
+            "--",
+            path,
+            check=False,
+        )
+        for sha in BLAME_SHA_RE.findall(out):
+            votes[sha] = votes.get(sha, 0) + 1
     if not votes:
         return None
     return max(votes, key=lambda s: votes[s])
@@ -117,6 +124,22 @@ def classify_fix(fix_sha: str) -> tuple[str, str | None, int | None]:
     if m:
         return "traced_to_pr", m.group(1), age_days
     return "no_pr", None, age_days
+
+
+def classify_fixes(shas: list[str]) -> list[tuple[str, str | None, int | None]]:
+    """classify_fix over every sha, in input order, a few fixes at a time.
+
+    Each fix is an independent chain of git subprocesses, so the work is
+    embarrassingly parallel and the GIL is irrelevant. The pool is bounded by
+    the CPU count: blame is CPU-bound in git itself, so more workers than cores
+    only adds contention. Order is preserved so the output is deterministic
+    regardless of which fix finishes first.
+    """
+    workers = max(1, min(8, os.cpu_count() or 1))
+    if workers == 1 or len(shas) < 2:
+        return [classify_fix(s) for s in shas]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(classify_fix, shas))
 
 
 def bucket(age_days: int) -> str:
@@ -247,30 +270,110 @@ def has_harvest_section(body: str) -> bool:
     return bool(HARVEST_HEADING_RE.search(body) and HARVEST_ANSWER_RE.search(body))
 
 
-def harvest_metrics(repo: str, since_iso: str) -> dict:
-    """since_iso is the exact UTC timestamp of the window start; the gh search
-    uses its date as a coarse pre-filter and mergedAt enforces the precise
-    boundary, keeping this window identical to the git-history window."""
-    prs = gh_json(
-        "pr",
-        "list",
-        "--repo",
-        repo,
-        "--state",
-        "merged",
-        "--search",
-        f"merged:>={since_iso[:10]}",
-        "--limit",
-        "1000",
-        "--json",
-        "title,body,mergedAt,baseRefName,headRefOid",
-    )
-    if len(prs) >= 1000:
-        raise RuntimeError(
-            "gh pr list hit its 1000-item cap; the harvest denominator would be "
-            "truncated. Narrow the window or paginate before publishing."
+def _local_pr_evidence(since_iso: str) -> bool | None:
+    """Whether the checkout's own history shows PR-merged commits since *since_iso*.
+
+    Read-only and cheap: a squash merge leaves a '(#N)' subject trailer and a
+    merge commit answers `--merges`; either is proof PRs merged in the window.
+    Returns None when git cannot answer authoritatively (shallow checkout, git
+    unavailable), so the caller falls back to a coarser rule.
+
+    Deliberately scoped to the checked-out branch: the scheduled run checks
+    out the default branch, which is also the harvest's own scope, and
+    scanning every ref would let a feature branch's merge commits manufacture
+    evidence against a legitimately quiet window. Known edge: `--since`
+    filters on committer date, so a backport cherry-picked onto the checked-
+    out branch keeps its '(#N)' subject with a fresh date and reads as
+    evidence -- a dispatch run against a release branch can fail loud on a
+    quiet window, which is the accepted cost of never publishing a false
+    zero on the branch the metric is actually about.
+    """
+    try:
+        if run(["git", "rev-parse", "--is-shallow-repository"]).strip() != "false":
+            return None
+        subjects = run(["git", "log", f"--since={since_iso}", "--format=%s"])
+        if any(PR_TRAILER_RE.search(s) for s in subjects.splitlines()):
+            return True
+        return bool(run(["git", "log", "--merges", f"--since={since_iso}", "--oneline"]).strip())
+    except (OSError, RuntimeError):
+        return None
+
+
+def merged_prs_since(repo: str, since_iso: str) -> list[dict]:
+    """Every PR merged at or after since_iso, one search per calendar day.
+
+    GitHub search returns at most 1000 items per query and the repo merges
+    ~950 PRs a week, so a single `merged:>=<date>` search overflows on any
+    window past seven days (and will on a busy seven). Per-day chunks stay far
+    under the cap; each is still checked, because a day that overflows would
+    silently truncate the denominator this metric exists to make trustworthy.
+    """
+    start = datetime.strptime(since_iso[:10], "%Y-%m-%d").date()
+    end = datetime.now(timezone.utc).date()
+    prs: list[dict] = []
+    seen: set[str] = set()
+    day = start
+    while day <= end:
+        chunk = gh_json(
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "merged",
+            "--search",
+            f"merged:{day.isoformat()}",
+            "--limit",
+            "1000",
+            "--json",
+            "number,title,body,mergedAt,baseRefName,headRefOid",
         )
-    prs = [p for p in prs if (p.get("mergedAt") or "") >= since_iso]
+        if len(chunk) >= 1000:
+            raise RuntimeError(
+                f"gh pr list hit its 1000-item cap for merged:{day}; the harvest "
+                "denominator would be truncated. Chunk finer before publishing."
+            )
+        for p in chunk:
+            # A PR merged near midnight UTC can be returned by two adjacent
+            # day searches; identity is the PR number, head sha as fallback.
+            key = str(p.get("number") or p.get("headRefOid") or "")
+            if key and key not in seen:
+                seen.add(key)
+                prs.append(p)
+        day += timedelta(days=1)
+    window = [p for p in prs if (p.get("mergedAt") or "") >= since_iso]
+    if not window:
+        # An empty window is legitimate only when the checkout agrees. The
+        # search surface omits nodes the token cannot read instead of
+        # erroring, so a permissions gap looks exactly like a quiet week --
+        # and this metric's whole contract is to never publish that.
+        evidence = _local_pr_evidence(since_iso)
+        if evidence:
+            raise RuntimeError(
+                f"gh pr list returned zero merged PRs since {since_iso}, yet the "
+                "checkout's own history shows commits that merged through PRs. "
+                "The search surface omits nodes the token cannot read instead "
+                "of erroring, so the probable cause is a token without "
+                "`pull-requests: read` -- failing loud rather than publishing "
+                "a false zero."
+            )
+        if evidence is None and (end - start).days >= 1:
+            raise RuntimeError(
+                f"gh pr list returned zero merged PRs since {since_iso} over a "
+                "window of at least one full day, and git cannot confirm the "
+                "window is empty (shallow checkout or git unavailable). Either "
+                "the window is genuinely quiet or the token lacks "
+                "`pull-requests: read`; re-run on a full-depth checkout to tell "
+                "the two apart rather than publishing a possible false zero."
+            )
+    return window
+
+
+def harvest_metrics(repo: str, since_iso: str) -> dict:
+    """since_iso is the exact UTC timestamp of the window start; the per-day gh
+    searches use its date as a coarse pre-filter and mergedAt enforces the
+    precise boundary, keeping this window identical to the git-history window."""
+    prs = merged_prs_since(repo, since_iso)
     fix_prs = [p for p in prs if FIX_SUBJECT_RE.match(p.get("title") or "")]
 
     # Two exclusions, both answering "was this PR ever asked for a section?".
@@ -342,8 +445,7 @@ def main() -> int:
     ages: list[int] = []
     age_counts = {name: 0 for name, _ in AGE_BUCKETS}
     culprit_votes: dict[str, int] = {}
-    for sha in capped:
-        cls, culprit_pr, age = classify_fix(sha)
+    for cls, culprit_pr, age in classify_fixes(capped):
         classes[cls] += 1
         if age is not None:
             ages.append(age)

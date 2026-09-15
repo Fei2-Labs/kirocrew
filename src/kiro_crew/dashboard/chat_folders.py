@@ -251,7 +251,7 @@ async def _unhide_folder(state: DashboardState, folder_id: str) -> bool:
 # caller here must be a conscious edit paired with a test, never a silent
 # widen — the point of the header is that a NEW internal caller surfaces as
 # ``unknown-internal`` in the audit until someone decides what to call it,
-# instead of silently inheriting another component's label (#3503).
+# instead of silently inheriting another component's label.
 _KNOWN_INTERNAL_CALLERS = frozenset({"kirocrew-dashboard"})
 
 
@@ -314,7 +314,7 @@ def _validate_project_dir(raw: str) -> tuple[str, str | None]:
     if not raw:
         return "", None
     if not os.path.isabs(raw) and not raw.startswith("~"):
-        return "", "project_dir must be an absolute path"
+        return "", "Project directory must be an absolute path"
     resolved = os.path.realpath(os.path.expanduser(raw))
     if is_sensitive_path(resolved):
         sel().log_api_access(
@@ -326,19 +326,19 @@ def _validate_project_dir(raw: str) -> tuple[str, str | None]:
         )
         return "", "project_dir refers to a sensitive path"
     if not os.path.isdir(resolved):
-        return "", "project_dir must be an existing directory"
+        return "", "Project directory must be an existing directory"
     return resolved, None
 
 
 def _folder_project_overlap_denied(resolved: str) -> str | None:
     """Pre-flight the voice-runtime workspace guard for a folder's project_dir.
 
-    #7392 review round 3: a folder's linked project lands on slots verbatim, so
-    without this check "link a folder to ~" is refused only at agent spawn.
+    A folder's linked project lands on slots verbatim, so without this check
+    "link a folder to ~" is refused only at agent spawn.
     Same shared scan and message as the project endpoint and set_project — the
     user-driven moments of choice agree. Returns the refusal message or None.
 
-    Synchronous on purpose (realpath/mkdir priming on first use — round 4):
+    Synchronous on purpose (realpath/mkdir priming on first use):
     callers on the event loop MUST run it via ``asyncio.to_thread``, exactly
     like the project endpoint does. It is deliberately NOT part of
     ``_validate_project_dir``: that validator also re-checks STORED values on
@@ -493,6 +493,224 @@ def _is_descendant(folders: list[dict], *, ancestor_id: str, folder_id: str) -> 
     return False
 
 
+class FolderCreateError(ValueError):
+    """A folder could not be created because the request was refused.
+
+    Carries the two halves of the folder API's 400 body: ``str(exc)`` is the
+    advisory prose a surface renders, ``code`` the machine-readable id it
+    branches on (empty for the refusals the folder API answers without one).
+    """
+
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class FolderOwnershipError(FolderCreateError):
+    """Refused because an app tried to nest under a folder it does not own.
+
+    Split from :class:`FolderCreateError` because the folder API answers it
+    differently (403 plus a denied SEL entry, not a plain 400), and the
+    response shape belongs to the caller — so the caller must be able to tell
+    this refusal apart without string-matching the message.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "cannot create a folder inside one this app does not own",
+            "folder_not_owned",
+        )
+
+
+class FolderCapError(FolderCreateError):
+    """Refused because the folder store is at its ceiling.
+
+    Split from :class:`FolderCreateError` for the same reason
+    :class:`FolderOwnershipError` is: the folder API answers it differently
+    (429, a retryable capacity refusal, not a plain 400), so a caller must be
+    able to tell it apart without string-matching the message.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            f"folder cap reached ({MAX_CHAT_FOLDERS})",
+            "folder_cap_reached",
+        )
+
+
+async def create_folder_record(
+    state: DashboardState,
+    *,
+    name: str,
+    parent_id: str = "",
+    project_dir: str = "",
+    default_agent: str = "",
+    color: str = "",
+    request_app: str = "",
+    tags: list[str] | None = None,
+    unique_project_dir: bool = False,
+    require_resolved_project_dir: bool = False,
+) -> dict[str, Any]:
+    """Validate one folder and append it to the store under the folders lock.
+
+    The single create path. Callers that build folders for the user — the folder
+    API below, project scaffolding — go through here, so none of them can end up
+    with weaker path validation, a dangling ``parent_id``, weaker app-ownership
+    isolation, or an unserialized store write than the others get. What stays
+    with the caller is what differs between them: the response shape, the audit
+    entry, and when to push a slots update (once per folder for a single create,
+    once for a whole scaffold).
+
+    ``request_app`` is the calling app's identity (empty when a person is
+    calling): it is stamped as ``owner_app`` and gates nesting under folders
+    other apps own. Never taken from a request body — a caller that could name
+    its own owner could name someone else's (see ``_folder_owner_app``).
+
+    ``tags`` is a shape-checked list of tag ids the caller wants copied onto
+    every new chat filed into this folder (the folder API validates the request
+    shape and answers 400 ``tags_invalid`` itself). The AUTHORITATIVE vocabulary
+    intersection still runs here, under ``tags_write_lock``, at the point of
+    application — the invariant every tag consumer follows (see
+    api_chat_slot_tags / the channel filing): a tag deletion committing between
+    the caller's shape check and this write must not be persisted onto the new
+    folder, and the strip pass a deletion runs cannot see a folder that is not
+    yet in the store. Included in the folder dict only when the intersection is
+    non-empty — the same optional-key shape as ``color``, so a tagless folder
+    keeps the record it has on disk today.
+
+    Returns:
+        The created folder, exactly as it was appended to the store.
+
+    ``unique_project_dir`` makes "one folder per directory" atomic: the check
+    runs inside the locked append, so two concurrent creators of the same
+    ``project_dir`` cannot both observe it absent and both persist a folder —
+    the loser is refused with code ``folder_project_dir_exists`` and can read
+    the winner's folder after the fact. Off by default because the folder API
+    has always allowed a person to point two folders at one directory by hand;
+    only a caller whose own contract is "additive, skip what exists" (the
+    scaffold) opts in.
+
+    ``require_resolved_project_dir`` refuses a ``project_dir`` whose validation
+    resolves to a different path than the caller named (code
+    ``folder_project_dir_moved``). A caller that sets it is asserting its input
+    is already canonical — the scaffold passes paths its scan just resolved and
+    walked, so a resolution that lands elsewhere means a path component was
+    swapped (typically for a symlink) between the scan and this create, and
+    persisting the resolved target would bind the folder to a directory the
+    scan never confirmed. Off by default because the folder API proper accepts
+    ``~`` and symlinked paths from a person by design; resolution moving those
+    is the feature, not an attack.
+
+    Raises:
+        FolderCreateError: if the folder was refused (unusable name, missing
+            parent, unusable ``project_dir``, unknown color, or a
+            ``unique_project_dir`` collision).
+        FolderOwnershipError: if an app tried to nest under a folder it does
+            not own.
+    """
+
+    name = name.strip()[:100]
+    if not name:
+        raise FolderCreateError("name required")
+    if parent_id and not any(f["id"] == parent_id for f in state._folders):
+        raise FolderCreateError("parent folder not found")
+    requested_dir = project_dir.strip()
+    # Off-loop: realpath + isdir + the sensitive-path scan touch the filesystem,
+    # and the scaffold calls this once per folder in a loop, so a slow or
+    # network-mounted directory would otherwise stall every other request.
+    project_dir, err = await asyncio.to_thread(_validate_project_dir, requested_dir)
+    if err:
+        raise FolderCreateError(err)
+    if require_resolved_project_dir and project_dir != requested_dir:
+        # The caller vouched its path was already canonical, so a resolution
+        # that lands elsewhere means the directory on disk is no longer the one
+        # the caller confirmed — refuse rather than persist the substitute.
+        raise FolderCreateError(
+            "That directory was moved or replaced after the scan — re-scan and retry",
+            "folder_project_dir_moved",
+        )
+    if project_dir:
+        # Off-loop: the shared scan primes runtime paths on first use.
+        conflict = await asyncio.to_thread(_folder_project_overlap_denied, project_dir)
+        if conflict is not None:
+            raise FolderCreateError(conflict, "workspace_overlaps_data_home")
+    color = color.strip().lower()
+    if color and not _is_valid_folder_color(color):
+        # `code` is the contract, `error` is advisory prose (RFC 9457 3.1.3) —
+        # the dashboard renders `error` verbatim into a localized UI, so a new
+        # error response without an id is untranslatable by construction.
+        raise FolderCreateError("color must be one of the folder palette values", "color_invalid")
+    folder: dict[str, Any] = {
+        "id": uuid.uuid4().hex[:12],
+        "name": name,
+        "order": len(state._folders),
+        "collapsed": False,
+        "hidden": False,
+        "parent_id": parent_id,
+        "project_dir": project_dir,
+        "default_agent": default_agent,
+    }
+    if color:
+        folder["color"] = color
+    if request_app:
+        folder["owner_app"] = request_app
+
+    def _append(folders: list[dict[str, Any]]) -> tuple[bool, str]:
+        # Re-check the parent under the lock. Its existence was validated before
+        # the lock was taken, so a concurrent delete of that parent would
+        # otherwise land this folder with a dangling parent_id — the same
+        # pre-lock/post-lock gap the reparent path re-tests.
+        parent = next((f for f in folders if f["id"] == parent_id), None) if parent_id else None
+        if parent_id and parent is None:
+            return False, "parent_not_found"
+        # The ceiling is tested here, under the lock, for the same reason the parent
+        # is re-checked here: `len(folders)` is only authoritative while the lock is
+        # held, so a pre-lock test lets concurrent creators each pass a cap that is
+        # already full.
+        if len(folders) >= MAX_CHAT_FOLDERS:
+            return False, "folder_cap_reached"
+        # Nesting into a folder writes to THAT folder's child list, so an app may
+        # only nest under one of its own. The top level is not a folder row and
+        # so has no owner to violate — that is where an app's own tree starts.
+        # Decided here rather than pre-lock because a reparent racing this
+        # request can change who the parent belongs to.
+        if request_app and parent is not None and _folder_owner_app(parent) != request_app:
+            return False, "forbidden_parent"
+        # Under the lock, not pre-lock: a pre-lock read is exactly the
+        # check-then-act gap that lets two concurrent creators both see the
+        # directory unclaimed.
+        if (
+            unique_project_dir
+            and project_dir
+            and any(str(f.get("project_dir") or "") == project_dir for f in folders)
+        ):
+            return False, "project_dir_exists"
+        folder["order"] = len(folders)  # recount under the lock
+        folders.append(folder)
+        return True, ""
+
+    if tags:
+        async with tags_write_lock(state):
+            refreshed, _ = _validate_folder_tags(state, tags)
+            if refreshed:
+                folder["tags"] = refreshed
+            create_err = await state.mutate_folders(_append)
+    else:
+        create_err = await state.mutate_folders(_append)
+    if create_err == "folder_cap_reached":
+        raise FolderCapError()
+    if create_err == "parent_not_found":
+        # The parent was deleted while this request waited for the lock.
+        raise FolderCreateError("parent folder not found", "folder_parent_not_found")
+    if create_err == "forbidden_parent":
+        raise FolderOwnershipError()
+    if create_err == "project_dir_exists":
+        raise FolderCreateError(
+            "a folder for this directory already exists", "folder_project_dir_exists"
+        )
+    return folder
+
+
 async def api_chat_folder_create(request: web.Request) -> web.Response:
     """POST /api/chat/folders — create a project folder."""
     state: DashboardState = request.app["state"]
@@ -525,38 +743,11 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    name = (body.get("name") or "").strip()[:100]
-    if not name:
-        return web.json_response({"error": "name required"}, status=400)
-    parent_id = str(body.get("parent_id") or "")
-    if parent_id and not any(f["id"] == parent_id for f in state._folders):
-        return web.json_response({"error": "parent folder not found"}, status=400)
-    project_dir = str(body.get("project_dir") or "").strip()
-    project_dir, err = _validate_project_dir(project_dir)
-    if err:
-        return web.json_response({"error": err}, status=400)
-    if project_dir:
-        # Off-loop: the shared scan primes runtime paths on first use (round 4).
-        conflict = await asyncio.to_thread(_folder_project_overlap_denied, project_dir)
-        if conflict is not None:
-            return web.json_response(
-                {"error": conflict, "code": "workspace_overlaps_data_home"}, status=400
-            )
-    default_agent = str(body.get("default_agent") or "").strip()
-    color = str(body.get("color") or "").strip().lower()
-    if color and not _is_valid_folder_color(color):
-        # `code` is the contract, `error` is advisory prose (RFC 9457 3.1.3) —
-        # the dashboard renders `error` verbatim into a localized UI, so a new
-        # error response without an id is untranslatable by construction.
-        return web.json_response(
-            {"error": "color must be one of the folder palette values", "code": "color_invalid"},
-            status=400,
-        )
     # Organizational tags copied onto every new chat filed into this folder.
-    # Validated exactly like the slot-tags endpoint (ids from the live
-    # vocabulary), and included in the folder dict only when non-empty — the
-    # same optional-key shape as `color`, so a tagless folder keeps the record
-    # it has on disk today.
+    # Shape-checked here — the request-facing half, so a non-array payload is
+    # refused before any folder work happens — while the AUTHORITATIVE
+    # vocabulary intersection runs in ``create_folder_record``, under the tags
+    # write lock, at the point of application.
     folder_tags: list[str] = []
     if "tags" in body:
         clean_tags, tags_err = _validate_folder_tags(state, body.get("tags"))
@@ -565,85 +756,24 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
                 {"error": tags_err or "tags invalid", "code": "tags_invalid"}, status=400
             )
         folder_tags = clean_tags
-    folder = {
-        "id": uuid.uuid4().hex[:12],
-        "name": name,
-        "order": len(state._folders),
-        "collapsed": False,
-        "hidden": False,
-        "parent_id": parent_id,
-        "project_dir": project_dir,
-        "default_agent": default_agent,
-    }
-    if color:
-        folder["color"] = color
-    if folder_tags:
-        folder["tags"] = folder_tags
     # Never from the body: a caller that could name its own owner could name
     # someone else's. Written only when an app is calling, so the person's rows
     # keep the shape they have on disk today and "absent means the person"
     # stays the one representation (see _folder_owner_app).
     request_app = _effective_request_app(state, request)
-    if request_app:
-        folder["owner_app"] = request_app
-
-    def _append(folders: list[dict[str, Any]]) -> tuple[bool, str]:
-        # Re-check the parent under the lock. Its existence was validated before
-        # the lock was taken, so a concurrent delete of that parent would
-        # otherwise land this folder with a dangling parent_id — the same
-        # pre-lock/post-lock gap the reparent path re-tests.
-        parent = next((f for f in folders if f["id"] == parent_id), None) if parent_id else None
-        if parent_id and parent is None:
-            return False, "parent_not_found"
-        # The ceiling is tested here, under the lock, for the same reason the parent
-        # is re-checked here: `len(folders)` is only authoritative while the lock is
-        # held, so a pre-lock test lets concurrent creators each pass a cap that is
-        # already full.
-        if len(folders) >= MAX_CHAT_FOLDERS:
-            return False, "folder_cap_reached"
-        # Nesting into a folder writes to THAT folder's child list, so an app may
-        # only nest under one of its own. The top level is not a folder row and
-        # so has no owner to violate — that is where an app's own tree starts.
-        # Decided here rather than pre-lock because a reparent racing this
-        # request can change who the parent belongs to.
-        if request_app and parent is not None and _folder_owner_app(parent) != request_app:
-            return False, "forbidden_parent"
-        folder["order"] = len(folders)  # recount under the lock
-        folders.append(folder)
-        return True, ""
-
-    if folder_tags:
-        # The AUTHORITATIVE intersection runs here, at the point of application,
-        # under ``tags_write_lock`` — the invariant every tag consumer follows
-        # (see api_chat_slot_tags / the channel filing): a tag deletion
-        # committing between the early shape check and this write must not be
-        # persisted onto the new folder, and the strip pass a deletion runs
-        # cannot see a folder that is not yet in the store.
-
-        async with tags_write_lock(state):
-            refreshed, _ = _validate_folder_tags(state, folder_tags)
-            if refreshed:
-                folder["tags"] = refreshed
-            else:
-                folder.pop("tags", None)
-            create_err = await state.mutate_folders(_append)
-    else:
-        create_err = await state.mutate_folders(_append)
-    if create_err == "folder_cap_reached":
-        return web.json_response(
-            {
-                "error": f"folder cap reached ({MAX_CHAT_FOLDERS})",
-                "code": "folder_cap_reached",
-            },
-            status=429,
+    parent_id = str(body.get("parent_id") or "")
+    try:
+        folder = await create_folder_record(
+            state,
+            name=str(body.get("name") or ""),
+            parent_id=parent_id,
+            project_dir=str(body.get("project_dir") or ""),
+            default_agent=str(body.get("default_agent") or "").strip(),
+            color=str(body.get("color") or ""),
+            request_app=request_app,
+            tags=folder_tags,
         )
-    if create_err == "parent_not_found":
-        # The parent was deleted while this request waited for the lock.
-        return web.json_response(
-            {"error": "parent folder not found", "code": "folder_parent_not_found"},
-            status=400,
-        )
-    if create_err == "forbidden_parent":
+    except FolderOwnershipError as exc:
         sel().log_api_access(
             caller=request_app,
             operation="chat.folder_create",
@@ -652,13 +782,18 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
             resources=f"parent={parent_id}",
             error="app cannot create inside a folder it does not own",
         )
-        return web.json_response(
-            {
-                "error": "cannot create a folder inside one this app does not own",
-                "code": "folder_not_owned",
-            },
-            status=403,
-        )
+        return web.json_response({"error": str(exc), "code": exc.code}, status=403)
+    except FolderCapError as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=429)
+    except FolderCreateError as exc:
+        # Inline literals rather than one hoisted payload dict: the error-code
+        # contract scan reads the body at the `json_response` site, and a local
+        # reads as an opaque body there (test/test_error_code_contract.py). The
+        # wire shape is unchanged — `code` appears only when the refusal carries
+        # one, exactly as the pre-extraction handler answered.
+        if exc.code:
+            return web.json_response({"error": str(exc), "code": exc.code}, status=400)
+        return web.json_response({"error": str(exc)}, status=400)
     state.push_slots_update()
     source, caller = _audit_origin(request)
     sel().log_api_access(
@@ -747,7 +882,7 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         if err:
             return web.json_response({"error": err}, status=400)
         if pd:
-            # Off-loop: the shared scan primes runtime paths on first use (round 4).
+            # Off-loop: the shared scan primes runtime paths on first use.
             conflict = await asyncio.to_thread(_folder_project_overlap_denied, pd)
             if conflict is not None:
                 return web.json_response(
@@ -1059,13 +1194,11 @@ def _effective_request_app(state: DashboardState, request: web.Request) -> str:
     Reads the claim ``token_auth_middleware`` publishes, and re-derives through
     the SAME shared rule (``token_auth.derive_caller_app``) when it is absent.
 
-    This route used to carry its own copy of the derivation, because the
-    internal-secret transport (the managed MCP set) carries no app claim of its
-    own and this was the only route compensating. The middleware now derives it
-    once for every route on that transport (issue #3690); the re-derivation here
-    is defense-in-depth for a caller that reaches the handler without having
-    passed that branch, and it calls the shared function rather than restating
-    the rule so the two can never disagree.
+    The internal-secret transport (the managed MCP set) carries no app claim of
+    its own, so the middleware derives one for every route on that transport.
+    The re-derivation here is defense-in-depth for a caller that reaches the
+    handler without having passed that branch, and it calls the shared function
+    rather than restating the rule so the two can never disagree.
 
     Never read from request BODY or tool arguments — a caller that could name
     its own scope could name someone else's.
@@ -1315,7 +1448,7 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "pinned": slot.pinned})
 
 
-_VALID_MODES = ("", "orchestrator", "crew")
+_VALID_MODES = ("", "orchestrator")
 
 
 async def api_chat_slot_mode(request: web.Request) -> web.Response:
@@ -1373,23 +1506,20 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
             {"error": "member thread mode is locked", "code": "member_mode_locked"},
             status=409,
         )
-    # Crew keeps its durable queue in a directory named after the slot, and a
-    # key that folds to nothing but dots has no such directory (see
-    # `CrewStore`). That refusal would otherwise land on the first crew MESSAGE
-    # — an unhandled 500 on a tab the switch had already reported as crew, and
-    # on every message after it. Refuse the switch instead, while it is still a
-    # request with an answer.
-    # Deferred import: this module is reachable from the gateway's boot path
-    # (gateway -> kiro_crew.dashboard -> chat_folders), and crew is a
-    # dashboard-only subsystem, so importing it at module scope made
-    # `--no-dashboard` pay for it before the API was ready to serve. Inside a
-    # mode-switch handler the cost is a sys.modules hit.
-    from kiro_crew.crew_chat import CrewOrchestrator, is_crew_capable_slot_key
-
-    if mode == "crew" and not is_crew_capable_slot_key(slot.key):
+    # A crew-bound (remote) session runs PLAIN chat only — the same rule
+    # api_chat_slot_create enforces at birth, applied here to the post-create
+    # switch that would otherwise reopen it. A non-plain mode (orchestrator,
+    # design-critique) is consumed by an earlier dispatch branch in api_chat that
+    # runs its tools and filesystem work on THIS machine, not on the peer the
+    # session is bound to. Keyed on ``executor`` rather than
+    # ``is_remote`` so even a half-bound slot can never be switched into one.
+    if slot.executor == "remote" and mode:
         return web.json_response(
-            {"error": "this session name cannot run crew mode", "code": "crew_unsupported_slot"},
-            status=400,
+            {
+                "error": "a crew-bound session runs plain chat only; mode-specific work runs on the crew, not here",
+                "code": "remote_mode_unsupported",
+            },
+            status=409,
         )
     # Serialize the busy-check/re-check/mutate/persist/rollback span under
     # the state-wide metadata txn lock — same rationale as
@@ -1415,15 +1545,10 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
             )
         # Work in SUBAGENTS keeps `slot.running` false the whole time, so that
         # flag alone lets the mode flip mid-flight and interleave two execution
-        # models in one session. Two separate questions are needed, because the
-        # risk is not symmetric:
-        #  * ANY direction — a plain-chat subagent may be running on this slot
-        #    right now, and its completion follows the default `_run_chat`
-        #    path, so ENTERING crew mode has to be refused for that too, not
-        #    just leaving it. (Gating the whole check on `slot.mode == "crew"`
-        #    missed exactly this.)
-        #  * LEAVING crew — the orchestrator may still hold crew topics or a
-        #    live queue, which only it can answer for.
+        # models in one session: a plain-chat subagent may be running on this
+        # slot right now, and its completion follows the default `_run_chat`
+        # path, so the switch has to be refused in EITHER direction while one
+        # is pending.
         busy = False
         subs = getattr(state, "subagents", None)
         if subs is not None:
@@ -1437,17 +1562,6 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
                 busy = bool(subs.has_pending_work_for(effective_session_key(slot)))
             except Exception:
                 busy = True  # fail closed: refuse rather than risk the flip
-        if not busy and slot.mode == "crew":
-            # isinstance, not `is not None` — matching gateway.py's own check
-            # on this attribute. A stand-in object passes an identity check and
-            # then answers `has_live_work` with something truthy, refusing a
-            # switch that is fine.
-            crew = getattr(state, "crew", None)
-            if isinstance(crew, CrewOrchestrator):
-                try:
-                    busy = bool(await crew.has_live_work(name))
-                except Exception:
-                    busy = True
         if slot.running or busy:
             sel().log_api_access(
                 caller="dashboard",

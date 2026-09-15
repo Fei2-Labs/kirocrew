@@ -121,7 +121,7 @@ class TestSpillToFile:
             wrong: list[str] = []
             monkeypatch.setattr(pc, "restrict_dir_to_owner", lambda p: calls.append(str(p)))
             # The file-shaped helper must NOT be what a directory goes through:
-            # its icacls grants carry no (OI)(CI), so spilled payloads written
+            # its grants carry no (OI)(CI), so spilled payloads written
             # into the directory afterwards would not inherit the lockdown.
             monkeypatch.setattr(pc, "restrict_to_owner", lambda p: wrong.append(str(p)))
         loose = tmp_path / "mcp_spill"
@@ -157,13 +157,24 @@ class TestSpillFailure:
         }
         line = json.dumps(msg, separators=(",", ":")).encode("utf-8") + b"\n"
 
-        # Point at a non-existent path that can't be created
-        fake_home = "/nonexistent/path/that/cannot/be/created"
+        # A home that cannot be created ON ANY HOST: a path beneath a regular
+        # file, so `mkdir(parents=True)` fails with NotADirectoryError /
+        # FileExistsError everywhere. The previous `/nonexistent/path/...`
+        # literal only looked uncreatable: on Windows a leading slash is
+        # drive-relative, so it resolved to a writable `C:\nonexistent\...`,
+        # the spill SUCCEEDED, and a 300 KiB sidecar was left at the drive
+        # root -- which then made `install_app("/nonexistent/path")` in
+        # test_app_manager see a real directory.
+        blocker = tmp_path / "blocker"
+        blocker.write_bytes(b"")
+        fake_home = str(blocker / "home")
         with patch.dict(os.environ, {"KIROCREW_HOME": fake_home}):
             result = maybe_spill_response(line, "server", 100_000)
 
-        # Original returned unmodified
+        # Original returned unmodified, and nothing was written anywhere.
         assert result == line
+        assert blocker.is_file()
+        assert not (blocker / "home").exists()
 
 
 # --- (f) Non-tool-result frames over threshold pass through ---

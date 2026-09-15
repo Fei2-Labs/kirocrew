@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from aiohttp import web
 
-from kiro_crew.dashboard import chat, handlers, openai_compat
+from kiro_crew.dashboard import chat, chat_voice, handlers, openai_compat
 
 
 def register(app: web.Application) -> None:
@@ -37,6 +37,12 @@ def register(app: web.Application) -> None:
     # Folders
     app.router.add_get("/api/chat/folders", chat.api_chat_folders)
     app.router.add_post("/api/chat/folders", chat.api_chat_folder_create)
+    # Deliberately OUTSIDE /api/chat: app API grants are prefix-matched, so a
+    # pre-existing app permission for /api/chat/folders (folder CRUD) must not
+    # silently inherit host-filesystem enumeration. The scaffolder app is
+    # granted /api/project-scaffold and nothing else.
+    app.router.add_post("/api/project-scaffold/scan", chat.api_chat_folders_scan)
+    app.router.add_post("/api/project-scaffold/create", chat.api_chat_folders_scaffold)
     app.router.add_patch("/api/chat/folders/{id}", chat.api_chat_folder_update)
     app.router.add_delete("/api/chat/folders/{id}", chat.api_chat_folder_delete)
     app.router.add_patch("/api/chat/slots/{slot}/folder", chat.api_chat_slot_folder)
@@ -60,9 +66,12 @@ def register(app: web.Application) -> None:
     app.router.add_patch("/api/chat/tag-columns/{id}", chat.api_chat_tag_column_update)
     app.router.add_delete("/api/chat/tag-columns/{id}", chat.api_chat_tag_column_delete)
     app.router.add_post("/api/voice/synthesize", chat.api_voice_synthesize)
+    app.router.add_post("/api/voice/cancel", chat_voice.api_voice_cancel)
+    chat_voice.register_voice_lifecycle(app)
     app.router.add_get("/api/voice/config", chat.api_voice_config)
     app.router.add_put("/api/voice/config", chat.api_voice_config)
     app.router.add_get("/api/voice/voices", chat.api_voice_voices)
+    app.router.add_get("/api/voice/system-voices", chat.api_voice_system_voices)
     app.router.add_post("/api/chat/slots/{slot}/handoff", chat.api_chat_slot_handoff)
     app.router.add_get("/api/handoff-channels", chat.api_handoff_channels)
     app.router.add_post("/api/chat/slots/{slot}/slack-link", chat.api_chat_slot_slack_link)

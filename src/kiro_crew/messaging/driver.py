@@ -34,6 +34,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
 )
+from kiro_crew.constants import _STEERING_TAIL_PREFIX_RE
 from kiro_crew.messaging.renderer import (
     COMPACTION,
     DONE,
@@ -90,6 +91,19 @@ _STEER_MARKER_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _MAX_STEER_MARKER_CHARS = 16_384
+#: Prefix closure of the same grammar :data:`_STEER_MARKER_RE` completes, reused
+#: from ``constants`` rather than respelled: it answers "could this unterminated
+#: tail still become a marker?", which is the question the drain below has to ask
+#: before it holds text back. Sourcing the pattern from the one place the grammar
+#: is written keeps the two probes from drifting apart -- a divergence
+#: ``test_the_two_spellings_of_the_grammar_agree`` pins.
+#:
+#: Recompiled with ``IGNORECASE`` because THIS module's recognizer carries it:
+#: ``constants``' copy is case-sensitive on purpose (it probes the exact
+#: sentinels a detach walk locates), but here a tail judged prose is EMITTED, so
+#: a probe stricter than the recognizer beside it would leak the very frames
+#: ``[steering steer-4a2f: ...]`` is accepted as.
+_STEER_TAIL_PREFIX_RE = re.compile(_STEERING_TAIL_PREFIX_RE.pattern, re.IGNORECASE | re.DOTALL)
 
 # These are KiroCrew-generated status prefixes, not model-authored prose. A
 # legacy dashboard transcript can contain the completed summary as an assistant
@@ -222,7 +236,25 @@ class _SteeringMarkerFilter:
                 if len(self._buffer) > _MAX_STEER_MARKER_CHARS:
                     self._buffer = ""
                     self._dropping_oversized = True
-                elif final:
+                    break
+                if _STEER_TAIL_PREFIX_RE.match(self._buffer) is None:
+                    # Starting with the sentinel is not the same as being a
+                    # marker. This tail cannot become one however the stream
+                    # continues -- the grammar has already diverged -- so it is
+                    # prose, and holding it back would end in deleting it at
+                    # flush. Handed on the same way a CLOSED frame that fails
+                    # `_STEER_MARKER_RE` already is, which is why "[STEERING
+                    # nonsense] tail" survives today and "[STEERING nonsense"
+                    # did not: the only difference between them was a "]" the
+                    # writer happened to type later.
+                    frames.append(("text", self._buffer[0]))
+                    self._buffer = self._buffer[1:]
+                    continue
+                # Still a viable prefix: hold it. At `final` it is a marker the
+                # stream was cut in the middle of, and that is dropped rather
+                # than emitted -- leaking half a control frame to a channel is
+                # the failure this class exists to prevent.
+                if final:
                     self._buffer = ""
                 break
 
@@ -315,7 +347,7 @@ class TurnDriver:
         ignored exactly as before.
     closing_gate:
         Optional synchronous gate invoked immediately before the provider stream
-        starts. Callers use it to reject a lease that shutdown can no longer
+        starts. Callers use it to reject a lease that shutdown cannot
         drain, and may also reject a structured monitor whose conversation
         generation changed. It must not await: the gate, monitor acceptance, and
         the stream's synchronous turn registration are one event-loop span.
@@ -821,27 +853,35 @@ class TurnDriver:
         if args is None:
             if getattr(event, "tool_final", False):
                 if session_directive.is_refusal(output):
-                    # encode() refused to emit a marker (payload over the
-                    # delivery limit): nothing was applied and the result text
-                    # already told the model so. Terminal for this call.
+                    # The tool DECLINED and said so in its own result text (an
+                    # oversized payload, a schema rejection ahead of the handler,
+                    # or a session this effect can never apply to): nothing was
+                    # applied and the model was told. Terminal for this call.
                     pending.pop(event.tool_call_id, None)
                     if consumed is not None and event.tool_call_id:
                         consumed.add(event.tool_call_id)
                     logger.info(
-                        "session-directive REFUSED for %r (tool_call_id=%s): "
-                        "payload over the %d-char delivery limit; nothing applied",
+                        "session-directive REFUSED for %r (tool_call_id=%s, "
+                        "out_len=%d): the tool returned a tagged refusal instead "
+                        "of a directive; nothing applied",
                         tool,
                         event.tool_call_id,
-                        session_directive.MAX_DIRECTIVE_CHARS,
+                        len(output),
                     )
                 else:
                     # Authenticated directive tool, final frame, no marker:
                     # the effect is being dropped outright. Never let that be
-                    # silent — this exact silence can hide a marker-escaping
-                    # transport regression.
+                    # silent — and name BOTH causes that reach here now that
+                    # every by-design decline is tagged: the marker was mangled
+                    # in transport, or the tool raised past its own return so its
+                    # decline never passed refuse_if_markerless. Asserting one
+                    # cause sends an operator hunting a bug that is not there.
                     logger.warning(
                         "session-directive decode FAILED for %r (tool_call_id=%s, "
-                        "out_len=%d) — effect dropped",
+                        "out_len=%d) — effect dropped. Either the marker was lost "
+                        "in transport (a marker-escaping regression) or the tool "
+                        "raised past its own return, so its decline was never "
+                        "tagged a refusal",
                         tool,
                         event.tool_call_id,
                         len(output),

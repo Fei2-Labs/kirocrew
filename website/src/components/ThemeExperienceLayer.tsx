@@ -18,6 +18,7 @@
  * prefers-reduced-motion and a user mute toggle.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { createPortal } from 'react-dom'
 import { Volume2, VolumeX } from 'lucide-react'
 import {
   useTheme,
@@ -35,6 +36,8 @@ import { grantConsent, getStoredConsent, revokeConsent } from '../utils/themeCon
 import { MC_THEME_SOUND_EVENT, type ThemeSoundDetail } from '../hooks/themeSound'
 import { MC_NOTIFICATION_EVENT } from '../hooks/notificationEvent'
 import { useIsNarrowViewport } from '../hooks/useIsMobile'
+import { useReducedMotion } from '../hooks/useReducedMotion'
+import { OVERLAY_Z_MAX, useThemeDecorSlot } from '../lib/themeDecorLayer'
 import { useAppSelector } from '../store'
 
 import { i18nT } from '../i18n/t'
@@ -50,9 +53,12 @@ const MAX_CONCURRENT_SOUNDS = 4
 // on the runtime resize path (see the Message Router).
 const TOPBAR_MAX_PX = 200
 // Overlay zIndex ceiling: the backend allows up to 9999, but overlays must sit
-// below the topbar's peers and, critically, below the mute button (z=50) and
-// the consent modal (z=120) so those stay clickable. Clamp to the 45 band.
-const OVERLAY_Z_MAX = 45
+// strictly below the top bar (TOPBAR_Z / TOPBAR_FOCUS_Z in lib/themeDecorLayer.ts,
+// which derives OVERLAY_Z_MAX from them) and, critically, below the mute button
+// (z=50) and the consent modal (z=120) so those stay clickable. The clamp alone
+// is not what enforces this — overlays also portal INTO the shell's stacking
+// context (see the render below); rendered outside it, a z of 2 would already
+// paint over the header (#7377).
 // `activate` + `once` overlays play a one-shot animation on theme activation.
 // The wire carries no per-overlay duration, so we auto-unmount after this
 // window (agent-chosen default; the overlay may also self-hide via
@@ -77,14 +83,6 @@ const topbarUrl = (slug: string, mode: string) =>
 const isSafeId = (s: string) => /^[a-z0-9-]{1,64}$/.test(s)
 /** A theme:sound name must be a bare audio filename (no path, allowed ext). */
 const isSafeAudioFile = (s: string) => /^[a-z0-9-]{1,64}\.(mp3|ogg|wav)$/.test(s)
-
-function readReducedMotion(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof window.matchMedia === 'function' &&
-    window.matchMedia('(prefers-reduced-motion: reduce)').matches === true
-  )
-}
 
 /**
  * Normalize one raw `assets.overlays` entry into a `ThemeOverlayDecl`, tolerating
@@ -173,12 +171,18 @@ export default function ThemeExperienceLayer() {
 
   // A remote Crew is a separate SPA in a full-bleed iframe; switching Crews only
   // toggles `display` on the local dashboard's wrapper inside `App`. This layer is
-  // a SIBLING of `<App />` (mounted in main.tsx) and its overlay/topbar iframes are
-  // `position: fixed` at up to OVERLAY_Z_MAX — so App's own `display: none` wrapper
-  // cannot hide them, and z-45 composites above the remote pane stack at z-1. Read
-  // the active remote-Crew id here so the render gate below can unmount the whole
-  // layer, mirroring how App hides the local dashboard.
+  // a SIBLING of `<App />` (mounted in main.tsx): its topbar strip, mute button and
+  // consent modal are `position: fixed` at the root, so App's own `display: none`
+  // wrapper cannot hide them, and they composite above the remote pane stack at
+  // z-1. Read the active remote-Crew id here so the render gate below can unmount
+  // the whole layer, mirroring how App hides the local dashboard. (Decorative
+  // overlays are the exception: they portal into the shell — see `decorSlot`.)
   const activeInstanceId = useAppSelector((s) => s.instances.activeId)
+  // Decorative overlays render INSIDE the dashboard shell's stacking context so
+  // the top bar outranks them (#7377); null while no shell is mounted
+  // (onboarding, bootstrap), in which case they render inline at the root —
+  // there is no chrome to sit under yet.
+  const decorSlot = useThemeDecorSlot()
 
   const active = colorTheme.startsWith('custom-')
     ? customThemeDataMap.get(colorTheme.slice('custom-'.length))
@@ -262,7 +266,7 @@ export default function ThemeExperienceLayer() {
   }, [slug, consentToken])
   const featuresOn = anyExperience && (!needsConsent || consented)
 
-  const [reduced, setReduced] = useState(readReducedMotion)
+  const reduced = useReducedMotion()
   const [muted, setMuted] = useState(() => localStorage.getItem(MUTE_KEY) === '1')
   // NOT useIsMobile: this layer mounts above the router on every route, embed included,
   // so the hook's `/embed/` always-false carve-out would un-hide a hideOnMobile topbar.
@@ -508,15 +512,6 @@ export default function ThemeExperienceLayer() {
     }
   }, [featuresOn, playTrigger])
 
-  // React to reduced-motion preference changes at runtime.
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
-    const mql = window.matchMedia('(prefers-reduced-motion: reduce)')
-    const handler = () => setReduced(mql.matches)
-    mql.addEventListener('change', handler)
-    return () => mql.removeEventListener('change', handler)
-  }, [])
-
   // `activate`+`once` overlays: mount on activation, then auto-unmount after the
   // one-shot window. Re-keys on overlayDecls (a theme switch), so a fresh
   // activation re-shows them. `continuous`/`none` activate overlays stay mounted.
@@ -756,6 +751,38 @@ export default function ThemeExperienceLayer() {
     )
   }
 
+  // Decorative overlays — manifest-driven placement/behaviour. mountedOverlays
+  // is already [] under reduced-motion, so motion overlays stay suppressed.
+  // Built once here because they render in one of two places (see below).
+  const overlays = (
+    <>
+      {mountedOverlays.map((decl) => (
+        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
+        <iframe
+          key={decl.id}
+          data-theme-frame="1"
+          data-theme-pointer={decl.pointerEvents ? '1' : '0'}
+          title={i18nT('components.themeExperienceLayer.theme_overlay', { id: decl.id })}
+          src={overlayUrl(slug, decl.id)}
+          sandbox="allow-scripts"
+          onLoad={(e) => postThemeState((e.currentTarget as HTMLIFrameElement).contentWindow)}
+          style={{
+            position: 'fixed',
+            border: 'none',
+            background: 'transparent',
+            // See topbar note: opt out of the parent's dark color-scheme so a
+            // full-viewport transparent overlay (e.g. Bikini's `bubbles`) does
+            // not composite an opaque backdrop that hides the entire dashboard.
+            colorScheme: 'normal',
+            pointerEvents: decl.pointerEvents ? 'auto' : 'none',
+            zIndex: decl.zIndex,
+            ...overlayPlacement(decl.position),
+          }}
+        />
+      ))}
+    </>
+  )
+
   return (
     <>
       {/* Themed topbar strip (static chrome — shown even under reduced-motion). */}
@@ -790,39 +817,18 @@ export default function ThemeExperienceLayer() {
             // The topbar is DECORATIVE branding (sprite-walker) laid over the top
             // strip of the real dashboard — it must be click-through, or it eats
             // clicks meant for the controls beneath it. It is still height-clamped
-            // (data-theme-maxh) so it can't cover the viewport.
+            // (data-theme-maxh) so it can't cover the viewport. Unlike the overlays
+            // below it is MEANT to paint over the header, so it stays at the root
+            // (z-45 vs the shell's z-1) rather than in the decor slot.
             pointerEvents: 'none',
             zIndex: 45,
           }}
         />
       )}
 
-      {/* Decorative overlays — manifest-driven placement/behaviour. mountedOverlays
-          is already [] under reduced-motion, so motion overlays stay suppressed. */}
-      {mountedOverlays.map((decl) => (
-        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
-        <iframe
-          key={decl.id}
-          data-theme-frame="1"
-          data-theme-pointer={decl.pointerEvents ? '1' : '0'}
-          title={i18nT('components.themeExperienceLayer.theme_overlay', { id: decl.id })}
-          src={overlayUrl(slug, decl.id)}
-          sandbox="allow-scripts"
-          onLoad={(e) => postThemeState((e.currentTarget as HTMLIFrameElement).contentWindow)}
-          style={{
-            position: 'fixed',
-            border: 'none',
-            background: 'transparent',
-            // See topbar note: opt out of the parent's dark color-scheme so a
-            // full-viewport transparent overlay (e.g. Bikini's `bubbles`) does
-            // not composite an opaque backdrop that hides the entire dashboard.
-            colorScheme: 'normal',
-            pointerEvents: decl.pointerEvents ? 'auto' : 'none',
-            zIndex: decl.zIndex,
-            ...overlayPlacement(decl.position),
-          }}
-        />
-      ))}
+      {/* Decorative overlays portal into the shell's decor slot so the header
+          outranks them (#7377); inline at the root only while no shell exists. */}
+      {decorSlot ? createPortal(overlays, decorSlot) : overlays}
 
       {/* Mute toggle — only when the active theme actually ships audio. */}
       {hasAudio && (

@@ -3,20 +3,29 @@
 from __future__ import annotations
 
 import asyncio
-import math
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import fields
-from typing import Protocol
 
-from kiro_crew.monitoring.decision import decide_monitor, monitor_budget_reason
-from kiro_crew.monitoring.github_pull_request import GitHubPullRequestProbeResult
+from kiro_crew.monitoring.decision import (
+    decide_monitor,
+    monitor_budget_reason,
+    terminal_decision_for_outcome,
+)
 from kiro_crew.monitoring.models import (
     MonitorDecision,
     MonitorObservationStatus,
     MonitorOutcome,
+    MonitorProbe,
     MonitorState,
+    MonitorVerdict,
     ProviderErrorKind,
+    is_finite_non_negative_number,
+    resolve_probe_result,
+)
+from kiro_crew.monitoring.registry import (
+    kind_supports_objective,
+    kind_supports_shadow,
 )
 
 ShadowStatePersistence = Callable[[MonitorState], Awaitable[None]]
@@ -26,44 +35,39 @@ class ShadowWakeDeliveryRefused(RuntimeError):
     """Raised when a caller asks the persistence-only path to wake a session."""
 
 
-class GitHubShadowProvider(Protocol):
-    """External probe boundary required by the shadow controller."""
-
-    def probe(
-        self,
-        raw_target: str,
-        *,
-        previous_observation: Mapping[str, object] | None = None,
-    ) -> GitHubPullRequestProbeResult: ...
-
-
 async def run_shadow_probe(
     state: MonitorState,
-    provider: GitHubShadowProvider,
+    provider: MonitorProbe,
     persist: ShadowStatePersistence,
     *,
     now: float,
     wake_delivery: bool = False,
-) -> MonitorDecision:
-    """Probe and persist one decision without acquiring a delivery capability."""
+) -> MonitorVerdict:
+    """Probe and persist one decision without acquiring a delivery capability.
+
+    A verdict returned before the probe runs carries no entries: refusing a
+    monitor for a recorded outcome or a spent budget observes nothing.
+    """
     if wake_delivery:
         raise ShadowWakeDeliveryRefused("wake delivery is unavailable in shadow mode")
-    if state.kind != "github_pull_request" or state.objective != "review_ready":
-        raise ValueError("shadow mode supports only github_pull_request review_ready")
-    if isinstance(now, bool) or not isinstance(now, (int, float)) or now < 0:
-        raise ValueError("now must be a finite non-negative number")
-    try:
-        now_is_finite = math.isfinite(now)
-    except OverflowError as exc:
-        raise ValueError("now must be a finite non-negative number") from exc
-    if not now_is_finite:
+    # A CAPABILITY the kind declares, not an allowlist of what a caller may request:
+    # this asks whether the persistence-only path is implemented for the kind, which
+    # is a fact about what code exists. A kind registered without it is refused here
+    # rather than silently inheriting a claim about a path it has never run.
+    if not kind_supports_shadow(state.kind):
+        raise ValueError(f"shadow mode is not implemented for monitored kind {state.kind!r}")
+    if not kind_supports_objective(state.kind, state.objective):
+        raise ValueError(
+            f"monitored kind {state.kind!r} does not declare objective {state.objective!r}"
+        )
+    if not is_finite_non_negative_number(now):
         raise ValueError("now must be a finite non-negative number")
     if not callable(persist):
         raise ValueError("persist must be callable")
 
-    terminal = _decision_for_outcome(state.outcome)
+    terminal = terminal_decision_for_outcome(state.outcome)
     if terminal is not None:
-        return terminal
+        return MonitorVerdict(decision=terminal)
     budget_reason = monitor_budget_reason(state, now=now)
     if budget_reason:
         staged = deepcopy(state)
@@ -73,19 +77,23 @@ async def run_shadow_probe(
         staged.stopped_at = now
         staged.next_probe_at = 0.0
         await _persist_and_publish(state, staged, persist)
-        return MonitorDecision.STOP_BUDGET
+        return MonitorVerdict(decision=MonitorDecision.STOP_BUDGET)
 
-    result = await asyncio.to_thread(
+    results = await asyncio.to_thread(
         provider.probe,
-        state.target,
-        previous_observation=deepcopy(state.last_observation),
+        (state.target,),
+        previous_observations={state.target: deepcopy(state.last_observation)},
     )
+    result = resolve_probe_result(results, state.target)
     staged = deepcopy(state)
-    decision = decide_monitor(staged, result.observation, now=now)
+    verdict = decide_monitor(staged, result.observation, now=now)
+    decision = verdict.decision
     staged.probe_count += 1
     staged.last_probe_at = now
     staged.last_decision = decision
     observation = result.observation
+    staged.last_observation_status = observation.status
+    staged.last_observation_reason_code = observation.reason_code
     provider_error = observation.provider_error or observation.supplemental_provider_error
     if provider_error is not None:
         staged.provider_error_count += 1
@@ -110,7 +118,7 @@ async def run_shadow_probe(
     else:
         staged.next_probe_at = now + staged.cadence_secs
     await _persist_and_publish(state, staged, persist)
-    return decision
+    return verdict
 
 
 async def _persist_and_publish(
@@ -135,13 +143,3 @@ def _terminal_outcome(
     if provider_error is ProviderErrorKind.NOT_FOUND:
         return MonitorOutcome.TARGET_UNAVAILABLE
     return MonitorOutcome.BLOCKED
-
-
-def _decision_for_outcome(outcome: MonitorOutcome | None) -> MonitorDecision | None:
-    if outcome is MonitorOutcome.SUCCESS:
-        return MonitorDecision.STOP_SUCCESS
-    if outcome is MonitorOutcome.BUDGET:
-        return MonitorDecision.STOP_BUDGET
-    if outcome is not None:
-        return MonitorDecision.STOP_BLOCKED
-    return None

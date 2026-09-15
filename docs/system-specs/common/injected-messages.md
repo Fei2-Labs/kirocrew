@@ -53,7 +53,7 @@ Discord pass those exact bytes through:
 
 ```
 [Monitor wake]
-Monitor <id>: GitHub pull request <target>; objective: review_ready.
+Monitor <id>: pull request <target>; objective: review_ready.
 Fingerprint: <fingerprint>. Classification: <reason code>.
 Head: <revision>. Changed: <allowlisted canonical facts>.
 Next action: <bounded instructions>.
@@ -90,6 +90,14 @@ Task: <first 100 chars of the task>
   instead of re-running the sub-agent.
 - A user-stopped agent says so explicitly and instructs the parent not to treat the
   partial output as a finished result or retry it unprompted.
+- A wide wave is delivered in chunks under a sibling prefix,
+  `SUBAGENT_BATCH_COMPLETION_PREFIX`, which `state.py` bundles with the others into
+  `SUBAGENT_COMPLETION_PREFIXES` for the same `str.startswith` classification. A
+  chunk is NOT the wave: a mid-wave chunk carries progress facts (how many of the
+  total are delivered, how many still running) and tells the parent to process
+  those results without spawning yet, because more chunks are still arriving. Only
+  the final chunk reports the wave finished, carries the run's tallies, and
+  releases the spawn-discipline gate.
 - The runner appends it with role `subagent`, so it renders as its own message kind
   rather than a user bubble.
 - Orchestration guards append to the same envelope when a stage has burned its
@@ -192,6 +200,25 @@ none is mirrored to a linked Slack or Telegram thread as though the user typed i
 | `[Interrupted turn — automatic recovery]` | A transient backend 5xx cut a turn short after tokens or tool calls had already streamed. |
 | `[Empty response — automatic recovery]` | The model returned no output twice. Continue the pending request; do not restart from scratch or re-run steps that already succeeded. |
 | `[Unfinished action — automatic recovery]` | The turn ended right after announcing an immediate action ("I'll do that now") without making the tool call, so nothing actually happened yet a billed turn was recorded. Instructs the model to carry out the announced action now — unless it was actually deferred pending the user's approval or an unmet condition, in which case it is told to hold and say what it is waiting for (a semantic consent backstop, since the terminal-promise detector's approval-gate deny-list cannot enumerate every conditional phrasing). Bounded to one attempt per turn; a second consecutive promise-only ending falls through and lands normally with a give-up notice. |
+| `[Connection lost — automatic recovery]` | A reset recovered an interrupted backend connection. The body lives in `chat_utils` so queue provenance and turn routing share one instruction. |
+| `[Session busy — automatic recovery]` | A reset recovered a turn the backend refused because the session was still busy. Distinct from the connection marker even though both requeue the same continuation shape: nothing was disconnected, and reporting a dropped connection to a user whose status card reads "Session busy" would contradict the card. |
+| `[Context compacted — automatic recovery]` | The backend compacted the conversation mid-turn and then ended the turn without finishing the work. The compaction succeeded, so the turn lands looking clean (a settled footer with elapsed time) and the chat would otherwise just stop. Bounded to one attempt. |
+| `[Continue — requested by the user]` | The user pressed Continue on an interrupted turn. It is in this family so `test_recovery_card_prefixes.py`'s cross-language drift guard covers it, but the value deliberately does not say "automatic recovery": a person pressed the button, and the card must not claim the system recovered by itself. |
+| `[Tool blocked — reason sent to the agent]` | Display-only. A tool deny's reason was steered into the running turn, so nothing is queued and no turn is dispatched — this row exists so the person sees the same blocked-tool card instead of only a generic "Steered" chip that reads as though they had steered the turn themselves. |
+
+A related notice-only guard handles turns that cannot be replayed safely. When a
+normal top-level turn ends after earlier tool calls with a new immediate-action
+promise, or its final segment claims foreground work is still continuing, the
+runner keeps the completed tool work landed and appends an informational notice:
+the main-agent turn has ended, separately shown subagents or monitor loops may
+continue, and otherwise the user must send a message to resume. This path never
+injects a continuation because replaying a mixed turn could duplicate a push,
+deployment, message, or other side effect. The detector is model-agnostic and
+matches only first-person progress claims at a sentence boundary; third-person
+status statements about a separately shown subagent or monitor are not classified
+as foreground work. A first-person claim that the main agent is running or checking
+one remains foreground work unless the same sentence delivers the content after a
+colon.
 
 **A tool deny is explained IN-BAND first, and the injection above is the
 fallback.** ACP's permission response carries only `outcome`/`optionId`, so the
@@ -213,7 +240,33 @@ kiro-cli's wrong attribution and no correction, while queueing wrongly costs one
 turn the model is told twice — which is what this path cost before in-band
 delivery existed.
 
-The recovery classification for the last two is **structural**: the queue entry
+**An approval prompt that expires unanswered takes the same in-band path**, with
+its own cause (`approval_timeout`): before the auto-decline is answered on the
+wire, the agent is told the prompt expired and that the user did NOT deny the
+call — for attended and unattended slots alike, since both are handed the same
+generic denial string. It deliberately joins no fallback recovery, and its
+notice is tracked outside the turn's refusal ledger so it cannot skew
+`should_queue_refusal_recovery`'s count-based decision: the timed-out decline
+answers the permission as an ordinary rejection (the recovery continuation
+stays reserved for system-side blocks), so on a harness without steer the
+unattended transcript line remains the only agent-facing explanation. The
+timeout card stays the sole user-visible surface — this steer paints no
+tool-blocked row.
+
+**The other two host-originated approval auto-declines take the same path**,
+each with its own cause and the same no-ledger, no-row discipline as the
+timeout: `approval_no_budget` (the turn had no budget left to host the prompt
+— the agent is told the prompt was never shown, to state the permission it
+needs, and not to immediately reissue the identical call, since this turn
+cannot host an approval wait) and `approval_undeliverable` (the approval card
+could not be delivered to the operator's channel — the agent is told the call
+was never judged and to state the permission it needs). All three are steered
+once, at the shared reject branch, gated on the host-recorded provenance; a
+genuine user refusal records no cause, so kiro-cli's generic denial stays the
+true attribution there and no notice is sent.
+
+The recovery classification for the last two rows of the marker table above
+is **structural**: the queue entry
 carries `kind == "synthetic_recovery"` (`SYNTHETIC_RECOVERY_KIND`), set at insert
 time. Metadata survives every queue transformation (merge, prefixing, truncation)
 and cannot collide with a user pasting the transcript-visible recovery text back
@@ -309,9 +362,35 @@ next turn into the same slot:
 - `{{STOP_FILE}}` in the configured message is substituted with the resolved stop
   sentinel path before the tag is prepended.
 - The slot entry uses role `nudge` with a structured `nudge` meta block (`cycle`,
-  `loop_id`), so the dashboard shows a compact cycle chip. The tag stays in
-  `content` because that is what the model reads, and the body is deliberately not
-  duplicated into meta: a multi-KB payload is stored and broadcast once.
+  `loop_id`), so the dashboard shows a compact cycle chip. The body is deliberately
+  not duplicated into meta: a multi-KB payload is stored and broadcast once.
+- **The visible row and the model's prompt are separate strings, and only an opt-in
+  `banner` makes them differ.** With no banner the two carry the same body, so an
+  existing loop's transcript is unchanged and `content` is what the model reads. With
+  a banner set, `content` carries that short stand-in instead of the message body and
+  is no longer what the model reads — the prompt still carries the full message. The
+  prompt is never shortened: re-delivering the whole instruction every cycle is the
+  guarantee the nudge exists to provide.
+- **`banner` is optional on every arming surface** and defaults to absent.
+  `POST /api/autonudge` and `PATCH /api/autonudge/{loop_id}` accept it; accepting it
+  on `PATCH` is what lets a running loop be quieted without resetting its budgets. The
+  MCP tools `monitor_start` and `monitor_update` carry it in their input schemas, and
+  `monitor_update` treats an explicit empty string as "clear", so a banner set once can
+  be removed without tearing the loop down. It is capped at `MAX_BANNER_CHARS` (500),
+  two orders of magnitude under the 8000-char `message` limit, because the two fields
+  have different jobs: `message` is an instruction re-delivered to the model every
+  cycle, a banner is one display line.
+- **A non-blank banner on a channel-bound loop is refused with 400.** A `slack:` /
+  `discord:` / `webex:` loop delivers the nudge as the turn's own input and has no
+  separate display surface to shorten, so storing one would be dead config the runtime
+  could never honour. A blank banner is still accepted there, since that is the default
+  every channel-bound caller already passes. A persisted banner is additionally repaired
+  at load: a non-string value is blanked, and a persisted string banner is
+  credential-scrubbed and re-capped (redaction runs before the cap slice, so a
+  secret straddling the cap is masked whole). A caller-supplied banner is also
+  credential-scrubbed at the write path with the same `redact_exfiltration_urls` /
+  `redact_credentials` passes the `message` field gets, since a banner is persisted and
+  served by `GET /api/autonudge`.
 - A nudge arriving while the slot is already running is DROPPED, not queued.
   Queueing would stack identical multi-KB payloads and blow the context window; the
   next idle tick schedules again.
@@ -320,6 +399,39 @@ next turn into the same slot:
 - Loops persist to `autonudge.json` under the data home and are re-armed on gateway
   restart. A slot that is unreachable (no history, deleted, or closed) has its loop
   removed.
+- **A loop stranded with no live timer is rescued by a periodic reconciler.** A
+  dashboard-bound loop's only re-arm path after a delivered fire is the slot's
+  `HOOK_EVENT_STOP`; if that never arrives (the nudge turn errors, times out, or is
+  cancelled on a hook-skipping path) or a deferred re-arm is dropped mid-fire, the
+  loop stays persisted `active` with a finished-or-absent timer and nothing on a
+  timer revives it. A finished timer task counts as "no live timer": nothing pops a
+  timer from the registry when it completes, so that is the shape the strandings
+  actually leave behind. The rescue requires **two consecutive** eligible passes,
+  because one observation cannot tell a stranded loop from a slot whose user turn is
+  still running or a loop inside another coroutine's mutation window; a user turn
+  starting clears the loop's candidacy, so any sign of life restarts the clock. A
+  pass that finds the service lock held defers entirely rather than arm a
+  mid-rollback shape. Re-arming targets the loop's **own persisted deadline**, so a
+  rescue never fires earlier than the schedule the user set. Deliberately skipped
+  whatever the passes observe: a loop mid-fire, one quiesced by administrative
+  cleanup, a monitor record whose version this gateway does not implement, and an
+  in-flight wake claim with no completion-evidence deadline — except a `BUSY` retry,
+  the one no-deadline shape that is legitimately live. An **inactive** loop still
+  awaiting terminal-completion evidence is deliberately **included**: its accepted-turn
+  correlation needs a timer to expire, and stranding it would refuse every replacement
+  watch on the slot forever.
+- **Delivered fires and reconciler rescues are both logged at INFO.** Fires were
+  otherwise unlogged, so a loop that had died and one with nothing to report were
+  byte-identical in the journal. One line per delivered turn — each of which already
+  spends a model turn — is what makes loop health observable from outside the process.
+- **The observation gate fails toward SPENDING.** An exception escaping the
+  pre-fire probe gate is treated as "not quiet" and the tick **fires**, matching the
+  service-wide invariant that every uncertain path resolves toward spending. Letting
+  it escape instead killed the timer task while the registry still held a strong
+  reference, so no "task exception was never retrieved" warning was ever emitted and
+  the loop went silent. Skipping the tick is the other wrong answer: a gate that
+  raises deterministically would keep the loop alive, re-arming and delivering
+  nothing forever — the silent mute the gate exists to prevent.
 - Structured monitor action accounting is a separate internal completion
   callback, not a new injected-message envelope. Until the probe dispatcher is
   attached, structured records remain fail-closed. The dormant adapters do not
@@ -363,6 +475,22 @@ cannot reach.
 
 So there is no `[Widget action event]` envelope. What reaches the session is an
 ordinary user message beginning `[UI] `, sent by a human, carrying an origin tag.
+
+## Other injected envelopes
+
+These carry no `state.py` prefix constant, so they are classified by their own
+literal header rather than through `str.startswith` on a shared prefix. The
+system prompt names each one so the model reads it as data or as automation
+speech rather than as the user.
+
+| Envelope | Emitted by | What it means to the model |
+|---|---|---|
+| `[work ledger — …]` | `session_ledger.py` snapshot builder, composed into a nudge by `dashboard/handlers/autonudge.py` | Durable per-session state that outranks the model's recollection of earlier cycles. |
+| `[Hook context:]` … `[End of hook context]` | `context.py` hook-context assembly | Context supplied by a configured hook whose action is `HOOK_INJECT_CONTEXT`; webhook-restored workflow state is one producer, not the envelope's only meaning. The payload is untrusted third-party data. |
+| `[Previous run result — do NOT repeat the same content]` | `cron.py` | A recurring cron's own last output, so the turn reports only what changed. |
+| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold; take the lighter path this turn. |
+| `[Relevant skills for this message]` | `skills.py` pointer renderer | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
+| `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and keeps nothing of the chat, its history or its lessons. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the ephemeral transcript. |
 
 ## Adding a new envelope
 

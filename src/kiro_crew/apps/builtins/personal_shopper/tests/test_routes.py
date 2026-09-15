@@ -1,9 +1,9 @@
 """Tests for the Personal Shopper HTTP routes.
 
 The load-bearing ones here pin the boundary between a CLIENT error and a SERVER
-error. Every field these handlers read used to go straight into a string or int
-operation, so a wrong TYPE — not a wrong value — raised inside the handler and
-surfaced as a 500. A 500 tells a caller "the server is broken" and is what gets
+error. A field these handlers read must not go straight into a string or int
+operation: a wrong TYPE — not a wrong value — then raises inside the handler and
+surfaces as a 500. A 500 tells a caller "the server is broken" and is what gets
 paged on; the correct answer to ``{"text": 1}`` is a 400 naming the offending
 field, which is what these assert.
 
@@ -135,8 +135,8 @@ class TestJsonObjectCatchWidth(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_unknown_charset_codec_is_a_400_not_a_500(self) -> None:
         # An unknown ``charset=`` on the request makes aiohttp's decode step raise
-        # LookupError (not a ValueError), which used to escape ``_json_object`` as
-        # a 500. It is a client-input mistake and must answer 400.
+        # LookupError (not a ValueError), which escapes ``_json_object`` as a 500
+        # unless it is caught. It is a client-input mistake and must answer 400.
         body, err = await routes_mod._json_object(
             _req_raising(LookupError("unknown encoding: bogus-codec"))
         )
@@ -394,10 +394,23 @@ class TestTheSuiteHasNoSideEffects(RoutesTestCase):
         )
 
     async def test_the_real_data_home_is_never_resolved(self) -> None:
-        """The patched path must not be the operator's home under any spelling."""
-        resolved = str(routes_mod._sites_path().resolve())
-        self.assertNotIn(".kiro/crew/apps", resolved)
-        self.assertNotIn(".kirocrew/apps", resolved)
+        """The patched path must not be the operator's home under any spelling.
+
+        Compared through ``as_posix()`` rather than ``str()``: ``str()`` of a
+        resolved path spells the separator the way the host does, so on Windows
+        the forward-slash needles could never match and this guard went green
+        even if the write HAD escaped into the operator's real data home. The
+        containment assertion is the positive form of the same claim and depends
+        on no separator spelling at all.
+        """
+        resolved = routes_mod._sites_path().resolve()
+        spelling = resolved.as_posix()
+        self.assertNotIn(".kiro/crew/apps", spelling)
+        self.assertNotIn(".kirocrew/apps", spelling)
+        self.assertTrue(
+            resolved.is_relative_to(Path(self._tmp).resolve()),
+            f"sites.json resolved outside the tmpdir and landed at {resolved}",
+        )
 
 
 if __name__ == "__main__":

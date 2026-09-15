@@ -13,7 +13,9 @@ element.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -26,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from kiro_crew.config.paths import data_home
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform_compat import (
     first_linked_ancestor,
@@ -107,7 +110,94 @@ def _git_env(*, network_protocol: str = "") -> dict[str, str]:
     return env
 
 
+class IsolationProbeError(RuntimeError):
+    """The push-isolation probe COULD NOT RUN — its sandbox launcher failed.
+
+    Raised instead of the fail-closed ``False`` because the two nonzero exits
+    mean opposite things: a probe that RAN and found a live url is a repository
+    problem ("re-run repository setup" fixes it), while a probe whose launcher
+    died before ``git`` executed says nothing about the remotes and setup
+    cannot fix it. Subclasses ``RuntimeError`` so the run-start route's
+    existing handler surfaces the message verbatim instead of a 500.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            "the push-isolation probe could not run: the sandbox launcher "
+            "failed before git executed"
+            + (f" ({detail})" if detail else "")
+            + " — the clone's remote urls were never read, so this is a "
+            "sandbox failure, not a live push url; fix the sandbox (see the "
+            "gateway log) rather than re-running repository setup"
+        )
+        self.detail = detail
+
+
+#: Signatures only the namespace-sandbox launcher emits on stderr, matched
+#: STRUCTURALLY so repository-influenced text cannot satisfy them (raised by
+#: the Opus review of this branch): a repo may legally be NAMED
+#: ``kirocrew_sandbox_x`` (``_GITHUB_RE`` admits ``_``), which puts that
+#: substring into the clone PATH that git echoes on path-printing fatals — so
+#: the script-filename marker only counts inside a real Python traceback frame
+#: (``File "…kirocrew_sandbox_….py"`` plus the ``Traceback`` banner, a shape
+#: git never prints), and the launcher's deliberate refusal prefixes must
+#: START a stderr line (owner/repo names cannot contain a space or colon, so
+#: no echoed path can begin a line with ``sandbox: ``). ``sandbox: WARNING``
+#: is deliberately NOT classified: the launcher warns and then still runs the
+#: command, so a warning can coexist with git's own exit code and must not
+#: reclassify it. The prefixes are pinned against the generated launcher by a
+#: round-trip test so this list cannot drift silently.
+_LAUNCHER_EXIT_PREFIXES = (
+    "sandbox: BLOCKED",
+    "sandbox: FATAL",
+    "sandbox: unshare(",
+    "sandbox_launcher:",
+)
+_LAUNCHER_TRACEBACK_RE = re.compile(r'^\s*File "[^"\n]*kirocrew_sandbox_[^"\n]*\.py"', re.MULTILINE)
+
+
+def _launcher_failure_detail(stderr: str) -> str | None:
+    """The bounded, redacted detail line when *stderr* shows the sandbox
+    launcher itself failed, else ``None`` (the exit code is git's own)."""
+    lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
+    launcher_failed = any(line.startswith(_LAUNCHER_EXIT_PREFIXES) for line in lines) or (
+        "Traceback (most recent call last)" in stderr
+        and _LAUNCHER_TRACEBACK_RE.search(stderr) is not None
+    )
+    if not launcher_failed:
+        return None
+    # The surfaced message carries only a bounded tail; the full (redacted,
+    # bounded) stderr goes to the log here, at the one classification site, so
+    # "see the gateway log" in the raised message is a promise that is kept.
+    logger.error(
+        "push-isolation probe could not run — sandbox launcher stderr (redacted): %s",
+        redact_via_context(stderr.strip())[:2000],
+    )
+    # The last line is the significant one for both failure shapes: a Python
+    # traceback ends with the exception ("ModuleNotFoundError: ..."), and the
+    # launcher's own sys.exit messages lead with their prefix.
+    tail = lines[-1] if lines else ""
+    # Redact BEFORE the bound, same as every stderr surface in this module.
+    return redact_via_context(tail)[:200]
+
+
 def _origin_urls(repo: Path, *, push: bool) -> list[str] | None:
+    """Read origin's fetch/push urls from the clone's local config, as data.
+
+    Returns the url list, ``[]`` when the key is absent, or ``None`` for an
+    ambiguous git failure (callers fail closed on ``None``). Raises
+    :class:`IsolationProbeError` for the one nonzero exit that is NOT evidence
+    about the remotes at all: a namespace-sandbox launcher dying before git
+    executed, identified by the launcher's own stderr signature. This module
+    spawns git directly, so no launcher exists in this probe's chain on a
+    stock install — the signature appears only on deployments that route the
+    gateway's subprocesses through the sandbox, where every ``git remote
+    get-url`` probe carries the launcher's traceback, and the classification is
+    inert everywhere else because the structural matching in
+    :func:`_launcher_failure_detail` cannot be satisfied by git's own output.
+    Collapsing that crash into the fail-closed path would report "push is not
+    disabled" for a clone whose remotes were never read — a misleading 409.
+    """
     key = "remote.origin.pushurl" if push else "remote.origin.url"
     try:
         proc = subprocess.run(
@@ -130,6 +220,10 @@ def _origin_urls(repo: Path, *, push: bool) -> list[str] | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
+    if proc.returncode != 0:
+        detail = _launcher_failure_detail(proc.stderr or "")
+        if detail is not None:
+            raise IsolationProbeError(detail)
     if proc.returncode == 1:
         return []
     if proc.returncode != 0:
@@ -138,6 +232,15 @@ def _origin_urls(repo: Path, *, push: bool) -> list[str] | None:
 
 
 def _repository_is_safe(repo: Path) -> bool:
+    """True iff the clone's Git metadata and local config are safe to reuse.
+
+    Fails CLOSED (``False``) for ambiguous git errors and for any unsafe
+    filesystem shape, but raises :class:`IsolationProbeError` when the
+    unsafe-keys probe's sandbox launcher died before git executed — a crashed
+    launcher exits 1, indistinguishable from git's own "no unsafe keys", so
+    reading the exit code alone would report an unscanned config as safe (the
+    one probe in the isolation chain that would otherwise fail OPEN).
+    """
     git_dir = repo / ".git"
     if first_linked_ancestor(git_dir) or is_link_or_junction(git_dir):
         return False
@@ -218,6 +321,18 @@ def _repository_is_safe(repo: Path) -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
+    if proc.returncode != 0:
+        # Exit 1 means "no unsafe keys" only when git itself ran. A sandbox
+        # launcher that dies before git executes also exits 1, so reading the
+        # exit code alone makes this the one probe in the isolation chain that
+        # fails OPEN during a launcher outage: metadata unsafety
+        # becomes invisible exactly when the host cannot run the probes. Same
+        # classifier as :func:`_origin_urls` — the structural stderr match is
+        # what keeps git's own output unable to satisfy it, and the raise says
+        # "the probe could not run" instead of an isolation verdict.
+        detail = _launcher_failure_detail(proc.stderr or "")
+        if detail is not None:
+            raise IsolationProbeError(detail)
     return proc.returncode == 1
 
 
@@ -301,6 +416,165 @@ def _retire_unsafe_clone(repo: Path) -> Path | None:
     return retired
 
 
+#: The quarantine markers' root: a TOP-LEVEL crew-home leaf, not a path under
+#: ``apps/auto-improvement/data/``. Two structural reasons.
+#:
+#: The leaf is bind-masked from every agent sandbox (``sandbox._CREW_HIDDEN_LEAVES``) and
+#: fenced from agent file tools (``security.sensitive_home_dirs``), which is what makes the
+#: marker something an agent cannot plant, rewrite or delete. Nothing inside a sandbox reads
+#: it -- the marker is written and read host-side by this module -- so HIDDEN is the right
+#: disposition of the three that list offers.
+#:
+#: A mask covers the name it is bound over, not that name's ancestors, so a leaf under
+#: ``apps/auto-improvement/data/`` would sit beneath a directory an agent CAN rename, taking
+#: the mount with it. At the top level the only ancestors are the data home and ``$HOME``,
+#: the residual every other fenced leaf already stands on. This mirrors
+#: ``aws_control.storage.STAGING_DIR_LEAF``, top-level for exactly this reason. Raised by the
+#: GPT review of this branch.
+_QUARANTINE_DIR_LEAF = "quarantined-clones"
+
+
+def _quarantine_root() -> Path | None:
+    """The masked directory quarantine markers live in, or ``None`` if it is unusable.
+
+    On a sandboxed host this exists before any agent runs: the sandbox materialises it ahead
+    of every namespace spawn (``sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES``), because a mask
+    can only bind over a name that exists. The ``mkdir`` here therefore matters only where
+    nothing is masking anything -- sandbox off, or Windows.
+
+    The root itself must be a REAL directory: a link planted at the root would put every
+    marker outside the fence, and no per-marker check can see that. Same guard
+    ``aws_control.storage._preview_staging_parent`` stands on.
+
+    IT MUST ALSO PROVE IT IS WRITABLE, by creating and removing a probe entry. A root that
+    exists and can be READ but not written is the one state where this guard fails OPEN: the
+    marking open fails, so nothing is recorded, while the reuse check finds no marker and
+    certifies the clone -- the poisoned tree is then reused with both halves of the mechanism
+    reporting nothing wrong. Proving writability at every call collapses that case into a
+    refusal, because the same root that could not take the write cannot pass the probe either.
+    ``os.access`` is not enough: it answers from the permission bits and is wrong under an ACL
+    or a read-only mount. Raised by the GPT review of this branch.
+    """
+    root = data_home() / _QUARANTINE_DIR_LEAF
+    try:
+        if is_link_or_junction(root) or first_linked_ancestor(root):
+            logger.error("quarantine marker root %s is under a link; refusing to use it", root)
+            return None
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if is_link_or_junction(root):
+            return None
+        probe = root / f".probe-{secrets.token_hex(8)}"
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        probe.unlink()
+    except OSError:
+        logger.exception("quarantine marker root %s is not usable for recording", root)
+        return None
+    return root
+
+
+def _quarantine_marker(repo: Path) -> Path | None:
+    """Where the refusal-to-reuse marker for *repo* lives, or ``None`` if unusable.
+
+    Keyed by the HASH of the clone's absolute path, so the name cannot be steered by a
+    repository name: it is fixed-length, has no separators to traverse with, and cannot
+    collide with another clone's marker.
+    """
+    root = _quarantine_root()
+    if root is None:
+        return None
+    digest = hashlib.sha256(str(repo.absolute()).encode("utf-8", "surrogateescape")).hexdigest()
+    return root / f"{digest}.json"
+
+
+def _mark_clone_quarantined(repo: Path, reason: str) -> Path | None:
+    """Persist "this clone must never be reused". The marker path, or ``None``.
+
+    WRITTEN BEFORE RETIREMENT IS ATTEMPTED, not after it fails. :func:`_retire_unsafe_clone`
+    renaming the tree aside is the primary guard and needs no marker, because a clone renamed
+    away from its canonical name is not found and not reused. The marker covers the window
+    that guard cannot: the caller persists it first, so a process that dies between the two
+    steps, or a rename that fails outright, still leaves a durable refusal behind rather than a
+    poisoned tree sitting at the name the next run looks up. A marker whose clone is retired or
+    removed clears itself, which is what the next paragraph is about.
+
+    WHEN IT CLEARS is the question a persisted latch has to answer, and this one answers it
+    structurally rather than on a timer or an event: the marker names a specific DIRECTORY, so
+    :func:`_clone_is_quarantined` reports it only while that directory still exists. A later
+    successful retirement, or an operator removing the tree, therefore clears the guard as a
+    side effect of removing the thing it guards -- there is no state where the bytes are gone
+    and the refusal outlives them, and none where the bytes are present and the refusal has
+    expired.
+
+    ``O_EXCL``, NEVER ``O_TRUNC``: this open must not be able to shorten an existing file, so
+    the truncating flag is simply not in the set. An existing ENTRY at the marker name is then
+    not a failure but the guard already standing, and it is reported as such.
+
+    THE TWO SIDES MUST AGREE ON WHAT "PRESENT" MEANS, which is why the reader below uses
+    ``lstat`` and not ``exists``. A DANGLING SYMLINK is an existing entry to this open --
+    ``O_CREAT|O_EXCL`` refuses it -- and an absent file to ``exists``. Split that way, a
+    planted dangling link would make marking report success while the guard read no marker at
+    all. Raised by the GPT review of this branch.
+
+    Best-effort by construction: if even this write fails there is nothing further to try, and
+    the caller logs that the clone is unsafe in place.
+    """
+    marker = _quarantine_marker(repo)
+    if marker is None:
+        return None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    body = json.dumps({"clone": str(repo.absolute()), "reason": reason}, ensure_ascii=True)
+    try:
+        fd = os.open(marker, flags, 0o600)
+        try:
+            os.write(fd, body.encode("ascii", "replace")[:4096])
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        return marker  # an entry already stands here; presence is the signal, not contents
+    except OSError:
+        logger.exception("could not mark clone %s as quarantined", repo)
+        return None
+    return marker
+
+
+def _clone_is_quarantined(repo: Path) -> bool:
+    """Is *repo* marked unreusable AND still the tree that was marked?
+
+    ``lstat`` rather than ``exists``: the question is whether an ENTRY stands at the marker
+    name, not whether it resolves to a readable file -- see
+    :func:`_mark_clone_quarantined` for why the two sides have to agree. Anything at that
+    name counts, so a planted entry can only make this MORE conservative: it reports the
+    clone quarantined, which refuses it.
+
+    Fails CLOSED on an unusable root, and on an ``lstat`` that raises for any reason other
+    than absence: "I could not look" is not "I looked and it was clean". A marker whose clone
+    is gone is stale -- that is how the guard clears -- and it is removed on the way past so
+    the directory does not accumulate one file per clone the app has ever retired.
+    """
+    marker = _quarantine_marker(repo)
+    if marker is None:
+        return True  # the guard cannot be consulted, so do not certify the clone
+    try:
+        os.lstat(marker)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.exception("could not read the quarantine marker for %s", repo)
+        return True
+    try:
+        if repo.exists():
+            return True
+    except OSError:
+        logger.exception("could not stat the quarantined clone %s", repo)
+        return True
+    try:
+        marker.unlink()
+    except OSError:
+        logger.warning("could not prune the stale quarantine marker %s", marker)
+    return False
+
+
 def _push_disabled(repo: Path) -> bool:
     return _origin_urls(repo, push=True) == [DISABLED_NO_PUSH] and _origin_urls(
         repo, push=False
@@ -308,7 +582,14 @@ def _push_disabled(repo: Path) -> bool:
 
 
 def _repository_is_isolated(repo: Path) -> bool:
-    """True only when metadata/config is safe and every origin URL is disabled."""
+    """True only when metadata/config is safe and every origin URL is disabled.
+
+    Fails CLOSED (``False``) for ambiguous git errors, but raises
+    :class:`IsolationProbeError` when the probe's sandbox launcher crashed
+    before git executed — that exit is not evidence about the remotes, and
+    reporting it as "push is not disabled" would hide the real failure. Both
+    outcomes refuse to start; only the surfaced reason differs.
+    """
     return _repository_is_safe(repo) and _push_disabled(repo)
 
 
@@ -416,6 +697,23 @@ def validate_target_url(url: str) -> tuple[CloneSpec | None, str]:
 
 
 def setup_safe_clone(url: str, scratch_root: Path, *, timeout_s: int = 300) -> tuple[dict, str]:
+    """Public entry: clone (or reuse) with push disabled. Returns ``(result, err)``.
+
+    A probe whose sandbox launcher crashed surfaces as the error string, not as
+    an exception: this function's callers consume ``(result, err)`` tuples off
+    a worker thread, and a raise here would turn a diagnosable sandbox failure
+    into a 500. The clone (when one exists) is deliberately left in place —
+    its remotes were never read, so there is no isolation verdict to act on,
+    and deleting a good clone over an unrelated sandbox failure only forces a
+    re-download after the sandbox is fixed.
+    """
+    try:
+        return _setup_safe_clone(url, scratch_root, timeout_s=timeout_s)
+    except IsolationProbeError as exc:
+        return {}, str(exc)
+
+
+def _setup_safe_clone(url: str, scratch_root: Path, *, timeout_s: int = 300) -> tuple[dict, str]:
     """Validate and install/reuse the canonical push-disabled clone.
 
     Reuse attests only enforceable properties: canonical location, safe Git
@@ -435,6 +733,22 @@ def setup_safe_clone(url: str, scratch_root: Path, *, timeout_s: int = 300) -> t
 
     if is_link_or_junction(dest):
         return {}, f"Destination is a link or junction (refused for safety): {dest}"
+
+    # REFUSE A QUARANTINED CLONE BEFORE ANY OTHER JUDGEMENT ABOUT IT. The marker is written
+    # whenever a rollback fails, before retirement is attempted, and it is what stops reuse
+    # when that retirement then fails or never runs -- so a clone still sitting at this name
+    # carries a provisional commit that was REFUSED and never scanned. Every reuse
+    # attestation below is about the clone's git metadata and remotes -- none of them look at
+    # what the branch tip points AT -- so a poisoned clone passes all of them and the next
+    # run commits its winner on top of the refused commit and publishes it as an unscanned
+    # ancestor. Checked ahead of the `.git` probe because the name is burned, not just its
+    # metadata: a tree whose `.git` was destroyed by the same failure must not fall through
+    # to the fresh-clone path and reuse the directory either.
+    if _clone_is_quarantined(dest):
+        return {}, (
+            f"Existing clone at {dest} is quarantined after a failed rollback and must not "
+            "be reused -- remove the directory to clear the marker and clone fresh."
+        )
 
     git_dir = dest / ".git"
     if is_link_or_junction(git_dir):
@@ -496,7 +810,15 @@ def setup_safe_clone(url: str, scratch_root: Path, *, timeout_s: int = 300) -> t
         # can cut a credential in the echoed remote URL mid-match, leaving a fragment
         # no downstream redaction pass recognises.
         return {}, f"git clone failed: {redact_via_context(tail[0])[:200]}"
-    if not _repository_is_safe(dest):
+    try:
+        safe = _repository_is_safe(dest)
+    except IsolationProbeError:
+        # This attempt created `dest` and has not disabled push yet, so unlike
+        # the reuse path there is no good clone to preserve — remove it rather
+        # than leaving a live origin url at the canonical location.
+        rmtree_force(dest)
+        raise
+    if not safe:
         rmtree_force(dest)
         return {}, "cloned repository failed Git metadata safety verification"
 
@@ -534,9 +856,13 @@ def list_clone_branches(clone: Path, *, timeout_s: int = 30) -> tuple[list[str],
     clone = Path(clone)
     if not (clone / ".git").is_dir():
         return [], f"Not a git clone: {clone}"
-    if not _repository_is_safe(clone):
-        return [], "clone Git metadata failed safety verification"
-    if not _push_disabled(clone):
+    try:
+        if not _repository_is_safe(clone):
+            return [], "clone Git metadata failed safety verification"
+        disabled = _push_disabled(clone)
+    except IsolationProbeError as exc:
+        return [], str(exc)
+    if not disabled:
         return [], "clone is not push-disabled"
     proc = subprocess.run(
         [
@@ -672,15 +998,12 @@ def resolve_origin_url(config: dict) -> str:
     Returns ``""`` when it does not validate, and every caller treats ``""`` as "no push
     target" — fail closed.
 
-    ``origin_url`` used to be returned VERBATIM while only the legacy fallback validated,
-    which made the docstring's own promise false for the preferred path. Measured:
-    ``{"origin_url": "https://attacker.example.com/exfil.git"}`` was returned unchanged and
-    became the push destination, while the identical string under ``target_url`` was
-    correctly refused ("Only github.com URLs are supported"). This is the one place the push
-    destination is resolved for the draft-PR push, the F10 direct push and one-click commit,
-    so an unvalidated value here redirects all three. Raised by the GPT review of this branch;
-    the security guidance on untrusted URL destinations asks for exactly this — allowlist the
-    destination rather than trusting persisted input.
+    ``origin_url`` must be validated on this path too, not returned VERBATIM: an
+    ``{"origin_url": "https://attacker.example.com/exfil.git"}`` that is passed through
+    unchanged becomes the push destination. This is the one place the push destination is
+    resolved for the draft-PR push, the F10 direct push and one-click commit, so an
+    unvalidated value here redirects all three — allowlist the destination rather than
+    trusting persisted input.
     """
     direct = str((config or {}).get("origin_url") or "").strip()
     if direct:
@@ -805,9 +1128,13 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
     bare = branch.split("/", 1)[1] if branch.startswith("origin/") else branch
     if not bare or not is_valid_branch_name(bare):
         return False, f"invalid branch name: {branch!r}"
-    if not _repository_is_safe(clone):
-        return False, "clone Git metadata failed safety verification"
-    if not _push_disabled(clone):
+    try:
+        if not _repository_is_safe(clone):
+            return False, "clone Git metadata failed safety verification"
+        disabled = _push_disabled(clone)
+    except IsolationProbeError as exc:
+        return False, str(exc)
+    if not disabled:
         return False, "clone is not push-disabled"
 
     def _run(*args: str, tmo: int = timeout_s) -> subprocess.CompletedProcess:
@@ -871,7 +1198,7 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
         if co.returncode == 0:
             return True, f"checked out {bare} @ {remote_ref} (no fetch — origin is disabled)"
 
-    # Then a local branch, so a previously-fetched branch still runs offline.
+    # Then a local branch, so an already-fetched branch still runs offline.
     local = _run("rev-parse", "--verify", "--quiet", bare, tmo=30)
     if local.returncode == 0:
         co = _run("checkout", bare)

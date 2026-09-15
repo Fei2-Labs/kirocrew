@@ -3,12 +3,14 @@
  * (#4198).
  *
  * The flow dispatches an optimistic user bubble and `setSlotRunning(true)`,
- * then awaits `api.sendChat` — and an HTTP 4xx/5xx RESOLVES rather than
- * rejecting, so the old `catch { /* WS will handle response *\/ }` never saw
- * the errors that matter: a refused send left the bubble on screen next to a
- * slot stuck `running`, with nothing said. These tests pin the fix on both
- * failure shapes (a resolved not-ok receipt and a transport reject): an error
- * row lands in the transcript that owns the bubble, reusing the existing
+ * then sends through the chat-core transport `sendTurn` — whose wire is
+ * `api.sendChat`, mocked here, so these tests drive the REAL receipt
+ * classification. An HTTP 4xx/5xx RESOLVES rather than rejecting, so the old
+ * `catch { /* WS will handle response *\/ }` never saw the errors that matter:
+ * a refused send left the bubble on screen next to a slot stuck `running`,
+ * with nothing said. These tests pin the fix on both failure shapes (a
+ * `refused` receipt and a `transport-error`): an error row lands in the
+ * transcript that owns the bubble, reusing the existing
  * `pages.chatPage.send_failed` catalog entry, and the optimistic running state
  * is undone. The accepted-receipt case pins that success stays untouched.
  */
@@ -21,7 +23,6 @@ import App from '../App'
 
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
-vi.mock('../pages/AgentsPage', () => ({ default: () => null }))
 vi.mock('../pages/ProjectsPage', () => ({ default: () => null }))
 vi.mock('../pages/LogsPage', () => ({ default: () => null }))
 vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => null }))
@@ -157,5 +158,8 @@ describe('Request a Feature — failed send is reported (#4198)', () => {
     const chat = store.getState().chat
     expect(chat.messages.some(m => m.role === 'error')).toBe(false)
     expect(chat.slotRunning).toBe(true)
+    // The send rides the transport: the wire is handed the deadline signal
+    // (message, slot, colorTheme, signal, meta, steer).
+    expect(sendChatMock).toHaveBeenCalledWith(expect.any(String), 'fr-slot', expect.anything(), expect.any(AbortSignal), undefined, undefined)
   })
 })

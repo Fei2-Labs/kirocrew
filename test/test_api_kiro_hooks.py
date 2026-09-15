@@ -20,7 +20,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.dashboard.handlers.hooks import api_kiro_hooks
 
-# The handler imports `_shipped_defaults` at module scope (hoisted, #1050), so
+# The handler imports `_shipped_defaults` at module scope (hoisted), so
 # it is patched in the handler's namespace.  `KIRO_AGENTS_DIR` stays patched at
 # the SOURCE module on purpose: `kiro_agents_dir_path()` reads it from `agent`'s
 # globals at call time, so the source-module patch is unaffected by the hoist —
@@ -145,7 +145,17 @@ class TestApiKiroHooks:
                 entry = (await resp.json())["hooks"]["postToolUse"][0]
                 assert entry["command"] == "[R:echo secret]"
                 assert entry["matcher"] == "[R:tool_*]"
-                assert mock_redact.call_count == 2
+                # Count the HANDLER's calls, not every call in the process. The patch
+                # target is the process-wide ``security.redact``, and the SEL routes
+                # every field it persists through the same function -- so any audit row
+                # written while the platform context composes on first use (a tier
+                # record from the policy ladder, say) would otherwise be counted
+                # against this handler and make the test assert on unrelated
+                # subsystems.
+                own = [
+                    c for c in mock_redact.call_args_list if c.args[0] in ("echo secret", "tool_*")
+                ]
+                assert len(own) == 2
 
     @pytest.mark.asyncio
     async def test_bundled_vs_user_tagging(self, kiro_dir: Path, tmp_path: Path) -> None:

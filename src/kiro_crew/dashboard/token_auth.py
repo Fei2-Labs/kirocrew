@@ -35,6 +35,7 @@ from kiro_crew.dashboard.origin import (
 from kiro_crew.dashboard.refresh_tokens import (
     MAX_REFRESH_TTL_SECS,
     REFRESH_COOKIE_PATH,
+    bind_chain_peer,
     cookie_jar_needs_pruning,
     foreign_port_cookies,
     generate_refresh_token,
@@ -258,9 +259,12 @@ class TokenStateManager:
         self._nonces: OrderedDict[str, float] = OrderedDict()
         # Observation latches for the Security Posture surface only — never read
         # by an auth decision. See bind_peer() / proxied_pin_observed().
-        # token → (peer key, exp, proxied). The peer key is "ip:<addr>" for the
-        # default address pin and "ts:node:<login>@<node>" / "ts:login:<login>" for a
-        # daemon-verified tailnet peer (RFC §3) — in-memory only, regenerated on restart.
+        # _token_pin_key(token) → (peer key, exp, proxied). The key comes from
+        # the signed payload rather than the token string, so every string that
+        # authenticates as a session finds that session's pin. The peer key is
+        # "ip:<addr>" for the default address pin and "ts:node:<login>@<node>" /
+        # "ts:login:<login>" for a daemon-verified tailnet peer (RFC §3) —
+        # in-memory only, regenerated on restart.
         self._peer_bindings: dict[str, tuple[str, float, bool]] = {}
         self._consumed: dict[str, float] = {}  # token → exp
 
@@ -302,8 +306,9 @@ class TokenStateManager:
         Security Posture surface only — it does not change the binding or how
         :meth:`check_peer` compares it.
         """
+        key = _token_pin_key(token)
         with self._lock:
-            self._peer_bindings[token] = (peer_key, session_exp, proxied)
+            self._peer_bindings[key] = (peer_key, session_exp, proxied)
 
     def proxied_pin_observed(self, now: float) -> bool | None:
         """Report the pin scope of the sessions that are LIVE at *now*.
@@ -339,8 +344,9 @@ class TokenStateManager:
         (Tailscale re-enroll), and reporting it as "IP mismatch" would send
         them chasing the wrong thing.
         """
+        key = _token_pin_key(token)
         with self._lock:
-            entry = self._peer_bindings.get(token)
+            entry = self._peer_bindings.get(key)
         if entry is None or entry[0] == peer_key:
             return True, ""
         stored = entry[0]
@@ -352,8 +358,9 @@ class TokenStateManager:
 
     def has_binding(self, token: str) -> bool:
         """Whether *token* currently has a peer binding (live or not)."""
+        key = _token_pin_key(token)
         with self._lock:
-            return token in self._peer_bindings
+            return key in self._peer_bindings
 
     def mark_consumed(self, token: str, session_exp: float) -> None:
         """Mark a token as consumed (used for one-time token patterns)."""
@@ -606,6 +613,12 @@ SPA_FALLBACK_EXCLUDED_PREFIXES = (
     "/app-assets/",
     "/artifact-app/",
     "/sandbox-doc/",
+    # Cached feature-video clips and posters (feature_videos_cache.py). A data
+    # route: a GET with no session must be refused, never answered with the
+    # shell — the browser's <video> would otherwise receive index.html with a
+    # 200 and render nothing, and a future non-/api GET registered beside it in
+    # routes/realtime.py would inherit the same silent fallback.
+    "/feature-videos/",
 )
 
 # App window entries (`/app-windows/<app>/<name>.html`) are their own Vite bundles, served
@@ -748,6 +761,35 @@ def _b64url_encode(data: bytes) -> str:
 def _b64url_decode(s: str) -> bytes:
     padding = 4 - len(s) % 4
     return base64.urlsafe_b64decode(s + "=" * (padding % 4))
+
+
+def _token_pin_key(token: str) -> str:
+    """The identity a token's peer pin is stored under.
+
+    Derived from the signed payload bytes, not from the token string, because
+    the two are not one-to-one: :func:`_b64url_decode` uses the stdlib decoder's
+    default ``validate=False``, which discards characters outside the base64
+    alphabet, so a cosmetically re-encoded copy of a token is a different string
+    carrying byte-identical payload bytes -- and :func:`validate_token` verifies
+    the signature over those bytes, so it accepts both as the same session.
+
+    Keyed on the string, such a copy authenticates as the session while missing
+    its binding, and :meth:`TokenStateManager.check_peer` treats an absent entry
+    as unbound. Keyed on the payload, every string that can authenticate as a
+    session resolves to that session's pin, so the pin cannot be shed by
+    re-spelling the cookie. The signed payload carries a per-mint nonce and
+    ``iat``, so two separate mints never share a key.
+
+    A token whose payload cannot be decoded keeps the raw string as its key. It
+    cannot authenticate at all (:func:`validate_token` rejects it as invalid
+    encoding), and folding every undecodable string into one shared key would
+    alias unrelated tokens onto one another's pins.
+    """
+    try:
+        payload = _b64url_decode(token.split(".", 1)[0])
+    except Exception:
+        return token
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _sign(payload: bytes) -> str:
@@ -1489,10 +1531,10 @@ def _api_pattern_matches(pattern: str, path: str) -> bool:
 # them in ``permissions.api`` adds no security value and produces silent 403
 # regressions whenever a new app forgets to list them.
 #
-# ``/api/ws`` is safe to allow implicitly ONLY because the WS layer now applies
+# ``/api/ws`` is safe to allow implicitly ONLY because the WS layer applies
 # per-app event scope filtering (``ws_event_scope.py``): a connected app token
 # receives just the events matching its ``permissions.events`` declarations, so
-# connecting no longer grants the full event stream. Contrast with functional
+# connecting does not grant the full event stream. Contrast with functional
 # paths like /api/chat/* or /api/spawn/* — those grant real capabilities and
 # MUST stay explicitly declared.
 #
@@ -1684,7 +1726,7 @@ async def _verify_unix_peer(
             error=_reason,
         )
         _log_auth(request, "internal", "denied", _reason)
-        return _deny(request, "Forbidden")
+        return _deny(request, "Forbidden", "unix_peer_unverified")
     peer_pid = get_peer_pid(sock)
     if peer_pid is None:
         return None
@@ -1719,7 +1761,7 @@ async def _verify_unix_peer(
             "denied",
             f"peer identity mismatch (peer_pid={peer_pid})",
         )
-        return _deny(request, "Forbidden")
+        return _deny(request, "Forbidden", "peer_session_mismatch")
     # Positive kernel attestation. Debug-level on purpose — this fires on
     # every internal call from a claimed session; the SEL trail records the
     # deny arm, which is the permission decision that changes anything.
@@ -1736,9 +1778,9 @@ def derive_caller_app(
     **Why this exists.** App-ownership checks gate on ``request["app"]``, which
     the app-token branch publishes. The internal-secret branch (the managed MCP
     set) carries no app claim at all: the secret proves the call came from
-    inside, not who made it. Every ownership check therefore became a no-op on
-    that transport, and an app agent granted ``@kirocrew-dashboard`` arrived
-    indistinguishable from the dashboard user (issue #3690).
+    inside, not who made it. Without this, every ownership check is a no-op on
+    that transport, and an app agent granted ``@kirocrew-dashboard`` arrives
+    indistinguishable from the dashboard user.
 
     The identity comes from the authenticated CALLING SESSION, resolved against
     server-side registries in four steps -- one per way a session can be owned:
@@ -2340,8 +2382,14 @@ def token_auth_middleware(
                     # loopback caller (kiro-cli / MCP) authenticated" from "no
                     # auth ran at all".
                     request["internal_auth"] = True
+                    if path == "/api/chat" or path.startswith("/api/chat/"):
+                        from kiro_crew.dashboard.handlers._shared import private_chat_route_refusal
+
+                        memory_refusal = await private_chat_route_refusal(request)
+                        if memory_refusal is not None:
+                            return memory_refusal
                     # Derive the app identity ONCE, here, so every ownership
-                    # check downstream sees it (issue #3690). The secret proves
+                    # check downstream sees it. The secret proves
                     # the call came from inside, not who made it, so identity
                     # comes from the authenticated calling session.
                     #
@@ -2419,10 +2467,10 @@ def token_auth_middleware(
                 )
                 _log_auth(request, "internal", "denied", f"cookie auth failed: {_reason}")
                 return _deny(request, "Forbidden")
-            # Session-pin enforcement (RFC §3). Internal paths validated the
-            # cookie but historically skipped the pin, which would let a
-            # peer-pinned session be replayed against /api/chat, /api/spawn
-            # and friends from a client the pin excludes.
+            # Session-pin enforcement (RFC §3). Internal paths validate the
+            # cookie, and skipping the pin here would let a peer-pinned session
+            # be replayed against /api/chat, /api/spawn and friends from a
+            # client the pin excludes.
             _pin_ok, _pin_mismatch = _check_pin(_tok)
             if not _pin_ok:
                 _log_auth(request, _audit_uid(_uid), "denied", _pin_mismatch)
@@ -2976,14 +3024,55 @@ def token_auth_middleware(
                     # at restart while a 30-day refresh credential beside it
                     # re-minted a fresh session on the next visit, and "ends at
                     # restart" would be false by one rotation.
+                    #
+                    # Peer binding for the CHAIN. The QR "persistent" session
+                    # shape carries its own ``require_peer`` claim on the link;
+                    # an ordinary Phase-3 session does not, so without this its
+                    # chain would be minted UNBOUND even though its access token
+                    # is pinned to a verified peer. That asymmetry is a
+                    # laundering path: a refresh cookie stolen from allowed node
+                    # A, replayed from allowed node B, rotated cleanly and handed
+                    # back an access token pinned to B. Binding here closes it at the mint, so
+                    # the chain says who owns it from its first byte rather than
+                    # relying on the rotation handler to infer it.
+                    #
+                    # Gated on a RESOLVED peer, not on ``peer_key``: that helper
+                    # answers ``ip:<addr>`` when no peer resolved, and binding a
+                    # chain to the tunnel's shared loopback address would read as
+                    # a pin while excluding nobody. ``bind_refresh_chains`` is the
+                    # operator's documented opt-out for cross-device roaming at
+                    # node scope.
+                    _refresh_require_peer = str(data.get("require_peer", "")) == "1"
+                    _refresh_peer_key = _session_peer_key
+                    if (
+                        not _refresh_require_peer
+                        and peer is not None
+                        and tailnet_trust is not None
+                        and tailnet_trust.bind_refresh_chains
+                        and peer_key.startswith("ts:")
+                    ):
+                        _refresh_require_peer = True
+                        _refresh_peer_key = peer_key
                     refresh_token, chain_id, _jti, refresh_exp = generate_refresh_token(
                         user_id,
                         boot=str(data.get("boot", "")),
-                        require_peer=str(data.get("require_peer", "")) == "1",
-                        peer_key=_session_peer_key,
+                        require_peer=_refresh_require_peer,
+                        peer_key=_refresh_peer_key,
                     )
                     refresh_remaining = int(refresh_exp - time.time())
                     if refresh_remaining > 0:
+                        if _refresh_peer_key:
+                            # Server-side twin of the signed claim above. The
+                            # claim is authoritative and cannot be forged, but it
+                            # only binds chains whose mint path remembered to set
+                            # it — and this issue exists because one did and the
+                            # others did not. A record the presented token cannot
+                            # influence makes the next forgetful mint path fail
+                            # closed instead of silently unbound. Offloaded
+                            # because it writes refresh_chains.json.
+                            await asyncio.to_thread(
+                                bind_chain_peer, chain_id, _refresh_peer_key, refresh_exp
+                            )
                         resp.set_cookie(
                             refresh_cookie_name(_cookie_port_from_host(request, port)),
                             refresh_token,

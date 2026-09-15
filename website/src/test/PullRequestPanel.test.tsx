@@ -19,6 +19,7 @@ vi.mock('../components/MarkdownRenderer', () => ({
 
 import PullRequestPanel, {
   CHECK_POLL_MAX_FAILURES,
+  SOURCE_REMOUNT_REVALIDATE_MS,
   pullRequestCheckPollDelay,
   pullRequestCiSignal,
   pullRequestIsLive,
@@ -446,6 +447,51 @@ describe('PullRequestPanel', () => {
     expect(alert).toHaveTextContent('gh auth login')
     expect(alert).not.toHaveTextContent('GitHub CLI login required')
     expect(alert).not.toHaveTextContent('{"error"')
+  })
+
+  function renderWithRetained(dataUpdatedAt: number) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData<PullRequestSource>(['pull-request-source', github.url], github, {
+      updatedAt: dataUpdatedAt,
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[{ url: github.url, provider: 'github', number: 12, repo: 'widgets' }]}
+          selectedUrl={github.url}
+          onSelect={() => {}}
+          onAddToChat={() => {}}
+        />
+      </QueryClientProvider>,
+    )
+  }
+
+  it('revalidates a retained payload older than the gateway cache window on mount', async () => {
+    // Stale-while-revalidate: the retained payload paints at once (no spinner)
+    // and a background refetch runs, because this gateway's own events cannot
+    // see a teammate's review or comment.
+    renderWithRetained(Date.now() - SOURCE_REMOUNT_REVALIDATE_MS - 1_000)
+    expect(screen.getAllByText(github.title).length).toBeGreaterThan(0)
+    await waitFor(() => expect(mockApi.pullRequestSource).toHaveBeenCalledWith(github.url, false))
+  })
+
+  it('does not refetch a retained payload the gateway would still serve from cache', () => {
+    // Inside the window a refetch returns the same bytes; a sibling view that
+    // shares this key (Code Review Sage) would otherwise pay two reads per open.
+    renderWithRetained(Date.now() - 1_000)
+    expect(screen.getAllByText(github.title).length).toBeGreaterThan(0)
+    expect(mockApi.pullRequestSource).not.toHaveBeenCalled()
+  })
+
+  it('shows a compact notice, not the full error card, when a background revalidation fails', async () => {
+    mockApi.pullRequestSource.mockRejectedValue(apiError({ error: 'gh: HTTP 401 Bad credentials' }))
+    renderWithRetained(Date.now() - SOURCE_REMOUNT_REVALIDATE_MS - 1_000)
+    await screen.findByRole('status')
+    // The loaded pull request stays on screen with a one-line notice above it...
+    expect(screen.getAllByText(github.title).length).toBeGreaterThan(0)
+    expect(screen.getByRole('status')).toHaveTextContent(/showing the last loaded version/i)
+    // ...and the full-height "could not load" card never appears over it.
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('caps rendered source tabs at the per-slot limit', () => {
@@ -994,5 +1040,97 @@ describe('PullRequestPanel merge-blocker banner', () => {
 
     expect(await screen.findByText('Add source tabs')).toBeInTheDocument()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+})
+
+describe('source tab project disambiguation', () => {
+  /** Render the panel with an explicit source list, without renderPanel's fixed
+   *  two-source pair. Payload fetches are mocked to the gitlab fixture for any
+   *  gitlab host — the tab LABELS come from the sources prop, not the payload. */
+  function renderWithSources(srcs: Array<{ url: string; provider: 'github' | 'gitlab'; number: number; repo: string; kind: 'change' | 'issue' }>) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    return render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={srcs}
+          selectedUrl={srcs[0].url}
+          onSelect={() => {}}
+          onAddToChat={vi.fn()}
+        />
+      </QueryClientProvider>,
+    )
+  }
+
+  it('qualifies each tab with its project when two projects share an MR IID', async () => {
+    // Two different GitLab projects, both MR !1. Bare `MR !1` tabs would be
+    // indistinguishable; the fix prefixes each with its full project path.
+    renderWithSources([
+      { url: 'https://gitlab.com/group-a/service/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'service', kind: 'change' },
+      { url: 'https://gitlab.com/group-b/service/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'service', kind: 'change' },
+    ])
+
+    const tabA = await screen.findByRole('tab', { name: /group-a\/service MR !1/i })
+    const tabB = await screen.findByRole('tab', { name: /group-b\/service MR !1/i })
+    expect(tabA).toBeInTheDocument()
+    expect(tabB).toBeInTheDocument()
+    // The tabs must not be the same element — the whole point of the fix.
+    expect(tabA).not.toBe(tabB)
+    expect(tabA.textContent).toContain('group-a/service')
+    expect(tabB.textContent).toContain('group-b/service')
+  })
+
+  it('qualifies with the host when the same project path exists on two hosts', async () => {
+    // Self-managed GitLab: the same group/project path on two hosts, same IID.
+    // The path alone no longer discriminates, so the host joins the qualifier.
+    renderWithSources([
+      { url: 'https://gitlab.com/group-a/service/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'service', kind: 'change' },
+      { url: 'https://gitlab.internal/group-a/service/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'service', kind: 'change' },
+    ])
+
+    // Host+path is 3 segments, so the minimal-unique-suffix shortener kicks
+    // in; the hosts differ, so one trailing segment cannot discriminate and
+    // the suffix grows until it includes the host.
+    const tabA = await screen.findByRole('tab', { name: /gitlab\.com\/group-a\/service MR !1/i })
+    const tabB = screen.getByRole('tab', { name: /gitlab\.internal\/group-a\/service MR !1/i })
+    expect(tabA).toBeInTheDocument()
+    expect(tabB).toBeInTheDocument()
+  })
+
+  it('keeps the discriminating tail visible for deep paths sharing a prefix', async () => {
+    // Two deep subgroup paths that differ only at the LAST segment. An
+    // end-truncated qualifier would render both as `platform/services/… MR !1`
+    // and restore the ambiguity; the shortener instead keeps the unique tail.
+    renderWithSources([
+      { url: 'https://gitlab.com/platform/services/ingest/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'ingest', kind: 'change' },
+      { url: 'https://gitlab.com/platform/services/egress/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'egress', kind: 'change' },
+    ])
+
+    const tabA = await screen.findByRole('tab', { name: /…\/ingest MR !1/i })
+    const tabB = screen.getByRole('tab', { name: /…\/egress MR !1/i })
+    expect(tabA).toBeInTheDocument()
+    expect(tabB).toBeInTheDocument()
+    // The shared prefix is elided, not the discriminating tail.
+    expect(tabA.textContent).not.toContain('platform/services')
+    expect(tabB.textContent).not.toContain('platform/services')
+  })
+
+  it('leaves a single-project session on the concise bare label', async () => {
+    // Two MRs from the SAME project: no ambiguity, so no project prefix.
+    renderWithSources([
+      { url: 'https://gitlab.com/group-a/service/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'service', kind: 'change' },
+      { url: 'https://gitlab.com/group-a/service/-/merge_requests/2', provider: 'gitlab', number: 2, repo: 'service', kind: 'change' },
+    ])
+
+    // Wait for the selected source's payload to settle first: once it loads,
+    // the selected tab gains a lifecycle glyph whose aria-label joins the
+    // accessible name, so an anchored whole-name match would only ever pass on
+    // the pre-fetch frame and silently stop checking the settled panel.
+    expect(await screen.findByText('GitLab source')).toBeInTheDocument()
+    const tabs = screen.getAllByRole('tab')
+    const labels = tabs.map(tab => tab.textContent ?? '')
+    expect(labels.some(text => text.includes('MR !1'))).toBe(true)
+    expect(labels.some(text => text.includes('MR !2'))).toBe(true)
+    // The project path never leaks into a single-project tab label.
+    for (const text of labels) expect(text).not.toContain('group-a/service')
   })
 })

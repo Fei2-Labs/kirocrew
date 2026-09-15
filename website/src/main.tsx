@@ -15,7 +15,8 @@ import { ProviderProvider } from './providers'
 import { ThemeProvider } from './hooks/useTheme'
 import { UIModeProvider } from './hooks/useUIMode'
 import ThemeExperienceLayer from './components/ThemeExperienceLayer'
-import { NavigationLeaveGuardProvider } from './components/NavigationLeaveGuard'
+import { NavigationLeaveGuardProvider, NavigationBackGuard } from './components/NavigationLeaveGuard'
+import { RouteHistoryTracker } from './components/NavHistoryArrows'
 import { initRum } from './rum'
 import { isEmbeddedPane } from './lib/embedded'
 // i18n must initialize before the first render — a component rendering ahead of
@@ -29,6 +30,14 @@ import { queryClient } from './api/queryClient'
 import ErrorBoundary from './components/ErrorBoundary'
 import DashboardBootstrap from './components/DashboardBootstrap'
 import { installPageZoomSuppression } from './utils/pageZoom'
+import { installStaleShellHeal } from './lib/staleShellHeal'
+import {
+  hasUnreconciledKeys,
+  hydrateUiPrefs,
+  needsHydrate,
+  reconcileNewDurableKeys,
+  startUiPrefsSync,
+} from './lib/uiPrefs'
 import 'katex/dist/katex.min.css'
 import './index.css'
 import './styles/cli-mode.css'
@@ -48,6 +57,8 @@ initI18n()
 // WebKit, which ignores both for user gestures. Installed before render so the
 // very first pinch is already suppressed. See utils/pageZoom.ts.
 installPageZoomSuppression()
+// Detect and break out of a stale service-worker shell (see the module doc).
+installStaleShellHeal()
 
 // Auto-recover from stale lazy-chunk errors after a frontend rebuild.
 // Vite fires `vite:preloadError` on window when a dynamic import() of a
@@ -96,7 +107,7 @@ if (import.meta.env.DEV) {
   // The finding is not noise — it is the only recurring reminder that suppressing page
   // zoom is an accessibility trade nobody has yet accepted in writing, and "nobody can
   // action it" was wrong: it is a decision, and a decision stays owed.
-  // See the page-zoom section of website/docs/page-layout.md for the policy.
+  // See the page-zoom row in website/docs/page-layout.md for the policy.
   import('react-dom').then(ReactDOM => import('@axe-core/react').then(axe => axe.default(React, ReactDOM, 1000)))
 }
 
@@ -140,7 +151,7 @@ startMemoryWatch('main')
 // element enters the tree on a normal load.
 installCommitProfilerConsoleApi()
 
-createRoot(document.getElementById('root')!).render(
+const appTree = (
   <StrictMode>
     <ErrorBoundary root scope="app-shell">
       <QueryClientProvider client={queryClient}>
@@ -151,6 +162,16 @@ createRoot(document.getElementById('root')!).render(
                 <ThemeExperienceLayer />
                 <NavigationLeaveGuardProvider>
                   <BrowserRouter>
+                    {/* Inside the router (it navigates) and outside the routes
+                        (it must survive every route change). Renders nothing,
+                        and stays out of the history stack entirely until a page
+                        publishes work at stake. */}
+                    <NavigationBackGuard />
+                    {/* Same placement contract as the guard above: inside the
+                        router so it sees every navigation, outside the routes so
+                        no route change unmounts it. Feeds the position store the
+                        top-bar arrows and the ⌘/Ctrl+←/→ chords read. */}
+                    <RouteHistoryTracker />
                     <Routes>
                       <Route path="/worlds-popout" element={<BrandingProvider><ProviderProvider><Suspense fallback={null}><WorldsPopout /></Suspense></ProviderProvider></BrandingProvider>} />
                       <Route
@@ -172,5 +193,91 @@ createRoot(document.getElementById('root')!).render(
         </Provider>
       </QueryClientProvider>
     </ErrorBoundary>
-  </StrictMode>,
+  </StrictMode>
 )
+
+// Restore the host-side backup of the renderer's own settings BEFORE the first
+// render, on any profile that has never successfully reached the host — a fresh
+// browser profile, a moved dashboard port (localStorage is per-origin), or a
+// relocated Electron userData directory. That is the case where the user would
+// otherwise see every setting back at its default and conclude the upgrade ate
+// them. Keyed on "never synced" rather than "no settings present" so a boot whose
+// fetch failed retries on the next one instead of forfeiting the restore.
+//
+// When something WAS restored we reload rather than render. Restoring before the
+// first render is not enough on its own: static imports are evaluated before any
+// statement here, so a store that reads its key at module scope (e.g.
+// hooks/useBottomTerminal.ts) has already captured the pre-restore value, and its
+// first write would persist that stale copy back over what we just restored. A
+// reload is the one move that is correct for every module-scope reader, present
+// and future, without a per-store re-init hook a new store would silently miss.
+// It costs one extra load on a fresh profile and cannot loop: hydrateUiPrefs
+// records the synced marker, so the next boot does not hydrate, and even with
+// that write dropped the second pass finds the keys present and restores nothing.
+//
+// Sync starts ONLY once this profile knows the host's state — i.e. the GET landed,
+// which is what clears needsHydrate(). If the fetch failed we render but do NOT
+// sync: the local keys at that moment are whatever the defaults-persisting hooks
+// just wrote, and uploading those would overwrite the very backup the failed
+// restore was trying to read. No sync means no backup for this session and the
+// next boot retries the restore. The asymmetry is deliberate — losing one
+// session's backup is recoverable, overwriting the host's copy is not.
+//
+// A profile that has synced pays nothing: needsHydrate() is a synchronous
+// localStorage read, so the usual launch renders on the same tick as before. The
+// first-time path is bounded by hydrateUiPrefs' own timeout, and a gateway that
+// never answers renders defaults rather than hanging the boot. See lib/uiPrefs.ts.
+
+// Embedded panes only: tell the parent this bundle EXECUTED, before React renders
+// anything. The parent's pane journal records `boot` for it. Without this line a
+// pane that loads its shell (a 200 the parent can see) and then never announces
+// `mc-embedded-ready` is indistinguishable from one whose bundle never ran; with
+// it the parent can tell "the entry ran but App/its bridge never mounted" from
+// "no JavaScript of ours ever executed in that frame". `stage` names how far
+// this file got. Wildcard target is safe: the payload carries no data and the
+// parent validates the origin. See EmbeddedHostBridge for the ready half.
+function announceBoot(stage: string): void {
+  if (!isEmbeddedPane()) return
+  try {
+    // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
+    window.parent?.postMessage({ type: 'mc-embedded-boot', v: 1, stage }, '*')
+  } catch {
+    /* no parent reachable — the ready announce carries its own retries */
+  }
+}
+announceBoot('entry')
+
+// (See the block above announceBoot for why the first-time boot may reload.)
+function boot(startSync: boolean): void {
+  announceBoot('render')
+  createRoot(document.getElementById('root')!).render(appTree)
+  if (startSync) startUiPrefsSync()
+}
+
+if (needsHydrate()) {
+  void hydrateUiPrefs().then(
+    (restored) => {
+      if (restored > 0) window.location.reload()
+      else boot(!needsHydrate())
+    },
+    () => boot(false),
+  )
+} else if (hasUnreconciledKeys()) {
+  // A WARM profile whose build upgrade added keys to DURABLE_PREF_KEYS: read
+  // the host's copy of the new keys before the first flush may run, or a
+  // default a hook persists on mount would overwrite the value another origin
+  // backed up (growth-gap issue 9491). Same shape as the cold path above --
+  // reload when something was written locally (module-scope readers already
+  // captured the pre-restore value), and do NOT sync after a failure (the
+  // next boot retries; flushing unreconciled keys is the clobber itself).
+  // Runs once per allowlist growth, not per boot: success records the roster.
+  void reconcileNewDurableKeys().then(
+    (restored) => {
+      if (restored > 0) window.location.reload()
+      else boot(restored === 0)
+    },
+    () => boot(false),
+  )
+} else {
+  boot(true)
+}

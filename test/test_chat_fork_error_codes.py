@@ -60,7 +60,17 @@ def test_no_refusal_in_this_module_is_prose_only() -> None:
 
 
 def test_the_ratchet_can_actually_fail() -> None:
-    """Self-check: a scan matching nothing would pass the assertion above vacuously."""
+    """Self-check: a scan matching nothing would pass the assertion above vacuously.
+
+    The count moves when a refusal enters or leaves this module's own body. Two
+    corpus-read refusals now answer through `chat_utils.history_corpus_unreadable`,
+    which sets the code by construction, so the scanner does not see them here —
+    a stronger guarantee than a per-site scan, but two fewer sites to count. There
+    is no ``slot_not_persistent`` site: an incognito or temporary session forks
+    and the child inherits its mode. The one memory-mode refusal in the module is
+    ``fork_source_memory_mode_invalid``, for a parent whose persisted mode is
+    outside the allowlist.
+    """
     coded = [f for f in _findings() if f.bucket == "compliant"]
     assert len(coded) == 27, f"scanner reached {len(coded)} coded sites, expected 27"
     assert all(f.code_value for f in coded)
@@ -152,10 +162,10 @@ async def test_an_over_long_prompt(tmp_path, monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_a_non_integer_index_and_an_out_of_range_one_differ(tmp_path, monkeypatch) -> None:
-    """The distinction a caller could not previously make without matching English.
+    """A caller distinguishes the two bugs by ``code``, not by matching English.
 
     "not an index" and "an index past the end" are different client bugs and want
-    different handling; before the code they were both ``400`` with prose.
+    different handling; without the ``code`` they are both ``400`` with prose.
     """
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
     _, bad_type = await _fork(_seeded_state(tmp_path), "forkable", {"at_message_index": "2"})
@@ -225,13 +235,52 @@ async def test_a_slot_with_no_forkable_messages(tmp_path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_non_persistent_slot(tmp_path, monkeypatch) -> None:
+async def test_a_non_persistent_slot_forks_and_inherits_its_mode(tmp_path, monkeypatch) -> None:
+    """The mode is a memory boundary, not a property of the transcript, so the
+    fork proceeds and the child is born with the parent's mode rather than the
+    persistent default."""
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
     state = _seeded_state(tmp_path)
-    state._slots["forkable"].memory_mode = "ephemeral"
+    state._slots["forkable"].memory_mode = "incognito"
     status, body = await _fork(state, "forkable", {})
-    assert status == 400
-    assert body["code"] == "slot_not_persistent"
+    assert status == 200
+    assert body["ok"] is True
+    assert body["memory_mode"] == "incognito"
+    assert state._slots[body["key"]].memory_mode == "incognito"
+
+
+@pytest.mark.asyncio
+async def test_a_parent_with_an_unrecognised_persisted_mode_is_refused(
+    tmp_path, monkeypatch
+) -> None:
+    """Rehydration copies the transcript header's ``memory_mode`` onto the slot as
+    written, so a hand-edited header puts a value outside the allowlist on a live
+    parent. The child inherits that value, and the slot constructor rejects it;
+    the fork must refuse with a code before any child exists, not surface the
+    constructor's ``ValueError`` as a 500."""
+    from kiro_crew.dashboard.chat_persistence import (
+        _rehydrate_slot_from_history,
+        _save_slot_to_history,
+    )
+
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("forkable")
+    slot.append("user", "hello", "msg msg-u")
+    slot.append("assistant", "hi", "msg msg-a")
+    slot.drain()
+    _save_slot_to_history(state, slot, closed=False)
+    state.conversation_log.update_metadata("dashboard:forkable", {"memory_mode": "off"})
+    del state._slots["forkable"]
+    parent = _rehydrate_slot_from_history(state, "forkable")
+    assert parent is not None and parent.memory_mode == "off"
+    keys_before = set(state._slots)
+
+    status, body = await _fork(state, "forkable", {})
+
+    assert status == 409
+    assert body["code"] == "fork_source_memory_mode_invalid"
+    assert set(state._slots) == keys_before, "a refused fork must allocate no child"
 
 
 # ── the property the conversion must not break ──
@@ -243,7 +292,7 @@ async def test_the_three_404s_stay_indistinguishable(tmp_path, monkeypatch) -> N
 
     ``404`` (not ``403``) is deliberate: it makes a slot owned by another app, an
     unscoped slot, and a slot that does not exist look identical to a caller
-    behind the App Kit isolation boundary, so the boundary cannot be used to
+    behind the App Kit isolation boundary, so the boundary cannot be abused to
     enumerate slots (CWE-204). The added ``code`` is a NEW field on that same
     response, so it is a new place for the three to diverge — this pins that
     they do not. The true reason stays recorded server-side via SEL.
@@ -300,3 +349,39 @@ async def test_every_refusal_carries_both_a_code_and_its_prose(tmp_path, monkeyp
         assert status == 400, payload
         assert isinstance(body.get("code"), str) and body["code"], payload
         assert isinstance(body.get("error"), str) and body["error"], payload
+
+
+def test_an_unreadable_mid_rotation_corpus_refuses_instead_of_approximating() -> None:
+    """The full-corpus read failing must FAIL CLOSED, by source inspection.
+
+    Driving this through the wire needs a mid-rotation chain plus a read that
+    throws only on the second call, which the seeded fixture cannot express; the
+    property that matters is structural, so it is asserted structurally.
+
+    Why it matters: a fallback prepending only THIS key's
+    rotated head, so a rotation on a LATER chain member left earlier members'
+    rotated rows missing and shifted every index. An index-addressed fork then
+    copied different messages than the reader pointed at, with nothing on screen
+    to say so. A retryable refusal is visible and recoverable; a silently wrong
+    fork is neither.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "src/kiro_crew" / _TARGET).read_text()
+    head, _, tail = src.partition("chained-full fork corpus read failed")
+    assert tail, "the full-read failure branch is gone -- re-point this guard"
+    # Scope to the except block itself: the `if not _rebuilt:` prepend further
+    # down is the LEGITIMATE path (full read fine, chain simply not mid-rotation)
+    # and must keep working, so it has to stay outside this window.
+    block, _, _rest = tail.partition("if not _rebuilt:")
+    assert "fork_corpus_unreadable" in block, (
+        "the full-corpus read failure must refuse with a retryable code; "
+        "approximating the index space silently forks the wrong messages"
+    )
+    # The 503 now lives in `chat_utils.history_corpus_unreadable`, which every
+    # corpus-read failure answers through — so assert the call, and let that
+    # helper's own module carry the status literal.
+    assert "history_corpus_unreadable(" in block, "the refusal must be retryable, not terminal"
+    assert (
+        "_rotated_head + all_messages" not in block
+    ), "the flat prepend must not run after a failed full read"

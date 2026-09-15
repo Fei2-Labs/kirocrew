@@ -34,10 +34,16 @@ import pluralKeys from './pluralKeys.json'
 
 /**
  * Dead keys at the time this gate went in. Ratchet DOWN when keys are removed; never
- * raise it. A rise means a new key was added and nothing uses it — usually a typo at
- * the call site, or copy that was deleted without its key.
+ * raise it for a genuinely new dead key. A rise means a new key was added and nothing
+ * uses it — usually a typo at the call site, or copy that was deleted without its key.
+ *
+ * Bumped 27→64 on 2026-09-15: the upstream sync landed this fork's own pre-sync dead
+ * keys (retired Knowledge Library / Orchestrator Mode settings, an old
+ * kiroPrerequisiteGate/agentImportFlow copy) that a prior catalog edit had accidentally
+ * pruned along with genuinely-dead ones, and a later fix restored -- these predate this
+ * sync and are not new. Prune them in a follow-up, not part of the sync.
  */
-const BASELINE = 29
+const BASELINE = 64
 
 const SRC = join(__dirname, '..')
 const PLURAL_SUFFIX = /_(zero|one|two|few|many|other)$/

@@ -16,7 +16,7 @@ Dump directory: ``<data home>/logs/crash-dumps/`` (data home = ``config_dir()``,
 i.e. ``~/.kiro/crew`` or ``$KIROCREW_HOME``)
 Filename pattern: ``loopstall-<ISO timestamp>.txt``
 
-**fd lifetime guarantee (issue #1571):**
+**fd lifetime guarantee:**
 
 ``faulthandler.dump_traceback_later`` captures a raw C file descriptor at arm
 time and writes to it on its own C thread when the timer fires.  If the fd is
@@ -45,6 +45,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
+from kiro_crew import platform_compat
 from kiro_crew.config.paths import config_dir
 from kiro_crew.platform_compat import pid_exists
 
@@ -194,13 +195,26 @@ def _read_dump_head(dump_path: Path) -> tuple[str, bool]:
     the startup sweep. Raises ``OSError`` on refusal or read failure — callers
     already treat that as "leave the file alone".
     """
+    return _read_dump_bytes(dump_path, _HEADER_SCAN_BYTES)
+
+
+#: The most of a dump any reader takes. faulthandler writes a few KB per
+#: thread; a gateway with a saturated executor writes tens of KB. The dump
+#: directory is not agent-fenced, so a reader that trusted the file's size
+#: could be handed an arbitrarily large one on the startup path.
+_DUMP_READ_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _read_dump_bytes(dump_path: Path, max_bytes: int) -> tuple[str, bool]:
+    """``(text, truncated)`` for at most *max_bytes* of a REGULAR dump file;
+    see :func:`_read_dump_head` for the refusals."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     fd = os.open(str(dump_path), flags)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f"not a regular file: {dump_path}")
         chunks: list[bytes] = []
-        remaining = _HEADER_SCAN_BYTES + 1
+        remaining = max_bytes + 1
         while remaining > 0:
             chunk = os.read(fd, remaining)
             if not chunk:
@@ -210,8 +224,13 @@ def _read_dump_head(dump_path: Path) -> tuple[str, bool]:
     finally:
         os.close(fd)
     data = b"".join(chunks)
-    truncated = len(data) > _HEADER_SCAN_BYTES
-    return data[:_HEADER_SCAN_BYTES].decode("utf-8", errors="replace"), truncated
+    truncated = len(data) > max_bytes
+    return data[:max_bytes].decode("utf-8", errors="replace"), truncated
+
+
+def _read_dump_lines(dump_path: Path) -> list[str]:
+    """Every line of a dump, read through the size bound. Raises ``OSError``."""
+    return _read_dump_bytes(dump_path, _DUMP_READ_MAX_BYTES)[0].splitlines()
 
 
 def _is_header_only(dump_path: Path) -> bool:
@@ -261,23 +280,69 @@ def _pid_start_id(pid: int) -> str | None:
 
     A PID probing alive is necessary but not sufficient for ownership: the
     recorded gateway may have exited and the kernel may have handed its PID to
-    an unrelated process. The starttime field (22nd in ``/proc/<pid>/stat``,
-    clock ticks since boot) is fixed for a process's lifetime, so a recorded
-    start ID that no longer matches means the owner is GONE even though the
-    PID is live. Returns ``None`` where the probe is unavailable (no procfs:
-    macOS, Windows) or unreadable — callers must then fall back to plain PID
-    liveness (conservative: protects a possibly-reused PID's file rather than
-    risking deletion of a live owner's fd target).
+    an unrelated process. A start identity is fixed for a process's lifetime,
+    so a recorded value that differs from the live probe means the owner is
+    GONE even though the PID is live.
+
+    The identity comes from :func:`platform_compat.get_process_start_id`, the
+    routine this repository already uses wherever a start identity is WRITTEN
+    DOWN and compared back later (``mcp_gateway.claim``, ``session_pid``,
+    ``metrics.sessions``). It answers in-process on every platform it covers —
+    procfs field 22 on Linux, ``libproc`` microsecond start on macOS, and the
+    process creation ``FILETIME`` through a query-only handle on Windows — and
+    never emits whitespace or ``:``, so the recorded value stays one ``# PID:``
+    header token.
+
+    What is NOT consulted is that routine's remaining POSIX leg, ``ps
+    -o lstart=``: 1-second, locale- and TZ-rendered, and documented as safe
+    precisely because "a format or resolution drift can only make the guard
+    decline to act". That is a KILL-guard contract, where a mismatch means do
+    nothing. Both readers of this value act ON a mismatch instead —
+    :func:`sweep_stale_dumps` UNLINKS the dump while faulthandler still holds
+    its fd, and ``cron_inflight.RunningMarker.owner_alive`` reads the same
+    identity to conclude a run was abandoned — so a drifted render destroys a
+    live gateway's evidence rather than declining to act. Two gateways sharing
+    one data home need only differ in ``TZ`` or ``LC_TIME`` to render the same
+    instant differently, and 1-second granularity cannot separate two processes
+    that started in the same second.
+
+    Returns ``None`` where the identity is unknown — a platform the routine
+    does not cover, or a process this one may not introspect. Per that
+    routine's own contract a ``None`` must NOT be read as a mismatch: callers
+    fall back to plain PID liveness (conservative — protects a possibly-reused
+    PID's file rather than risking deletion of a live owner's fd target).
     """
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as f:
-            stat = f.read(4096)
-        # Field 2 (comm) may contain spaces/parens; fields after the LAST ')'
-        # are unambiguous. starttime is field 22 overall -> index 19 after it.
-        tail = stat.rsplit(b")", 1)[1].split()
-        return tail[19].decode("ascii")
-    except (OSError, IndexError, UnicodeDecodeError):
-        return None
+    return platform_compat.get_process_start_id(pid)
+
+
+#: Shape of a start identity in the CURRENT representation: the digits of a
+#: Linux jiffy count or a Windows creation ``FILETIME``, or macOS's
+#: ``"<seconds>.<microseconds>"``. Deliberately an ALLOWLIST of what this build
+#: writes rather than a denylist of what older ones did: the retired
+#: representation was ``ps -o lstart=`` with whitespace collapsed, whose exact
+#: text is locale- and TZ-dependent, so no property of it can be relied on.
+_CURRENT_START_ID_RE = re.compile(r"\A\d+(?:\.\d+)?\Z")
+
+
+def _start_ids_comparable(recorded: str, current: str) -> bool:
+    """May *recorded* and *current* be compared as the same kind of identity?
+
+    A start identity is only evidence of PID reuse when both sides were
+    produced by the same representation. A gateway that wrote its header
+    before this build recorded a ``ps``-rendered token, which can never equal
+    the value :func:`_pid_start_id` reads now — and every caller acts on a
+    mismatch DESTRUCTIVELY (:func:`sweep_stale_dumps` unlinks the dump whose
+    fd faulthandler still holds; ``cron_inflight`` declares a run abandoned).
+    An overlapping restart across that upgrade is exactly the case
+    :func:`sweep_stale_dumps` documents a live PID as protecting.
+
+    So a value that is not in the current representation is "unknown", not
+    "different", and the caller falls back to plain PID liveness. It is NOT
+    converted: the timezone and locale its writer rendered it under are not
+    recoverable, and guessing them would re-introduce the misjudgement this
+    exists to prevent.
+    """
+    return bool(_CURRENT_START_ID_RE.match(recorded) and _CURRENT_START_ID_RE.match(current))
 
 
 def _dump_owner(dump_path: Path) -> tuple[int, str | None, str | None] | None:
@@ -321,6 +386,12 @@ def _owner_alive(dump_path: Path, is_pid_alive: Callable[[int], bool]) -> bool |
     differs, the owner is confirmed dead (``False``) despite the live PID.
     When either side lacks a start ID (legacy header, no procfs), plain PID
     liveness stands — conservative, since ``True`` only ever protects a file.
+
+    The same conservative stand applies when the two values are not the same
+    KIND of identity: a header written before this build recorded a
+    ``ps``-rendered token that can never equal what is read now, and treating
+    that as a mismatch would unlink the dump of a gateway that is still alive
+    across the upgrade. See :func:`_start_ids_comparable`.
     """
     owner = _dump_owner(dump_path)
     if owner is None:
@@ -334,7 +405,11 @@ def _owner_alive(dump_path: Path, is_pid_alive: Callable[[int], bool]) -> bool |
         return False
     if recorded_start is not None:
         current_start = _pid_start_id(pid)
-        if current_start is not None and current_start != recorded_start:
+        if (
+            current_start is not None
+            and _start_ids_comparable(recorded_start, current_start)
+            and current_start != recorded_start
+        ):
             return False  # PID recycled: live process is not the owner
     return True
 
@@ -495,9 +570,11 @@ def open_dump_file(dumps_dir: Path | None = None) -> DumpFile:
 
     # Use os.open() for a raw fd that is never wrapped in a closable Python
     # buffered layer.  O_WRONLY|O_CREAT|O_TRUNC mirrors open("w") semantics.
+    # Binary mode preserves the header and faulthandler's bytes without CRT
+    # newline translation on Windows, matching the binary dump reader.
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if sys.platform == "win32":
-        flags |= os.O_NOINHERIT
+        flags |= os.O_NOINHERIT | os.O_BINARY
     else:
         flags |= os.O_CLOEXEC
     fd = os.open(str(path), flags, 0o644)
@@ -645,7 +722,7 @@ def dump_first_stack_lines(dump_path: Path, max_lines: int = 5) -> list[str]:
     recognizable (malformed or foreign dump content).
     """
     try:
-        lines = dump_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = _read_dump_lines(dump_path)
     except OSError:
         return []
     stack_lines = [ln for ln in lines[_HEADER_LINES:] if ln.strip()]
@@ -654,6 +731,78 @@ def dump_first_stack_lines(dump_path: Path, max_lines: int = 5) -> list[str]:
     if wedged is None:
         return stack_lines[:max_lines]
     return (preamble + wedged)[:max_lines]
+
+
+def dump_owner_identity(dump_path: Path) -> tuple[int, str | None, str | None] | None:
+    """``(pid, pid_domain, start_id)`` of the gateway that wrote *dump_path*.
+
+    The full identity, for a reader that must tell the crashed gateway from a
+    later process holding the same PID number: a replacement container is PID 1
+    like the one it replaced, and a recycled PID on one host is live while its
+    owner is gone. ``pid_domain`` / ``start_id`` are ``None`` where the header
+    predates them or procfs was unavailable; a reader then falls back to the
+    number alone.
+    """
+    return _dump_owner(dump_path)
+
+
+def current_process_identity() -> tuple[str, str | None]:
+    """``(pid_domain, start_id)`` of THIS process -- what its dump header
+    records, offered so a sibling file written by the same process (a cron
+    in-flight marker) carries the same identity and can be joined to it."""
+    return _pid_domain(), _pid_start_id(os.getpid())
+
+
+def pid_identity_alive(pid: int, pid_domain: str | None, start_id: str | None) -> bool | None:
+    """Liveness of the process a recorded ``(pid, pid_domain, start_id)`` names.
+
+    The same three-way answer as :func:`_owner_alive`, for a record that is not a
+    dump header: ``None`` when the PID belongs to a domain this process cannot
+    probe (another host, another PID namespace -- a replacement container's
+    PID 1 says nothing about the PID 1 that died), ``False`` when the PID is
+    gone or is live under a different start id (recycled), ``True`` when it is
+    this process or a live PID whose start id matches (or is unknowable on
+    either side, the conservative direction). A record without a domain is
+    probed locally like a pre-domain header.
+
+    "Unknowable" includes a recorded value that is not the same KIND of
+    identity as the one read now — a marker written before this build carries
+    a ``ps``-rendered token, and calling that a mismatch would report a run
+    that is still executing as abandoned. See :func:`_start_ids_comparable`.
+    """
+    if pid_domain is not None and pid_domain != _pid_domain():
+        return None
+    if start_id is not None:
+        # Before the own-PID shortcut: a restarted gateway can be handed the
+        # crashed one's PID, and then "this process" is NOT the writer.
+        current = _pid_start_id(pid)
+        if (
+            current is not None
+            and _start_ids_comparable(start_id, current)
+            and current != start_id
+        ):
+            return False
+    if pid == os.getpid():
+        return True
+    return pid_exists(pid)
+
+
+def dump_wedged_frames(dump_path: Path) -> list[str]:
+    """Every frame line of the WEDGED thread's stack (see ``_wedged_thread_block``).
+
+    Unlike :func:`dump_first_stack_lines` this returns the whole block and no
+    preamble: the stall attribution walks all of it looking for the frame that
+    names the surface (a cron run, a dashboard turn, a channel dispatcher), and
+    that frame sits far below the top-of-stack gate frames.
+    """
+    try:
+        lines = _read_dump_lines(dump_path)
+    except OSError:
+        return []
+    stack_lines = [ln for ln in lines[_HEADER_LINES:] if ln.strip()]
+    _preamble, blocks = _split_stack_content(stack_lines)
+    wedged = _wedged_thread_block(blocks)
+    return list(wedged) if wedged is not None else []
 
 
 def dump_replay_lines(
@@ -669,15 +818,14 @@ def dump_replay_lines(
     FIRST, before the other threads, so the one stack that explains the stall
     always survives the caps.  Real dumps routinely exceed them — a gateway
     with a saturated default executor produces 200+ stack lines of idle
-    workers, and top-down order truncated the replay before ever reaching the
-    main thread (observed on the 2026-08-09 stall dumps: the journal showed
-    only ``Queue.get`` workers and ``[truncated]``).
+    workers, and top-down order truncates the replay before ever reaching the
+    main thread, leaving a journal of only ``Queue.get`` workers and
+    ``[truncated]``.
     """
     try:
-        content = dump_path.read_text(encoding="utf-8", errors="replace")
+        all_lines = _read_dump_lines(dump_path)
     except OSError:
         return [], False
-    all_lines = content.splitlines()
     stack_lines = [ln for ln in all_lines[_HEADER_LINES:] if ln.strip()]
     preamble, blocks = _split_stack_content(stack_lines)
     wedged = _wedged_thread_block(blocks)

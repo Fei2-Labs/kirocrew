@@ -6,6 +6,13 @@
   "author": "kirocrew",
   "license": "MIT",
   "defaultEnabled": false,
+  "platform": {
+    "os": [
+      "macos",
+      "linux",
+      "windows"
+    ]
+  },
   "highlights": [
     "One health light per account, each with reconnect guidance matched to how the profile authenticates",
     "Private, encrypted, versioned storage that is created only after you confirm it",
@@ -46,6 +53,10 @@
     "governance"
   ],
   "iconUrl": "/app-assets/aws-control/icon.svg",
+  "heroImage": "/app-assets/aws-control/hero-light.svg",
+  "heroImageDark": "/app-assets/aws-control/hero-dark.svg",
+  "heroImageDetail": "/app-assets/aws-control/hero-detail-light.svg",
+  "heroImageDetailDark": "/app-assets/aws-control/hero-detail-dark.svg",
   "screenshots": [
     "/app-assets/aws-control/screenshot-main.png"
   ]

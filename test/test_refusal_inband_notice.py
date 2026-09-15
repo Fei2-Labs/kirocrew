@@ -14,6 +14,7 @@ fires only when the notice could not be delivered.
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
 
@@ -27,6 +28,11 @@ from kiro_crew.dashboard.chat_runner import (
     _steer_policy_notice,
 )
 from kiro_crew.dashboard.state import (
+    _DENY_CAUSE_TEXT,
+    DENY_CAUSE_APPROVAL_NO_BUDGET,
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    DENY_CAUSE_APPROVAL_UNDELIVERABLE,
+    DENY_CAUSE_BATCH_CASCADE,
     DENY_CAUSE_HOOK_ERROR,
     DENY_CAUSE_INVALID_NAME,
     DENY_CAUSE_POLICY,
@@ -168,22 +174,6 @@ class TestSteerPolicyNotice:
 
         notices: list[str] = []
         assert await _steer_policy_notice(_Bare(), "bash", "denied", notices) is False
-        assert notices == []
-
-    @pytest.mark.asyncio
-    async def test_non_provider_cannot_opt_itself_into_steering(self):
-        calls: list[str] = []
-
-        class _Impostor:
-            supports_steer = True
-
-            async def steer(self, message: str) -> bool:
-                calls.append(message)
-                return True
-
-        notices: list[str] = []
-        assert await _steer_policy_notice(_Impostor(), "bash", "denied", notices) is False
-        assert calls == []
         assert notices == []
 
     @pytest.mark.asyncio
@@ -367,7 +357,7 @@ class TestRecoveryIsNowAFallback:
             self.REFUSALS,
             stopping=False,
             needs_reset=False,
-            stop_reason="end_turn",
+            user_stopped=False,
             notices_sent=1,
             notices_pending=0,
         )
@@ -379,7 +369,7 @@ class TestRecoveryIsNowAFallback:
             self.REFUSALS,
             stopping=False,
             needs_reset=False,
-            stop_reason="end_turn",
+            user_stopped=False,
             notices_sent=1,
             notices_pending=1,
         )
@@ -390,16 +380,16 @@ class TestRecoveryIsNowAFallback:
             [("bash", "denied"), ("fs_write", "blocked")],
             stopping=False,
             needs_reset=False,
-            stop_reason="end_turn",
+            user_stopped=False,
             notices_sent=1,
             notices_pending=0,
         )
 
     def test_defaults_preserve_pre_existing_behaviour(self):
-        # A caller that knows nothing about notices (harness without steer, and
-        # every existing call site) must behave exactly as before.
+        # A caller that knows nothing about notices (harness without steer)
+        # behaves as if nothing was steered: the extra turn is owed.
         assert should_queue_refusal_recovery(
-            self.REFUSALS, stopping=False, needs_reset=False, stop_reason="end_turn"
+            self.REFUSALS, stopping=False, needs_reset=False, user_stopped=False
         )
 
     def test_user_cancel_still_wins_over_in_band_accounting(self):
@@ -407,14 +397,14 @@ class TestRecoveryIsNowAFallback:
             self.REFUSALS,
             stopping=False,
             needs_reset=False,
-            stop_reason="cancelled",
+            user_stopped=True,
             notices_sent=0,
             notices_pending=0,
         )
 
     def test_no_refusals_never_queues_even_with_notices(self):
         assert not should_queue_refusal_recovery(
-            [], stopping=False, needs_reset=False, stop_reason="end_turn", notices_sent=3
+            [], stopping=False, needs_reset=False, user_stopped=False, notices_sent=3
         )
 
 
@@ -437,6 +427,59 @@ class TestCauseSpecificWording:
         assert "nothing judged the call" in out
         assert "safety policy" not in out
 
+    def test_approval_timeout_says_expired_not_denied_or_blocked(self):
+        out = build_refusal_steer_notice(
+            "bash", "prompt expired after 600s", cause=DENY_CAUSE_APPROVAL_TIMEOUT
+        )
+        assert "expired unanswered" in out
+        assert "never judged" in out
+        # The action was never judged, so neither a policy verdict nor the
+        # policy guidance ("find an allowed alternative") may appear: both
+        # would send the model routing around a call nobody refused.
+        assert "safety policy" not in out
+        assert "allowed alternative" not in out
+        # No-reissue is justified by the ABSENT RESPONDER, not by turn budget:
+        # under the default config (600s window, 7200s ceiling) a reissued call
+        # recomputes min(approval_timeout_for, tool_approval_timeout_secs()) and
+        # gets a fresh full window, so a budget claim would be false. The honest
+        # rationale — the person who did not answer is still away — also agrees
+        # with the unattended transcript line ("instead of retrying the same
+        # call").
+        assert "state the permission you need" in out.lower()
+        assert "do not immediately reissue" in out.lower()
+        assert "budget" not in out.lower()
+
+    def test_approval_no_budget_says_never_shown_not_denied(self):
+        out = build_refusal_steer_notice(
+            "bash",
+            "the turn had no budget left to wait for approval",
+            cause=DENY_CAUSE_APPROVAL_NO_BUDGET,
+        )
+        assert "no budget left to host its approval prompt" in out
+        assert "never judged" in out
+        # The action was never judged, so neither a policy verdict nor the
+        # policy guidance may appear: both would send the model routing around
+        # a call nobody refused.
+        assert "safety policy" not in out
+        assert "allowed alternative" not in out
+        assert "state the permission you need" in out.lower()
+        # Unlike the timeout, the no-reissue advice here IS justified by the
+        # budget: the window is recomputed from what is left of THIS turn, so
+        # an immediately reissued identical call is declined the same way.
+        assert "do not immediately reissue" in out.lower()
+
+    def test_approval_undeliverable_says_delivery_failed_not_denied(self):
+        out = build_refusal_steer_notice(
+            "bash",
+            "the approval prompt could not be delivered to Slack",
+            cause=DENY_CAUSE_APPROVAL_UNDELIVERABLE,
+        )
+        assert "could not be delivered" in out
+        assert "never judged" in out
+        assert "safety policy" not in out
+        assert "allowed alternative" not in out
+        assert "state the permission you need" in out.lower()
+
     def test_policy_wording_is_unchanged_by_default(self):
         # Every pre-existing caller passes no cause; the policy text must be
         # byte-identical to what shipped, or the model's correction changes
@@ -448,10 +491,35 @@ class TestCauseSpecificWording:
             "bash", "denied"
         )
 
+    def test_batch_cascade_names_the_group_and_defers_to_the_reason(self):
+        # The cascade's members were never individually judged, so the wording
+        # must neither claim a policy verdict nor scope itself to one call: the
+        # single notice stands in for every cascaded member of the batch.
+        # The reason below is the batch-framed copy the setter records: the
+        # notice shows it under the CASCADED member's title, so it must speak
+        # about the batch's originating tool, not the member it is shown under.
+        out = build_refusal_steer_notice(
+            "list_files",
+            "the host declined an earlier tool of this batch "
+            "(the approval prompt went unanswered for 600s)",
+            cause=DENY_CAUSE_BATCH_CASCADE,
+        )
+        assert "every remaining call in its batch" in out
+        assert "nothing judged these calls themselves" in out
+        # The reason is where the ORIGINATING host cause lives; the clause must
+        # direct the model at it rather than restating one hardcoded cause.
+        assert "unanswered for 600s" in out
+        assert "safety policy" not in out
+        # Re-issuing is sanctioned once the original decline is addressed — the
+        # opposite of the policy guidance to find a different approach.
+        assert "re-issue" in out.lower()
+
     def test_every_cause_keeps_the_invariant_half(self):
         # The half that does the actual work -- naming the string being corrected
-        # and forbidding a hand-back -- must not vary with the cause.
-        for cause in (DENY_CAUSE_POLICY, DENY_CAUSE_INVALID_NAME, DENY_CAUSE_HOOK_ERROR):
+        # and forbidding a hand-back -- must not vary with the cause. Iterated
+        # over the table itself so a cause added later inherits this guard
+        # instead of silently escaping a hand-enumerated tuple.
+        for cause in _DENY_CAUSE_TEXT:
             out = build_refusal_steer_notice("bash", "why", cause=cause)
             assert "User denied tool execution" in out, cause
             assert "NOT a user action" in out, cause
@@ -459,10 +527,10 @@ class TestCauseSpecificWording:
             assert "do not ask the user" in out.lower(), cause
 
     def test_the_bracket_tag_is_cause_neutral(self):
-        # The tag has to be true for all three causes. Saying "policy notice" above
+        # The tag has to be true for every cause. Saying "policy notice" above
         # a sentence that explains the call was NOT a policy matter contradicts the
         # body one line later, and the body is the part doing the correcting.
-        for cause in (DENY_CAUSE_POLICY, DENY_CAUSE_INVALID_NAME, DENY_CAUSE_HOOK_ERROR):
+        for cause in _DENY_CAUSE_TEXT:
             out = build_refusal_steer_notice("bash", "why", cause=cause)
             assert out.startswith("[Kiro Crew host notice]"), cause
             # "policy" may still appear in the POLICY cause's own clause; what must
@@ -681,6 +749,40 @@ class TestEveryHostDenyCallSiteIsWired:
             f"pass refusal_notices= and refusal_reasons=: lines {missing}"
         )
 
+    def test_both_continuation_gates_read_the_live_stop_signal(self):
+        # Both end-of-turn continuation gates take the host's Stop signal, read
+        # LIVE at each call (`_stop_pressed()`), never a snapshot and never the
+        # backend's wire stop reason. A snapshot taken before the awaited Stop
+        # hook goes stale when a Stop presses and resolves during it; a wire
+        # stop reason reads codex's `cancel`-only reject (stopReason
+        # "cancelled", no Stop pressed) as a user cancel -- the silent-stop
+        # defect. Pinned at source level because both sites live inside the
+        # turn coroutine.
+        src = self._src()
+        assert src.count("def _stop_pressed() -> bool:") == 1, "the live Stop signal helper moved"
+        body = src.split("def _stop_pressed() -> bool:", 1)[1][:1400]
+        assert "_stop_generation" in body and "_stop_gen_at_entry" in body
+        # refusal recovery: the gate call, and the re-read after the awaited
+        # credential-hint lookup, before the queue write.
+        gate = "if should_queue_refusal_recovery("
+        assert (
+            src.count(gate) == 1
+        ), "the refusal-recovery gate moved or multiplied -- guard is stale"
+        window = src.split(gate, 1)[1][:2400]
+        assert "user_stopped=_stop_pressed()" in window[:600]
+        assert "_stop_reason" not in window[:400], "the gate must not take the wire stop reason"
+        after_await = window.split("await _credential_tool_hint_for(", 1)[1]
+        assert "if _stop_pressed()" in after_await.split("_queue_recovery(", 1)[0]
+        assert "turn_aborted=(_stop_reason == STOP_REASON_CANCELLED)" in window
+        # stop-hook continuation: outer gate and the recheck after the config load.
+        hook_calls = re.findall(
+            r"should_queue_hook_continuation\(\s*slot\._stopping, needs_session_reset, user_stopped=_stop_pressed\(\)\s*\)",
+            src,
+        )
+        assert (
+            len(hook_calls) == 2
+        ), f"expected the hook gate + its post-await recheck, saw {len(hook_calls)}"
+
     def test_interactive_approved_path_is_wired(self):
         # The sharpest case: the person clicked APPROVE and the host denied
         # anyway, so "user denied tool execution" is not merely unhelpful but
@@ -699,4 +801,419 @@ class TestEveryHostDenyCallSiteIsWired:
         assert wired == calls, (
             f"{calls - wired} deny call(s) in the interactive approved branch do not "
             "steer -- the user approved, so 'user denied tool execution' is false there"
+        )
+
+    def test_cascade_site_branches_on_provenance(self):
+        # The cascade answers ``reject_tool`` for every remaining member of a
+        # denied batch, and its attribution depends on WHO denied the first
+        # member: a host auto-decline must steer a cause-specific correction,
+        # while a person's own refusal keeps kiro-cli's generic message TRUE
+        # for the remainder and stays exempt. Guarded at source level because
+        # the branch lives inside the turn coroutine, where the direct unit
+        # fixtures of this file cannot reach it.
+        src = self._src()
+        anchor = 'if getattr(slot, "_batch_rejected", False):'
+        assert anchor in src, "the cascade site moved -- guard is stale"
+        # Window sized for the full cascade block: the audit-first SEL write
+        # now sits between the anchor and the reject answer, so
+        # the original 3500-char window would fall short of the reject.
+        block = src.split(anchor, 1)[1][:5200]
+        steer_at = block.find("_steer_policy_notice")
+        reject_at = block.find("reject_tool(")
+        assert steer_at != -1, "host-caused cascade no longer steers a notice"
+        assert reject_at != -1, "the cascade site no longer answers the rejection"
+        # Steer while the permission request is still unanswered: that is what
+        # proves the turn is in flight and keeps the notice queued, so a steer
+        # placed after the reject can be silently dropped.
+        assert steer_at < reject_at, "the cascade steers AFTER answering the rejection"
+        assert (
+            "DENY_CAUSE_BATCH_CASCADE" in block[:reject_at]
+        ), "the cascade steer lost its cause-specific wording"
+        # The steer must be GATED on host provenance -- steering for a batch the
+        # person themselves refused would re-attribute their own decision.
+        assert (
+            "_batch_rejected_cause" in block[:steer_at]
+        ), "the cascade steer is no longer gated on rejection provenance"
+        assert (
+            "deny-notice-exempt:" in block[:reject_at]
+        ), "the user-originated cascade lost its exemption marker"
+
+    def test_every_host_decline_arm_records_provenance(self):
+        # Four host-side auto-declines reach the batch setter with
+        # ``outcome == "rejected"``: both Slack-delivery-failure arms, the
+        # no-budget branch, and the approval timeout. Each must overwrite the
+        # per-tool cause IN ITS OWN BRANCH, and the setter must copy it onto
+        # the slot -- an arm that forgets leaves its cascade indistinguishable
+        # from a user refusal, which is exactly the cause-blindness this
+        # provenance exists to remove. Anchored per arm rather than a file-wide
+        # tally: a tally stays green when one arm loses its assignment while
+        # another site gains one. Each window is wide enough to hold the arm's
+        # own assignment but too narrow to reach the next arm's (the nearest
+        # foreign assignment sits ~1.8k chars past the slack-None landmark).
+        src = self._src()
+        arm_anchors = (
+            (
+                "slack delivery-failure (None branch)",
+                "Linked approval delivery to Slack failed; auto-rejecting tool %r",
+                1100,
+                "DENY_CAUSE_APPROVAL_UNDELIVERABLE",
+            ),
+            (
+                "slack delivery-failure (except arm)",
+                "Error mirroring approval prompt to Slack",
+                900,
+                "DENY_CAUSE_APPROVAL_UNDELIVERABLE",
+            ),
+            (
+                "no-budget",
+                "format_approval_no_budget_card()",
+                400,
+                "DENY_CAUSE_APPROVAL_NO_BUDGET",
+            ),
+            (
+                "approval timeout",
+                "format_approval_timeout_card(_approval_window)",
+                400,
+                "DENY_CAUSE_APPROVAL_TIMEOUT",
+            ),
+        )
+        missing = []
+        for arm, anchor, window, constant in arm_anchors:
+            assert (
+                src.count(anchor) == 1
+            ), f"the {arm} arm's source landmark is no longer unique -- guard is stale"
+            win = src.split(anchor, 1)[1][:window]
+            if f"_host_deny_cause = {constant}" not in win or "_host_deny_reason = " not in win:
+                missing.append(arm)
+        assert not missing, (
+            f"these host auto-decline arms no longer record their cause constant "
+            f"and reason: {missing} -- their declines are again indistinguishable "
+            "from a user refusal"
+        )
+        setter = "slot._batch_rejected_cause = ("
+        assert (
+            setter in src and "_host_deny_reason" in src.split(setter, 1)[1][:300]
+        ), "the batch setter no longer copies the decline's provenance onto the slot"
+        # The copy must stay BATCH-FRAMED: the cascade notice embeds it under
+        # the cascaded member's title, where the bare per-tool reason would
+        # claim that member's own prompt failed.
+        assert "earlier tool of this batch" in src.split(setter, 1)[1][:300], (
+            "the batch copy lost its batch framing — the cascade notice now "
+            "misattributes the originating decline to the cascaded member"
+        )
+
+    def test_shared_reject_branch_steers_the_host_cause(self):
+        # The three host auto-decline arms (no budget, Slack ts-None, Slack
+        # except) record their cause upstream and funnel into the interactive
+        # rejected branch; the correction is steered there ONCE, gated on the
+        # provenance, BEFORE the rejection is answered. Guarded at source
+        # level because the branch lives inside the turn coroutine, where the
+        # direct unit fixtures of this file cannot reach it.
+        src = self._src()
+        anchor = "# deny-notice-exempt: interactive user denial."
+        assert src.count(anchor) == 1, "the interactive exemption marker moved -- guard is stale"
+        before = src.split(anchor, 1)[0][-1400:]
+        gate = "if _host_deny_cause:"
+        assert gate in before, (
+            "the shared reject branch no longer gates a steer on the " "host-decline provenance"
+        )
+        gated = before.split(gate, 1)[1]
+        assert "_steer_policy_notice(" in gated, "the provenance gate no longer steers"
+        assert (
+            "cause=_host_deny_cause" in gated
+        ), "the shared steer no longer carries the arm's recorded cause"
+        assert (
+            "_host_deny_reason" in gated
+        ), "the shared steer no longer carries the arm's recorded reason"
+        after = src.split(anchor, 1)[1][:1200]
+        assert (
+            "await client.reject_tool(event.request_id)" in after
+        ), "the steer must precede the rejection going on the wire"
+
+    def test_flag_and_provenance_clear_together(self):
+        # A stale cause is never READ today (the flag gates the only reader and
+        # the setter overwrites before any read), so no behavioural test can pin
+        # these clears -- but letting them drift apart falsifies the slot
+        # field's documented "set together, cleared together" contract and
+        # leaves a debugging trap. Pinned at source level: every clear of the
+        # flag must clear the provenance beside it.
+        src = self._src()
+        sites = [m.end() for m in re.finditer(r"slot\._batch_rejected = False", src)]
+        assert len(sites) >= 2, (
+            "expected the model-output clear and the turn-finally clear -- "
+            f"found {len(sites)} flag clear(s)"
+        )
+        unpaired = [
+            src[max(0, end - 160) : end].splitlines()[-1].strip()
+            for end in sites
+            if 'slot._batch_rejected_cause = ""' not in src[end : end + 120]
+        ]
+        assert (
+            not unpaired
+        ), f"these flag clears do not clear the provenance beside them: {unpaired}"
+
+    # ------------------------------------------------------------------
+    # Every ``client.reject_tool`` answer site, not just the three helpers.
+    #
+    # The helpers above are chokepoints, but nothing forces a deny path to go
+    # THROUGH one: a site that answers the permission request directly (as the
+    # policy-deny, batch-cascade, and interactive branches do) never appears in
+    # the helper scan, and a host-side auto-decline added at such a site hands
+    # the model kiro-cli's "User denied tool execution" -- the wrong-attribution
+    # class fixed for policy/hook/invalid-name via the steer helpers and still
+    # being paid down branch by branch (other approval auto-decline paths are not yet covered).
+    # This scan closes the enumeration for chat_runner.py -- the module that
+    # answers the dashboard's ``session/request_permission`` -- other modules
+    # answer their own surfaces and are out of this guard's scope. Every
+    # ``await <anything>.reject_tool(`` here must either be preceded by a
+    # ``_steer_policy_notice`` call in its own suite, or carry a
+    # ``deny-notice-exempt:`` comment naming why the generic message is the
+    # TRUE attribution there (the user-denial branches). A site whose steer is
+    # GATED on provenance carries both: the steer corrects the cause it can
+    # identify, and the marker states why the generic message is TRUE on the
+    # branch it deliberately leaves alone. Only an UNCONDITIONAL steer makes a
+    # surviving marker stale, because then no path reaches the generic message.
+    # ------------------------------------------------------------------
+
+    REJECT_TXT = ".reject_tool("
+    EXEMPT_MARKER = "deny-notice-exempt:"
+    STEER = "_steer_policy_notice"
+    LEDGER_NAMES = ("_refusal_notices", "refusal_notices")
+
+    def _tree(self) -> ast.Module:
+        return ast.parse(self._src())
+
+    @staticmethod
+    def _stmt_lists(tree: ast.Module):
+        """Yield every statement suite (body/orelse/finalbody) in the module."""
+        for node in ast.walk(tree):
+            for field in ("body", "orelse", "finalbody"):
+                stmts = getattr(node, field, None)
+                if isinstance(stmts, list) and stmts and isinstance(stmts[0], ast.stmt):
+                    yield stmts
+
+    @staticmethod
+    def _calls(tree: ast.Module, func_name: str) -> list[ast.Call]:
+        return [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == func_name
+        ]
+
+    def _reject_awaits(self, tree: ast.Module) -> list[ast.Await]:
+        # Receiver-agnostic on purpose: keying both locators on the literal name
+        # ``client`` would give them a SHARED blind spot (an aliased receiver
+        # drops out of both while the cross-check still balances). Any awaited
+        # ``.reject_tool(`` is an answer site; the steer/exempt rules judge it.
+        return [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "reject_tool"
+        ]
+
+    def _suite_chain(self, tree: ast.Module, target: ast.AST) -> list[tuple[list, int]]:
+        """Every (suite, index) whose statement contains *target*, innermost first.
+
+        Innermost-first ordering (by containing-statement span) is what lets the
+        checks below reason about "this site's own suite" and "one level up"
+        without a parent map: the statement holding the node directly is the
+        smallest one that contains it.
+        """
+        chain: list[tuple[list, int]] = []
+        for stmts in self._stmt_lists(tree):
+            for i, stmt in enumerate(stmts):
+                if any(child is target for child in ast.walk(stmt)):
+                    chain.append((stmts, i))
+        chain.sort(key=lambda pair: (pair[0][pair[1]].end_lineno or 0) - pair[0][pair[1]].lineno)
+        return chain
+
+    def _is_steered(self, tree: ast.Module, reject: ast.Await) -> bool:
+        """True when a ``_steer_policy_notice`` call precedes the reject in its
+        own suite -- the steer-before-answer ordering every wired site uses,
+        including the helpers (whose steer sits in a preceding ``if
+        refusal_notices is not None:`` guard statement)."""
+        return self._steer_stmt(tree, reject) is not None
+
+    def _steer_stmt(self, tree: ast.Module, reject: ast.Await):
+        """The preceding statement in the reject's own suite that carries the
+        steer, or None. Returning the STATEMENT (not a bool) is what lets the
+        caller tell an unconditional steer from a gated one."""
+        chain = self._suite_chain(tree, reject)
+        assert chain, f"reject_tool at line {reject.lineno} sits in no statement suite"
+        stmts, idx = chain[0]
+        for prev in stmts[:idx]:
+            for sub in ast.walk(prev):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Name)
+                    and sub.func.id == self.STEER
+                ):
+                    return prev
+        return None
+
+    def _steer_is_gated(self, stmt: ast.stmt) -> bool:
+        """True when the steer only runs on some paths through *stmt*.
+
+        A steer nested under a branch (``if``/``try``/loop) covers one cause and
+        leaves the complement to the generic message, so such a site can be BOTH
+        wired and exempt without either claim being false -- the provenance-gated
+        cascade is exactly that shape. A steer reached unconditionally covers
+        every path, which is what makes a surviving exemption marker stale.
+        """
+        branching = (ast.If, ast.Try, ast.While, ast.For, ast.AsyncFor, ast.IfExp)
+        # Walk down from *stmt* carrying whether a branch was crossed, so the
+        # question is "is this call under a branch" rather than "does this
+        # statement contain a branch anywhere" -- a statement can hold both an
+        # unconditional steer and an unrelated conditional.
+        stack: list[tuple[ast.AST, bool]] = [(stmt, False)]
+        while stack:
+            node, gated = stack.pop()
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == self.STEER
+            ):
+                if not gated:
+                    return False  # reached on every path -- unconditional
+                continue
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, gated or isinstance(node, branching)))
+        return True
+
+    def _is_exempt(self, lines: list[str], lineno: int) -> bool:
+        """True when the contiguous comment block directly above *lineno* carries
+        the exemption marker WITH a stated reason. Directly-above placement is
+        deliberate: a marker allowed anywhere nearby would keep excusing the site
+        after the code it argued about moved."""
+        i = lineno - 2  # line above the reject, 0-based
+        while i >= 0 and lines[i].lstrip().startswith("#"):
+            comment = lines[i].lstrip().lstrip("#").strip()
+            if comment.startswith(self.EXEMPT_MARKER):
+                return bool(comment[len(self.EXEMPT_MARKER) :].strip())
+            i -= 1
+        return False
+
+    def test_the_reject_scan_finds_every_answer_site_the_source_contains(self):
+        # Same cross-check discipline as the helper scan above, with a stronger
+        # independent locator: the AST walker cannot be fooled by a comment or a
+        # string, and the textual count sees any ``.reject_tool(`` spelling
+        # regardless of what the walker requires around it. A divergence means
+        # one locator stopped seeing a site the other still sees -- including a
+        # call that lost its ``await`` -- and every assertion below would be
+        # vacuous for that site.
+        src = self._src()
+        textual = src.count(self.REJECT_TXT)
+        assert textual >= 6, f"expected the known deny-answer sites, textual count {textual}"
+        found = self._reject_awaits(self._tree())
+        assert len(found) == textual, (
+            f"the AST walk found {len(found)} of {textual} reject_tool sites -- "
+            "one locator no longer sees every answer shape, so the steer-or-exempt "
+            "assertion below is vacuous for the ones it missed"
+        )
+
+    def test_every_reject_tool_site_is_steered_or_exempt(self):
+        tree = self._tree()
+        lines = self._src().splitlines()
+        unwired: list[int] = []
+        double: list[int] = []
+        for reject in self._reject_awaits(tree):
+            steer_stmt = self._steer_stmt(tree, reject)
+            steered = steer_stmt is not None
+            exempt = self._is_exempt(lines, reject.lineno)
+            if steered and exempt and not self._steer_is_gated(steer_stmt):
+                # An UNCONDITIONAL steer covers every path, so a surviving
+                # exemption marker is lying to one audience; the marker must not
+                # outlive the wiring it excused. A GATED steer is the legitimate
+                # third shape: it corrects the cause it can identify and the
+                # marker states why the generic message is TRUE on the branch it
+                # deliberately leaves alone (the provenance-gated cascade --
+                # host-caused steers, user-originated stays exempt).
+                double.append(reject.lineno)
+            elif not steered and not exempt:
+                unwired.append(reject.lineno)
+        assert not double, (
+            f"reject_tool sites at lines {double} steer on EVERY path and still "
+            f"carry '{self.EXEMPT_MARKER}' -- drop the stale exemption comment"
+        )
+        assert not unwired, (
+            f"reject_tool sites at lines {unwired} answer the permission request "
+            "with no in-band notice and no stated exemption -- the model reads "
+            "kiro-cli's 'User denied tool execution' there. Steer first via "
+            "_steer_policy_notice (see the _reject_* helpers), or add a "
+            f"'# {self.EXEMPT_MARKER} <why the generic message is TRUE here>' "
+            "comment directly above the call"
+        )
+
+    def test_every_turn_ledger_steer_is_paired_with_a_reason(self):
+        # should_queue_refusal_recovery compares the two ledgers by COUNT, so a
+        # steer that appends to the turn's _refusal_notices without a matching
+        # _refusal_reasons entry breaks the comparison silently: an unsettled
+        # extra notice forces a duplicate recovery turn, and a settled one masks
+        # a real deny whose own steer failed. Every caller that threads the turn
+        # ledger must therefore pair it with a reason append in its own suite or
+        # one level up (the helpers append after their `if ... is not None`
+        # guard). A caller with nothing to append uses a throwaway list instead
+        # -- either a plain local name or an empty list literal -- and that shape
+        # passes here BECAUSE it never touches the turn ledger.
+        tree = self._tree()
+        unpaired: list[int] = []
+        checked = 0
+        for call in self._calls(tree, self.STEER):
+            notices = None
+            if len(call.args) >= 4:
+                notices = call.args[3]
+            for kw in call.keywords:
+                if kw.arg == "notices":
+                    notices = kw.value
+            # Never silently skip a shape this scan cannot classify: an
+            # Attribute (``slot._refusal_notices``) or any other indirection
+            # could alias the turn ledger while dropping out of the pairing
+            # check entirely -- the same quiet-exit rot the reject scan refuses.
+            # Two shapes ARE classified. A plain name is judged by whether it
+            # names the turn ledger. An empty list DISPLAY is a throwaway built
+            # fresh at the call site, so it cannot alias the ledger under any
+            # binding -- stronger evidence than a name, not weaker, which is why
+            # accepting it keeps the fail-loud posture rather than punching a
+            # hole in it. A non-empty list still fails: elements mean the caller
+            # is seeding notices this scan would have to reason about.
+            _throwaway_display = isinstance(notices, ast.List) and not notices.elts
+            assert isinstance(notices, ast.Name) or _throwaway_display, (
+                f"_steer_policy_notice at line {call.lineno} passes a notices "
+                "argument this guard cannot classify -- use the turn ledger by "
+                "name, or a throwaway list (a plain local name, or an empty "
+                "list literal)"
+            )
+            if _throwaway_display or notices.id not in self.LEDGER_NAMES:
+                continue
+            checked += 1
+            chain = self._suite_chain(tree, call)
+            paired = False
+            for stmts, idx in chain[:2]:
+                for later in stmts[idx + 1 :]:
+                    for sub in ast.walk(later):
+                        if (
+                            isinstance(sub, ast.Call)
+                            and isinstance(sub.func, ast.Attribute)
+                            and sub.func.attr == "append"
+                            and isinstance(sub.func.value, ast.Name)
+                            and re.fullmatch(r"_?refusal_reasons", sub.func.value.id)
+                        ):
+                            paired = True
+            if not paired:
+                unpaired.append(call.lineno)
+        # Count-pinned like the helper scan: the three helpers plus the policy
+        # TOOL_DENY site all thread the turn ledger today, and a site silently
+        # dropping out of THIS scan is how the pairing assertion goes vacuous.
+        assert checked >= 4, f"expected the known turn-ledger steer callers, saw {checked}"
+        assert not unpaired, (
+            f"steer callers at lines {unpaired} thread the turn's refusal-notice "
+            "ledger without a paired _refusal_reasons append -- the count "
+            "comparison in should_queue_refusal_recovery breaks silently. Append "
+            "the reason alongside the notice, or use a local throwaway list when "
+            "this deny is answered without a recovery entry"
         )

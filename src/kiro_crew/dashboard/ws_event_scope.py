@@ -78,7 +78,7 @@ manifest being trusted is not the one being widened.
 Gating the broad scopes through the install-time consent path
 (``apps/admission.py``) is tracked separately.
 
-## Dashboard users (empty app claim) are unaffected — full event stream as before.
+## Dashboard users (empty app claim) are unaffected — they get the full stream.
 """
 
 from __future__ import annotations
@@ -615,7 +615,7 @@ def _decide_ws_event(
     # System-sourced notifications (source == "system" or source == "") are
     # gateway-internal sends (send_message MCP tool, heartbeat, cron fallback).
     # They carry no ``source_app`` because they flow through state.notify(),
-    # which pre-dates per-app channels. They need their OWN declaration
+    # which has no per-app channel. They need their OWN declaration
     # (``notification:system``): that stream is user content, not the app's
     # own, so folding it into ``notification`` would make a single declaration
     # a broad grant -- the shape this module exists to remove.
@@ -678,8 +678,8 @@ def _slot_visible(
 
     # slots:user — user-initiated slots
     # slots:user — user-initiated slots only.  ``getattr`` defaults to ``""``
-    # (a sentinel that matches NO scope declaration) so a pre-migration slot
-    # or a race condition that leaves ``_origin`` unset remains INVISIBLE
+    # (a sentinel that matches NO scope declaration) so a slot with no recorded
+    # origin, or a race that leaves ``_origin`` unset, remains INVISIBLE
     # rather than being silently classified as USER.  Deny-by-default (CWE-269).
     if getattr(slot, "_origin", "") == SlotOrigin.USER and "slots:user" in allowed_events:
         return True
@@ -1012,9 +1012,9 @@ def app_events_revoked(app: str) -> bool:
     A COLD miss reports NOT revoked (and schedules the refresh) for the same
     reason the declaration cache falls back to the connect snapshot: reporting
     "revoked" for an unknown app would blank every app's own slots on the first
-    broadcast after a gateway restart. One refresh interval of the pre-existing
-    behaviour is the conservative side here; the socket was authenticated against
-    the same file at connect.
+    broadcast after a gateway restart. One refresh interval of unrevoked
+    visibility is the conservative side here; the socket was authenticated
+    against the same file at connect.
     """
     cached = _declared_cache.get(app)
     if cached is None:

@@ -83,6 +83,11 @@ export interface AvailableProfile {
  * read as "can't tell", not "none" — the UI says so instead of implying the
  * operator has no accounts. `registeredCount`/`max` bound the registry so the
  * picker can show a count hint and stop offering more once the cap is reached.
+ *
+ * A scan that FAILS on a supported platform answers 503 `profiles_unavailable`
+ * rather than a 200 carrying an empty list, so this payload is only ever the
+ * real listing: `profiles: []` with `supported: true` does mean none are left to
+ * register. The failed scan surfaces through the query's error state instead.
  */
 export interface AvailableProfilesResponse {
   profiles: AvailableProfile[]
@@ -94,11 +99,25 @@ export interface AvailableProfilesResponse {
 /**
  * Payload of `POST /profiles/register`. A batch registers the prefix that fits
  * under the cap, so `added + skipped` counts the whole request, not just the
- * winners. Error codes: `invalid_names` (400), `unknown_profile` (400).
+ * winners. Error codes: `invalid_names` (400), `unknown_profile` (400),
+ * `profiles_unavailable` (503, the local profile scan could not run, so no name
+ * could be checked and nothing was registered), `unsupported_platform` (501, the
+ * same but on a platform that cannot scan at all, so retrying never clears it).
  */
 export interface RegisterProfilesResult {
   added: number
   skipped: number
+}
+
+/**
+ * Outcome of dropping profiles from the registry. Registry-only: nothing in
+ * AWS or in the operator's AWS CLI configuration changes. `consentWithdrawn`
+ * names the paid services whose grant named a removed profile.
+ */
+export interface UnregisterProfilesResult {
+  removed: number
+  skipped: number
+  consentWithdrawn: string[]
 }
 
 /**
@@ -182,6 +201,36 @@ export interface DriveListing {
 export interface DriveDownload {
   url: string
   expiresSecs: number
+  /** The object's stored Content-Type from the same HEAD that gates the
+   *  presign, or null when S3 recorded none. The preview uses it to tell a
+   *  real PDF from a `.pdf`-named object served as octet-stream. */
+  contentType?: string | null
+}
+
+/** Payload of `GET /drive/{account}/preview` — the head bytes of a text file,
+ *  decoded utf-8. `truncated` says the file continues past the preview window;
+ *  `redacted` says the egress redactor masked at least one value, so what is
+ *  shown is not byte-for-byte what the file holds. */
+export interface DrivePreview {
+  content: string
+  truncated: boolean
+  redacted: boolean
+}
+
+/** One filename-search hit. `key` is section-relative (full path, not basename). */
+export interface DriveSearchHit {
+  key: string
+  size: number
+  modified: string
+}
+
+/** Payload of `GET /drive/{account}/search`. `capped` says the walk stopped at
+ *  `limit` hits — more matches may exist beyond it. The server owns the cap
+ *  and echoes it so the notice can name the real number. */
+export interface DriveSearch {
+  results: DriveSearchHit[]
+  capped: boolean
+  limit: number
 }
 
 /** Result of `POST /drive/{account}/upload`. */
@@ -356,17 +405,94 @@ export interface BackupJobState {
 }
 
 /**
+ * Where an archive (or an install) came from, relative to THIS install.
+ *
+ * `self` is this machine, `other` is a different install writing to the same
+ * shared drive, and `legacy` is an archive written before installs were named --
+ * its owning id is unknown, so it can be neither self nor other.
+ */
+export type BackupOrigin = 'self' | 'other' | 'unverified' | 'legacy'
+
+/**
+ * One archived object in the bucket.
+ *
+ * `install` is the owning install id (32 lowercase hex), or '' for a legacy
+ * archive that carries none. `origin` is that id compared to this install. The
+ * id is what decides what a restore is allowed to do; the human LABEL a row
+ * renders is looked up separately in `RemoteBackup.installs` and never gates
+ * anything.
+ */
+export interface BackupArchive {
+  key: string
+  size: number
+  modified: string
+  install: string
+  origin: BackupOrigin
+}
+
+/**
+ * One install writing to this shared drive, as the bucket's published label
+ * beside the archives reports it.
+ *
+ * `label` is SELF-ASSERTED: it is written by that install into a bucket any
+ * co-tenant install can read, so it is only ever what a human reads, never what
+ * a decision is made on. '' when the install published no label. `origin` marks
+ * whether this row is this install ('self') or a co-tenant ('other').
+ */
+export interface RemoteInstall {
+  id: string
+  label: string
+  origin: 'self' | 'other'
+}
+
+/**
+ * The remote half of `GET /backup/{account}?remote=1`. No longer a bare
+ * `Record<BackupKind, ...>`: it gained the install roster that resolves each
+ * archive row's label, plus the co-tenant count.
+ *
+ * `others` counts OTHER installs writing to this drive; `truncated` says more
+ * co-tenant installs exist than are listed in `installs`, and `max` is the cap
+ * that truncated it. `max` is served rather than derived from `installs.length`,
+ * which counts THIS install too and so is off by one.
+ */
+export interface RemoteBackup {
+  snapshot: BackupArchive[]
+  sessions: BackupArchive[]
+  installs: RemoteInstall[]
+  others: number
+  truncated: boolean
+  max: number
+}
+
+/**
+ * This install's own identity, published beside its archives so a co-tenant
+ * renders it as a name. `id` is 32 lowercase hex; `label` is the human name,
+ * editable through `POST /install/label`.
+ */
+export interface InstallIdentity {
+  id: string
+  label: string
+}
+
+/**
  * Payload of `GET /backup/{account}`. `runs` holds the last local run per kind;
  * `remote` lists the archive in the bucket (null when it could not be read,
  * with the reason in `remoteError`). `nightly` is the scheduled-snapshot toggle.
  * `jobs` carries the in-flight and last-failed run per kind for this account.
+ * `install` is this machine's own identity, always present.
  */
 export interface BackupStatus {
   nightly: boolean
   runs: Partial<Record<BackupKind, BackupRun>>
   jobs?: Partial<Record<BackupKind, BackupJobState>>
-  remote: Record<BackupKind, DriveFile[]> | null
+  install: InstallIdentity
+  remote: RemoteBackup | null
   remoteError?: string
+}
+
+/** Result of `POST /install/label`. */
+export interface InstallLabelResult {
+  install: InstallIdentity
 }
 
 /**
@@ -386,11 +512,14 @@ export interface BackupRunResult {
 /**
  * Result of `POST /backup/{account}/restore`. Nothing is hot-swapped: the
  * archive is downloaded to a local staging folder and `path` is where it landed.
+ * `origin` and `install` echo whose archive was restored, resolved from the key.
  */
 export interface BackupRestoreResult {
   downloaded: true
   path: string
   bytes: number
+  origin: BackupOrigin
+  install: string
 }
 
 /** Payload of `GET /iam-policy` — the exact permissions to paste, as JSON text. */

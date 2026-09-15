@@ -103,6 +103,7 @@ def _step(**kw) -> str:
         "trusted": True,
         "startup_host": _HOST,
         "published": True,
+        "port_free": True,
     }
     args.update(kw)
     return tailnet_mobile._derive_step(**args)  # type: ignore[arg-type]
@@ -140,11 +141,11 @@ class TestProbeDistinguishesCauses:
         assert p.name == ""
 
     def test_stopped_backend_state_is_its_own_not_usable_state(self) -> None:
-        """``BackendState "Stopped"`` must not read as healthy (issue #7244).
+        """``BackendState "Stopped"`` must not read as healthy.
 
         A stopped daemon answers status reads and is not in the needing-login
-        set, so before this field it passed every probe check and the flow
-        reported a ready tailnet whose URL nothing could reach. The remedy
+        set, so without this field it passes every probe check and the flow
+        reports a ready tailnet whose URL nothing can reach. The remedy
         (start Tailscale) differs from signing in, so it is a distinct signal,
         not a ``logged_in`` overload.
         """
@@ -376,7 +377,7 @@ class TestStepPrecedence:
         assert _step(probe=_probe(name="", stopped=True)) == "start_daemon"
 
     def test_stopped_daemon_is_never_ready(self) -> None:
-        """The issue-#7244 shape: serve status still returns the stale config
+        """Serve status still returns the stale config
         with exit 0 while the daemon is stopped, so ``published=True`` arrives
         alongside a stopped probe — and must not derive ``ready`` (the card
         would show Active for a URL nothing can reach)."""
@@ -417,6 +418,21 @@ class TestUndeterminedIsNotFree:
 
     def test_unknown_is_not_rendered_as_ready_either(self) -> None:
         assert _step(published=None) != "ready"
+
+
+class TestOccupiedIsNotOfferedThePublishButton:
+    """The card must never offer an action ``publish()`` will refuse.
+
+    ``published=False`` covers two opposite situations — the port is free, and a
+    stranger's handler sits at the mount — and the old derivation offered the
+    publish button for both, walking the second into a refusal one click later.
+    """
+
+    def test_a_strangers_handler_derives_occupied(self) -> None:
+        assert _step(published=False, port_free=False) == "occupied"
+
+    def test_an_undetermined_port_derives_occupied(self) -> None:
+        assert _step(published=False, port_free=None) == "occupied"
 
 
 class TestRestartIsNotReady:
@@ -653,7 +669,18 @@ def _machine(
         patch.object(
             tailnet_mobile.tailnet_serve,
             "serve_state",
-            return_value=SimpleNamespace(published=published, configured=True, detail=detail),
+            # A REAL ServeState, not a namespace double, so a field added to the
+            # dataclass cannot drift past this fixture unnoticed. ``port_free``
+            # mirrors the real producer's invariant: a published port is
+            # occupied (by us), an unpublished one is free here because this
+            # fixture's ``published=False`` means "ready to publish", and an
+            # undetermined ``published`` leaves the port undetermined too.
+            return_value=tailnet_mobile.tailnet_serve.ServeState(
+                published=published,
+                configured=True,
+                detail=detail,
+                port_free=(True if published is False else (False if published is True else None)),
+            ),
         ),
     ):
         yield
@@ -1234,8 +1261,8 @@ class TestQrCallerBounds:
     the credential. Behind ``tailscale serve`` every request reaches the
     gateway from 127.0.0.1, so the token cannot be device-pinned — its own
     bounds are the only limit that holds, which is what made this surface the
-    laundering path: one POST from a deliberately bounded owner session used to
-    mint a boot-bound, refresh-chained credential that outlived it.
+    laundering path: one POST from a deliberately bounded owner session could
+    mint a boot-bound, refresh-chained credential that outlives it.
     """
 
     @staticmethod
@@ -1701,7 +1728,9 @@ class TestStatusIsOwnerOnly:
             patch.object(
                 tailnet_mobile.tailnet_serve,
                 "serve_state",
-                return_value=SimpleNamespace(published=True, configured=True, detail="ours"),
+                return_value=tailnet_mobile.tailnet_serve.ServeState(
+                    published=True, configured=True, detail="ours", port_free=False
+                ),
             ),
         ):
             return await tailnet_mobile.api_tailnet_mobile_status(_request(**req_kw))

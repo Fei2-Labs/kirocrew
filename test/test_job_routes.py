@@ -55,7 +55,7 @@ def sdk(tmp_path: Path) -> Any:
     forgotten on teardown so it never leaks into another test.
 
     Teardown also STOPS the app's work, not just the registry entry. A route test
-    that starts a run and then fails an assertion used to leave that worker
+    that starts a run and then fails an assertion would leave that worker
     executing: forgetting the SDK makes it unreachable but does not end it, so it
     kept holding the SDK's lock and writing records while later tests ran. Done
     through the SDK's own ``remove_all_async``, which already discards every
@@ -132,7 +132,7 @@ async def _wait_terminal(sdk: JobSDK, run_id: str, deadline: float = _DEADLINE) 
     ``read_bytes_with_retry`` deliberately re-raises ``PermissionError`` instead
     of sleeping the loop for its retry budget.  When the job worker's concurrent
     ``os.replace`` is in flight, that surfaces the Windows sharing violation as
-    a flaky test failure (#7703).  Off the loop the retry applies, exactly as it
+    a flaky test failure.  Off the loop the retry applies, exactly as it
     does for the production routes.
     """
     end = time.monotonic() + deadline
@@ -301,6 +301,35 @@ async def test_the_interruption_fields_reach_the_client(
     # Still withheld: these have no client meaning and never gained one.
     assert "origin" not in run
     assert "pid" not in run
+
+
+@pytest.mark.asyncio
+async def test_work_observed_reaches_the_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sdk: JobSDK
+) -> None:
+    """``work_observed`` is served: a client deciding whether a run actually did
+    its work reads the observed fact rather than re-deriving it. An SDK-minted
+    boolean, so it carries none of the sanitizing cost the P2 result channel does.
+    """
+    from kiro_crew.apps.job_sdk import DONE, JobRun
+
+    _setup_guards(tmp_path, monkeypatch)
+    run_id = "7d" * 16
+    sdk.store.write(
+        JobRun(
+            run_id=run_id,
+            app=sdk.app_name,
+            kind="observed",
+            status=DONE,
+            work_observed=True,
+        )
+    )
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get(f"{_base()}/{run_id}")
+        assert resp.status == 200
+        run = (await resp.json())["run"]
+    assert run["work_observed"] is True
 
 
 @pytest.mark.asyncio
@@ -532,7 +561,7 @@ async def test_cancel_live_cancellable_run_is_200_cancelling(
 
 
 # ---------------------------------------------------------------------------
-# 9b: a requested cancel survives a fresh read (issue #7589)
+# 9b: a requested cancel survives a fresh read
 # ---------------------------------------------------------------------------
 
 
@@ -562,7 +591,7 @@ async def test_requested_cancel_is_visible_to_a_later_read_of_the_run(
 ) -> None:
     """A GET after the cancel — a reload, a second tab, a fresh mount.
 
-    Holding the cancel response was previously the ONLY way to know a cancel had
+    A client that only re-reads the run must still see a cancel had
     been asked for: ``_public_view`` served no such field, so any client that
     re-read the run saw ``running`` and no evidence the button had worked.
     """
@@ -856,7 +885,7 @@ async def test_sdk_refusal_becomes_a_coded_503_not_a_bare_500(
 
 
 # ---------------------------------------------------------------------------
-# The off-loop-read invariant behind the polling helpers (#7703)
+# The off-loop-read invariant behind the polling helpers
 # ---------------------------------------------------------------------------
 
 
@@ -867,7 +896,7 @@ def test_wait_helpers_are_coroutine_functions() -> None:
     they read ON the event loop, where ``read_bytes_with_retry`` deliberately
     re-raises the Windows sharing-violation ``PermissionError`` instead of
     sleeping the loop for its retry budget — a flake nobody can reproduce on
-    a POSIX box (#7703).  ``async`` + ``asyncio.to_thread`` is the contract.
+    a POSIX box.  ``async`` + ``asyncio.to_thread`` is the contract.
     """
     assert inspect.iscoroutinefunction(_wait_terminal)
     assert inspect.iscoroutinefunction(_wait_status)
@@ -877,7 +906,7 @@ def test_wait_helpers_are_coroutine_functions() -> None:
 async def test_on_loop_read_propagates_permission_error_offloaded_read_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sdk: JobSDK
 ) -> None:
-    """Prove the #7703 defect directly, without a Windows shard.
+    """Prove the sharing-violation defect directly, without a Windows shard.
 
     With Windows semantics shimmed (``platform_compat.IS_WINDOWS`` true) and the
     record's first ``Path.read_bytes`` raising ``PermissionError`` — the sharing

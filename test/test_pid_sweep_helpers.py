@@ -697,28 +697,45 @@ class TestPidAgeSeconds:
         assert age is not None
         assert abs(age - age_desired) < 1.0
 
-    def test_non_linux_returns_none(self) -> None:
-        """On non-Linux, an unresolvable pid's age comes back None."""
+    def test_non_linux_without_a_start_id_returns_none(self) -> None:
+        """Off Linux the age comes from ``get_process_start_id``; no id, no age.
+
+        The start id is pinned to ``None`` rather than assumed: on a real macOS host
+        the darwin backend answers for any live pid, so the old shape of this test
+        (patch ``sys.platform`` and hope pid 1234 has no start time) passed on Linux
+        CI and failed on every Mac that happened to be running pid 1234.
+        """
         from kiro_crew.session_pid import _pid_age_seconds
 
         with (
             patch("kiro_crew.session_pid.sys.platform", "darwin"),
-            patch(
-                "kiro_crew.session_pid.platform_compat.get_process_start_id",
-                return_value=None,
-            ),
+            patch("kiro_crew.session_pid.platform_compat.get_process_start_id", return_value=None),
         ):
             assert _pid_age_seconds(1234) is None
+
+    def test_non_linux_with_a_start_id_derives_the_age(self) -> None:
+        from kiro_crew.session_pid import _pid_age_seconds
+
+        now = 1_000_000.0
+        with (
+            patch("kiro_crew.session_pid.sys.platform", "darwin"),
+            patch(
+                "kiro_crew.session_pid.platform_compat.get_process_start_id",
+                return_value=f"{now - 42.5:.6f}",
+            ),
+            patch("kiro_crew.session_pid.time.time", return_value=now),
+        ):
+            assert _pid_age_seconds(1234) == pytest.approx(42.5)
 
 
 class TestPidInSpawnGrace:
     """Tests for _pid_in_spawn_grace helper."""
 
     def test_macos_young_pid_returns_true(self) -> None:
-        """macOS: grace DOES apply (regression — it was silently Linux-only).
+        """macOS: grace DOES apply — a young off-Linux pid is protected.
 
-        The startup sweep SIGKILLed a live kiro-cli on macOS because this
-        returned False unconditionally off-Linux (2026-07-29 repro).
+        The startup sweep must not SIGKILL a live kiro-cli on macOS; grace
+        applies cross-platform, not only on Linux.
         """
         from kiro_crew.session_pid import _pid_in_spawn_grace
 
@@ -815,9 +832,8 @@ class TestSweepGraceIntegration:
     def test_non_linux_old_orphan_still_killed(self, session_pid_file: Path) -> None:
         """On macOS, an orphan OLDER than the grace window is still killed.
 
-        Grace now applies cross-platform, so the age must be stubbed old —
-        previously non-Linux skipped grace entirely, which is the defect that
-        let the sweep kill freshly-spawned backends.
+        Grace applies cross-platform, so the age must be stubbed old — a young
+        off-Linux orphan is protected by grace and would survive the sweep.
         """
         from kiro_crew.session_pid import _sweep_pid_entries
 

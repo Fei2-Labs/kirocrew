@@ -59,13 +59,15 @@ class TestOwnership:
         self, monkeypatch, tmp_path: Path
     ):
         """The production hook gate enforces the owner boundary for actual fs tools."""
+        from kiro_crew import sandbox
         from kiro_crew.hooks import TOOL_DENY, HookManager, HooksConfig
-        from kiro_crew.security import is_sensitive_bash_command, is_sensitive_path
+        from kiro_crew.security import is_sensitive_path
 
         relative_edit = "apps/meetings/data/edits/m1/note-taker.md"
         assert is_sensitive_path(f"~/.kiro/crew/{relative_edit}") is True
         assert is_sensitive_path(f"~/.kirocrew/{relative_edit}") is True
-        assert is_sensitive_bash_command(f"cat ~/.kiro/crew/{relative_edit}") is not None
+        # The shell plane is masked by the sandbox, not matched by text.
+        assert "apps/meetings/data/edits" in sandbox._CREW_HIDDEN_LEAVES
 
         crew_home = tmp_path / "crew-home"
         monkeypatch.setenv("KIROCREW_HOME", str(crew_home))
@@ -318,7 +320,7 @@ class TestOutputsOverlay:
             resp = await client.delete(
                 f"{BASE}/meetings/standup/outputs", json={"agent_id": "note-taker"}
             )
-            assert (await resp.json())["reverted"] is True
+            assert (await resp.json()) == {"ok": True, "agent_id": "note-taker"}
 
             body = await (await client.get(f"{BASE}/meetings/standup/outputs")).json()
         assert body["outputs"]["note-taker"] == "# Generated\n"
@@ -333,7 +335,10 @@ class TestOutputsOverlay:
                 f"{BASE}/meetings/standup/outputs", json={"agent_id": "note-taker"}
             )
             assert resp.status == 200
-            assert (await resp.json())["reverted"] is False
+            # The response says nothing about whether an edit existed: no client
+            # ever consumed the old ``reverted`` flag, so the payload is the same
+            # either way.
+            assert (await resp.json()) == {"ok": True, "agent_id": "note-taker"}
 
     @pytest.mark.asyncio
     async def test_a_sidecar_is_ignored_once_the_agent_turns_into_an_html_widget(
@@ -539,7 +544,7 @@ class TestBodyCaps:
         """Functional half of the arithmetic above.
 
         A multibyte document comfortably inside ``MAX_MINUTES_CHARS`` exceeds the
-        256 KiB default, so this request is exactly the one that used to 413.
+        256 KiB default, so this request is exactly the one the default would 413.
         """
         from kiro_crew.apps.builtins.meetings.backend.routes import _common
 

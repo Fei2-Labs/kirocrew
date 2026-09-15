@@ -1,9 +1,10 @@
 """Slack as a concrete :class:`MessagingTransport`.
 
 This wraps the existing ``SlackClientOps`` surface in the channel-neutral
-transport contract. Nothing in the live gateway path constructs it: the Slack
-path routes through ``slack.transport_dispatch`` (TurnDriver + SlackRenderer)
-and only ``SlackTransport.channel_type`` is read, by ``handlers_system``.
+transport contract. The live inbound path still routes through
+``slack.transport_dispatch`` (TurnDriver + SlackRenderer), and Slack remains
+absent from the shared ``channel_transports`` registry. The gateway constructs a
+pass-local instance only to replay refused-turn notices through its live client.
 
 Direction of dependency is ``slack -> messaging`` (allowed): the neutral
 ``messaging`` package never imports Slack.
@@ -18,6 +19,7 @@ in ``slack/events.py`` so the two inbound paths agree.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
@@ -29,7 +31,7 @@ from kiro_crew.messaging.transport import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.slack.client import SlackClientOps
-from kiro_crew.slack.enterprise import validated_self_bot_id
+from kiro_crew.slack.enterprise import trusted_bot_admission
 from kiro_crew.slack.format import SLACK_MSG_LIMIT
 
 # A dispatch callback consumes a normalized, already-authorized message and
@@ -37,10 +39,10 @@ from kiro_crew.slack.format import SLACK_MSG_LIMIT
 DispatchFn = Callable[[InboundMessage], Awaitable[None]]
 
 # Slack's capabilities — the SINGLE declaration (the renderer imports this
-# object; it was previously declared twice, an un-DRY drift hazard).
+# object; two literal declarations for one fact are an un-DRY drift hazard).
 # max_message_chars matches the SHIPPED send path: slack/format.py splits at
-# SLACK_MSG_LIMIT (3900), not the platform's ~40000 ceiling that was declared
-# before. Declaring the ceiling was a lie waiting for a capability-aware
+# SLACK_MSG_LIMIT (3900), not the platform's ~40000 ceiling. Declaring that
+# ceiling would be a lie waiting for a capability-aware
 # caller to trust it and emit messages 10x larger than the renderer ever sends.
 SLACK_CAPABILITIES = TransportCapabilities(
     streaming=True,
@@ -103,6 +105,16 @@ class SlackTransport(MessagingTransport):
     async def send_message(
         self, conversation_id: str, content: str, thread_id: str | None = None
     ) -> str:
+        # Inbound events normally resolve this before any reply. Refused-turn
+        # replay runs after a restart with no event to warm the per-process cache,
+        # so an org-wide Slack install would otherwise post without the channel's
+        # home team_id and reject Slack Connect destinations. Keep the hook
+        # optional for SlackClientOps test doubles and alternate clients.
+        ensure_home_team = getattr(self._client, "ensure_channel_team", None)
+        if ensure_home_team is not None:
+            outcome = ensure_home_team(conversation_id)
+            if inspect.isawaitable(outcome):
+                await outcome
         return await self._client.post_message(conversation_id, content, thread_id)
 
     async def resolve_conversation(self, user_id: str) -> str:
@@ -131,22 +143,16 @@ class SlackTransport(MessagingTransport):
     def may_send_to(
         self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
     ) -> bool:
-        """Never consulted -- permits, and says why.
+        """Authorize a refused-turn notice for a currently allowed sender.
 
-        An override with a reason rather than an inherited default, so a reader
-        does not have to infer this transport's stance. The shared send ladder
-        (``chat_runner._resolve_channel_target``) returns early for
-        ``SLACK_NAMESPACE`` before any transport call: Slack's proactive traffic
-        goes through the gateway's own client and streaming path, which is not
-        registered in ``channel_transports``. Nothing routes here, so there is no
-        decision this method can enforce.
-
-        It could not answer anyway: a Slack link persists a **channel** id
-        (``D…``/``C…``) while the roster holds user ids, so the same
-        conversation-id-is-not-a-principal problem applies. Slack's own proactive
-        paths do their allow-list checks at their own call sites.
+        Slack remains absent from the shared transport registry, so ordinary
+        proactive traffic still uses the gateway's existing route. The gateway
+        creates this adapter only for inbound-spool replay and supplies a fresh
+        snapshot of its owner roster. ``conversation_id`` is an opaque channel
+        id, so the persisted sender principal is the only identity this gate can
+        recheck; empty or revoked principals fail closed.
         """
-        return bool(conversation_id)
+        return bool(conversation_id and principal and principal in self._allowed_users)
 
     # -- Inbound adapter ----------------------------------------------------
     def authorize(self, msg: InboundMessage) -> bool:
@@ -193,20 +199,13 @@ class SlackTransport(MessagingTransport):
         # Loop bounding (the per-thread trusted-bot turn cap) is the
         # dispatch layer's job; this transport decides admissibility only.
         bot_id = event.get("bot_id") or ""
-        self_bot_id = validated_self_bot_id()
-        from_trusted_bot = (
-            bool(bot_id)
-            and bool(self_bot_id)
-            and bot_id != self_bot_id
-            and bot_id in self._trusted_bot_ids
-        )
-        if bot_id and not from_trusted_bot:
-            if bot_id == self_bot_id and bot_id in self._trusted_bot_ids:
-                deny_error = "own_bot_id_never_trusted"
-            elif not self_bot_id and bot_id in self._trusted_bot_ids:
-                deny_error = "trusted_bot_requires_verified_self_id"
-            else:
-                deny_error = "untrusted_bot"
+        # READ TIMING: the transport passes its CONSTRUCTOR SNAPSHOT, matching
+        # its `allowed_users` pattern — a transport's admission set is fixed for
+        # its lifetime, so a live edit needs a reconstruction. The event gate
+        # deliberately passes the live config instead; the predicate takes the
+        # set as an argument precisely so each site owns that choice.
+        from_trusted_bot, deny_error = trusted_bot_admission(bot_id, self._trusted_bot_ids)
+        if deny_error:
             sel().log_api_access(
                 caller=bot_id,
                 operation="slack_transport.receive",
@@ -217,6 +216,17 @@ class SlackTransport(MessagingTransport):
             return
         if event.get("subtype") == "bot_message" and not from_trusted_bot:
             return
+        # TRUST PROVENANCE: the admitted peer bot is normalized into a plain
+        # InboundMessage below, which carries no trust flag — so a dispatcher
+        # reading it cannot tell a peer bot from a human. Whoever wires
+        # `_dispatch` to a real consumer MUST thread `from_trusted_bot` through
+        # to the layer enforcing the per-thread turn cap and error-reply
+        # suppression (`handle_message_transport` already accepts it), either by
+        # adding the field to InboundMessage at that point or by re-deriving it
+        # at the seam. It is deliberately NOT added here: widening the
+        # channel-neutral InboundMessage contract for a path with no consumer
+        # would ship an unenforced field, and an unenforced trust flag reads as
+        # a guarantee that nothing checks.
         msg = InboundMessage(
             channel_type="slack",
             user_id=event.get("user") or (bot_id if from_trusted_bot else ""),

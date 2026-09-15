@@ -4,10 +4,14 @@ import { Bot, Boxes, Sparkles, Terminal } from 'lucide-react'
 
 import { api } from '../../api/client'
 import type { AcpBackendProbe } from '../../api/client'
+import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
 import { SettingsCard, SettingsButtonGroup } from '../../components/settings'
 import { useConfigSchema } from '../../components/settingRef/useConfigSchema'
 import { i18nT } from '../../i18n/t'
+import { clearCachedModels } from '../../providers/adapters/acp'
+import { KiroSignInCard } from './KiroSignInCard'
+import { KIRO_SIGN_IN_BACKEND } from './kiroSignInLink'
 
 /** The config field the switch owns. Also the schema path the options are gated on. */
 const CONFIG_KEY = 'agent.acp_backend'
@@ -167,6 +171,25 @@ export function AgentBackendTab() {
     onSuccess: () => {
       setSaveError('')
       qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      // The model list is the NEW backend's now. `/api/models` re-reads
+      // `agent.acp_backend` on every call, so the server side needs no restart;
+      // only the frontend cache did, because `['available-models']` is refetched
+      // in exactly one other place — a spawned session (`useWebSocket`'s
+      // `activity_event`) — and the global `staleTime: Infinity` plus the
+      // self-heal poll stopping after one live success mean nothing else ever
+      // re-asks. That is why the picker looked like it needed a gateway restart:
+      // the restart was just the next session spawn.
+      //
+      // `resetQueries`, not `invalidateQueries`: invalidate keeps the OLD
+      // backend's rows on screen until the refetch lands, and a cold
+      // `--list-models` spawn can take the gateway's full 10s. A pick in that
+      // window writes an id the new backend rejects. Reset drops the data to
+      // `undefined` first, so every picker shows the auto-only placeholder for
+      // those seconds, then refetches. Drop the last-good localStorage list
+      // FIRST for the same reason: a failing first fetch must degrade to
+      // auto-only, not to the old backend's ids.
+      clearCachedModels()
+      qc.resetQueries({ queryKey: ['available-models'] })
     },
     // No optimistic write and no local mirror of the value: the button group reads
     // straight from the query, so a rejected PATCH needs no revert — the cache was
@@ -260,10 +283,11 @@ export function AgentBackendTab() {
    * the same mistake as disabling one. `current` joins for the same reason: the saved
    * value must always have a chip.
    *
-   * Sorted rather than left in arrival order: KIRO first because it is the default
-   * and the floor, then by `policy_id`, which is the order the probe endpoint already
-   * sorts by. Set iteration order would otherwise follow whichever query resolved
-   * first and reshuffle the control between renders.
+   * Sorted rather than left in arrival order: the two kiro-family harnesses first —
+   * KIRO because it is the default and the floor, then KAS — and everything else by
+   * `policy_id`, which is the order the probe endpoint already sorts by. Set iteration
+   * order would otherwise follow whichever query resolved first and reshuffle the
+   * control between renders.
    */
   const candidates = Array.from(
     new Set<string>([
@@ -275,6 +299,15 @@ export function AgentBackendTab() {
   ).sort((a, b) => {
     if (a === KIRO) return -1
     if (b === KIRO) return 1
+    // KAS second, ahead of the byte order below. It is not an adapter: it is kiro-cli's
+    // own ACP relay, resolved from the same binary and sharing kiro's install verdict
+    // (`_probe_kas` delegates to `_probe_kiro`), so the two harnesses that are really
+    // one install belong adjacent at the head of the row. Under `policy_id` alone it
+    // sorts on 'k' and lands behind every adapter whose name happens to start earlier
+    // ('claude', 'codex'), which reads to the operator as a rank rather than an
+    // alphabet.
+    if (a === KAS) return -1
+    if (b === KAS) return 1
     // Byte order, not `localeCompare`/`compareText`: these are machine identifiers,
     // and the point of the sort (see above) is to reproduce the order the probe
     // endpoint already returned them in. A collator reads the READER's locale, so
@@ -325,6 +358,8 @@ export function AgentBackendTab() {
    * A standing caveat about the harness itself, independent of whether it is
    * installed. Unlike `status`, this does not change with the probe.
    *
+   * ## Tool gating, which is stated here
+   *
    * The DEFAULT path is gated: Claude asks, `claude-agent-acp` turns that into
    * `session/request_permission`, and Crew's own approval path decides. What escapes
    * is narrower and worth stating precisely -- a tool ALREADY pre-approved in Claude's
@@ -335,10 +370,51 @@ export function AgentBackendTab() {
    * That is documented, intended Claude behaviour rather than a defect here, but it
    * means the guarantee differs per harness. An operator choosing between harnesses is
    * choosing between governance models, so the panel names the difference instead of
-   * letting them find it in a shell command that never asked.
+   * letting them find it in a shell command that never asked. It is a TOOL-GATING
+   * disclosure and not an auth one, so nothing below replaces it.
+   *
+   * Which is why this returns a LIST rather than one string. Claude is the harness
+   * that carries both -- its tool gating has the caveat above AND it signs in through
+   * its own credential file -- and an earlier revision returned early on the gating
+   * line, so the one harness with two facts to state showed one of them.
+   *
+   * ## Signing in, which the SERVER states
+   *
+   * `auth.sign_in_remedy` arrives as a finished sentence and is rendered verbatim;
+   * `auth.signs_in_separately` decides whether it is rendered at all, because a
+   * harness that authenticates through Crew's own identity store has no separate
+   * sign-in to finish. Absent `auth` says nothing, like every other absent probe
+   * field.
+   *
+   * It is NOT translated, and that is the trade rather than an oversight. A
+   * translated per-harness sentence is, by construction, a per-harness edit to
+   * thirteen locale files, so the harness that needs the sentence most -- one an
+   * edition registered and this frontend has never heard of -- is exactly the one
+   * that would get no sentence at all. An untranslated remedy that is CORRECT beats
+   * a translated one nobody adds.
+   *
+   * This also finishes the pattern the option list already follows: `candidates` is
+   * a union of server answers rather than ids written here, and `nameOf` falls back
+   * to the wire id when this frontend has no translated name. The `value === CODEX`
+   * branch this replaces was the panel's last per-harness literal. Now the server
+   * names a harness and states its remedy, and adding one costs no edit here.
+   *
+   * Still a caveat and not a probe line, deliberately. A measurement here would gate
+   * the control -- `missing` disables the chip -- and the paths that authenticate a
+   * harness are not all checkable: an ambient key, a relocated config home, an
+   * adapter carrying its own configuration. Each of those is an operator whose switch
+   * we would have disabled while they were already signed in, which the probe module
+   * names as the more expensive mistake. A standing sentence cannot be wrong in that
+   * direction.
    */
-  const caveat = (value: string): string =>
-    value === CLAUDE ? i18nT('pages.developer.agentBackendTab.claude_uses_its_own_permissions') : ''
+  const caveats = (value: string): string[] => {
+    const lines: string[] = []
+    if (value === CLAUDE)
+      lines.push(i18nT('pages.developer.agentBackendTab.claude_uses_its_own_permissions'))
+    const auth = probe(value)?.auth
+    if (auth?.signs_in_separately) lines.push(auth.sign_in_remedy)
+    return lines
+  }
 
   /**
    * Translated display names for the agents this frontend knows by name.
@@ -429,7 +505,12 @@ export function AgentBackendTab() {
             disabled: disabledOption(value),
             describedById: statusId(value),
           }))}
-          onChange={v => patchMut.mutate(v)}
+          // `SettingsButtonGroup` fires for the pressed option too, and a PATCH
+          // that writes the value already stored still resolves successfully —
+          // which would run `onSuccess` and reset the model list, blanking every
+          // picker and spawning `--list-models` for a backend that did not
+          // change. Only a real change is a save.
+          onChange={v => { if (v !== current) patchMut.mutate(v) }}
         />
         {/* One line per agent the panel offers — the reader is choosing BETWEEN them,
             so showing only the selected one's status would hide the very comparison
@@ -446,7 +527,11 @@ export function AgentBackendTab() {
                 className={`m-0 ${disabledOption(value) ? 'text-warn' : 'text-muted'}`}
               >
                 {status(value)}
-                {caveat(value) && <div className="mt-0.5 text-muted">{caveat(value)}</div>}
+                {caveats(value).map(line => (
+                  <div key={line} className="mt-0.5 text-muted">
+                    {line}
+                  </div>
+                ))}
               </dd>
             </div>
           ))}
@@ -462,6 +547,21 @@ export function AgentBackendTab() {
           {i18nT('pages.developer.agentBackendTab.set_is_fixed_at_gateway_start')}
         </p>
       </SettingsCard>
+      {/* Kiro sign-in, under the switch that gives it a purpose. The identity the
+          card stores is consumed by the KAS relay alone
+          (`ACP_BACKENDS_HOST_AUTH_CALLBACK`), so the card is offered exactly when
+          KAS is: on a build or policy that hides that option there is nothing to
+          sign in for, and a chooser there would be a sign-in to nothing. Keyed on
+          `visible` — the same set the rows above render — so the switch and the
+          card cannot disagree about whether KAS is on offer. Gated on KAS being
+          OFFERED rather than SELECTED, so the user can sign in first and switch
+          second instead of paying one "not signed in" turn to find the card.
+          Isolated so a throwing card cannot take the switch down with it. */}
+      {visible.includes(KIRO_SIGN_IN_BACKEND) && (
+        <ErrorBoundary scope="developer-kiro-sign-in" fallback={null}>
+          <KiroSignInCard />
+        </ErrorBoundary>
+      )}
     </>
   )
 }

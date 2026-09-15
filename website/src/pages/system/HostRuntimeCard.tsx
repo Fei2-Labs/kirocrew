@@ -17,28 +17,8 @@ import { Card, CardTitle } from '../../components/ui'
 import { electronPlatform } from '../../lib/electron'
 import { i18nT } from '../../i18n/t'
 
-interface WslDistro {
-  name: string
-  /** Stable enum — never branch on the raw localized text. */
-  state: 'running' | 'stopped' | 'unknown'
-  /** The OS's own word for the state, in the OS language, for display. */
-  stateLabel: string
-  version: number
-  isDefault: boolean
-}
-
-interface WslDetectResult {
-  available: boolean
-  distros: WslDistro[]
-  defaultDistro: string | null
-  error?: string
-  reason?: string
-}
-
 /** Present only in the desktop shell (see electron/preload.js). */
-const resolveDetect =
-  (): (() => Promise<WslDetectResult>) | undefined =>
-    (window as { wslAPI?: { detect: () => Promise<WslDetectResult> } }).wslAPI?.detect
+const resolveDetect = (): (() => Promise<WslDetectResult>) | undefined => window.wslAPI?.detect
 
 export default function HostRuntimeCard() {
   const detect = resolveDetect()

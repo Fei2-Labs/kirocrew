@@ -28,6 +28,7 @@ from kiro_crew.acp.client import (
     AcpError,
     AcpProcessDied,
     AcpTimeoutError,
+    AcpToolGateUnroutable,
     OversizeLineUnrecoverable,
     _direct_children,
     _drain_oversize_line,
@@ -410,6 +411,11 @@ class TestClientAccessors:
         client._process = _live_process()
         assert client.is_process_alive() is True
         assert client.exit_code is None
+        # Idle == done: a live process with no prompt sent is NOT an unfinished
+        # turn (see test_acp_turn_done_idle_init). A turn begins when the prompt
+        # entry clear()s the Event.
+        assert client.has_unfinished_turn() is False
+        client._turn_done.clear()
         assert client.has_unfinished_turn() is True  # turn not done + process alive
 
         client._process.returncode = 3
@@ -437,7 +443,7 @@ class TestClientAccessors:
 
         assert client._session_key == "new"
         assert client._channel_id == "C-new"
-        # Stale context must not be handed to the new chat (#2932).
+        # Stale context must not be handed to the new chat.
         assert client.last_prompt_stats.context_pct == 0.0
         assert client.last_prompt_stats.context_used_tokens == 0
         assert client.last_prompt_stats.context_window_tokens == 0
@@ -660,7 +666,8 @@ class TestResetPaths:
         # The exception was retrieved, so asyncio will not report it at GC.
         assert done.exception() is not None
 
-    def test_reset_state_unlinks_claude_settings_and_survives_pipe_errors(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_teardown_unlinks_claude_settings_and_survives_pipe_errors(self, tmp_path):
         client = _client(
             tmp_path, acp_backend=ACP_BACKEND_CLAUDE, permission_mode="bypassPermissions"
         )
@@ -677,6 +684,10 @@ class TestResetPaths:
         client._pid = None
         client._child_pids = {}
 
+        # The pair every real caller runs: the seed's removal is a disk operation
+        # (revoke the durable grant, then unlink) so it lives in the async discard,
+        # while _reset_state stays synchronous and drops the in-memory claim.
+        await client._discard_claude_settings_seed()
         client._reset_state()
 
         assert not stale.exists()  # bypassPermissions must not persist a crash
@@ -740,6 +751,111 @@ class TestEnsureReady:
             await client.ensure_ready()
 
         assert client._kill_process.await_count == 2  # once per attempt
+
+    @pytest.mark.asyncio
+    async def test_tool_gate_refusal_does_not_retry_the_spawn(self, tmp_path):
+        """A gate refusal is a configuration fact, so a respawn re-reads it.
+
+        ``AcpToolGateUnroutable`` documents itself Non-retryable, but it subclasses
+        ``AcpError``, so the generic transport ladder would retry it: attempt 0
+        tears the child down, respawns, hits the identical refusal, and only then
+        raises. That is one wasted spawn plus teardown, and it spends the reconnect
+        budget the distinct type exists to protect.
+
+        Revert-verified: dropping the dedicated handler makes both counters 2.
+        """
+        client = _client(tmp_path)
+        spawns = {"n": 0}
+
+        async def _spawn():
+            spawns["n"] += 1
+            client._process = _live_process()
+
+        async def _init():
+            raise AcpToolGateUnroutable("codex routes tool calls around the gate")
+
+        def _reset():
+            # Faithful to production: the real _reset_state drops the process
+            # handle, which is what makes the retry actually RESPAWN. A bare
+            # MagicMock leaves it set, so _spawn runs once either way and the
+            # spawn assertion below could never fail.
+            client._process = None
+
+        client._spawn = _spawn
+        client._initialize_session = _init
+        client._snapshot_process_tree = AsyncMock()
+        client._kill_process = AsyncMock()
+        client._reset_state = _reset
+
+        with pytest.raises(AcpToolGateUnroutable):
+            await client.ensure_ready()
+
+        assert spawns["n"] == 1, "the refusal was retried with a fresh process"
+        assert client._kill_process.await_count == 1
+
+    def test_sandbox_preflight_translates_the_gate_refusal(self, monkeypatch):
+        """The RAW gate exception must not escape the preflight.
+
+        ``acp_tool_gate`` is a leaf module that cannot import this one, so its
+        ``ToolGateUnroutable`` is a plain ``Exception``. That makes it invisible to
+        BOTH handlers around the spawn: it is not an ``AcpError``, so the transport
+        ladder cannot see it, and it is not ``AcpToolGateUnroutable``, so the
+        dedicated non-retrying handler cannot either. Raised raw, a sandbox-floor
+        refusal escaped ``ensure_ready`` entirely and skipped the cleanup every
+        other refusal path runs.
+
+        Revert-verified: dropping the translation raises the raw type and fails here.
+        """
+        from kiro_crew import acp_tool_gate
+
+        def _refuse(backend, mode):
+            raise acp_tool_gate.ToolGateUnroutable("no sandbox backend on this host")
+
+        monkeypatch.setattr(acp_tool_gate, "enforce_sandbox_floor", _refuse)
+
+        with pytest.raises(AcpToolGateUnroutable, match="no sandbox backend"):
+            acp_client._sandbox_preflight("codex", "standard")
+
+    @pytest.mark.asyncio
+    async def test_sandbox_preflight_is_bounded_on_a_stalled_disk(self, monkeypatch):
+        """A preflight that never returns must not hold the spawn open.
+
+        The mask half canonicalizes the home and override roots on disk, and on a
+        stalled mount that wait has no end of its own; nothing else on the spawn
+        path bounds it (``ensure_ready`` times the handshake AFTER the spawn). The
+        deadline turns that into a retryable ``AcpError`` naming the slow disk, and
+        the adapter is not started without its mask.
+
+        Revert-verified: dropping the ``wait_for`` makes this test hang on the
+        stalled worker instead of raising.
+        """
+        import threading
+
+        monkeypatch.setattr(acp_client, "_SANDBOX_PREFLIGHT_TIMEOUT", 0.05)
+        release = threading.Event()
+
+        def _stalled(backend, mode):
+            release.wait(5.0)
+            return ()
+
+        try:
+            with pytest.raises(AcpError, match="did not finish within 0 s"):
+                await acp_client._run_preflight_bounded(_stalled, "codex", "standard")
+        finally:
+            release.set()  # let the worker thread go; the test must not leak it
+
+    @pytest.mark.asyncio
+    async def test_sandbox_preflight_within_budget_returns_the_mask(self):
+        calls = []
+
+        def _quick(backend, mode):
+            calls.append((backend, mode))
+            return ("/home/u/.aws",)
+
+        assert await acp_client._run_preflight_bounded(_quick, "codex", "standard") == (
+            "/home/u/.aws",
+        )
+        assert calls == [("codex", "standard")]
 
     @pytest.mark.asyncio
     async def test_shutdown_kills_and_resets(self, tmp_path):
@@ -1335,9 +1451,10 @@ class TestPermissionEvent:
         event = client._build_permission_event(msg)
 
         assert event.kind == EVENT_PERMISSION_REQUEST
-        assert event.options == [{"id": "allow_once", "label": "", "kind": "allow_once"}]
+        # Options carry id + label only; the kind lives in the recorded option map.
+        assert event.options == [{"id": "allow_once", "label": ""}]
         # Legacy id with no usable kind still resolves the allow ids.
-        assert client._permission_options["req-1"]["allow_once"] == "allow_once"
+        assert client._permission_options["req-1"]["once"] == "allow_once"
         # is_shell is deny-by-default: the payload's own kind is untrusted.
         assert event.is_shell is False
 
@@ -1361,7 +1478,7 @@ class TestPermissionEvent:
 
         assert event.tool_input == '{"path": "/etc/hosts"}'
         assert event.raw_tool_params == {"path": "/etc/hosts"}
-        assert client._permission_options["req-2"] == {"reject_once": "reject"}
+        assert client._permission_options["req-2"] == {"reject": "reject"}
 
     def test_debug_logging_redacts_the_payload(self, tmp_path, caplog):
         client = _client(tmp_path)
@@ -1675,13 +1792,17 @@ class TestAdvertisedModelCacheWiring:
         client._write_claude_local_settings()
         assert self._read_seed(tmp_path)["availableModels"] == served
 
-    def test_seed_falls_back_to_registry_on_cold_cache(self, tmp_path, monkeypatch):
+    def test_cold_cache_seeds_no_model_keys_at_all(self, tmp_path, monkeypatch):
+        # No static-registry fallback: a guessed allowlist poisons the adapter's
+        # union+dedup merge for any model the registry has not caught up on, so an
+        # unseeded file (adapter falls back to its own provider list) beats a stale
+        # one. The post-capture re-seed fills both keys in.
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
-        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE, model="claude-opus-5")
         client._write_claude_local_settings()
-        assert self._read_seed(tmp_path)["availableModels"] == mr.seed_available_models(
-            "claude_code"
-        )
+        seed = self._read_seed(tmp_path)
+        assert "availableModels" not in seed
+        assert "model" not in seed
 
     def test_claude_capture_feeds_and_flags_the_cache(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})

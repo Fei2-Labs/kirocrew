@@ -4,8 +4,10 @@ The stub is the shim kiro-cli execs in place of the real MCP binary. It
 connects to gatewayd over a unix socket, Registers with a full
 :class:`PoolKey` payload, then bridges kiro-cli stdio ↔ gateway until
 either side closes. On handshake failure it logs a structured fallback
-record to ``$KIROCREW_HOME/logs/stub_fallback.jsonl`` and ``execvpe``\u200bs
-the real MCP backend in place, preserving per-session correctness.
+record to ``$KIROCREW_HOME/logs/stub_fallback.jsonl`` and hands the session
+to the real MCP backend, preserving per-session correctness: ``execvpe`` in
+place on POSIX, and on Windows -- which has no in-place exec -- a child
+inheriting this process's stdio (see :func:`_fallback_spawn_child`).
 
 Register fields match :meth:`PoolKey.from_register`; hashes use SHA-256
 (stdlib). Bridge phase is NOT wrapped in a timeout (learned correction
@@ -26,6 +28,7 @@ import os
 import queue
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -38,7 +41,8 @@ from kiro_crew.executors import configure_default_executor, subprocess_executor
 from kiro_crew.jsonl_util import bounded_records, rotate_jsonl_at
 from kiro_crew.mcp_caller import CallerContext, _parent_pid
 from kiro_crew.mcp_gateway import transport
-from kiro_crew.mcp_gateway.hashing import hash_command, hash_effective_env
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
+from kiro_crew.mcp_gateway.hashing import decode_target_args, hash_command, hash_effective_env
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES, PoolKey
 from kiro_crew.metrics.events import MCP_RECONNECTS, emit_counter
 
@@ -141,7 +145,7 @@ def _default_socket_path() -> str:
     """Resolve the default gateway socket under KIROCREW_HOME (0700 dir)."""
     home = _crew_home()
     new_path = home / "kirocrew-mcp-gateway.sock"
-    # Accept legacy socket name written by older versions (#928).
+    # Accept legacy socket name written by older versions.
     legacy_path = home / "mc-mcp-gateway.sock"
     if not new_path.exists() and legacy_path.exists():
         return str(legacy_path)
@@ -162,7 +166,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--server", required=True)
     p.add_argument("--agent", required=True)
     p.add_argument("--target-command", required=True, dest="target_command")
-    p.add_argument("--target-args", default="", dest="target_args")
+    p.add_argument(
+        "--target-args-b64",
+        default=None,
+        help="Base64url-encoded JSON argv; takes precedence over --target-args.",
+    )
+    p.add_argument("--target-args", default="", help="Legacy delimiter-separated argv.")
     p.add_argument("--target-args-sep", default="|", dest="target_args_sep")
     p.add_argument("--sandbox-mode", default="standard", dest="sandbox_mode")
     p.add_argument("--work-dir", required=True, dest="work_dir")
@@ -199,18 +208,23 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--channel-id", default=None, dest="channel_id")
     p.add_argument(
+        "--pool-identity-env-b64",
+        default=None,
+        help="Base64url-encoded JSON env names; takes precedence over --pool-identity-env.",
+    )
+    p.add_argument(
         "--pool-identity-env",
         default="",
         dest="pool_identity_env",
         help=(
-            "Env variable NAMES (separated by --target-args-sep) whose value the "
-            "operator declared part of backend identity via "
-            "mcp_gateway.pool_identity_env. Folded into effective_env_hash even "
-            "when the name looks like a rotating secret. Names only, never "
-            "values, so this is safe on argv. Carries NO authority: gatewayd "
-            "re-reads the operator's own list at spawn and refuses to forward "
-            "when the hash it recomputes does not match the one registered here, "
-            "so a stub cannot widen what gets applied to a shared backend."
+            "DEPRECATED: env variable NAMES separated by --target-args-sep. "
+            "Read only when --pool-identity-env-b64 is absent. Folded into "
+            "effective_env_hash even when the name looks like a rotating "
+            "secret. Names only, never values, so this is safe on argv. "
+            "Carries NO authority: gatewayd re-reads the operator's own list "
+            "at spawn and refuses to forward when the hash it recomputes does "
+            "not match the one registered here, so a stub cannot widen what "
+            "gets applied to a shared backend."
         ),
     )
     p.add_argument(
@@ -222,7 +236,27 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 
 def _split_target_args(raw: str, sep: str) -> list[str]:
+    """Read delimiter-separated arguments from legacy overlays."""
     return raw.split(sep) if raw else []
+
+
+def _resolve_target_args(args: argparse.Namespace) -> list[str]:
+    """Share one decode between backend launch and the registered command hash."""
+    encoded = getattr(args, "target_args_b64", None)
+    if encoded is not None:
+        return decode_target_args(encoded)
+    return _split_target_args(args.target_args, args.target_args_sep)
+
+
+def _resolve_pool_identity_env(args: argparse.Namespace) -> frozenset[str]:
+    """Decode names only; the daemon independently checks forwarding authority."""
+    encoded = getattr(args, "pool_identity_env_b64", None)
+    names = (
+        decode_target_args(encoded)
+        if encoded is not None
+        else _split_target_args(args.pool_identity_env, args.target_args_sep)
+    )
+    return frozenset(n for n in names if n)
 
 
 def _parse_env_csv(raw: str) -> dict[str, str]:
@@ -301,7 +335,7 @@ def _hash_permission_profile(
     for tool in sorted(auto_approve):
         h.update(tool.encode("utf-8"))
         h.update(b"\0")  # NUL delimiter: injective — cannot occur in a tool name,
-        #                  so ["a,b"] and ["a","b"] no longer collide onto one key.
+        #                  so ["a,b"] and ["a","b"] cannot collide onto one key.
     h.update(b"mode=")
     h.update(approval_mode.encode("utf-8"))
     h.update(b"\0trust_all=")
@@ -330,6 +364,33 @@ def _binary_version(command: str) -> str:
         return h.hexdigest()[:24]
     except OSError:
         return "unknown"
+
+
+#: Kiro Crew's own MCP servers, as the subcommand a stub's target args name.
+#: For these the target binary is the ``kirocrew`` console-script shim, whose
+#: bytes never change across a ``git pull`` of an editable install, so its
+#: hash alone let a pooled backend from a two-day-old checkout keep answering
+#: stubs from a freshly restarted gateway. The package's own fingerprint is
+#: folded in for exactly these, and only these: a third-party MCP binary is
+#: what its bytes say it is, and re-partitioning its pool on every Kiro Crew
+#: commit would cold-start it for no reason.
+_KIROCREW_MCP_SUBCOMMANDS = frozenset(
+    {"mcp-core", "mcp-cron", "mcp-work", "mcp-computer", "mcp-dashboard"}
+)
+
+
+def pool_binary_version(command: str, target_args: list[str]) -> str:
+    """The ``binary_version`` a stub registers: the binary's hash, plus the Kiro
+    Crew code fingerprint when the target is one of Kiro Crew's own servers.
+    """
+    base = _binary_version(command)
+    if not any(a in _KIROCREW_MCP_SUBCOMMANDS for a in target_args):
+        return base
+    # Imported here, not at module top: the stub's cold-start path is timed
+    # and this module is only needed on the Kiro Crew branch.
+    from kiro_crew.code_fingerprint import code_fingerprint
+
+    return f"{base}+{code_fingerprint()}"
 
 
 def binary_fingerprint(command: str) -> str:
@@ -389,8 +450,6 @@ def _build_caller_block(channel_id: Optional[str]) -> dict[str, str]:
     session_key = CallerContext.from_env().session_key
     # Diagnostic identity only — the OS user. USERNAME is the Windows spelling
     # of USER; check both so this dimension is not empty on one platform.
-    # (A ``KIROCREW_PRINCIPAL`` override existed historically but nothing ever
-    # set it — Kiro Crew is single-operator, so it was deleted.)
     principal = (
         os.environ.get("USER") or os.environ.get("USERNAME") or ""
     )
@@ -417,7 +476,7 @@ def build_register_payload(args: argparse.Namespace) -> dict:
 
     The result is accepted verbatim by :meth:`PoolKey.from_register` —
     callers do not post-process."""
-    target_args = _split_target_args(args.target_args, args.target_args_sep)
+    target_args = _resolve_target_args(args)
     # Prefer --env-json when present (commas/equals round-trip intact);
     # fall back to the legacy --env CSV for overlay files written by a
     # pre-JSON rewriter that may still be on disk during the transition.
@@ -429,12 +488,7 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         env_pairs = _parse_env_csv(args.env)
     auto_approve = _parse_auto_approve(args.auto_approve)
     channel_id = _resolve_channel_id(args.channel_id)
-    # Reuses the target-args separator rather than ',' so a name can never be
-    # split the way the legacy CSV env encoding split values. Empty -> the
-    # default set, which hashes exactly as it did before this flag existed.
-    identity_keys = frozenset(
-        n for n in args.pool_identity_env.split(args.target_args_sep) if n
-    )
+    identity_keys = _resolve_pool_identity_env(args)
 
     try:
         work_dir = str(Path(args.work_dir).resolve())
@@ -442,8 +496,13 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         work_dir = str(args.work_dir)
 
     caller = _build_caller_block(channel_id)
+    # Per-session token from the injected ACP entry's own env
+    # (``session_servers.attach_stub_session_token``). Absent for a stub
+    # launched from a hand-written config or an overlay predating the token: the
+    # field is then omitted below and gatewayd keeps its PID-keyed behavior.
+    session_token = os.environ.get(STUB_SESSION_TOKEN_ENV, "")
 
-    return {
+    payload = {
         "type": "register",
         "stub_uuid": str(uuid.uuid4()),
         "server_name": args.server,
@@ -451,7 +510,7 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         "command_args_hash": hash_command(args.target_command, target_args),
         "effective_env_hash": hash_effective_env(env_pairs, identity_keys=identity_keys),
         "work_dir": work_dir,
-        "binary_version": _binary_version(args.target_command),
+        "binary_version": pool_binary_version(args.target_command, target_args),
         # Not os.getuid(): that attribute does not exist on Windows, where an
         # AttributeError here would abort the Register frame and send every
         # session to per-session exec -- pooling would appear enabled and
@@ -478,7 +537,7 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         # ``user_identity``. Omitting the key would make that daemon reject
         # every new stub's register as malformed, silently un-pooling the
         # whole install until the daemon restarts. A current daemon ignores
-        # the key. Safe to drop once no pre-#3604 daemon can be adopted.
+        # the key. Safe to drop once no daemon predating the key can be adopted.
         "user_identity": caller["principal_id"] or "unknown",
         "channel_id": channel_id,
         "config_snapshot_hash": _CONFIG_SNAPSHOT_PLACEHOLDER,
@@ -499,6 +558,14 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         "session_type": caller["session_type"],
         "principal_id": caller["principal_id"],
     }
+    if session_token:
+        # Sibling field, deliberately NOT a PoolKey dimension: a per-connection
+        # value in the key would give every session its own backend and pooling
+        # would silently stop (see the ``pool`` module docstring). The token says
+        # WHICH session this connection belongs to, never which backends are
+        # interchangeable.
+        payload["stub_session_token"] = session_token
+    return payload
 
 
 async def _write_frame(writer: asyncio.StreamWriter, obj: dict) -> None:
@@ -652,10 +719,10 @@ class StubSession:
     which is scoped to one socket:
 
     * **the stdin reader thread and its queue.** This is why a reconnect cannot
-      simply call ``run_bridge`` again on a fresh socket. The reader used to be
-      created per call, so a second call would put two threads on fd 0 --
-      splitting kiro-cli's lines between two consumers -- while any line the
-      first one had already dequeued died with the old frame.
+      simply call ``run_bridge`` again on a fresh socket. Creating the reader
+      per call would put two threads on fd 0 -- splitting kiro-cli's lines
+      between two consumers -- while any line the first one had already
+      dequeued dies with the old frame.
     * **the ``initialize`` frame.** The stdin pump consumes and forwards it
       once and kiro-cli never re-sends it, so without a copy here a fresh daemon
       would hold a never-initialized backend that rejects every later call --
@@ -1427,8 +1494,8 @@ def _fallback_log_path() -> Path:
 
 
 # Rotate the fallback log once it exceeds this size, keeping ONE previous
-# generation (``.jsonl.1``). The log grew unbounded before (467 KB in 15 h on
-# one degraded host, issue #3495); a 1 MiB cap bounds total disk use at ~2 MiB
+# generation (``.jsonl.1``). Unrotated it grows unbounded (467 KB in 15 h on
+# one degraded host); a 1 MiB cap bounds total disk use at ~2 MiB
 # while keeping enough history for the gateway's per-server fallback-rate
 # aggregation (see ``gatewayd`` stats).
 _FALLBACK_LOG_MAX_BYTES = 1024 * 1024
@@ -1578,11 +1645,113 @@ async def alog_fallback(
     )
 
 
+def _inherited_std_fd(stream: Any, default: int) -> int:
+    """The fd to hand a child for one of our own standard streams.
+
+    ``sys.stdin`` and friends can be replaced or detached (pytest's capture, a
+    ``pythonw`` host), in which case ``fileno()`` raises rather than answering.
+    Fall back to the well-known number: this runs in a process kiro-cli spawned
+    with real pipes on 0/1/2, so the constant is right whenever the object is
+    not.
+    """
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return default
+    return fd if isinstance(fd, int) and fd >= 0 else default
+
+
+def _child_exit_status(rc: object) -> int:
+    """The status to exit with after relaying a Windows child's own.
+
+    Windows reports an exit code as an unsigned ``DWORD``, and a crash lands far
+    above ``INT_MAX``: an access violation is ``0xC0000005``, i.e. 3221225477.
+    ``os._exit`` parses its argument as a C ``int``, so handing that straight
+    over raises ``OverflowError`` -- the stub would die on an exception instead
+    of relaying the status, which is the one thing this function exists to do,
+    and it would do so on the ordinary signature of a crashing backend rather
+    than in some corner.
+
+    Reinterpret such a value as signed 32-bit instead of clamping it. The OS
+    reads the low 32 bits back out, so the code kiro-cli observes is the exact
+    ``DWORD`` the backend exited with -- a clamp would silently rewrite a crash
+    into some unrelated status. Anything still outside a C ``int``, or not an
+    int at all, becomes 1: unrepresentable, so report plain failure.
+    """
+    if not isinstance(rc, int):
+        return 1
+    if rc > 0x7FFFFFFF:
+        rc -= 0x100000000
+    return rc if -0x80000000 <= rc <= 0x7FFFFFFF else 1
+
+
+def _fallback_spawn_child(argv: list[str], exec_env: dict[str, str]) -> NoReturn:
+    """Stand in for ``execvpe`` on Windows, which has no in-place exec.
+
+    CPython documents the replacement as in-place *"On Unix"*, where the image
+    is loaded into this process and keeps its pid. Windows has no such call, so
+    the ``exec*`` family is emulated as spawn-then-exit: the backend comes up
+    under a NEW pid and THIS process dies. kiro-cli owns this process's stdio
+    pipe and waits on the pid it spawned, so that exit reads to it as the server
+    hanging up -- it reports ``connection closed: initialize response`` and the
+    server's whole tool surface is missing from the session. The degrade path was
+    fatal on the one platform it existed to rescue, and every stubbed server
+    failed while every directly-launched one worked.
+
+    Run the backend as a CHILD and stay alive as its parent instead. Its stdin,
+    stdout and stderr are this process's own fds, duplicated into it explicitly
+    (``close_fds`` blocks handle inheritance on Windows, so passing the numbers
+    is what guarantees the child gets the real pipe rather than a fresh
+    console). kiro-cli therefore talks to the real backend over the pipe it
+    already holds, and the pid it waits on lives for the session. Every
+    ``fallback_exec`` call site is reached with kiro-cli's ``initialize`` still
+    unread -- the stub's own "clean per-session exec" invariant, asserted by the
+    comments at each of those sites -- so the hand-off loses no buffered request.
+
+    Resolve the command against the CHILD's ``PATH``, because that is what
+    ``execvpe`` searches; Windows ``CreateProcess`` would search this process's
+    instead, so a relative command could otherwise resolve differently on the
+    two platforms. An unresolvable name is passed through unchanged so the
+    resulting ``FileNotFoundError`` still surfaces, matching ``execvpe``.
+
+    Exit through ``os._exit``: this stands in for a process replacement, which
+    runs no cleanup handlers and flushes nothing, and a ``SystemExit`` raised
+    here would have to survive the teardown of the stub's own event loop.
+    """
+    resolved = shutil.which(argv[0], path=exec_env.get("PATH")) or argv[0]
+    # Our own buffers, not the child's: it inherits the same fds, so anything
+    # still queued here would interleave into the middle of its JSON-RPC stream.
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            stream.flush()
+    proc = subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+        [resolved, *argv[1:]],
+        env=exec_env,
+        stdin=_inherited_std_fd(sys.stdin, 0),
+        stdout=_inherited_std_fd(sys.stdout, 1),
+        stderr=_inherited_std_fd(sys.stderr, 2),
+    )
+    try:
+        rc = proc.wait()
+    except BaseException:
+        # Do not leave the backend holding kiro-cli's pipe with nobody waiting on
+        # it. A hard ``TerminateProcess`` on us cannot be intercepted at all, and
+        # the child survives that; what saves the session there is the pipe
+        # itself -- kiro-cli's exit closes fd 0 and an MCP server exits on stdin
+        # EOF, exactly as a directly-launched one would.
+        with contextlib.suppress(OSError):
+            proc.terminate()
+        raise
+    os._exit(_child_exit_status(rc))
+
+
 def fallback_exec(args: argparse.Namespace) -> None:
     """Replace the current process with the real MCP backend. ``execvpe``
     never returns on success; a return raises so the caller surfaces a
-    diagnostic."""
-    target_args = _split_target_args(args.target_args, args.target_args_sep)
+    diagnostic. Windows has no in-place exec, so there the backend runs as a
+    child inheriting this process's stdio -- see :func:`_fallback_spawn_child`
+    for why the emulated ``exec*`` would kill the session outright."""
+    target_args = _resolve_target_args(args)
     argv = [args.target_command, *target_args]
     # Restore the server's declared env. The rewriter moves declared env
     # (which routinely holds tokens / API keys) into a 0600 sidecar the stub
@@ -1590,7 +1759,17 @@ def fallback_exec(args: argparse.Namespace) -> None:
     # the real backend directly, so it must run with its declared env to match
     # the non-pooled baseline — the daemon's own environment lacks it.
     exec_env = dict(os.environ)
+    # Never hand the backend this session's stub token. It is a bearer name for
+    # the session's identity at gatewayd, and the process about to replace this
+    # one is the operator's third-party server binary — which on a later gateway
+    # start could register with it and be answered as this session. Its own
+    # declared env is restored below; this one value was never part of it. The
+    # non-fallback path is unaffected: gatewayd spawns backends from its OWN
+    # environment, so the token has never reached one there.
+    exec_env.pop(STUB_SESSION_TOKEN_ENV, None)
     exec_env.update(_parse_env_file(getattr(args, "env_file", "") or ""))
+    if platform_compat.IS_WINDOWS:
+        _fallback_spawn_child(argv, exec_env)
     # exec IS this fallback stub's whole purpose: when the gateway is
     # unavailable, replace this process with the operator's real MCP backend.
     # argv (target_command / target_args) and exec_env (the server's declared
@@ -2028,9 +2207,10 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
         return 1
     if session.reason in StubSession.RECONNECTABLE:
         # The transport was lost with nothing in flight, so no call needs an
-        # answer — but the session still loses these servers, and that used to
-        # leave no trace at all. Record it so a degraded session is explicable
-        # afterwards instead of looking like a healthy one whose tools fail.
+        # answer — but the session still loses these servers, and without this
+        # record that leaves no trace at all. Record it so a degraded session is
+        # explicable afterwards instead of looking like a healthy one whose
+        # tools fail.
         await alog_fallback(
             f"bridge_dead_{session.reason}", stub_uuid, pool_label, args
         )

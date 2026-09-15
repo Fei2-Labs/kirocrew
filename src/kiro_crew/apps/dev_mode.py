@@ -9,9 +9,9 @@ When an installed app has ``dev: true`` in its ``installed.json``:
   and broadcasts an ``app_reload`` WebSocket event whenever any file changes.
   The dashboard's AppHost reloads so edits appear without a manual refresh.
 
-Link the whole ``ui/`` DIRECTORY, never individual files inside it: since
-#6809 the UI route opens the final name with ``O_NOFOLLOW`` (the swap-resistant
-open that closed the check-then-reopen window), so a per-file symlink like
+Link the whole ``ui/`` DIRECTORY, never individual files inside it: the UI route
+opens the final name with ``O_NOFOLLOW`` (the swap-resistant open that closes
+the check-then-reopen window), so a per-file symlink like
 ``ln -s ~/src/app/dist/index.mjs ui/index.mjs`` answers 404 — indistinguishable
 from "not built yet". The directory link keeps working because the route
 resolves the ui root before validating against it.
@@ -52,6 +52,7 @@ from kiro_crew.apps.manager import (
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.security import is_sensitive_path, path_contains_sensitive
+from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +77,11 @@ _DEV_SENTINEL = ".dev-apps.json"
 #: :func:`_reconcile_sentinel_from_installed` rebuilds from each app's own
 #: (app-writable) ``installed.json``, so a sentinel entry can be laundered by
 #: an app that writes ``dev: true`` to its own metadata and waits for a
-#: restart. This record is the AUTHORIZATION half the UI route requires
-#: (#6809). Binding the grant to the SPECIFIC resolved root (not a bare name)
+#: restart. This record is the AUTHORIZATION half the UI route requires.
+#: Binding the grant to the SPECIFIC resolved root (not a bare name)
 #: is load-bearing: it makes the grant self-invalidating — repointing ``ui``
 #: after the toggle (an app update, a swapped link, a reinstall under the same
-#: name) yields a root that no longer equals the granted one, so any grant
+#: name) yields a root that does not equal the granted one, so any grant
 #: left behind by a crash mid-revoke or an uninstall race authorizes at most
 #: the exact tree the operator approved, never a new target. The two files
 #: stay separate on purpose — merging them would either re-open the
@@ -194,6 +195,54 @@ def _write_dev_grants(grants: dict[str, str]) -> None:
     atomic_write(path, json.dumps(grants, indent=2, sort_keys=True) + "\n")
 
 
+def _grant_record_unwritable() -> str | None:
+    """Reason the grant record cannot be written from THIS process, or ``None``.
+
+    The STRUCTURAL half of the operator-vs-agent runtime check: the
+    grant record is sealed read-only against agent-sandboxed processes at the
+    OS level (``sandbox._CREW_READONLY_LEAVES``), so opening it for write
+    succeeds only outside that confinement. Unlike the environment marker,
+    this cannot be evaded by scrubbing the environment or synthesizing command
+    text at runtime — the kernel answers, not the command's spelling.
+
+    The probe opens without ``O_TRUNC`` (never alters existing content) and
+    with ``O_CREAT`` (an operator's first-ever toggle creates the empty file,
+    which :func:`_read_dev_grants` already reads as "no grants").
+    """
+    path = _grants_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.close(fd)
+    except OSError as exc:
+        return f"the dev-mode grant record is not writable from this process ({exc})"
+    return None
+
+
+def _operator_attestation_refusal() -> str | None:
+    """Reason this process cannot carry operator attestation, or ``None``.
+
+    The runtime human-vs-agent check for ``confirm_out_of_install_root``:
+    the flag is meaningful only when a HUMAN at a host terminal supplied it,
+    so a process showing any evidence of agent-shell confinement is refused
+    regardless of how the flag reached ``sys.argv``. Two independent tiers,
+    each unforgeable in the refusal direction:
+
+    * :func:`kiro_crew.sandbox.agent_confinement_evidence` — the launcher-set
+      marker plus (on macOS) the kernel's own Seatbelt verdict;
+    * :func:`_grant_record_unwritable` — the sealed-record write probe, which
+      holds even when the environment was scrubbed (``env -u``) or the flag
+      text was synthesized at runtime (``$(printf ...)``), because the OS
+      sandbox denies the write no matter what the command looked like.
+    """
+    from kiro_crew.sandbox import agent_confinement_evidence
+
+    evidence = agent_confinement_evidence()
+    if evidence is not None:
+        return evidence
+    return _grant_record_unwritable()
+
+
 def _scan_installed_dev_apps() -> set[str]:
     """Return the dev-app set derived authoritatively from every ``installed.json``.
 
@@ -260,7 +309,7 @@ def _reconcile_sentinel_from_installed() -> set[str]:
         # preserved data while the app itself — its ``installed.json`` — is
         # gone. Never ADD a grant from ``installed.json`` — that is
         # app-writable metadata, and deriving the grant from it is exactly
-        # the laundering path #6809 closes.
+        # the laundering path a separate grant record closes.
         grants = _read_dev_grants()
         live: dict[str, str] = {}
         for gname, groot in grants.items():
@@ -275,6 +324,16 @@ def _reconcile_sentinel_from_installed() -> set[str]:
                 "app dev-mode: pruning grants for absent apps (%s)",
                 sorted(set(grants) - set(live)),
             )
+            _write_dev_grants(live)
+        elif not _grants_path().exists():
+            # Materialize the (empty) record at gateway startup: the Linux
+            # sandbox launcher can only seal an EXISTING target read-only
+            # (bind-over-self + MS_RDONLY skips absent paths), so a host that
+            # never granted dev mode would otherwise leave the record
+            # creatable from inside an agent sandbox until the first operator
+            # toggle. Seatbelt denies by path pattern and does not need this,
+            # but the record's existence also keeps the operator-attestation
+            # write probe exercising the same open() the seal governs.
             _write_dev_grants(live)
         _set_dev_cache(installed)
     return installed
@@ -294,8 +353,18 @@ def _set_dev_cache(names: set[str]) -> None:
     _dev_apps_cache = set(names)
 
 
-def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
+def set_dev_mode(
+    name: str, enabled: bool, *, confirm_out_of_install_root: bool = False
+) -> dict[str, Any]:
     """Toggle dev mode for an installed app. Returns a result dict.
+
+    ``confirm_out_of_install_root`` is the operator's explicit acknowledgement
+    for a grant whose ui root resolves OUTSIDE the app's install directory
+    (see the confirmation gate below). Only host-boundary callers (the CLI)
+    may pass it — the HTTP toggle route must not, because a request-body flag
+    from the dashboard origin is app-controllable, not operator attestation.
+    It never overrides the sensitive-path refusal, and an in-install root
+    does not need it.
 
     Blocking filesystem IO — callers on the event loop MUST offload this to a
     thread (``await asyncio.to_thread(set_dev_mode, ...)``).
@@ -323,6 +392,39 @@ def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
         if meta is None:
             return {"error": f"app {name!r} is not installed"}
         granted_root: str | None = None
+        out_of_install_confirmed = False
+        # VALIDATE BEFORE ANY WRITE: every enable (and any disable of a granted
+        # app) mutates the grant record, and that record is sealed read-only
+        # against agent-sandboxed processes at the OS level (see
+        # ``sandbox._CREW_READONLY_LEAVES``). Probing writability up front
+        # keeps the refusal atomic: without it, an enable would write
+        # installed.json and the sentinel and then fail at the (deliberately
+        # last) grant write, leaving dev metadata claiming a state the
+        # authorization record never granted. Dev-mode toggles from a
+        # sandboxed process go through the gateway (the dashboard toggle),
+        # which owns the record; the CLI path is for processes on the host
+        # outside agent confinement.
+        if enabled or name in _read_dev_grants():
+            unwritable = _grant_record_unwritable()
+            if unwritable is not None:
+                sel().log_api_access(
+                    caller=f"app:{name}",
+                    operation="dev_mode_grant_write",
+                    outcome="denied",
+                    source="apps",
+                    resources=str(_grants_path()),
+                    error=unwritable,
+                )
+                return {
+                    "error": (
+                        f"cannot toggle dev mode for app {name!r}: "
+                        f"{unwritable} — the grant record is operator-owned "
+                        "and sealed against agent-sandboxed processes; use "
+                        "the dashboard toggle, or run the CLI from a host "
+                        "terminal"
+                    ),
+                    "code": "dev_mode_grant_record_readonly",
+                }
         if enabled:
             # VALIDATE BEFORE ANY WRITE: a refusal must leave prior state
             # exactly as it was — an already-enabled app whose `ui` was
@@ -336,8 +438,7 @@ def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
             # re-pointing to re-bind). A root escaping the install dir into a
             # SENSITIVE location (credential stores, key material) is refused
             # outright — no dev workflow legitimately serves those, and the
-            # unauthenticated UI route must never be grantable onto them
-            # (#6809).
+            # unauthenticated UI route must never be grantable onto them.
             granted_root = os.path.realpath(apps_dir() / name / "ui")
             try:
                 # Anchor = resolved apps ROOT + literal name (same rule as the
@@ -363,6 +464,87 @@ def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
                             "dev-mode grant is refused"
                         )
                     }
+                # OUT-OF-INSTALL grants additionally require the operator's
+                # EXPLICIT confirmation, and only a caller on the gateway
+                # host can supply it. The toggle route carries no
+                # app-vs-operator identity — an app's UI bundle runs as a
+                # same-origin module with the dashboard's own credentials,
+                # so any request-body flag is data the app controls, never
+                # an attestation — which is why the HTTP endpoint NEVER
+                # passes this parameter and answers every out-of-install
+                # enable with the refusal below. The CLI flag
+                # (--confirm-out-of-install-root) is the one way to supply
+                # it, and it is operator-only through THREE independent
+                # tiers: running the CLI requires a process on the host
+                # (app page-code cannot cross that); an AGENT shell on
+                # the host is refused by the builtin deny rule
+                # ``self-protection-dev-mode-out-of-root-confirm`` plus its
+                # argv-structural floor (text tiers, evadable by runtime
+                # construction of the flag); and — decisive — the runtime
+                # human-vs-agent check below, whose kernel-enforced half
+                # (the sealed grant record) holds even against a command
+                # that synthesizes the flag at runtime or scrubs its own
+                # environment. Both outcomes of the decision are
+                # SEL-audited (see the emissions below). The load-bearing
+                # serving guarantees remain the resolved-root equality
+                # binding and the sensitivity screen above; this gate
+                # closes the self-grant path to them and makes the escape
+                # explicit at the call site.
+                # Validate-before-write: like the sensitivity refusal above,
+                # this must leave prior state untouched. Both the refusal and
+                # the confirmed grant are SEL-audited: the permission decision
+                # on an out-of-install root is exactly the kind of authority
+                # change the event log exists to record.
+                if not confirm_out_of_install_root:
+                    sel().log_api_access(
+                        caller=f"app:{name}",
+                        operation="dev_mode_out_of_install_grant",
+                        outcome="denied",
+                        source="apps",
+                        resources=granted_root,
+                        error="out-of-install ui root requires operator confirmation",
+                    )
+                    return {
+                        "error": (
+                            f"app {name!r} has a ui root resolving outside "
+                            f"its install directory ({granted_root}) — "
+                            "granting dev mode on it requires explicit "
+                            "operator confirmation: run `kirocrew app dev "
+                            f"{name} --confirm-out-of-install-root` on the "
+                            "gateway host"
+                        ),
+                        "code": "dev_mode_out_of_install_confirmation_required",
+                    }
+                # RUNTIME human-vs-agent check: the flag is operator
+                # ATTESTATION, so it is honoured only from a process showing
+                # no evidence of agent-shell confinement. The deny-list tiers
+                # above stop an agent SPELLING the flag; this stops an agent
+                # RUNNING it — including via runtime flag synthesis
+                # (``$(printf ...)``) and environment scrubbing, which no
+                # command-text scan can see.
+                attestation_refusal = _operator_attestation_refusal()
+                if attestation_refusal is not None:
+                    sel().log_api_access(
+                        caller=f"app:{name}",
+                        operation="dev_mode_out_of_install_grant",
+                        outcome="denied",
+                        source="apps",
+                        resources=granted_root,
+                        error=(
+                            "confirmation flag refused — not an operator "
+                            f"process: {attestation_refusal}"
+                        ),
+                    )
+                    return {
+                        "error": (
+                            f"app {name!r}: --confirm-out-of-install-root "
+                            "carries operator attestation and was refused "
+                            f"because {attestation_refusal}; run the command "
+                            "yourself from a host terminal"
+                        ),
+                        "code": "dev_mode_operator_attestation_required",
+                    }
+                out_of_install_confirmed = True
         else:
             # Revoke the AUTHORIZATION first: every write below narrows state,
             # so a crash after any prefix of them leaves the SAFER remainder
@@ -391,6 +573,17 @@ def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
             grants = _read_dev_grants()
             grants[name] = granted_root
             _write_dev_grants(grants)
+            if out_of_install_confirmed:
+                # Audit AFTER the grant record lands, so the event asserts an
+                # authority change that actually happened (a decision-point
+                # event could record a grant a later write failure undid).
+                sel().log_api_access(
+                    caller=f"app:{name}",
+                    operation="dev_mode_out_of_install_grant",
+                    outcome="granted",
+                    source="apps",
+                    resources=granted_root,
+                )
         # Update the in-process cache immediately so a same-process POST toggle
         # takes effect on the very next UI request (no wait for a watcher tick).
         _set_dev_cache(names)
@@ -453,9 +646,9 @@ def dev_mode_granted_root(name: str) -> str | None:
     the apps ROOT written only by :func:`set_dev_mode` — never created by the
     startup reconcile) AND the app's ``installed.json`` ``dev`` flag.
     ``installed.json`` alone is the app's own writable metadata — an app that
-    edits it to ``dev: true`` must not thereby authorize itself (#6809: the UI
-    route relaxes root containment only under this grant, and a self-granted
-    app could point its ui root at a credential directory). The watch
+    edits it to ``dev: true`` must not thereby authorize itself: the UI route
+    relaxes root containment only under this grant, and a self-granted app
+    could point its ui root at a credential directory. The watch
     sentinel is deliberately NOT consulted: the reconcile rebuilds it from
     app-writable metadata at every startup, so it proves watching, not
     authorization.
@@ -466,8 +659,9 @@ def dev_mode_granted_root(name: str) -> str | None:
     exact tree the operator approved, never whatever ``ui`` points at now.
     (The toggle endpoint itself carries no app-vs-operator identity — a
     same-origin caller reaches it too — which is why the binding, the
-    sensitive-path screen at grant time, and this equality check carry the
-    guarantee rather than the file's authorship alone.)
+    sensitive-path screen and the explicit out-of-install confirmation at
+    grant time, and this equality check carry the guarantee rather than the
+    file's authorship alone.)
 
     Blocking IO — do NOT call on the event loop; callers run it off-loop, and
     it sits on an exceptional path (an out-of-install ui root), never on

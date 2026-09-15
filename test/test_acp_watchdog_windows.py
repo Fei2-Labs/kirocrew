@@ -58,7 +58,7 @@ def _fake_config(*, turn_timeout: float = CHAT_TURN_TIMEOUT, **watchdog: float) 
     """A real config object with only the two sections under test set.
 
     Real ``AgentConfig``/``WatchdogConfig`` rather than a namespace double, so a
-    key that no longer exists in production fails the test instead of silently
+    key that does not exist in production fails the test instead of silently
     passing on an invented attribute.
     """
     return KiroCrewConfig(
@@ -106,7 +106,8 @@ def test_loader_defaults_match_the_handle_snapshot_defaults() -> None:
 def test_over_ceiling_window_is_clamped_with_a_warning(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    cfg = _fake_config(tool_stall_suspect_secs=10800.0, tool_stall_hard_cap_secs=10800.0)
+    over = _WINDOW_BUDGET * 2
+    cfg = _fake_config(tool_stall_suspect_secs=over, tool_stall_hard_cap_secs=over)
     with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
         wd = _load_with(monkeypatch, cfg)
 

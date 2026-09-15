@@ -802,7 +802,7 @@ class TestChannelUploadEndpoint:
 
     @pytest.mark.asyncio
     async def test_discord_destination_gets_send_document(self, tmp_path, outbox_pdf):
-        # Issue #6058: Discord was an explicit skip while its only upload verb
+        # Discord was an explicit skip while its only upload verb
         # was the extraction one, whose sanitizer maps any non-raster mime to
         # `.bin` (report.pdf would arrive as report.bin). It now has the same
         # purpose-built name-preserving verb Telegram uses, so it delivers.
@@ -1009,7 +1009,7 @@ class TestChannelUploadEndpoint:
 
 
 class TestSlackUploadAuthorizationRungs:
-    """The two ceilings the Slack leg shares with the channel leg (issue #7290).
+    """The two ceilings the Slack leg shares with the channel leg.
 
     Slack is deliberately absent from ``channel_transports``, so it reaches
     neither the send ladder's ``channels`` governance vet nor the ceiling the
@@ -1282,7 +1282,7 @@ class TestSlackUploadAuthorizationRungs:
 
 class TestDestinationOracleEquivalence:
     """The rungs the destination oracle must keep answering exactly as the two
-    inline ladders did (issue #6060).
+    inline ladders did.
 
     The classes above already pin the seven Slack destination OUTCOMES and the
     channel leg's skip-vs-error semantics, and they run unchanged against the
@@ -1597,7 +1597,9 @@ class TestDestinationOracleEquivalence:
         """The point of the change: neither endpoint carries its own resolver any
         more. Pinned structurally so a future edit that re-inlines a ladder in
         one leg fails here instead of in review."""
+        import ast
         import inspect
+        import textwrap
 
         from kiro_crew.dashboard import upload_destination
         from kiro_crew.dashboard.handlers import files
@@ -1605,8 +1607,19 @@ class TestDestinationOracleEquivalence:
         def _body(func):
             """The function's code, with its docstring dropped — the docstrings
             NAME these rungs to say where they live, and a text scan would flag
-            exactly the sentence documenting the move."""
-            return inspect.getsource(func).replace(func.__doc__ or "\0", "")
+            exactly the sentence documenting the move.
+
+            Dropped from the AST rather than by subtracting ``func.__doc__`` from
+            the source text: from Python 3.13 the compiler strips the common
+            indentation from docstrings, so the compiled ``__doc__`` does not
+            occur verbatim in the raw source, a textual replace is a no-op, and
+            the docstring's own mention of ``_resolve_mirror_target`` fails this
+            ratchet on every 3.13 host."""
+            tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+            node = tree.body[0]
+            if ast.get_docstring(node) is not None:
+                node.body = node.body[1:]
+            return ast.unparse(node)
 
         slack_src = _body(files.api_slack_upload_file)
         channel_src = _body(files.api_channel_upload_file)

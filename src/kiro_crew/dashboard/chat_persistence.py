@@ -14,11 +14,17 @@ import uuid
 from collections import OrderedDict, deque
 from collections.abc import Iterator, Mapping
 from itertools import islice
+from pathlib import Path
 
 from kiro_crew import model_registry
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import agent_model_map
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.chat_attachments import (
+    ImageBudget,
+    persist_inline_images,
+    same_text_modulo_images,
+)
 from kiro_crew.config.loader import (
     AUTOCOMPACT_PCT_MAX,
     AUTOCOMPACT_PCT_MIN,
@@ -36,6 +42,13 @@ from kiro_crew.dashboard.chat_utils import (
     slot_history_key,
     slot_transcript_key,
 )
+from kiro_crew.dashboard.slot_buffers import (
+    committed_filtered_note_ids,
+    drop_committed_restored_notes,
+    sanitize_restored_deferred_notes,
+    serialize_deferred_notes,
+    union_deferred_notes,
+)
 from kiro_crew.dashboard.state import (
     _TRANSIENT_ROLES,
     DashboardState,
@@ -47,6 +60,8 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.history import (
+    ROWS_ONLY_DEFERRED_META_KEYS,
+    ROWS_ONLY_OWNED_META_KEYS,
     SLOT_OWNED_META_KEYS,
     ConversationLog,
     _archive_lines,
@@ -56,6 +71,7 @@ from kiro_crew.history import (
     transcript_sort_key,
     update_metadata_off_loop,
 )
+from kiro_crew.memory_stores import named_store_or_empty
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -221,6 +237,32 @@ def _validate_reasoning_effort(raw: object) -> str:
     return ""
 
 
+#: Retired session modes. A slot persisted under one of these comes back as a
+#: PLAIN chat: the transcript is untouched and still renders; there is no
+#: mode-specific dispatch for it, because the mode itself is gone.
+#:
+#: ``crew`` — Crew Mode (one session fanning topics out to sub-sessions),
+#: retired in favour of the Crew Members page. Its durable store under
+#: ``<data home>/crew/`` is neither read nor deleted here; the transcript is
+#: the user's record and the store held only routing state.
+_RETIRED_MODES: frozenset[str] = frozenset({"crew"})
+
+
+def _restored_mode(raw: object) -> str:
+    """The mode a persisted slot comes back with, or "" for plain chat.
+
+    Maps a :data:`_RETIRED_MODES` value to "" rather than refusing the restore:
+    the session and its history are still the user's, the mode that once
+    dispatched them is not. Anything that is not a non-empty string is "" too,
+    which matches what the old ``if meta.get("mode")`` guard admitted.
+    """
+    if not isinstance(raw, str) or not raw:
+        return ""
+    if raw in _RETIRED_MODES:
+        return ""
+    return raw
+
+
 def _validate_autocompact_pct(raw: object) -> float | None:
     """Return *raw* as a threshold percent within the documented range, else None.
 
@@ -311,8 +353,8 @@ def _read_open_slots_keys() -> list[object]:
     """Read and parse ``open_slots.json``, returning its raw ``keys`` list.
 
     Pure disk work with no slot state touched, so the async driver can hoist the
-    whole thing into ``asyncio.to_thread``: the read plus the JSON parse were
-    running on the event loop during startup (#895).
+    whole thing into ``asyncio.to_thread``: inline, the read plus the JSON parse
+    run on the event loop during startup.
 
     Entries are returned UNVALIDATED — the file is attacker-writable, so every
     caller must pass each one through :func:`_sanitize_open_slot_key` before it
@@ -351,8 +393,8 @@ def _sanitize_open_slot_key(raw: object) -> str | None:
     if "/" in raw or "\\" in raw:
         logger.warning("restore_open_slots: rejecting key with path separators: %r", raw)
         return None
-    # Fold to the canonical (filename-charset) key. Snapshots written before
-    # slot-key normalization landed may carry a raw display-style key (e.g.
+    # Fold to the canonical (filename-charset) key. An on-disk snapshot may
+    # carry a raw display-style key (e.g.
     # "Artifact: My Doc") alongside its sanitized twin — after folding, the
     # second form hits the caller's dedup guard instead of restoring a duplicate
     # sidebar session backed by the same transcript.
@@ -487,8 +529,8 @@ def _deletion_during_read(
 
     Returns a short reason for logging, or ``None`` when it is safe to build.
 
-    Offloading a transcript read (#895) opened a window that did not exist when
-    read-then-build ran atomically on the loop: ``ConversationLog.delete_session``
+    Offloading a transcript read opens a window an atomic on-loop read-then-build
+    does not have: ``ConversationLog.delete_session``
     leaves **no tombstone** — its own docstring notes that once the delete
     releases the lock "a concurrent writer can recreate the session" — so a slot
     published from content we already hold rewrites, on its next flush, a file
@@ -651,7 +693,7 @@ def restore_open_slots(state: DashboardState) -> int:
 
 
 async def restore_open_slots_async(state: DashboardState) -> int:
-    """:func:`restore_open_slots`, with the disk reads off the loop (#895).
+    """:func:`restore_open_slots`, with the disk reads off the loop.
 
     Restoring a tab reads and redacts a transcript, so a user with many large
     tabs can spend tens of seconds in here. Doing that synchronously monopolizes
@@ -756,6 +798,70 @@ def _attach_variants(slot: _ChatSlot, m: dict) -> None:
         slot.messages[-1]["variant_idx"] = m.get("variant_idx", 0)
 
 
+def _pin_private_agent_assignment(
+    session_key: str,
+    agent: str,
+    config: KiroCrewConfig,
+    *,
+    conversation_log=None,
+    native_context: bool = False,
+) -> str:
+    """Pin an owner-selected member, never a name recovered from history.
+
+    Callers must positively authorize the owner request before using this
+    helper. Legacy members keep their declared V1 memory until owner opt-in.
+    """
+    selected = agent or config.default_agent
+    if selected == "default":
+        return ""
+    member = config.agents.get(selected)
+    store = getattr(member, "memory_store", "")
+    if not store:
+        return ""
+    record = config.memory_stores.get(store) if isinstance(store, str) else None
+    if record is None or record.memory_version != 2:
+        return ""
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.member_memory_auth import bind_private_session_store, read_private_session_store
+    from kiro_crew.memory_stores import require_member_memory_store
+
+    store = require_member_memory_store(config, selected)
+    log = conversation_log if conversation_log is not None else ConversationLog()
+    if read_private_session_store(session_key) is None and (
+        native_context or log.has_log(session_key)
+    ):
+        from kiro_crew.memory_stores import UnknownMemoryStore
+
+        raise UnknownMemoryStore(
+            "This conversation retains its V1 history. Open a new conversation for private memory."
+        )
+    bind_private_session_store(session_key, store)
+    return store
+
+
+async def pin_private_agent_store(
+    state: DashboardState, session_key: str, agent: str, config: KiroCrewConfig
+) -> str:
+    """Run :func:`_pin_private_agent_assignment` off the loop for one slot.
+
+    ``native_context`` is whether the session already has a live or resumable
+    provider: such a session carries V1 context no transcript row shows yet.
+    Callers snapshot the slot before awaiting and re-compare afterwards; this
+    helper only owns the file IO hop and the probe.
+    """
+    return await asyncio.to_thread(
+        _pin_private_agent_assignment,
+        session_key,
+        agent,
+        config,
+        conversation_log=state.conversation_log,
+        native_context=(
+            state.sessions.get_provider(session_key) is not None
+            or bool(state.sessions.resumable_sid(session_key))
+        ),
+    )
+
+
 def _member_restore_identity(slot_name: str) -> tuple[str, str] | None:
     """Resolve a member slot's restore identity from its binding.
 
@@ -769,14 +875,13 @@ def _member_restore_identity(slot_name: str) -> tuple[str, str] | None:
     # Function-local ON PURPOSE: kiro_crew.members imports kiro_crew.artifacts
     # (slugify), and importing that at module scope closes the
     # artifacts -> ... -> webhooks -> validation -> artifacts cycle when this
-    # module loads inside crew_chat's import graph
-    # (test_crew_chat_does_not_import_the_dashboard_handler_tree pins this).
+    # module is imported outside the dashboard handler tree.
     from kiro_crew import members as members_mod
 
     prefix = members_mod.DM_SLOT_KEY_PREFIX
     if not slot_name.startswith(prefix):
         return None
-    binding = members_mod.read_dm_binding(slot_name[len(prefix) :])
+    binding = members_mod.read_dm_binding_for_slot(slot_name)
     member = (binding or {}).get("member", "")
     if not member:
         logger.warning(
@@ -933,6 +1038,7 @@ def _rehydrate_slot_from_history(
         # Legacy metadata has no ``created_at``: record the observation
         # itself so the guard's missing-file witness still fires for it.
         slot._disk_meta_observed = bool(meta)
+        slot._memory_assignment_from_history = True
         # Member keys keep the binding-derived agent/mode: transcript metadata
         # is the operator-editable file the pin must not re-derive from.
         if meta.get("agent") and _member_identity is None:
@@ -961,10 +1067,41 @@ def _rehydrate_slot_from_history(
             slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
         if meta.get("workspace"):
             slot.workspace = meta["workspace"]
+        if meta.get("memory_store"):
+            slot.memory_store = str(meta["memory_store"])
         if meta.get("project"):
             slot.project = meta["project"]
-        if meta.get("mode") and _member_identity is None:
-            slot.mode = meta["mode"]
+        # Restore the remote executor marker INDEPENDENTLY of its target fields.
+        # history JSONL is a file on disk, so a truncated write or a hand-edit can
+        # leave the ``executor="remote"`` marker without a valid instance_id /
+        # remote_slot. Dropping the marker in that case would fail
+        # OPEN: the session would come back as an ordinary local slot and its next
+        # send would run the crew's turn on THIS machine — the wrong-host execution
+        # the remote binding exists to prevent. Fail CLOSED instead: keep the
+        # marker, populate only the target fields that are valid, and let the
+        # incomplete-binding guard in ``api_chat`` (``slot.executor == "remote" and
+        # not slot.is_remote`` -> 409 ``remote_binding_incomplete``) plus the
+        # ``_run_chat`` chokepoint (keyed on ``executor``, not ``is_remote``) refuse
+        # the send with a message the user can act on, rather than run local.
+        _relay_was_in_flight = False
+        _executor_meta = meta.get("executor")
+        _instance_meta = meta.get("instance_id")
+        _remote_slot_meta = meta.get("remote_slot")
+        if _executor_meta == "remote":
+            slot.executor = "remote"
+            if isinstance(_instance_meta, str) and _instance_meta:
+                slot.instance_id = _instance_meta
+            if isinstance(_remote_slot_meta, str) and _remote_slot_meta:
+                slot.remote_slot = _remote_slot_meta
+            # Deferred to AFTER the window is loaded (see below): the metadata line
+            # is read before the transcript rows, so appending here would land the
+            # notice ahead of the conversation instead of at its tail. Only a
+            # COMPLETE binding can have been mid-relay; an incomplete one never
+            # dispatched, so there is no in-flight tail to recover.
+            if slot.is_remote:
+                _relay_was_in_flight = bool(meta.get("relay_in_flight"))
+        if _member_identity is None and (_mode := _restored_mode(meta.get("mode"))):
+            slot.mode = _mode
         if meta.get("created_by"):
             # Creator attribution restored so the member ownership boundary in
             # session-control authorization survives a restart: without it every
@@ -1006,6 +1143,11 @@ def _rehydrate_slot_from_history(
             if getattr(state, "_tags_authoritative", True):
                 known = {t.get("id") for t in state._tags}
                 slot.tags = [t for t in slot.tags if t in known]
+            # Keep "tags changed => revision changed" everywhere tags are
+            # replaced (chat_tags.py cannot be imported here: it imports us).
+            bump_revision = getattr(slot, "bump_tags_revision", None)
+            if callable(bump_revision):
+                bump_revision()
         if meta.get("auto_tagged"):
             slot._auto_tagged = True
         if meta.get("human_seen"):
@@ -1013,6 +1155,19 @@ def _rehydrate_slot_from_history(
             # been working in keeps the full approval window instead of silently
             # dropping to the unattended deny-fast (state._ChatSlot.unattended).
             slot._human_seen = True
+        restored_notes = sanitize_restored_deferred_notes(meta.get("deferred_notes"))
+        if restored_notes:
+            # Replay the persisted deferred-note hold so the
+            # existing flush_deferred_notes() call sites deliver it on the
+            # first turn after the restart. Sanitized, and bounded by the
+            # DURABLE CEILING (2x the live cap): every durable entry is a
+            # 200-acknowledged note, and the first flush drains the surplus
+            # while the live cap still binds new enqueues. Entries whose
+            # delivered row is already committed (the rows-only handover
+            # window) are dropped below, once the message window is loaded —
+            # the filter is pure and scans that in-memory window, never the
+            # transcript file (this function runs on the event loop).
+            slot._deferred_notes = restored_notes
         mm = meta.get("memory_mode", "persistent")
         slot.memory_mode = mm
         if mm != "persistent":
@@ -1054,6 +1209,18 @@ def _rehydrate_slot_from_history(
             if _prefetched_messages is not None
             else state.conversation_log.read_messages_chained(history_key)
         )
+        if slot._deferred_notes:
+            # The committed-row dedup deferred from the hold restore above:
+            # pure scan of the in-memory window, no file I/O on the loop.
+            _pre_filter_notes = slot._deferred_notes
+            slot._deferred_notes = drop_committed_restored_notes(messages, _pre_filter_notes)
+            # A filtered entry's row is committed (often by a rows-only
+            # handover save, into the frozen prefix no later save window
+            # carries) — record its id so the next full save retires the
+            # durable entry row-lessly instead of retaining it forever.
+            slot._dropped_note_ids.update(
+                committed_filtered_note_ids(_pre_filter_notes, slot._deferred_notes)
+            )
         if needs_tab_id_backfill:
             # Persist the freshly-minted tab_id AFTER reading the transcript above,
             # never before. update_metadata_off_loop dispatches an os.replace() of
@@ -1158,6 +1325,28 @@ def _rehydrate_slot_from_history(
         # turns counted above) is never rewritten.
         slot._disk_window_len = len(slot.messages)
         slot._dirty = False
+        if _relay_was_in_flight:
+            # The gateway crashed while this slot's turn was executing on the peer
+            # (flagged in the binding block above). The relay reader died with it
+            # and the turn's tail was never mirrored here, so the loaded window
+            # stops mid-turn. Append an explicit notice at the TAIL rather than
+            # resurrect a silently truncated conversation — the peer may well have
+            # finished, and the next send re-synchronises the visible history.
+            # ``broadcast=False`` is the sanctioned replay door (fork / transfer /
+            # window-rebuild use it): no clients exist at boot, and it appends a
+            # schema-correct row with a minted id. Placed AFTER ``_disk_window_len``
+            # so the new row is not miscounted as already-persisted, with ``_dirty``
+            # re-armed so the next flush writes it. The runtime ``_relay_in_flight``
+            # stays False, so that flush clears the on-disk marker and a second
+            # restart cannot append the notice twice.
+            slot.append(
+                "error",
+                "This turn was interrupted when the app restarted. The crew may "
+                "have finished it — send again to pick the conversation back up.",
+                "msg msg-err",
+                broadcast=False,
+            )
+            slot._dirty = True
         logger.info("Rehydrated session %s (%s) from history", slot_name, slot.title)
         return slot
     except BaseException:
@@ -1255,10 +1444,10 @@ async def rehydrate_slot_from_history_async(
         )
         return None
     # DELETION race, the same window and the same remedy the two bulk restore
-    # drivers apply. This wrapper's read has always been offloaded, so the window
-    # predates #895 — the guard is folded in here anyway rather than left as the
-    # one uncovered instance, because a class of defect fixed at two of three
-    # call sites simply returns through the third.
+    # drivers apply. This wrapper's read is offloaded too, so it carries the same
+    # window — the guard is folded in here rather than left as the one uncovered
+    # instance, because a class of defect handled at two of three call sites
+    # simply returns through the third.
     #
     # NOT gated on ``adopt_closed``: that opt-in is about the ``closed`` FLAG (an
     # app-owned worker slot whose lifecycle belongs to the app), not about the
@@ -1310,7 +1499,7 @@ def _prefetch_recent_session(
     folders_only: bool,
     cutoff: float | None,
 ) -> tuple[dict | None, list[dict] | None, tuple[str, str] | None]:
-    """Read one candidate session's metadata + transcript, off the loop (#895).
+    """Read one candidate session's metadata + transcript, off the loop.
 
     Applies the selection filters BETWEEN the two reads so a session that is
     going to be skipped never pays for its transcript walk — the metadata read is
@@ -1326,8 +1515,8 @@ def _prefetch_recent_session(
     """
     meta = conv_log.get_metadata(key)
     if not meta:
-        # No metadata line at all. ``list_sessions()`` is a SNAPSHOT, and since
-        # #895 it is taken one thread hop before this read, so a session can be
+        # No metadata line at all. ``list_sessions()`` is a SNAPSHOT taken one
+        # thread hop before this read, so a session can be
         # deleted in between and still appear in the list — or the read itself
         # came back empty. Either way there is nothing to build from, and
         # building anyway is destructive rather than merely useless: an empty
@@ -1422,6 +1611,7 @@ def _apply_recent_session(
     # Legacy metadata has no ``created_at``: record the observation itself so
     # the guard's missing-file witness still fires for it.
     slot._disk_meta_observed = bool(meta)
+    slot._memory_assignment_from_history = True
     # Member keys keep the binding-derived agent/mode: transcript metadata is
     # the operator-editable file the pin must not re-derive from.
     if meta.get("agent") and _member_identity is None:
@@ -1447,10 +1637,12 @@ def _apply_recent_session(
         slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
     if meta.get("workspace"):
         slot.workspace = meta["workspace"]
+    if meta.get("memory_store"):
+        slot.memory_store = str(meta["memory_store"])
     if meta.get("project"):
         slot.project = meta["project"]
-    if meta.get("mode") and _member_identity is None:
-        slot.mode = meta["mode"]
+    if _member_identity is None and (_mode := _restored_mode(meta.get("mode"))):
+        slot.mode = _mode
     if meta.get("created_by"):
         # Same rehydration as _rehydrate_slot_from_history: without it a
         # member-created worker restored through the recent-session path
@@ -1493,6 +1685,11 @@ def _apply_recent_session(
         if getattr(state, "_tags_authoritative", True):
             known = {t.get("id") for t in state._tags}
             slot.tags = [t for t in slot.tags if t in known]
+        # Keep "tags changed => revision changed" everywhere tags are
+        # replaced (chat_tags.py cannot be imported here: it imports us).
+        bump_revision = getattr(slot, "bump_tags_revision", None)
+        if callable(bump_revision):
+            bump_revision()
     if meta.get("auto_tagged"):
         slot._auto_tagged = True
     if meta.get("human_seen"):
@@ -1500,6 +1697,20 @@ def _apply_recent_session(
         # been working in keeps the full approval window instead of silently
         # dropping to the unattended deny-fast (state._ChatSlot.unattended).
         slot._human_seen = True
+    _sanitized_notes = sanitize_restored_deferred_notes(meta.get("deferred_notes"))
+    restored_notes = drop_committed_restored_notes(messages, _sanitized_notes)
+    # A filtered entry's row is committed (often by a rows-only handover save,
+    # into the frozen prefix no later save window carries) — record its id so
+    # the next full save retires the durable entry row-lessly instead of
+    # retaining it forever. Sanitizer-dropped entries are NOT recorded: only
+    # the committed-filter delta has a transcript owner.
+    slot._dropped_note_ids.update(committed_filtered_note_ids(_sanitized_notes, restored_notes))
+    if restored_notes:
+        # Replay the persisted deferred-note hold — see the
+        # mirror in _rehydrate_slot_from_history (committed rows dropped by a
+        # pure scan of the already-prefetched messages; no file I/O here,
+        # this apply half runs on the event loop).
+        slot._deferred_notes = restored_notes
     mm = meta.get("memory_mode", "persistent")
     slot.memory_mode = mm
     if mm != "persistent":
@@ -1635,7 +1846,7 @@ def restore_recent_sessions(
 async def restore_recent_sessions_async(
     state: DashboardState, window_minutes: int = 30, *, folders_only: bool = False
 ) -> int:
-    """:func:`restore_recent_sessions`, with the disk reads off the loop (#895).
+    """:func:`restore_recent_sessions`, with the disk reads off the loop.
 
     Same rationale as :func:`restore_open_slots_async` — keeps the stall-watchdog
     heartbeat alive while a large restore proceeds, and holds
@@ -1860,25 +2071,60 @@ _entry_cache: OrderedDict[str, tuple[dict | None, int]] = OrderedDict()
 _entry_cache_bytes = 0
 
 # Lazily resolved ``(max_entries, max_bytes)`` for the entry cache. Resolved
-# once per process and then served from this module global: the builder runs on
-# every message of every flush, so it must not stat or parse ``config.json``
-# per call, and the one-time read keeps the hot path free of config I/O the way
-# the loader's push pattern does for the event loop. A changed value therefore
-# takes effect on the next gateway restart, which the config field descriptions
-# state. ``None`` means "not resolved yet"; tests reset it via the autouse
-# cache-isolation fixture in ``test/conftest.py``.
+# once and then served from this module global: the builder runs on every
+# message of every flush, so it must not stat or parse ``config.json`` per call,
+# and the memo keeps the hot path free of config I/O the way the loader's push
+# pattern does for the event loop. The memo is INVALIDATED on a config write
+# (see ``_on_config_change``), so a changed bound takes effect on the next flush
+# rather than on the next gateway restart. ``None`` means "not resolved yet";
+# tests reset it via the autouse cache-isolation fixture in ``test/conftest.py``.
 _entry_cache_bounds_cached: tuple[int, int] | None = None
 _entry_cache_bounds_read_warned = False
+
+#: The registered bounds applier, kept so ``watch_config`` stays idempotent.
+_entry_cache_config_sub: object = None
+
+
+def _on_config_change(change: object) -> None:
+    """Drop the memoised entry-cache bounds so the next read re-resolves them.
+
+    Invalidation rather than a push, because the memo is read on the flush hot
+    path and a config write is rare: clearing it costs one assignment and the
+    next flush pays a single fingerprint-cached load. The read-failure warning
+    latch is cleared with it, so a bound that starts working again warns once
+    more instead of staying silent about a NEW failure.
+    """
+    del change  # either bound changing invalidates the same pair
+    global _entry_cache_bounds_cached, _entry_cache_bounds_read_warned
+    _entry_cache_bounds_cached = None
+    _entry_cache_bounds_read_warned = False
+
+
+def watch_config() -> None:
+    """Register the entry-cache bounds invalidator on the process config watcher."""
+    global _entry_cache_config_sub
+    if _entry_cache_config_sub is not None:
+        return
+    from kiro_crew.config import live
+
+    _entry_cache_config_sub = live.subscribe(
+        "dashboard.chat_entry_cache_max_entries",
+        "dashboard.chat_entry_cache_max_bytes",
+        callback=_on_config_change,
+        name="chat-entry-cache-bounds",
+    )
 
 
 def _entry_cache_bounds() -> tuple[int, int]:
     """Configured ``(max_entries, max_bytes)`` bounds for the entry cache.
 
     Reads the validated config once (loader-clamped to the documented ranges)
-    and memoises the pair for the process lifetime. Falls back to the built-in
-    defaults when the loaded values are not real integers (a stubbed config
+    and memoises the pair until a config write invalidates it (see
+    ``_on_config_change``). Falls back to the built-in defaults when the loaded
+    values are not real integers (a stubbed config
     object would otherwise flow a non-numeric value into the eviction
-    comparison) -- that shape is process-permanent, so it latches. A config
+    comparison) -- that shape does not change without a config write, so it
+    memoises like any other resolved pair. A config
     read that RAISES falls back to the defaults for this call WITHOUT
     latching, so a transient failure retries on the next call instead of
     discarding an operator's setting for the process lifetime; ``load()``
@@ -1946,7 +2192,7 @@ def _approx_window_payload_bytes(window: list[dict]) -> int:
     return total
 
 
-def _build_message_entry(m: dict) -> dict | None:
+def _build_message_entry(m: dict, *, attachments: tuple[Path, str] | None = None) -> dict | None:
     """Memoised front door to :func:`_build_message_entry_uncached`.
 
     The cached value is the POST-redaction entry, never the raw input, so a hit
@@ -1964,14 +2210,20 @@ def _build_message_entry(m: dict) -> dict | None:
         payload = json.dumps(m, sort_keys=True, default=str)
     except Exception:
         # An unserializable message must still persist; fall back to computing it.
-        return _build_message_entry_uncached(m)
+        return _build_message_entry_uncached(m, attachments=attachments)
     key = hashlib.sha256(payload.encode()).hexdigest()
+    # *attachments* is part of the cache KEY, not just of the computation: the
+    # entry it produces names a path inside ONE session's attachment directory,
+    # so serving it to another session would point that session's transcript at
+    # a file its own delete will never reclaim. Folded in AFTER the digest rather
+    # than into its input, so the message payload keeps exactly one hashing site.
+    key = f"{attachments}\x00{key}"
     size = len(payload)
     with _entry_cache_lock:
         if key in _entry_cache:
             _entry_cache.move_to_end(key)
             return _entry_cache[key][0]
-    entry = _build_message_entry_uncached(m)
+    entry = _build_message_entry_uncached(m, attachments=attachments)
     if size > _ENTRY_MAX_CACHEABLE_BYTES:
         return entry
     # Refuse to STORE a pairing whose key and entry may describe different states.
@@ -2001,12 +2253,23 @@ def _build_message_entry(m: dict) -> dict | None:
     return entry
 
 
-def _build_message_entry_uncached(m: dict) -> dict | None:
+def _build_message_entry_uncached(
+    m: dict, *, attachments: tuple[Path, str] | None = None
+) -> dict | None:
     """Build one persisted JSONL message dict from an in-memory slot message.
 
     Returns None for transient roles that are never persisted. Applies the
     same redaction the overwrite path used so append and rewrite produce
     byte-identical lines for the same message.
+
+    *attachments* is ``(sessions directory, transcript stem)`` when the caller
+    knows which session this row belongs to, which turns on inline-image
+    preservation: the image a ``![alt](/abs/path.png)`` names is copied into that
+    session's attachment directory and the PERSISTED destination is rewritten to
+    point there (see :mod:`kiro_crew.chat_attachments`), and the in-memory row is
+    updated to the same destination so every later flush of the window is a
+    no-op for it. ``None`` skips the step, which is what a caller with no session
+    context (a test, a preview) gets.
     """
     role = m.get("role", "assistant")
     if role in ("chunk", "done", "streaming", "queued", "permission"):
@@ -2018,6 +2281,37 @@ def _build_message_entry_uncached(m: dict) -> dict | None:
     # redact `system` on the way in, so excluding it here would let unredacted
     # bytes from a legacy or foreign writer survive the rewrite indefinitely.
     if role != "user":
+        if attachments is not None:
+            # One budget for the whole row: the variants below draw on it too.
+            image_budget = ImageBudget()
+            # COMMITTED back into the live row, not computed on the side. This
+            # function re-serializes the whole window on every flush from the
+            # in-memory rows, so a row that kept naming the scratch file would
+            # be re-resolved from scratch each time -- and once the agent's
+            # scratch is reclaimed, that resolution fails open to the dead path
+            # and the flush OVERWRITES the good persisted row with it. Writing
+            # the durable path into the row makes every later flush idempotent
+            # by construction (the destination is already inside the store),
+            # and the live UI reads the image from disk at view time either
+            # way, so nothing it shows changes.
+            #
+            # Before redaction, so the file read is of the path as written.
+            # Redaction still runs on the result, so what lands on disk is
+            # exactly as redacted as before.
+            #
+            # Compare-and-set, not a blind assignment: this runs in the save's
+            # worker thread while the event loop owns the same row dict, and a
+            # variant switch can replace the row's content between the read
+            # above and this line. Writing the rewrite of the OLD text over the
+            # user's newly chosen reply would lose that choice; when the row has
+            # moved on, the next flush rewrites whatever it holds then.
+            rewritten = persist_inline_images(
+                content, sessions_dir=attachments[0], stem=attachments[1], budget=image_budget
+            )
+            if rewritten != content:
+                if m.get("content") == content:
+                    m["content"] = rewritten
+                content = rewritten
         content, _ = redact_exfiltration_urls(content)
         content, _ = redact_credentials(content)
     entry: dict = {
@@ -2042,6 +2336,20 @@ def _build_message_entry_uncached(m: dict) -> dict | None:
             if not isinstance(v, dict):
                 continue
             vc = v.get("content", "")
+            # A variant is an alternate reply the user can switch BACK to, so its
+            # images break in exactly the way this rewrite exists to stop. It is
+            # persisted and redacted here, so it is rewritten here too -- from
+            # the SAME budget as the primary content, so a row with many
+            # variants cannot copy many times the per-message ceiling -- and
+            # committed into the live variant for the reason the primary is.
+            if attachments is not None and role != "user":
+                rewritten = persist_inline_images(
+                    vc, sessions_dir=attachments[0], stem=attachments[1], budget=image_budget
+                )
+                if rewritten != vc:
+                    if v.get("content") == vc:  # compare-and-set, as for the primary
+                        v["content"] = rewritten
+                    vc = rewritten
             vc, _ = redact_exfiltration_urls(vc)
             vc, _ = redact_credentials(vc)
             redacted_variants.append({**v, "content": vc})
@@ -2059,8 +2367,8 @@ def _build_message_entry_uncached(m: dict) -> dict | None:
 # ``_build_message_entry``). A window-region disk line carrying one of these is
 # not a real message and is never treated as a cross-process append to preserve.
 # Canonically defined in ``state`` (imported above) so the trim path that must
-# count durable rows shares the same set; re-exported here unchanged for this
-# module's historical readers (session_control, chat_handlers).
+# count durable rows shares the same set; re-exported here for this module's
+# other readers (session_control, chat_handlers).
 
 
 def _foreign_tail_ts(foreign_lines: list[str]) -> str | None:
@@ -2270,7 +2578,7 @@ def _frozen_prefix_and_foreign_appends(
     # window entry absorbs AT MOST ONE disk line. Identity is checked in four
     # tiers of decreasing confidence:
     #   (0) ``meta.mid`` — the stable id stamped at append time and carried onto
-    #       durable copies (PR #5133); an id match IS the same message, resolved
+    #       durable copies; an id match IS the same message, resolved
     #       first across ALL disk lines so no heuristic tier can steal the
     #       entry, and an id-carrying line whose id matches NO entry is foreign
     #       regardless of body (two distinct identical-content messages carry
@@ -2350,9 +2658,13 @@ def _frozen_prefix_and_foreign_appends(
     # the ``/api/chat`` meta rides through), so a bare id equality is not proof
     # of sameness the way a minted-uuid contract would suggest:
     #   * corroborated (same (role, content) — a durable copy — or same ``ts``
-    #     — an in-place edit): consume the entry and drop the line (the window
-    #     re-serializes it). The ids matching exactly makes this NOT a dedup
-    #     drop, so it is not routed to the ``foreign-dedup`` archive.
+    #     — an in-place edit — or the same text modulo PRESERVED IMAGES: the
+    #     durable copy landed by ``append_if_absent`` names an image's stored
+    #     copy while the window entry, whose rewrite failed open once the
+    #     agent's scratch file was gone, still names the original): consume
+    #     the entry and drop the line (the window re-serializes it). The ids
+    #     matching exactly makes this NOT a dedup drop, so it is not routed to
+    #     the ``foreign-dedup`` archive.
     #   * id matches an unconsumed entry but NEITHER body nor ``ts`` agrees
     #     (an id reused across two genuinely distinct messages): leave the
     #     entry unconsumed and let the line fall through to the legacy tiers
@@ -2377,8 +2689,19 @@ def _frozen_prefix_and_foreign_appends(
             continue
         for _i in _live:
             _e = window_entries[_i]
-            if (_role, _content) == (_e.get("role"), _e.get("content", "")) or (
-                _ts and _ts == _e.get("ts")
+            if (
+                (_role, _content) == (_e.get("role"), _e.get("content", ""))
+                or (_ts and _ts == _e.get("ts"))
+                or (
+                    _role == _e.get("role")
+                    and isinstance(_content, str)
+                    and same_text_modulo_images(
+                        _content,
+                        _e.get("content", ""),
+                        sessions_dir=path.parent,
+                        stem=path.stem,
+                    )
+                )
             ):
                 consumed[_i] = True
                 handled[_j] = True
@@ -2482,6 +2805,8 @@ def _save_slot_to_history(
     force: bool = False,
     rewrite: bool = False,
     expected_history_key: str | None = None,
+    expected_disk_older_count: int | None = None,
+    rows_only: bool = False,
 ) -> bool:
     """Persist slot messages to JSONL history (append-safe).
 
@@ -2518,10 +2843,47 @@ def _save_slot_to_history(
     a fresh slot with its own file), so this never reads/writes a sibling and
     legacy no-tab_id sessions stay isolated.
 
-    Returns ``False`` only when the delete-won guard aborted the save because
-    the session was permanently deleted while this save awaited the lock — the
-    in-memory window was NOT persisted and must not be treated as durable.
-    Every other completion (including the benign no-op skips) returns ``True``.
+    ``rows_only``: persist the window but leave the metadata line's slot-owned
+    fields as they are on disk, keeping authority over only
+    :data:`~kiro_crew.history.ROWS_ONLY_OWNED_META_KEYS`. It exists for the one
+    caller whose slot is not the transcript's only writer: the close/cleanup
+    hand-over drain, which writes a popped slot's unsaved rows onto a transcript a
+    concurrent same-key replacement now holds. The default rebuild would revert
+    whatever that replacement had already published (a folder or a pinned title
+    from ``POST /api/chat/slots``, a tag, a pin), so the rows move and the line does
+    not. The deferred set is
+    :data:`~kiro_crew.history.ROWS_ONLY_DEFERRED_META_KEYS`, which is wider than the
+    owned fields alone: a title's provenance and refresh budget describe the title
+    and travel with it. It includes ``closed``/``closed_at``, so an open-shaped
+    rows-only write does not erase a dismissal the replacement committed while this
+    one was in flight.
+
+    The deferral is conditional on there being another writer to defer to, decided
+    from the line's ``tab_id``: a line this slot published itself, or no line at
+    all, gets the ordinary rebuild. Otherwise the flag would cost the popped slot
+    its own uncommitted metadata — an edit is acknowledged when it lands in memory
+    and persists on a later flush, and after the pop no flush ever visits that slot
+    again.
+
+    ``expected_disk_older_count`` pairs an explicit *messages* snapshot with the
+    ``slot._disk_older_count`` the caller observed in the SAME synchronous stretch
+    it froze that snapshot in. A snapshot is internally consistent by
+    construction, but the frozen-prefix boundary it must be written against is
+    not: a concurrent ``append`` at the window cap trims the front and credits
+    the trimmed rows to ``_disk_older_count``, so a snapshot frozen before that
+    trim, written against the counter read after it, emits those rows twice —
+    once in the frozen prefix and once at the head of the snapshot. Supplying the
+    paired count makes that drift refuse the save (``False``, nothing written)
+    instead of committing a duplicated transcript; a caller that reads the live
+    counter itself cannot detect the drift at all. Ignored without *messages*,
+    where the bounded retry below already takes both halves together.
+
+    Returns ``False`` when the delete-won guard aborted the save because the
+    session was permanently deleted while this save awaited the lock, when
+    ``expected_history_key`` no longer matches the slot's routing, or when
+    ``expected_disk_older_count`` drifted — the in-memory window was NOT
+    persisted and must not be treated as durable. Every other completion
+    (including the benign no-op skips) returns ``True``.
     """
     if not state.conversation_log:
         return True
@@ -2539,10 +2901,25 @@ def _save_slot_to_history(
     # snapshot the window, then confirm _disk_older_count is unchanged; a small
     # bounded retry closes the race without locks (slot._lock is an asyncio.Lock
     # and so cannot be acquired from this thread). An explicit snapshot is
-    # already consistent by construction.
+    # internally consistent by construction, but its PAIRING with the frozen
+    # prefix boundary is not -- see ``expected_disk_older_count`` above.
     if messages is not None:
         window = list(messages)
         disk_older = slot._disk_older_count
+        if expected_disk_older_count is not None and disk_older != expected_disk_older_count:
+            # The window hit the cap and trimmed while this save was in flight,
+            # so the trimmed rows are now credited to the frozen prefix AND
+            # still present at the head of the frozen snapshot. Writing would
+            # duplicate them. Refuse like the guards below: nothing written, and
+            # the caller (which holds the retryable-503 contract) re-decides
+            # against the state that actually exists.
+            logger.warning(
+                "Slot %s save refused: frozen prefix moved from %d to %d during the write",
+                slot.key,
+                expected_disk_older_count,
+                disk_older,
+            )
+            return False
     else:
         for _ in range(_FLUSH_SNAPSHOT_RETRIES):
             disk_older = slot._disk_older_count
@@ -2621,10 +2998,9 @@ def _save_slot_to_history(
             # A FORCED (or closing) save of a message-less slot is a metadata
             # mutation (folder filing/unfiling, a tag assignment, a pin, a
             # pinned title, a mode switch, a close) -- the full save below has no window to
-            # write, but the mutation still has to reach disk. This became
-            # reachable when `session_create` started persisting `folder_id`
-            # at birth (#6118): an empty newborn HAS a metadata line, so any
-            # acknowledged metadata change before its first message must
+            # write, but the mutation still has to reach disk. `session_create`
+            # persists `folder_id` at birth, so an empty newborn HAS a metadata
+            # line and any acknowledged metadata change before its first message must
             # overwrite that line, or a restart resurrects the birth state the
             # user already changed. The merge carries every slot-owned field a
             # force/closed save is responsible for -- not just `folder_id`:
@@ -2698,6 +3074,14 @@ def _save_slot_to_history(
                     fields["agent"] = slot.agent
                 if slot.workspace:
                     fields["workspace"] = slot.workspace
+                # CLEARABLE, and it has to be: the merge cannot delete a key, so a
+                # crew rebound from a silo back to the default store would keep
+                # consolidating into the silo it left. The cleared spelling is ""
+                # rather than "default" so it reads as falsy everywhere -- the
+                # rehydrate mirror and the consolidator's own resolver both treat
+                # falsy as "the global store", which is also how a session written
+                # before crew stores existed reads.
+                fields["memory_store"] = named_store_or_empty(slot.memory_store)
                 if slot.project:
                     fields["project"] = slot.project
                 if slot._app:
@@ -2715,6 +3099,25 @@ def _save_slot_to_history(
                     fields["channel_origin"] = True
                 if slot.forked_from is not None:
                     fields["forked_from"] = slot.forked_from
+                if slot.executor == "remote" and slot.instance_id and slot.remote_slot:
+                    # All three or none, exactly like the full save: a newborn
+                    # bound to a peer has an EMPTY window until the first relayed
+                    # row lands, so this merge is the only writer its binding
+                    # ever sees. Dropping it here means a restart in that window
+                    # brings the session back as an ordinary local one and the
+                    # next turn runs on this machine instead of the crew the user
+                    # picked. The completeness guard keeps the fail-closed
+                    # invariant: a half-binding is never written, so rehydration
+                    # never has to repair one.
+                    fields["executor"] = "remote"
+                    fields["instance_id"] = slot.instance_id
+                    fields["remote_slot"] = slot.remote_slot
+                    if getattr(slot, "_relay_in_flight", False):
+                        # Only ever written while a turn is mid-flight; the relay
+                        # clears it when the turn ends, so a persisted True means
+                        # "crashed mid-turn" on reload. Nested under the binding
+                        # because it is meaningless without one.
+                        fields["relay_in_flight"] = True
                 if getattr(slot, "_tab_id", None):
                     fields["tab_id"] = slot._tab_id
                 if getattr(slot, "_auto_tagged", False):
@@ -2755,6 +3158,17 @@ def _save_slot_to_history(
                     return False
                 merged_fields.clear()
                 merged_fields.update(_fresh_fields())
+                # Held /note lines: a MERGE writer, so it unions
+                # with the on-disk hold and never shrinks it. A live-state
+                # mirror here could race a turn-end flush that just delivered
+                # rows into a window this empty-window save does not write —
+                # clearing the only durable copy of a note whose row is
+                # unsaved. Retirement belongs to the full save's paired
+                # snapshot alone.
+                merged_fields["deferred_notes"] = union_deferred_notes(
+                    meta.get("deferred_notes"),
+                    serialize_deferred_notes(slot._deferred_notes[:]),
+                )
                 return True
 
             applied = state.conversation_log.update_metadata_if(
@@ -2977,8 +3391,24 @@ def _save_slot_to_history(
                 meta_line["mode"] = slot.mode
             if slot.workspace and slot.workspace != "default":
                 meta_line["workspace"] = slot.workspace
+            if _named := named_store_or_empty(slot.memory_store):
+                meta_line["memory_store"] = _named
             if slot.project:
                 meta_line["project"] = slot.project
+            # Remote-execution binding. All three are written together or not at
+            # all: a half-restored binding (executor="remote" with no peer slot)
+            # is the fail-closed refusal case, so persisting the marker without
+            # its target would resurrect a session that can never run. Written
+            # only when the whole binding is present, and read back the same way.
+            if slot.executor == "remote" and slot.instance_id and slot.remote_slot:
+                meta_line["executor"] = "remote"
+                meta_line["instance_id"] = slot.instance_id
+                meta_line["remote_slot"] = slot.remote_slot
+                if getattr(slot, "_relay_in_flight", False):
+                    # See the merge-save site: written only while a turn is
+                    # in-flight, so a True read back on reload is the crash signal
+                    # that triggers the interrupted-turn row.
+                    meta_line["relay_in_flight"] = True
             if slot.folder_id:
                 meta_line["folder_id"] = slot.folder_id
             if slot._channel_folder_filed or existing_meta.get("channel_folder_filed"):
@@ -3034,6 +3464,46 @@ def _save_slot_to_history(
                 # SLOT_OWNED_META_KEYS and survive via carry_unowned_metadata
                 # even on a save by a slot that has not learned the flag yet.
                 meta_line["human_seen"] = True
+            # Durable copy of the held /note lines. OWNED
+            # (in SLOT_OWNED_META_KEYS), so this rebuild decides the key's
+            # whole value — and retirement is ROW-DERIVED: an entry is
+            # retired exactly when the window THIS save writes contains its
+            # delivered row (``meta.noteId``, stamped by the flush) or its id
+            # was recorded as dropped at the rebind seam. Everything else —
+            # the on-disk hold and the live hold, both read HERE, under the
+            # same history lock the merge writers commit under — is kept, so
+            # a /note persist that won the lock during this save's patient
+            # acquire is unioned rather than overwritten, and a flush
+            # interleaving anywhere around the window snapshot leaves the
+            # entry to the save that actually writes its row. Row and
+            # retirement land in one atomic file replace; a crash on either
+            # side re-delivers rather than loses.
+            window_note_ids: set[str] = set()
+            for row in window:
+                row_meta = row.get("meta")
+                if isinstance(row_meta, dict):
+                    row_note_id = row_meta.get("noteId")
+                    if isinstance(row_note_id, str) and row_note_id:
+                        window_note_ids.add(row_note_id)
+            dropped_note_ids = set(slot._dropped_note_ids)
+            surviving_hold = [
+                entry
+                for entry in union_deferred_notes(
+                    existing_meta.get("deferred_notes"),
+                    serialize_deferred_notes(slot._deferred_notes[:]),
+                )
+                if entry.get("id") not in window_note_ids
+                and entry.get("id") not in dropped_note_ids
+            ]
+            if surviving_hold:
+                meta_line["deferred_notes"] = surviving_hold
+            # The drop records this write retires are CONSUMED only after the
+            # atomic_write below commits (and never on the rows-only path,
+            # which defers the key to the on-disk value): a dropped note's row
+            # never exists, so the recorded id is its ONLY retirement path —
+            # consuming it before the write commits would leak the entry into
+            # the durable hold forever if the write fails.
+            retired_drop_ids = dropped_note_ids if not rows_only else set()
             if slot.forked_from is not None:
                 meta_line["forked_from"] = slot.forked_from
             if slot.linked_session_key:
@@ -3083,7 +3553,45 @@ def _save_slot_to_history(
                 meta_line["rotation_generation"] = (
                     int(existing_meta.get("rotation_generation", 0) or 0) + 1
                 )
-            carry_unowned_metadata(meta_line, existing_meta, SLOT_OWNED_META_KEYS)
+            # ``rows_only`` DEFERS to the line on disk, so it owes evidence that the
+            # line is somebody ELSE's. ``tab_id`` is that evidence and the only
+            # per-writer mark the line carries: it is minted per slot OBJECT
+            # (``get_or_create_slot`` assigns a fresh uuid; a rehydrate adopts the
+            # file's), and every save stamps the writer's own onto the line. A line
+            # still carrying THIS slot's id was published by this slot and describes
+            # nothing that needs protecting, so the ordinary rebuild must run —
+            # metadata edits are acknowledged to the user the instant they land in
+            # memory (``_dirty``, persisted by a later flush), and the slot a
+            # rows-only write carries has been popped, so deferring here would drop
+            # a title, folder, tag set or pin the user already saw applied with
+            # nothing left to retry it.
+            #
+            # Unprovable ownership defers, because the two errors cost differently.
+            # Deferring this slot's own edit loses fields that were never committed;
+            # rebuilding over a live holder's committed line reverts fields it
+            # already published, and for a replacement nobody types in again nothing
+            # rewrites them, so that loss is permanent.
+            own_tab_id = getattr(slot, "_tab_id", "") or ""
+            line_is_this_slots = bool(own_tab_id) and existing_meta.get("tab_id") == own_tab_id
+            if rows_only and existing_meta and not line_is_this_slots:
+                # A rows-only write does not own the slot-owned fields: the line
+                # describes whichever OTHER live slot published it, and this one is
+                # only here to get its messages down. Drop the rebuild for every
+                # field outside the file-identity subset and let the carry below
+                # restore the on-disk value verbatim, so a title, folder, tag set or
+                # pin another holder acknowledged is not reverted by a write that was
+                # never about it. ``closed``/``closed_at`` are deferred with the
+                # rest: on this line they are the other holder's own dismissal, and
+                # an open-shaped write that erased them would resurface a tab the
+                # user put away with that holder already popped. Gated on an existing
+                # line because with none there is no other writer to defer to and
+                # the slot's own state is all there is — and that is the branch below,
+                # where the open-shaped write still clears a stale ``closed``.
+                for meta_key in ROWS_ONLY_DEFERRED_META_KEYS:
+                    meta_line.pop(meta_key, None)
+                carry_unowned_metadata(meta_line, existing_meta, ROWS_ONLY_OWNED_META_KEYS)
+            else:
+                carry_unowned_metadata(meta_line, existing_meta, SLOT_OWNED_META_KEYS)
             meta_str = json.dumps(meta_line) + "\n"
 
             # ── Frozen prefix (never rewritten) + freshly serialized window ──
@@ -3112,7 +3620,12 @@ def _save_slot_to_history(
                 or _approx_window_payload_bytes(window) > cache_max_bytes
                 else _build_message_entry
             )
-            window_entries = [e for m in window if (e := build_entry(m)) is not None]
+            # ``path`` is this session's transcript, so its directory and stem are
+            # what pairs an attachment with the session that will delete it.
+            attachments = (path.parent, path.stem)
+            window_entries = [
+                e for m in window if (e := build_entry(m, attachments=attachments)) is not None
+            ]
             window_lines = [json.dumps(e) + "\n" for e in window_entries]
             frozen_prefix, foreign_lines, dedup_dropped = _frozen_prefix_and_foreign_appends(
                 slot, path, disk_older, window_entries, collect_foreign=not rewrite
@@ -3198,6 +3711,12 @@ def _save_slot_to_history(
                     _preserve_mtime = None
 
             atomic_write(path, payload, fsync=True)
+            # The write committed: the deferred-note drop records it retired
+            # are now safe to consume (see the meta build above). Discard is
+            # idempotent, and a record consumed here can no longer be needed —
+            # the retired entry left the durable hold in the same file replace.
+            for retired_id in retired_drop_ids:
+                slot._dropped_note_ids.discard(retired_id)
             if _preserve_mtime is not None:
                 try:
                     os.utime(path, (_preserve_mtime, _preserve_mtime))
@@ -3207,45 +3726,83 @@ def _save_slot_to_history(
                     logger.debug(
                         "could not restore pre-close mtime for %s", history_key, exc_info=True
                     )
-            # A rewrite (archive-safe) save succeeded → clear the pending-rewrite
-            # flag so later saves return to the cheap default path.
-            if rewrite:
-                slot._pending_rewrite = False
-            # Record how many window messages are now on disk so memory trimming
-            # can safely fold leading window messages into the frozen prefix.
-            slot._disk_window_len = len(window)
-            # Record the disk identity this save just wrote (carried forward
-            # from ``existing_meta`` when present), so the delete-won guard can
-            # recognize a file recreated by another writer after a permanent
-            # delete on the NEXT save.
-            slot._disk_meta_created_at = str(meta_line.get("created_at") or "")
-            # A committed save is a direct observation of the file this slot
-            # writes — even when the carried-forward metadata is legacy and
-            # has no ``created_at`` for the identity string above.
-            slot._disk_meta_observed = True
-            # Record the post-write mtime in the frozen-prefix cache (even when
-            # there is no frozen prefix, ``disk_older == 0``). The cache doubles
-            # as the "did another process touch this file since we last wrote
-            # it?" signal: a matching mtime on the next save proves THIS slot was
-            # the last writer, so the frozen prefix is reusable and no NEW
+            # The witnesses below all describe THIS file. They live on the live
+            # slot, so they may only be stamped while the slot still routes to
+            # the transcript this save wrote. The event loop can rebind the slot
+            # (a cron injection re-linking it) after the routing snapshot above
+            # and while this worker writes: the write itself stays correct (it
+            # lands on the authorized transcript), but stamping would then
+            # describe the OLD file on a slot that now writes the NEW one —
+            # clearing ``_pending_rewrite`` the new transcript still owes,
+            # over-claiming ``_disk_window_len`` rows as persisted, and handing
+            # the delete-won guard another file's identity. Skipping leaves every
+            # witness at its pre-save value, which is the conservative side of
+            # each one: the next save re-reads the prefix, re-takes the
+            # archive-safe path, and re-observes the file. The cache
+            # invalidations after this block are keyed on the file that WAS
+            # written, so they stay unconditional.
+            # Everything the stamping needs is computed BEFORE the routing
+            # re-check, so the stamped region is assignments only: this runs in a
+            # worker thread, and a syscall between the check and the last
+            # assignment is the realistic point at which the event loop gets to
+            # rebind the slot underneath a half-applied stamp. It cannot be made
+            # atomic against the loop from here (``slot._lock`` is an asyncio lock
+            # and no undo is right once the rebind path has recomputed these for
+            # its own transcript) -- collapsing the five fields into one
+            # assignable record carrying the key it describes is the real fix, and
+            # belongs with that record rather than here.
+            #
+            # The frozen-prefix cache records the post-write mtime (even when
+            # there is no frozen prefix, ``disk_older == 0``). It doubles as the
+            # "did another process touch this file since we last wrote it?"
+            # signal: a matching mtime on the next save proves THIS slot was the
+            # last writer, so the frozen prefix is reusable and no NEW
             # cross-process append can have landed — letting the foreign-append
-            # scan take the O(window) fast path instead of re-reading the
-            # whole file. The foreign lines this save just preserved are cached
+            # scan take the O(window) fast path instead of re-reading the whole
+            # file. The foreign lines this save just preserved are cached
             # alongside so the fast path re-emits them verbatim: they now live in
             # the on-disk window region (after the frozen prefix), and because
             # ``disk_older`` is unchanged a bare frozen+window rebuild on the next
             # save would otherwise silently delete them.
+            _post_write_cache: tuple[float, int, int, str, list[str]] | None
             try:
                 _st = path.stat()
-                slot._frozen_prefix_cache = (
+            except OSError:
+                _post_write_cache = None
+            else:
+                _post_write_cache = (
                     _st.st_mtime,
                     _st.st_size,
                     disk_older,
                     frozen_prefix,
                     foreign_lines,
                 )
-            except OSError:
-                slot._frozen_prefix_cache = None
+            # The disk identity this save just wrote (carried forward from
+            # ``existing_meta`` when present), so the delete-won guard can
+            # recognize a file recreated by another writer after a permanent
+            # delete on the NEXT save.
+            _post_write_created_at = str(meta_line.get("created_at") or "")
+            if slot_history_key(slot) == history_key:
+                # A rewrite (archive-safe) save succeeded → clear the pending-rewrite
+                # flag so later saves return to the cheap default path.
+                if rewrite:
+                    slot._pending_rewrite = False
+                # How many window messages are now on disk, so memory trimming can
+                # safely fold leading window messages into the frozen prefix.
+                slot._disk_window_len = len(window)
+                slot._disk_meta_created_at = _post_write_created_at
+                # A committed save is a direct observation of the file this slot
+                # writes — even when the carried-forward metadata is legacy and
+                # has no ``created_at`` for the identity string above.
+                slot._disk_meta_observed = True
+                slot._frozen_prefix_cache = _post_write_cache
+            else:
+                logger.warning(
+                    "Slot %s was rebound from %s while its save was in flight; "
+                    "leaving the persistence witnesses at their pre-save values",
+                    slot.key,
+                    history_key,
+                )
             state.conversation_log._invalidate_cache(history_key)
             state.conversation_log.note_tab_id(history_key, tab_id)
             return True
@@ -3372,6 +3929,7 @@ async def save_slot_off_loop(
     rewrite: bool = False,
     best_effort: bool = True,
     expected_history_key: str | None = None,
+    rows_only: bool = False,
 ) -> bool:
     """Persist a slot from the event loop without blocking or dropping the save.
 
@@ -3406,11 +3964,17 @@ async def save_slot_off_loop(
     the worker's routing snapshot, and without this pin the durable write
     would target a transcript the caller never authorized.
 
+    ``rows_only``: write the window but leave the metadata line's slot-owned
+    fields as they stand on disk when the line was published by ANOTHER slot --
+    for a caller persisting a slot's rows onto a transcript another live slot now
+    holds. See :func:`_save_slot_to_history` for the full contract, including the
+    ``tab_id`` test that keeps the flag from deferring to the caller's own line.
+
     Returns ``False`` only when the save was skipped WITHOUT writing: the
     session was permanently deleted while the save awaited the lock (the
     delete-won guard in :func:`_save_slot_to_history`), or the routing moved
     off ``expected_history_key``. Neither skip raises, for either
-    ``best_effort`` mode, so a clean return NO LONGER proves a committed write.
+    ``best_effort`` mode, so a clean return does NOT prove a committed write.
     Callers that go on to republish the slot's content elsewhere (fork, the
     transfer export) must check the return; archival callers (close/cleanup)
     may ignore it — the delete already disposed of what they were archiving.
@@ -3426,6 +3990,7 @@ async def save_slot_off_loop(
             force=force,
             rewrite=rewrite,
             expected_history_key=expected_history_key,
+            rows_only=rows_only,
         )
 
     def _begin_guarded_metadata_write() -> None:
@@ -3491,35 +4056,27 @@ async def save_slot_off_loop(
             _finish_guarded_metadata_write()
 
 
-def _build_history_prefix(slot: _ChatSlot) -> str:
-    """Build a condensed history prefix from slot messages for session re-injection.
+def _build_history_prefix(
+    slot: _ChatSlot,
+    *,
+    conversation_log: ConversationLog | None = None,
+    current_message: dict | None = None,
+    model_window: int | None = None,
+) -> str:
+    """Legacy no-builder entry point; share the canonical merge and budget."""
+    from kiro_crew.context import build_session_replay
 
-    Redacts here as defence in depth. The returned prefix is prepended to the ACP
-    prompt, so it leaves the dashboard's own storage and is persisted by kiro-cli
-    into its session file — an egress path, not an internal read, so it does not
-    rely solely on the load-time content pass upstream. Redaction is idempotent,
-    so the common case is a no-op.
-    """
-    lines: list[str] = []
-    total = 0
-    for m in slot.messages:
-        role = m.get("role", "")
-        if role in ("chunk", "done", "streaming", "queued", "permission", "error", "tool"):
-            continue
-        label = "User" if role == "user" else "Assistant"
-        text = m.get("content", "")[:500]
-        if role != "user":
-            text, _ = redact_exfiltration_urls(text)
-            text, _ = redact_credentials(text)
-        line = f"{label}: {text}"
-        if total + len(line) > _MAX_HISTORY_CHARS:
-            break
-        lines.append(line)
-        total += len(line)
-    if not lines:
+    replay = build_session_replay(
+        conversation_log,
+        slot_history_key(slot),
+        pending_messages=list(slot.messages),
+        current_message=current_message,
+        model_window=model_window,
+    )
+    if not replay:
         return ""
     return (
         "[Previous chat history for this tab — session was reset after stop]\n"
-        + "\n".join(lines)
+        + replay
         + "\n[End of history]\n\n"
     )

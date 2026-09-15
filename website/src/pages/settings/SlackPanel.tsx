@@ -7,9 +7,11 @@ import { SettingsSection, SettingsCard, SettingsInput, SettingsToggle } from '..
 import { SecretField } from '../../components/SecretField'
 import { Input, Btn } from '../../components/ui'
 import { api, type SlackConfigData, type SlackConfigSave } from '../../api/client'
+import { copyToClipboard } from '../../utils/clipboard'
 
 import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
+import { SchemaRestartBadge } from '../../components/settingRef/RestartRequiredBadge'
 /** Brand name — do-not-translate, so it lives here rather than in the catalog. */
 const CHANNEL_NAME = "Slack"
 const SETUP_GUIDE = 'https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/docs/slack-integration.md'
@@ -55,15 +57,25 @@ function StatusBadge({ config }: { config: SlackConfigData }) {
   )
 }
 
-/** One-line explanation of WHY Slack is not connected, with the fix. */
-function connectionHint(config: SlackConfigData): string {
-  if (config.connected || !config.configured) return ''
+/**
+ * The gateway's startup failure (`connect_error`), kept apart from
+ * {@link connectionHint}: it is the outcome of something that FAILED, so it
+ * renders through `ErrorNotice`, while the hint describes a state that has not
+ * gone wrong yet.
+ */
+function connectError(config: SlackConfigData): string {
+  if (config.connected || !config.configured || !config.connect_error) return ''
   if (config.connect_error === 'invalid_auth') {
     return i18nT('pages.settings.slackPanel.slack_rejected_the_stored_tokens_invalid_auth_re')
   }
-  if (config.connect_error) {
-    return i18nT('pages.settings.slackPanel.slack_connection_failed_at_startup', { error: config.connect_error })
-  }
+  return i18nT('pages.settings.slackPanel.slack_connection_failed_at_startup', { error: config.connect_error })
+}
+
+/** One-line explanation of WHY Slack is not connected, with the fix. */
+function connectionHint(config: SlackConfigData): string {
+  // A startup failure is shown by `connectError`; "saved but not yet active"
+  // would only repeat it underneath.
+  if (config.connected || !config.configured || config.connect_error) return ''
   return i18nT('pages.settings.slackPanel.tokens_are_saved_but_not_yet_active_restart_the')
 }
 
@@ -154,6 +166,9 @@ export function SlackPanel() {
   const [verifyWarning, setVerifyWarning] = useState('')
   const [tokensVerified, setTokensVerified] = useState(false)
   const [manifestCopied, setManifestCopied] = useState(false)
+  // Separate from `!manifestCopied`: idle and failed both read as not-copied,
+  // but only the failure needs a notice (same split as MobileLoginCard).
+  const [manifestCopyFailed, setManifestCopyFailed] = useState(false)
 
   // Public manifest template + one-click Slack create URL (no secrets).
   const manifestQ = useQuery({
@@ -163,12 +178,26 @@ export function SlackPanel() {
     retry: false,
   })
 
-  const copyManifest = useCallback(() => {
+  const copyManifest = useCallback(async () => {
     if (!manifestQ.data) return
-    navigator.clipboard.writeText(manifestQ.data.manifest).then(() => {
-      setManifestCopied(true)
-      setTimeout(() => setManifestCopied(false), 1500)
-    }).catch(() => {})
+    setManifestCopyFailed(false)
+    // The shared helper, not `navigator.clipboard.writeText` directly: on a
+    // plain-HTTP remote dashboard `navigator.clipboard` is undefined, and a
+    // direct call throws synchronously before any `.catch()` could attach — so
+    // the copy failed AND nothing reported it. The helper guards the API, falls
+    // back to `execCommand`, and resolves `false` (or rejects) when both fail.
+    let ok = false
+    try {
+      ok = await copyToClipboard(manifestQ.data.manifest)
+    } catch {
+      ok = false
+    }
+    if (!ok) {
+      setManifestCopyFailed(true)
+      return
+    }
+    setManifestCopied(true)
+    setTimeout(() => setManifestCopied(false), 1500)
   }, [manifestQ.data])
   const [error, setError] = useState('')
 
@@ -198,8 +227,10 @@ export function SlackPanel() {
           msg = e.message
         }
       }
+      // Persist until the next save attempt clears it: the rejected draft is
+      // still in the form, and a notice that erases itself after a few seconds
+      // leaves a quiet form that reads as saved.
       setError(msg)
-      setTimeout(() => setError(''), 8000)
     },
     onSuccess: (res, vars) => {
       setSaved(true)
@@ -234,10 +265,13 @@ export function SlackPanel() {
   }, [draft, botToken, appToken, botClear, appClear, saveMut])
 
   if (isLoading) return <p className="text-[13px] text-muted p-4">{i18nT('pages.settings.slackPanel.loading_slack_config')}</p>
-  if (isError || !data || !draft) return <p className="text-[13px] text-danger p-4">{i18nT('pages.settings.slackPanel.cannot_load_slack_config_is_the_gateway_running')}</p>
+  // Nothing to lose here: the form is not mounted in this branch.
+  if (isError || !data || !draft) return <ErrorNotice className="m-4" message={i18nT('pages.settings.slackPanel.cannot_load_slack_config_is_the_gateway_running')} askAgent />
 
   const upd = (patch: Partial<Draft>) => setDraft(d => (d ? { ...d, ...patch } : d))
   const ro = data.read_only
+  const startupError = connectError(data)
+  const hint = connectionHint(data)
 
   return (
     <>
@@ -254,10 +288,15 @@ export function SlackPanel() {
           <p className="text-[12px] text-muted mt-1">
             {i18nT('pages.settings.slackPanel.talk_to_your_agents_from_slack_over_socket_mode')}
           </p>
-          {connectionHint(data) && (
+          {/* No hand-off: `botToken` / `appToken` (SecretField drafts, never
+              persisted) and the unsaved `draft` (owner id, enterprise allow-list,
+              command, session folder) live in this panel's local state —
+              navigating to the chat would discard them. */}
+          <ErrorNotice message={startupError} className="mt-2" />
+          {hint && (
             <p className="text-[12px] text-warn mt-1 flex items-center gap-1.5">
               <AlertTriangle size={12} className="flex-none" />
-              {connectionHint(data)}
+              {hint}
             </p>
           )}
         </div>
@@ -288,7 +327,7 @@ export function SlackPanel() {
             >
               {i18nT('pages.settings.slackPanel.create_slack_app')} <ExternalLink size={13} />
             </a>
-            <Btn onClick={copyManifest} disabled={!manifestQ.data}>
+            <Btn onClick={() => { void copyManifest() }} disabled={!manifestQ.data}>
               {manifestCopied ? <><Check size={13} /> {i18nT('pages.settings.slackPanel.copied')}</> : i18nT('pages.settings.slackPanel.copy_manifest_yaml')}
             </Btn>
             <a href={SETUP_GUIDE} target="_blank" rel="noopener noreferrer"
@@ -296,6 +335,15 @@ export function SlackPanel() {
               {i18nT('pages.settings.slackPanel.setup_guide')} <ExternalLink size={13} />
             </a>
           </div>
+          {/* No hand-off for either: the token fields and the unsaved `draft`
+              share this panel, and navigating to the chat would discard them. The
+              setup-guide link beside them is the recovery path. */}
+          {manifestQ.isError && (
+            <ErrorNotice variant="inline" className="mt-2" message={i18nT('pages.settings.slackPanel.manifest_unavailable')} />
+          )}
+          {manifestCopyFailed && (
+            <ErrorNotice variant="inline" className="mt-2" message={i18nT('pages.settings.slackPanel.copy_manifest_failed')} onDismiss={() => setManifestCopyFailed(false)} />
+          )}
         </SettingsCard>
       </SettingsSection>
 
@@ -367,6 +415,10 @@ export function SlackPanel() {
             placeholder={i18nT('pages.settings.slackPanel.kirocrew')}
             disabled={ro}
           />
+          {/* The one slack.* field that cannot hot-apply: the slash command is
+              registered in the Slack app manifest. The badge answers from the
+              schema, so it disappears by itself if that ever changes. */}
+          <div className="-mt-1 pb-1"><SchemaRestartBadge configKey="slack.command" /></div>
           <SettingsToggle
             label={i18nT('pages.settings.slackPanel.phase_reactions')}
             description={i18nT('pages.settings.slackPanel.show_phase_aware_emoji_reactions_queued_thinking')}
@@ -414,7 +466,7 @@ export function SlackPanel() {
         </Btn>
         {saved && (
           <span className="inline-flex items-center gap-1.5 text-[12px] text-ok">
-            <Check size={14} /> {tokensVerified ? i18nT('pages.settings.slackPanel.verified_with_slack_and_saved_restart_the_gatewa') : restartHint ? i18nT('pages.settings.slackPanel.saved_restart_the_gateway_to_apply') : i18nT('pages.settings.slackPanel.saved')}
+            <Check size={14} /> {tokensVerified ? (restartHint ? i18nT('pages.settings.slackPanel.verified_with_slack_and_saved_restart_the_gatewa') : i18nT('pages.settings.slackPanel.verified_and_saved')) : restartHint ? i18nT('pages.settings.slackPanel.saved_restart_the_gateway_to_apply') : i18nT('pages.settings.slackPanel.saved')}
           </span>
         )}
         {saved && verifyWarning && (
@@ -422,11 +474,10 @@ export function SlackPanel() {
             <AlertTriangle size={14} /> {verifyWarning}
           </span>
         )}
-        {/*
-          Deliberately NOT opted in, same as `BrowserPanel`: `botToken`/`appToken`
-          live in local state (never persisted — `formKey` even remounts them after
-          a successful save), and both come from the Slack app admin.
-        */}
+        {/* No hand-off: `botToken` / `appToken` (SecretField drafts, never
+            persisted — `formKey` even remounts them after a successful save) and
+            the unsaved `draft` are exactly what a failed save did not store; the
+            hand-off unmounts this panel and would lose them. */}
         <ErrorNotice message={error} variant="inline" />
       </div>}
     </>

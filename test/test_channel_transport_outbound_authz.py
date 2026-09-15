@@ -45,10 +45,10 @@ _PRINCIPAL_ANSWERED = {
     "(a space answers from its own room allow-list instead)",
 }
 
-#: Transports that permit unconditionally, with the reason stated at the method.
-_PERMITS_WITH_REASON = {
-    "slack": "ladder returns early for SLACK_NAMESPACE; never consulted",
-}
+#: No shipped transport currently permits every persisted destination without a
+#: channel-specific revocation decision. Kept as a typed table so a future
+#: unavoidable exception must still record its reason at the method.
+_PERMITS_WITH_REASON: dict[str, str] = {}
 
 
 def _transport_classes() -> dict[str, list[str]]:
@@ -117,7 +117,7 @@ class TestEveryTransportDecidesForItself:
         )
 
     def test_recorded_permits_still_name_real_channels(self) -> None:
-        """A stale row would silently excuse a channel that no longer exists."""
+        """A stale row would silently excuse a channel that does not exist."""
         found = _transport_classes()
         stale = [
             channel
@@ -311,7 +311,7 @@ class TestOtherTransportsThatCanAnswer:
         assert t.may_send_to("conv-2") is False
 
     def test_teams_refuses_a_conversation_whose_owner_was_revoked(self) -> None:
-        # Learned while Alice was allowed; she is no longer on the roster.
+        # Learned while Alice was allowed; she is not on the roster.
         t = self._teams(["bob@example.com"], owner="alice@example.com", conversation="conv-1")
         assert t.may_send_to("conv-1") is False
 
@@ -726,6 +726,30 @@ class TestTheLadderConsultsTheTransport:
         transport = _StubTransport(RuntimeError("roster unavailable"))
         link = ChannelLink(channel_type="telegram", channel_id="111")
         assert self._resolve(transport, link) is None
+
+    def test_check_recipient_false_skips_only_the_recipient_leg(self) -> None:
+        """The one caller whose link carries a CONFIGURED-TARGET id, not a
+        conversation id (mirror-link creation), opts out: the recipient
+        question is unanswerable in that spelling — ``user:123`` can never match
+        a roster of bare ids — and is re-decided by that caller against the
+        resolved id. Governance and capability still gate the resolve."""
+        transport = _StubTransport(False)
+        link = ChannelLink(channel_type="telegram", channel_id="user:123")
+        from kiro_crew.dashboard.chat_runner import _resolve_channel_target
+
+        resolved = _resolve_channel_target(
+            _StubState(transport), "telegram:kirocrew:direct:123", link, check_recipient=False
+        )
+        assert resolved == (link, transport)
+        # The leg was skipped, not consulted-and-ignored.
+        assert transport.calls == []
+
+    def test_the_recipient_leg_defaults_on(self) -> None:
+        """Every persisted-link caller keeps the check without naming the flag."""
+        transport = _StubTransport(False)
+        link = ChannelLink(channel_type="telegram", channel_id="111")
+        assert self._resolve(transport, link) is None
+        assert transport.calls == [("111", None, "111")]
 
     def test_a_refusal_is_audited(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A revoked recipient losing its notices must not look like an idle agent."""

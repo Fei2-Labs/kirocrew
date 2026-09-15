@@ -122,6 +122,8 @@ export const ALWAYS_LATIN = [
   // detection or the `Crew` half orphans as a reportable Latin run.
   'AWS', 'Discord', 'Docker', 'Git', 'GitHub', 'GitLab', 'JSON', 'Kiro', 'Kiro Crew',
   'KiroCrew',
+  // Connections launch-set provider brands (registry names; DNT proper nouns).
+  'Atlassian', 'Linear', 'Notion', 'Stripe', 'Vercel',
   'MCP', 'Markdown', 'Node.js', 'OAuth', 'Playwright', 'Python', 'Slack',
   'Telegram', 'TypeScript', 'Webex', 'WhatsApp', 'YAML', 'iMessage', 'npm',
   // `WeCom` and `WeChat` are deliberately ABSENT despite rendering from the same
@@ -421,6 +423,9 @@ export function scanDocument(opts) {
     if (node.nodeType === 3) return true
     if (node.nodeType !== 1) return false
     if (!visible(node)) return false
+    // An explicit control group is its own UI unit. Its children are still visited
+    // and graded below, including untranslated labels or split prose inside it.
+    if (/^(?:group|tablist|radiogroup|toolbar)$/.test(node.getAttribute('role') || '')) return false
     const d = getComputedStyle(node).display
     if (d === 'contents') return true
     return d.startsWith('inline') || inlineTags.has(node.tagName)

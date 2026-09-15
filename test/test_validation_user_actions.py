@@ -79,7 +79,7 @@ class TestMcpCoreUserActions:
     def test_learn_with_negative(self):
         """The NOT-clause must reach the payload, not just the tool schema.
 
-        Regression guard: this test used to supply ``negative`` and assert only
+        Regression guard: a weaker version supplies ``negative`` and asserts only
         that the call succeeded, so it passed while ``_call_tool`` built the body
         as ``{rule, category, scope}`` and dropped the clause client-side -- the
         very field whose ``rule`` description tells the model to prefer it over
@@ -250,7 +250,7 @@ class TestMcpCronUserActions:
 
         The ownership gate reads the stored row now, so a mock that leaves
         ``get_job`` unset returns a bare ``MagicMock`` whose ``session_key``
-        compares unequal to the caller's and the tool refuses. It used to be
+        compares unequal to the caller's and the tool refuses -- an unidentified
         waved through, because an unidentified caller was.
         """
         job = MagicMock()
@@ -487,20 +487,21 @@ class TestMcpCronUserActions:
     # -- cron_remove_all --
 
     def test_remove_all(self):
-        with patch("kiro_crew.mcp_cron.CronService") as mock_svc, patch.dict(
-            "os.environ", {"KIROCREW_CLI": "1"}, clear=False
-        ) as env:
-            env.pop("KIROCREW_SESSION_KEY", None)
+        # Identity, not an ambient flag: this tool is not reachable with no
+        # session at all by setting KIROCREW_CLI=1, which is the forgeable claim
+        # gone. The tool path being exercised here is unchanged; what
+        # changed is that reaching it requires a caller the gateway can name.
+        with patch("kiro_crew.mcp_cron.CronService") as mock_svc:
             svc = mock_svc.return_value
             job = MagicMock()
             job.id = "x"
-            job.session_key = ""
+            job.session_key = self._session_key
             svc.list_jobs.return_value = [job]
             svc.remove_jobs_sync.return_value = (["x"], [])
             result = self._simulate_tool_call("cron_remove_all", {})
         assert "Removed 1" in result
         svc.remove_jobs_sync.assert_called_once_with(
-            ["x"], actor="mcp", source="mcp"
+            ["x"], actor=self._session_key, source="mcp"
         )
 
 

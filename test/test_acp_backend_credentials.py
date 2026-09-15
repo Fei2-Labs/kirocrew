@@ -1,209 +1,185 @@
-"""An ACP backend's credential store must be unreadable to the agent.
+"""An ACP adapter's OAuth token store is on the sensitive-path floor.
 
-Each experimental backend authenticates through its own vendor CLI, which
-persists a live OAuth token under the user's home. The agent must not be able to
-read the credential that authorises its own backend.
+Each adapter owns its own sign-in flow and persists its own tokens. Kiro Crew
+never reads them — it only ever checks that the file EXISTS so it can name the
+right sign-in command — so an agent ``fs_read`` of one buys nothing legitimate
+and would let it impersonate the operator against that vendor.
 
-The parity test here is what keeps ``security._SENSITIVE_HOME_DIRS`` honest:
-``security`` cannot import the backend registry (that is an import cycle), so the
-list is written literally and this test is the contract that stops the two
-drifting. Adding a backend with a credential path and forgetting the security
-entry fails here rather than shipping an exposed token.
+Claude Code is already selectable, so its leaf being off the floor was a live
+read, not a hypothetical. Codex's leaf has the same shape.
+
+Two properties are pinned separately because they fail apart:
+
+* the ``$HOME``-rooted default is classified, and the adapter's sibling CONFIG
+  files are NOT (routing diagnosis reads them and they hold no credential); and
+* the leaf is re-anchored under every home override the adapter honours, since
+  an override moves the token out from under a ``$HOME``-rooted entry.
+
+Each test is revert-verified: with the corresponding half of the change removed
+they fail.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import os
 
 import pytest
 
 from kiro_crew import security
-from kiro_crew.acp.backends import credential_leaves
+from kiro_crew.security import _SENSITIVE_HOME_DIRS, is_sensitive_path
+
+#: leaf, the env vars that move it, and the spelling it takes under each of them.
+#:
+#: The third element is not always the basename. ``CODEX_HOME`` and the two claude
+#: variables stand in for the token's PARENT, so one segment is left. OpenCode's
+#: ``XDG_DATA_HOME`` stands in for ``.local/share``, so two are -- and a floor that
+#: anchored on the basename alone would fence ``$XDG_DATA_HOME/auth.json``, a path
+#: that harness never writes, while the relocated token stayed readable.
+ADAPTER_TOKEN_LEAVES: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    (".codex/auth.json", ("CODEX_HOME",), "auth.json"),
+    (
+        ".claude/.credentials.json",
+        ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME"),
+        ".credentials.json",
+    ),
+    (
+        ".local/share/opencode/auth.json",
+        ("XDG_DATA_HOME",),
+        "opencode/auth.json",
+    ),
+)
+
+#: Sibling files that must STAY readable. Losing these would break routing
+#: diagnosis, and unlike the token they carry no credential.
+READABLE_SIBLINGS: tuple[str, ...] = (
+    ".codex/config.toml",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+)
 
 
-def test_acp_backend_credentials_are_protected() -> None:
-    """Every registered backend's credential leaf is on the sensitive list."""
-    missing = [leaf for leaf in credential_leaves() if leaf not in security._SENSITIVE_HOME_DIRS]
-    assert not missing, (
-        f"ACP backend credential paths absent from _SENSITIVE_HOME_DIRS: {missing}. "
-        "security.py cannot import the registry (import cycle), so add the leaf "
-        "literally next to the other backend entries."
-    )
+def _clear_cache() -> None:
+    """Drop the TTL target cache so an env change is observed immediately."""
+    security._home_targets_cache.clear()
 
 
-def test_at_least_one_backend_declares_a_credential_path() -> None:
-    """Guards the parity test above against passing vacuously.
+@pytest.fixture(autouse=True)
+def _isolated_home(monkeypatch, tmp_path):
+    """Anchor every case on a scratch home with no adapter overrides set.
 
-    If every descriptor stopped declaring credential paths, the loop would have
-    nothing to check and would pass with the protection removed.
+    The overrides are cleared rather than merely unset-if-absent: a developer
+    machine that genuinely exports ``CODEX_HOME`` would otherwise make the
+    default-location assertions pass for the wrong reason.
     """
-    assert credential_leaves()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    for var in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "XDG_DATA_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    _clear_cache()
+    yield tmp_path
+    _clear_cache()
 
 
-class TestCodexAuthJson:
-    """The Codex token store, through both enforcement paths."""
-
-    @property
-    def auth(self) -> str:
-        return str(Path.home() / ".codex" / "auth.json")
-
-    @property
-    def config(self) -> str:
-        return str(Path.home() / ".codex" / "config.toml")
-
-    def test_fs_gate_blocks_the_token_store(self) -> None:
-        assert security.is_sensitive_path(self.auth)
-
-    def test_fs_gate_still_allows_the_ordinary_config(self) -> None:
-        """config.toml must stay readable.
-
-        The tool-gate refusal message tells the operator to inspect
-        approval_policy in this file, so blocking it would make the remedy
-        impossible to follow.
-        """
-        assert not security.is_sensitive_path(self.config)
-
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "cat ~/.codex/auth.json",
-            "head -c 100 ~/.codex/auth.json",
-            "base64 ~/.codex/auth.json",
-            "cp ~/.codex/auth.json /tmp/stolen",
-            "python3 -c \"print(open('~/.codex/auth.json').read())\"",
-        ],
+@pytest.mark.parametrize("leaf,_env_vars,_under_root", ADAPTER_TOKEN_LEAVES)
+def test_token_leaf_is_on_the_floor(leaf, _env_vars, _under_root) -> None:
+    """The leaf is listed, so the registry and the gate cannot drift apart."""
+    assert leaf in _SENSITIVE_HOME_DIRS, (
+        f"{leaf} must be in _SENSITIVE_HOME_DIRS; without it an agent fs_read "
+        "can lift that adapter's OAuth token"
     )
-    def test_bash_matcher_blocks_reads_by_any_verb(self, command: str) -> None:
-        """The catch-all is verb-independent on purpose.
 
-        A per-verb denied-command rule would need an entry per reader; naming the
-        path blocks the readers nobody enumerated too.
-        """
-        assert security.is_sensitive_bash_command(command)
 
-    def test_relative_traversal_is_covered_for_leaf_entries(self) -> None:
-        """A leaf credential file is protected however its path is respelled.
+@pytest.mark.parametrize("leaf,_env_vars,_under_root", ADAPTER_TOKEN_LEAVES)
+def test_default_location_is_blocked(_isolated_home, leaf, _env_vars, _under_root) -> None:
+    """The documented ``$HOME``-rooted location is refused."""
+    target = os.path.join(str(_isolated_home), *leaf.split("/"))
+    assert is_sensitive_path(target) is True
 
-        A ``cd`` into the directory, a ``;`` separator, and a ``$HOME`` variable
-        all resolve to the same file, so each form is blocked. This is general to
-        every FILE-shaped entry in _SENSITIVE_HOME_DIRS rather than specific to
-        this backend — ``~/.docker/config.json`` and ``~/.kube/config`` are
-        covered on the same tree, as are DIRECTORY entries (``.ssh``, ``.aws``).
-        """
-        assert security.is_sensitive_bash_command("cd ~/.codex && cat auth.json")
-        assert security.is_sensitive_bash_command("cd ~/.codex; cat auth.json")
-        assert security.is_sensitive_bash_command("cd $HOME/.codex && cat auth.json")
 
-    def test_a_directory_entry_does_block_relative_traversal(self) -> None:
-        """Pins that directory entries are covered alike, not just leaf files."""
-        assert security.is_sensitive_bash_command("cd ~/.ssh && cat id_rsa")
+@pytest.mark.parametrize("sibling", READABLE_SIBLINGS)
+def test_sibling_config_stays_readable(_isolated_home, sibling) -> None:
+    """Only the token leaf is classified, never the whole adapter directory.
 
-    def test_bash_matcher_allows_reading_the_config(self) -> None:
-        assert not security.is_sensitive_bash_command("cat ~/.codex/config.toml")
-
-    def test_codex_home_override_reanchors_only_the_token(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        override = tmp_path / "codex-home"
-        monkeypatch.setenv("CODEX_HOME", str(override))
-        security._home_targets_cache.clear()
-
-        assert security.is_sensitive_path(str(override / "auth.json"))
-        assert not security.is_sensitive_path(str(override / "config.toml"))
-
-    @pytest.mark.parametrize(
-        "command",
-        ["cat $CODEX_HOME/auth.json", "cat ${CODEX_HOME}/auth.json"],
+    Classifying the directory would be the easy over-broad fix and would break
+    routing diagnosis, which reads these files.
+    """
+    target = os.path.join(str(_isolated_home), *sibling.split("/"))
+    assert is_sensitive_path(target) is False, (
+        f"{sibling} carries no credential and routing diagnosis reads it; "
+        "classify the token leaf, not the directory"
     )
-    def test_shell_expansion_of_codex_home_is_blocked(
-        self,
-        command: str,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "custom-codex"))
-        security._home_targets_cache.clear()
-        assert security.is_sensitive_bash_command(command)
-
-    def test_shell_cd_into_codex_home_blocks_relative_token_read(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        override = tmp_path / "custom-codex"
-        monkeypatch.setenv("CODEX_HOME", str(override))
-        security._home_targets_cache.clear()
-
-        assert security.is_sensitive_bash_command('cd "$CODEX_HOME" && cat auth.json')
-        assert security.is_sensitive_bash_command("cd ${CODEX_HOME}; cat auth.json")
 
 
-class TestClaudeCredentialsJson:
-    """The Claude OAuth token store, including supported root overrides."""
+@pytest.mark.parametrize("leaf,env_vars,under_root", ADAPTER_TOKEN_LEAVES)
+def test_home_override_is_anchored(monkeypatch, tmp_path, leaf, env_vars, under_root) -> None:
+    """An override moves the token, and the gate follows it.
 
-    @property
-    def credentials(self) -> str:
-        return str(Path.home() / ".claude" / ".credentials.json")
+    One variable at a time: an adapter honouring two roots must cover EACH of
+    them, and asserting them together would pass while one was missed.
+    """
+    for var in env_vars:
+        override = tmp_path / f"override-{var.lower()}"
+        override.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv(var, str(override))
+        _clear_cache()
+        try:
+            moved = override.joinpath(*under_root.split("/"))
+            assert is_sensitive_path(str(moved)) is True, (
+                f"{leaf} moved by {var} is no longer gated; a literal "
+                "$HOME-rooted entry only covers the default location"
+            )
+        finally:
+            monkeypatch.delenv(var, raising=False)
+            _clear_cache()
 
-    @property
-    def settings(self) -> str:
-        return str(Path.home() / ".claude" / "settings.json")
 
-    def test_default_token_store_is_blocked_but_settings_are_readable(self) -> None:
-        assert security.is_sensitive_path(self.credentials)
-        assert not security.is_sensitive_path(self.settings)
+@pytest.mark.parametrize("leaf,env_vars,under_root", ADAPTER_TOKEN_LEAVES)
+def test_default_location_survives_an_override(
+    monkeypatch, tmp_path, _isolated_home, leaf, env_vars, under_root
+) -> None:
+    """Setting an override ADDS a target; it never drops the default one.
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "cat ~/.claude/.credentials.json",
-            "base64 ~/.claude/.credentials.json",
-            "python3 -c \"print(open('~/.claude/.credentials.json').read())\"",
-            "cd ~/.claude && cat .credentials.json",
-        ],
-    )
-    def test_bash_matcher_blocks_default_token_reads(self, command: str) -> None:
-        assert security.is_sensitive_bash_command(command)
+    The override anchoring is additive precisely so a host where the adapter
+    still uses its default path keeps its protection.
+    """
+    override = tmp_path / "elsewhere"
+    override.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv(env_vars[0], str(override))
+    _clear_cache()
+    default_target = os.path.join(str(_isolated_home), *leaf.split("/"))
+    assert is_sensitive_path(default_target) is True
 
-    @pytest.mark.parametrize("env_name", ["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"])
-    def test_root_override_reanchors_only_the_token(
-        self,
-        env_name: str,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        override = tmp_path / env_name.casefold()
-        monkeypatch.setenv(env_name, str(override))
-        security._home_targets_cache.clear()
 
-        assert security.is_sensitive_path(str(override / ".credentials.json"))
-        assert not security.is_sensitive_path(str(override / "settings.json"))
+def test_override_roots_are_part_of_the_cache_key() -> None:
+    """A changed override must invalidate the cached target set.
 
-    @pytest.mark.parametrize("env_name", ["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"])
-    def test_shell_expansion_and_relative_read_under_override_are_blocked(
-        self,
-        env_name: str,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        override = tmp_path / env_name.casefold()
-        monkeypatch.setenv(env_name, str(override))
-        security._home_targets_cache.clear()
+    The TTL cache is keyed on the resolved roots, so a root the BUILDER anchors
+    on but the KEY omits would serve targets computed for the previous value —
+    the fail-open shape the resolved-home key already exists to prevent. Asserts
+    on the key's own contents rather than on cache behaviour, so the reason a
+    failure happened is visible.
 
-        assert security.is_sensitive_bash_command(f"cat ${{{env_name}}}/.credentials.json")
-        assert security.is_sensitive_bash_command(f'cd "${{{env_name}}}" && cat .credentials.json')
+    Each adapter override reaches the key through ``adapter_roots``, keyed by the
+    variable name the declaration spells, so what has to be present is the
+    VARIABLE rather than a per-adapter NamedTuple field.
+    """
+    resolved = dict(security._resolve_root_anchors(str(security.Path.home())).adapter_roots)
+    for _leaf, root_envs, _under_root in security._OVERRIDE_ANCHORED_LEAVES:
+        for env_var in root_envs:
+            assert env_var in resolved, (
+                f"_OVERRIDE_ANCHORED_LEAVES anchors on {env_var!r}, which the resolved "
+                "roots do not carry, so it cannot be part of the cache key"
+            )
 
-    @pytest.mark.parametrize("env_name", ["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"])
-    def test_changed_override_invalidates_the_sensitive_target_cache(
-        self,
-        env_name: str,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        first = tmp_path / "first"
-        second = tmp_path / "second"
-        monkeypatch.setattr(security.time, "monotonic", lambda: 1000.0)
-        monkeypatch.setenv(env_name, str(first))
-        security._home_targets_cache.clear()
-        assert security.is_sensitive_path(str(first / ".credentials.json"))
 
-        monkeypatch.setenv(env_name, str(second))
-        assert security.is_sensitive_path(str(second / ".credentials.json"))
+def test_every_anchored_leaf_is_actually_on_the_floor() -> None:
+    """The override table cannot name a leaf the read tier does not classify.
+
+    Guards the opposite drift from the tests above: an entry removed from
+    ``_SENSITIVE_HOME_DIRS`` while its override anchor stays leaves the table
+    describing protection that is not there.
+    """
+    for leaf, _root_fields, _under_root in security._OVERRIDE_ANCHORED_LEAVES:
+        assert (
+            leaf in _SENSITIVE_HOME_DIRS
+        ), f"{leaf} is override-anchored but absent from _SENSITIVE_HOME_DIRS"

@@ -37,6 +37,9 @@ export default [
       // Test files assert on visible English by design.
       'src/**/*.test.{ts,tsx}',
       'src/test/**',
+      // Storybook fixtures are development-only renders of a primitive with
+      // sample copy; nothing in them reaches a user. Same category as tests.
+      'src/**/*.stories.{ts,tsx}',
       // MODEL-FACING PROMPTS, by naming convention. A `*.prompt.ts` module may
       // contain ONLY the text of a message sent to an agent — no UI copy — so the
       // suffix IS the boundary and its sibling module stays fully covered. Same
@@ -60,6 +63,21 @@ export default [
       // the module may contain ONLY paint data, so the filename IS the
       // boundary and its consumer (FolderGlyph.tsx) stays fully covered.
       'src/components/folderColorPaint.ts',
+      // The MCP App (SEP-1865) host theme token map: every string is a CSS custom
+      // property name (`--bg`), a protocol variable key (`--color-text-primary`), a
+      // CSS value (`400`, `9999px`) or the `color-mix()` wash template that derives
+      // the info fill from `--info`. None is read as words — the module's whole
+      // output is a Record of stylesheet declarations handed to an app iframe, and
+      // translating any of it would break the paint it exists to perform. Same
+      // named-boundary idiom as `folderColorPaint.ts` above, and the same
+      // color-mix-over-theme-variables category.
+      //
+      // Stated as a false-negative class, per this file's convention: user-visible
+      // copy added here will not be reported. Verified copy-free rather than
+      // assumed — it imports neither `i18nT` nor `useTranslation`, has no render
+      // path (no JSX, no DOM writes), and its consumer `McpAppFrame.tsx` — which
+      // does carry copy — stays fully covered.
+      'src/lib/mcpAppTheme.ts',
       // Pierre's shared render configuration: injected stylesheet text
       // (`unsafeCSS` templates of selectors, lengths and `var(--…)` references),
       // theme ids the library matches on, and an extension→grammar map. None of
@@ -369,6 +387,29 @@ export default [
               // (`=1`, `=true`) — never a sentence — so prose still cannot match.
               String.raw`^[?&][a-z_]+=[a-z0-9]+$`,
 
+              // An angle-bracketed SENTINEL written into a diagnostic log line, e.g.
+              // `<redacted>`, `<empty>`, `<unserializable>` in lib/paneLog.ts. These are
+              // not copy in either direction: nobody reads them in the UI, and the reader
+              // is whoever greps gateway-launch.log — translating one would make the
+              // journal unsearchable in exactly the incident it exists for, and
+              // `<redacted>` in particular is the marker that a credential was WITHHELD,
+              // so a locale that renamed it would read as if the token had been printed.
+              // Shape: the whole string is one angle-bracketed lowercase word. Prose
+              // never takes that form — copy that mentions a placeholder carries the
+              // surrounding sentence (`Enter <name> here`), which the anchors reject.
+              String.raw`^<[a-z]+>$`,
+
+              // The same sentinel standing in for a URL QUERY, e.g. `?token=<redacted>`
+              // and `?<query>` — the two values `safePaneUrl` substitutes for a query it
+              // will not journal. Deliberately a separate entry from the bare sentinel
+              // above and from the `^[?&][a-z_]+=…$` server-contract shapes: neither of
+              // those admits an angle bracket, and widening either to reach these would
+              // also let a bracket into a shape whose whole tightness argument is that it
+              // carries only `[a-z0-9_=]`. The leading `?` is required, so this cannot
+              // match a bare word, and the key is optional because one of the two forms
+              // replaces the entire query rather than one parameter's value.
+              String.raw`^\?(?:[a-z_]+=)?<[a-z]+>$`,
+
               // A catalog KEY assembled at runtime, e.g.
               // `apps.crewCompanion.state.${slot}`. Translating a key would break the
               // lookup it performs — the value it resolves to is what gets translated.
@@ -436,6 +477,34 @@ export default [
               // merely containing such a token alongside a plain word still
               // fails, because every token must match end to end.
               String.raw`^\[@(?:media|supports)\([^)\s]*\)\]:[^\s]+(?:\s+\[@(?:media|supports)\([^)\s]*\)\]:[^\s]+)*$`,
+              // Tailwind DESCENDANT-VARIANT clusters, e.g. the flush icon-cell row
+              // shared by the message footers in utils/touchActions.ts:
+              // `gap-x-0 [&_button]:h-7 [&>button:first-child]:-ms-[7px] [@media(hover:none)]:[&_button]:h-8`.
+              // Neither shape above covers these: the general class shape forbids
+              // `&`, `>` and `_`, which are what a descendant selector is made of,
+              // and the `@`-variant shape requires EVERY token to open with `[@`,
+              // while this cluster mixes plain utilities (`gap-x-0`) with `[&…]:`
+              // and `[@media(…)]:` tokens. Such constants live at module level
+              // under ALL-CAPS names, so `i18n-strict` looks inside them.
+              //
+              // Deliberately NARROWER than "allow & and > anywhere", on two axes:
+              // (a) the first lookahead rejects any two ADJACENT bare lowercase
+              // words — the prose shape (`copy failed [&_x]:hidden`) that would
+              // otherwise ride in on a single variant token; a class cluster never
+              // has two adjacent bare words, every utility next to a bare
+              // `flex`/`isolate` carries a hyphen, digit, colon or bracket.
+              // (b) the second lookahead requires at least one token that OPENS
+              // with a `[&…]:` descendant variant — copy never opens a word with
+              // `[&` — and `&`, `>`, `_` and `,` are admitted ONLY inside a bracket
+              // group that itself opens with `&` or `@media(`/`@supports(`; outside
+              // them the char class is the general class shape's (plain `[7px]`
+              // arbitrary values included).
+              //
+              // Known false negative, stated: a SINGLE bare word plus variant
+              // tokens (`saved [&_button]:p-0`) is missed — the same single-word
+              // residue the general class shape already accepts, caught by the
+              // en-XA render gate instead.
+              String.raw`^(?!.*(?:^|\s)[a-z]+\s+[a-z]+(?:\s|$))(?=(?:^|.*\s)\[&[^\]\s]*\]:)(?:[\s\-a-z0-9:/().%#\[\]]|\[(?:&|@(?:media|supports)\()[^\]\s]*\])+$`,
               // Tailwind ARBITRARY-VALUE clusters whose bracketed value carries a
               // comma or underscore, e.g. the notification glass surfaces in
               // components/notifications/NotificationFeed.tsx:
@@ -724,7 +793,17 @@ export default [
               // Key CAP names and modifier glyphs. These name physical keys, which the
               // catalog's own translator context says are left as printed on the keyboard
               // (see `components.shortcutsModal.k`, `components.commandPalette.tab`).
-              '[⌘⇧⌥⌃]+[A-Za-z0-9]?$', '(?:Ctrl|Cmd|Alt|Win|Opt|Shift|Esc|Tab|Enter|Del)$',
+              //
+              // `Meta` and `Control` are the WAI-ARIA modifier vocabulary, which is what
+              // an `aria-keyshortcuts` value is spelled in — the same kind of machine
+              // grammar as the OS accelerator entry directly above, just parsed by
+              // assistive tech instead of by the OS. They are needed BARE, unlike the
+              // accelerator pattern, because that one requires a `+<key>` suffix and the
+              // ARIA value is assembled a modifier at a time (see
+              // `hooks/useNavShortcutHint.ts`). Anchored to the whole value like every
+              // sibling here, so a sentence merely containing the word "Control" is still
+              // reported — only the bare token is exempt.
+              '[⌘⇧⌥⌃]+[A-Za-z0-9]?$', '(?:Ctrl|Cmd|Alt|Win|Opt|Shift|Esc|Tab|Enter|Del|Meta|Control)$',
               // A TEMPLATE LITERAL is validated one QUASI at a time (the rule reports
               // the whole template if ANY quasi fails), so the fragments BETWEEN
               // interpolations need shapes of their own. `data:${mime};base64,${b64}`
@@ -831,6 +910,14 @@ export default [
             exclude: [
               // Diagnostics and dev-only output.
               '^console\\.\\w+$', '^(Type)?Error$', '^URL(SearchParams)?$',
+              // Same class as `(Type)?Error` above: `new DOMException('Aborted',
+              // 'AbortError')` carries a protocol error NAME the platform matches
+              // by value (AbortError is how an abort is recognised), never copy.
+              '^DOMException$',
+              // `useStagedMount(gate, key, bypass)`'s string argument is a REMOUNT
+              // CACHE KEY -- an opaque identity with \u0000 separators, compared by
+              // value and never rendered. Anchored to the bare hook name.
+              '^useStagedMount$',
               // `popoutController.ts`'s two console shims: `logDebug` is
               // `console.debug` and `logWarn` is `console.warn`, both behind a debug
               // flag. Identical class to `^console\.\w+$` one line up — the argument
@@ -858,9 +945,29 @@ export default [
               // A CALLEE exemption, not a whole-file one, for the reason the ones
               // above give -- and the name is deliberately long and specific rather
               // than a generic `warnSkip`, so a future helper elsewhere cannot
-              // inherit this by accident. One definition exists today, in
-              // `src/apps/command-bar/contributedCommands.ts`, which renders nothing.
+              // inherit this by accident. TWO definitions exist today:
+              // `src/apps/command-bar/contributedCommands.ts`, which renders nothing,
+              // and `src/apps/fileMenuContributions.tsx`, the same shim for a refused
+              // `contributes.fileMenuItems` row. The second REUSES this name rather
+              // than adding a second global exemption for a differently-named shim:
+              // one entry covering both keeps the released surface the same size,
+              // where two would widen it for no gain. Note the file-scope caveat
+              // still holds for the second one -- `fileMenuContributions.tsx` does
+              // render real rows (a contributed row's app-owned `label`, straight to
+              // JSX), which is exactly why the exemption stays on the callee.
               '^warnContributionSkipped$',
+              // `scrollInspector.ts`'s diagnostic sink. `devLog(tag, detail)` writes a
+              // fixed-format line into a developer overlay -- `STORE.save 9020
+              // a-…794bcf@-471`, `WRITE reprice2 965->20211` -- read by comparing it
+              // against the same line in an earlier frame. Same class as
+              // `^console\\.\\w+$` above; translating it would destroy the only property
+              // that makes it useful, since the format IS the interface.
+              //
+              // A CALLEE exemption rather than a whole-file one, for the reason the
+              // ones above give. One definition exists, in `src/dev/scrollInspector.ts`,
+              // which renders no product copy: everything it draws is this diagnostic
+              // and it is inert unless a developer turns the overlay on.
+              '^devLog$',
               // Validator diagnostics, for parity with `Error` above. A rejected input's
               // reason names the FIELD that failed (`Missing or invalid "meta" field`,
               // `Invalid meta.format: "…" (expected "svg", "lottie", or "sprite")`) and
@@ -1005,6 +1112,10 @@ export default [
           'object-properties': {
             exclude: [
               'id', 'key', 'navId', 'slug', 'type', 'kind', 'code', 'name',
+              // `heightScopeKey: `${slot}@w${bucket}`` -- the virtualizer's height-
+              // cache partition key (slot id + width bucket), looked up by value.
+              // Same class as `key` one entry up; never rendered.
+              'heightScopeKey',
               'className', 'icon', 'path', 'route', 'href', 'url', 'method',
               'event', 'variant', 'color', 'align', 'position', 'placement',
               // Monaco tokenizer state transitions: `next: '@displayMath'`, `'@pop'`.
@@ -1035,6 +1146,14 @@ export default [
               // for — `aliases` moves _total 1842 -> 1840 and changes no other file's
               // entry, so it hands nothing back.
               'aliases',
+              // `namespace: 'KiroCrewComposer'` — Lexical's editor-instance
+              // identifier (`createEditor({ namespace })`), used to tag devtools
+              // and error frames and matched by value; never rendered. Same
+              // lookup-key class as `key`/`navId` above. Measured under the
+              // `aliases` standard: one occurrence in the tree (the new
+              // LexicalComposerInput.tsx), zero baseline entries touched, so the
+              // exemption hands back no other file's debt.
+              'namespace',
               // `error` on a VALIDATION RESULT object (`{ ok: false, error }`) — the
               // same class as `errors.push` in `callees` above, and exempt for the same
               // reason. A user-facing failure message belongs in a toast or a rendered
@@ -1059,6 +1178,28 @@ export default [
           },
         },
       ],
+    },
+  },
+
+  // A URL-path-segment table: the core-owned first segments under
+  // `/api/apps/<app>/`, mirroring `CORE_APP_ROUTE_SEGMENTS` in `apps/manifest.py`.
+  // Route segments are a contract with the router, never copy — a translated
+  // `uninstall` does not localize anything, it silently un-reserves a core route and
+  // lets an app's manifest claim it.
+  //
+  // Scoped to this one file, and the file exists to be scopeable. A global
+  // `words.exclude` shape cannot express it: the values are bare lowercase words
+  // (`open`, `update`, `config`, `enable`), so the whole-value-anchored entry that
+  // would release them would equally release a button labelled exactly "Open". And
+  // releasing their previous home, `apps/fileMenuContributions.tsx`, would release the
+  // app-actions label and every other string in a module that DOES render copy. The
+  // set also sits under an ALL-CAPS declarator, so `eslint.i18n.strict.config.js`
+  // recovers it and `[added-lines]` charges the whole array on any edit to it.
+  // Keep `coreAppRoutes.ts` route segments only.
+  {
+    files: ['src/apps/coreAppRoutes.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
     },
   },
 
@@ -1094,6 +1235,26 @@ export default [
       // whole template sits under an ALL-CAPS declarator.
       'src/apps/crew-companion/styles.ts',
     ],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // The chat scroll inspector: a DEVELOPER OVERLAY, and every string it draws is a
+  // diagnostic whose FORMAT is the interface. Its readout is compared against the
+  // same readout in an earlier frame -- `to-end 24600px  rows=39  msgs=200/7417`,
+  // `WRITE reprice2 965->20211` -- so a localised copy would destroy the only
+  // property that makes it useful, the way a localised `console.log` would.
+  //
+  // Whole-file rather than callee-scoped, unlike `devLog` in `callees` above: the
+  // module also assigns its own `textContent` and `cssText` directly, and it meets
+  // the "verified copy-free" standard the exact-path precedents above are held to
+  // -- it renders NOTHING but this diagnostic, and it is inert unless a developer
+  // turns the overlay on (a module-level flag is read first by every entry point,
+  // so disabled means no element at all). Product copy added here later belongs in
+  // the catalog, not under this exemption; keep this module diagnostics-only.
+  {
+    files: ['src/dev/scrollInspector.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },
@@ -1140,6 +1301,26 @@ export default [
   // `object-properties: next` exclusion above refuses. See the module's own header.
   {
     files: ['src/apps/issue-radar/lib/wireValues.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // DURABLE SERVER-MATCHED VALUE ONLY, same category as `wireValues.ts` above: the
+  // one string in this module is a folder NAME the server stores and this code then
+  // finds again by that name on a later run. Translating it forks a second folder the
+  // moment the reader switches language and strands every session already filed under
+  // the old name, so the value has to be language-independent for the same reason a
+  // protocol value does.
+  //
+  // Scoped to this one file, and the module's own header says to keep it copy-free:
+  // a shape rule cannot express "the identifier a folder is looked up by, but only in
+  // this module", and the alternative tried first — assembling the name at runtime
+  // from lowercase tokens so the scanner could not see it — was worse. That opens a
+  // third suppression channel this config does not count, which is exactly what
+  // centralizing suppression here exists to prevent.
+  {
+    files: ['src/apps/command-bar/sessionFolder.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

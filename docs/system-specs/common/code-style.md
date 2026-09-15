@@ -17,10 +17,11 @@ Paths below are relative to `src/kiro_crew/`.
 | Provider event kinds | `providers/base.py` | Re-exports the `EVENT_*` names from `acp/types.py`; that re-export is the seam providers code against, not a second definition. |
 | ACP client timeouts | `acp/client.py` | `_INIT_TIMEOUT`, `_DEFAULT_PROMPT_TIMEOUT`, `_READ_TIMEOUT`, `_STALE_TURN_TIMEOUT`, `_TOOL_STALL_TIMEOUT`, `_WAIT_RESPONSE_MAX_TIMEOUT`, `_SEL_AUDIT_TIMEOUT_SECONDS`. |
 | MCP protocol version | `mcp_shared.py` | The `initialize` reply's `protocolVersion` for the managed stdio servers. `mcp_cron.py` / `mcp_core.py` do not carry their own copy. |
-| Credential keys | `config/loader.py` | `CRED_*` env-var names plus the `_CREDENTIAL_KEYS` tuple. |
+| Credential keys | `config/loader.py` | `CRED_*` env-var names plus the `CREDENTIAL_KEYS` tuple. |
 | Dashboard port | `config/loader.py` | `_DEFAULT_PORT` (5476) and `DASHBOARD_PORT` (honors `KIROCREW_PORT`). `dashboard/origin.py` imports `_DEFAULT_PORT` rather than restating it. |
 | Hook results and event names | `hooks.py` | `HOOK_PASSTHROUGH` / `HOOK_REPLY` / `HOOK_MODIFY` / `HOOK_INJECT_CONTEXT`, the tool verdicts `TOOL_ALLOW` / `TOOL_AUTO_APPROVE` / `TOOL_DENY`, and `HOOK_EVENT_*` / `HOOK_EVENTS`. |
-| Memory paths and dir names | `memory.py` | `WORKSPACE_DIR_NAME`, `MEMORY_DIR_NAME`, `HISTORY_DIR_NAME`, `PREFERENCES_FILE`, `PROJECTS_FILE`. |
+| Memory paths and dir names | `memory.py` | `WORKSPACE_DIR_NAME`, `MEMORY_DIR_NAME`, `HISTORY_DIR_NAME`, `PREFERENCES_FILE`, `PROJECTS_FILE`, `INDEX_DB_FILE` (the FTS index *name* only — which directory a given store's index sits in is store policy, owned by `memory_stores.memory_index_path_for`). |
+| Named memory stores | `memory_stores.py` | `MEMORY_STORES_DIR_NAME`, `DEFAULT_MEMORY_STORE`, `MEMORY_DB_FILE` (the vector-store filename, which `vector_memory._DB_FILE` aliases rather than restating), `MEMORY_STORE_NAME_MAX`, `_STORE_NAME_RE`, `_WINDOWS_RESERVED_BASENAMES`; the tree's host-local entries `MEMBER_API_KEY_FILE`, `MEMBER_BACKUPS_DIR_NAME`, `EXECUTION_LOGS_DIR_NAME`, `STORE_BACKUP_DIR_NAME` (which `memory_backup.BACKUP_DIR_NAME` aliases), and the layout predicates `is_host_local_store_state` / `named_store_product_file` the snapshot and export read. A stdlib-only LEAF module, so `security.py` can build its sensitive-path fence from `MEMORY_STORES_DIR_NAME` without a cycle. |
 | Lesson limits | `learn.py` | `_LESSONS_FILE`, `_MAX_LESSONS_IN_CONTEXT`, `_MAX_LESSONS_TOTAL` (prune oldest past the total). |
 | Cron limits | `cron.py` | `_CRONS_FILE`, `_STORE_VERSION`, `_MIN_INTERVAL_SECS`, `_JOB_TIMEOUT_SECS`, `_TIMER_POLL_SECS`, `_AUTO_PAUSE_THRESHOLD`, the reaper intervals, the skip-date horizon, the store file-lock timeouts, and the hourly/daily jitter caps. |
 | Session and transcript limits | `history.py` | `SESSIONS_DIR_NAME`, `ARCHIVE_RETENTION_DAYS`, the JSONL rotation pair `_SESSION_MAX_BYTES` (2 MB) / `_SESSION_KEEP_LINES`, the file-lock timeouts, and the search caps (`SEARCH_MIN_CHARS`, `_SEARCH_SCAN_WINDOW`, `_TITLE_BOOST`). |
@@ -29,7 +30,7 @@ Paths below are relative to `src/kiro_crew/`.
 | Heartbeat intervals | `heartbeat.py` | `_DEFAULT_INTERVAL`, `_FTS_REBUILD_TICKS`, `_PRUNE_TICKS`, `HEARTBEAT_TASK_TIMEOUT_SECS`, `HEARTBEAT_FILE`. |
 | Subagent limits | `subagent.py` | `_MAX_CONCURRENT`, `_TIMEOUT_SECS`, `_TURN_LIMIT`, `_MAX_DONE_RESULT_LEN`, `_STARTUP_TIMEOUT_SECS`, `INJECTION_TIMEOUT`, the reaper/stall intervals. |
 | Slot state caps | `dashboard/state.py` | `_MAX_SLOT_MESSAGES`, `_MAX_PERSISTED_NOTIFICATIONS`, `_MAX_SOURCE_LINKS_PER_SLOT`, `_MAX_PENDING_CONTEXT`, `NATIVE_SUBAGENT_DONE_RESULT_CAP`, `_QUESTION_TIMEOUT_MAX`. |
-| Injected-message envelope prefixes | `dashboard/state.py` | `CRON_NOTIFY_PREFIX` / `CRON_NOTIFY_END` / `CRON_NOTIFY_RE`, `SUBAGENT_COMPLETION_PREFIX`, `SUBAGENT_SYNTHESIS_PREFIX`, and the five `*_RECOVERY_PREFIX` markers. All in one place so the frontend has one list to mirror. See [injected-messages](injected-messages.md). |
+| Injected-message envelope prefixes | `dashboard/state.py` | `CRON_NOTIFY_PREFIX` / `CRON_NOTIFY_END` / `CRON_NOTIFY_RE`, `SUBAGENT_COMPLETION_PREFIX`, `SUBAGENT_SYNTHESIS_PREFIX`, and every `*_RECOVERY_PREFIX` marker — `test_recovery_card_prefixes.py` is the cross-language drift guard that keys on that suffix. All in one place so the frontend has one list to mirror. See [injected-messages](injected-messages.md). |
 | Usage cache TTLs | `dashboard/handlers/usage.py` | `_CACHE_TTL`, `_TOKEN_CACHE_TTL`, `_CONTEXT_CACHE_TTL`, `_TOKEN_HISTORY_DAYS`, `_CONTEXT_TOP_SESSIONS`. |
 | Webhook hook limits | `dashboard/handlers/hooks.py` | `_HOOK_MAX_CONCURRENT` (semaphore-backed, 429 past it), `_HOOK_MESSAGE_MAX_LEN`, `_HOOK_TIMEOUT_DEFAULT` / `_HOOK_TIMEOUT_MAX` (both prime, to avoid a thundering herd with cron intervals). |
 | Embed cache | `embeddings.py` | `_EMBED_CACHE_MAX` (128 entries, keyed by text plus model id; the comment there carries the memory arithmetic). |
@@ -41,7 +42,7 @@ Paths below are relative to `src/kiro_crew/`.
 | Base agent config | `config/defaults.json` | `tools`, `allowedTools`, `resources`, `hooks`, model. Packaged as package data, so editing it needs no code change. |
 | Managed MCP server specs | `agent.py` | `_MANAGED_MCP_SERVERS`: which servers are auto-registered and refreshed while preserving user customizations. |
 | AgentCore policy-field validators | `platform/agentcore_schema.py` | `AGENTCORE_GATEWAY_URL_MAX`, `WORKLOAD_NAME_MIN` / `WORKLOAD_NAME_MAX`, `normalize_agentcore_gateway_url`, `normalize_agentcore_workload_name`. AWS-free so governance can parse a policy without the optional extra. |
-| Built-in skills | `builtin_skills/<name>/SKILL.md` | Frontmatter (`always`, `triggers`, `dir`) is the skill's own contract. This is the only tree copied into a user's `~/.kiro/crew/skills/`. |
+| Built-in skills | `builtin_skills/<name>/SKILL.md` | Frontmatter (`always`, `triggers`, `dir`) is the skill's own contract. This is the only tree copied into a user's `~/.kiro/crew/skills/`, so a skill any shipped feature, tool or doc references MUST live here. The top-level `skills/` tree is repo-checkout-only and reaches no installed user. |
 
 Other style rules:
 
@@ -53,6 +54,7 @@ Other style rules:
 | Async | `asyncio` throughout; `async def` for all I/O |
 | Module-global asyncio primitives | Never a bare `asyncio.Lock()`/`Event()`/`Queue()` at module scope — it binds to the import-time (or first-use) loop and raises `RuntimeError` from any other loop (Python 3.10+). Use `kiro_crew.loop_lock.LoopBoundLock` for locks, or create the primitive inside the coroutine. CI enforces this (`loop-bound-locks` gate). |
 | Dataclasses | `@dataclass` for data containers |
+| Product name | The product is **Kiro Crew**: two words, a space, capital `K`. Identifiers keep the spelling their own system gave them (the `kirodotdev/KiroCrew` repo slug, `KiroCrew.dmg` artifacts, the `KiroCrew Nightly` OS identifier, the `kirocrew` CLI, `KIROCREW_*` env vars, `kiro_crew` imports). CI gates the lines a change ADDS, so an existing spelling nearby does not exempt a new one; run `BRAND_BASE_REF=origin/main python3 scripts/check_brand_name.py` before pushing. |
 | Errors | Custom exceptions in `acp/client.py`; return error strings at tool boundaries. See [error-handling](error-handling.md). |
 
 ## Comments explain the WHY
@@ -65,7 +67,10 @@ Do NOT put in a comment or docstring:
 
 - PR or review numbers, review-round or finding markers, ticket ids
 - incident dates, milestone tags, commit SHAs
-- historical narration: "previously", "used to", "we now", "Status: implemented"
+- historical narration: "previously", "used to", "we now", "no longer",
+  "historically", "Status: implemented"
+- a change's place in a sequence of changes: "hotfix", "follow-up to",
+  "regression for", "round N", "GPT round", "review round"
 
 That history lives in git. State CURRENT behavior in present tense. A comment that
 narrates a change is stale the moment the next change lands, and a reader cannot
@@ -74,13 +79,35 @@ tell whether it describes the code in front of them.
 Keep them concise. `_vendor/` (vendored third-party code) and pragma comments
 (`# type: ignore`, `# noqa`) are exempt.
 
+`scripts/check_comment_history.py` enforces this, and the list above IS its rule
+set: every phrase named there is a pattern in the script, and the script matches
+nothing the list does not name. It reads only comment tokens and docstrings, so a
+string literal that is not a docstring is never scanned and a user-facing message
+using one of these phrases is fine. Present-tense purpose is not narration:
+"regression test pins this shape" passes, "regression for the truncated parse"
+does not.
+
+The gate is diff-scoped, like the brand-name gate: it judges only the lines a
+change ADDS, measured against `COMMENT_HISTORY_BASE_REF` (the PR's base in CI).
+Added lines are complete for regression — a line only reaches `main` through a
+diff that added it — and they are the only lines a contributor can act on. There
+is no baseline file: a shared per-file count would make one JSON the merge-conflict
+hotspot of every cleanup PR. The legacy markers the tree still carries are not
+tracked; a marker can re-enter only on an added line, which is what the gate
+judges. Without the env the script prints whole-tree counts and does not enforce.
+
+```bash
+COMMENT_HISTORY_BASE_REF=origin/main python3 scripts/check_comment_history.py
+```
+
 ## The lint pitfalls
 
-The blocking gates are black (baselined), the subprocess-encoding gate (baselined), isort, flake8 and mypy. Run them before
+The blocking gates are black (baselined), the subprocess-encoding gate (baselined), the comment-history gate (diff-scoped), isort, flake8 and mypy. Run them before
 committing:
 
 ```bash
-python3 scripts/check_black_formatting.py && python3 scripts/check_subprocess_encoding.py && isort src/kiro_crew test
+python3 scripts/check_black_formatting.py && python3 scripts/check_subprocess_encoding.py
+COMMENT_HISTORY_BASE_REF=origin/main python3 scripts/check_comment_history.py && isort src/kiro_crew test
 flake8 src/kiro_crew test && mypy src/kiro_crew
 python -m pytest
 ```
@@ -91,6 +118,12 @@ recorded in `.github/black-baseline.txt` and exempted; every other file must be
 clean, and a file that *becomes* clean must be pruned from the list, so it only
 ever shrinks. Format what you touched with
 `black --target-version py310 <paths>`, never the whole tree.
+
+**On macOS, run `mypy --platform linux src/kiro_crew`.** CI type-checks on Linux, and
+typeshed guards `os.listxattr` / `getxattr` / `setxattr` behind
+`sys.platform == "linux"` even though macOS has them. A bare local run therefore
+reports errors in files you did not touch, and — the half that matters — it MISSES the
+Linux-only errors CI fails on, so a clean local run is a false green.
 
 | Gate | Rule | Detail |
 |---|---|---|

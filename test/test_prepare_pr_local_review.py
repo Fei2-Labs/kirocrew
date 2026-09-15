@@ -9,8 +9,8 @@ restating it, so these tests hold two properties:
     (sentinel sections present, lifted verbatim, expressions substituted, model
     pins agreeing with the bundled profile, auxiliary inputs staged the way the
     workflow stages them).
-  * **Loud failure** - if a workflow is restructured so the extraction no longer
-    finds the contract, the script FAILS instead of degrading into a stale
+  * **Loud failure** - if a workflow is restructured so the extraction stops
+    finding the contract, the script FAILS instead of degrading into a stale
     paraphrase. Silently emitting a paraphrase is the exact drift the script
     exists to prevent, so the mutation tests below matter more than the happy
     path: they run the extractor against deliberately broken workflow copies.
@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 from skill_script_helpers import load_skill_script
+
+from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = REPO_ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr"
@@ -69,9 +71,46 @@ FAKE_VALUES = {
 }
 
 
+def _fixture_git_env() -> dict[str, str]:
+    """Env for a fixture git call: no host config, templates, hooks, or identity bleed.
+
+    The session/module-scoped template builders below run BEFORE the function-scoped
+    ``_git_identity`` autouse fixture in ``test/conftest.py`` has pinned anything, so
+    they would otherwise read the developer's real ``~/.gitconfig`` -- a
+    ``commit.gpgSign`` aborts the whole template, and a ``core.hooksPath`` or
+    ``init.templateDir`` would EXECUTE host hooks from inside the test run. The
+    ``GIT_DIR`` location family is dropped (the production list, so an exported
+    ``GIT_DIR`` from a hook or ``rebase --exec`` cannot retarget the fixture), both
+    template channels are emptied, and identity is supplied. Deliberately NOT
+    ``git_command_env()``: that pins ``diff.external`` empty for commands that never
+    diff, and these fixtures run ``git diff``.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS}
+    env.update(
+        {
+            "GIT_TEMPLATE_DIR": "",
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "init.templateDir",
+            "GIT_CONFIG_VALUE_0": "",
+        }
+    )
+    return env
+
+
 def _git(cwd, *args):
     proc = subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_fixture_git_env(),
     )
     return proc.stdout.strip()
 
@@ -145,7 +184,7 @@ def _stage_gpt_prompts(text, stage):
     """Write the shared GPT prompt files where the workflow's specs stage them.
 
     The live workflow splices `.github/review-prompts/gpt-*.md` into its
-    prompt (#5852); the assembler resolves those splices against the staging
+    prompt; the assembler resolves those splices against the staging
     tree, so the extraction helpers must pre-populate it the way
     ``stage_files`` does in production - from the repo's own prompt files.
     """
@@ -196,21 +235,17 @@ def no_gh(monkeypatch):
     return fake
 
 
-@pytest.fixture
-def parity_repo(tmp_path):
-    """A synthetic repo that resolve_profile.py recognises as Kiro Crew.
+@pytest.fixture(scope="session")
+def _parity_repo_template(tmp_path_factory):
+    """Build the parity repo once per session; ``parity_repo`` copies it per test.
 
-    Carries real copies of both reviewer workflows and both base-ref prompt
-    files, a backend AUTOSDE.yaml, and deliberately NO website/AUTOSDE.yaml so
-    the absent-file fallback path is exercised. One base commit on ``main`` plus
-    one feature commit, so BASE...HEAD is non-empty.
-
-    Both contract workflows are committed on ``main`` - the base branch - not
-    only written to the worktree, because the extractor reads a reviewer's
-    contract out of the base commit. A workflow present only in the checkout is
-    not authority and fails the run closed.
+    Ten git subprocesses plus the workflow/prompt copies were paid on every one
+    of the ~130 tests below (~2.5s each under load, the largest single setup
+    cost in the suite). Session scope is safe because this directory is never
+    handed to a test -- only copied from -- so a test that commits, checks out
+    ``main``, or rewrites a workflow in its copy cannot reach another test's.
     """
-    root = tmp_path / "repo"
+    root = tmp_path_factory.mktemp("parity-seed") / "repo"
     (root / ".github" / "workflows").mkdir(parents=True)
     (root / ".github" / "review-prompts").mkdir(parents=True)
     shutil.copy(GPT_WORKFLOW, root / ".github" / "workflows" / GPT_WORKFLOW.name)
@@ -229,6 +264,31 @@ def parity_repo(tmp_path):
     (root / "changed.py").write_text("VALUE = 1\n", encoding="utf-8")
     _git(root, "add", "-A")
     _git(root, "commit", "-m", "feat(thing): add VALUE\n\nA body line for intent.")
+    return root
+
+
+@pytest.fixture
+def parity_repo(tmp_path, _parity_repo_template):
+    """A synthetic repo that resolve_profile.py recognises as Kiro Crew.
+
+    Carries real copies of both reviewer workflows and both base-ref prompt
+    files, a backend AUTOSDE.yaml, and deliberately NO website/AUTOSDE.yaml so
+    the absent-file fallback path is exercised. One base commit on ``main`` plus
+    one feature commit, so BASE...HEAD is non-empty.
+
+    Both contract workflows are committed on ``main`` - the base branch - not
+    only written to the worktree, because the extractor reads a reviewer's
+    contract out of the base commit. A workflow present only in the checkout is
+    not authority and fails the run closed.
+
+    Each test receives its own ``copytree`` of the session template. The repo
+    has no remote, so nothing recorded in ``.git`` names the template's path;
+    the ``reset --hard`` re-stats the copied files against the index, because a
+    copied checkout otherwise reads as having "unstaged changes" on Windows.
+    """
+    root = tmp_path / "repo"
+    shutil.copytree(_parity_repo_template, root)
+    _git(root, "reset", "--hard", "HEAD")
     return root
 
 
@@ -255,7 +315,7 @@ def test_gpt_prompt_is_lifted_verbatim_not_paraphrased():
     """Every extracted line must exist in its source, byte for byte.
 
     This is the property the whole script rests on: the local brief is the
-    server's own text - since #3697 every line of it is a line of a shared
+    server's own text - every line of it is a line of a shared
     prompt file spliced in verbatim.
     """
     prompt = _gpt_prompt()
@@ -364,7 +424,7 @@ def test_opus_wrapper_prompts_extracted_for_every_stage():
 def test_gpt_lane_is_spliced_and_opus_lane_has_no_prompt_target():
     """Lane dispatch keys on the prompt-assembly splice, so the shapes stay disjoint.
 
-    Since #3697 the GPT lane's prompt is assembled purely from shared prompt
+    The GPT lane's prompt is assembled purely from shared prompt
     files (dispatch keys on the opening ``cat ... >`` splice). Its specs carry
     the workflow's cp bootstrap as a worktree fallback; the Opus lane's specs
     stay fail-closed (no fallback).
@@ -744,7 +804,7 @@ def test_a_reviewer_declaring_no_contract_is_skipped_not_failed(parity_repo, tmp
 )
 def test_non_string_contract_exits_40_through_the_cli(parity_repo, tmp_path, literal):
     """The CLI documents EXIT_PARITY for a profile the extractor cannot honour.
-    A falsy value (``0``, ``false``, ``""``) additionally used to be dropped by
+    A falsy value (``0``, ``false``, ``""``) can be dropped by
     a truthiness filter, silently reviewing against fewer contracts than the
     profile declared - so it must fail closed here too, not skip."""
     _profile_on_main(
@@ -836,7 +896,7 @@ def test_a_string_model_survives_the_type_gate():
 )
 def test_non_string_model_exits_40_through_the_cli(parity_repo, tmp_path, field, literal):
     """The CLI documents EXIT_PARITY for a profile the extractor cannot honour.
-    A truthy non-string used to reach ``.lower()`` and exit 1 with a traceback."""
+    A truthy non-string would otherwise reach ``.lower()`` and exit 1 with a traceback."""
     _profile_on_main(
         parity_repo,
         "[review]\n[[review.reviewers]]\nname = \"gpt\"\n"
@@ -909,8 +969,8 @@ def test_two_reviewers_cannot_claim_one_brief(tmp_path):
 def test_duplicate_reviewer_names_refuse_before_any_brief_is_written(
     parity_repo, tmp_path, no_gh
 ):
-    """Two same-named reviewers used to produce two lanes and ONE brief file:
-    whichever wrote last handed its contract to both reviewers. Fail closed, and
+    """Two same-named reviewers would produce two lanes and ONE brief file:
+    whichever wrote last hands its contract to both reviewers. Fail closed, and
     leave no half-assembled output behind."""
     _profile_on_main(
         parity_repo,

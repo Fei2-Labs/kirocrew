@@ -108,7 +108,9 @@ Two properties are load-bearing and worth knowing before you touch that lane:
 
 - **Linux is built natively per arch, never cross-compiled.** `build-desktop.sh`
   provisions a python-build-standalone interpreter and then *runs* it (pip
-  install, plus the `python -m kiro_crew --version` self-containment gate), so a
+  install, plus the `python -m kiro_crew --version` self-containment gate and
+  its companion `import kiro_crew.cli` chain probe — bare `--version` answers
+  before the heavy imports, so the probe carries the gate's meaning), so a
   host that cannot execute the target architecture cannot build it. macOS gets
   away with one host only because Rosetta 2 executes the x86_64 slice.
 - **The runner's glibc is the ceiling on what the artifacts may require.** The
@@ -371,22 +373,25 @@ same way). Key details:
   drifted probe list breaks the build instead of every user's launch (see
   [How the app finds and launches the backend](#how-the-app-finds-and-launches-the-backend)).
 - **Self-containment verified** — the build script runs
-  `PYTHONNOUSERSITE=1 bin/python3.12 -m kiro_crew --version` to catch any
-  missing dependency before packaging.
+  `PYTHONNOUSERSITE=1 bin/python3.12 -m kiro_crew --version` followed by
+  `PYTHONNOUSERSITE=1 bin/python3.12 -c 'import kiro_crew.cli'` to catch any
+  missing dependency before packaging. Bare `--version` is a pre-dispatch
+  fast-path (see `docs/system-specs/modules/cli.md`), so the import probe is
+  the half that resolves the chain.
 - **Local dictation runtime bundled** — supported desktop builds include
   `pywhispercpp`, the platform `imageio-ffmpeg` executable used for compressed
   recordings, and all transitive runtime dependencies. The build imports the
   recognizer and executes the exact packaged decoder before publishing — and
   distinguishes a decoder that fails to AUTHENTICATE, which fails the build, from
   one that authenticates but will not run on the build host, which warns and
-  ships (see [stt-streaming](../system-specs/features/stt-streaming.md)). Model
+  ships (see [stt-streaming](../system-specs/modules/stt-streaming.md)). Model
   weights are deliberately excluded from the installer: the user selects a
   model and clicks **Download now**, with no package manager or separate
   dependency step. Intel macOS is the unsupported recognizer exception.
   Every bundled executable ships **uncompressed** — the Apple notary service
   decompresses archive members and rejects an unsigned executable found inside
   one, which fails the whole macOS release (see
-  [stt-streaming](../system-specs/features/stt-streaming.md) for how the runtime
+  [stt-streaming](../system-specs/modules/stt-streaming.md) for how the runtime
   then authenticates a decoder whose bytes signing rewrote).
 - **Dashboard bundled** — the SPA is staged into
   `lib/python3.12/site-packages/kiro_crew/static/dist/` inside the bundle.
@@ -906,11 +911,55 @@ commands honored must install the resources directory root-owned.
 
 The commands run with a **constructed environment**, not the app's own. Only an explicit pass-through set reaches them — `USER`, `LOGNAME`, `TZ`, `TMPDIR`, the `LANG`/`LC_*` locale vars, and the proxy vars — plus a narrowed system-only `PATH` and `cwd=/`. `HOME` is deliberately excluded: Python derives its user-site directory from it, so passing it through would let a planted `sitecustomize.py` run on every `python` start. Everything else is absent by construction, because `shell: true` means a shell interprets the command and a shell reads its environment as code: the loader family (`LD_*`/`DYLD_*`), the interpreter family (`PYTHON*`, `NODE_OPTIONS`), the startup files (`BASH_ENV`, `ENV`), the tracing pair (`SHELLOPTS` plus a command-substituting `PS4`), word splitting (`IFS`), and exported shell functions (`BASH_FUNC_*`, which shadow a command name outright). A packager whose updater needs any other variable must set it inside its own command rather than relying on inheritance.
 
-**On Windows the marker's commands are never honored.** There is no POSIX owner
-to read and `access(W_OK)` does not model ACLs, so no honest provenance verdict
-exists; the check fails closed by declaration and every Windows marker is
-treated as bare (managed, updater off). A Windows packager drives updates with
-its own installer, not through this marker.
+**On Windows a loose marker's commands are never honored.** There is no POSIX
+owner to read and `access(W_OK)` does not model ACLs, so no honest provenance
+verdict exists; the check fails closed by declaration and every loose Windows
+marker is treated as bare (managed, updater off). A Windows packager either
+drives updates with its own installer or bakes the marker in (next).
+
+### Baking the marker into the app (editions)
+
+The provenance rule above refuses every install the app's own user owns, which
+is every per-user package manager (a Toolbox, Homebrew, `~/Applications`), and
+can never pass on Windows. An **edition** — a build that IS produced by the
+package manager's owner — does not need to drop a file beside the app after the
+fact; it declares the marker at build time:
+
+```bash
+KIROCREW_MANAGED_INSTALL_MARKER=/path/to/marker.json bash packaging/build-desktop.sh
+```
+
+`build-desktop.sh` validates the file (a JSON object of string fields
+`managedBy` / `updateCommand` / `checkCommand`, under 8 KiB, with an
+`updateCommand` — a marker that disables updates while offering none fails the
+build rather than shipping silently) and copies it to
+`website/electron/EXTERNALLY-MANAGED`, which electron-builder packs **into
+`app.asar` next to `main.js`**. The running app reads that copy first and
+trusts it without any ownership probe, on every platform: it is part of the
+application's own code, so anyone positioned to rewrite it is already
+positioned to rewrite the code that reads it, and no file-ownership check could
+add to that. On macOS the baked copy is additionally sealed by codesign. A baked
+marker outranks a loose one when both exist — a build-time declaration by the
+edition that produced the binary beats a file dropped next to it later.
+
+The default build ships no baked marker (the file is gitignored and removed at
+the start of every build), so a plain checkout keeps the loose-marker contract
+exactly as described above.
+
+The commands themselves still run under the constructed environment described
+above: **no app environment variable reaches them** — not `HOME`, and not
+anything the edition's own wrapper exported before launching the app. So a
+command must not rely on `$HOME` or `~` expanding (derive the home directory
+from `USER`, which is passed through, or name paths that do not depend on it),
+and must not reference a variable it expects the app to have inherited. On
+Windows that failure is silent: `cmd.exe` leaves an undefined `%VAR%` in the
+command line **as the literal text `%VAR%`**, not as an empty string, so a
+wrapper argument such as `"%SOME_VAR%"` arrives as that string. The one value
+the constructed environment does derive for the command is
+`KIROCREW_MANAGED_ARGV0` — the running app executable's absolute path
+(`process.execPath`, taken from the process, never from the environment) — so a
+wrapper that verifies its relaunch target has a trustworthy answer without any
+inheritance.
 
 For local testing, the `KIROCREW_EXTERNALLY_MANAGED` env var points at a marker
 file (any other non-empty value marks the install managed with no metadata).

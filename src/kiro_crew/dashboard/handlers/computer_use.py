@@ -761,10 +761,9 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         # (``agent._computer_use_spec_gate``): while it is off the server is not in
         # ``mcpServers`` at all, so no backend is spawned. A reset alone would
         # therefore restart every session into the SAME spec that omits the server
-        # — the tools would not appear until the next gateway start, which is a
-        # regression in the one path that has to work. Rebuilding here keeps the
-        # user-visible contract ("enable, sessions restart, tools are there")
-        # exactly as it was.
+        # — the tools would not appear until the next gateway start. Rebuilding
+        # here holds the user-visible contract: enable, sessions restart, tools
+        # are there.
         #
         # UNDER THE CONFIG LOCK, reacquired: the rebuild READS the keystone and
         # WRITES the spec, so leaving it outside would let two overlapping PUTs
@@ -777,8 +776,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         # so this cannot self-deadlock.
         #
         # A rebuild failure must not fail the SAVE: the write already landed and
-        # was audited. The fallback is the pre-existing behaviour — the tool
-        # surface appears on the next gateway start.
+        # was audited. The fallback is the un-rebuilt spec — the tool surface
+        # appears on the next gateway start.
         #
         # The import is function-local and must STAY function-local, which is not
         # a style choice: it makes the name resolve at CALL time, so
@@ -801,8 +800,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             sessions_reset = await _reset_all_sessions(request)
         except Exception:
             # The write already landed and was audited; a restart failure must not
-            # report the SAVE as failed. Worst case is the pre-existing behaviour:
-            # the new tool surface appears on the next cold session.
+            # report the SAVE as failed. Worst case: the new tool surface appears
+            # on the next cold session.
             logger.exception("computer-use enable saved, but session reset failed")
 
     payload = await _full_payload()

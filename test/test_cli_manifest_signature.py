@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -19,6 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 from installer_test_helpers import run_bounded
+from skill_script_helpers import load_skill_script
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "packaging" / "signing" / "cli-manifest.py"
@@ -49,18 +49,30 @@ def _find_openssl() -> str | None:
     return next((str(path) for path in candidates if path.is_file()), None)
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _openssl_on_path():
-    """Expose Git for Windows' OpenSSL to Python helpers and installer shells."""
+@pytest.fixture(scope="module")
+def _openssl_bin() -> str:
+    """Resolve the OpenSSL executable path once per module (no PATH mutation)."""
     openssl = _find_openssl()
     if openssl is None:
         pytest.skip("OpenSSL is not available")
-    old_path = os.environ.get("PATH", "")
-    os.environ["PATH"] = str(Path(openssl).parent) + os.pathsep + old_path
-    try:
-        yield
-    finally:
-        os.environ["PATH"] = old_path
+    return openssl
+
+
+@pytest.fixture(autouse=True)
+def _openssl_on_path(_openssl_bin: str, monkeypatch):
+    """Expose Git for Windows' OpenSSL to Python helpers and installer shells.
+
+    Function-scoped (not module-scoped): a module-scoped mutation is applied
+    once at the first test's setup and reverted once at the last test's
+    teardown, so every test in between runs correctly but the first/last
+    test's own per-test env snapshot shows PATH changing across the test
+    boundary. monkeypatch.setenv is function-scoped and reverts after EACH
+    test, so no single test's boundary ever sees the mutation persist. The
+    binary lookup itself stays module-scoped (``_openssl_bin``) since it does
+    no PATH mutation and is safe to cache.
+    """
+    openssl_dir = str(Path(_openssl_bin).parent)
+    monkeypatch.setenv("PATH", openssl_dir + os.pathsep + os.environ.get("PATH", ""))
 
 
 @dataclass(frozen=True)
@@ -72,13 +84,13 @@ class SigningKey:
 
 
 @pytest.fixture(scope="module")
-def test_key(tmp_path_factory: pytest.TempPathFactory) -> SigningKey:
+def test_key(tmp_path_factory: pytest.TempPathFactory, _openssl_bin: str) -> SigningKey:
     root = tmp_path_factory.mktemp("cli-manifest-key")
     private = root / "private.pem"
     public = root / "public.pem"
     subprocess.run(
         [
-            "openssl",
+            _openssl_bin,
             "genpkey",
             "-algorithm",
             "RSA",
@@ -92,13 +104,13 @@ def test_key(tmp_path_factory: pytest.TempPathFactory) -> SigningKey:
         stderr=subprocess.DEVNULL,
     )
     subprocess.run(
-        ["openssl", "pkey", "-in", str(private), "-pubout", "-out", str(public)],
+        [_openssl_bin, "pkey", "-in", str(private), "-pubout", "-out", str(public)],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     der = subprocess.run(
-        ["openssl", "pkey", "-pubin", "-in", str(public), "-outform", "DER"],
+        [_openssl_bin, "pkey", "-pubin", "-in", str(public), "-outform", "DER"],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -258,7 +270,7 @@ def test_optional_min_version_is_signed_and_round_trips(
     assert verified.returncode == 0, verified.stderr
 
     # Flip the floor after signing: the canonical payload changes, so the
-    # existing signature must no longer verify.
+    # existing signature must fail to verify.
     manifest["min_version"] = "0.0.1"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     tampered = _run_helper(
@@ -768,10 +780,9 @@ def test_kms_signer_requires_matching_non_exportable_key_and_verifies_output(
         stderr=subprocess.DEVNULL,
     ).stdout
 
-    spec = importlib.util.spec_from_file_location("cli_manifest_test_helper", HELPER)
-    assert spec is not None and spec.loader is not None
-    helper = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(helper)
+    # Import-by-path writes bytecode beside the source unless suppressed; the
+    # helper does the suppression, so no __pycache__ lands in packaging/signing/.
+    helper = load_skill_script("cli_manifest_test_helper", HELPER)
 
     key_arn = "arn:aws:kms:us-west-2:000000000000:key/test"
     aws_calls: list[list[str]] = []
@@ -871,7 +882,7 @@ def test_verify_accepts_a_signed_manifest_and_rejects_tampering(
     verified = _verify_manifest(manifest, test_key)
     assert verified.returncode == 0, verified.stderr
 
-    # Tampered field: signature no longer covers the payload.
+    # Tampered field: the signature does not cover the payload.
     data = json.loads(manifest.read_text(encoding="utf-8"))
     data["version"] = "9.9.9"
     tampered = tmp_path / "tampered.json"

@@ -3,7 +3,7 @@
 Third-party MCP servers write telemetry, caches, and scratch files into
 whatever temp directory their process sees. Spawned with an inherited
 default, that is the shared system temp dir -- which nothing ever cleans, so
-their output accumulates for as long as the host lives (issue #5064). Setting
+their output accumulates for as long as the host lives. Setting
 ``TMPDIR``/``TMP``/``TEMP`` at the spawn chokepoint contains every
 well-behaved server without touching any server's code. A server that
 hardcodes ``/tmp`` ignores the variables and keeps today's behavior: this is
@@ -95,6 +95,28 @@ def allocate_probe_tmp() -> Path:
     owner-dead dir the daemon sweep reclaims once idle.
     """
     return allocate_backend_tmp("probe")
+
+
+#: Child-facing scratch subdirectory of a probe allocation (see
+#: :func:`probe_child_scratch`).
+PROBE_SCRATCH_SUBDIR = "tmp"
+
+
+def probe_child_scratch(root: Path) -> Path:
+    """Create and return the child-facing scratch subdir of a probe allocation.
+
+    The allocation ROOT holds the ``.owner`` reclamation record. The probe's
+    sandbox write carve-out and the ``TMPDIR`` triple point at this SUBDIR so
+    that record stays OUTSIDE the child's writable window: a child
+    that could garble ``.owner`` (or write a live pid into it) would make the
+    directory permanently unreclaimable by the daemon sweep after a gateway
+    crash, since the sweep deletes only owned-and-dead directories. Same
+    permission treatment as the parent allocation.
+    """
+    scratch = root / PROBE_SCRATCH_SUBDIR
+    scratch.mkdir(mode=0o700)
+    platform_compat.restrict_dir_to_owner(scratch)
+    return scratch
 
 
 def tmp_env(path: Path) -> dict[str, str]:

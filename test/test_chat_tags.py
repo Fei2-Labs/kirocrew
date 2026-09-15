@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -295,7 +296,7 @@ class TestTagVocabulary:
     async def test_update_tag_redacts_credential_straddling_truncation(self, tmp_path, monkeypatch):
         """Redaction must run BEFORE truncation: a credential crossing the
         60-char cut would otherwise be sliced into a fragment the scanners
-        no longer recognize, persisting a raw key prefix."""
+        do not recognize, persisting a raw key prefix."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
         app = _make_tags_app(state)
@@ -474,6 +475,7 @@ class TestSlotTags:
             t1 = await (await client.post("/api/chat/tags", json={"name": "T1"})).json()
             t2 = await (await client.post("/api/chat/tags", json={"name": "T2"})).json()
             slot = _ChatSlot("s1")
+            original_revision = slot.tags_revision
             state._slots["s1"] = slot
             with patch("kiro_crew.dashboard.chat_tags.save_slot_off_loop"):
                 resp = await client.put(
@@ -483,7 +485,242 @@ class TestSlotTags:
             assert resp.status == 200
             data = await resp.json()
             assert data["tags"] == [t1["id"], t2["id"]]
+            assert data["tags_revision"] == slot.tags_revision
+            assert data["prior_tags_revision"] == original_revision
+            assert slot.tags_revision != original_revision
+            # Revisions are TOTALLY ORDERED, not merely opaque: a persisted
+            # per-process epoch counter then a zero-padded sequence, so a client
+            # can tell an older snapshot it never saw (a delayed HTTP fetch after
+            # a newer WebSocket frame, or a slow pre-restart reply) from a newer
+            # commit by string order alone. The successor must share the epoch
+            # and sort strictly after its predecessor.
+            import re as _re
+
+            assert _re.fullmatch(r"\d{16}\.\d{20}-[0-9a-f]{8}", slot.tags_revision)
+            assert _re.fullmatch(r"\d{16}\.\d{20}-[0-9a-f]{8}", original_revision)
+            assert slot.tags_revision.split(".")[0] == original_revision.split(".")[0]
+            assert slot.tags_revision > original_revision
+            assert state.serialize_slot(slot)["tags_revision"] == slot.tags_revision
             assert slot.tags == [t1["id"], t2["id"]]
+
+    @pytest.mark.asyncio
+    async def test_assign_with_stale_base_revision_is_refused_without_writing(
+        self, tmp_path, monkeypatch
+    ):
+        """Two clients: B commits t2 while A composes ``[t1]`` onto the earlier
+        snapshot. A's write names that snapshot's revision as its base; the
+        server compares under the tag lock, refuses without touching the slot,
+        and returns the current list + revision so A can rebase its delta. The
+        same list sent with the CURRENT revision (or no base at all) commits."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        app = _make_tags_app(state)
+        async with TestClient(TestServer(app)) as client:
+            t1 = await (await client.post("/api/chat/tags", json={"name": "T1"})).json()
+            t2 = await (await client.post("/api/chat/tags", json={"name": "T2"})).json()
+            slot = _ChatSlot("s1")
+            state._slots["s1"] = slot
+            stale_base = slot.tags_revision
+            with patch("kiro_crew.dashboard.chat_tags.save_slot_off_loop") as save:
+                # Client B commits t2 (unconditional legacy write).
+                resp = await client.put("/api/chat/slots/s1/tags", json={"tags": [t2["id"]]})
+                assert resp.status == 200
+                current = slot.tags_revision
+                assert current != stale_base
+                saves_before = save.call_count
+                # Client A, composed onto the pre-B snapshot, tries to replace with [t1].
+                resp = await client.put(
+                    "/api/chat/slots/s1/tags",
+                    json={"tags": [t1["id"]], "base_tags_revision": stale_base},
+                )
+                assert resp.status == 409
+                body = await resp.json()
+                assert body["code"] == "stale_base"
+                assert body["base_tags_revision"] == stale_base
+                assert body["tags_revision"] == current
+                assert body["tags"] == [t2["id"]]
+                assert slot.tags == [t2["id"]] and slot.tags_revision == current
+                assert save.call_count == saves_before  # nothing written
+                # A rebases its delta onto the returned list and retries.
+                resp = await client.put(
+                    "/api/chat/slots/s1/tags",
+                    json={"tags": [t2["id"], t1["id"]], "base_tags_revision": current},
+                )
+                assert resp.status == 200
+                assert slot.tags == [t2["id"], t1["id"]]
+                assert (await resp.json())["prior_tags_revision"] == current
+                # A non-string base is rejected up front.
+                resp = await client.put(
+                    "/api/chat/slots/s1/tags", json={"tags": [], "base_tags_revision": 5}
+                )
+                assert resp.status == 400
+                assert (await resp.json())["code"] == "base_not_string"
+
+    @pytest.mark.asyncio
+    async def test_assign_refusal_restores_tags_and_revision(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        app = _make_tags_app(state)
+        async with TestClient(TestServer(app)) as client:
+            tag = await (await client.post("/api/chat/tags", json={"name": "T1"})).json()
+            slot = _ChatSlot("s1")
+            slot.tags = ["existing"]
+            original_revision = slot.tags_revision
+            state._slots["s1"] = slot
+
+            async def _refuse(*_args, **_kwargs):
+                return False
+
+            state.push_slots_update = MagicMock()
+            with patch("kiro_crew.dashboard.chat_tags.save_slot_off_loop", _refuse):
+                resp = await client.put(
+                    "/api/chat/slots/s1/tags", json={"tags": [tag["id"]]}
+                )
+
+            assert resp.status == 409
+            assert slot.tags == ["existing"]
+            body = await resp.json()
+            assert body["code"] == "session_gone"
+            # The provisional revision may have leaked via a concurrent slots
+            # broadcast while the save awaited; the rejection must name it so
+            # clients can classify that frame as stale, not as a newer writer.
+            assert body["rejected_tags_revision"]
+            assert body["rejected_tags_revision"] != original_revision
+            # The rollback mints a FRESH revision rather than restoring the
+            # prior one: a client that adopted the leaked revision already
+            # treats the prior one as a known predecessor and would keep the
+            # rejected tags. The fresh revision is broadcast so it reconverges.
+            assert slot.tags_revision != original_revision
+            assert slot.tags_revision != body["rejected_tags_revision"]
+            assert body["tags_revision"] == slot.tags_revision
+            # The rolled-back list rides along so a client can seed its accepted
+            # snapshot from the server's post-rollback state before retrying.
+            assert body["tags"] == ["existing"]
+            state.push_slots_update.assert_called()
+
+    def test_revision_epoch_persists_and_orders_across_restarts(self, tmp_path, monkeypatch):
+        """A restarted process claims a higher epoch from the persisted counter,
+        so every revision it mints sorts after every revision of the previous
+        process — however far the old process's sequence had advanced."""
+        from kiro_crew.dashboard import state as state_module
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        # Process 1: fresh data home, seeds the counter and mints many revisions.
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_EPOCH", None)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_SEQ", 0)
+        old_revisions = [state_module.mint_tags_revision() for _ in range(50)]
+        assert old_revisions == sorted(old_revisions)
+        epoch_file = tmp_path / state_module._TAGS_REVISION_EPOCH_FILE
+        first_epoch = int(epoch_file.read_text().strip())
+        assert first_epoch > 0
+        # Process 2 ("restart"): re-claims (>= counter + 1 and >= clock) and
+        # starts its sequence over.
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_EPOCH", None)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_SEQ", 0)
+        new_revision = state_module.mint_tags_revision()
+        assert int(epoch_file.read_text().strip()) > first_epoch
+        assert new_revision.split(".")[1].startswith("0" * 19 + "1")
+        assert all(new_revision > old for old in old_revisions)
+        # A backward clock step cannot regress the claim below the counter.
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_EPOCH", None)
+        monkeypatch.setattr(state_module.time, "time_ns", lambda: 1_000_000)
+        assert state_module.ensure_tags_revision_epoch() == int(epoch_file.read_text().strip())
+        assert state_module.ensure_tags_revision_epoch() > int(new_revision.split(".")[0])
+
+    def test_unpersisted_epoch_mints_opaque_revisions(self, tmp_path, monkeypatch):
+        """When the epoch counter cannot be persisted, no ordering may be asserted
+        (the next restart cannot know about it, and a backward clock step could
+        then yield a LOWER orderable epoch that clients would reject). The process
+        mints opaque revisions instead, which clients treat with equality and
+        lineage only; a later writable restart persists a real epoch again and
+        orderable minting resumes."""
+        import re as _re
+
+        from kiro_crew.dashboard import state as state_module
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        epoch_file = tmp_path / state_module._TAGS_REVISION_EPOCH_FILE
+        epoch_file.write_text("41\n")
+        real_atomic_write = state_module.atomic_write
+
+        def _unwritable(*_args, **_kwargs):
+            raise OSError("read-only data home")
+
+        monkeypatch.setattr(state_module, "atomic_write", _unwritable)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_EPOCH", None)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_SEQ", 0)
+        assert state_module.ensure_tags_revision_epoch() is None
+        opaque = [state_module.mint_tags_revision() for _ in range(3)]
+        assert all(_re.fullmatch(r"[0-9a-f]{32}", r) for r in opaque)
+        assert len(set(opaque)) == 3
+        assert epoch_file.read_text().strip() == "41"  # nothing persisted
+        # The failed claim is remembered: no disk retry on every mint.
+        assert state_module._TAGS_REVISION_EPOCH == state_module._TAGS_REVISION_EPOCH_UNPERSISTED
+
+        # Home becomes writable again on a later restart: orderable minting resumes.
+        monkeypatch.setattr(state_module, "atomic_write", real_atomic_write)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_EPOCH", None)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_SEQ", 0)
+        recovered = state_module.mint_tags_revision()
+        assert _re.fullmatch(r"\d{16}\.\d{20}-[0-9a-f]{8}", recovered)
+        assert int(epoch_file.read_text().strip()) == int(recovered.split(".")[0]) > 41
+
+    def test_epoch_claim_is_durable_before_it_is_used(self, tmp_path, monkeypatch):
+        """The anti-regression guarantee rests on the persisted counter surviving
+        a crash. The claim must fsync the file's data AND sync the parent
+        directory (the rename's entry) before any revision is minted from it;
+        otherwise a power loss inside the flush window followed by a backward
+        clock step re-claims an epoch that connected clients already hold."""
+        from kiro_crew.dashboard import state as state_module
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        calls: list[tuple[str, object]] = []
+        real_atomic_write = state_module.atomic_write
+
+        def _recording_write(path, data, **kwargs):
+            calls.append(("write", kwargs.get("fsync", False)))
+            return real_atomic_write(path, data, **kwargs)
+
+        def _recording_fsync_dir(path, **_kwargs):
+            calls.append(("sync_dir", Path(path)))
+
+        monkeypatch.setattr(state_module, "atomic_write", _recording_write)
+        monkeypatch.setattr(state_module, "fsync_dir", _recording_fsync_dir)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_EPOCH", None)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_SEQ", 0)
+        claimed = state_module.ensure_tags_revision_epoch()
+        assert claimed is not None and claimed > 0
+        assert calls == [("write", True), ("sync_dir", tmp_path)]
+
+        # A directory sync that reports the device refused the write is a failed
+        # claim: the counter is not durable, so ordering must not be asserted.
+        def _failing_fsync_dir(path, **_kwargs):
+            raise OSError(5, "EIO")
+
+        monkeypatch.setattr(state_module, "fsync_dir", _failing_fsync_dir)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_EPOCH", None)
+        assert state_module.ensure_tags_revision_epoch() is None
+
+    def test_malformed_epoch_file_mints_opaque_revisions(self, tmp_path, monkeypatch):
+        """A counter that cannot be parsed is not "no counter": the real value may
+        exceed anything the clock now yields, so re-seeding from the clock could
+        persist a LOWER epoch than clients already hold (a backward clock step
+        after the corruption). The process must mint opaque revisions and leave
+        the file alone rather than assert an order it cannot prove."""
+        import re as _re
+
+        from kiro_crew.dashboard import state as state_module
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        epoch_file = tmp_path / state_module._TAGS_REVISION_EPOCH_FILE
+        epoch_file.write_text("garbage\n")
+        # Backward clock: far below any epoch a healthy process would have claimed.
+        monkeypatch.setattr(state_module.time, "time_ns", lambda: 1_000_000)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_EPOCH", None)
+        monkeypatch.setattr(state_module, "_TAGS_REVISION_SEQ", 0)
+        assert state_module.ensure_tags_revision_epoch() is None
+        assert _re.fullmatch(r"[0-9a-f]{32}", state_module.mint_tags_revision())
+        assert epoch_file.read_text() == "garbage\n"  # never overwritten with a low epoch
 
     @pytest.mark.asyncio
     async def test_assign_slot_not_found(self, tmp_path, monkeypatch):
@@ -809,9 +1046,47 @@ class TestDrop:
                 resp = await client.post("/api/chat/slots/s1/drop", json={"column_id": col["id"]})
             data = await resp.json()
             assert data["ok"] is True
+            assert "tags_revision" not in data
             assert done["id"] in data["tags"]
             assert todo["id"] not in data["tags"]
             assert spike["id"] in data["tags"]
+
+    @pytest.mark.asyncio
+    async def test_drop_refusal_restores_tags_with_fresh_revision(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        app = _make_tags_app(state)
+        async with TestClient(TestServer(app)) as client:
+            todo = await (
+                await client.post("/api/chat/tags", json={"name": "ToDo", "status": True})
+            ).json()
+            done = await (
+                await client.post("/api/chat/tags", json={"name": "Done", "status": True})
+            ).json()
+            slot = _ChatSlot("s1")
+            slot.tags = [todo["id"]]
+            original_revision = slot.tags_revision
+            state._slots["s1"] = slot
+            col = await (
+                await client.post(
+                    "/api/chat/tag-columns", json={"tag_ids": [done["id"]], "mode": "any"}
+                )
+            ).json()
+
+            async def _refuse(*_args, **_kwargs):
+                return False
+
+            state.push_slots_update = MagicMock()
+            with patch("kiro_crew.dashboard.chat_tags.save_slot_off_loop", _refuse):
+                resp = await client.post("/api/chat/slots/s1/drop", json={"column_id": col["id"]})
+            data = await resp.json()
+            assert data["ok"] is False
+            # Tags rolled back, but under a FRESH revision (not the prior one a
+            # client that saw the leaked provisional frame already treats as
+            # stale), and the rollback is broadcast so clients reconverge.
+            assert slot.tags == [todo["id"]]
+            assert slot.tags_revision != original_revision
+            state.push_slots_update.assert_called()
 
     @pytest.mark.asyncio
     async def test_drop_on_filter_only_column_is_noop(self, tmp_path, monkeypatch):
@@ -1232,7 +1507,7 @@ class TestNonObjectBodiesAcrossConvertedHandlers:
     ``[]`` / ``"s"`` / ``5`` / ``true`` / ``null`` are all VALID JSON, so
     ``request.json()`` returned them and the ``.get()`` (or ``in``) that each
     handler performs next raised from OUTSIDE the parse ``try`` -- a 500 for
-    what is really malformed client input (issue #5587). Driven through a real
+    what is really malformed client input. Driven through a real
     client so the shared guard's 64 KB pre-decode cap is exercised on the wire,
     which is how these endpoints now read their body; the cap decision for each
     site is recorded in ``_CAP_REGISTER`` in ``test_json_object_body_guard.py``.

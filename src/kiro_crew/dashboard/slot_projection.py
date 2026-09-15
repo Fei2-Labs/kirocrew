@@ -6,6 +6,32 @@ from collections.abc import Callable
 from typing import Any
 
 
+def resolved_row_identity(slot: Any) -> str:
+    """The identity the sidebar renders this slot under.
+
+    A purely local session is its own key. A remote-bound one -- minted through
+    ``create_peer_slot`` or adopted from a peer row -- is ``<instance_id>:<peer_key>``,
+    the same identity the peer row carries before anything is bound to it.
+
+    That equality is the whole point. The sidebar keys rows on this value (React
+    key, ``layoutId``, ``data-session-row``, the hover-hold seats), so a binding
+    that preserves it re-renders ONE row where a fresh key would mount a second
+    element beside the row the user clicked and leave the browser to notice they
+    are the same conversation.
+
+    The invariant that buys, and the trap in it: for a remote-bound session this
+    identity is NOT the local slot key, and never becomes it. Read ``key`` when you
+    need the local slot -- switching sessions, loading a transcript, addressing the
+    slot on the wire. Splitting this string to recover that key yields the PEER's
+    key, which is routable only inside a request sent back through that instance.
+    """
+    instance_id = getattr(slot, "instance_id", "") or ""
+    remote_slot = getattr(slot, "remote_slot", "") or ""
+    if getattr(slot, "is_remote", False) and instance_id and remote_slot:
+        return f"{instance_id}:{remote_slot}"
+    return str(getattr(slot, "key", "") or "")
+
+
 class SlotProjection:
     """Build cached source links and the public summary of a slot.
 
@@ -213,14 +239,40 @@ class SlotProjection:
             # = it can, null = not known yet. Carried so the frontend reads the
             # answer instead of inferring it from whether the pin appears in
             # `GET /api/models` -- a list every unrelated filter (deprecation,
-            # curation) narrows, which silently turned those filters into
-            # entitlement signals (#1819). DISPLAY only; never a write source.
+            # curation) narrows, which would silently turn those filters into
+            # entitlement signals. DISPLAY only; never a write source.
             "model_withheld": slot.model_withheld,
+            # The model the live session actually resolved to, so a slot that
+            # inherits (no pin, or a withheld one) can be NAMED rather than
+            # shown as "auto". "" = not known. DISPLAY only, like the verdict
+            # above: never a write source.
+            "served_model": slot.served_model,
             "reasoning_effort": slot.reasoning_effort,
             "mode": slot.mode,
             "surface": slot.mode,
             "workspace": slot.workspace,
             "project": slot.project,
+            # Remote-execution binding. Shipped on every slot (not just remote
+            # ones) so the frontend can branch on a field that is always
+            # present: an absent key and "runs locally" would be the same
+            # reading, and a stale client would then render a peer session as
+            # local. The binding's third field, `remote_slot`, is still NOT
+            # projected: it is the PEER's slot key, routable only inside a
+            # request sent back through that instance, and shipping a routable
+            # peer key to a browser buys nothing.
+            #
+            # What the browser does need from it is the row's IDENTITY, so that
+            # is projected instead, already resolved. A remote-bound session --
+            # minted through `create_peer_slot` or adopted from a peer row --
+            # identifies as `<instance_id>:<peer_key>`, which is exactly the
+            # identity the peer row carried before it was bound. Same identity
+            # before and after means the sidebar re-renders ONE row rather than
+            # replacing the row the user clicked with a sibling, and it means a
+            # log line, a `data-session-row` selector and a trace all stay
+            # continuous across the adopt instead of splitting in two.
+            "executor": slot.executor,
+            "instance_id": slot.instance_id,
+            "row_identity": resolved_row_identity(slot),
             "artifact": slot._artifact,
             "messages": len(slot.messages),
             "running": slot.running,
@@ -262,6 +314,7 @@ class SlotProjection:
             "folder_id": slot.folder_id,
             "pinned": slot.pinned,
             "tags": list(slot.tags),
+            "tags_revision": getattr(slot, "tags_revision", ""),
             "color_index": slot.color_index,
             "color_hex": slot.color_hex,
             "color_theme": slot.color_theme,
@@ -272,4 +325,12 @@ class SlotProjection:
             "linked_session_key": slot.linked_session_key,
             "app": slot._app,
             "origin": slot._origin,
+            # Creator attribution: the slot key of the session that asked for
+            # this one via the session-control create verb ("" for a person's
+            # own tab, a fork, a restore). Written at birth and rehydrated, so
+            # it is the one durable link from a crew member's DM thread to the
+            # workers it drives -- the Crew Members drawer filters the live
+            # ``slots`` frames on it. A member caller is ownership-fenced to the
+            # slots it created (``authorize_target``), so created == driven.
+            "created_by": getattr(slot, "_created_by", ""),
         }

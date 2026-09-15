@@ -20,7 +20,7 @@ import {
   sendErrorToChat,
   __resetNavSeamForTests,
 } from '../utils/errorReport'
-import { PREFILL_STORAGE_KEY } from '../utils/navIntent'
+import { PREFILL_STORAGE_KEY, writePrefill } from '../utils/navIntent'
 
 vi.mock('react-virtuoso', () => ({
   Virtuoso: ({ data, itemContent }: { data?: unknown[]; itemContent: (index: number, item: unknown) => ReactNode }) => (
@@ -234,15 +234,22 @@ describe('ChatPage error handoff', { timeout: 15_000 }, () => {
       sendErrorToChat('second diagnostic')
     })
 
-    await waitFor(() => expect(api.createChatSlot).toHaveBeenCalledTimes(2))
-    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('error-two'))
+    // The second handoff is not processed until the first has finished its
+    // seed confirmation: `processErrorHandoffs` polls up to 300 x 10ms for the
+    // composer to take the prompt (or the slot to move on), and only then
+    // schedules the next item on a 0ms timer. That is up to ~3s of legitimate
+    // internal waiting before `createChatSlot` can be called a second time, so
+    // `waitFor`'s 1000ms default was asserting on a moment the code had not
+    // reached yet. The widened ceilings name that boundary; nothing sleeps.
+    await waitFor(() => expect(api.createChatSlot).toHaveBeenCalledTimes(2), { timeout: 5000 })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('error-two'), { timeout: 5000 })
     await waitFor(() => {
       expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe('second diagnostic')
-    })
+    }, { timeout: 5000 })
     await waitFor(() => {
       const drafts = JSON.parse(localStorage.getItem('mc-chat-drafts') || '{}')
       expect(drafts['error-one']).toBe('first diagnostic')
-    })
+    }, { timeout: 5000 })
     expect(consumeChatHandoff()).toBeNull()
   })
 
@@ -449,6 +456,43 @@ describe('ChatPage composerSlotRef effect ordering', () => {
 })
 
 describe('ChatPage draft persistence', { timeout: 15_000 }, () => {
+  it('leaves the draft alone when a staged prefill belongs to another slot', async () => {
+    // A prefill is addressed to ONE slot. Landing on a different slot must not
+    // seed the composer with it, and must not consume it either — the slot it
+    // was written for may become active next.
+    localStorage.setItem('mc-chat-drafts', JSON.stringify({ 'slot-a': 'mine, still here' }))
+    writePrefill('slot-b', 'prompt for B')
+    const store = makeStore('slot-a', [{ key: 'slot-a' }, { key: 'slot-b' }])
+    await renderAndWaitForInput(store)
+
+    await waitFor(() => expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe('mine, still here'))
+    expect(JSON.parse(sessionStorage.getItem(PREFILL_STORAGE_KEY)!).slotKey).toBe('slot-b')
+  })
+
+  it('discards an unreadable prefill and restores the persisted draft', async () => {
+    localStorage.setItem('mc-chat-drafts', JSON.stringify({ 'slot-a': 'mine, still here' }))
+    sessionStorage.setItem(PREFILL_STORAGE_KEY, '{not json')
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    await renderAndWaitForInput(store)
+
+    await waitFor(() => expect((screen.getByLabelText('Message input') as HTMLTextAreaElement).value).toBe('mine, still here'))
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('stops the browser navigating away when files are dragged over the page', async () => {
+    // Chrome opens a dropped file as a new document unless dragover/drop are
+    // cancelled at the document level; the page installs that guard on mount.
+    // Fired on `document` directly — the composer's own drop target stops
+    // propagation, so a drop there never reaches this listener.
+    const store = makeStore('slot-a', [{ key: 'slot-a' }])
+    await renderAndWaitForInput(store)
+
+    // fireEvent returns dispatchEvent's verdict: false once preventDefault ran.
+    expect(fireEvent.dragOver(document, { dataTransfer: { types: ['Files'] } })).toBe(false)
+    // A text drag is not a file: nothing to guard, the default stays.
+    expect(fireEvent.dragOver(document, { dataTransfer: { types: ['text/plain'] } })).toBe(true)
+  })
+
   it('preserves draft when switching sessions', async () => {
     const store = makeStore('slot-a', [{ key: 'slot-a' }, { key: 'slot-b' }])
     await renderAndWaitForInput(store)

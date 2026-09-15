@@ -149,6 +149,31 @@ class TestReplyFormatCollapse:
         assert out[REPLY_FORMAT_LABEL] == len(contracts)
         assert sum(out.values()) == len(body + contracts)
 
+    def test_pre_request_contracts_use_the_stable_marker(self):
+        project = "[PROJECT] /workspace/example\n\n"
+        thread_meta = "[marker-removed]\nordinary fallback context\n"
+        contracts = (
+            "[REPLY FORMAT RULES]\n"
+            "\n\n(If presenting choices, end with options)"
+            "\n\n(If a decision is needed, ask once)"
+        )
+        header = "[CURRENT USER REQUEST -- respond]\n"
+        typed = "Which permission is missing?"
+        prompt = project + thread_meta + contracts + header + typed
+        assert prompt.count("[REPLY FORMAT RULES]") == 1
+        start = len(prompt) - len(typed)
+
+        out = split_blocks(prompt, user_span=(start, len(prompt)))
+
+        # Fallback metadata is another user's data. It stays outside the trusted
+        # reply-format block (and therefore remains with the preceding context
+        # bucket until it gains its own marker).
+        assert out["working_folder"] == len(project) + len(thread_meta)
+        assert out[REPLY_FORMAT_LABEL] == len(contracts)
+        assert out["request_header"] == len(header)
+        assert out[USER_LABEL] == len(typed)
+        assert sum(out.values()) == len(prompt)
+
 
 class TestForgedMarkersInUserText:
     """The user's own text is the one attacker-controlled span of the prompt."""
@@ -263,7 +288,7 @@ class TestExpandedInputAttribution:
 class TestEmittedMarkersAreRecognized:
     """Every marker the context assembly emits must be in _MARKERS, or its bytes
     fold into the PRECEDING block and mislabel (e.g. [UI LANGUAGE] / [USER
-    PROFILE] counted as runtime). Regression for the identity/session banners.
+    PROFILE] counted as runtime).
     """
 
     def test_identity_banners_are_their_own_blocks_not_runtime(self):
@@ -328,7 +353,7 @@ class TestPostAssemblyOpenersAreRecognized:
         # The block runs from its marker; the separator newline before it stays
         # with the preceding block.
         assert out["theme_persona"] == len(persona) - 1
-        # The persona's own bytes are NO LONGER credited to the request header.
+        # The persona's own bytes are not credited to the request header.
         assert out["request_header"] == len(header) + 1
         assert out[USER_LABEL] == len(typed)
         assert sum(out.values()) == len(prompt)
@@ -383,7 +408,7 @@ class TestUserTypedMarkerNeutralizedBeforeSizing:
     """chat_runner sizes the user span from the NEUTRALIZED message (the same
     _neutralize_structural_markers build_message applies), so a user who types a
     primary boundary marker does not over-credit the span into the trailing
-    reply-format contract. Regression for pre-neutralization length.
+    reply-format contract.
     """
 
     def test_typed_request_header_marker_does_not_bleed_into_contract(self):
@@ -414,9 +439,9 @@ class TestUserTypedMarkerNeutralizedBeforeSizing:
 class TestAppendedSuffixDoesNotShiftUserOffset:
     """An APPENDED suffix after the user text (theme persona, inline $skill body)
     must NOT be folded into user_offset — the offset counts only what was
-    PREPENDED between the request header and the user text. Regression for the
-    persona-append shift: chat_runner measures the message length BEFORE the
-    persona append, so the offset here stays prepend-only. This exercises the
+    PREPENDED between the request header and the user text. chat_runner measures
+    the message length BEFORE the persona append, so the offset here stays
+    prepend-only. This exercises the
     split_blocks contract that fix relies on, at a block boundary where the
     difference is observable.
     """

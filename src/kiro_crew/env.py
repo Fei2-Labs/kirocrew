@@ -16,7 +16,7 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
 
 from kiro_crew import platform_compat
-from kiro_crew.config.paths import data_home
+from kiro_crew.config.paths import data_home, peek_data_home
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
@@ -48,10 +48,10 @@ _EXTRA_PATH_DIRS = (
 # declared by bare name never launches and the session simply comes up short of
 # tools, which reads as a missing capability rather than a launch failure.
 #
-# So the list is extensible from two sides, merged in :func:`mcp_search_path`
-# (issue #5083). Fixing it at that one function is deliberate: it is the path all
-# three of those consumers resolve against, so one contributed directory reaches
-# all of them without any of them knowing it exists.
+# So the list is extensible from two sides, merged in :func:`mcp_search_path`.
+# Fixing it at that one function is deliberate: it is the path all three of those
+# consumers resolve against, so one contributed directory reaches all of them
+# without any of them knowing it exists.
 #
 # * ``mcp.extra_path_dirs`` in the config — an operator on one host.
 # * :func:`register_mcp_path_dirs` — a packaged/downstream build or an embedding
@@ -626,6 +626,27 @@ def git_build_info() -> tuple[str, str]:
     )
 
 
+def _managed_browser_cli_dirs() -> list[str]:
+    """Managed browser CLI directories exposed to agent shell commands.
+
+    The resolver in ``browser_cli.install`` never consumes this search path. It
+    resolves the same crew-home leaf by absolute path. These entries exist only
+    so an approved agent shell command can spell ``playwright-cli`` normally;
+    the OS sandbox seals the whole prefix read-only before that shell starts.
+    """
+    try:
+        root = peek_data_home() / "playwright-cli"
+    except Exception:
+        logger.debug("could not resolve managed browser CLI path", exc_info=True)
+        return []
+    entries: tuple[Path, ...]
+    if platform_compat.IS_WINDOWS:
+        entries = (root / "managed-bin", root / "bin", root)
+    else:
+        entries = (root / "managed-bin", root / "bin")
+    return [value for entry in entries if (value := _validated_bin_dir(str(entry)))]
+
+
 def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     """Return *base_path* prepended with well-known MCP binary directories.
 
@@ -665,7 +686,8 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     # would otherwise put a relative "{mise_data}/shims" entry on every spawned
     # subprocess's PATH, re-resolved against the CHILD's cwd — letting a
     # work-dir-relative executable shadow the configured command.
-    extra = [
+    extra = _managed_browser_cli_dirs() if home is None else []
+    extra += [
         e
         for d in _EXTRA_PATH_DIRS
         if (e := _validated_bin_dir(d.format(home=resolved_home, mise_data=mise_data)))
@@ -685,7 +707,7 @@ _SEARCH_PATH_REPORT_LIMIT = 40
 #: Appended to "MCP command not found" warnings. Naming the directories searched
 #: tells a reader the binary is installed somewhere uncovered; this tells them
 #: what to do about it, so the diagnosis and the remedy arrive together instead
-#: of the remedy living only in the source (issue #5083).
+#: of the remedy living only in the source.
 MCP_PATH_HINT = "if it is installed elsewhere, add that directory to mcp.extra_path_dirs"
 
 
@@ -825,7 +847,7 @@ def spec_env_path(env_path: str) -> str:
 
 
 def mcp_search_path(env_path: str) -> str:
-    """:func:`spec_env_path` plus the contributed MCP directories (issue #5083).
+    """:func:`spec_env_path` plus the contributed MCP directories.
 
     The path an MCP command is RESOLVED against -- the probe, the agent-config
     command resolver, and gatewayd's rewriter all use this one. Separate from
@@ -874,7 +896,7 @@ def mcp_search_path(env_path: str) -> str:
 #
 # * ``LD_*`` / ``DYLD_*`` are dynamic-loader channels honoured by every
 #   ELF/Mach-O binary in the spawn chain, the sandbox wrapper included.
-# * The listed ``PYTHON*`` keys matter because Kiro Crew's Linux sandbox launcher
+# * The ``PYTHON`` namespace matters because Kiro Crew's Linux sandbox launcher
 #   IS a Python process: ``sandbox.namespace_argv`` returns
 #   ``[sys.executable, "-I", "-S", "-B", <generated script>, *argv]`` (sandbox.py),
 #   and that interpreter starts with the env we hand ``Popen``. A declared
@@ -884,13 +906,35 @@ def mcp_search_path(env_path: str) -> str:
 #   ``PYTHONUSERBASE`` is too: it relocates user-site, whose ``.pth`` files are
 #   EXECUTED during startup.
 #
-# NOTE this list is a prefix set, not the glob ``PYTHON*`` — do not describe it as
-# such. It does not cover ``HOME``, which also derives the user-site path when
-# ``PYTHONUSERBASE`` is unset, and stripping ``HOME`` from a spec overlay would
-# break servers that legitimately need it. The launcher's ``-I -S`` is what
+# NOTE the ``PYTHON`` entry covers that whole namespace by prefix, but this is
+# still a PREFIX set rather than a general glob: it does not cover ``HOME``,
+# which also derives the user-site path when ``PYTHONUSERBASE`` is unset, and
+# stripping ``HOME`` from a spec overlay would break servers that legitimately
+# need it. The launcher's ``-I -S`` is what
 # actually closes that class (site processing never happens, so no ``.pth`` runs
 # whatever the paths point at); these prefixes are defense in depth for it and the
 # primary control for any future launcher that forgets those flags.
+#
+# ``PYTHON`` is denied as a NAMESPACE, not as a list of the dangerous names in
+# it, for the same reason ``KIROCREW_`` is below: an enumeration cannot cover the
+# variable nobody has added yet. ``python3 --help-env`` documents 29 ``PYTHON*``
+# variables on 3.12 alone, plus platform-only spellings like
+# ``PYTHONEXECUTABLE``, and several are execution channels rather than
+# preferences -- ``PYTHONPATH`` places a ``sitecustomize`` module,
+# ``PYTHONSTARTUP`` names a file, ``PYTHONBREAKPOINT`` takes a dotted callable
+# and imports it, ``PYTHONWARNINGS`` resolves a dotted filter category through
+# ``warnings._getcategory``'s ``__import__``, ``PYTHONHOME`` and
+# ``PYTHONPLATLIBDIR`` move where the standard library is found. Naming them
+# one at a time was tried and did not converge: this set reached six entries by
+# accretion while 23 documented siblings stayed open.
+#
+# The cost is a benign ``PYTHON*`` variable in a spec being refused --
+# ``PYTHONUNBUFFERED=1`` on a user's own Python MCP server is the realistic
+# example. That is a logged refusal rather than a broken server (see the
+# asymmetry note below), and ``denied_spec_env_keys`` names the key so the probe
+# explains itself instead of reading as a bug. Every first-party ``PYTHON*`` use
+# in this tree sets the variable directly on a child process rather than
+# declaring it in a spec ``env``, so none of them route through here.
 #
 # Prefix-matched, case-insensitively (Windows env is case-insensitive).
 #
@@ -906,10 +950,7 @@ def mcp_search_path(env_path: str) -> str:
 _SPEC_ENV_DENIED_PREFIXES: tuple[str, ...] = (
     "LD_",
     "DYLD_",
-    "PYTHONPATH",
-    "PYTHONHOME",
-    "PYTHONSTARTUP",
-    "PYTHONUSERBASE",
+    "PYTHON",
 )
 
 # The env namespace Kiro Crew reserves for ITSELF. A spec-declared ``env`` may
@@ -920,18 +961,16 @@ _SPEC_ENV_DENIED_PREFIXES: tuple[str, ...] = (
 # how the gateway tells a process it spawns WHO IS CALLING, and the consumers
 # treat them as vouched-for:
 #
-# * ``KIROCREW_CLI`` — ``mcp_cron._caller_is_cli()`` is exactly
-#   ``os.environ.get("KIROCREW_CLI") == "1"``, and a true return makes the cron
-#   tools skip per-session ownership entirely. Forged, it turns
-#   ``cron_remove_all`` into "delete every session's jobs" and ``cron_list``
-#   into the cross-principal disclosure ``mcp_cron`` explicitly refuses (see its
-#   ownerless-row note: an allowlisted Slack participant is not the operator).
+# * ``KIROCREW_CLI`` — no consumer reads it. It is covered because the deny is on
+#   the NAMESPACE rather than on a list of keys, which is the same property that
+#   covers the next identity variable somebody adds.
 # * ``KIROCREW_SESSION_KEY`` / ``KIROCREW_HOST_PID`` — two of the three sources
 #   ``mcp_core._resolve_session_key_strict()`` accepts, chosen precisely because
 #   they are, in its own words, sources "the gateway authors and an agent cannot
 #   write". A spec overlay authoring one makes that claim false, which is worse
 #   than the loader class: it corrupts the resolver the ownership checks are
-#   built on rather than the process that hosts them.
+#   built on rather than the process that hosts them. These two are the live
+#   reason this boundary exists.
 # * ``KIROCREW_OWNER_ID`` / ``KIROCREW_INTERNAL_SECRET`` — the Slack owner
 #   identity and the loopback shared secret. ``cron_script`` already denies these
 #   two on its own path; putting them here extends the same control to the probe,
@@ -962,10 +1001,24 @@ _SPEC_ENV_RESERVED_PREFIXES: tuple[str, ...] = ("KIROCREW_",)
 def sanitize_spec_env(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
     """Drop loader-injection and reserved-namespace keys from a spec env.
 
-    For spawn paths that apply a config-declared ``env`` to a child THEY
-    launch (the probe). The declared env is config-file
-    text — the same trust level as the command itself, which those paths
-    already refuse to run unsandboxed — so a key that executes code in the
+    For paths that let a config-declared ``env`` reach a child process. Two
+    shapes qualify and both are covered: a spawn path that launches the child
+    ITSELF (the probe), and a path that EMITS the env into an agent spec for
+    ``kiro-cli`` to launch from (``agent._enforce_managed_mcp_ownership``, for
+    a managed server's entry merged out of the agent-writable
+    ``agent.json``). The launcher's identity does not change the argument --
+    what matters is that config-file text becomes a child's environment.
+
+    That second caller does NOT disturb the ``emit_env`` asymmetry noted above.
+    The asymmetry protects a USER'S OWN Python MCP server, which may
+    legitimately be configured through ``env.PYTHONPATH``; the managed
+    population is ours, its ``command``/``args`` are ours, and it runs as the
+    entry point holding the internal API secret, so no declared loader or
+    namespace variable on it is legitimate in the first place.
+
+    The declared env is config-file
+    text -- the same trust level as the command itself, which those paths
+    already refuse to run unsandboxed -- so a key that executes code in the
     launcher before confinement is established must not pass through.
 
     Two independent classes are dropped, for two different reasons:
@@ -977,13 +1030,15 @@ def sanitize_spec_env(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
       mitigate this one at all: confinement bounds what the child may touch, not
       whose jobs Kiro Crew believes the child is entitled to. That is why "the
       command is equally config-authored, and it runs sandboxed" does not settle
-      this class the way it settles the command itself. This prefix set is
-      interim depth, not the authorization control: it stops the ``env`` block
+      this class the way it settles the command itself. This prefix set is depth,
+      not the authorization control, and it cannot be: it stops the ``env`` block
       from spelling an identity key, while the same config's ``command`` field
-      reaches the identical consumer (``sh -c 'KIROCREW_CLI=1 exec ...'``). The
-      real fix is consumer-side vouching so the claim is one a config cannot
-      author -- tracked in #6624. Keep this set when that lands; it also covers
-      KIROCREW_SESSION_KEY / KIROCREW_HOST_PID.
+      reaches the identical consumer (``sh -c 'KIROCREW_SESSION_KEY=... exec
+      ...'``). The control belongs at the CONSUMER, which must not grant
+      authority from ambient environment at all. Keep this set regardless:
+      ``KIROCREW_SESSION_KEY`` / ``KIROCREW_HOST_PID`` have legitimate producers,
+      so for them the consumer-side answer is a strict resolver, and this prefix
+      keeps a config out of the overlay it reads.
 
     Matching is case-INSENSITIVE on purpose: Windows environment variables
     are case-insensitive, so ``pythonpath`` reaches Python exactly like
@@ -993,14 +1048,36 @@ def sanitize_spec_env(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
     Dropped keys are logged at WARNING: a spec relying on one is broken by
     policy, not by accident, and silence would read as the credential-drop
     bug this sanitizer's caller exists to fix.
+
+    An entry whose key or value is not a string is dropped for a different
+    reason -- not policy but type. The signature promises ``str -> str`` and
+    every caller builds ``pairs`` from parsed JSON, so without this the
+    ill-typed value reaches an emitted spec whose schema is a string map.
     """
     out: dict[str, str] = {}
     for key, value in pairs:
+        # Honor this function's own str -> str signature. Every caller builds
+        # `pairs` from parsed JSON, where a value may be any JSON type, so an
+        # `env` of {"PORT": 3000} would otherwise be copied through into an
+        # emitted spec whose schema is a string map -- and a spec kiro-cli
+        # rejects costs the user every Crew MCP tool, from one mistyped config
+        # value. Dropped rather than coerced with str(), matching how a
+        # malformed non-dict `env` is dropped by the managed-entry caller: a
+        # value we invent is not the one the user wrote. A non-string KEY is
+        # unreachable from JSON (object keys are always strings) but would
+        # crash `key.upper()` below, so it is guarded in the same place.
+        if not isinstance(key, str) or not isinstance(value, str):
+            logger.warning(
+                "dropping spec env entry %r: keys and values must be strings, got "
+                "key %s and value %s",
+                key,
+                type(key).__name__,
+                type(value).__name__,
+            )
+            continue
         folded = key.upper()
         if any(folded.startswith(p) for p in _SPEC_ENV_DENIED_PREFIXES):
-            logger.warning(
-                "dropping spec env key %r: loader/interpreter injection channel", key
-            )
+            logger.warning("dropping spec env key %r: loader/interpreter injection channel", key)
             continue
         if any(folded.startswith(p) for p in _SPEC_ENV_RESERVED_PREFIXES):
             # Distinct message on purpose: reporting a forged KIROCREW_CLI as a
@@ -1041,8 +1118,7 @@ def denied_spec_env_keys(env: "Mapping[str, object]") -> list[str]:
     return [
         k
         for k in env
-        if isinstance(k, str)
-        and any(k.upper().startswith(p) for p in _SPEC_ENV_DENIED_PREFIXES)
+        if isinstance(k, str) and any(k.upper().startswith(p) for p in _SPEC_ENV_DENIED_PREFIXES)
     ]
 
 

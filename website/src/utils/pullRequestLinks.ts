@@ -1,5 +1,5 @@
 import type { ComponentType } from 'react'
-import type { ChatMessage, SourceProviderId } from '../types'
+import type { ChatMessage, ChatSlot, SourceProviderId } from '../types'
 import { reportSeamCollision } from '../apps/seamCollision'
 import { safeSetItem } from './safeStorage'
 
@@ -42,6 +42,25 @@ export function partitionSourceLinks(
   const issues: PullRequestLink[] = []
   for (const link of links) (link.kind === 'issue' ? issues : changes).push(link)
   return { changes, issues }
+}
+
+/**
+ * The pull-request URLs a slot's sidebar chips name — the set a turn-boundary
+ * invalidation is scoped to. Issue links are skipped (their panel has no
+ * turn-boundary refresh), an unknown slot yields nothing, and the list is the
+ * serialized chip subset, not every link in the transcript: the slots payload
+ * carries only the first few, so a session with more PRs than chips has its
+ * overflow left to the status-delta path.
+ */
+export function slotChangeUrls(slots: readonly ChatSlot[], slotKey: string): string[] {
+  const slot = slots.find(s => s.key === slotKey)
+  if (!slot?.source_links) return []
+  const urls: string[] = []
+  for (const link of slot.source_links) {
+    if (link.kind === 'issue' || !link.url || urls.includes(link.url)) continue
+    urls.push(link.url)
+  }
+  return urls
 }
 
 /* ── Source-provider registry (edition extension seam) ────────────────────────
@@ -548,6 +567,40 @@ export function forgeChipLabel(link: PullRequestLink): string | null {
     }
     return typeof label === 'string' && label ? label : null
   }
+  const project = sourceProjectPath(link)
+  if (project === null) return null
+  const sigil = link.provider === 'gitlab' && link.kind === 'change' ? '!' : '#'
+  return `${project}${sigil}${link.number}`
+}
+
+/** The FULL project path a GitHub / GitLab link belongs to — `owner/repo` for
+ *  GitHub, `group/subgroup/project` for GitLab (subgroups included). Recovered
+ *  from the parser's own canonical `url`, because `link.repo` deliberately keeps
+ *  only the last path segment (see the `PullRequestLink` docs), which two
+ *  same-named projects in different groups would collide on. Returns null for
+ *  Jira, for a registered provider (which owns its own chip grammar), and for
+ *  any shape the parser would not have produced. Derives only from a url THIS
+ *  module built, never from raw chat text. */
+export function sourceProjectPath(link: PullRequestLink): string | null {
+  if (link.provider !== 'github' && link.provider !== 'gitlab') return null
+  return projectPathFromUrl(link)
+}
+
+/** The host a GitHub / GitLab link lives on (`gitlab.com`, `gitlab.internal`).
+ *  Project paths are only unique per host — self-managed GitLab is a supported
+ *  configuration, so `group/svc` can exist on two hosts at once — which makes
+ *  the host part of a project's identity even though it is usually elided from
+ *  labels. Null for Jira and registered providers, matching sourceProjectPath. */
+export function sourceProjectHost(link: PullRequestLink): string | null {
+  if (link.provider !== 'github' && link.provider !== 'gitlab') return null
+  try {
+    return new URL(link.url).host
+  } catch {
+    return null
+  }
+}
+
+function projectPathFromUrl(link: PullRequestLink): string | null {
   let path: string
   try {
     path = new URL(link.url).pathname
@@ -558,13 +611,13 @@ export function forgeChipLabel(link: PullRequestLink): string | null {
     // Canonical shape: /owner/repo/(pull|issues)/N
     const parts = path.split('/').filter(Boolean)
     if (parts.length !== 4) return null
-    return `${parts[0]}/${parts[1]}#${link.number}`
+    return `${parts[0]}/${parts[1]}`
   }
   // GitLab: the project path is everything before the /-/ marker.
   for (const { marker } of GITLAB_MARKERS) {
     const idx = path.lastIndexOf(marker)
     if (idx <= 0) continue
-    return `${path.slice(1, idx)}${link.kind === 'change' ? '!' : '#'}${link.number}`
+    return path.slice(1, idx)
   }
   return null
 }

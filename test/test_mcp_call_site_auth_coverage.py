@@ -68,11 +68,19 @@ import ast
 import re
 from pathlib import Path
 
+import pytest
+
 from kiro_crew.dashboard.server import (
     _MIXED_INTERNAL_API_PATHS,
     _STRICT_INTERNAL_API_PATHS,
 )
 from kiro_crew.dashboard.token_auth import _BYPASS_EXACT, internal_path_matches
+
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_mcp_call_site_auth_coverage")
 
 _SRC = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
 _CORE = _SRC / "mcp_core.py"
@@ -91,7 +99,9 @@ _SOURCES = (
     _CORE,
     _SRC / "mcp_shared.py",
     _SRC / "mcp_dashboard.py",
+    _SRC / "mcp_work.py",
     _SRC / "mcp_computer.py",
+    _SRC / "mcp_cron.py",
     _SRC / "cli_commands.py",
     _SRC / "cli_server.py",
     _SRC / "cron_script.py",
@@ -686,6 +696,17 @@ class TestMcpCallSiteAuthCoverage:
             if path.resolve() in scanned:
                 continue
             if "/tests/" in f"/{rel}" or path.name.startswith("test_"):
+                continue
+            # OUT OF SCOPE BY SHAPE, not by exception: a container image's own source
+            # under ``apps/builtins/<app>/crew/runtime/**``. This guard exists because a
+            # module that reaches THE DASHBOARD with the internal secret must have its
+            # call sites checked. That tree is not in the dashboard's process: it is
+            # built into a Linux image and its secret header is passed between the
+            # image's OWN processes over loopback, never to the owner's gateway. It is
+            # also not importable from here, which is what
+            # ``test_spawn_audit.py::test_container_image_assets_are_not_imported``
+            # holds, so adding it to ``_SOURCES`` is not available either.
+            if "/crew/runtime/" in f"/{rel}":
                 continue
             text = path.read_text(encoding="utf-8")
             tree = ast.parse(text)

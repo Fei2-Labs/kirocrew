@@ -109,7 +109,7 @@ class TestUrlOverride:
         """A mirror override may carry credentials, a signed query, or a PATH token."""
         redacted = engine_source.redact_url("https://u:p@host/path?sig=secret#frag")
         assert "secret" not in redacted and "p@" not in redacted
-        # HOST-ONLY. The path used to be kept, and it is the third place a mirror can
+        # HOST-ONLY. The path is dropped, and it is the third place a mirror can
         # hide a secret — `/artifactory/api/npm/tok-…/`, a presigned `/AKIA…/`.
         assert redacted == "https://host"
 
@@ -177,8 +177,8 @@ class TestDownloadVerification:
 
     def test_a_malformed_url_is_handled_not_escaped(self, tmp_path: Path):
         """`http.client.InvalidURL` derives from `HTTPException`, NOT from `OSError`,
-        `URLError` or `ValueError` — so it used to pass through this handler entirely
-        and be reported by an outer catch-all as an unexplained crash."""
+        `URLError` or `ValueError` — so without explicit handling it passes through
+        this handler and an outer catch-all reports it as an unexplained crash."""
         import http.client
 
         staging = tmp_path / "engine.tar.gz"
@@ -251,7 +251,7 @@ class TestDownloadVerification:
         assert ok is False and engine_source.SKIP_DOWNLOAD_ENV in error
         assert not opener.called
 
-    def test_the_ssl_context_is_installed_on_the_handler_not_the_open_call(self):
+    def test_the_ssl_context_is_installed_on_the_handler_not_the_open_call(self, tmp_path):
         """`OpenerDirector.open` has NO `context` parameter — passing one there
         raises TypeError on every real download while every mock passes. This
         pins the context onto an HTTPSHandler instead."""
@@ -268,7 +268,7 @@ class TestDownloadVerification:
             return mock.Mock(open=mock.Mock(side_effect=urllib.error.URLError("stop")))
 
         with mock.patch.object(engine_source.urllib.request, "build_opener", spy):
-            engine_source.download_archive(Path("/tmp/kc-unused-engine.tar.gz"))
+            engine_source.download_archive(tmp_path / "kc-unused-engine.tar.gz")
         https = [h for h in captured if isinstance(h, engine_source.urllib.request.HTTPSHandler)]
         assert https, "an HTTPSHandler carrying the SSL context must be installed"
         assert getattr(https[0], "_context", None) is not None
@@ -519,8 +519,8 @@ class TestInstallEngine:
     def test_the_marker_is_written_before_the_swap_not_after(self, tmp_path: Path):
         """A failing marker write must not be able to leave NO usable engine.
 
-        The marker was previously written into the LIVE tree after ``_swap_in``,
-        which had already retired the previous engine — so a failure there left a
+        Writing the marker into the LIVE tree after ``_swap_in`` — which has
+        already retired the old engine — means a failure there leaves a
         complete new tree that ``is_installed`` reports as absent, with the old one
         gone as well. Marking the staging tree makes the swap the last fallible
         step, and the swap is the step that already rolls back.

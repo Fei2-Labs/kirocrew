@@ -1,8 +1,8 @@
 """Tests for the security-posture detail registry (``security_posture``).
 
-The registry exists because Settings → Security used to render hardcoded counts
-that had silently gone stale by 2-3x. These tests pin the two properties that
-make that regression structurally impossible:
+The registry exists so Settings → Security cannot render hardcoded counts that
+silently go stale by 2-3x. These tests pin the two properties that make that
+class of drift structurally impossible:
 
 1. **Derivation** — every ``count`` is ``len(items)``, and the items come from the
    LIVE control (``security._SENSITIVE_HOME_DIRS``, ``BUILTIN_DENIED_RULES``,
@@ -30,6 +30,23 @@ from kiro_crew.security_posture import (
     build_posture_snapshot,
     build_posture_snapshot_async,
 )
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _drop_source_corpus_after_module():
+    """Release the whole-tree corpus this module's census pulls in.
+
+    ``_package_baseline_log_census`` below is its own ``lru_cache(maxsize=1)``
+    wrapping a ``source_corpus.parsed_candidates`` walk, so it holds two
+    references on the corpus: its own cached census AND (via
+    ``source_corpus``) the ~160 MB raw+NFKC text cache. ``test/conftest.py``
+    releases the corpus itself at every module's teardown; this releases the
+    census on top. Module teardown rather than per test, because the two tests
+    here deliberately share the census cache within the module.
+    """
+    yield
+    _package_baseline_log_census.cache_clear()
+
 
 # ANY use of a redactor, including every wrapper.
 #
@@ -62,6 +79,7 @@ _BASELINE_REDACTORS = frozenset(
         "redact_credentials",
         "redact_exfiltration_urls",
         "redact_and_truncate",
+        "redact_with_findings",
     }
 )
 
@@ -94,16 +112,22 @@ def _is_log_write(call: ast.Call) -> bool:
 
 
 def _wraps_baseline_call(node: ast.AST | None) -> bool:
-    """True when *node* is, or contains, a call to a baseline redactor."""
+    """True when *node* invokes or passes a baseline redactor callback."""
+
     if node is None:
         return False
-    return any(
-        isinstance(sub, ast.Call)
-        and isinstance(sub.func, (ast.Name, ast.Attribute))
-        and (sub.func.id if isinstance(sub.func, ast.Name) else sub.func.attr)
-        in _BASELINE_REDACTORS
-        for sub in ast.walk(node)
-    )
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, (ast.Name, ast.Attribute)):
+            name = sub.func.id if isinstance(sub.func, ast.Name) else sub.func.attr
+            if name in _BASELINE_REDACTORS:
+                return True
+        if isinstance(sub, ast.keyword) and sub.arg == "redactor":
+            value = sub.value
+            if isinstance(value, (ast.Name, ast.Attribute)):
+                name = value.id if isinstance(value, ast.Name) else value.attr
+                if name in _BASELINE_REDACTORS:
+                    return True
+    return False
 
 
 def _scope_body(scope: ast.AST):
@@ -133,7 +157,7 @@ def _gate_side_baseline_log_sites(
     through a local whose most recent assignment in the same scope was a baseline
     call (the ``x, _ = redact_exfiltration_urls(x)`` / ``x, _ =
     redact_credentials(x)`` pair idiom, which is a hand-rolled ``security.redact``
-    and the exact shape #7151 converged in three modules).
+    and the exact shape all three modules use).
 
     Flow-lite, and honest about it: the most recent assignment WINS, so a name
     reassigned from an unredacted source stops counting, but branches and loops
@@ -216,8 +240,8 @@ def _gate_side_baseline_log_sites(
 #:   only claim these numbers make is "this many were here when the gate went up".
 #: * NOT the egress axis. ``NON_EGRESS_REDACTION_MODULES`` and ``_REDACTION_SINKS``
 #:   decide whether a module is an output boundary; that decision says nothing
-#:   about WHICH redactor spelling a site uses, which is why all three sites #7151
-#:   converged sat correctly bucketed for years while reading the weaker pass.
+#:   about WHICH redactor spelling a site uses, which is why all three sites
+#:   sat correctly bucketed for years while reading the weaker pass.
 #:
 #: What the gate buys: a NEW gate-side log line cannot be born on the baseline
 #: silently. Growth in any module — or a first site in a module absent from here —
@@ -230,16 +254,7 @@ def _gate_side_baseline_log_sites(
 #: nets to zero (both edits land in one reviewed diff), and the scan is
 #: single-scope (see :func:`_gate_side_baseline_log_sites`).
 _BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
-    # 8, not 7. The eighth is the adapter arm of the startup-model degrade in
-    # `_apply_startup_model`: a `set_config_option("model", ...)` wire refusal
-    # logs the id it declined, alongside the entitlement-withheld warning that
-    # sits a few lines above it. Both scan a MODEL ID -- a value the backend
-    # itself advertised, never a credential or a URL -- and both run in the
-    # gateway's own process. This module has no `redact_log_via_context` site at
-    # all: all eight read the baseline pair, so converting one alone would not
-    # move the census (counts do not pin identity, per the note below) while
-    # putting a per-line lazy context resolution on the ACP hot path. Converting
-    # `acp/client.py` is one decision about all eight, not eight decisions.
+    # +1: model-unavailable warning log in the rejected-model path
     "acp/client.py": 8,
     "apps/builtins/pptx_maker/backend/routes.py": 1,
     "dashboard/chat_nav.py": 1,
@@ -256,13 +271,16 @@ _BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
     "dashboard/state.py": 1,
     "knowledge/agent_fetch.py": 1,
     "mcp_cron.py": 1,
-    "mcp_gateway/backend.py": 2,
+    # The pooled-backend daemon never composes a companion context. Its
+    # declared-temp warnings therefore use the baseline pass deliberately.
+    "mcp_gateway/backend.py": 3,
+    "mcp_gateway/gatewayd.py": 1,
     "mcp_tools/knowledge.py": 5,
     "mcp_tools/messaging.py": 1,
     "mcp_tools/skills.py": 2,
     "messaging/sessions_view.py": 1,
     "slack/events.py": 2,
-    "slack/gateway.py": 6,
+    "slack/gateway.py": 7,
     "slack/handler.py": 3,
     "subagent_manager/admission.py": 4,
     "voice_reply.py": 4,
@@ -421,12 +439,12 @@ class TestDerivation:
     def test_every_mcp_schema_registry_is_covered_by_the_posture_view(self, snapshot):
         """The drift guard's OWN blind spot, closed.
 
-        This class previously hardcoded ``MCP_CORE_SCHEMAS | MCP_CRON_SCHEMAS`` — the
-        same two names the implementation hardcoded — so when ``MCP_COMPUTER_SCHEMAS``
-        was added, all ten computer-use tools were absent from the security-posture
-        report and the test written to catch exactly that stayed green. Discovering the
-        registries from ``validation`` instead means a NEW one fails here until it is
-        added to ``security_posture._SCHEMA_REGISTRY_NAMES``.
+        This class discovers the MCP schema registries from ``validation`` rather
+        than hardcoding a set like ``MCP_CORE_SCHEMAS | MCP_CRON_SCHEMAS``: a
+        hardcoded set leaves a newly added registry (say ``MCP_COMPUTER_SCHEMAS``)
+        absent from the security-posture report while the test written to catch
+        exactly that stays green. Discovering them means a NEW registry fails here
+        until it is added to ``security_posture._SCHEMA_REGISTRY_NAMES``.
         """
         from kiro_crew import security_posture
 
@@ -705,18 +723,20 @@ class TestOmissionDetection:
         """
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         call = _REDACTOR_CALL_RE
 
         registered = {module for _label, module, _detail in security_posture._REDACTION_SINKS}
         allowlisted = security_posture.NON_EGRESS_REDACTION_MODULES
-        # security.py DEFINES the redactors; security_posture.py only names them.
-        self_referential = {"security.py", "security_posture.py"}
+        # The ``security`` package DEFINES the redactors; security_posture.py only
+        # names them. The whole package is skipped, not one file, because the
+        # definitions are spread across its submodules.
+        self_referential = {"security_posture.py"}
 
         unclassified: list[str] = []
         for path in sorted(pkg.rglob("*.py")):
             rel = path.relative_to(pkg).as_posix()
-            if rel in self_referential or rel.startswith(("_vendor/", "testing/")):
+            if rel in self_referential or rel.startswith(("security/", "_vendor/", "testing/")):
                 continue
             if "/tests/" in rel or rel.endswith("_test.py"):
                 continue
@@ -734,14 +754,14 @@ class TestOmissionDetection:
         )
 
     def test_allowlist_has_no_stale_entries(self):
-        """A path that no longer calls a redactor must leave the allowlist.
+        """A path that does not call a redactor must leave the allowlist.
 
         Otherwise the allowlist silently grows into a place where a real sink can
         hide behind a dead entry.
         """
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         call = _REDACTOR_CALL_RE
         stale = [
             rel
@@ -877,7 +897,7 @@ class TestOmissionDetection:
         import re
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         explicit: set[str] = set()
         for path in pkg.rglob("*.py"):
             if path.name in {"sel.py", "security_posture.py"}:
@@ -915,14 +935,14 @@ class TestRedactionSinkRegistry:
     def test_every_named_sink_module_exists(self):
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         for _label, module, _detail in security_posture._REDACTION_SINKS:
             assert (pkg / module).is_file(), module
 
     def test_every_named_sink_module_actually_redacts(self):
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         for label, module, _detail in security_posture._REDACTION_SINKS:
             text = (pkg / module).read_text(encoding="utf-8")
             # The claim "this is an output path where redaction is applied" must be
@@ -940,10 +960,12 @@ class TestRedactionSinkRegistry:
         """
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         # Wrappers that run BOTH scanners internally, so a sink using one is fully
         # covered: StreamRedactor (rolling dual-pass), redact() (the dual-pass
-        # helper), redact_and_truncate() (redact-then-slice, so a credential cannot
+        # helper), redact_with_findings() (the same two passes in the same order,
+        # returning each one's warnings), redact_and_truncate() (redact-then-slice,
+        # so a credential cannot
         # straddle the truncation boundary), redact_via_context() (routes to
         # CredentialPolicy.redact, whose Default delegates to security.redact), and
         # display_safe() (redact_for_display with the exfil+credential redactor,
@@ -951,10 +973,14 @@ class TestRedactionSinkRegistry:
         dual_pass = (
             "StreamRedactor",
             "redact(",
+            "redact_with_findings",
             "redact_tree",
             "redact_and_truncate",
             "redact_via_context",
             "display_safe",
+            # The shared dashboard memory helper recursively runs the exfil
+            # scanner followed by the credential scanner for every text value.
+            "_redact_memory_field(",
             # redact_mcp_error runs redact_exfiltration_urls THEN redact_credentials
             # (mcp_discovery.py) and then scrubs the exact configured header values
             # the generic scanners cannot know about — strictly more than either
@@ -985,7 +1011,7 @@ class TestRedactionSinkRegistry:
         """
         from pathlib import Path
 
-        pkg = Path(security.__file__).resolve().parent
+        pkg = Path(security_posture.__file__).resolve().parent
         # claim substring (case-insensitive) -> symbol that must exist in the module
         claims = {
             "streamredactor": "StreamRedactor",
@@ -1020,14 +1046,14 @@ class TestGateSideLogRedactorSpelling:
 
     ``TestOmissionDetection`` above forces every redactor call site into a bucket —
     egress sink or not. That decision is orthogonal to this one, and all three
-    sites PR #7151 converged prove it: each was correctly listed as non-egress,
+    converged sites prove it: each was correctly listed as non-egress,
     with an accurate reason, while reading the companion-blind baseline pass. The
     bucket was never wrong; the redactor was, and no gate looked at that.
 
     So this class asks the other question — does a gate-side log line reach its
     text through ``redact_log_via_context`` — and it asks it of a PROPERTY rather
     than of a list of already-decided sites, because a converged-sites list (the
-    narrow guard #7151 shipped, in ``test_platform_context``) is a regression
+    narrow guard in ``test_platform_context``) is a regression
     guard: it protects what has been decided and says nothing about a site born
     tomorrow, which is the direction the class grew in the first place.
     """
@@ -1098,8 +1124,12 @@ class TestGateSideLogRedactorSpelling:
             "def apply(stderr):\n"
             "    logger.error('install failed: %s', redact(stderr.decode()))\n"
         )
+        callback_in_logger = (
+            "def apply(value):\n" "    logger.warning('%s', format_field(value, redactor=redact))\n"
+        )
         assert len(_gate_side_baseline_log_sites(pair_into_audit)) == 1
         assert len(_gate_side_baseline_log_sites(nested_in_logger)) == 1
+        assert len(_gate_side_baseline_log_sites(callback_in_logger)) == 1
 
         converged_pair = (
             "def log_decline(title):\n"
@@ -1157,7 +1187,7 @@ class TestGateSideLogRedactorSpelling:
             assert _gate_side_baseline_log_sites(source) == set(), label
 
     def test_the_converged_sites_stay_out_of_the_census(self):
-        """#7151's three sites must have nothing left for this scan to find.
+        """The three converged sites must have nothing left for this scan to find.
 
         Ties the general rule to the narrow guard: ``test_platform_context`` pins
         that each of these still CALLS the helper, and this pins that none of them

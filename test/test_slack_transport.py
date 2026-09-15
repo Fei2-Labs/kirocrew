@@ -10,6 +10,11 @@ from __future__ import annotations
 
 import pytest
 
+# ``enterprise_mod`` is imported as a module, not a symbol: the trusted-bot
+# admission rule (and its self-bot-id read) lives in ONE place now, shared by
+# this transport and the Socket Mode event gate, so the self-id stub belongs on
+# the module that owns the rule.
+import kiro_crew.slack.enterprise as enterprise_mod
 from kiro_crew.messaging.transport import InboundMessage, MessagingTransport
 from kiro_crew.slack.format import SLACK_MSG_LIMIT
 from kiro_crew.slack.transport import SlackTransport
@@ -22,6 +27,10 @@ class FakeClient:
         self.posted: list[tuple] = []
         self.dms: list[str] = []
         self.replies: list[dict] = []
+        self.ensured: list[str] = []
+
+    async def ensure_channel_team(self, channel):
+        self.ensured.append(channel)
 
     async def post_message(self, channel, text, thread_ts=None, **kw):
         self.posted.append((channel, text, thread_ts))
@@ -98,12 +107,26 @@ class TestAuthorize:
         assert t.authorize(InboundMessage("slack", "U_INTRUDER", "C1", "x")) is False
 
 
+class TestSpoolEgress:
+    def test_current_owner_authorizes_original_thread_route(self):
+        t = _t(allowed_users={"U_OWNER"})
+
+        assert t.may_send_to("C1", "1700.0", principal="U_OWNER") is True
+
+    @pytest.mark.parametrize("principal", ["", "U_REVOKED"])
+    def test_missing_or_revoked_sender_fails_closed(self, principal):
+        t = _t(allowed_users={"U_OWNER"})
+
+        assert t.may_send_to("C1", "1700.0", principal=principal) is False
+
+
 class TestTier1:
     @pytest.mark.asyncio
     async def test_send_message_delegates(self):
         c = FakeClient()
         ts = await SlackTransport(c).send_message("C1", "hello", "1700.0")
         assert ts == "1700.0001"
+        assert c.ensured == ["C1"]
         assert c.posted == [("C1", "hello", "1700.0")]
 
     @pytest.mark.asyncio
@@ -184,9 +207,7 @@ class TestReceiveTrustedBots:
 
     @pytest.mark.asyncio
     async def test_trusted_bot_admitted(self, monkeypatch):
-        import kiro_crew.slack.transport as transport_mod
-
-        monkeypatch.setattr(transport_mod, "validated_self_bot_id", lambda: "B_SELF")
+        monkeypatch.setattr(enterprise_mod, "validated_self_bot_id", lambda: "B_SELF")
         seen, dispatch = self._collector()
         t = SlackTransport(
             FakeClient(),
@@ -213,9 +234,7 @@ class TestReceiveTrustedBots:
 
     @pytest.mark.asyncio
     async def test_untrusted_bot_still_dropped(self, monkeypatch):
-        import kiro_crew.slack.transport as transport_mod
-
-        monkeypatch.setattr(transport_mod, "validated_self_bot_id", lambda: "B_SELF")
+        monkeypatch.setattr(enterprise_mod, "validated_self_bot_id", lambda: "B_SELF")
         seen, dispatch = self._collector()
         t = SlackTransport(
             FakeClient(),
@@ -232,7 +251,7 @@ class TestReceiveTrustedBots:
 
         import kiro_crew.slack.transport as transport_mod
 
-        monkeypatch.setattr(transport_mod, "validated_self_bot_id", lambda: "B_SELF")
+        monkeypatch.setattr(enterprise_mod, "validated_self_bot_id", lambda: "B_SELF")
         rec = MagicMock()
         monkeypatch.setattr(transport_mod, "sel", lambda: rec)
         t = SlackTransport(FakeClient(), trusted_bot_ids={"B_PEER"})
@@ -249,7 +268,7 @@ class TestReceiveTrustedBots:
 
         import kiro_crew.slack.transport as transport_mod
 
-        monkeypatch.setattr(transport_mod, "validated_self_bot_id", lambda: "B_SELF")
+        monkeypatch.setattr(enterprise_mod, "validated_self_bot_id", lambda: "B_SELF")
         rec = MagicMock()
         monkeypatch.setattr(transport_mod, "sel", lambda: rec)
         seen, dispatch = self._collector()
@@ -262,9 +281,7 @@ class TestReceiveTrustedBots:
 
     @pytest.mark.asyncio
     async def test_own_bot_never_trusted_even_when_listed(self, monkeypatch):
-        import kiro_crew.slack.transport as transport_mod
-
-        monkeypatch.setattr(transport_mod, "validated_self_bot_id", lambda: "B_SELF")
+        monkeypatch.setattr(enterprise_mod, "validated_self_bot_id", lambda: "B_SELF")
         seen, dispatch = self._collector()
         t = SlackTransport(FakeClient(), trusted_bot_ids={"B_SELF"}, dispatch=dispatch)
         await t.receive({"event": {"bot_id": "B_SELF", "channel": "C1", "text": "echo"}})
@@ -272,9 +289,7 @@ class TestReceiveTrustedBots:
 
     @pytest.mark.asyncio
     async def test_unverified_self_id_fails_closed(self, monkeypatch):
-        import kiro_crew.slack.transport as transport_mod
-
-        monkeypatch.setattr(transport_mod, "validated_self_bot_id", lambda: "")
+        monkeypatch.setattr(enterprise_mod, "validated_self_bot_id", lambda: "")
         seen, dispatch = self._collector()
         t = SlackTransport(FakeClient(), trusted_bot_ids={"B_PEER"}, dispatch=dispatch)
         await t.receive({"event": {"bot_id": "B_PEER", "channel": "C1", "text": "ping"}})
@@ -282,9 +297,7 @@ class TestReceiveTrustedBots:
 
     @pytest.mark.asyncio
     async def test_trusted_set_is_frozen_snapshot(self, monkeypatch):
-        import kiro_crew.slack.transport as transport_mod
-
-        monkeypatch.setattr(transport_mod, "validated_self_bot_id", lambda: "B_SELF")
+        monkeypatch.setattr(enterprise_mod, "validated_self_bot_id", lambda: "B_SELF")
         seen, dispatch = self._collector()
         live = {"B_PEER"}
         t = SlackTransport(FakeClient(), trusted_bot_ids=live, dispatch=dispatch)

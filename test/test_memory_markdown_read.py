@@ -1,9 +1,9 @@
 """Tests for the markdown memory read surface.
 
-Covers ``kirocrew memory show`` (the documented-but-previously-missing
-command) and ``kirocrew memory export --include-markdown``, plus the
-``MemoryStore`` readers behind them. The most important guard is that
-``export`` WITHOUT the flag stays byte-identical to its previous shape.
+Covers ``kirocrew memory show`` and ``kirocrew memory export --include-markdown``,
+plus the ``MemoryStore`` readers behind them. The most important guard is that
+the ``--include-markdown`` flag is purely additive: ``export`` WITHOUT it emits
+identical bytes.
 """
 
 from __future__ import annotations
@@ -12,14 +12,18 @@ import argparse
 import json
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from member_memory_helpers import env as _member_env
+from member_memory_helpers import request
 
 from kiro_crew import cli_commands
 from kiro_crew.memory import MemoryStore
+
+env = _member_env
 
 # ── Helpers ──
 
@@ -1224,3 +1228,340 @@ class TestEmptyIndexIsNotAbsence:
         out = capsys.readouterr().out
         assert "empty or unavailable" in out
         assert "No memory-history matches." not in out
+
+
+class TestLinkedWorkspaceAncestorGate:
+    """On Windows, a linked ANCESTOR of the workspace must be refused before
+    the leaf reparse-point checks -- those are lstats that resolve every
+    ancestor, so the probe itself would traverse the link and open the SMB
+    connection the lexical UNC gate exists to prevent."""
+
+    def _windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import types
+
+        from kiro_crew import memory as memory_mod
+
+        # Patch ONLY memory.py's view of os (same rationale as the UNC gate
+        # tests above): patching the global os.name would make pathlib
+        # dispatch WindowsPath everywhere on a POSIX test host. lstat is
+        # carried so the read path's updated_at branch cannot surface a stub
+        # AttributeError masquerading as a product bug.
+        monkeypatch.setattr(memory_mod, "os", types.SimpleNamespace(name="nt", lstat=os.lstat))
+
+    def test_linked_ancestor_is_refused_before_any_leaf_lstat(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ordering IS the property: the leaf predicate is wired to explode,
+        so a regression that lstats first fails loudly instead of silently."""
+        from kiro_crew import memory as memory_mod
+
+        ms = _populated_store(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(memory_mod, "first_linked_ancestor", lambda _p: str(tmp_path))
+
+        def _boom(_p: object) -> bool:  # pragma: no cover
+            raise AssertionError("leaf reparse check ran before the ancestor walk")
+
+        monkeypatch.setattr(memory_mod, "is_link_or_junction", _boom)
+        audits: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            ms,
+            "_audit_read_refusal",
+            lambda rule, path, reason: audits.append((rule, reason)),
+        )
+
+        snapshot = ms.markdown_snapshot()
+
+        assert snapshot["preferences"]["content"] == ""
+        assert snapshot["history"] == []
+        # The guard is consulted once per read surface (preferences, projects,
+        # history) and the refusal short-circuits before any per-entry work,
+        # so the multiplicity is bounded by the surface count -- a regression
+        # to per-entry consultation would blow this bound out.
+        assert len(audits) == 3
+        assert set(audits) == {("workspace_linked_ancestor", "a workspace ancestor is a link")}
+
+    def test_bypassing_the_guard_restores_the_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mutation check: with the walk reporting no link, the same store
+        reads again -- the refusal above is attributable to the guard."""
+        from kiro_crew import memory as memory_mod
+
+        ms = _populated_store(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(memory_mod, "first_linked_ancestor", lambda _p: None)
+
+        snapshot = ms.markdown_snapshot()
+
+        assert "- prefers pytest" in snapshot["preferences"]["content"]
+
+    def test_the_walk_is_not_consulted_on_posix(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """POSIX linked ancestors stay deliberately unrejected (a symlinked
+        /home is a legitimate setup and those components are not
+        agent-writable), so the walk must not even run there."""
+        if os.name == "nt":
+            pytest.skip("gate is active on Windows by design")
+        from kiro_crew import memory as memory_mod
+
+        def _boom(_p: object) -> None:  # pragma: no cover
+            raise AssertionError("ancestor walk ran on POSIX")
+
+        monkeypatch.setattr(memory_mod, "first_linked_ancestor", _boom)
+        ms = _populated_store(tmp_path)
+        assert "- prefers pytest" in ms.markdown_snapshot()["preferences"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Private (member) store read and index guards
+#
+# The default store above degrades an unreadable file to an empty entry. A
+# member's private store refuses instead: its readers raise, its index rebuild
+# keeps the previous index, and nothing from a file outside the binding is
+# ever returned. These exercise ``MemoryStore`` through the dashboard's
+# ``markdown_memory_for_store`` so the store is the one the handlers bind.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_owner_markdown_loader_retains_private_history_without_vector_attachment(env):
+    from kiro_crew.dashboard.handlers._shared import markdown_memory_for_store
+
+    memory = await markdown_memory_for_store(env.state, "member-alice")
+    assert memory.vector_store is None
+    path = env.home / "memory_stores" / "member-alice" / "memory" / "history" / "2000-01-01.md"
+    path.write_text(
+        "# 2000-01-01\n#### decision\nKeep the original project contract.", encoding="utf-8"
+    )
+    assert memory.prune_history(keep_days=1) == 0
+    assert "original project contract" in memory.read_recent_history()
+    assert await markdown_memory_for_store(env.state, "member-alice") is memory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("escape", ["hardlink", "opened_path"])
+async def test_private_history_reader_refuses_inodes_outside_its_binding(env, monkeypatch, escape):
+    from kiro_crew.dashboard.handlers._shared import markdown_memory_for_store
+
+    memory = await markdown_memory_for_store(env.state, "member-alice")
+    path = env.home / "memory_stores" / "member-alice" / "memory" / "history" / "2000-01-01.md"
+    other = env.home / "other-member-evidence.txt"
+    other.write_text("Private evidence belonging elsewhere.", encoding="utf-8")
+    if escape == "hardlink":
+        os.link(other, path)
+    else:
+        path.write_text("This member's own content.", encoding="utf-8")
+        monkeypatch.setattr("kiro_crew.memory.fd_real_path", lambda descriptor: str(other))
+    assert memory.read_recent_history() == ""
+    assert other.read_text(encoding="utf-8") == "Private evidence belonging elsewhere."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("document", ["preferences", "projects"])
+@pytest.mark.parametrize("failure", ["hardlink", "opened_path", "invalid_utf8", "oversize"])
+async def test_private_anchor_read_refuses_unsafe_present_files(
+    env, monkeypatch, document, failure
+):
+    from kiro_crew.dashboard.handlers._shared import markdown_memory_for_store
+
+    memory = await markdown_memory_for_store(env.state, "member-alice")
+    path = memory._memory_dir / f"{document}.md"
+    other = env.home / "memory_stores" / "member-bob" / "private-evidence.txt"
+    other.write_text("Evidence belongs only to Bob.", encoding="utf-8")
+    if failure == "hardlink":
+        path.unlink()
+        os.link(other, path)
+        reason = "hard links"
+    elif failure == "opened_path":
+        monkeypatch.setattr("kiro_crew.memory.fd_real_path", lambda descriptor: str(other))
+        reason = "bound path"
+    elif failure == "invalid_utf8":
+        path.write_bytes(b"\xff")
+        reason = "UTF-8"
+    else:
+        monkeypatch.setattr(memory, "_HISTORY_SNAPSHOT_MAX_BYTES", 128)
+        path.write_text("x" * 129, encoding="utf-8")
+        reason = "size cap"
+    with pytest.raises(OSError, match=reason):
+        getattr(memory, f"read_{document}")()
+    assert other.read_text(encoding="utf-8") == "Evidence belongs only to Bob."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("document", ["preferences", "projects"])
+async def test_private_anchor_missing_and_empty_remain_valid_initial_states(env, document):
+    from kiro_crew.dashboard.handlers._shared import markdown_memory_for_store
+
+    memory = await markdown_memory_for_store(env.state, "member-alice")
+    path = memory._memory_dir / f"{document}.md"
+    path.unlink()
+    reader = getattr(memory, f"read_{document}")
+    assert reader() == ""
+    path.write_text("", encoding="utf-8")
+    assert reader() == ""
+    getattr(memory, f"write_{document}")("# Current guidance\nKeep the actual project contract.")
+    assert "actual project contract" in reader()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("document", ["preferences", "projects"])
+async def test_private_anchor_get_returns_scoped_unavailable_reason_without_contents(env, document):
+    from kiro_crew.dashboard.handlers import memory as memory_handlers
+    from kiro_crew.dashboard.handlers._shared import markdown_memory_for_store
+
+    memory = await markdown_memory_for_store(env.state, "member-alice")
+    path = memory._memory_dir / f"{document}.md"
+    other = env.home / "memory_stores" / "member-bob" / "private-evidence.txt"
+    other.write_text("DO-NOT-EXPOSE-THIS-PRIVATE-CONTENT", encoding="utf-8")
+    path.unlink()
+    os.link(other, path)
+    handler = getattr(memory_handlers, f"api_memory_{document}")
+    response = await handler(request(env, query={"store": "member-alice"}, owner=True))
+    assert response.status == 503
+    body = json.loads(response.text)
+    assert body["code"] == "store_unavailable"
+    assert "member-alice" in body["error"] and "hard links" in body["error"]
+    assert "DO-NOT-EXPOSE-THIS-PRIVATE-CONTENT" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["hardlink", "invalid_utf8", "vanished", "unsafe_root", "linked_root"]
+)
+async def test_private_index_rebuild_refusal_preserves_previous_search(env, monkeypatch, failure):
+    from kiro_crew.dashboard.handlers._shared import markdown_memory_for_store
+
+    memory = await markdown_memory_for_store(env.state, "member-alice")
+    memory.write_preferences("# Preferences\nOriginal searchable sentinel.")
+    memory.rebuild_index()
+    before = memory.search("sentinel")
+    count = memory.index_row_count()
+    assert before
+    path = memory._history_dir / "2000-01-01.md"
+    if failure == "hardlink":
+        other = env.home / "memory_stores" / "member-bob" / "secret-evidence.txt"
+        other.write_text("foreignclassifiedrecord", encoding="utf-8")
+        os.link(other, path)
+    elif failure == "invalid_utf8":
+        path.write_bytes(b"\xff")
+    elif failure == "vanished":
+        path.write_text("A source about to disappear.", encoding="utf-8")
+        original = memory._guarded_entry
+
+        def read_then_disappear(candidate, **kwargs):
+            if candidate == path:
+                path.unlink()
+            return original(candidate, **kwargs)
+
+        monkeypatch.setattr(memory, "_guarded_entry", read_then_disappear)
+    elif failure == "linked_root":
+        from conftest import make_dir_link
+
+        other = env.home / "memory_stores" / "member-bob" / "history"
+        other.mkdir()
+        (other / path.name).write_text("foreignclassifiedrecord", encoding="utf-8")
+        memory._history_dir.rmdir()
+        make_dir_link(memory._history_dir, other)
+    else:
+        monkeypatch.setattr(memory, "_read_root_guard", lambda: False)
+    with monkeypatch.context() as traversal_guard:
+        if failure in {"unsafe_root", "linked_root"}:
+            traversal_guard.setattr(
+                "kiro_crew.memory.os.scandir",
+                lambda *args: pytest.fail("unsafe root was traversed"),
+            )
+        with pytest.raises(OSError, match="refused"):
+            memory.rebuild_index()
+    assert memory.search("sentinel") == before
+    assert memory.search("foreignclassifiedrecord") == []
+    assert memory.index_row_count() == count
+
+
+@pytest.mark.asyncio
+async def test_private_index_database_failure_rolls_back_and_is_explicit(env, monkeypatch):
+    from kiro_crew._sqlite_compat import sqlite3
+    from kiro_crew.dashboard.handlers._shared import markdown_memory_for_store
+
+    memory = await markdown_memory_for_store(env.state, "member-alice")
+    memory.write_preferences("# Preferences\nOriginal searchable sentinel.")
+    memory.rebuild_index()
+    before = memory.search("sentinel")
+    original_get_db = memory._get_db
+
+    class FailingInsert:
+        def __init__(self):
+            self.connection = original_get_db()
+
+        def execute(self, sql, *args):
+            if sql.startswith("INSERT INTO memory_fts"):
+                raise sqlite3.OperationalError("injected disk write failure")
+            return self.connection.execute(sql, *args)
+
+        def commit(self):
+            self.connection.commit()
+
+        def close(self):
+            self.connection.close()
+
+        def rollback(self):
+            self.connection.rollback()
+
+    with monkeypatch.context() as database_guard:
+        database_guard.setattr(memory, "_get_db", FailingInsert)
+        with pytest.raises(sqlite3.OperationalError, match="disk write failure"):
+            memory.rebuild_index()
+    assert memory.search("sentinel") == before
+
+
+@pytest.mark.asyncio
+async def test_private_index_readers_keep_previous_index_until_all_sources_are_read(
+    env, monkeypatch
+):
+    from kiro_crew.dashboard.handlers._shared import markdown_memory_for_store
+
+    memory = await markdown_memory_for_store(env.state, "member-alice")
+    memory.write_preferences("# Preferences\nOriginal searchable sentinel.")
+    memory.rebuild_index()
+    previous = memory.search("sentinel")
+    memory._preferences_file.write_text("Replacement searchable record.", encoding="utf-8")
+    later = memory._history_dir / "2000-01-01.md"
+    later.write_bytes(b"\xff")
+    original_read = memory._guarded_entry
+    checked = []
+
+    def read_with_concurrent_query(path, **kwargs):
+        if path == later:
+            checked.append(path)
+            assert memory.search("sentinel") == previous
+            assert memory.search("Replacement") == []
+        return original_read(path, **kwargs)
+
+    monkeypatch.setattr(memory, "_guarded_entry", read_with_concurrent_query)
+    with pytest.raises(OSError, match="UTF-8"):
+        memory.rebuild_index()
+    assert checked == [later]
+    assert memory.search("sentinel") == previous
+    assert memory.search("Replacement") == []
+
+
+@pytest.mark.asyncio
+async def test_private_index_covers_retained_days_beyond_snapshot_limit(env):
+    from kiro_crew.dashboard.handlers._shared import markdown_memory_for_store
+
+    memory = await markdown_memory_for_store(env.state, "member-alice")
+    first_day = date(2000, 1, 1)
+    total_days = memory._HISTORY_SNAPSHOT_MAX_ENTRIES + 1
+    for index in range(total_days):
+        path = memory._history_dir / f"{(first_day + timedelta(days=index)).isoformat()}.md"
+        text = "oldestevidencesentinel" if index == 0 else f"Retained decision number {index}."
+        path.write_text(text, encoding="utf-8")
+    (memory._history_dir / "notes.md").write_text("notadailysentinel", encoding="utf-8")
+    assert memory.rebuild_index() == total_days + 2
+    assert memory.search("oldestevidencesentinel")
+    assert memory.search("notadailysentinel") == []
+    assert len(memory.read_history_entries()) == memory._HISTORY_SNAPSHOT_MAX_ENTRIES
+    assert (memory._history_dir / "2000-01-01.md").read_text(
+        encoding="utf-8"
+    ) == "oldestevidencesentinel"

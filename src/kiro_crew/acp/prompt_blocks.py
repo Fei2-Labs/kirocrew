@@ -38,12 +38,13 @@ from kiro_crew.hooks import is_unc_shape, safe_read_file_bytes, unc_probe_allowe
 # The budget constants and Pillow machinery live in the LEAF module
 # kiro_crew.imaging (shared with the gateway's tool-result rewrite, which must
 # not import the ACP package). The two constants are re-exported because this
-# module is where the prompt path's callers and tests historically found them.
+# module is where the prompt path's callers and tests import them from.
 from kiro_crew.imaging import (  # noqa: F401 -- constants re-exported, see comment
     MAX_IMAGE_B64_BYTES,
     MAX_IMAGE_EDGE_PX,
     downscale_image_block,
 )
+from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +176,29 @@ def build_prompt_blocks(
             path = Path(raw)
             suffix = path.suffix.lower()
             mime = IMAGE_MEDIA_TYPES.get(suffix)
-            if mime is None or not path.is_file():
+            if mime is None:
+                # Unreachable for regex-produced candidates today (_PATH_RE's
+                # suffix group and IMAGE_MEDIA_TYPES share one key set), kept
+                # as the lexical backstop should the two ever drift.
+                continue
+            # A linked ANCESTOR defeats the lexical UNC screen above: the
+            # candidate is not itself UNC-shaped -- only the link's target is
+            # -- and is_file()/stat() below resolve every ancestor, so the
+            # probe itself would traverse the link and open the SMB
+            # connection. Windows-only for the same reason as the UNC gate:
+            # on POSIX stat-ing through a symlink is harmless. Reference
+            # wiring: dashboard/handlers/themes.py::_resolve_local_source.
+            if os.name == "nt" and first_linked_ancestor(path) is not None:
+                seen.add(raw)
+                continue
+            # The LEAF gets the junction-aware check the walk deliberately
+            # excludes: is_file() below FOLLOWS a final-component link, so a
+            # leaf symlink/junction targeting a UNC share is the same probe.
+            # lstat-based, so the link itself is never followed.
+            if os.name == "nt" and is_link_or_junction(path):
+                seen.add(raw)
+                continue
+            if not path.is_file():
                 continue
             try:
                 size = path.stat().st_size
@@ -257,8 +280,8 @@ def summarize_prompt_structure(blocks: object) -> dict:
       than a size describing a payload the counts claim is empty.
 
     This summary is deliberately safe to log: it carries no content and
-    therefore cannot leak credentials or user data. That is a hard requirement
-    (issue #6022) -- the kiro-cli data dir is fenced precisely because it holds
+    therefore cannot leak credentials or user data. That is a hard
+    requirement -- the kiro-cli data dir is fenced precisely because it holds
     SSO tokens, so the outbound-request diagnostics must expose counts, types,
     and sizes ONLY, never the bytes themselves.
 

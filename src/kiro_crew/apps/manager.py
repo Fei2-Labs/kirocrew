@@ -9,6 +9,7 @@ registration (agents, skills, crons) to bridge functions.
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import logging
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
+from kiro_crew import platform_compat
 from kiro_crew.apps.admission import app_admission_denied
 from kiro_crew.apps.discovery import discover_builtin_apps
 from kiro_crew.apps.execution import (
@@ -48,6 +50,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.pinned_fs import supports_pinned_walk
 from kiro_crew.platform import current_context, safe_context_call
+from kiro_crew.platform_compat import is_link_or_junction
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -387,13 +390,49 @@ def _check_path_safety(path: str) -> bool:
 # Build-input / VCS directories never needed at runtime.  The app-kit runtime
 # layout is ``app.json`` + backend code + ``ui/dist/`` — ``node_modules`` is
 # npm build input and ``.git`` comes from cloned registry sources.
+# ``.kirocrew-deps`` (plus its transient staging/prior siblings) is the
+# gateway's own ``pip --target`` provisioning of the app's requirements.txt:
+# machine- and platform-specific, re-provisioned at the destination on first
+# spawn, and copying it would put a foreign wheel tree FIRST on the child's
+# PYTHONPATH, shadowing the correctly provisioned copy.
 # ``shutil.ignore_patterns`` matches by basename at every depth, so both
 # ``node_modules`` and ``ui/node_modules`` are dropped.  ``build`` is
 # deliberately NOT listed: the manifest may reference runtime paths anywhere
 # under the app root, and silently dropping a manifest-referenced directory
 # would record a successful install with missing files.  A ``build`` symlink
 # into a huge build tree is already neutralized by ``symlinks=True``.
-_COPY_IGNORE = ("node_modules", ".git", "__pycache__", ".venv")
+_COPY_IGNORE = (
+    "node_modules",
+    ".git",
+    "__pycache__",
+    ".venv",
+    ".kirocrew-deps",
+    ".kirocrew-deps-staging",
+    ".kirocrew-deps-prior",
+    ".kirocrew-deps.lock",
+)
+
+
+# The bare fixed name is reserved too (nothing generates it today, but it
+# is inside the gateway-owned namespace and a plantable look-alike), so the
+# per-transaction suffix is optional. An app-owned name with any OTHER
+# suffix shape (e.g. "-assets") does not match and is preserved data.
+_DEPS_STAGING_SWEEP_RE = re.compile(r"\.kirocrew-deps-staging(-\d+-[0-9a-f]{8})?")
+
+
+def _is_generated_deps_artifact_name(n: str) -> bool:
+    """True only for the EXACT names the gateway's provisioning generates.
+
+    The uninstall sweep deletes what matches; a loose ``.kirocrew-deps*``
+    prefix glob also swallowed app-owned entries that merely share the
+    prefix (e.g. a user's ``.kirocrew-deps-backup``) and permanently
+    deleted preserved data. Generated names are closed-form: the live tree,
+    the prior tree, the lock, and pid-nonce staging dirs.
+    """
+    return (
+        n in (".kirocrew-deps", ".kirocrew-deps-prior", ".kirocrew-deps.lock")
+        or _DEPS_STAGING_SWEEP_RE.fullmatch(n) is not None
+    )
 
 
 def _copy_app_tree(source: Path, dest: Path) -> None:
@@ -419,7 +458,17 @@ def _copy_app_tree(source: Path, dest: Path) -> None:
     _isjunction = getattr(os.path, "isjunction", None)
 
     def _ignore(dir_path: str, names: list[str]) -> set[str]:
-        skip = {n for n in names if n in _COPY_IGNORE}
+        # Staging dirs carry unique per-transaction suffixes
+        # (.kirocrew-deps-staging-<pid>-<nonce>), and an interrupted
+        # install's leftover must neither be copied on update nor survive -
+        # but the match is the STRICT generated pattern, never a bare
+        # prefix: an app-owned name that merely shares the prefix (e.g.
+        # ".kirocrew-deps-staging-assets") is the app's data and must copy.
+        skip = {
+            n
+            for n in names
+            if n in _COPY_IGNORE or _DEPS_STAGING_SWEEP_RE.fullmatch(n) is not None
+        }
         for n in names:
             if n in skip:
                 continue
@@ -480,8 +529,8 @@ def _copy_app_tree(source: Path, dest: Path) -> None:
 # destroy preserved user data.  Different apps proceed in parallel.
 _LIFECYCLE_LOCKS: dict[str, LoopBoundLock] = {}
 
-# Registry installs historically call ``install_app(source)`` / ``update_app(source)``
-# with one positional argument. Keep that internal callable contract (tests and
+# Registry installs call ``install_app(source)`` / ``update_app(source)`` with one
+# positional argument. Keep that internal callable contract (tests and
 # downstream integrations replace these functions), while carrying the server-
 # resolved repository through ``asyncio.to_thread`` without putting it in the
 # app-controlled manifest. Context variables are copied into to_thread workers
@@ -511,7 +560,7 @@ def _effective_source_repository(explicit: str) -> str:
 
 
 def app_lifecycle_lock(name: str) -> LoopBoundLock:
-    """Return the per-app lock guarding install/update/uninstall (loop-bound, #4800).
+    """Return the per-app lock guarding install/update/uninstall (loop-bound).
 
     Must be called from (and the lock used on) the event loop thread; the
     guarded blocking work itself runs off-loop via executor/``to_thread``.
@@ -938,6 +987,22 @@ def update_app(
 # ---------------------------------------------------------------------------
 
 
+def _remove_any_shape(path: Path) -> None:
+    """Delete ``path`` whatever it is: tree, file, or dangling link.
+
+    ``shutil.rmtree`` refuses non-directories, so a file-shaped dependency
+    artifact (an app writing a FILE named like a deps tree) would survive
+    every uninstall and poison the next quarantine rename. Links are
+    unlinked, never traversed. Missing is fine.
+    """
+    if platform_compat.is_link_or_junction(path):
+        platform_compat.unlink_link_or_junction(path)
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
 def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
     """Uninstall an app while preserving its ``data/`` directory by default.
 
@@ -997,21 +1062,248 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
             error_code="trust_grant_not_removed",
         )
 
+    quarantined: list[tuple[Path, Path]] = []
+    _data_pin = None
+    _deps_lock: contextlib.ExitStack | None = None
     try:
         if keep_data:
             data = dest / "data"
             # Move data to temp, remove app dir, move data back
             tmp_data = dest.parent / f".{name}-data-tmp"
+            if platform_compat.is_link_or_junction(data):
+                # A LINKED data dir would make every operation below act on
+                # the link's TARGET - an app pointing data at another app's
+                # tree (or anywhere else) would have this uninstall rename
+                # and delete a foreign deps tree, and "preserve" the victim's
+                # data as its own. Refuse: the gateway creates data/ as a
+                # real directory, so a link here is never legitimate.
+                raise OSError(
+                    f"app {name!r} data directory is a symlink/junction; "
+                    f"refusing to operate through it"
+                )
             if data.is_dir():
+                # The check above is a TOCTOU window against a RUNNING
+                # backend (CLI uninstall does not stop it first): pin the
+                # directory for the whole quarantine transaction - the
+                # enumeration and every rename below go through the pin, so
+                # a data/ swapped for a link after validation cannot
+                # redirect them into another app's tree. Deferred import:
+                # backend imports this module at load, so the reverse import
+                # must not run at module level (same pattern as bridges).
+                from kiro_crew.apps.backend import _PinnedDir
+
+                _data_pin = _PinnedDir(data)
+            if data.is_dir():
+                # data/ preservation exists for USER data. The gateway's own
+                # generated dependency trees (data/.kirocrew-deps*) must NOT
+                # ride through an uninstall: a compromised app could plant
+                # code there (sitecustomize.py), and a later reinstall under
+                # the same name would prepend it to PYTHONPATH - revoked code
+                # executing in a fresh install. Updates still keep the trees
+                # (update never passes through here). QUARANTINE-RENAME, not
+                # delete: the trees are renamed out of data/ (cheap, same
+                # filesystem) so a later failure in THIS uninstall can put
+                # them back - deleting first would leave a failed uninstall
+                # (app still installed) stripped of its working dependencies.
+                # Deletion happens only after every destructive step
+                # committed. Links are unlinked directly (nothing to restore:
+                # the link's target is untouched); rmtree would refuse them.
+                assert _data_pin is not None  # bound by the pin block above
+                _data_pin.verify()  # enumeration reads through the path
+                # Serialize against ACTIVE provisioning: without the same
+                # per-app lock the provision transaction holds, a pip run
+                # racing this uninstall can create staging (or swap a tree
+                # live) AFTER the enumeration below - the tree then survives
+                # in preserved data and executes on a same-name reinstall.
+                # The lock file is opened through the pin (dir_fd), same as
+                # the provisioner's own open.
+                _lflags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                _lock_name = (
+                    ".kirocrew-deps.lock" if _data_pin.fd is not None
+                    else str(data / ".kirocrew-deps.lock")
+                )
+                # Match the provisioner's creator election: uninstall can race
+                # its first open before either caller holds the dependency lock.
+                try:
+                    _lfd = os.open(
+                        _lock_name, _lflags | os.O_CREAT | os.O_EXCL, 0o644,
+                        dir_fd=_data_pin.fd,
+                    )
+                except FileExistsError:
+                    _lfd = os.open(_lock_name, _lflags, dir_fd=_data_pin.fd)
+                _deps_lock = contextlib.ExitStack()
+                _lf = _deps_lock.enter_context(os.fdopen(_lfd, "r+"))
+                _deps_lock.enter_context(platform_compat.file_lock(_lf.fileno(), exclusive=True))
+                # NOT the lock file here: we HOLD it - on Windows renaming
+                # or deleting an open file fails with WinError 32, which
+                # took every uninstall down. It is handled after release.
+                _gen_names = [".kirocrew-deps", ".kirocrew-deps-prior"]
+                # Staging names are suffixed per transaction; purge every one
+                # that matches the STRICT generated pattern. A loose prefix
+                # glob here quarantined app-owned same-prefix entries into
+                # the doomed set, which the success path deletes at commit -
+                # permanent loss of preserved data (same defect the post-move
+                # sweep already guards against with the strict matcher).
+                _gen_names.extend(
+                    p.name
+                    for p in data.glob(".kirocrew-deps-staging*")
+                    if _DEPS_STAGING_SWEEP_RE.fullmatch(p.name) is not None
+                )
+                for gen in _gen_names:
+                    gen_path = data / gen
+                    if platform_compat.is_link_or_junction(gen_path):
+                        platform_compat.unlink_link_or_junction(gen_path)
+                    elif gen_path.exists():
+                        doomed = dest.parent / f".{name}-deps-doomed{gen}"
+                        # A stale crash leftover at the doomed name can be
+                        # ANY shape (a file-shaped artifact quarantined by a
+                        # prior run - rmtree refuses files, so a plain rmtree
+                        # here would leave it and the rename below would
+                        # fail forever after). Shape-aware, best-effort.
+                        try:
+                            _remove_any_shape(doomed)
+                        except OSError:
+                            pass
+                        # Pinned move OUT of data/: the source entry is
+                        # resolved against the held descriptor, so a swapped
+                        # data/ cannot make this quarantine a foreign tree.
+                        _data_pin.rename_out(gen, doomed)
+                        quarantined.append((doomed, gen_path))
+                _deps_lock.close()
+                # The lock ARTIFACT rides in preserved data only when it is
+                # a regular file (harmless: the next provisioning reopens
+                # it without creation flags). Any OTHER shape - a directory or link an app
+                # planted at the name - would poison the next transaction's
+                # lock open, so purge those now that nothing holds the name.
+                _lock_artifact = data / ".kirocrew-deps.lock"
+                try:
+                    if platform_compat.is_link_or_junction(_lock_artifact):
+                        platform_compat.unlink_link_or_junction(_lock_artifact)
+                    elif _lock_artifact.is_dir():
+                        _data_pin.verify()
+                        shutil.rmtree(str(_lock_artifact), ignore_errors=True)
+                except OSError:
+                    pass
+                _data_pin.verify()
                 shutil.move(str(data), str(tmp_data))
+                # POST-MOVE sweep: the lock cannot be held across the move
+                # (the open lock file lives INSIDE data/ and Windows refuses
+                # to move a tree holding an open file), so a fast concurrent
+                # provisioning could land a tree in the close-to-move
+                # window. The moved tree is PRIVATE now - provisioners
+                # target data/, which does not exist at this point - so purging here has
+                # no race to lose: any deps tree that slipped in dies before
+                # preservation.
+                for _late in list(tmp_data.glob(".kirocrew-deps*")):
+                    if not _is_generated_deps_artifact_name(_late.name):
+                        continue  # app-owned name sharing the prefix: not ours
+                    if _late.name == ".kirocrew-deps.lock" and _late.is_file():
+                        continue  # regular lock file is harmless
+                    try:
+                        if platform_compat.is_link_or_junction(_late):
+                            platform_compat.unlink_link_or_junction(_late)
+                        elif _late.is_dir():
+                            shutil.rmtree(str(_late))
+                        else:
+                            _late.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                # FAIL LOUD on survivors: a running app still holds open
+                # descriptors into the moved tree and can recreate or wedge
+                # entries after the sweep - letting one ride into preserved
+                # data hands a same-name reinstall revoked .pth code, the
+                # exact property this purge exists for. Aborting keeps the
+                # app installed and its trees restorable (the except arm
+                # below restores the quarantined ones).
+                _survivors = [
+                    p.name
+                    for p in tmp_data.glob(".kirocrew-deps*")
+                    if _is_generated_deps_artifact_name(p.name)
+                    and not (p.name == ".kirocrew-deps.lock" and p.is_file())
+                ]
+                if _survivors:
+                    raise OSError(
+                        f"app {name!r}: generated dependency artifacts resisted the "
+                        f"uninstall purge ({', '.join(sorted(_survivors)[:3])}); "
+                        f"refusing to preserve them into reinstallable data"
+                    )
+            if _data_pin is not None:
+                _data_pin.close()
             shutil.rmtree(dest)
             if tmp_data.is_dir():
                 dest.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(tmp_data), str(data))
         else:
             shutil.rmtree(dest)
+        # Point of commit: every destructive step succeeded, the app is
+        # uninstalled - NOW the quarantined trees die. A tree that resists
+        # deletion here is logged, not fatal: under its doomed name it is
+        # unreachable by any reinstall or PYTHONPATH (the security property
+        # the purge exists for), unlike the silently-preserved live tree the
+        # fail-loud rule targets.
+        for doomed, _orig in quarantined:
+            try:
+                _remove_any_shape(doomed)
+            except OSError as exc:
+                logger.warning(
+                    "Could not delete quarantined deps tree %s after uninstalling %s: %s",
+                    doomed,
+                    name,
+                    exc,
+                )
+        quarantined = []
     except OSError as exc:
-        # The delete failed, so the app is STILL INSTALLED — but its grant was
+        if _deps_lock is not None:
+            try:
+                _deps_lock.close()
+            except OSError:
+                pass
+        if _data_pin is not None:
+            try:
+                _data_pin.close()
+            except OSError:
+                pass
+        # The delete failed, so the app is STILL INSTALLED. FIRST move the
+        # preserved data back home if the failure struck mid-move: a raise
+        # after ``data`` was renamed to its temp name would otherwise orphan
+        # the user's entire data directory under a hidden dot-name. Restoring
+        # it first also gives the quarantined-tree restore below its original
+        # parent back.
+        if keep_data:
+            try:
+                _tmp_restore = dest.parent / f".{name}-data-tmp"
+                _data_restore = dest / "data"
+                if _tmp_restore.is_dir() and not _data_restore.exists():
+                    dest.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(_tmp_restore), str(_data_restore))
+            except OSError as restore_exc:
+                logger.warning(
+                    "Could not restore preserved data for app %s after a "
+                    "failed uninstall: %s",
+                    name,
+                    restore_exc,
+                )
+        # ... then put the quarantined deps trees back (best-effort; if data
+        # could not be restored it may still sit at its temp name, in which
+        # case restore beside it there): a failed uninstall must not leave a
+        # working app stripped of its provisioned dependencies.
+        for doomed, orig in quarantined:
+            try:
+                target = orig
+                if not orig.parent.exists():
+                    alt = dest.parent / f".{name}-data-tmp" / orig.name
+                    if alt.parent.exists():
+                        target = alt
+                if doomed.exists() and not target.exists():
+                    doomed.rename(target)
+            except OSError as restore_exc:
+                logger.warning(
+                    "Could not restore quarantined deps tree %s for app %s: %s",
+                    doomed,
+                    name,
+                    restore_exc,
+                )
+        # ... and its grant was
         # withdrawn above, which would leave a trusted app silently stripped of the
         # permission the operator gave it, from an operation that did not even
         # succeed. Put it back.
@@ -1672,6 +1964,39 @@ def get_app_manifest(name: str) -> AppManifest | None:
         return None
 
 
+def _absence_is_genuine(meta_path: Path) -> bool:
+    """Whether nothing at *meta_path* really means nothing is there.
+
+    The nearest ancestor that exists has to be a DIRECTORY. If something else
+    occupies part of the path, the file cannot exist for a reason that is NOT
+    absence, and that must not read as "the app was uninstalled".
+
+    Separated from the exception class deliberately: POSIX reports this as
+    ``NotADirectoryError`` while Windows raises ``FileNotFoundError``, so the class
+    identifies the platform rather than the condition.
+
+    ``is_link_or_junction`` is checked for the same reason, one predicate over:
+    ``is_symlink`` is False for a Windows directory junction, so a DANGLING junction
+    would present as ``is_dir=False, exists=False, is_symlink=False`` and this walk
+    would step over the thing occupying the path. Something IS at that component, so
+    the answer is unknown, not absence.
+
+    Walks upward because the non-directory component need not be the immediate
+    parent. Terminates: the filesystem root exists and is a directory. An ancestor
+    that cannot be inspected at all is treated as not-genuine, which is the same
+    fail-to-unknown direction as the rest of this function.
+    """
+    for ancestor in meta_path.parents:
+        try:
+            if ancestor.is_dir():
+                return True
+            if ancestor.exists() or ancestor.is_symlink() or is_link_or_junction(ancestor):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def app_enabled_state(name: str) -> bool | None:
     """Tri-state enablement: True, False, or None when the metadata cannot be READ.
 
@@ -1683,16 +2008,70 @@ def app_enabled_state(name: str) -> bool | None:
     unrecoverable. This keeps the two apart.
 
     A missing metadata file is a definite False — the app is not installed — not a
-    failure to read one.
+    failure to read one, and NOTHING ELSE is. Leading with ``Path.is_file()`` broke
+    that: it answers a silent False for five path shapes that are not absence, all
+    verified against this interpreter — a dangling symlink, a directory in the file's
+    place, a fifo in its place, a symlink loop (ELOOP), and a non-directory parent
+    component (ENOTDIR). Only a genuine ``stat`` fault such as EACCES was reported
+    correctly, because ``is_file`` re-raises that and the handler below turns it into
+    None.
+
+    Absence is decided from the path's SHAPE, never from the exception class, because
+    one condition does not produce one class across platforms: a non-directory parent
+    component raises ``NotADirectoryError`` (ENOTDIR) on POSIX but
+    ``FileNotFoundError`` on Windows, which maps ERROR_PATH_NOT_FOUND to ENOENT — the
+    same class a genuinely missing file raises. Keying "definitely not installed" on
+    ``FileNotFoundError`` therefore told the truth on Linux and not on Windows, where
+    a wrong-shape parent still read as a deliberate uninstall. See
+    :func:`_absence_is_genuine`; ``_spawn_exec_shim`` records the same lesson for
+    ``chdir`` ("the errno is not the thing to key on").
+
+    The cost of the wrong answer is asymmetric, which is why the callers that already
+    respect the tri-state are the ones that make this worth fixing. ``apps.backend``
+    reads it before DELETING materialized resources -- ``_drop_disabled_app_resources``
+    on a False, ``_undo_promotion_of_disabled_app`` likewise -- and its own comments
+    say a None "must not be collapsed into disabled" and is retried instead. That
+    contract was already written correctly; it was this function that did not honour
+    it, so a dangling symlink or a directory in the metadata's place deleted an app's
+    agent files.
+
+    ``apps.hook_reconcile`` consumes it too, and only because this fix put it there.
+    Its unattended 15s teardown decides "gone" from ``get_app`` -> ``_read_installed``,
+    which has the same ``Path.is_file()`` collapse and additionally folds a corrupt
+    JSON body into None -- so before this change every one of those shapes unloaded a
+    healthy app's routes and modules on the next tick. That reader has 24 callers and
+    ``get_app``/``list_apps`` 63, so it is not made tri-state here; the reconciler
+    confirms absence through THIS function instead and defers on unknown.
     """
     meta_path = app_dir(name) / INSTALLED_META_FILENAME
     try:
-        if not meta_path.is_file():
+        try:
+            st = meta_path.stat()
+        except FileNotFoundError:
+            # A dangling link is a path that EXISTS and whose target cannot be
+            # seen, which is not the same as nothing being there. Both predicates
+            # are asked because is_symlink is False for a Windows junction, and
+            # _absence_is_genuine below walks the PARENTS -- never meta_path itself.
+            if meta_path.is_symlink() or is_link_or_junction(meta_path):
+                logger.warning("Metadata path %s is a dangling link or junction", meta_path)
+                return None
+            # This class is reached for TWO different conditions depending on the
+            # platform, so it cannot decide the verdict on its own.
+            if not _absence_is_genuine(meta_path):
+                logger.warning(
+                    "Metadata path %s cannot exist: a component of it is not a "
+                    "directory",
+                    meta_path,
+                )
+                return None
             return False
+        if not stat.S_ISREG(st.st_mode):
+            logger.warning("Metadata path %s is not a regular file", meta_path)
+            return None
         data = json.loads(meta_path.read_text(encoding="utf-8"))
         return bool(InstalledApp.from_dict(data).enabled)
     # No `json.JSONDecodeError` member: it subclasses ValueError, so pairing the two is
-    # redundant and the repo ratchets against it (see #5287).
+    # redundant and the repo ratchets against it.
     except (OSError, ValueError, TypeError, KeyError) as exc:
         logger.warning("Could not determine enabled state from %s: %s", meta_path, exc)
         return None
@@ -2398,8 +2777,7 @@ def _builtin_owns_install(existing: InstalledApp) -> bool:
     False means a USER installed an app under this name, and the builtin must not
     touch it. That distinction cannot be recovered once lost: registration would
     overwrite ``origin`` and set ``lifecycle="locked"``, so afterwards nothing on
-    disk shows the install was ever user-owned, and the user can no longer
-    uninstall it.
+    disk shows the install was ever user-owned, and the user cannot uninstall it.
 
     ``source`` is the discriminator: this function is the only writer of
     ``source="builtin"``, while ``install_app()`` records the install path or
@@ -2761,7 +3139,7 @@ def register_builtin_apps() -> int:
 
                 write_app_secret(name, generate_app_secret())
             # Invalidate the proxy secret cache so the newly-written (or
-            # previously existing) secret is picked up on the next request.
+            # pre-existing) secret is picked up on the next request.
             try:
                 # circular import: routes → manager
                 # kiro_crew.apps.routes imports from kiro_crew.apps.manager

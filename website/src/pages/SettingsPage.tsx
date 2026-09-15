@@ -196,17 +196,23 @@ export default function SettingsPage() {
   // through `getAdvertisedSurfaces()`, but this tab is the surface's only
   // advertised home (it is `hiddenFromNav`), so the gate has to be applied here
   // or an unreleased page would be listed for everyone. The hook, rather than a
-  // bare `readPreviewFlag`, so toggling it in Developer > Feature Previews updates this
+  // bare `readPreviewFlag`, so toggling it in Settings > Developer > Feature Previews updates this
   // rail without a reload.
   const webhooksPreview = usePreviewFlag(PREVIEW_WEBHOOKS)
   const allTabs = buildTabs().filter(t => t.key !== 'webhooks' || webhooksPreview)
   const baseTabs = embedded ? allTabs.filter(t => t.key !== 'instances') : allTabs
   const tabs = updateAvailable ? baseTabs.map(t => (t.key === 'about' ? { ...t, dot: true } : t)) : baseTabs
 
+  const memorySelection = new URLSearchParams(search)
+  const memberMemoryView = pathname.replace(/\/$/, '') === '/settings/overview'
+    && memorySelection.get('view') === 'memory' && !!memorySelection.get('store')
+    && memorySelection.get('store') !== 'default'
+
   return (
     <SidePanelLayout
       title={i18nT('pages.settingsPage.settings')}
       tabs={tabs}
+      paneOwnsHeader={memberMemoryView}
       basePath={SETTINGS_BASE_PATH}
       headerRightDock="bottom-float"
       // Keyed apart from the main window: an embedded pane has a different tab

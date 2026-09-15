@@ -22,10 +22,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    # Type-only: importing providers.base from this leaf at runtime enters the
-    # providers -> acp package -> runtime -> session_pid -> providers cycle.
     from kiro_crew.providers.base import LLMProvider
 else:
+    # The aliases below subscript LLMProvider at module scope, so a name must
+    # exist at runtime; a real import would cross the agent-SDK boundary gate.
     LLMProvider = Any
 
 
@@ -495,14 +495,13 @@ class WarmSessionPool:
         if not self._pool_size:
             return
         qsize = self._warm_pool.qsize()
-        if not qsize:
-            return
-        self._deps.logger.debug(
-            "Pool health: sweeping %d providers (target=%d, ttl=%ds)",
-            qsize,
-            self._pool_size,
-            self._pool_ttl_secs,
-        )
+        if qsize:
+            self._deps.logger.debug(
+                "Pool health: sweeping %d providers (target=%d, ttl=%ds)",
+                qsize,
+                self._pool_size,
+                self._pool_ttl_secs,
+            )
         healthy: list[tuple[LLMProvider, float]] = []
         to_shutdown: list[LLMProvider] = []
         now = time.monotonic()
@@ -558,15 +557,23 @@ class WarmSessionPool:
                 self._pool_sweep_pids.clear()
 
         removed = qsize - len(healthy)
+        deficit = self._pool_size - len(healthy)
         if removed:
             self._deps.logger.info(
                 "Pool health: removed %d dead/expired, %d healthy remain",
                 removed,
                 len(healthy),
             )
-            self._owner._schedule_replenish()
+        elif deficit > 0:
+            self._deps.logger.debug(
+                "Pool health: pool under target (%d healthy, target=%d), replenishing",
+                len(healthy),
+                self._pool_size,
+            )
         else:
             self._deps.logger.debug("Pool health: all %d providers healthy", len(healthy))
+        if removed or deficit > 0:
+            self._owner._schedule_replenish()
 
     async def drain_warm_pool(self) -> list[LLMProvider]:
         """Remove and return all queued providers without shutting them down."""

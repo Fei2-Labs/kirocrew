@@ -88,7 +88,11 @@ class TestGetValidEffortLevels:
         assert client.get_valid_effort_levels() == ["low", "medium", "high"]
 
     def test_extracts_codex_reasoning_effort_levels(self):
-        client = AcpClient()
+        # The selector id is resolved from the backend: codex-acp spells it
+        # ``reasoning_effort``, so only a codex client reads that entry.
+        from kiro_crew.acp.types import ACP_BACKEND_CODEX
+
+        client = AcpClient(acp_backend=ACP_BACKEND_CODEX)
         client._acp_config_options = [
             {"id": "reasoning_effort", "options": [{"value": "low"}, {"value": "high"}]},
         ]

@@ -39,6 +39,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
 import { rehypeSanitize, remarkVerbatimUnknownTags } from '../../../../components/MarkdownRenderer'
 import { mdImageDestToPath } from '../../../../utils/fileTokens'
+import { copyToClipboard } from '../../../../utils/clipboard'
 import { classifyPlatform } from '../../../../hooks/useGatewayPlatform'
 import { useImeGuard } from '../../../../hooks/useImeGuard'
 import type { ChatMessage } from '../shared/types'
@@ -1735,15 +1736,22 @@ const MD_REHYPE = [rehypeRaw, rehypeSanitize]
  * MarkdownRenderer uses) instead of an `any` that hides a misspelled prop.
  */
 const mdComponents: Components = {
-  // `href` and the children are restated after the spread — both already arrive in
-  // `p`, so this is the same anchor at runtime — because an <a> whose href is only
-  // ever supplied by a spread is indistinguishable from a bare <a onClick>: it is
-  // not focusable and Enter does not fire it, and neither a reader nor the linter
-  // can tell it apart from a real link.
-  a: (p) => <a {...p} href={p.href} style={{ color: 'var(--accent)', textDecoration: 'none', cursor: 'pointer' }}
+  // react-markdown's defaultUrlTransform rewrites a destination whose scheme is
+  // outside its allowlist (and an empty `[x]()` destination) to href="". An
+  // anchor with an empty href still paints as a live link and its "Copy Link
+  // Address" resolves to the current page URL, so a refused destination renders
+  // as inert text instead -- same degradation as md-notebook's Preview.
+  //
+  // On the anchor path, `href` and the children are restated after the spread --
+  // both already arrive in `p`, so this is the same anchor at runtime -- because
+  // an <a> whose href is only ever supplied by a spread is indistinguishable
+  // from a bare <a onClick>: it is not focusable and Enter does not fire it, and
+  // neither a reader nor the linter can tell it apart from a real link.
+  a: (p) => p.href ? <a {...p} href={p.href} style={{ color: 'var(--accent)', textDecoration: 'none', cursor: 'pointer' }}
     onMouseEnter={(e) => (e.currentTarget.style.textDecoration = 'underline')}
     onMouseLeave={(e) => (e.currentTarget.style.textDecoration = 'none')}
-    onClick={(e) => { e.preventDefault(); const href = p.href; if (href) api?.openExternal?.(href) }}>{p.children}</a>,
+    onClick={(e) => { e.preventDefault(); const href = p.href; if (href) api?.openExternal?.(href) }}>{p.children}</a>
+    : <span>{p.children}</span>,
   table: (p) => <table style={{ borderCollapse: 'collapse', fontSize: 11, width: '100%', margin: '4px 0' }} {...p} />,
   th: (p) => <th style={{ border: '1px solid var(--border)', padding: '3px 6px', textAlign: 'left', fontWeight: 600 }} {...p} />,
   td: (p) => <td style={{ border: '1px solid var(--border)', padding: '3px 6px' }} {...p} />,
@@ -2006,7 +2014,18 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
     const approvalActions = [
       ['approve', i18nT('apps.mochi.approval.btn_approve'), '#2e7d32', Check],
       ...(req.trustGrantable === true
-        ? [['trust', i18nT('apps.mochi.approval.btn_trust'), '#1565c0', Handshake]]
+        ? [[
+          'trust',
+          // With scopes this button only OPENS the tier list, so the bare verb is
+          // right. Without them the same click IS the broadest grant, so the
+          // button must name what it grants: consent has to match the scope, and
+          // an unqualified "Trust" beside one tool reads as trusting that tool.
+          hasTrustScopes
+            ? i18nT('apps.mochi.approval.btn_trust')
+            : i18nT('apps.mochi.approval.trust_all_tools'),
+          '#1565c0',
+          Handshake,
+        ]]
         : []),
       ['reject', i18nT('apps.mochi.approval.btn_reject'), '#c62828', Ban],
     ] as [string, string, string, React.ComponentType<{ size?: number }>][]
@@ -2083,8 +2102,11 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
             </div>
           )}
           {req.trustGrantable === true && !hasTrustScopes && (
+            // This hint renders ONLY on the scopeless path, where the button
+            // grants the whole session. It therefore describes the session and
+            // names no tool: naming the pending tool understates the grant.
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 5 }}>
-              {i18nT('apps.mochi.approval.trust_hint', { tool: req.tool })}
+              {i18nT('apps.mochi.approval.trust_hint')}
             </div>
           )}
         </div>
@@ -2230,9 +2252,11 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
             <button
               className="copy-md-btn"
               onClick={() => {
-                navigator.clipboard.writeText(text)
-                setCopied(true)
-                setTimeout(() => setCopied(false), 1500)
+                copyToClipboard(text).then((ok) => {
+                  if (!ok) return
+                  setCopied(true)
+                  setTimeout(() => setCopied(false), 1500)
+                })
               }}
               title={copied ? i18nT('apps.mochi.chatPanel.copied') : i18nT('apps.mochi.chatPanel.copy_markdown')}
               aria-label={copied ? i18nT('apps.mochi.chatPanel.copied') : i18nT('apps.mochi.chatPanel.copy_markdown')}

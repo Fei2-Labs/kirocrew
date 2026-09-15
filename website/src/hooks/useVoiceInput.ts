@@ -56,11 +56,31 @@ interface Opts {
   onPartial?: (text: string, sessionId: string | null) => void
   /** Fired when streaming semantic endpointing judges the utterance complete. */
   onEndpoint?: () => void
+  /** Streaming capture stopped; final corrections may still arrive while typing. */
+  onCaptureStop?: () => void
   /** Id of the session/slot that currently owns the mic. Snapshotted the
    *  instant a recording starts so the resulting transcript can be attributed
    *  to the slot that initiated it — even if the user switches sessions before
    *  the (async) transcription finishes. */
   sessionId?: string | null
+  /**
+   * True when this instance's composer is the one on screen for a session, so a
+   * batch transcript that settles through the inbox is delivered to THIS `onText`
+   * alone rather than to every mounted instance. Composers co-mount (session
+   * grid, Crew Members DMs); without a claim each would receive the text and
+   * apply its own routing to it. Omit on a host that cannot show any session's
+   * composer — it then only receives unclaimed transcripts.
+   */
+  ownsSession?: (sessionId: string | null) => boolean
+  /**
+   * True when `onText` can take a batch transcript for a session this instance
+   * does NOT currently show (it routes it somewhere durable). When false the
+   * inbox never hands this instance unowned text — it keeps the text until an
+   * owner appears instead of letting it drop. Explicit: the one production
+   * caller (`useComposerVoice`) passes it alongside `ownsSession`; an instance
+   * that says nothing accepts nothing unowned.
+   */
+  acceptsUnowned?: boolean
 }
 
 /** Which capture path produced a transcript. The caller's disarm flags are all
@@ -170,9 +190,10 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   // Destructure individual members so downstream useCallback deps track
   // stable references (start/stop/recording) instead of the hook's
   // always-new return object literal, preventing memoization churn.
-  const { recording: streamRecording, start: streamStart, stop: streamStop, switchDevice: streamSwitchDevice, cancel: streamCancel } = useStreamingStt({
+  const { recording: streamRecording, draining: streamDraining, start: streamStart, stop: streamStop, switchDevice: streamSwitchDevice, cancel: streamCancel } = useStreamingStt({
     onPartial: streamOnPartial,
     onFinal: streamOnFinal,
+    onCaptureStop: opts.onCaptureStop,
     onError: setError,
     onLevel: setLevel,
     onDevice: streamOnDevice,
@@ -226,13 +247,25 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   )
   // The inbox request this instance currently displays as busy, if any.
   const shownRef = useRef<number | null>(null)
+  // Latest ownership predicate, read at settle time (not subscribe time) so a
+  // host whose on-screen composer changes — a slot switch, entering split mode —
+  // answers for the composer it shows NOW.
+  const ownsRef = useRef(opts.ownsSession)
+  ownsRef.current = opts.ownsSession
+  // Explicit flag, no inferred default: every production caller states both
+  // `ownsSession` and `acceptsUnowned`, so a legacy "no predicate means take
+  // everything" rule would have had no caller and one more branch to reason about.
+  const acceptsUnownedRef = useRef(opts.acceptsUnowned ?? false)
+  acceptsUnownedRef.current = opts.acceptsUnowned ?? false
 
   // A batch transcription outlives the component that started it (see
   // voiceTranscriptInbox): leaving Chat unmounts this hook while `/api/stt` is
   // still in flight, so its progress and result are routed through the inbox
-  // instead of into a dead closure. Whichever instance is mounted delivers it —
-  // restoring the busy indicator for the slot still waiting — and a result that
-  // settled with none mounted is drained here on the next mount.
+  // instead of into a dead closure. Every mounted instance shows the busy state
+  // (the mic is one shared device, so every composer's controls must read the
+  // same "in flight" fact); the TEXT is delivered once, to the instance whose
+  // composer owns the session, and a result that settled with none mounted is
+  // drained here on the next mount.
   useEffect(() => subscribeTranscripts({
     begin: request => {
       if (capturing()) return
@@ -240,7 +273,7 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
       setTranscribing(true)
       setSessionOwner(request.sessionId)
     },
-    settle: result => {
+    settle: (result, deliver) => {
       // Only the request actually on display releases the busy state, and only
       // while nothing is capturing here: a transcription that settles after this
       // instance started its own session must not blank that session's mic UI.
@@ -248,9 +281,12 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
         shownRef.current = null
         if (!capturing()) { setTranscribing(false); setSessionOwner(null) }
       }
+      if (!deliver) return
       if (result.error) setError(result.error)
       else if (result.text) onTextRef.current(result.text, result.sessionId, 'batch')
     },
+    owns: sessionId => ownsRef.current?.(sessionId) === true,
+    get acceptsUnowned() { return acceptsUnownedRef.current },
   }), [capturing])
 
   // Acquire (or reuse) a live mic stream and attach the level meter + device
@@ -352,11 +388,14 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
       // this stream to the slot now on screen.
       if (startingRef.current) return
       startingRef.current = true
+      // Stop spoken replies before capture can feed them back into dictation.
+      window.dispatchEvent(new CustomEvent('voice-stop'))
       const gen = ++startGenRef.current
       const streamSession = sessionIdRef.current
       streamSessionRef.current = streamSession
       try {
-        await streamStart()
+        const started = await streamStart()
+        if (started === false) return
         // Aborted by a slot switch during startup — stop the stream rather than
         // capture invisibly for a slot that is no longer on screen.
         if (streamSession !== sessionIdRef.current) { streamStop(); return }
@@ -375,6 +414,7 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
     }
     if (!voiceInputSupported || startingRef.current) return
     startingRef.current = true
+    window.dispatchEvent(new CustomEvent('voice-stop'))
     const gen = ++startGenRef.current
     // Attribute this recording's transcript to the slot that owns the mic RIGHT
     // NOW. Captured as a local (not the ref) so a second recording started in
@@ -487,7 +527,7 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   }, [streamEnabled, streamStart, streamStop, acquireWarm])
 
   const stop = useCallback(() => {
-    if (streamEnabled) { streamStop(); setSessionOwner(null); return }
+    if (streamEnabled) { streamStop(); return }
     setPartial('')
     levelStopRef.current?.()
     levelStopRef.current = null
@@ -532,6 +572,10 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
     setSessionOwner(null)
   }, [streamEnabled, streamCancel, releaseWarm])
 
+  useEffect(() => {
+    if (streamEnabled && !streamRecording && !streamDraining && !startingRef.current) setSessionOwner(null)
+  }, [streamEnabled, streamRecording, streamDraining])
+
   const isRecording = streamEnabled ? streamRecording : recording
   const toggle = useCallback(() => { if (isRecording) stop(); else start() }, [isRecording, start, stop])
   /**
@@ -575,5 +619,5 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   /** True when `switchDevice` takes effect immediately rather than next recording. */
   const deviceSwitchIsLive = streamEnabled && streamRecording
 
-  return { recording: isRecording, transcribing, sessionOwner, streamEnabled, toggle, start, stop, cancel, prewarm, error, level, deviceLabel, deviceId, clearError, partial, download, sampleRef, switchDevice, deviceSwitchIsLive }
+  return { recording: isRecording, transcribing: transcribing || !!streamDraining, sessionOwner, streamEnabled, toggle, start, stop, cancel, prewarm, error, level, deviceLabel, deviceId, clearError, partial, download, sampleRef, switchDevice, deviceSwitchIsLive }
 }

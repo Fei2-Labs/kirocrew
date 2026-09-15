@@ -42,6 +42,13 @@ export interface NormalizedUsage {
     thisWeek: UsagePeriod
     thisMonth: UsagePeriod
     avgMsgsPerSession: number
+    /**
+     * Transcripts the path validator refused while scanning the sessions dir
+     * (#6733). On a Windows roaming-profile (UNC) home every transcript is
+     * refused, so a `total` of 0 with a positive count here is the silent
+     * failure the usage page must not render as a confident zero.
+     */
+    refusedTranscripts: number
     dailyHistory: { date: string; sessions: number; messages: number; toolCalls: number }[]
   }
   billing: {
@@ -98,7 +105,6 @@ export interface ProviderLabels {
   sessionProcess: string
   agentTemplateField: string
   processCountLabel: string
-  warmPoolDescription: string
   configFile: string
   pluginRegistryName: string
   hooksSection: string

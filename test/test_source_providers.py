@@ -21,11 +21,60 @@ from kiro_crew.dashboard.handlers import source_providers as source
 from kiro_crew.sandbox import spawn_shim_argv
 
 
+def _trust_ancestors_above(monkeypatch, base):
+    """Pin ancestor owners without changing fixture files or permission bits."""
+    ancestors = set(base.resolve().parents)
+    real_stat = pathlib.Path.stat
+
+    def fake_stat(self, **kwargs):
+        info = real_stat(self, **kwargs)
+        if self not in ancestors:
+            return info
+
+        class AncestorStat:
+            st_uid = 0
+
+            def __getattr__(self, name):
+                return getattr(info, name)
+
+        return AncestorStat()
+
+    monkeypatch.setattr(pathlib.Path, "stat", fake_stat)
+
+
 @pytest.fixture(autouse=True)
 def _mock_source_sel(monkeypatch):
     audit = MagicMock()
     monkeypatch.setattr(source, "_sel", lambda: audit)
     return audit
+
+
+@pytest.fixture(autouse=True)
+def _no_visibility_refresh_side_task(monkeypatch):
+    """Keep the repo-visibility refresh out of tests that are not about it.
+
+    A cache write-through schedules ``_refresh_repo_visibility`` as a detached
+    task; nothing in this module awaits it, so it ran on into the NEXT test and
+    past this one's pins. Its ``_run_provider`` resolves the provider CLI on a
+    worker thread, and that resolution reads ``workspace_root()``, which reached
+    ``config_dir()`` after ``KIROCREW_HOME`` had been unpinned and created the
+    operator's real ``~/.kiro/crew`` (third side-effect audit, four tests here).
+    No test in this module asserts anything about visibility
+    (``test_public_repo_chip_status.py`` owns that surface and drains the set
+    itself), so the scheduler is a recorder here: the calls are observable, the
+    task is never spawned, and nothing outlives the test.
+    """
+    scheduled: list[tuple] = []
+    monkeypatch.setattr(
+        source,
+        "schedule_visibility_refresh",
+        lambda urls, *a, **k: scheduled.append((tuple(urls), a, k)),
+    )
+    yield scheduled
+    for task in list(source._VISIBILITY_TASKS):
+        if not task.get_loop().is_closed():
+            task.cancel()
+    source._VISIBILITY_TASKS.clear()
 
 
 def test_parse_github_pull_request() -> None:
@@ -187,7 +236,7 @@ def test_github_checks_do_not_collapse_a_commit_status_into_a_check_run() -> Non
 
 def test_github_checks_classify_untyped_rows_by_shape_not_by_name() -> None:
     """A row without `__typename` must still be classified correctly. A status
-    row carrying both `context` and `name` used to be read as a check-run and
+    row carrying both `context` and `name` must not be read as a check-run and
     collide with a nameless check-run (both normalize to the `"Check"`
     placeholder), letting the status success hide the check-run failure."""
     rollup = [
@@ -360,6 +409,9 @@ def test_provider_executable_not_found_gives_install_guidance(monkeypatch) -> No
         "PROVIDER_EXECUTABLE_CANDIDATES",
         {"gh": ("/nonexistent-kirocrew/gh",), "glab": ("/nonexistent-kirocrew/glab",)},
     )
+    # Windows also scans the Program Files install dirs; a host with a real gh
+    # there (GitHub's own runners ship one) must still read as "not found".
+    monkeypatch.setattr(github_runner, "_wellknown_windows_dirs", lambda _executable: ())
 
     with pytest.raises(source.SourceProviderError) as excinfo:
         source._resolve_provider_executable("gh")
@@ -415,13 +467,14 @@ _tmp_owner_ok = (
 @pytest.mark.skipif(not _tmp_owner_ok, reason="temp dir not owned by root or current user")
 def test_provider_executable_accepts_user_owned_install(monkeypatch, tmp_path) -> None:
     """The default policy accepts the user's own gh — the Homebrew case that
-    previously forced a `sudo cp` into a root-owned directory."""
+    would otherwise force a `sudo cp` into a root-owned directory."""
     executable = tmp_path / "gh"
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
     monkeypatch.setenv("KIROCREW_GH_BIN", str(executable))
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     assert source._resolve_provider_executable("gh") == str(executable.resolve())
 
@@ -442,6 +495,7 @@ def test_provider_executable_accepts_symlinked_install(monkeypatch, tmp_path) ->
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
     monkeypatch.setenv("KIROCREW_GH_BIN", str(link))
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     assert source._resolve_provider_executable("gh") == str(target.resolve())
 
@@ -472,10 +526,15 @@ def test_provider_executable_strict_mode_rejects_symlink(monkeypatch, tmp_path) 
         source._resolve_provider_executable("gh")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="exercises the POSIX uid branch")
 def test_provider_executable_refuses_a_root_gateway(monkeypatch, tmp_path) -> None:
-    """A root gateway is refused in BOTH modes: every process it spawns (the
-    agent's own shell included) is root too, which makes the ownership and
-    agent-tree checks vacuous."""
+    """A root POSIX gateway is refused in BOTH modes. The sandbox masks the
+    credential homes from the agent's children but leaves the filesystem
+    writable, and a provider child runs unsandboxed with those credentials —
+    so a root agent could overwrite a root-owned `gh` and this walk could not
+    tell that write from the operator's install. The refusal keeps the mask a
+    boundary; the Windows elevated case has no such boundary and is not refused
+    (see the test below)."""
     executable = tmp_path / "gh"
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)
@@ -485,6 +544,46 @@ def test_provider_executable_refuses_a_root_gateway(monkeypatch, tmp_path) -> No
 
     with pytest.raises(ValueError, match="disabled for a root gateway"):
         source._validate_provider_executable(str(executable))
+
+
+def test_provider_executable_elevated_windows_gateway_is_not_refused(
+    monkeypatch, tmp_path
+) -> None:
+    """On Windows the validator asks nothing about the token's elevation: the
+    built-in Administrator account (always elevated, no UAC split token) and a
+    "Run as administrator" launch both go through the same ACL walk as any user,
+    keyed on the gateway user's SID."""
+    executable = tmp_path / "gh.exe"
+    executable.write_text("rem\n")
+    executable.chmod(0o755)
+    checked: list[tuple[str, str]] = []
+
+    def fake_windows_check(path, *, label, me_sid, strict):
+        checked.append((label, me_sid))
+
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner.sys, "platform", "win32")
+    monkeypatch.setattr(github_runner.platform_compat, "current_user_sid", lambda: "S-1-5-21-7-500")
+    monkeypatch.setattr(github_runner, "check_provider_path_component_windows", fake_windows_check)
+    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [])
+
+    assert github_runner.validate_provider_executable(str(executable)) == str(executable.resolve())
+    assert checked == [("executable", "S-1-5-21-7-500")]
+
+
+def test_provider_executable_windows_still_refuses_an_unverifiable_sid(
+    monkeypatch, tmp_path
+) -> None:
+    """The SID is the analog of ``uid``; without it the ACL walk cannot say
+    whose install this is, so that refusal stays."""
+    executable = tmp_path / "gh.exe"
+    executable.write_text("rem\n")
+    executable.chmod(0o755)
+    monkeypatch.setattr(github_runner.sys, "platform", "win32")
+    monkeypatch.setattr(github_runner.platform_compat, "current_user_sid", lambda: None)
+
+    with pytest.raises(ValueError, match="SID is unverifiable"):
+        github_runner.validate_provider_executable(str(executable))
 
 
 def test_provider_executable_rejects_binary_owned_by_another_user(
@@ -636,6 +735,763 @@ async def test_fetch_cache_evicts_oldest_entry_by_aggregate_weight(monkeypatch) 
     assert sum(entry[1] for entry in source._CACHE.values()) <= source._CACHE_MAX_BYTES
 
 
+# ── Terminal-state retention ─────────────────────────────────────────────────
+# A merged or closed pull request never moves on its own, so both caches keep it
+# for `_TERMINAL_TTL_SECS` instead of re-reading it on the open-PR cadence for
+# as long as its chip sits in a sidebar.
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"state": "OPEN"}, source._CACHE_TTL_SECS),
+        ({"state": "OPEN", "draft": True}, source._CACHE_TTL_SECS),
+        ({"state": "opened"}, source._CACHE_TTL_SECS),
+        ({"state": "MERGED"}, source._TERMINAL_TTL_SECS),
+        ({"state": "merged"}, source._TERMINAL_TTL_SECS),
+        ({"state": "CLOSED"}, source._CLOSED_TTL_SECS),
+        # A closed-while-draft GitLab MR is closed, not draft (see _project_state).
+        ({"state": "closed", "draft": True}, source._CLOSED_TTL_SECS),
+        # Transient / unknown lifecycles are not terminal.
+        ({"state": "locked"}, source._CACHE_TTL_SECS),
+        ({}, source._CACHE_TTL_SECS),
+    ],
+)
+def test_full_payload_ttl_is_decided_by_projected_lifecycle(payload, expected) -> None:
+    assert source._full_payload_ttl(payload) == expected
+
+
+def test_terminal_ttl_is_the_longer_one() -> None:
+    """The property every retention test below rests on: merged outlives
+    closed, and both outlive the open cadence of either cache."""
+    assert source._TERMINAL_TTL_SECS > source._CLOSED_TTL_SECS
+    assert source._CLOSED_TTL_SECS > source._CACHE_TTL_SECS
+    assert source._CLOSED_TTL_SECS > source._CHECK_TTL_SECS
+    assert source._TERMINAL_CHIP_STATES == {"merged", "closed"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_pull_request_serves_a_terminal_payload_past_the_open_ttl(monkeypatch) -> None:
+    """With no conditional read available (GitLab), a merged MR aged past the
+    open TTL is still a cache hit -- no provider read at all."""
+    url = "https://gitlab.com/acme/repo/-/merge_requests/21"
+    source._CACHE.clear()
+    fetch = AsyncMock(return_value={"state": "merged", "checks": []})
+    monkeypatch.setattr(source, "_fetch_gitlab", fetch)
+    monkeypatch.setattr(source, "_gh_conditional_get", AsyncMock(side_effect=AssertionError))
+    stale_for_open = source.time.monotonic() - source._CACHE_TTL_SECS - 5
+    cached = {"state": "merged", "url": url, "marker": "cached"}
+    source._CACHE[url] = (stale_for_open, 10, cached)
+    try:
+        assert await source.fetch_pull_request(url) is cached
+        fetch.assert_not_awaited()
+        # The explicit refresh button still bypasses every TTL.
+        result = await source.fetch_pull_request(url, refresh=True)
+        assert result.get("marker") is None
+        fetch.assert_awaited_once()
+    finally:
+        source._CACHE.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_closed_payload_ages_on_the_closed_clock_without_a_conditional_read(
+    monkeypatch,
+) -> None:
+    """Closed outlives the open TTL but not the merged one: it can be reopened."""
+    url = "https://gitlab.com/acme/repo/-/merge_requests/24"
+    source._CACHE.clear()
+    fetch = AsyncMock(return_value={"state": "closed"})
+    monkeypatch.setattr(source, "_fetch_gitlab", fetch)
+    cached = {"state": "closed", "marker": "cached"}
+    try:
+        source._CACHE[url] = (source.time.monotonic() - source._CLOSED_TTL_SECS + 60, 10, cached)
+        assert await source.fetch_pull_request(url) is cached
+        fetch.assert_not_awaited()
+        source._CACHE[url] = (source.time.monotonic() - source._CLOSED_TTL_SECS - 1, 10, cached)
+        assert (await source.fetch_pull_request(url)).get("marker") is None
+        fetch.assert_awaited_once()
+    finally:
+        source._CACHE.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_expired_terminal_github_payload_is_revalidated_with_the_issue_probe_only(
+    monkeypatch,
+) -> None:
+    """A finished github.com pull request keeps accruing discussion and a closed
+    one can be reopened, so it is revalidated on the open cadence -- but its CI
+    is over, so only the issue probe is sent (one rate-limit-free request)."""
+    url = "https://github.com/acme/repo/pull/21"
+    source._CACHE.clear()
+    source._REVALIDATORS.clear()
+    fetch = AsyncMock(return_value={"state": "MERGED", "headSha": "a" * 40, "marker": "fresh"})
+    monkeypatch.setattr(source, "_fetch_github", fetch)
+    probes = _FakeProbes(
+        source._ConditionalRead(304, '"i"'),
+        source._ConditionalRead(200, 'W/"never-asked"'),
+        source._ConditionalRead(200, 'W/"never-asked"'),
+    )
+    monkeypatch.setattr(source, "_gh_conditional_get", probes)
+    source._REVALIDATORS[url] = source._Revalidator('"i"', "", "", "a" * 40, 1.0)
+    stale_for_open = source.time.monotonic() - source._CACHE_TTL_SECS - 5
+    cached = {"state": "MERGED", "headSha": "a" * 40, "marker": "cached"}
+    source._CACHE[url] = (stale_for_open, 10, cached)
+    try:
+        assert await source.fetch_pull_request(url) is cached
+        fetch.assert_not_awaited()
+        assert set(probes.sent) == {"issue"}
+        assert source._CACHE[url][0] > stale_for_open
+
+        # A post-merge comment (or a reopen) moves the issue ETag: full read.
+        moved = _FakeProbes(
+            source._ConditionalRead(200, 'W/"i2"'),
+            source._ConditionalRead(304, '"c"'),
+        )
+        monkeypatch.setattr(source, "_gh_conditional_get", moved)
+        source._CACHE[url] = (stale_for_open, 10, cached)
+        assert (await source.fetch_pull_request(url)).get("marker") == "fresh"
+        fetch.assert_awaited_once()
+        assert set(moved.sent) == {"issue"}
+    finally:
+        source._CACHE.clear()
+        source._REVALIDATORS.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_fetch_pull_request_refetches_an_open_payload_past_the_open_ttl(monkeypatch) -> None:
+    """The open-PR cadence is unchanged: the same age on an OPEN payload is a miss."""
+    url = "https://github.com/acme/repo/pull/22"
+    source._CACHE.clear()
+    fetch = AsyncMock(return_value={"state": "OPEN", "checks": []})
+    monkeypatch.setattr(source, "_fetch_github", fetch)
+    stale_for_open = source.time.monotonic() - source._CACHE_TTL_SECS - 5
+    source._CACHE[url] = (stale_for_open, 10, {"state": "OPEN", "marker": "cached"})
+    try:
+        result = await source.fetch_pull_request(url)
+        assert result.get("marker") is None
+        fetch.assert_awaited_once()
+    finally:
+        source._CACHE.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_terminal_payload_re_reads_once_past_its_own_ttl(monkeypatch) -> None:
+    """Terminal retention is long, not infinite: past its own TTL it re-reads."""
+    url = "https://gitlab.com/acme/repo/-/merge_requests/23"
+    source._CACHE.clear()
+    fetch = AsyncMock(return_value={"state": "merged", "checks": []})
+    monkeypatch.setattr(source, "_fetch_gitlab", fetch)
+    expired = source.time.monotonic() - source._TERMINAL_TTL_SECS - 5
+    source._CACHE[url] = (expired, 10, {"state": "merged", "marker": "cached"})
+    try:
+        result = await source.fetch_pull_request(url)
+        assert result.get("marker") is None
+        fetch.assert_awaited_once()
+    finally:
+        source._CACHE.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_write_sweep_keeps_a_terminal_entry_older_than_the_open_ttl(monkeypatch) -> None:
+    """The on-write expiry sweep ages each entry by its OWN lifecycle TTL."""
+    source._CACHE.clear()
+    monkeypatch.setattr(source, "_fetch_github", AsyncMock(return_value={"state": "OPEN"}))
+    merged = "https://github.com/acme/repo/pull/30"
+    open_pr = "https://github.com/acme/repo/pull/31"
+    written = "https://github.com/acme/repo/pull/32"
+    stale_for_open = source.time.monotonic() - source._CACHE_TTL_SECS - 5
+    source._CACHE[merged] = (stale_for_open, 10, {"state": "MERGED"})
+    source._CACHE[open_pr] = (stale_for_open, 10, {"state": "OPEN"})
+    try:
+        await source.fetch_pull_request(written)
+        assert merged in source._CACHE
+        assert open_pr not in source._CACHE
+        assert written in source._CACHE
+    finally:
+        source._CACHE.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.parametrize(
+    ("entry_state", "age", "force", "due"),
+    [
+        # Open PRs: the chip TTL, and force bypasses it.
+        ("open", 1, False, False),
+        ("open", None, False, True),  # None = past _CHECK_TTL_SECS
+        ("open", 1, True, True),
+        ("draft", 1, True, True),
+        # Closed: the closed clock (shorter than merged), and a turn boundary may
+        # re-read it (an agent can reopen).
+        ("closed", None, False, False),
+        ("closed", None, True, True),
+        ("closed", "closed", False, True),  # past _CLOSED_TTL_SECS
+        ("closed", "terminal", False, True),  # past _TERMINAL_TTL_SECS
+        # Merged: long TTL and NOT force-read — it cannot change.
+        ("merged", None, False, False),
+        ("merged", None, True, False),
+        ("merged", "closed", False, False),  # the closed clock is not merged's
+        ("merged", "terminal", False, True),
+        ("merged", "terminal", True, True),
+        # No lifecycle known yet: chip TTL applies (status may be None).
+        ("", 1, False, False),
+        ("", None, False, True),
+    ],
+)
+def test_chip_refresh_due_by_lifecycle(entry_state, age, force, due) -> None:
+    now = 1_000_000.0
+    if age is None:
+        age = source._CHECK_TTL_SECS + 1
+    elif age == "closed":
+        age = source._CLOSED_TTL_SECS + 1
+    elif age == "terminal":
+        age = source._TERMINAL_TTL_SECS + 1
+    status = {"state": entry_state} if entry_state else None
+    entry = (now - age, status)
+    assert source._chip_refresh_due(entry, now, force=force) is due
+
+
+def test_chip_refresh_due_for_a_missing_entry() -> None:
+    assert source._chip_refresh_due(None, 0.0, force=False) is True
+    assert source._chip_refresh_due(None, 0.0, force=True) is True
+
+
+@pytest.mark.asyncio
+async def test_schedule_check_refresh_skips_finished_pull_requests(monkeypatch) -> None:
+    """The periodic chip sweep spends no provider read on a merged or closed PR
+    whose entry is past the open-PR TTL; a turn boundary re-reads a closed one
+    but never a merged one."""
+    merged = "https://github.com/acme/repo/pull/40"
+    closed = "https://github.com/acme/repo/pull/41"
+    open_pr = "https://github.com/acme/repo/pull/42"
+    source._check_cache.clear()
+    source._check_inflight.clear()
+    source._check_forced_at.clear()
+    refresh = AsyncMock(return_value=None)
+    monkeypatch.setattr(source, "_refresh_check_status", refresh)
+    stale = source.time.monotonic() - source._CHECK_TTL_SECS - 1
+    source._check_cache[merged] = (stale, {"state": "merged", "ci": "passed"})
+    source._check_cache[closed] = (stale, {"state": "closed"})
+    source._check_cache[open_pr] = (stale, {"state": "open", "ci": "running"})
+    try:
+        assert source.schedule_check_refresh([merged, closed, open_pr]) == [open_pr]
+        assert source._check_inflight == {open_pr}
+        source._check_inflight.clear()
+
+        forced = source.request_check_refresh_now([merged, closed, open_pr])
+        assert set(forced) == {closed, open_pr}
+        assert merged not in source._check_inflight
+        assert merged not in source._check_forced_at
+    finally:
+        source._check_cache.clear()
+        source._check_inflight.clear()
+        source._check_forced_at.clear()
+
+
+# ── Conditional revalidation (If-None-Match probes) ──────────────────────────
+
+
+def _gh_i_output(status: int, reason: str, etag: str, body: str, sep: str = "\r\n") -> bytes:
+    lines = [f"HTTP/2.0 {status} {reason}", "Content-Type: application/json; charset=utf-8"]
+    if etag:
+        lines.append(f"Etag: {etag}")
+    return (sep.join(lines) + sep + sep + body).encode()
+
+
+def test_parse_conditional_get_reads_status_and_etag_and_ignores_the_body() -> None:
+    parse = source._parse_conditional_get("gh")
+    read = parse(0, _gh_i_output(200, "OK", 'W/"abc"', '{"updated_at": "x"}'), b"")
+    assert read == source._ConditionalRead(200, 'W/"abc"')
+
+
+def test_parse_conditional_get_treats_304_exit_1_as_success() -> None:
+    """`gh` exits 1 on every non-2xx status, so the 304 the request exists for
+    arrives as a failure exit code and must be read from the status line."""
+    parse = source._parse_conditional_get("gh")
+    read = parse(1, _gh_i_output(304, "Not Modified", '"abc"', ""), b"gh: HTTP 304\n")
+    assert read == source._ConditionalRead(304, '"abc"')
+
+
+def test_parse_conditional_get_accepts_lf_separated_headers_and_missing_etag() -> None:
+    parse = source._parse_conditional_get("gh")
+    read = parse(0, _gh_i_output(200, "OK", "", "[]", sep="\n"), b"")
+    assert read == source._ConditionalRead(200, "")
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    [
+        (1, _gh_i_output(404, "Not Found", "", '{"message": "Not Found"}'), b"gh: Not Found"),
+        (1, _gh_i_output(401, "Unauthorized", "", "{}"), b"gh: HTTP 401: Bad credentials"),
+        (1, b"", b"gh: authentication required"),
+        (0, b"not a status line\r\n\r\n{}", b""),
+    ],
+)
+def test_parse_conditional_get_rejects_everything_but_200_and_304(
+    returncode, stdout, stderr
+) -> None:
+    parse = source._parse_conditional_get("gh")
+    with pytest.raises(source.SourceProviderError):
+        parse(returncode, stdout, stderr)
+
+
+def test_parse_conditional_get_appends_login_hint_on_auth_failure() -> None:
+    parse = source._parse_conditional_get("gh")
+    with pytest.raises(source.SourceProviderError, match="gh auth login"):
+        parse(1, b"", b"gh: authentication required")
+
+
+@pytest.mark.asyncio
+async def test_gh_conditional_get_sends_if_none_match_only_when_known(monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run_provider(*argv, **kwargs):
+        calls.append(argv)
+        assert kwargs["parse"] is not None
+        return source._ConditionalRead(304, '"e2"')
+
+    monkeypatch.setattr(source, "_run_provider", fake_run_provider)
+    await source._gh_conditional_get("repos/acme/repo/issues/7", "")
+    await source._gh_conditional_get("repos/acme/repo/issues/7", 'W/"e1"')
+    assert calls == [
+        ("gh", "api", "repos/acme/repo/issues/7", "-i"),
+        ("gh", "api", "repos/acme/repo/issues/7", "-i", "-H", 'If-None-Match: W/"e1"'),
+    ]
+
+
+class _FakeProbes:
+    """Scripted `_gh_conditional_get`: answers by path and records the validator
+    each probe was sent. `status` defaults to a 304 echo so tests written around
+    the issue/check-runs pair stay focused on them."""
+
+    def __init__(
+        self,
+        issue: source._ConditionalRead,
+        checks: source._ConditionalRead,
+        status: source._ConditionalRead | None = None,
+    ) -> None:
+        self.issue = issue
+        self.checks = checks
+        self.status = status or source._ConditionalRead(304, '"s1"')
+        self.sent: dict[str, str] = {}
+
+    async def __call__(self, path: str, etag: str, **_: object) -> source._ConditionalRead:
+        if "/check-runs" in path:
+            kind = "checks"
+        elif path.endswith("/status"):
+            kind = "status"
+        else:
+            kind = "issue"
+        self.sent[kind] = etag
+        if isinstance(getattr(self, kind), Exception):
+            raise getattr(self, kind)
+        return getattr(self, kind)
+
+
+_OPEN_PAYLOAD = {"state": "OPEN", "headSha": "a" * 40, "url": "https://github.com/acme/repo/pull/7"}
+_REF = source.parse_source_url("https://github.com/acme/repo/pull/7")
+
+
+@pytest.mark.asyncio
+async def test_payload_unchanged_first_probe_learns_validators_and_is_unknown(monkeypatch) -> None:
+    """With nothing to send, a 200 is the only possible answer, and a 200 is
+    never read as unchanged -- it returns the validators for the caller to
+    commit once the full read has landed."""
+    source._REVALIDATORS.clear()
+    probes = _FakeProbes(
+        source._ConditionalRead(200, 'W/"i1"'),
+        source._ConditionalRead(200, 'W/"c1"'),
+    )
+    monkeypatch.setattr(source, "_gh_conditional_get", probes)
+    try:
+        outcome = await source._probe_github_payload(_REF, _OPEN_PAYLOAD)
+        assert outcome.unchanged is False
+        assert probes.sent == {"issue": "", "checks": "", "status": ""}
+        learned = outcome.learned
+        assert learned is not None
+        assert (learned.issue_etag, learned.checks_etag, learned.head_sha) == (
+            'W/"i1"',
+            'W/"c1"',
+            "a" * 40,
+        )
+        # Nothing is committed on a 200 until the fanout that follows succeeds.
+        assert _REF.url not in source._REVALIDATORS
+    finally:
+        source._REVALIDATORS.clear()
+
+
+@pytest.mark.asyncio
+async def test_payload_unchanged_requires_both_probes_to_answer_304(monkeypatch) -> None:
+    source._REVALIDATORS.clear()
+    source._REVALIDATORS[_REF.url] = source._Revalidator('W/"i1"', 'W/"c1"', 'W/"s1"', "a" * 40, 1.0)
+    try:
+        both = _FakeProbes(
+            source._ConditionalRead(304, '"i1"'), source._ConditionalRead(304, '"c1"')
+        )
+        monkeypatch.setattr(source, "_gh_conditional_get", both)
+        assert (await source._probe_github_payload(_REF, _OPEN_PAYLOAD)).unchanged is True
+        assert both.sent == {"issue": 'W/"i1"', "checks": 'W/"c1"', "status": 'W/"s1"'}
+        # A 304 echoes the validator in the strong form; whichever form the
+        # server sent last is what goes out next.
+        assert source._REVALIDATORS[_REF.url].issue_etag == '"i1"'
+
+        # CI moved: check-runs answers 200 while the issue half is still 304.
+        ci_moved = _FakeProbes(
+            source._ConditionalRead(304, '"i1"'),
+            source._ConditionalRead(200, 'W/"c2"'),
+        )
+        monkeypatch.setattr(source, "_gh_conditional_get", ci_moved)
+        moved = await source._probe_github_payload(_REF, _OPEN_PAYLOAD)
+        assert moved.unchanged is False
+        assert moved.learned is not None and moved.learned.checks_etag == 'W/"c2"'
+        # ...and the committed validators still describe the payload the cache holds.
+        assert source._REVALIDATORS[_REF.url].checks_etag == '"c1"'
+
+        # A review landed: the issue half answers 200.
+        review = _FakeProbes(
+            source._ConditionalRead(200, 'W/"i2"'),
+            source._ConditionalRead(304, '"c2"'),
+        )
+        monkeypatch.setattr(source, "_gh_conditional_get", review)
+        assert (await source._probe_github_payload(_REF, _OPEN_PAYLOAD)).unchanged is False
+    finally:
+        source._REVALIDATORS.clear()
+
+
+@pytest.mark.asyncio
+async def test_payload_unchanged_does_not_reuse_check_runs_etag_across_a_push(monkeypatch) -> None:
+    """The check-runs validator belongs to a commit; after a push the old one
+    would keep answering 304 for a head nobody is looking at."""
+    source._REVALIDATORS.clear()
+    source._REVALIDATORS[_REF.url] = source._Revalidator('W/"i1"', 'W/"c1"', 'W/"s1"', "a" * 40, 1.0)
+    probes = _FakeProbes(
+        source._ConditionalRead(304, '"i1"'),
+        source._ConditionalRead(200, 'W/"c-new"'),
+    )
+    monkeypatch.setattr(source, "_gh_conditional_get", probes)
+    try:
+        pushed = {**_OPEN_PAYLOAD, "headSha": "b" * 40}
+        outcome = await source._probe_github_payload(_REF, pushed)
+        assert outcome.unchanged is False
+        assert probes.sent["checks"] == ""
+        assert probes.sent["issue"] == 'W/"i1"'
+        assert outcome.learned is not None and outcome.learned.head_sha == "b" * 40
+    finally:
+        source._REVALIDATORS.clear()
+
+
+@pytest.mark.asyncio
+async def test_payload_unchanged_is_unknown_on_probe_failure_or_missing_head(monkeypatch) -> None:
+    source._REVALIDATORS.clear()
+    source._REVALIDATORS[_REF.url] = source._Revalidator('W/"i1"', 'W/"c1"', 'W/"s1"', "a" * 40, 1.0)
+    failing = _FakeProbes(
+        source.SourceProviderError("gh: HTTP 500"),  # type: ignore[arg-type]
+        source._ConditionalRead(304, '"c1"'),
+    )
+    monkeypatch.setattr(source, "_gh_conditional_get", failing)
+    try:
+        assert await source._probe_github_payload(_REF, _OPEN_PAYLOAD) == source._PROBE_UNKNOWN
+        # Validators learned before the failure survive it untouched.
+        assert source._REVALIDATORS[_REF.url].issue_etag == 'W/"i1"'
+        assert await source._probe_github_payload(_REF, {"state": "OPEN"}) == source._PROBE_UNKNOWN
+    finally:
+        source._REVALIDATORS.clear()
+
+
+def test_revalidators_map_is_bounded(monkeypatch) -> None:
+    source._REVALIDATORS.clear()
+    monkeypatch.setattr(source, "_REVALIDATORS_MAX", 3)
+    try:
+        for index in range(5):
+            source._REVALIDATORS[f"u{index}"] = source._Revalidator("", "", "", "", float(index))
+        source._trim_revalidators()
+        assert set(source._REVALIDATORS) == {"u2", "u3", "u4"}
+    finally:
+        source._REVALIDATORS.clear()
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://github.com/acme/repo/pull/7", True),
+        # GitLab's API is not probed.
+        ("https://gitlab.com/acme/repo/-/merge_requests/7", False),
+    ],
+)
+def test_revalidation_applies_to_github_only(url, expected) -> None:
+    ref = source.parse_source_url(url)
+    assert source._revalidation_applies(ref) is expected
+
+
+@pytest.mark.asyncio
+async def test_terminal_payload_probes_the_issue_only(monkeypatch) -> None:
+    """CI is over for a merged or closed pull request, so the two commit-level
+    probes are not sent; the issue probe alone decides (reopen, comments)."""
+    source._REVALIDATORS.clear()
+    probes = _FakeProbes(
+        source._ConditionalRead(304, '"i1"'),
+        source._ConditionalRead(200, 'W/"c"'),
+        source._ConditionalRead(200, 'W/"s"'),
+    )
+    monkeypatch.setattr(source, "_gh_conditional_get", probes)
+    source._REVALIDATORS[_REF.url] = source._Revalidator('"i1"', "", "", "a" * 40, 1.0)
+    try:
+        for state in ("MERGED", "CLOSED"):
+            probes.sent.clear()
+            payload = {**_OPEN_PAYLOAD, "state": state}
+            assert (await source._probe_github_payload(_REF, payload)).unchanged is True
+            assert set(probes.sent) == {"issue"}
+        # Validators for the commit half are carried, not blanked, by the skip.
+        assert source._REVALIDATORS[_REF.url].checks_etag == ""
+    finally:
+        source._REVALIDATORS.clear()
+
+
+@pytest.mark.asyncio
+async def test_open_payload_requires_the_commit_status_probe_too(monkeypatch) -> None:
+    """Legacy commit statuses are a separate resource from check runs and the
+    panel's rollup renders both, so a moved status ETag alone re-reads."""
+    source._REVALIDATORS.clear()
+    source._REVALIDATORS[_REF.url] = source._Revalidator('"i"', '"c"', '"s"', "a" * 40, 1.0)
+    probes = _FakeProbes(
+        source._ConditionalRead(304, '"i"'),
+        source._ConditionalRead(304, '"c"'),
+        source._ConditionalRead(200, 'W/"s2"'),
+    )
+    monkeypatch.setattr(source, "_gh_conditional_get", probes)
+    try:
+        outcome = await source._probe_github_payload(_REF, _OPEN_PAYLOAD)
+        assert outcome.unchanged is False
+        assert probes.sent == {"issue": '"i"', "checks": '"c"', "status": '"s"'}
+        assert outcome.learned is not None and outcome.learned.status_etag == 'W/"s2"'
+    finally:
+        source._REVALIDATORS.clear()
+
+
+@pytest.mark.asyncio
+async def test_validators_from_a_200_are_committed_only_after_the_fanout_succeeds(
+    monkeypatch,
+) -> None:
+    """A probe that answers 200 describes a payload the cache does not hold
+    yet. If the fanout then fails, the old validators must stay: committing the
+    new ones would pair the pre-change payload with post-change ETags, and every
+    later probe would answer 304 against it and re-stamp the stale payload as
+    current for good."""
+    url = "https://github.com/acme/repo/pull/23"
+    source._CACHE.clear()
+    source._REVALIDATORS.clear()
+    source._REVALIDATORS[url] = source._Revalidator('"i1"', '"c1"', '"s1"', "a" * 40, 1.0)
+    probes = _FakeProbes(
+        source._ConditionalRead(200, 'W/"i2"'),
+        source._ConditionalRead(304, '"c1"'),
+        source._ConditionalRead(304, '"s1"'),
+    )
+    monkeypatch.setattr(source, "_gh_conditional_get", probes)
+    stale = source.time.monotonic() - source._CACHE_TTL_SECS - 5
+    cached = {"state": "OPEN", "headSha": "a" * 40, "marker": "cached"}
+    source._CACHE[url] = (stale, 10, cached)
+    fetch = AsyncMock(side_effect=source.SourceProviderError("gh: HTTP 503"))
+    monkeypatch.setattr(source, "_fetch_github", fetch)
+    try:
+        with pytest.raises(source.SourceProviderError):
+            await source.fetch_pull_request(url)
+        assert source._REVALIDATORS[url].issue_etag == '"i1"'
+
+        # The same probe answer followed by a fanout that lands commits them.
+        fetch = AsyncMock(return_value={"state": "OPEN", "headSha": "a" * 40, "marker": "fresh"})
+        monkeypatch.setattr(source, "_fetch_github", fetch)
+        source._CACHE[url] = (stale, 10, cached)
+        assert (await source.fetch_pull_request(url)).get("marker") == "fresh"
+        assert source._REVALIDATORS[url].issue_etag == 'W/"i2"'
+    finally:
+        source._CACHE.clear()
+        source._REVALIDATORS.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_revalidation_forces_a_full_read_past_the_max_age(monkeypatch) -> None:
+    """Re-stamping rests on the issue ETag moving for every rendered field,
+    which GitHub does not promise; past the ceiling one full read runs without
+    probing and the validators are dropped so the next cycle learns afresh."""
+    url = "https://github.com/acme/repo/pull/29"
+    source._CACHE.clear()
+    source._REVALIDATORS.clear()
+    now = source.time.monotonic()
+    aged = now - source._REVALIDATED_MAX_AGE_SECS - 1
+    source._REVALIDATORS[url] = source._Revalidator('"i"', '"c"', '"s"', "a" * 40, now, read_at=aged)
+    probes = _FakeProbes(source._ConditionalRead(304, '"i"'), source._ConditionalRead(304, '"c"'))
+    monkeypatch.setattr(source, "_gh_conditional_get", probes)
+    fetch = AsyncMock(return_value={"state": "OPEN", "headSha": "a" * 40, "marker": "fresh"})
+    monkeypatch.setattr(source, "_fetch_github", fetch)
+    stale = now - source._CACHE_TTL_SECS - 5
+    source._CACHE[url] = (stale, 10, {"state": "OPEN", "headSha": "a" * 40, "marker": "cached"})
+    try:
+        assert (await source.fetch_pull_request(url)).get("marker") == "fresh"
+        fetch.assert_awaited_once()
+        assert probes.sent == {}
+        assert url not in source._REVALIDATORS
+    finally:
+        source._CACHE.clear()
+        source._REVALIDATORS.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_all_304_carries_read_at_forward_and_a_full_read_resets_it(monkeypatch) -> None:
+    url = "https://github.com/acme/repo/pull/31"
+    source._CACHE.clear()
+    source._REVALIDATORS.clear()
+    now = source.time.monotonic()
+    source._REVALIDATORS[url] = source._Revalidator('"i"', '"c"', '"s"', "a" * 40, now, read_at=now - 60)
+    monkeypatch.setattr(
+        source,
+        "_gh_conditional_get",
+        _FakeProbes(source._ConditionalRead(304, '"i"'), source._ConditionalRead(304, '"c"')),
+    )
+    stale = now - source._CACHE_TTL_SECS - 5
+    cached = {"state": "OPEN", "headSha": "a" * 40, "marker": "cached"}
+    source._CACHE[url] = (stale, 10, cached)
+    fetch = AsyncMock(return_value={"state": "OPEN", "headSha": "a" * 40, "marker": "fresh"})
+    monkeypatch.setattr(source, "_fetch_github", fetch)
+    try:
+        assert await source.fetch_pull_request(url) is cached
+        assert source._REVALIDATORS[url].read_at == now - 60
+
+        monkeypatch.setattr(
+            source,
+            "_gh_conditional_get",
+            _FakeProbes(source._ConditionalRead(200, 'W/"i2"'), source._ConditionalRead(304, '"c"')),
+        )
+        source._CACHE[url] = (stale, 10, cached)
+        assert (await source.fetch_pull_request(url)).get("marker") == "fresh"
+        read_at = source._REVALIDATORS[url].read_at
+        assert read_at is not None and read_at >= now
+    finally:
+        source._CACHE.clear()
+        source._REVALIDATORS.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_expired_open_payload_is_served_when_probes_answer_304(monkeypatch) -> None:
+    """The user-visible effect: an idle open PR past its TTL costs two probes
+    and no fanout, and its entry is re-stamped fresh."""
+    url = "https://github.com/acme/repo/pull/50"
+    source._CACHE.clear()
+    source._REVALIDATORS.clear()
+    fanout = AsyncMock(return_value={"state": "OPEN", "headSha": "a" * 40, "marker": "fresh"})
+    monkeypatch.setattr(source, "_fetch_github", fanout)
+    monkeypatch.setattr(
+        source,
+        "_gh_conditional_get",
+        _FakeProbes(
+            source._ConditionalRead(304, '"i"'), source._ConditionalRead(304, '"c"')
+        ),
+    )
+    source._REVALIDATORS[url] = source._Revalidator('"i"', '"c"', '"s"', "a" * 40, 1.0)
+    stale_at = source.time.monotonic() - source._CACHE_TTL_SECS - 5
+    cached = {"state": "OPEN", "headSha": "a" * 40, "marker": "cached"}
+    source._CACHE[url] = (stale_at, 10, cached)
+    try:
+        assert await source.fetch_pull_request(url) is cached
+        fanout.assert_not_awaited()
+        stored_at, size, payload = source._CACHE[url]
+        assert stored_at > stale_at and size == 10 and payload is cached
+        # ...and a second read inside the TTL is a plain hit: no probes either.
+        monkeypatch.setattr(source, "_gh_conditional_get", AsyncMock(side_effect=AssertionError))
+        assert await source.fetch_pull_request(url) is cached
+    finally:
+        source._CACHE.clear()
+        source._REVALIDATORS.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_expired_open_payload_falls_through_to_the_fanout_on_a_change(monkeypatch) -> None:
+    url = "https://github.com/acme/repo/pull/51"
+    source._CACHE.clear()
+    source._REVALIDATORS.clear()
+    fanout = AsyncMock(return_value={"state": "OPEN", "headSha": "a" * 40, "marker": "fresh"})
+    monkeypatch.setattr(source, "_fetch_github", fanout)
+    monkeypatch.setattr(
+        source,
+        "_gh_conditional_get",
+        _FakeProbes(
+            source._ConditionalRead(200, 'W/"i2"'), source._ConditionalRead(304, '"c"')
+        ),
+    )
+    source._REVALIDATORS[url] = source._Revalidator('"i"', '"c"', '"s"', "a" * 40, 1.0)
+    stale_at = source.time.monotonic() - source._CACHE_TTL_SECS - 5
+    source._CACHE[url] = (stale_at, 10, {"state": "OPEN", "headSha": "a" * 40, "marker": "cached"})
+    try:
+        result = await source.fetch_pull_request(url)
+        assert result["marker"] == "fresh"
+        fanout.assert_awaited_once()
+    finally:
+        source._CACHE.clear()
+        source._REVALIDATORS.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_refresh_and_cold_reads_never_probe(monkeypatch) -> None:
+    """An explicit refresh reads in full, and a cache miss has nothing to
+    revalidate -- neither spends a probe."""
+    url = "https://github.com/acme/repo/pull/52"
+    source._CACHE.clear()
+    source._REVALIDATORS.clear()
+    fanout = AsyncMock(return_value={"state": "OPEN", "headSha": "a" * 40})
+    monkeypatch.setattr(source, "_fetch_github", fanout)
+    monkeypatch.setattr(source, "_gh_conditional_get", AsyncMock(side_effect=AssertionError))
+    try:
+        await source.fetch_pull_request(url)  # cold
+        source._CACHE[url] = (
+            source.time.monotonic() - source._CACHE_TTL_SECS - 5,
+            10,
+            {"state": "OPEN", "headSha": "a" * 40},
+        )
+        await source.fetch_pull_request(url, refresh=True)
+        assert fanout.await_count == 2
+    finally:
+        source._CACHE.clear()
+        source._REVALIDATORS.clear()
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_revalidation_does_not_restamp_an_entry_a_mutation_dropped(monkeypatch) -> None:
+    """Generation guard: a mutation landing while the probes were in flight has
+    already dropped the entry; the confirmed payload is still returned, but the
+    pre-mutation entry must not be written back."""
+    url = "https://github.com/acme/repo/pull/53"
+    source._CACHE.clear()
+    source._REVALIDATORS.clear()
+    ref = source.parse_source_url(url)
+    cached_entry = (0.0, 10, {"state": "OPEN", "headSha": "a" * 40})
+
+    async def probes_then_mutation(*_args, **_kwargs):
+        source._FULL_FETCH_GENERATIONS[url] = 7
+        source._CACHE.pop(url, None)
+        return source._ConditionalRead(304, '"x"')
+
+    monkeypatch.setattr(source, "_gh_conditional_get", probes_then_mutation)
+    source._REVALIDATORS[url] = source._Revalidator('"i"', '"c"', '"s"', "a" * 40, 1.0)
+    source._CACHE[url] = cached_entry
+    try:
+        result = await source._revalidate_pull_request(ref, 0, cached_entry)
+        assert result is cached_entry[2]
+        assert url not in source._CACHE
+    finally:
+        source._CACHE.clear()
+        source._REVALIDATORS.clear()
+        source._FULL_FETCH_GENERATIONS.pop(url, None)
+
+
 @pytest.mark.asyncio
 async def test_run_json_kills_process_tree_when_stdout_exceeds_limit(monkeypatch) -> None:
     class FakeProcess:
@@ -699,7 +1555,7 @@ async def test_run_json_kills_process_tree_when_stdout_exceeds_limit(monkeypatch
 
 @pytest.mark.asyncio
 async def test_run_json_on_windows_defers_to_the_sandbox_gate(monkeypatch) -> None:
-    """Windows is no longer refused by a platform check of its own.
+    """Windows is not refused by a platform check of its own.
 
     It has no OS sandbox backend, but neither does a backend-less Linux host, and
     both must reach the same gate: ``sandboxed_spawn_argv`` fail-closes unless the
@@ -1346,7 +2202,7 @@ async def test_fetch_github_marks_failed_secondary_endpoints_partial(
 
 @pytest.mark.asyncio
 async def test_fetch_github_reads_rollup_outside_the_core_field_set(monkeypatch) -> None:
-    """The core `pr view` field set must not bundle `statusCheckRollup` (#5115).
+    """The core `pr view` field set must not bundle `statusCheckRollup`.
 
     `gh` resolves a `--json` field set atomically, so a bundled rollup made a
     fine-grained token without Checks read access fail the WHOLE panel read.
@@ -1390,7 +2246,7 @@ async def test_fetch_github_reads_rollup_outside_the_core_field_set(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_fetch_github_core_payload_survives_rollup_failure(monkeypatch) -> None:
-    """A Checks-blind token costs the checks SECTION, never the panel (#5115)."""
+    """A Checks-blind token costs the checks SECTION, never the panel."""
 
     async def fake_run(*argv: str, **_kwargs: int):
         command = " ".join(argv)
@@ -1768,7 +2624,7 @@ async def test_github_check_status_omits_unsettled_merge_state(
 async def test_github_check_status_keeps_authorized_fields_when_rollup_fails(
     monkeypatch,
 ) -> None:
-    """The chip renders state/merge under a Checks-blind token (#5115).
+    """The chip renders state/merge under a Checks-blind token.
 
     Bundling `statusCheckRollup` into the chip read made the WHOLE read fail
     when the token lacked Checks access; the split keeps the fields the token
@@ -1925,7 +2781,7 @@ def test_status_from_full_payload_projects_the_merge_pair() -> None:
     If it dropped the pair, every full fetch would rewrite the chip entry without
     it, the next chip refresh would judge that a change and drop the full payload,
     and the write-through would strip it again — the repeating chip↔full
-    transition PR #443's flap damper exists to contain, spun by a projection gap.
+    transition the flap damper exists to contain, spun by a projection gap.
     """
     projected = source.status_from_full_payload(
         {
@@ -2556,7 +3412,7 @@ def test_gitlab_check_bucket_is_faithful() -> None:
 
 @pytest.mark.asyncio
 async def test_fetch_gitlab_full_jobs_page_keeps_aggregate_authoritative(monkeypatch) -> None:
-    """A truncated (full-page) job list must not poison the CI glyph (#1097).
+    """A truncated (full-page) job list must not poison the CI glyph.
 
     When the jobs list comes back as a full page it may be truncated — a failed
     job on a later page would be invisible. The glyph is projected from the
@@ -2603,7 +3459,7 @@ async def test_fetch_gitlab_full_jobs_page_keeps_aggregate_authoritative(monkeyp
 
 
 def test_record_full_payload_clears_flap_tracker_on_change() -> None:
-    """An authoritative full-payload write resets the chip flap counter (#2079).
+    """An authoritative full-payload write resets the chip flap counter.
 
     The flap damper counts *consecutive identical* chip transitions. A
     full-payload write that changes the status between chip refreshes is a real,
@@ -2631,7 +3487,7 @@ def test_record_full_payload_clears_flap_tracker_on_change() -> None:
 
 @pytest.mark.asyncio
 async def test_forced_refresh_inflight_not_floored_and_requeues(monkeypatch) -> None:
-    """An already-in-flight URL is not floor-stamped and gets one follow-up (#2333).
+    """An already-in-flight URL is not floor-stamped and gets one follow-up.
 
     A TTL-paced chip fetch may be in flight when the turn boundary fires. Its
     result can predate the turn's final push, so the forced call must NOT record
@@ -2663,7 +3519,7 @@ async def test_forced_refresh_inflight_not_floored_and_requeues(monkeypatch) -> 
 
 @pytest.mark.asyncio
 async def test_refresh_check_status_issues_pending_follow_up_force(monkeypatch) -> None:
-    """When a fetch completes for a URL with a queued force, one follow-up fires (#2333)."""
+    """When a fetch completes for a URL with a queued force, one follow-up fires."""
     url = "https://github.com/acme/repo/pull/92"
     source._check_cache.clear()
     source._check_inflight.clear()
@@ -2737,7 +3593,7 @@ async def test_chip_refresh_damps_projection_flap(monkeypatch) -> None:
         assert invalidate.await_count == source._CHECK_FLAP_DAMP_THRESHOLD - 1
         assert sink.call_count == source._CHECK_FLAP_DAMP_THRESHOLD - 1
         # The chip cache still tracks the latest projection (glyph stays live,
-        # just no longer drives the loop).
+        # just does not drive the loop).
         assert source.get_cached_check_status(url) == {"state": "draft"}
         # A genuinely different transition clears the damp.
         source._check_cache[url] = (source.time.monotonic(), {"state": "draft"})
@@ -3001,7 +3857,7 @@ async def test_full_fetch_coalesces_concurrent_forced_refreshes(monkeypatch) -> 
 async def test_full_fetch_projects_chip_status_under_cache_lock(monkeypatch) -> None:
     """The write-through projection must run inside ``_CACHE_LOCK``.
 
-    Regression for the TOCTOU where a provider mutation landing between the
+    Guards the TOCTOU where a provider mutation landing between the
     passing generation check and the chip projection could republish
     pre-mutation status into the chip cache — a stale ``source_status`` delta the
     full-cache invalidation cannot undo. Keeping the projection in the same
@@ -5534,11 +6390,11 @@ async def test_resolve_handler_rejects_bad_thread_id(monkeypatch) -> None:
 def test_forced_refresh_over_cap_stays_eligible(monkeypatch) -> None:
     """A turn-boundary force deferred by the pending cap must not be locked out.
 
-    Regression for the review finding: recording ``_check_forced_at`` (and
-    renewing the cache timestamp) *before* admission meant a URL the pending cap
-    rejected was both marked "just forced" (10s floor) and had its TTL renewed —
-    so the next turn boundary AND the periodic sweep both skipped it, making the
-    chip staler in exactly the contention case force exists for.
+    Recording ``_check_forced_at`` (and renewing the cache timestamp) *before*
+    admission would mark a URL the pending cap rejected as "just forced" (10s
+    floor) and renew its TTL — so the next turn boundary AND the periodic sweep
+    both skip it, making the chip staler in exactly the contention case force
+    exists for.
     """
     url = "https://github.com/acme/repo/pull/77"
     source._check_cache.clear()
@@ -5727,8 +6583,8 @@ def test_record_full_payload_clears_ci_when_checks_genuinely_empty() -> None:
     """The guard must be scoped to PARTIAL checks, not merely-empty ones.
 
     A PR with no CI configured returns ``checks: []`` and NO ``partialSections``
-    entry for checks. That is authoritative "there is no CI", so a previously
-    known glyph should clear rather than linger forever.
+    entry for checks. That is authoritative "there is no CI", so an already-known
+    glyph should clear rather than linger forever.
     """
     url = "https://github.com/acme/repo/pull/35"
     source._check_cache.clear()
@@ -5865,7 +6721,7 @@ def test_self_hosted_jira_rejected_when_allowlist_empty(monkeypatch) -> None:
 class TestSourceRefLabel:
     """``source_ref_label`` -- what a sidebar chip is CALLED.
 
-    These assertions were previously spread across the sidebar's own render
+    These assertions gather what was spread across the sidebar's own render
     fixtures, where each provider's punctuation was rebuilt by a template
     string. They live here now because this is the side that knows the
     convention, and the renderer prints whatever it is handed.
@@ -7784,10 +8640,11 @@ class TestAdfToMarkdown:
 
     def test_folding_a_long_whitespace_run_is_linear(self):
         """A provider-controlled newline-FREE whitespace run, bounded only by the
-        8MiB fetch cap, used to be folded by a pattern whose whitespace runs and
-        newline anchor competed for the same characters: 200k spaces took ~45s of
-        backtracking, per heading and per table cell. The budget is ~100x the
-        linear cost, so this fails only on a return to quadratic scanning."""
+        8MiB fetch cap, must fold in linear time. A pattern whose whitespace runs
+        and newline anchor compete for the same characters backtracks
+        quadratically — 200k spaces cost seconds per heading and per table cell.
+        The budget is ~100x the linear cost, so this fails only on a return to
+        quadratic scanning."""
         payload = " " * 200_000 + "x"
         start = time.monotonic()
         assert source._md_one_line(payload) == "x"
@@ -8714,11 +9571,10 @@ class TestAdfToMarkdown:
     def test_a_credential_split_across_a_media_alt_is_redacted(self):
         """This supersedes an earlier, narrower claim of mine.
 
-        In round 16 I rebutted this by showing the emitted `[alt](url)` brackets
-        the alt, so the halves cannot form one token. That was true of the code at
-        the time. Round 17 then added a path where a URL failing the destination
-        scan drops the link and emits the LABEL ALONE -- no brackets -- and the
-        rebuttal quietly stopped holding. Measured on that path, the output was
+        The emitted `[alt](url)` form brackets the alt, so its halves cannot form
+        one token. But on the path where a URL failing the destination scan drops
+        the link and emits the LABEL ALONE -- no brackets -- that bracketing is
+        gone. Measured on that path, the output is
         `ghp\\_Ab3Df6Hj9Kl2Np5Qr8TvWx4Yz7Bc0Ef3`: one recoverable credential, with
         the backslash from escaping `ghp_` defeating the payload-level pass.
 
@@ -9295,6 +10151,52 @@ class TestGetJiraAuth:
         result = source._get_jira_auth("acme.atlassian.net")
         assert result == ("dev@acme.com", "env-override")
 
+    def test_catalog_slots_match_runtime_precedence(self, monkeypatch):
+        """Catalog output names the same vault slot the runtime resolves."""
+        from kiro_crew.dashboard.handlers.secrets import _managed_secret_catalog
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        monkeypatch.delenv("JIRA_API_TOKEN", raising=False)
+        host_name = source.jira_host_token_name(FakeEntry.host)
+        cases = (
+            ([host_name], {host_name: "host-value"}, host_name),
+            ([], {"JIRA_API_TOKEN": "global-value"}, "JIRA_API_TOKEN"),
+        )
+        for stored_names, vault_values, expected_name in cases:
+            monkeypatch.setattr(
+                source,
+                "_resolve_jira_token_from_vault",
+                lambda name, values=vault_values: values.get(name, ""),
+            )
+            assert source._get_jira_auth(FakeEntry.host) == (
+                FakeEntry.email,
+                vault_values[expected_name],
+            )
+            catalog = _managed_secret_catalog(
+                stored_names,
+                [FakeEntry.host],
+                jira_global_applicable=True,
+                wakatime_enabled=False,
+            )
+            assert expected_name in {entry["name"] for entry in catalog}
+
     def test_migrated_secret_ref_in_env_resolves_from_vault_not_uri(self, monkeypatch):
         """After `secrets import --apply`, the .env line is
         `JIRA_API_TOKEN=secret://JIRA_API_TOKEN` and `load_credentials`
@@ -9509,7 +10411,7 @@ def test_parse_jira_self_hosted_url(monkeypatch) -> None:
     assert ref.number == 99
 
 
-# --- Jira linked issues (issue #2584) ---
+# --- Jira linked issues ---
 
 
 class TestJiraLinkedChanges:
@@ -9658,7 +10560,7 @@ class TestJiraLinkedChanges:
         assert result[1]["state"] == "closed"
 
 
-# --- Jira fix versions as the milestone equivalent (issue #2585) ---
+# --- Jira fix versions as the milestone equivalent ---
 
 
 class TestJiraFixVersionMilestone:
@@ -9685,7 +10587,7 @@ class TestJiraFixVersionMilestone:
         assert source._jira_fix_version_milestone(version)["state"] == "closed"
 
     def test_archived_version_maps_to_closed(self) -> None:
-        """An archived version no longer takes work, so it is not open."""
+        """An archived version takes no work, so it is not open."""
         version = {"name": "1.0.0", "released": False, "archived": True}
         assert source._jira_fix_version_milestone(version)["state"] == "closed"
 
@@ -9747,7 +10649,7 @@ class TestJiraFixVersionMilestone:
 
 
 class TestJiraPickFixVersion:
-    """Tests for _jira_pick_fix_version (issue #7595)."""
+    """Tests for _jira_pick_fix_version."""
 
     def test_mixed_versions_prefer_the_unreleased_one(self) -> None:
         """A pending release wins over an already-shipped one ahead of it."""
@@ -9885,7 +10787,7 @@ class TestJiraFixVersionInPayload:
 
     @pytest.mark.asyncio
     async def test_pending_version_wins_over_a_shipped_one(self, monkeypatch) -> None:
-        """A released version ahead of a pending one does not steal the chip (#7595)."""
+        """A released version ahead of a pending one does not steal the chip."""
         issue, _seen = await _jira_fetch(
             monkeypatch,
             {
@@ -9914,9 +10816,9 @@ class TestJiraFixVersionInPayload:
 class _ReapProbe:
     """A PIPE-stdio child double that records how it is reaped.
 
-    A killed child blocked writing into a full pipe -- or a surviving
+    A killed child blocking on a write into a full pipe -- or a surviving
     descendant still holding the pipes open -- makes a bare ``await
-    proc.wait()`` hang the caller forever (#6005). The bounded reap must
+    proc.wait()`` hang the caller forever. The bounded reap must
     therefore drain the pipes via ``communicate()`` and must never touch
     ``wait()``.
     """
@@ -9945,7 +10847,7 @@ class _ReapProbe:
 async def test_terminate_process_reaps_via_communicate_not_wait(monkeypatch):
     """``_terminate_process`` must route through the bounded, pipe-draining
     ``kill_and_reap`` -- a bare ``await proc.wait()`` here can hang the gateway
-    task forever when the child is killed with a full pipe (#6005)."""
+    task forever when the child is killed with a full pipe."""
     from kiro_crew import platform_compat
 
     proc = _ReapProbe()

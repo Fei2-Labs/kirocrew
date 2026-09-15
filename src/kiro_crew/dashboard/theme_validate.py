@@ -251,6 +251,7 @@ _THEME_ALLOWED_DIRS = {
     "overlays": 2,
     "topbar": 2,
     "audio": 2,
+    "loader": 1,
 }
 # Per-level ceilings (entry count + total uncompressed bytes, §6.2).
 _THEME_ENTRIES_BY_LEVEL = {0: 32, 1: 64, 2: 160}
@@ -260,7 +261,7 @@ _THEME_TOTAL_BYTES_BY_LEVEL = {0: 256 * 1024, 1: 2 * 1024 * 1024, 2: 5 * 1024 * 
 # binding limit stays the per-level total-byte ceiling, not this count.
 _THEME_MAX_FONTS = 6
 # Which Font Family option a face feeds. An entry with no (or an unknown) role
-# is proportional, so a pack written before roles existed keeps its meaning.
+# is proportional.
 _THEME_FONT_ROLES = frozenset({"sans", "mono"})
 _THEME_FONT_DEFAULT_ROLE = "sans"
 # Font tokens a pack must NOT declare in overrides.css. Declaring them there
@@ -284,6 +285,17 @@ _THEME_LOADER_ICONS = frozenset(
 )
 _THEME_LOADER_ICONS_MIN = 4
 _THEME_LOADER_ICONS_MAX = len(_THEME_LOADER_ICONS)
+# Custom loader artwork an installed pack ships itself (Level 1): the pack's own
+# images, served with a strict Content-Type + nosniff and the sandboxed asset CSP
+# like any other pack asset (logo/favicon). One image renders on its own; 2..8
+# are cycled by the stock carousel. Animated WebP/APNG/GIF and animated SVG all
+# self-animate inside the <img>, so a pack can ship a single fully-authored loop.
+# SVG is safe here for the same reason logo.svg is: an <img>-referenced SVG runs
+# in the browser's secure static/animated mode — no scripts, no external loads —
+# and is served under _THEME_ASSET_CSP (default-src 'none'; sandbox), never as a
+# top-level document.
+_THEME_LOADER_IMAGE_MAX = 8
+_THEME_LOADER_IMAGE_EXTS = ("png", "webp", "gif", "svg")
 # Per-file size caps by category (bytes), §4.1.
 _THEME_FILE_CAPS = {
     "manifest": 16 * 1024,
@@ -297,6 +309,8 @@ _THEME_FILE_CAPS = {
     "preview": 512 * 1024,
     "overlay": 200 * 1024,
     "topbar": 100 * 1024,
+    # Custom loader: a pack's own image for the carousel / single loader.
+    "loader_icon": 256 * 1024,
     "audio_manifest": 16 * 1024,
     "audio": 512 * 1024,
     "audio_ambient": 2 * 1024 * 1024,
@@ -356,9 +370,9 @@ _THEME_HTML_DENY_RE = re.compile(
 
 # ── Overlay / topbar theme.json declarations (§3.1) ──
 # Declarations are OPTIONAL: a theme.json with no ``overlays``/``topbar`` keys
-# still validates and behaves exactly as before (filesystem-derived placement).
-# When present, they let a pack pin placement/behaviour instead of inheriting
-# the hardcoded defaults below.
+# still validates and falls back to filesystem-derived placement. When present,
+# they let a pack pin placement/behaviour instead of inheriting the hardcoded
+# defaults below.
 _THEME_OVERLAY_ID_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 # Closed position enum (LOCKED — doc gives examples only).
 _THEME_OVERLAY_POSITIONS = frozenset(
@@ -495,6 +509,9 @@ def _classify_theme_file(rel: str) -> tuple[str | None, int]:
         return "overlay", 2
     if top == "topbar" and len(parts) == 2 and parts[1] in ("dark.html", "light.html"):
         return "topbar", 2
+    if top == "loader" and len(parts) == 2:
+        if ext in _THEME_LOADER_IMAGE_EXTS:
+            return "loader_icon", 1
     if top == "audio" and len(parts) == 2 and ext in ("mp3", "ogg", "wav"):
         stem = parts[1].rsplit(".", 1)[0]
         return ("audio_ambient" if stem == "ambient" else "audio"), 2
@@ -687,11 +704,11 @@ def _iter_css_rules(text: str):
 
     The tokenizer is a string-aware state machine: it splits on real top-level
     braces only, treating ``{``/``}``/``;`` inside quoted strings and ``url()``
-    (e.g. data-URIs) as opaque — so a value like ``content:"}"`` no longer
-    truncates a rule, and legit values containing braces are not false-rejected.
+    (e.g. data-URIs) as opaque — so a value like ``content:"}"`` does not
+    truncate a rule, and legit values containing braces are not false-rejected.
     At-rule groups whose body contains nested rules (``@media``) are flattened:
-    their inner rules are yielded and the group prelude itself is not (matching
-    the prior naive parser, which only ever surfaced leaf rules).
+    their inner rules are yielded and the group prelude itself is not, so a
+    consumer only ever sees leaf rules.
     """
     stripped = _CSS_COMMENT_RE.sub(" ", text)
     yield from _iter_css_rules_level(stripped)
@@ -701,7 +718,7 @@ def _iter_css_rules_level(text: str):
     for prelude, body in _scan_css_blocks(text):
         if _css_has_top_level_brace(body):
             # At-rule group (e.g. @media): recurse into its nested rules and do
-            # not emit the group prelude, mirroring the old flat parser.
+            # not emit the group prelude, so a consumer only sees leaf rules.
             yield from _iter_css_rules_level(body)
             continue
         selectors = [s.strip().lower() for s in _css_split_top_level(prelude, ",") if s.strip()]
@@ -1135,6 +1152,34 @@ def _validate_loader_icons(manifest: dict[str, Any], level: int) -> str | None:
     return None
 
 
+def _loader_image_names(theme_dir: Path) -> list[str]:
+    """Sorted file names of the pack's own loader images (png/webp/gif/svg)."""
+    d = theme_dir / "loader"
+    if not d.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in d.iterdir()
+        if p.is_file() and p.suffix.lower().lstrip(".") in _THEME_LOADER_IMAGE_EXTS
+    )
+
+
+def _validate_loader_images(theme_dir: Path) -> str | None:
+    """A pack shipping its own loader art may ship at most 8 images.
+
+    Presence-based (like topbar dark/light) — no manifest key. One image renders
+    on its own; 2..8 are cycled by the carousel. Too many fails install so the
+    loader always has a bounded pool.
+    """
+    names = _loader_image_names(theme_dir)
+    if len(names) > _THEME_LOADER_IMAGE_MAX:
+        return (
+            f"loader/ must contain at most {_THEME_LOADER_IMAGE_MAX} "
+            ".png/.webp/.gif/.svg images"
+        )
+    return None
+
+
 def _validate_theme_dir(
     path: Path, *, installing: bool = False
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -1208,12 +1253,11 @@ def _validate_theme_dir(
     # already-installed pack is re-read by the theme-detail route) stays
     # lenient and coerces an unknown role to "sans" -- only an absent `role`
     # is the deliberate default case; an explicit ``null`` is rejected.
-    # Rejecting it only at install
-    # keeps a pack that predates this rule loading, matching the font-pin
-    # check below. "monospace" (the CSS keyword) is the likeliest typo for
-    # exactly the role most likely to be mistyped, and the failure is
-    # otherwise silent: the mono face quietly renders as Sans while Mono keeps
-    # the built-in JetBrains Mono (#2750).
+    # Rejecting it only at install keeps an already-installed pack loading,
+    # matching the font-pin check below. "monospace" (the CSS keyword) is the
+    # likeliest typo for exactly the role most likely to be mistyped, and the
+    # failure is otherwise silent: the mono face quietly renders as Sans while
+    # Mono keeps the built-in JetBrains Mono.
     if installing:
         fonts_manifest = manifest.get("fonts")
         if isinstance(fonts_manifest, list):
@@ -1331,6 +1375,9 @@ def _validate_theme_dir(
     tb_err = _validate_topbar_decls(manifest, path)
     if tb_err:
         return None, tb_err
+    li_err = _validate_loader_images(path)
+    if li_err:
+        return None, li_err
     _audio_desc, au_err = _validate_audio_manifest(path)
     if au_err:
         return None, au_err
@@ -1469,6 +1516,13 @@ def _theme_asset_descriptor(
         if len(resolved_loader_icons) >= _THEME_LOADER_ICONS_MIN:
             desc["loaderIcons"] = resolved_loader_icons[:_THEME_LOADER_ICONS_MAX]
 
+    # Pack-supplied loader artwork (Level 1): the pack's own images, as relative
+    # asset paths the frontend resolves against the theme's asset route. One
+    # image renders on its own; 2..8 are cycled by the carousel.
+    loader_images = _loader_image_names(theme_dir)
+    if loader_images and len(loader_images) <= _THEME_LOADER_IMAGE_MAX:
+        desc["loaderImages"] = [f"loader/{name}" for name in loader_images]
+
     if level >= 2:
         overlays_dir = theme_dir / "overlays"
         declared = manifest.get("overlays")
@@ -1598,6 +1652,7 @@ _THEME_ASSET_CT = {
     ".svg": "image/svg+xml",
     ".png": "image/png",
     ".webp": "image/webp",
+    ".gif": "image/gif",
     ".ico": "image/x-icon",
     ".mp3": "audio/mpeg",
     ".ogg": "audio/ogg",

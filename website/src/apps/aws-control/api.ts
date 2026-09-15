@@ -12,6 +12,7 @@ import type {
   AwsAccountsResponse,
   AvailableProfilesResponse,
   RegisterProfilesResult,
+  UnregisterProfilesResult,
   ReconnectPlan,
   DriveSection,
   DriveStatus,
@@ -19,6 +20,8 @@ import type {
   DriveBootstrapResult,
   DriveListing,
   DriveDownload,
+  DrivePreview,
+  DriveSearch,
   DriveUploadResult,
   DriveDeleteResult,
   DriveFolderResult,
@@ -31,6 +34,7 @@ import type {
   BackupStatus,
   BackupRunResult,
   BackupRestoreResult,
+  InstallLabelResult,
   IamPolicyResponse,
 } from './types'
 
@@ -153,6 +157,11 @@ export const awsControlApi = {
     return postJson<RegisterProfilesResult>('/profiles/register', { names })
   },
 
+  /** Forget the named profiles here only; the AWS CLI configuration and every AWS resource stay as they are. */
+  unregisterProfiles(names: string[]): Promise<UnregisterProfilesResult> {
+    return postJson<UnregisterProfilesResult>('/profiles/unregister', { names })
+  },
+
   /** Reconnect guidance for a degraded/unknown profile, by profile name. */
   reconnectPlan(name: string): Promise<ReconnectPlan> {
     return request<ReconnectPlan>(`/profiles/${enc(name)}/reconnect-plan`)
@@ -197,6 +206,22 @@ export const awsControlApi = {
   driveDownload(account: string, section: DriveSection, key: string): Promise<DriveDownload> {
     const q = new URLSearchParams({ section, key })
     return request<DriveDownload>(`/drive/${enc(account)}/download?${q.toString()}`)
+  },
+
+  /** The first bytes of a TEXT file, proxied through the gateway. A browser
+   *  fetch of the presigned URL would be blocked by CORS (the bucket carries
+   *  no CORS config), so text preview reads through this endpoint instead;
+   *  media previews (img/video/iframe) use the presigned URL directly because
+   *  those tags are exempt from CORS. */
+  drivePreview(account: string, section: DriveSection, key: string): Promise<DrivePreview> {
+    const q = new URLSearchParams({ section, key })
+    return request<DrivePreview>(`/drive/${enc(account)}/preview?${q.toString()}`)
+  },
+
+  /** Case-insensitive filename search across one whole section. */
+  driveSearch(account: string, section: DriveSection, query: string): Promise<DriveSearch> {
+    const q = new URLSearchParams({ section, q: query })
+    return request<DriveSearch>(`/drive/${enc(account)}/search?${q.toString()}`)
   },
 
   /** Move one stored object inside the files section (server-side copy, then
@@ -309,9 +334,12 @@ export const awsControlApi = {
    * every call, so polling it would spend paid AWS round trips to read a fact the
    * server holds in memory. Ask for it only when the stored-archive list is open.
    */
-  backup(account: string, opts?: { remote?: boolean }): Promise<BackupStatus> {
-    const q = opts?.remote ? '?remote=1' : ''
-    return request<BackupStatus>(`/backup/${enc(account)}${q}`)
+  backup(account: string, opts?: { remote?: boolean; others?: boolean }): Promise<BackupStatus> {
+    const q = new URLSearchParams()
+    if (opts?.remote) q.set('remote', '1')
+    if (opts?.others) q.set('others', '1')
+    const qs = q.toString()
+    return request<BackupStatus>(`/backup/${enc(account)}${qs ? `?${qs}` : ''}`)
   },
 
   /**
@@ -329,8 +357,23 @@ export const awsControlApi = {
     return postJson<{ nightly: boolean }>(`/backup/${enc(account)}/nightly`, { enabled })
   },
 
-  /** Restore one archived key into a local staging folder (nothing is hot-swapped). */
-  backupRestore(account: string, key: string): Promise<BackupRestoreResult> {
-    return postJson<BackupRestoreResult>(`/backup/${enc(account)}/restore`, { key })
+  /**
+   * Restore one archived key into a local staging folder (nothing is hot-swapped).
+   *
+   * `foreignOk` overrides the backend's refusal to restore any archive it cannot
+   * prove is this install's own (409 `foreign_install_archive`); it is sent only
+   * after the reader confirms in-page. That covers every non-self origin, legacy
+   * included -- a pre-namespace archive carries no id, so it confirms and then
+   * sends the override like any other unproven row. The decision is on the
+   * archive's owning id, never its human label.
+   */
+  backupRestore(account: string, key: string, foreignOk?: boolean): Promise<BackupRestoreResult> {
+    const body = foreignOk ? { key, foreignOk: true } : { key }
+    return postJson<BackupRestoreResult>(`/backup/${enc(account)}/restore`, body)
+  },
+
+  /** Rename this install, so its archives render as a name on a co-tenant drive. */
+  installLabel(label: string): Promise<InstallLabelResult> {
+    return postJson<InstallLabelResult>('/install/label', { label })
   },
 }

@@ -35,7 +35,7 @@
 1 src/kiro_crew/connections/mint.py
 1 src/kiro_crew/cron.py
 3 src/kiro_crew/dashboard/chat_handlers.py
-5 src/kiro_crew/dashboard/chat_runner.py
+3 src/kiro_crew/dashboard/chat_runner.py
 1 src/kiro_crew/dashboard/chat_summary.py
 1 src/kiro_crew/dashboard/chat_utils.py
 2 src/kiro_crew/dashboard/handlers/agents.py
@@ -48,7 +48,6 @@
 1 src/kiro_crew/dashboard/handlers/usage.py
 1 src/kiro_crew/dashboard/session_memory.py
 1 src/kiro_crew/dashboard/stall_enrichment.py
-1 src/kiro_crew/dashboard/state.py
 1 src/kiro_crew/dashboard/steer_settle.py
 1 src/kiro_crew/dashboard/turn_dispatch.py
 1 src/kiro_crew/discord/renderer.py
@@ -66,12 +65,12 @@
 1 src/kiro_crew/session_cleanup.py
 2 src/kiro_crew/session_compaction.py
 1 src/kiro_crew/session_map.py
-3 src/kiro_crew/session_pid.py
+2 src/kiro_crew/session_pid.py
 1 src/kiro_crew/session_pool.py
 3 src/kiro_crew/slack/gateway.py
 3 src/kiro_crew/slack/handler.py
 1 src/kiro_crew/slack/transport_dispatch.py
-8 src/kiro_crew/subagent.py
+7 src/kiro_crew/subagent.py
 2 src/kiro_crew/subagent_persistence.py
 2 src/kiro_crew/task_executor.py
 1 src/kiro_crew/task_planner.py

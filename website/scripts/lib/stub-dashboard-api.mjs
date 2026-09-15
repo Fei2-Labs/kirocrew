@@ -51,8 +51,8 @@ export const KIROCREW_CONFIG_FIXTURE = {
     default_agent: 'kirocrew', provider: 'acp', model: 'auto',
     approval_mode: 'interactive', sandbox: 'auto',
     subagent_max_turns: 100, max_subagents: 3, subagent_auto_max: 16,
-    conductor_skill: false, tool_search: true,
-    max_channels: 8, max_channel_agents: 4, enforce_denied_commands: 'all',
+    tool_search: true,
+    max_channels: 8, max_channel_agents: 4,
   },
   session: { timeout_secs: 1800, pool_size: 2, pool_agent: 'kirocrew', pool_ttl_secs: 600 },
   memory: { embedding_provider: 'local' },
@@ -178,6 +178,9 @@ export async function stubDashboardApi(page, opts = {}) {
       return json(route, {
         restore_sessions: false, restore_window_minutes: 30,
         merge_queued_messages: false, widget_density: 'more',
+        // The gateway's default answer for `capabilities.social_share`; a
+        // capture that wants the pinned-off state overrides this route.
+        social_share_enabled: true,
       })
     }
     if (path === '/api/agents' || path === '/api/chat/agents') {

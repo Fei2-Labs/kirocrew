@@ -13,6 +13,7 @@ import inspect
 import json
 import os
 import platform
+import stat
 import sys
 import threading
 from contextlib import ExitStack
@@ -22,6 +23,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from kiro_crew import apple_speech, platform_compat
+from kiro_crew import transcribe as _tr_mod
 from kiro_crew.config.loader import (
     _VALID_STT_PROVIDERS,
     STT_PROVIDER_LOCAL,
@@ -94,6 +96,20 @@ def _fake_native_audio(path):
         return path, False
 
     return _inner
+
+
+def _stub_probe_under_cap(monkeypatch):
+    """Answer the r26/r27 pre-remux duration gate with 'under the cap'.
+
+    Remux-driving tests fake the FFmpeg spawn, which would otherwise make the
+    probe unanswerable and trip the None-refuses gate before the code under
+    test runs.
+    """
+
+    async def _under_cap(path, max_secs, **kw):
+        return False
+
+    monkeypatch.setattr(_tr_mod, "audio_exceeds_secs", _under_cap)
 
 
 class TestHelperBuild:
@@ -230,14 +246,121 @@ class TestHelperBuild:
         resolved = apple_speech._swiftc_fast()
         assert resolved is None or resolved in apple_speech._SWIFTC_FIXED_PATHS
 
+    def test_a_versioned_xcode_bundle_is_a_trusted_prefix(self):
+        """`Xcode.app` is a SYMLINK to the versioned bundle on a real install.
+
+        Every GitHub macOS runner, and any machine holding more than one Xcode,
+        spells the bundle `Xcode_<version>.app`, so `realpath` of a genuine
+        toolchain never starts with `/Applications/Xcode.app/`. This is a pure
+        string rule and grants nothing on its own -- the ownership walk still has
+        to reach root at every level up to the bundle root.
+        """
+        assert (
+            apple_speech._xcode_bundle_prefix(
+                "/Applications/Xcode_16.4.app/Contents/Developer/Toolchains/"
+                "XcodeDefault.xctoolchain/usr/bin/swiftc"
+            )
+            == "/Applications/Xcode_16.4.app/"
+        )
+        assert (
+            apple_speech._xcode_bundle_prefix("/Applications/Xcode-beta.app/Contents/x")
+            == "/Applications/Xcode-beta.app/"
+        )
+        assert (
+            apple_speech._xcode_bundle_prefix("/Applications/Xcode.app/Contents/x")
+            == "/Applications/Xcode.app/"
+        )
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Not under /Applications at all.
+            "/opt/planted/Xcode.app/Contents/x",
+            # Not an app bundle, so not one path component.
+            "/Applications/Xcodex/Contents/x",
+            # A DEEPER component named like a bundle cannot widen the rule.
+            "/Applications/Other.app/Xcode_1.app/Contents/x",
+            # The bundle root itself, with nothing under it, is not a toolchain path.
+            "/Applications/Xcode_16.4.app",
+            # A different vendor's app.
+            "/Applications/Safari.app/Contents/x",
+        ],
+    )
+    def test_the_xcode_bundle_rule_stays_one_component_under_applications(self, path):
+        assert apple_speech._xcode_bundle_prefix(path) is None
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="the bundle rule is a POSIX path prefix and the refusal is a POSIX "
+        "ownership walk (st_uid, mode bits); apple_speech never runs on Windows",
+    )
+    def test_a_planted_bundle_is_still_refused_by_ownership(self, tmp_path, monkeypatch):
+        """The bundle-name rule is a prefix, not a grant.
+
+        `/Applications` is `775 root:admin`, so an admin-group user can create a
+        bundle beside a real Xcode. It is owned by that user, and the walk from the
+        compiler up to the bundle root is what refuses it -- so widening the NAME
+        cannot widen the trust.
+        """
+        planted = tmp_path / "Applications" / "Xcode_99.app" / "usr" / "bin"
+        planted.mkdir(parents=True)
+        swiftc = planted / "swiftc"
+        swiftc.write_text("#!/bin/sh\n")
+        monkeypatch.setattr(apple_speech, "_APPLICATIONS_DIR", f"{tmp_path}/Applications/")
+        monkeypatch.setattr(apple_speech, "_TRUSTED_TOOLCHAIN_PREFIXES", ())
+
+        # The name matches, so the prefix resolves...
+        assert apple_speech._xcode_bundle_prefix(str(swiftc)) is not None
+        # ...and the ownership walk still refuses it, because this tree is ours.
+        assert not apple_speech._is_trusted_toolchain(str(swiftc))
+
     def test_trusted_toolchain_accepts_a_real_install(self):
-        """The tightened check must not refuse a genuine toolchain."""
+        """Ownership decides, in BOTH directions, on whatever toolchain the host has.
+
+        A genuine root-owned install (Command Line Tools, a root-owned Xcode) must
+        be accepted. A toolchain the invoking user can write must be refused even
+        when it is a complete, working Xcode: a hosted CI runner's Xcode is
+        installed by the runner account, so it is exactly the agent-writable
+        compiler the check exists to refuse, and asserting acceptance there would
+        pin the wrong contract. The expectation is derived from the ownership walk
+        the check is specified as, and the test names which case it ran.
+        """
         real = [p for p in apple_speech._SWIFTC_FIXED_PATHS if os.path.isfile(p)]
         if not real:
             pytest.skip("no Swift toolchain on this host")
+
+        def _root_owned_up_to_prefix(path: str) -> bool | None:
+            resolved = os.path.realpath(path)
+            prefix = next(
+                (p for p in apple_speech._TRUSTED_TOOLCHAIN_PREFIXES if resolved.startswith(p)),
+                None,
+            ) or apple_speech._xcode_bundle_prefix(resolved)
+            if prefix is None:
+                return None
+            stop = prefix.rstrip("/")
+            probe = resolved
+            while True:
+                st = os.lstat(probe)
+                if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+                    return False
+                if probe == stop:
+                    return True
+                probe = os.path.dirname(probe)
+
+        accepted = []
         for path in real:
-            assert apple_speech._is_trusted_toolchain(path), path
-        assert apple_speech._swiftc_fast() in real
+            expected = _root_owned_up_to_prefix(path)
+            assert expected is not None, f"{path} resolves outside every trusted prefix"
+            assert apple_speech._is_trusted_toolchain(path) is expected, (
+                f"{path}: root-owned-to-prefix={expected}, "
+                f"trusted={apple_speech._is_trusted_toolchain(path)}"
+            )
+            if expected:
+                accepted.append(path)
+        if accepted:
+            assert apple_speech._swiftc_fast() in accepted
+        else:
+            assert apple_speech._swiftc_fast() is None
 
     @pytest.mark.skipif(
         not platform_compat.IS_POSIX,
@@ -430,6 +553,115 @@ class TestTranscribePlumbing:
         assert (path, is_temp) == ("/tmp/voice.wav", False)
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name == "nt", reason="descriptor paths are the POSIX branch")
+    async def test_a_descriptor_path_never_takes_the_native_fast_path(self, tmp_path):
+        """``/dev/fd/N`` names a descriptor of THIS process — meaningless to
+        the Swift helper (GPT review r23: a native-suffix import would 502).
+        The remux is the materializing path, so a descriptor input must reach
+        it even when its real suffix is native."""
+        real = tmp_path / "voice.wav"
+        real.write_bytes(b"x")
+        fd = os.open(str(real), os.O_RDONLY)
+        called = []
+        try:
+            with (
+                patch("kiro_crew.transcribe._open_ffmpeg_for_execution", return_value=None),
+                patch(
+                    "kiro_crew.transcribe.ensure_ffmpeg_in_path",
+                    side_effect=lambda: called.append(True),
+                ),
+            ):
+                await apple_speech._to_native_audio(f"/dev/fd/{fd}")
+        finally:
+            os.close(fd)
+        assert called, "the fast path must be skipped: the remux branch was never reached"
+
+    @pytest.mark.asyncio
+    async def test_an_over_cap_input_is_refused_before_the_remux(self, monkeypatch):
+        """The ``-t`` bound is a temp-disk guard, not a licence to truncate:
+        a recording the probe shows is over the ceiling must be REFUSED before
+        conversion (GPT review r26) — transcribing only its first hour would
+        be silent data loss for every non-import caller."""
+        from kiro_crew import transcribe as tr
+
+        async def _too_long(path, max_secs, **kw):
+            return True
+
+        monkeypatch.setattr(tr, "audio_exceeds_secs", _too_long)
+        with (
+            patch("kiro_crew.transcribe._resolve_ffmpeg_for_execution", return_value="ffmpeg"),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+        ):
+            with pytest.raises(apple_speech.RecordingTooLongError, match="trim"):
+                await apple_speech._to_native_audio("/tmp/voice.webm")
+
+    @pytest.mark.asyncio
+    async def test_an_unverifiable_duration_is_refused_before_the_remux(self, monkeypatch):
+        """A ``None`` probe must refuse too (GPT review r27): a TRANSIENT
+        cause — a load spike that times the probe out but clears before the
+        remux — would let the ``-t``-bounded conversion succeed on the
+        truncated prefix of an over-cap recording. Only a persistent cause is
+        covered by the aligned-budget argument, so unknown duration is a loud,
+        retryable refusal — the same rule the meetings import gate applies."""
+        from kiro_crew import transcribe as tr
+
+        async def _unanswerable(path, max_secs, **kw):
+            return None
+
+        monkeypatch.setattr(tr, "audio_exceeds_secs", _unanswerable)
+        with (
+            patch("kiro_crew.transcribe._resolve_ffmpeg_for_execution", return_value="ffmpeg"),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+        ):
+            with pytest.raises(apple_speech.DurationUnverifiedError, match="retry"):
+                await apple_speech._to_native_audio("/tmp/voice.webm")
+
+    @pytest.mark.asyncio
+    async def test_the_over_cap_refusal_surfaces_as_a_transcribe_error(self, monkeypatch):
+        from kiro_crew import transcribe as tr
+
+        async def _too_long(path, max_secs, **kw):
+            return True
+
+        monkeypatch.setattr(tr, "audio_exceeds_secs", _too_long)
+        monkeypatch.setattr(apple_speech, "availability", lambda: apple_speech.Availability(True))
+        monkeypatch.setattr(apple_speech, "helper_path", lambda: "/fake/helper")
+        with (
+            patch("kiro_crew.transcribe._resolve_ffmpeg_for_execution", return_value="ffmpeg"),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+        ):
+            text, metrics = await apple_speech.transcribe("/tmp/voice.webm")
+        assert text is None
+        assert "ceiling" in metrics["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_remux_is_bounded_by_the_decoder_ceiling(self, tmp_path, monkeypatch):
+        """An unbounded conversion of a large low-bitrate input could expand
+        into a multi-gigabyte WAV and exhaust the temp volume (GPT review
+        r23): the remux must carry ``-t _MAX_AUDIO_SECS``, the same ceiling
+        ``batch_duration_cap_secs`` reports for this lane."""
+        from kiro_crew import transcribe as tr
+
+        _stub_probe_under_cap(monkeypatch)
+        captured: dict = {}
+
+        async def fake_spawn(executable, *args, **kwargs):
+            captured["args"] = args
+            raise OSError("stop here — argv captured")
+
+        with (
+            patch("kiro_crew.transcribe._resolve_ffmpeg_for_execution", return_value="ffmpeg"),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("kiro_crew.transcribe._create_ffmpeg_subprocess", side_effect=fake_spawn),
+        ):
+            with pytest.raises(OSError, match="argv captured"):
+                await apple_speech._to_native_audio("/tmp/voice.webm")
+
+        args = captured["args"]
+        assert "-t" in args
+        assert args[args.index("-t") + 1] == str(tr._MAX_AUDIO_SECS)
+
+    @pytest.mark.asyncio
     async def test_webm_without_ffmpeg_degrades_instead_of_refusing(self):
         """The dashboard records .webm, which the framework cannot read. With no
         ffmpeg we still hand the original path over so the caller surfaces the
@@ -545,6 +777,7 @@ class TestTranscodeTempOwnership:
     async def test_spawn_failure_removes_the_owned_temp(self, tmp_path, monkeypatch):
         """An ffmpeg that fails to spawn never ran, so nothing else will ever
         remove the mkstemp output — the invocation must."""
+        _stub_probe_under_cap(monkeypatch)
         owned = self._owned_temp(tmp_path, monkeypatch)
         src = tmp_path / "voice.webm"
         src.write_bytes(b"data")
@@ -562,9 +795,104 @@ class TestTranscodeTempOwnership:
         assert src.exists()
 
     @pytest.mark.asyncio
+    async def test_transcode_closes_authenticated_decoder_after_child_exit(
+        self, tmp_path, monkeypatch
+    ):
+        """Cleanup at this call site: the staged decoder
+        handle outlives the spawn (the macOS syspolicy assessment resolves the
+        staged path asynchronously after ``create_subprocess_exec`` returns) and
+        is released exactly once, after the child has exited, by the invocation
+        itself rather than by ``__del__`` on the gateway event loop."""
+        from kiro_crew import transcribe as tr
+
+        _stub_probe_under_cap(monkeypatch)
+        owned = self._owned_temp(tmp_path, monkeypatch)
+        src = tmp_path / "voice.webm"
+        src.write_bytes(b"data")
+        events: list = []
+
+        binary = tmp_path / "ffmpeg"
+        binary.write_bytes(b"decoder")
+        descriptor = os.open(str(binary), os.O_RDONLY)
+
+        class _Recording(tr._AuthenticatedFfmpeg):
+            def close(self):
+                # Only the first effective close counts: ``close`` is
+                # idempotent and ``__del__`` re-enters it with the descriptor
+                # already surrendered.
+                if self.descriptor >= 0:
+                    events.append("closed")
+                super().close()
+
+        opened = _Recording(str(binary), descriptor, str(binary))
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self):
+                assert "closed" not in events, "handle closed before the child exited"
+                events.append("exited")
+                return b"", b""
+
+        async def fake_exec(*_args, **_kwargs):
+            assert "closed" not in events, "handle closed before the spawn returned"
+            return _Proc()
+
+        with (
+            patch(
+                "kiro_crew.transcribe._open_ffmpeg_for_execution",
+                return_value=opened,
+            ),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+        ):
+            result_path, is_temp = await apple_speech._to_native_audio(str(src))
+        assert result_path == str(owned)
+        assert is_temp is True
+        assert events == ["exited", "closed"]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_on_the_close_await_still_removes_the_owned_temp(
+        self, tmp_path, monkeypatch
+    ):
+        """A cancellation landing exactly on the deferred close await -- the
+        only suspension point between the child exiting and the success return
+        transferring the temp to the caller -- must not propagate with the
+        invocation-owned ``.wav`` still on disk."""
+        _stub_probe_under_cap(monkeypatch)
+        owned = self._owned_temp(tmp_path, monkeypatch)
+        src = tmp_path / "voice.webm"
+        src.write_bytes(b"data")
+
+        proc = AsyncMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        async def cancelled_close(_executable, **_kwargs):
+            raise asyncio.CancelledError
+
+        with (
+            patch(
+                "kiro_crew.transcribe._open_ffmpeg_for_execution",
+                return_value="/fake/ffmpeg",
+            ),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch(
+                "kiro_crew.transcribe._close_ffmpeg_for_execution",
+                side_effect=cancelled_close,
+            ),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await apple_speech._to_native_audio(str(src))
+        assert not owned.exists()
+        assert src.exists()
+
+    @pytest.mark.asyncio
     async def test_temp_creation_failure_closes_authenticated_decoder_off_loop(
         self, tmp_path, monkeypatch
     ):
+        _stub_probe_under_cap(monkeypatch)
         from kiro_crew import transcribe as tr
 
         binary = tmp_path / "ffmpeg"
@@ -629,6 +957,13 @@ class TestTranscodeTempOwnership:
             return real_unlink(path, *args, **kwargs)
 
         monkeypatch.setattr(apple_speech.os, "unlink", tracked_unlink)
+
+        async def _under_cap(path, max_secs, **kw):
+            return False
+
+        # The r26 pre-remux duration probe would otherwise consume the fake
+        # process; this test is about cancellation INSIDE the remux.
+        monkeypatch.setattr(_tr_mod, "audio_exceeds_secs", _under_cap)
         with (
             patch(
                 "kiro_crew.transcribe._open_ffmpeg_for_execution",
@@ -649,6 +984,7 @@ class TestTranscodeTempOwnership:
     ):
         """The cleanup must not eat the success path: the caller's existing
         cleanup relies on receiving the temp path with ownership."""
+        _stub_probe_under_cap(monkeypatch)
         owned = self._owned_temp(tmp_path, monkeypatch)
         src = tmp_path / "voice.webm"
         src.write_bytes(b"data")
@@ -671,13 +1007,13 @@ class TestTranscodeTempOwnership:
     @pytest.mark.asyncio
     async def test_sandbox_rejection_removes_the_owned_native_temp(self, tmp_path, monkeypatch):
         """The fail-closed sandbox refusal returns after `transcribe` received an
-        owned temp but used to exit before the cleanup `finally` was armed."""
+        owned temp, before the cleanup `finally` is armed, and must still remove it."""
         from kiro_crew import sandbox as sb
 
         owned = tmp_path / "native.wav"
         owned.write_bytes(b"x")
 
-        async def fake_native(_path):
+        async def fake_native(*_a, **_k):
             return str(owned), True
 
         def boom(argv):
@@ -774,7 +1110,7 @@ class TestStreamingSession:
 
 
 class TestHelperArgvPinsFast:
-    """Pin the ``--fast`` flag in the STREAMING helper argv (#5896).
+    """Pin the ``--fast`` flag in the STREAMING helper argv.
 
     ``--fast`` inserts ``.frequentFinalization`` into the transcriber's reporting
     options; without it the helper emits only volatile partials for the whole open
@@ -846,7 +1182,7 @@ class TestHelperArgvPinsFast:
 
 
 class TestSandboxCleanupPathIsDropped:
-    """Every `_sandboxed` call site must unlink the returned cleanup path (#5776).
+    """Every `_sandboxed` call site must unlink the returned cleanup path.
 
     The third tuple element is a real temp file on any host with a sandbox
     backend (Linux namespace launcher / macOS ``.sb`` profile), and the

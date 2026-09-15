@@ -313,7 +313,8 @@ class TestPrSearch(unittest.TestCase):
 class _NoRealGhBase(unittest.TestCase):
     """Fail loudly if a test in this class reaches a real ``gh`` subprocess.
 
-    AGENTS.md: "Mock external processes (kiro-cli) - never spawn real processes in
+    docs/system-specs/common/testing-conventions.md: mock external processes
+    (kiro-cli), never spawn real processes in
     tests." ``enrich_pulls`` fans out to FOUR calls (card summaries + its by-number
     top-up, merge readiness + its by-number top-up), and each top-up fires whenever
     the mocked first call does not cover every row, so a test that mocks only some of
@@ -545,7 +546,8 @@ class TestPrListMergeReadiness(unittest.TestCase):
     def _no_spawn(self):
         """Fail loudly if a test reaches a real ``gh`` process.
 
-        AGENTS.md: "Mock external processes — never spawn real processes in tests."
+        docs/system-specs/common/testing-conventions.md: mock external processes,
+        never spawn real processes in tests.
         ``enrich_pulls`` makes FOUR calls (summaries + its by-number top-up, readiness +
         its by-number top-up), so mocking only some leaves the rest to shell out, which
         measurably happened, and which makes the suite depend on network and on a
@@ -687,7 +689,7 @@ class TestPrListMergeReadiness(unittest.TestCase):
         self.assertEqual(out[1]["pr_merged_at"], "2026-08-03T06:45:33Z")
 
     def test_enrichment_corrects_a_stale_cached_row(self):
-        # The #1265 case: the row was cached while the PR was open, the user armed
+        # The row was cached while the PR was open, the user armed
         # auto-merge from it, and GitHub answered "already merged".
         pulls = [{"number": 1265, "state": "open", "merged_at": None}]
         summaries = {1265: {"additions": 1, "deletions": 0, "changed_files": 1,
@@ -962,7 +964,7 @@ class TestPrAiSummary(unittest.TestCase):
     def test_fingerprint_catches_an_edit_that_changes_no_metadata(self):
         # Editing a comment changes neither its created_at nor the comment count,
         # so a metadata-only digest would keep serving a summary written from text
-        # that no longer exists. The body is hashed, so it cannot.
+        # that is gone. The body is hashed, so it cannot.
         base = routes._pr_ai_fingerprint(self.detail, self.timeline, self.checks)
         edited = list(self.timeline)
         edited[0] = {**edited[0], "body": "Actually this is fine."}

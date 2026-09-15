@@ -256,6 +256,16 @@ const SCROLLING_KEYS = new Set([
   'PageUp', 'PageDown', 'Home', 'End', ' ', 'Spacebar',
 ])
 
+// Direction of one scrolling key, for callers that need the input's own
+// direction. Comparisons against `KeyboardEvent.key` protocol values, never
+// rendered; horizontal arrows scroll neither way, and Space pages down.
+function scrollKeyDirection(key: string): 'up' | 'down' | undefined {
+  if (key === 'ArrowUp' || key === 'PageUp' || key === 'Home') return 'up'
+  if (key === 'ArrowDown' || key === 'PageDown' || key === 'End') return 'down'
+  if (key === ' ' || key === 'Spacebar') return 'down'
+  return undefined
+}
+
 /**
  * Attach a one-shot "the user is trying to scroll" listener set and return a
  * detach function.
@@ -273,25 +283,48 @@ const SCROLLING_KEYS = new Set([
  */
 export function attachUserScrollIntent(
   target: EventTarget | undefined,
-  onUser: () => void,
+  onUser: (dir?: 'up' | 'down') => void,
 ): () => void {
   if (!target) return () => {}
   const onKey = (e: Event) => {
     const key = (e as KeyboardEvent).key
     // A bare modifier press is not scroll intent; an unknown key is not either.
-    if (typeof key === 'string' && SCROLLING_KEYS.has(key)) onUser()
+    if (typeof key !== 'string' || !SCROLLING_KEYS.has(key)) return
+    onUser(scrollKeyDirection(key))
   }
+  const onWheel = (e: Event) => {
+    // The wheel delta is the input's own direction, available BEFORE any scroll
+    // event: negative deltaY scrolls up. A zero/absent delta stays directionless.
+    const dy = (e as WheelEvent).deltaY
+    onUser(dy < 0 ? 'up' : dy > 0 ? 'down' : undefined)
+  }
+  // Track the previous touch Y within this attachment: a finger moving DOWN the
+  // screen scrolls the content UP. The first move has no baseline and reports
+  // no direction rather than guessing.
+  let lastTouchY = Number.NaN
+  const onTouch = (e: Event) => {
+    const y = (e as TouchEvent).touches?.[0]?.clientY
+    if (typeof y !== 'number') {
+      onUser()
+      return
+    }
+    const prev = lastTouchY
+    lastTouchY = y
+    onUser(Number.isNaN(prev) || y === prev ? undefined : y > prev ? 'up' : 'down')
+  }
+  // A scrollbar grab carries no direction until it actually scrolls.
+  const onPointer = () => onUser()
   const passive = { passive: true } as const
-  target.addEventListener('wheel', onUser, passive)
-  target.addEventListener('touchmove', onUser, passive)
+  target.addEventListener('wheel', onWheel, passive)
+  target.addEventListener('touchmove', onTouch, passive)
   // pointerdown fires when the scrollbar thumb is grabbed, before any scroll
   // event arrives, so the abort lands ahead of the first drag movement.
-  target.addEventListener('pointerdown', onUser, passive)
+  target.addEventListener('pointerdown', onPointer, passive)
   target.addEventListener('keydown', onKey, passive)
   return () => {
-    target.removeEventListener('wheel', onUser)
-    target.removeEventListener('touchmove', onUser)
-    target.removeEventListener('pointerdown', onUser)
+    target.removeEventListener('wheel', onWheel)
+    target.removeEventListener('touchmove', onTouch)
+    target.removeEventListener('pointerdown', onPointer)
     target.removeEventListener('keydown', onKey)
   }
 }

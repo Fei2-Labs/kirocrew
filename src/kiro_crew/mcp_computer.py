@@ -122,8 +122,8 @@ from kiro_crew.mcp_core import (
     _internal_secret,
     _replay_target,
     _resolve_api_target,
-    _resolve_session_key_strict,
     _session_key_header_error,
+    require_strict_session_key,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.validation import MCP_COMPUTER_SCHEMAS, ValidationError, validate_tool_args
@@ -173,8 +173,8 @@ ERR_GATEWAY_UNREACHABLE = (
 # the unattended-surface refusal that was removed by product decision. On a POOLED
 # backend one process serves many sessions, so the pid alone separates only what the
 # injected caller block does not already name: co-tenants gatewayd can name get real
-# per-session keys, and the unnamed ones USED to collapse onto one
-# ``unresolved:<pid>`` namespace (#5322). They no longer do — gatewayd injects a
+# per-session keys, and the unnamed ones would otherwise collapse onto one
+# ``unresolved:<pid>`` namespace. gatewayd injects a
 # per-CONNECTION nonce on every forwarded call, which is appended here, so two
 # unnamed co-tenants of one pooled process hold separate namespaces. It is
 # deliberately NOT presented as trustworthy attribution: the prefix names it as
@@ -199,11 +199,11 @@ def _unresolved_session_key() -> str:
     * 1:1 shim (no gateway, no nonce) — kiro-cli spawns one shim per session, so
       the pid is already the separator and the key is unchanged.
     * Pooled backend — one process serves N connections, so the pid separates
-      nothing; the gateway-minted per-connection nonce does (#5322).
+      nothing; the gateway-minted per-connection nonce does.
 
-    Without the nonce half, two unnamed co-tenants of a pooled backend shared one
-    key, which is what let ``SnapshotIndex``'s ``(session_key, window_key)``
-    namespace alias them onto one entry and let one session's action resolve
+    Without the nonce half, two unnamed co-tenants of a pooled backend share one
+    key, which lets ``SnapshotIndex``'s ``(session_key, window_key)``
+    namespace alias them onto one entry and one session's action resolve
     against another's element indices — while each session's own fingerprint
     check still passed, because both trees describe the same window.
 
@@ -709,7 +709,9 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     # ``mcp_core`` itself documents as "agent-writable and therefore forgeable", and
     # an unnamed audit identity is honest where a forged one is a lie. What the audit
     # loses is attribution, which is worth less than the feature working.
-    session_key = _resolve_session_key_strict() or _unresolved_session_key()
+    session_key = require_strict_session_key("computer-use attribution")[0] or (
+        _unresolved_session_key()
+    )
     header_err = _session_key_header_error(session_key)
     if header_err:
         return f"{ERROR_PREFIX}{header_err}"

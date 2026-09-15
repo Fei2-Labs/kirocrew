@@ -49,7 +49,7 @@ Multi-session parallel chat with full Markdown rendering, syntax-highlighted cod
 - **Tool input preview**: expandable tool input display in approval cards.
 - **File upload**: on desktop, use **Upload file** from the `+` menu or drop a file into Chat. On a phone or other touch device, tap `+` to open the native system Files picker directly. Both paths accept images and regular files such as `.zip`, `.csv`, and `.docx`.
 - **Folder management**: create, rename, and organize sessions into sidebar folders with indent borders.
-- **Per-channel session folders**: optional, off by default — each channel's settings panel (Slack, Discord, Telegram, Teams, Webex, WeCom, WeChat) can file conversations that start there into a named sidebar folder, marked with the channel's brand mark. Config key: `<channel>.session_folder` ("" = off). The folder is created when the setting is saved, so the surfacing path only ever reads the folder store; a configured folder that no longer exists (config.json hand-edited, or the folder deleted) leaves conversations unfiled until the next save recreates it. Filing applies as each conversation is first surfaced; a session moved by hand afterwards stays where it was put.
+- **Per-channel session folders**: optional, off by default — every messaging channel's settings panel can file conversations that start there into a named sidebar folder, marked with the channel's brand mark. Config key: `<channel>.session_folder` ("" = off). The folder is created when the setting is saved, so the surfacing path only ever reads the folder store; a configured folder that no longer exists (config.json hand-edited, or the folder deleted) leaves conversations unfiled until the next save recreates it. Filing applies as each conversation is first surfaced; a session moved by hand afterwards stays where it was put.
 - **Session colors**: per-session color picker for visual organization.
 
 ### Settings (`/settings/*`)
@@ -58,7 +58,7 @@ Settings uses tabbed panels for Overview, Imports, Chat, Display, Voice, Notific
 
 ### Agent Capabilities (`/capabilities`)
 
-Tabbed management for crews, agent templates, MCP connections, skills, steering, hooks, prompts, and workflow libraries. `/agents` and `/connections` redirect here.
+Tabbed management for crews, agent templates, MCP connections, skills, the knowledge library, steering, hooks, prompts, and workflow libraries. `/agents`, `/connections` and `/knowledge` redirect here.
 
 ### Schedule (`/schedule`)
 
@@ -66,7 +66,7 @@ Create and manage cron jobs, organize them in folders, and switch between list, 
 
 ### Developer (`/developer`)
 
-Tabbed developer views for logs, system metrics, telemetry, storage, MCP pooling, memory, configuration, feature previews, and the session archive. The former standalone `/system` page is now the System tab here.
+Tabbed developer views for logs, system metrics, telemetry, storage, MCP pooling, memory, configuration, the agent backend, feature previews, debug tools, and the session archive. The former standalone `/system` page is now the System tab here.
 
 ### Logs (`/logs`)
 
@@ -82,7 +82,7 @@ Browse discoverable apps, manage the installed-app library, and open app detail 
 
 ### Other shipped routes
 
-`/knowledge` opens the Knowledge Library, `/notifications` opens notifications, `/artifacts` opens artifact management, and `/deploy` opens artifact deployment. Built-in app routes are registered dynamically.
+`/knowledge` redirects to the Knowledge Library at `/capabilities?tab=knowledge`, `/notifications` opens notifications, `/artifacts` opens artifact management, and `/deploy` opens artifact deployment. Built-in app routes are registered dynamically.
 
 ## Real-Time Updates
 
@@ -97,8 +97,26 @@ Terminal tabs in the chat side panel host a real shell (PTY) bound to the chat's
 | `resize` | client → server | `{cols, rows}` | Viewport size change |
 | `title` | server → client | `{text}` | Live tab title: foreground command name while one runs, else the shell cwd basename (polled ~1/s, pushed on change) |
 | `cwd` | server → client | `{path}` | The shell's full live working directory (same poll, pushed on change) |
-| `error` | server → client | `{message}` | Session-level failure |
+| `error` | server → client | `{message, code?}` | Session-level failure. `code: "displaced"` marks the one frame sent to a socket a newer connection has just replaced |
 | `pong` | server → client | — | Keepalive reply |
+
+Terminal routes are available only to the dashboard owner. When another window
+belonging to that owner reconnects to the same terminal session, the newest
+connection becomes its input and resize owner. The displaced connection can no
+longer write to or resize the PTY; the server sends it one `error` frame
+(`code: "displaced"`, `Another connection owns this terminal session`) and
+closes that displaced WebSocket with bounded cleanup. The displaced window does
+not redial on its own — an automatic redial would take the terminal straight
+back and the two windows would displace each other in a loop — so it shows a
+neutral banner reading "Another window took over this terminal" whose button reads "Use terminal here" (it takes the PTY back from the other window, which then parks the same way), and waits for
+that button; network and tab-focus revives leave a displaced session
+parked. Live `title`, `cwd` and `pong` frames are delivered only to the current
+owner, and a frame that could not be delivered is retried on the next change
+rather than marked sent. A reconnect that cannot replay current output or
+receive its ready frame leaves the existing owner in place and also closes the
+failed candidate without waiting indefinitely on its transport; a reconnect
+with no live owner (a reload) always converges, even while the shell is
+streaming output continuously.
 
 **Selection toolbar.** Highlighting text in a terminal shows a floating toolbar with **Send to chat** and **Copy**. Send to chat appends the selection to the chat composer draft (never overwrites the draft, never auto-sends), annotated with a `Terminal output (path):` header — using the live `cwd` value when the backend has reported one, else the terminal's spawn directory — and wrapped in a code fence so the agent reads it as literal output. Copy places the raw selection on the clipboard.
 

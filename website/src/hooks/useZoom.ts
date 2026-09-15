@@ -29,12 +29,7 @@ const FAMILY_MAP: Record<FontFamily, string> = {
 // itself persists the factor per-origin across launches. In a plain browser
 // the bridge is absent — a web page cannot drive the browser's native zoom —
 // so the UI falls back to a keyboard-shortcut hint (`zoomSupported: false`).
-type ZoomAPI = {
-  get(): Promise<number>
-  set(factor: number): Promise<number>
-  step(dir: 1 | -1): Promise<number>
-}
-const zoomAPI = (): ZoomAPI | undefined => (window as { zoomAPI?: ZoomAPI }).zoomAPI
+const zoomAPI = (): ZoomAPI | undefined => window.zoomAPI
 
 // Legacy page-side scaling (removed): a CSS `zoom` on #root ('mc-zoom') and an
 // html font-size scale ('mc-font-scale') that stacked with native zoom into

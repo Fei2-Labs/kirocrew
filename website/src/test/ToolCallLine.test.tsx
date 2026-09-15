@@ -446,6 +446,8 @@ describe('ToolCallLine entrance reveal', () => {
  *  reads as a slide. */
 describe('ToolCallLine row slide', () => {
   it('keeps the shell status line mounted while it collapses, then drops it', async () => {
+    // `ts: 1` puts the command far past the appearance threshold, so the line
+    // is up from the first paint.
     const msg = toolMsg({ meta: { tool_call_id: 'tc_slide_exit' } })
     const store = createTestStore({
       chat: {
@@ -467,6 +469,7 @@ describe('ToolCallLine row slide', () => {
     expect(screen.getByText(/Running ·/)).toBeTruthy()
     // …and gone once the collapse finishes.
     await waitFor(() => expect(screen.queryByText(/Running ·/)).toBeNull())
+    expect(screen.queryByTestId('shell-activity')).toBeNull()
   })
 
   it('grows a first-appearance row from zero height and releases it afterwards', async () => {

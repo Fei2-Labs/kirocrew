@@ -1,4 +1,4 @@
-"""Off-loop DB discipline for the knowledge store (#7078, remedy A of #3057).
+"""Off-loop DB discipline for the knowledge store.
 
 ``scripts/check_sync_io_in_async.py`` rejects a blocking DB call written
 *lexically* inside an ``async def``. It cannot see the same call one frame down:
@@ -13,7 +13,7 @@ These tests pin the discipline from four directions:
 2. the *interprocedural* catch, together with proof that the static gate is
    blind to the very same call -- the two are complementary, not redundant,
 3. the deliberate departure from ``history.py``: ``KIROCREW_DEV_MODE`` alone
-   must NOT arm this store's raise while #7019's 85 recorded on-loop callers
+   must NOT arm this store's raise while 85 recorded on-loop callers
    are outstanding,
 4. a mutation guard, so deleting the check from the accessor fails loudly
    instead of silently disarming everything above.
@@ -181,7 +181,7 @@ class TestDevModeDeparture:
     ``history.py``'s guard can arm that branch because every session mutator was
     already offloaded when it landed, so a raise there means genuinely new
     drift. This store still has 85 recorded on-loop callers (the whole of
-    ``.github/sync-io-in-async-baseline.txt``), owned by #7019. Raising on a
+    ``.github/sync-io-in-async-baseline.txt``). Raising on a
     tracked backlog reports it as a regression, and the developer's rational
     response -- unset ``KIROCREW_DEV_MODE`` -- would silence history.py's guard
     too. Pinned so flipping it later is a conscious edit with a failing test.
@@ -220,7 +220,7 @@ class TestSharedSwitchCannotArmThisStore:
     were written to history's fully-offloaded surface. If this store read that
     same switch, the on-loop ``/api/knowledge/stats`` and
     ``/api/knowledge/namespaces`` handlers would raise and 500 the e2e run --
-    a green-looking flag arming a raise on the backlog #7019 owns. The store
+    a green-looking flag arming a raise on the tracked backlog. The store
     therefore reads its OWN switch. Pinned here because the failure only shows
     up in an expensive end-to-end job.
     """
@@ -253,7 +253,7 @@ class TestSharedSwitchCannotArmThisStore:
     def test_ci_exports_the_shared_flag_not_the_store_flag(self):
         """The premise above, asserted against the real CI config rather than
         assumed. If CI later exports the store switch too, this fails and the
-        narrowing must be re-judged (that is the #7019 completion signal)."""
+        narrowing must be re-judged (that is the completion signal)."""
         ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         setup_py = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
         assert STRICT_ENV in ci and STRICT_ENV in setup_py, (
@@ -267,14 +267,14 @@ class TestSharedSwitchCannotArmThisStore:
 
 
 class TestConstructionOnLoopIsSanctioned:
-    """Construction is the ONE vetted on-loop take (#8231).
+    """Construction is the ONE vetted on-loop take.
 
     ``setup_knowledge_routes()`` reads the gateway's lazy ``knowledge_store``
     property at route registration, before the socket binds, so ``__init__``
     -- schema init, migrations, graph load -- runs on the event-loop thread on
     every launch, by the constructor's documented design (moving that work off
-    the boot path is #8329). Before #8231 the guard warned on every boot for
-    that deliberate take. The constructor now wraps exactly those calls in
+    the boot path is a separate change). The guard would warn on every boot for
+    that deliberate take, so the constructor wraps exactly those calls in
     ``allow_on_loop()``; these tests pin both directions -- construction is
     silent, AND the guard stays fully armed on every path after the block ends.
     """
@@ -336,11 +336,18 @@ class TestConstructionOnLoopIsSanctioned:
 
     def test_constructor_wraps_init_in_the_scoped_opt_out(self):
         """Mutation guard: the ``allow_on_loop()`` ``with`` block's body must be
-        EXACTLY the three init calls. Textual-order checks are not enough: they
+        EXACTLY the two init calls. Textual-order checks are not enough: they
         stay green when the calls are dedented out of the block (the likely
-        drift in a later constructor edit), and they cannot see a FOURTH call
+        drift in a later constructor edit), and they cannot see a THIRD call
         joining the block -- which the scoped exemption would silently sanction
         against a ``blocking: true`` rule. AST nesting catches both.
+
+        ``_load_graph`` sits OUTSIDE this block: the
+        graph is materialised by its first reader via ``ensure_graph_loaded``,
+        which runs on a worker thread, so the guard SHOULD be armed for it --
+        reaching the load on the loop is now a real finding, not a sanctioned
+        take. It is asserted absent below so a later edit cannot quietly put a
+        data-scaled scan back on the pre-bind boot path.
         """
         src = textwrap.dedent(inspect.getsource(KnowledgeStore.__init__))
         tree = ast.parse(src)
@@ -369,7 +376,12 @@ class TestConstructionOnLoopIsSanctioned:
                 and func.value.id == "self"
             ), "the sanctioned block must call methods on self only"
             calls.append(func.attr)
-        assert calls == ["_init_schema", "_migrate", "_load_graph"], (
+        assert "_load_graph" not in calls, (
+            "the graph load is back inside the sanctioned block -- that returns a "
+            "data-scaled two-table scan to the pre-bind boot path and un-arms the "
+            "guard for it. It belongs behind ensure_graph_loaded (#8329)."
+        )
+        assert calls == ["_init_schema", "_migrate"], (
             "the sanctioned block's body changed -- a call moved out (re-arming "
             "the guard for it) or joined in (sanctioning NEW on-loop work, which "
             f"needs its own justification): {calls}"

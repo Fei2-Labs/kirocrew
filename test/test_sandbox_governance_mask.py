@@ -83,6 +83,7 @@ class TestKeystonesAreSealedInEveryMode:
     #: THESE paths are covered, so a test derived from the same tuple the production
     #: code reads would pass just as happily after someone emptied it.
     KEYSTONES = (
+        "member-memory-bindings",
         "security_policy.json",
         "admission_policy.json",
         "app_admission.json",
@@ -91,6 +92,20 @@ class TestKeystonesAreSealedInEveryMode:
         "computer_use.json",
         "oauth_endpoints.json",
         "aws_service_consent.json",
+        # Recorded consent to deliver a scanner-flagged file. Sealing it
+        # is the load-bearing half of the whole design: the deny-list tiers can
+        # be evaded by runtime path construction, so only a kernel write denial
+        # makes "the owner consents, never the agent" true rather than merely
+        # intended.
+        "file_delivery_consent.json",
+        # Gateway-executed browser launcher. Agent shells must read and run it,
+        # but a write would choose the binary the unsandboxed gateway executes.
+        "playwright-cli",
+        # The app dev-mode authorization record: sealing it is what
+        # makes the operator-attestation flag unforgeable from an agent shell
+        # — a sandboxed process cannot mint a grant however the toggle was
+        # spelled.
+        "apps/.dev-grants.json",
     )
 
     @_POSIX_ONLY
@@ -140,11 +155,15 @@ class TestSecretsAreMaskedInEveryMode:
     """Crew-home leaves with no in-sandbox reader are bind-masked, not merely sealed."""
 
     MASKED = (
+        "memory_stores",
         "token_signing.key",
         "refresh_chains.json",
         "kas",
         "mcp-apps",
         "ledger",
+        # Same model as ledger, two parties: the worker agent carries the full file
+        # toolset, so an unmasked work-ledger lets it reach any conductor's records.
+        "work-ledger",
         "backup",
         "browser-cookies.txt",
         "playwright-storage-state.json",
@@ -152,6 +171,7 @@ class TestSecretsAreMaskedInEveryMode:
         "ops_mission_control_secrets.json",
         "whatsapp",
         "apps/aws-control/data",
+        "aws-control-staging",
         "workspace/md-notebook/pat",
         "data.sqlite3",
         "data.sqlite3-wal",
@@ -261,6 +281,17 @@ class TestTheReconciliationIsComplete:
         assert not hidden & readonly
         assert not hidden & visible
         assert not readonly & visible
+
+    def test_the_gateway_launcher_is_a_top_level_readonly_leaf(self) -> None:
+        """A nested leaf can be bypassed by renaming its writable parent.
+
+        The Linux bind mount follows the moved parent, leaving the original path
+        free for an agent-planted replacement. A top-level leaf has no extra
+        agent-writable ancestor inside the data home.
+        """
+        assert "playwright-cli" in sandbox._CREW_READONLY_LEAVES
+        assert "playwright-cli" in sandbox._CREW_NOFOLLOW_READONLY_DIR_LEAVES
+        assert "tools/playwright-cli" not in sandbox._CREW_READONLY_LEAVES
 
     @pytest.mark.parametrize("mode", _MODES)
     def test_every_mode_carries_the_derived_set(self, mode: str) -> None:
@@ -392,3 +423,333 @@ class TestThirdPartyCredentialsKeepTheirExistingTiering:
         for listing in (sandbox._STRICT_DIRS, sandbox._CC_DIRS, sandbox._STANDARD_DIRS):
             assert ".local/share/kiro-cli" not in listing
             assert ".local/share/amazon-q" not in listing
+
+
+class TestAppBackendOwnedLeaves:
+    """An app's OWN backend gets its state leaves back; nothing else changes.
+
+    The md-notebook leaves are masked to fence agent subprocesses, but the Notes
+    backend is itself a sandboxed spawn and is those files' only legitimate
+    reader/writer. Masking it from itself made every attach/clone fail on the
+    registry's final atomic rename. The spawn passes the resolved leaf paths as
+    ``extra_visible_dirs``; these tests pin that the exemption lifts exactly those
+    targets, on both platform builders, and that a default build keeps the mask.
+    """
+
+    LEAVES = (
+        "workspace/md-notebook/pat",
+        "workspace/md-notebook/vaults.json",
+        "workspace/md-notebook/settings.json",
+    )
+
+    def test_the_helper_resolves_both_home_spellings(self) -> None:
+        targets = sandbox.app_backend_visible_targets("md-notebook")
+
+        for prefix in _CREW_PREFIXES:
+            for leaf in self.LEAVES:
+                assert _crew_path(prefix, leaf) in targets
+
+    def test_an_app_with_no_owned_leaves_gets_no_exemption(self) -> None:
+        assert sandbox.app_backend_visible_targets("meetings") == ()
+        assert sandbox.app_backend_visible_targets("no-such-app") == ()
+
+    @_POSIX_ONLY
+    def test_linux_unhides_the_owned_leaves_for_this_spawn(self) -> None:
+        script = sandbox._build_launcher_script(
+            "standard", extra_visible_dirs=sandbox.app_backend_visible_targets("md-notebook")
+        )
+        match = re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S)
+        assert match
+        hidden = set(json.loads(match.group(1)))
+
+        for prefix in _CREW_PREFIXES:
+            for leaf in self.LEAVES:
+                assert _crew_path(prefix, leaf) not in hidden, f"{leaf} still masked"
+
+    def test_macos_drops_every_rule_for_the_owned_leaves(self) -> None:
+        profile = sandbox._build_seatbelt_profile(
+            "standard", extra_visible_dirs=sandbox.app_backend_visible_targets("md-notebook")
+        )
+
+        for prefix in _CREW_PREFIXES:
+            for leaf in self.LEAVES:
+                target = _crew_path(prefix, leaf)
+                # Read AND write, because the EPERM the issue reports is the write
+                # side: the staged sibling temp is written fine and the rename onto
+                # the masked literal is what Seatbelt refuses.
+                assert f'"{target}"' not in profile, f"{leaf} still carries a deny rule"
+
+    @_POSIX_ONLY
+    @pytest.mark.parametrize("mode", _MODES)
+    @pytest.mark.parametrize("prefix", _CREW_PREFIXES)
+    @pytest.mark.parametrize("leaf", LEAVES)
+    def test_a_default_build_keeps_the_mask(self, mode: str, prefix: str, leaf: str) -> None:
+        """No exemption without the spawn asking: agent subprocesses stay fenced."""
+        hidden, _readonly, files = _launcher_sets(mode)
+        target = _crew_path(prefix, leaf)
+
+        assert target in hidden
+        assert target in files
+
+    def test_the_backend_spawn_passes_the_owned_leaves(self) -> None:
+        """`apps/backend.py` must thread the helper's result into ``wrap_argv``.
+
+        Asserted structurally rather than by a full spawn, which needs a manifest, a
+        reserved port, and a live interpreter: the call site must derive its visible
+        set from the helper, keyed by the app being spawned — and only behind the
+        immutable-provenance gate, so a third-party install that claimed the builtin's
+        name cannot spawn with the builtin's credential leaves unmasked.
+        """
+        import inspect
+
+        from kiro_crew.apps import backend as backend_mod
+
+        src = inspect.getsource(backend_mod._start_app_backend_body)
+        assert "app_backend_visible_targets(app_name)" in src
+        assert "is_builtin_app(app_root=execution_path, app_name=app_name)" in src
+
+
+class TestForeignMaskShadowGuard:
+    """A carve-out spelling beneath a FOREIGN mask is refused, not carved.
+
+    ``_hidden_path_contains_visible_path`` cancels any hidden mask entry that
+    CONTAINS a visible path, so an ``extra_visible_dirs`` spelling planted beneath
+    an independently masked directory (a data home relocated under a credential
+    tree) would take that whole foreign mask down with it. Both crew-home carve-out
+    producers — the policy-cache site in ``apps/backend.py`` and
+    ``app_backend_visible_targets`` — must refuse such a spelling and keep the mask;
+    their consumers fail closed on the masked path, which is strictly safer.
+    """
+
+    def test_a_path_beneath_a_masked_credential_tree_is_shadowed(self) -> None:
+        # ``.gnupg`` is masked at EVERY tier, standard included, so a data home
+        # planted beneath it shadows at the tier the app-backend spawn asks for.
+        planted = os.path.join(_home(), ".gnupg", "crew", "policy_cache")
+        assert sandbox.carveout_shadowed_by_foreign_mask(planted)
+
+    def test_standard_mode_ignores_a_strict_only_mask(self) -> None:
+        """``standard`` deliberately leaves ``~/.aws`` visible; there is no mask
+        to take down, so an ungoverned standard-mode carve-out must be allowed
+        (refusing would break md-notebook and cache-only backends for nothing)."""
+        planted = os.path.join(_home(), ".aws", "crew", "policy_cache")
+        assert not sandbox.carveout_shadowed_by_foreign_mask(planted, mode="standard")
+
+    def test_strict_mode_refuses_beneath_a_strict_mask(self) -> None:
+        planted = os.path.join(_home(), ".aws", "crew", "policy_cache")
+        assert sandbox.carveout_shadowed_by_foreign_mask(planted, mode="strict")
+
+    def test_cc_mode_refuses_beneath_a_cc_mask(self) -> None:
+        planted = os.path.join(_home(), ".aws", "crew", "policy_cache")
+        assert sandbox.carveout_shadowed_by_foreign_mask(planted, mode="cc")
+
+    def test_a_sibling_prefix_is_not_an_ancestor(self) -> None:
+        """``~/.gnupg-backup`` shares ``~/.gnupg``'s string prefix but is not
+        beneath it — a ``startswith`` misimplementation reds here."""
+        planted = os.path.join(_home(), ".gnupg-backup", "crew", "policy_cache")
+        assert not sandbox.carveout_shadowed_by_foreign_mask(planted)
+
+    def test_the_producer_threads_its_mode_to_the_guard(self, monkeypatch, tmp_path) -> None:
+        """``app_backend_visible_targets(mode=...)`` must reach the guard: the
+        same relocated spelling under a strict-only mask survives a standard
+        spawn and is dropped from a strict one."""
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".aws" / "relocated-crew"))
+        reloc = str(tmp_path / ".aws" / "relocated-crew" / "workspace" / "md-notebook" / "pat")
+
+        assert reloc in sandbox.app_backend_visible_targets("md-notebook")
+        assert reloc not in sandbox.app_backend_visible_targets("md-notebook", mode="strict")
+
+    def test_a_governance_floor_clamps_the_check_up(self, monkeypatch) -> None:
+        """A ``sandbox.min_level`` floor raises the tier the masks are built for,
+        so the shadow check must judge against the clamped tier, not the ask."""
+        monkeypatch.setattr(sandbox, "_governance_sandbox_floor", lambda: "strict")
+        planted = os.path.join(_home(), ".aws", "crew", "policy_cache")
+        assert sandbox.carveout_shadowed_by_foreign_mask(planted, mode="standard")
+
+    def test_a_masked_entry_itself_is_not_shadowed(self) -> None:
+        """Equality is the carve-out's whole job; only a PROPER ancestor is foreign."""
+        for target in (
+            _crew_path(".kiro/crew", "workspace/md-notebook/pat"),
+            # The default policy-cache spelling IS a masked entry (every tier list
+            # carries ``.kiro/crew/policy_cache``); the cache-only carve-out must
+            # keep working on a default layout.
+            _crew_path(".kiro/crew", "policy_cache"),
+        ):
+            assert not sandbox.carveout_shadowed_by_foreign_mask(target), target
+
+    def test_an_unmasked_location_is_not_shadowed(self) -> None:
+        assert not sandbox.carveout_shadowed_by_foreign_mask(
+            os.path.join(_home(), "projects", "notes")
+        )
+
+    def test_an_unresolvable_home_fails_toward_refusal(self, monkeypatch) -> None:
+        """No mask universe to check means no carve-out, never a carve-anyway."""
+
+        def _boom() -> object:
+            raise RuntimeError("no home")
+
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(_boom))
+        assert sandbox.carveout_shadowed_by_foreign_mask("/anywhere/at/all")
+
+    def test_the_md_notebook_carveout_drops_a_shadowed_spelling(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A data home relocated beneath a masked tree keeps that tree's mask.
+
+        ``.gnupg`` is masked at the ``standard`` tier the app-backend spawn asks
+        for. ``Path.home`` is pinned to ``tmp_path`` so the resolver (which
+        CREATES the relocated directory) never writes beneath the real home.
+        """
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".gnupg" / "relocated-crew"))
+
+        # Positive first, so the absence loop below cannot pass vacuously: the
+        # relocated spelling really is minted by the resolver and really does
+        # trip the guard.
+        shadowed_leaf = str(
+            tmp_path / ".gnupg" / "relocated-crew" / "workspace" / "md-notebook" / "pat"
+        )
+        assert shadowed_leaf in sandbox._relocated_crew_targets(("workspace/md-notebook/pat",))
+        assert sandbox.carveout_shadowed_by_foreign_mask(shadowed_leaf)
+
+        targets = sandbox.app_backend_visible_targets("md-notebook")
+
+        shadowed_root = str(tmp_path / ".gnupg") + os.sep
+        assert targets, "the default home spellings must survive the refusal"
+        for target in targets:
+            assert not target.startswith(shadowed_root), f"{target} would unmask ~/.gnupg"
+        # The refusal is per-spelling: the default-home entries are still carved.
+        assert os.path.join(str(tmp_path), ".kiro/crew/workspace/md-notebook/pat") in targets
+
+    def test_the_cache_site_guards_its_carveout(self) -> None:
+        """`apps/backend.py` must thread the cache path through the shadow guard.
+
+        Asserted structurally rather than by a full spawn (which needs a manifest, a
+        reserved port, and a live interpreter), mirroring the sibling test above: the
+        cache-only carve-out must consult the guard before widening ``_visible``.
+        """
+        import inspect
+
+        from kiro_crew.apps import backend as backend_mod
+
+        src = inspect.getsource(backend_mod._start_app_backend_body)
+        assert "carveout_shadowed_by_foreign_mask(_cache_target)" in src
+
+
+class TestAPodChildsRemappedHomeIsMasked:
+    """``acp.client._apply_pod_home_remap`` gives a pod's
+    kiro-cli child a pod-owned ``HOME`` (``KIROCREW_OS_HOME``) and
+    ``pod.runtime._seed_pod_os_home`` stages the host's SSO tokens into it -- but
+    every entry in the tier lists is ``$HOME``-relative joined against the GATEWAY's
+    home, so none of them named the remapped tree.
+
+    Both ACP transports freeze their sandbox BEFORE applying the remap, so the mask
+    was computed against the original home and the child's own ``$HOME`` resolved to
+    an UNMASKED copy of the credential. Re-anchoring inside the mask builder (rather
+    than feeding ``extra_hidden_dirs`` from each transport) makes the mask correct
+    regardless of that call order, and covers both transports from one place."""
+
+    # The production helper builds each target with ``os.path.normpath(os.path.join(
+    # os_home, leaf))``, so an expected value spelled with a literal "/" matches only
+    # on POSIX -- on Windows the same call yields backslashes and the assertion failed
+    # on shard 3 even though the mask contained the right paths. Building the expected
+    # value through the SAME two calls is platform-correct by construction, and keeps
+    # the assertion an exact-membership check rather than a weaker substring test.
+    _OS_HOME = "/pods/x/os-home"
+
+    @staticmethod
+    def _expected(leaf: str) -> str:
+        return os.path.normpath(os.path.join(TestAPodChildsRemappedHomeIsMasked._OS_HOME, leaf))
+
+    def test_the_remapped_home_is_re_anchored_when_the_pod_marker_is_set(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_POD", "1")
+        monkeypatch.setenv("KIROCREW_OS_HOME", self._OS_HOME)
+
+        out = sandbox._pod_os_home_targets((".aws", ".ssh"))
+
+        assert self._expected(".ssh") in out
+        # ``.aws`` is the pod's OWN grant store, carved out on purpose -- see
+        # ``_pod_os_home_targets``. The credential FILES under it stay masked.
+        assert self._expected(".aws") not in out
+        assert self._expected(".aws/config") in out
+        assert self._expected(".aws/credentials") in out
+
+    def test_the_seeded_sso_token_directory_stays_reachable_in_tiers_that_mask_aws(
+        self, monkeypatch
+    ) -> None:
+        """The concrete credential: `_seed_pod_os_home` writes
+        `<os-home>/.aws/sso/cache/kiro-auth-token*.json`, and the pod's kiro-cli
+        child WRITES its own MCP OAuth grants into that same directory.
+
+        Bind-masking `<os-home>/.aws` empty breaks both
+        directions -- the child cannot read the token it was seeded, and its grant
+        writes land in the overlay rather than the pod tree, so `mcp_grant`'s stat
+        answers "no grant" forever. On Linux `is_kiro_cli` does not skip Crew's
+        launcher (`delegate_to_kiro` is darwin/win32 only), so this mask really
+        does reach the pod child. A read-only per-file re-expose cannot substitute:
+        the child needs WRITE access, and the grant filenames are sha256 keys that
+        do not exist at launcher-build time.
+
+        `_STANDARD_DIRS` is deliberately EXCLUDED: standard mode leaves `.aws`
+        visible so `credential_process` can reach Bedrock auth, so the carve-out is
+        a no-op there and that tier's output is unchanged."""
+        monkeypatch.setenv("KIROCREW_POD", "1")
+        monkeypatch.setenv("KIROCREW_OS_HOME", self._OS_HOME)
+
+        for listing in (sandbox._STRICT_DIRS, sandbox._CC_DIRS):
+            assert ".aws" in listing, "the tier list no longer masks .aws at all"
+            out = sandbox._pod_os_home_targets(tuple(listing))
+            assert self._expected(".aws") not in out
+            # Carving out the store must not reopen the file-credential leg.
+            assert self._expected(".aws/config") in out
+            assert self._expected(".aws/credentials") in out
+            # A sibling credential leaf is still empty-masked.
+            assert self._expected(".gnupg") in out
+        # A tier that never masked .aws gains nothing, so standard-mode pods keep
+        # byte-identical masks -- asserted rather than assumed.
+        assert ".aws" not in sandbox._STANDARD_DIRS
+        standard_out = sandbox._pod_os_home_targets(tuple(sandbox._STANDARD_DIRS))
+        assert self._expected(".aws/config") not in standard_out
+
+    def test_a_non_pod_session_mask_is_unchanged(self, monkeypatch) -> None:
+        """Gated on the pod marker exactly as ``config.paths`` gates the resolver, so
+        an ordinary session gains no rule."""
+        monkeypatch.delenv("KIROCREW_POD", raising=False)
+        monkeypatch.setenv("KIROCREW_OS_HOME", "/pods/x/os-home")
+
+        assert sandbox._pod_os_home_targets((".aws",)) == []
+
+    def test_the_marker_must_be_exactly_one(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_POD", "false")
+        monkeypatch.setenv("KIROCREW_OS_HOME", "/pods/x/os-home")
+
+        assert sandbox._pod_os_home_targets((".aws",)) == []
+
+    def test_no_os_home_yields_nothing(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_POD", "1")
+        monkeypatch.delenv("KIROCREW_OS_HOME", raising=False)
+
+        assert sandbox._pod_os_home_targets((".aws",)) == []
+
+    def test_a_remap_target_equal_to_the_real_home_adds_no_duplicate(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Mirrors ``_relocated_crew_targets``: only paths that DIFFER from the
+        ``$HOME``-relative spelling are returned."""
+        monkeypatch.setenv("KIROCREW_POD", "1")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("KIROCREW_OS_HOME", str(tmp_path))
+
+        assert sandbox._pod_os_home_targets((".aws",)) == []
+
+    def test_both_mask_builders_consume_the_helper(self) -> None:
+        """One helper, both builders. The launcher script (Linux) and the seatbelt
+        profile (macOS) each join the tier list against ``home`` separately, so a
+        fix in only one of them would be silently platform-specific."""
+        import inspect
+
+        launcher = inspect.getsource(sandbox._build_launcher_script)
+        assert "_pod_os_home_targets(" in launcher
+        seatbelt = inspect.getsource(sandbox._build_seatbelt_profile)
+        assert "_pod_os_home_targets(" in seatbelt

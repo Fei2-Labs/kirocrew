@@ -1,5 +1,6 @@
 import type { DisplayItem } from '../pages/chat/types'
-import { TURN_OPENER_ROLES } from '../pages/chat/groupDisplayItems'
+import type { ChatMessage } from '../types'
+import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import { mdImageDestToPath } from './fileTokens'
 import { type PasteBlock, expandAll } from './pasteTokens'
 
@@ -60,18 +61,36 @@ export function pinHandoffY(foldY: number, collapsedCardH: number): number {
 }
 
 /**
- * Rows that can take the pin: the ones that OPEN a turn.
+ * Rows that can take the pin: what the HUMAN typed.
  *
- * Derived from `TURN_OPENER_ROLES` rather than restated, because the two lists
- * disagreeing is the defect this exists to prevent. A nudge and a subagent
- * completion are machine-injected, but each IS the thing that started the turn
- * being read, and a session made almost entirely of them (a babysit loop, a
- * workflow fan-out) otherwise offers no pinnable row cycle after cycle — the walk
- * upward skips every one and lands on the human's last typed message, dozens of
- * turns and tens of thousands of pixels away.
+ * Deliberately NARROWER than `TURN_OPENER_ROLES`. A nudge and a subagent
+ * completion open turns too (the grouping keeps treating them that way), but they
+ * are machine-injected: a banner that quotes "Auto-nudge · cycle 36" over the
+ * transcript tells the reader nothing they asked, and in a babysit loop it
+ * re-pins on EVERY cycle, so scrolling through the session shows a fresh machine
+ * row taking the band every few screens. The banner exists to answer "what did I
+ * ask that this is a reply to", and only a row the user authored can answer it —
+ * so the walk upward skips every machine opener and lands on the last typed
+ * prompt, however many cycles ago that was. The distance is the honest answer:
+ * nothing closer was the user's.
+ *
+ * Two `user`-role rows are still excluded because the role alone over-admits:
+ *
+ * - A STEER (`meta.steer`, set by the `steer_push` echo) is injected INTO a turn
+ *   already running; its row lays out between the opener and that turn's reply,
+ *   so admitting it hands the pin to the interruption for the rest of the turn.
+ * - A subagent completion in OLDER scrollback was persisted under role `user`
+ *   (before the `subagent` role existed). The same completion-event parser the
+ *   transcript card uses recognises it, so it is excluded by SHAPE, not by role.
  */
+function isSteer(msg: ChatMessage): boolean {
+  return !!(msg.meta as { steer?: boolean } | undefined)?.steer
+}
+
 function isPrompt(item: DisplayItem | undefined): boolean {
-  return !!item && item.kind === 'single' && TURN_OPENER_ROLES.has(item.msg.role)
+  if (!item || item.kind !== 'single') return false
+  const { msg } = item
+  return msg.role === 'user' && !isSteer(msg) && !isSubagentCompletionMessage(msg)
 }
 
 /**
@@ -105,30 +124,6 @@ export function findNextPromptIdx(items: DisplayItem[], afterIdx: number): numbe
 }
 
 /**
- * Whether a transcript row must be HIDDEN because the banner stands in for it.
- *
- * Pure and here rather than inline in a style attribute because it is the one rule
- * in the feature whose failure DELETES a message: the row is hidden on the promise
- * that the banner shows the same content in the same place, and any state that
- * breaks that promise while leaving this true makes the message unreachable in
- * both places at once. `minimized` is checked first for exactly that reason — a
- * chip stands in for nothing.
- *
- * Identity beats position: the pin's index is computed in a scroll rAF and a
- * streaming append can shift the list before the row renders, which hid the wrong
- * row. Match on the message timestamp when the pin has one, falling back to the
- * index only for a message carrying none, and pass no timestamp for a grouped row.
- */
-export function pinHidesRow(
-  pin: { ts?: string; idx: number } | null,
-  minimized: boolean,
-  row: { ts?: string; idx: number },
-): boolean {
-  if (minimized || !pin) return false
-  return pin.ts != null ? row.ts === pin.ts : pin.idx === row.idx
-}
-
-/**
  * Display index of the row the pinned-prompt jump should scroll to when the
  * user asks for `target`.
  *
@@ -145,19 +140,17 @@ export function pinHidesRow(
  * puts a non-prompt row (or the top of the list) on the line instead, so the
  * previous turn's banner survives and the chain continues.
  *
- * The walk deliberately consumes MACHINE turn openers too (nudge and subagent
- * rows — `isPrompt` derives from `TURN_OPENER_ROLES`), not only consecutive
- * user rows like a steer following its prompt. The mechanism-backed case is a
- * fan-out whose completions drain back to back: each is a turn opener and none
- * of them carries a reply of its own, so they lay out as one run of consecutive
- * opener rows. Consecutive
- * nudge rows arise only when nudged turns persist no reply (an errored or
- * cancelled cycle — a normal cycle interposes its tool/assistant rows). In
- * both shapes each row is pinnable, and each belongs to the same contextual
- * block as the row directly above the run: jumping to any member lands at the
- * block's top, where the exchange reads in order — stopping mid-run would
- * drop the reader between two machine rows with the context that explains
- * them still hidden above.
+ * The walk consumes only rows `isPrompt` admits — consecutive USER prompts (a
+ * double-send, a prompt typed while the previous one was still queued). Machine
+ * openers (nudge and subagent rows) are not prompts here, so a run of them above
+ * the target is an ordinary non-prompt gap and the walk stops at the target: the
+ * previous user prompt's banner then survives the landing exactly as it would
+ * over any other reply row. The walk used to consume machine runs so a jump
+ * never landed "between two machine rows with the context that explains them
+ * still hidden above"; that concern went away with the rows themselves — a
+ * nudge is now a one-line self-labelled system row and a subagent completion a
+ * self-labelled headline card, so a landing beside either reads on its own, and
+ * the banner above it names the user prompt the whole block answers.
  *
  * Walking up lengthens the jump. The virtualizer's near/far decision
  * (`mountIndex` in useVirtualChat) compares the anchor's jump window against
@@ -230,19 +223,35 @@ export function computePinPush(bannerH: number, foldY: number, nextTop: number |
 }
 
 /**
- * Lines of prompt text the COLLAPSED card shows before clamping.
+ * Lines of prompt text the card shows AT REST — one.
  *
- * One line was the original choice and it loses too much: a long prompt is the
- * one most worth summarising, and a single clamped line of it is usually just its
- * opening clause. Three keeps the card small enough to sit under the title
- * without dominating the viewport, and it widens the range over which the card is
- * a pixel-exact copy of the bubble it replaces — every prompt up to three lines
- * now hands over with no size change at all, where before only a one-liner did.
+ * The card sits over the top of whatever reply the reader is scrolling through,
+ * so its resting height is space taken from that reply. Three resting lines
+ * (the earlier value) cost ~13% of a phone viewport on every long turn, and the
+ * reporter of #4984 named it as the one piece of chrome that actively gets in
+ * the way of reading. One line is enough to answer "what did I ask" at a
+ * glance; the fuller preview is one hover away (`PINNED_PREVIEW_LINES`), and
+ * the whole prompt one click away (the chevron).
  *
- * Consequence for the hand-off line: a taller card pushes `pinHandoffY` DOWN,
- * which makes the pin condition (`rowBottom <= handoffY`) EASIER to satisfy, so a
- * card growing after it mounts can never invalidate the pin that mounted it. The
- * coupling is monotone in the safe direction — see the test of the same name.
+ * Consequence for the hand-off line: the card's settled resting height is what
+ * `pinHandoffY` is derived from, and a SHORTER card moves that line UP, so a
+ * prompt hands over sooner. The pin condition (`rowBottom <= handoffY`) is
+ * evaluated against this settled height only — the hover peek and the full
+ * expansion grow the live card but never re-report a collapsed height — so a
+ * card growing after it mounts can never invalidate the pin that mounted it.
+ * See the test of the same name.
+ */
+export const PINNED_RESTING_LINES = 1
+
+/**
+ * Lines of prompt text the card shows while the pointer is over it or a control
+ * inside it has keyboard focus — the PEEK.
+ *
+ * A single clamped line of a long prompt is usually just its opening clause;
+ * three lines is the amount that reliably carries the ask. Hover is the right
+ * trigger because it costs the reader nothing when they are not interested: the
+ * card grows only while they point at it and shrinks back the moment they leave.
+ * Touch has no hover, so on touch the chevron is the way to more than one line.
  */
 export const PINNED_PREVIEW_LINES = 3
 
@@ -484,10 +493,6 @@ export interface PinnedPromptInput {
   /** Stored (collapsed) prompt content — the identity the derivation keys on. */
   raw: string
   pastes: PasteBlock[]
-  /** Compact label a machine-authored row shows instead of its payload. */
-  machineLabel: string | null
-  /** Body such a row reveals when expanded, when it differs from `raw`. */
-  machineBody?: string
   push: number
   bannerH: number
 }
@@ -509,22 +514,20 @@ export function nextPinnedPromptState(
   prev: PinnedPromptState | null,
   input: PinnedPromptInput,
 ): PinnedPromptState {
-  const { idx, ts, raw, pastes, machineLabel, machineBody, push, bannerH } = input
+  const { idx, ts, raw, pastes, push, bannerH } = input
   const sameMsg = prev !== null && prev.idx === idx && prev.raw === raw && prev.ts === ts
   if (sameMsg && prev.push === push && prev.bannerH === bannerH) return prev
   if (sameMsg) return { ...prev, push, bannerH }
-  const derived = machineLabel === null ? derivePinnedPromptText(raw, pastes) : null
-  const text = machineLabel ?? derived?.text ?? ''
-  const full = machineBody ?? derived?.body ?? raw
+  const { text, body: full, images } = derivePinnedPromptText(raw, pastes)
   return {
     idx,
     ts,
     text,
     raw,
     full,
-    images: derived?.images ?? [],
-    // By COMPARISON, not by being machine-authored: a short multiline paste never
-    // clamps, so this flag is the only thing that can reach its body.
+    images,
+    // By COMPARISON: a short multiline paste never clamps, so this flag is the
+    // only thing that can reach its body.
     bodyBeyondPreview: full !== text,
     push,
     bannerH,

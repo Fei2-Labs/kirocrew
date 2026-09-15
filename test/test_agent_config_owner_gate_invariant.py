@@ -35,17 +35,15 @@ _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # Pre-owner exclusions: routes that intentionally only require authentication
 # (not ownership) because they execute during the initial onboarding flow
 # BEFORE an owner is configured.
+#
+# Empty by intent: the onboarding import routes are owner-gated like every
+# other mutating route. The pre-owner shape needs no exemption because
+# ``is_owner_dashboard_request`` accepts the signed local bootstrap subjects
+# (``local-app`` / ``local-startup``) whenever no ``owner_id`` is configured,
+# so the local onboarding flow passes the ordinary gate. A pre-owner route
+# that must skip the gate for a real reason belongs here, with justification.
 # --------------------------------------------------------------------------- #
-_PRE_OWNER_EXCLUSIONS: frozenset[tuple[str, str]] = frozenset(
-    {
-        # Onboarding import routes use ``_caller()`` which checks authentication
-        # but not ownership. These routes run during initial setup when the user
-        # is importing configuration from another installation -- there is no
-        # configured owner yet, so the owner gate cannot apply.
-        ("POST", "/api/onboarding/import/apply"),
-        ("PUT", "/api/onboarding/import/state"),
-    }
-)
+_PRE_OWNER_EXCLUSIONS: frozenset[tuple[str, str]] = frozenset()
 
 # --------------------------------------------------------------------------- #
 # Known ungated routes: mutating routes that predate the owner-gating effort.
@@ -92,25 +90,6 @@ _KNOWN_UNGATED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("PUT", "/api/config/kirocrew"),
         ("PATCH", "/api/config/kirocrew"),
         ("PUT", "/api/config/theme"),
-        # --- Workspace CRUD (files.py) ---
-        # Found BY this walk, not by the migration: none of the three carries an
-        # owner gate, and ``api_workspaces_delete`` removes a workspace from
-        # config.json for any authenticated dashboard session -- including the
-        # session token minted for an allow-listed Slack user, which has an empty
-        # app identity and so is authenticated but not the owner.
-        #
-        # Listed rather than gated HERE because gating them changes WHO may manage
-        # workspaces, which is a product decision, not the mechanical migration
-        # this change is: tracked as #6470. The DELETE is the highest-priority
-        # entry in this set.
-        ("POST", "/api/workspaces"),
-        ("PUT", "/api/workspaces/{name}"),
-        ("DELETE", "/api/workspaces/{name}"),
-        # --- Member thread creation (members.py) ---
-        # Also found by this walk. Creates a thread against a crew member for any
-        # authenticated caller. Same disposition as the workspace routes above
-        # (#6470).
-        ("POST", "/api/members/{slug}/thread"),
     }
 )
 
@@ -118,16 +97,22 @@ _KNOWN_UNGATED_ROUTES: frozenset[tuple[str, str]] = frozenset(
 # ``test_known_ungated_routes_not_growing``. Raising it is the reviewable act
 # that adding a new ungated route costs; lower it whenever an entry is gated and
 # removed, so the ratchet stays tight.
-_MAX_KNOWN_UNGATED_ROUTES = 24
+_MAX_KNOWN_UNGATED_ROUTES = 20
 
 # --------------------------------------------------------------------------- #
 # Coherence floor: the walk must find at least this many GATED mutating routes.
-# This is the count of routes that we expect to be owner-gated (from agents.py,
-# files.py, connections.py). If a refactor removes or relocates routes such
-# that fewer than this threshold are gated, the test fails loudly rather than
-# passing vacuously.
+# This is the count of owner-gated routes the walk enforces, measured live at
+# Registered by handlers.agents, handlers.connections,
+# handlers.files, and handlers.members). Keep it equal to the real count -- a
+# slack floor cannot catch a refactor that silently drops routes out of the
+# walk. Hardcoded deliberately: deriving it from the walk itself would
+# reintroduce the vacuity one level up. If routes are intentionally removed,
+# the assertion fails and you must lower the floor in the same commit. If
+# routes are added, the ``>=`` assertion still passes, so raising the floor
+# back to the real count is a manual, unenforced step -- do it whenever you
+# touch this file, or the slack this floor exists to prevent regrows.
 # --------------------------------------------------------------------------- #
-_MINIMUM_GATED_ROUTES = 19
+_MINIMUM_GATED_ROUTES = 28
 
 
 class _FakeState:

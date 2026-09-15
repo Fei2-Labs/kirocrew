@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
 from kiro_crew.acp import codex, spec_agent_guard
-from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.spec_agent_guard import SpecAdapterAgentRefused
-from kiro_crew.acp.types import ACP_BACKEND_CODEX
 
 
 class TestModelIdTranslation:
@@ -64,28 +61,6 @@ class TestModelIdTranslation:
         """
         assert codex.is_composite_advertisement(["gpt-5.2[high]", "gpt-5.2[low]"])
         assert not codex.is_composite_advertisement(["claude-opus-4.8"])
-
-
-class TestCompositeModelStartup:
-    """A persisted Codex picker row must survive a cold session start."""
-
-    @pytest.mark.asyncio
-    async def test_startup_sends_only_the_base_model_and_keeps_the_selection(
-        self, tmp_path: Path
-    ) -> None:
-        client = AcpClient(
-            work_dir=tmp_path,
-            model="gpt-5.2[high]",
-            acp_backend=ACP_BACKEND_CODEX,
-        )
-        client._session_id = "session-1"
-        client.set_config_option = AsyncMock()
-
-        await client._apply_startup_model()
-
-        client.set_config_option.assert_awaited_once_with("model", "gpt-5.2")
-        assert client._model == "gpt-5.2[high]"
-        assert client._resolved_model_id == "gpt-5.2"
 
 
 class TestSpecAdapterAgentGuard:

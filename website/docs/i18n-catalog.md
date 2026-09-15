@@ -38,6 +38,17 @@ locale before matching `data-setting-label`, while the palette deliberately
 continues to index the stable English text. Run `npm run gen:settings` after
 changing a setting label or its translation key.
 
+That command writes **two** artifacts: the UI registry, and
+`src/kiro_crew/docs/settings-registry.generated.json` — the agent-facing
+enumeration bundled into the Python docs package, so the agent can answer "where
+is that setting?" with a working deep link. Both are byte-matched against a live
+extraction by `settingsRegistry.test.ts`, so regenerating is not optional. The
+JSON is where the English-label problem becomes visible outside the dashboard:
+each entry ships a prebuilt `route`, and that route highlights by
+`key:<configKey>` wherever the control exposes one, precisely because the id form
+resolves an English label against the rendered DOM and cannot match a translated
+dashboard.
+
 ## Catalog structure
 
 Catalogs live in `src/i18n/locales/`:
@@ -321,6 +332,20 @@ Available: `fmtNumber`, `fmtPercent`, `fmtCurrency`, `fmtUnit`, `fmtDuration`,
 `fmtTimeNumeric`, `fmtDateTimeNumeric`, `fmtDateFields`, `fmtWeekday`,
 `fmtRelative`, `fmtList`, `collator`, `compareText`, plus `activeLocale` and
 `toDate`.
+
+Bounded-monitor evidence follows the same seam. Probe, wake, agent-turn, token,
+provider-error, cadence, and budget values pass through `fmtNumber`; probe
+deadlines pass through `fmtDateTimeNumeric`. The catalog keeps these usage lines
+label-first (`"Probes: {{count}}"`) because `count` is already formatted text and
+may also be the translated unknown-state label, so it must not be used as an
+i18next plural selector. Human-readable monitor statuses are catalog values in
+all shipped locales. Provider classifications, scheduler decisions, terminal
+reason codes, and target URLs are machine or user data instead: render them with
+`translate="no"` and never add their open-ended values to the catalog.
+Bounded-monitor validation formats the backend minimum and maximum before passing
+them to the field-specific catalog message. The pull-request example translates
+only its local “e.g.” prefix; the URL remains byte-identical under the catalog's
+do-not-translate URL rule.
 
 **Naming a locale IS the opt-out**, which is why there is no allowlist file:
 

@@ -2,7 +2,7 @@
 
 Middle rung of the Connections launch ladder (L0 = the account-free metadata
 probe, L2 = the manual UI gate); the full contract -- verdict table, runbook,
-known gap -- lives in ``docs/architecture/design-notes/connections-l1-smoke.md``.
+known gap -- lives in ``docs/system-specs/modules/connections.md``.
 Invariants: **Kiro Crew holds no token** (kiro-cli injects the bearer in its own
 process, so a managed provider's healthy reply is an OAuth challenge -- graded
 ``GRANT_HELD``, never ``NEEDS_RECONSENT``, reserved for attributable
@@ -67,7 +67,7 @@ _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 # Whole-run budget derived from the per-request one; bounds a stall-every-leg server.
 _TOTAL_BUDGET_MULTIPLIER = 3
 
-# JSON-RPC error substrings meaning "the grant no longer works": only these grade
+# JSON-RPC error substrings meaning the grant is rejected: only these grade
 # NEEDS_RECONSENT past initialize, so an outage is never a consent problem.
 _RECONSENT_TOKENS = ("unauthorized", "invalid_token", "invalid_grant", "forbidden")
 
@@ -641,7 +641,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
     async def _run_and_persist() -> dict[str, Any]:
-        # Fatal path persists in-loop too -- round 2's trap, one seam over.
+        # Fatal path persists in-loop too -- the same trap as the seam one over.
         try:
             report = await run_l1(
                 concurrency=args.concurrency,
@@ -664,7 +664,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _echo(
             f"VACUOUS: {report['exercised_count']} of {report['provider_count']} providers "
             f"exercised, {report['min_exercised']} required -- one-time consent click per "
-            "provider; see docs/architecture/design-notes/connections-l1-smoke.md."
+            "provider; see docs/system-specs/modules/connections.md."
         )
     return 0 if report["ok"] else 1
 

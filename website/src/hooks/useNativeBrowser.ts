@@ -1,36 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 /** State mirrored back from the main process's per-panel browser manager. */
-export interface NativeBrowserState {
-  open: boolean
-  visible: boolean
-  url: string
-  bounds: { x: number; y: number; width: number; height: number } | null
-  overlayActive?: boolean
-  refused?: boolean
-}
+export type NativeBrowserState = globalThis.NativeBrowserState
 
-interface NativeBrowserBridge {
-  open: (panelId: string, url: string) => Promise<NativeBrowserState | null>
-  navigate: (panelId: string, url: string) => Promise<NativeBrowserState | null>
-  setBounds: (
-    panelId: string,
-    rect: { x: number; y: number; width: number; height: number },
-    viewport: { width: number; height: number },
-  ) => Promise<NativeBrowserState | null>
-  setOverlayActive: (panelId: string, active: boolean) => Promise<NativeBrowserState | null>
-  setInactive: (panelId: string, value: boolean) => Promise<NativeBrowserState | null>
-  close: (panelId: string) => Promise<NativeBrowserState | null>
-  getState: (panelId: string) => Promise<NativeBrowserState | null>
-  setAgentAct: (panelId: string, enabled: boolean) => Promise<{ ok: boolean } | null>
-  setControlOwner: (panelId: string, owner: string) => Promise<unknown>
-  onDidNavigate: (cb: (p: { panelId?: string; url: string; title: string }) => void) => () => void
-  onTitleUpdated: (cb: (p: { panelId?: string; url: string; title: string }) => void) => () => void
-}
-
-function bridge(): NativeBrowserBridge | null {
-  const w = window as unknown as { browserAPI?: NativeBrowserBridge }
-  return w.browserAPI ?? null
+function bridge(): BrowserAPI | null {
+  return window.browserAPI ?? null
 }
 
 /** Selector for SPA chrome that would be occluded by the native layer. */

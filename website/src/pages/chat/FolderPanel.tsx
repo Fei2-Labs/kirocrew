@@ -3,11 +3,13 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { Folder, RotateCw, ExternalLink, ChevronDown, ChevronUp, Search, X } from 'lucide-react'
 import DetailPanel from '../../components/DetailPanel'
-import { revealOrOpen, useRevealLabel } from '../../components/FilePathMenu'
+import { revealOrOpen, useRevealFailure, useRevealLabel } from '../../components/FilePathMenu'
+import ErrorNotice from '../../components/ErrorNotice'
 import { useBranding } from '../../hooks/useBranding'
 import { useGatewayPlatform } from '../../hooks/useGatewayPlatform'
 import { api } from '../../api/client'
 import { fileIcon, colorForExt } from '../../utils/fileIcons'
+import { useFileMenuItems, visibleFileMenuItems, FolderRowActions } from '../../apps/fileMenuContributions'
 import { PierreWorkspaceTree } from '../../pierre/tree'
 import { useTreeState } from './FileBrowserRail'
 
@@ -173,6 +175,16 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
     return () => clearTimeout(id)
   }, [query])
 
+  // App-contributed 'folder-row' actions, rendered per row (hover-revealed).
+  const folderItems = useFileMenuItems('folder-row')
+  // A contributed row's dispatch failure. Held here rather than in the row: the menu
+  // closes on select, and the row is unmounted the moment the listing re-renders, so
+  // neither can host the notice. Cleared on navigation for the reason `useRevealFailure`
+  // clears on its subject — a refusal raised for the old directory must not be shown
+  // under the new one.
+  const [contribError, setContribError] = useState<string | null>(null)
+  useEffect(() => { setContribError(null) }, [cwd])
+
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ['browse-files', cwd],
     queryFn: () => api.browseFiles(cwd),
@@ -255,6 +267,9 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
   // a directory as well as a file — this button reveals `cwd` itself. Shared with
   // every other file-location surface via useRevealLabel.
   const revealLabel = useRevealLabel()
+  // A failed reveal renders above the search box; askAgent on — the only
+  // editable field is a transient search string, not a durable draft.
+  const reveal = useRevealFailure(cwd)
   // `/api/reveal` shells out on the gateway, so revealing `cwd` only makes sense
   // when the browser is on that same machine. A remote/tunneled session would
   // otherwise get a mis-worded "Path copied" alert; hide the button there, the
@@ -282,7 +297,7 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
           </button>
           {directLocal && (
             <button
-              onClick={() => { void revealOrOpen(cwd, 'reveal') }}
+              onClick={() => { void revealOrOpen(cwd, 'reveal', reveal) }}
               className="flex items-center justify-center w-[26px] h-[26px] rounded-md cursor-pointer transition-colors text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none"
               title={revealLabel}
               aria-label={revealLabel}
@@ -293,6 +308,19 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
         </div>
       }
     >
+      {reveal.error && (
+        <div className="mx-2 mt-1.5">
+          <ErrorNotice variant="inline" className="whitespace-normal" message={reveal.error} askAgent onDismiss={reveal.clear} testId="folder-panel-reveal-error" />
+        </div>
+      )}
+      {/* A contributed row's endpoint refused or never answered. askAgent on for the
+          same reason the reveal notice above gives: the only editable field in this
+          panel is a transient search string, not a durable draft. */}
+      {contribError && (
+        <div className="mx-2 mt-1.5">
+          <ErrorNotice variant="inline" className="whitespace-normal" message={contribError} askAgent onDismiss={() => setContribError(null)} testId="folder-panel-contrib-error" />
+        </div>
+      )}
       <div className="flex items-center gap-1.5 mx-2 mt-1.5 px-2 h-[28px] shrink-0 rounded-md bg-bg border border-border focus-within:border-accent">
         <Search size={12} className="shrink-0 text-muted" />
         <input
@@ -363,8 +391,10 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
               </span>
             </div>
             {isSearchError && (
-              <div className="px-2 py-2 text-[12px] text-danger">
-                {(searchError as Error)?.message || t('pages.chat.folderPanel.search_failed')}
+              // Read failure; the only editable field is the transient search
+              // box, not a durable draft → hand-off on.
+              <div className="px-2 py-2">
+                <ErrorNotice variant="inline" message={(searchError as Error)?.message || t('pages.chat.folderPanel.search_failed')} askAgent />
               </div>
             )}
             {!isSearchError && isSearching && matches.length === 0 && (
@@ -433,8 +463,9 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
             )}
             {isLoading && <div className="px-2 py-2 text-[12px] text-muted">{t('pages.chat.folderPanel.loading')}</div>}
             {isError && (
-              <div className="px-2 py-2 text-[12px] text-danger">
-                {(error as Error)?.message || t('pages.chat.folderPanel.unable_to_list_folder')}
+              // List failure in a side panel with nothing unsaved → hand-off on.
+              <div className="px-2 py-2">
+                <ErrorNotice variant="inline" message={(error as Error)?.message || t('pages.chat.folderPanel.unable_to_list_folder')} askAgent />
               </div>
             )}
             {!isLoading && !isError && isEmpty && (
@@ -447,6 +478,7 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
                 label={d.name}
                 title={d.path}
                 onActivate={() => navigate(d.path)}
+                actions={<FolderRowActions items={visibleFileMenuItems(folderItems, { path: d.path, kind: 'dir' })} node={{ path: d.path, kind: 'dir' }} onError={setContribError} />}
               />
             ))}
             {files.map(f => {
@@ -458,6 +490,7 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
                   label={f.name}
                   title={f.path}
                   onActivate={() => onFileOpen?.(f.path)}
+                  actions={<FolderRowActions items={visibleFileMenuItems(folderItems, { path: f.path, kind: 'file' })} node={{ path: f.path, kind: 'file' }} onError={setContribError} />}
                 />
               )
             })}
@@ -474,12 +507,14 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
  *  `sub` carries a search hit's subfolder. It is right-aligned and truncates from
  *  the START, because the tail of a path is what distinguishes two same-named
  *  files while the head is the part they share. */
-function Row({ icon, label, sub, title, onActivate }: {
+function Row({ icon, label, sub, title, onActivate, actions }: {
   icon: React.ReactNode
   label: string
   sub?: string
   title: string
   onActivate: () => void
+  /** App-contributed row actions (folder-row surface), right-aligned. */
+  actions?: React.ReactNode
 }) {
   return (
     <div
@@ -500,6 +535,7 @@ function Row({ icon, label, sub, title, onActivate }: {
           {sub}
         </span>
       )}
+      {actions}
     </div>
   )
 }

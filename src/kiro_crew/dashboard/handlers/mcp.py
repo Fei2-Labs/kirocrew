@@ -26,7 +26,8 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     FORWARD_DECLARED_ENV_DEFAULT,
     KiroCrewConfig,
-    _resolve_stub_servers,
+    _resolve_stub_overrides,
+    _resolve_stub_roster,
 )
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
@@ -133,12 +134,16 @@ class _McpFileLock:
     async def __aenter__(self) -> None:
         _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
         _MCP_LOCK_PATH.touch(exist_ok=True)
-        # Open the lock fd WRITABLE. Windows msvcrt.locking() requires write
-        # access on the handle — an "r" fd fails with EACCES and
+        # Open the lock fd WRITABLE and non-truncating. Windows msvcrt.locking()
+        # requires write access on the handle -- an "r" fd fails with EACCES and
         # platform_compat.acquire_lock swallows that (best-effort semantics),
         # silently degrading this to a no-op and letting concurrent
         # /api/mcp/toggle requests race the atomic-rename write of mcp.json
-        # (one flip is lost). "r+" keeps the shared file present (no truncate).
+        # (one flip is lost). "r+" keeps the shared file present (no truncate);
+        # see platform_compat.open_lock_file for the full Windows rationale
+        # (GH-9248). Kept inline rather than routed through that helper: the fd
+        # is stored on self._fd and released in __aexit__, so it must OUTLIVE
+        # this method -- the with-scoped helper would close it at method return.
         fd = open(_MCP_LOCK_PATH, "r+")
         # Run blocking lock acquire in a thread to avoid blocking the event
         # loop. Bind self._fd ONLY AFTER a successful acquire — otherwise a
@@ -186,6 +191,8 @@ class _McpFileLockSync:
     def __enter__(self) -> None:
         _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
         _MCP_LOCK_PATH.touch(exist_ok=True)
+        # Non-truncating "r+", kept inline for the same reason as
+        # :class:`_McpFileLock` above.
         fd = open(_MCP_LOCK_PATH, "r+")
         try:
             platform_compat.acquire_lock(fd.fileno(), exclusive=True)
@@ -215,7 +222,7 @@ def _get_mcp_lock_sync() -> _McpFileLockSync:
 # pointing at a removed package. This coarse async mutex spans BOTH phases so
 # apply calls are fully serialized; the narrower file lock is retained inside for
 # cross-process coordination with bridges.py. Loop-bound via the shared
-# LoopBoundLock (#4800).
+# LoopBoundLock.
 _apply_lock = LoopBoundLock()
 
 
@@ -701,8 +708,8 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
     and ``~/.kiro/settings/mcp.json``), and provider-global entries. This
     handler describes what the DASHBOARD shows; it makes no claim about which
     of these sources kiro-cli itself loads at session time — that is backend
-    behaviour this repo cannot verify (see issue #2946, where agent-level and
-    disabled entries still initialized).
+    behaviour this repo cannot verify: agent-level and disabled entries have
+    been seen initializing there anyway.
     """
     global _mcp_probe_in_progress
     from kiro_crew.mcp_discovery import list_servers  # circular import
@@ -1055,7 +1062,7 @@ async def api_mcp_quarantine_clear(request: web.Request) -> web.Response:
     Deliberately does NOT touch ``disabled`` in any config file: this clears only
     the count Kiro Crew accumulated on its own, so a server the user had switched
     off by hand stays off. It does not mount or unmount anything either -- the
-    server was never unmounted (issue #6171).
+    server was never unmounted.
     """
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
@@ -1304,12 +1311,12 @@ def _string_identifier(body: dict, field: str) -> tuple[str, web.Response | None
     """Read one mutation identifier the dashboard's forms post.
 
     The field must be a STRING before normalization: a truthy non-string
-    (array/object/number from a malformed client) used to reach ``.strip()``
-    and surface as HTTP 500 before any validation ran — past the point where
+    (array/object/number from a malformed client) otherwise reaches ``.strip()``
+    and surfaces as HTTP 500 before any validation runs — past the point where
     such a handler would already hold the config lock or have touched
-    persistence. Missing or blank keeps the handlers' existing required-field
-    responses untouched; only the TYPE contract is new, and its 400 carries a
-    stable machine-readable ``code``.
+    persistence. Missing or blank leaves the handlers' required-field responses
+    alone; only the TYPE contract is enforced here, and its 400 carries a stable
+    machine-readable ``code``.
     """
     raw = body.get(field)
     if raw is None:
@@ -1589,10 +1596,10 @@ async def api_mcp_server_detail(request: web.Request) -> web.Response:
                 _write_mcp_json(data)
         from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
-        # Hold the config lock across the offloaded read-modify-write: since the
-        # sync now runs in a worker thread, two concurrent DELETE/PUT requests
-        # would otherwise both read kirocrew.json and the last write would drop
-        # the other's change (the event loop used to serialize this for free).
+        # Hold the config lock across the offloaded read-modify-write: the sync
+        # runs in a worker thread, so without the lock two concurrent DELETE/PUT
+        # requests would both read kirocrew.json and the last write would drop
+        # the other's change.
         async with _get_config_lock():
             await asyncio.to_thread(lambda: _sync_mcp_to_agent(name, False, remove=True))
         sel().log_api_access(
@@ -2639,6 +2646,53 @@ def _overlay_shadowed_keys(overlay: dict, keys: Collection[str]) -> list[str]:
     return sorted(k for k in keys if k in overlay)
 
 
+def _record_stub_decisions(section: dict, names: list[str], stub: bool) -> None:
+    """Record a toggle as a DECISION in ``stub_overrides``, not as a new stub set.
+
+    Call AFTER :func:`_freeze_stub_servers`, which settles what the roster is;
+    this writes only the operator's deviation from it.
+
+    Rewriting ``stub_servers`` instead would make the roster un-shippable. That
+    key is the layer a distribution owns, so a handler that persists the resulting
+    set into it takes ownership away on the first click: every later roster change
+    arrives into a file that already answers the question, and the addition
+    silently never takes effect. Writing the decision
+    instead leaves the roster alone, so the two layers can both keep moving.
+
+    A decision that AGREES with the roster deletes the override rather than
+    storing it. The two are identical in effect today and differ tomorrow: stored,
+    the entry would pin that server against a later roster change — so an
+    operator toggling a server back to the roster's answer is asking to follow the
+    roster again, not to freeze its current value. That prune is also what keeps
+    the map sparse under the batch action, which would otherwise write an entry
+    for every eligible server at once and shadow the roster wholesale.
+
+    Sorted on write so the file has one canonical form and two writers cannot
+    produce a spurious diff.
+    """
+    roster = set(_resolve_stub_roster(section))
+    overrides = dict(_resolve_stub_overrides(section))
+    for name in names:
+        if (name in roster) == stub:
+            overrides.pop(name, None)
+        else:
+            overrides[name] = stub
+    # Normalize the roster's FORM, never its content. The old write path rebuilt
+    # this key from a set on every toggle, which incidentally deduplicated it and
+    # dropped non-string junk; recording decisions elsewhere would silently retire
+    # that, and a duplicate here makes the dashboard's ``stub_count`` overcount
+    # (the resolver preserves what the file holds). Membership is untouched, so
+    # the layer stays the distribution's to ship and to grow.
+    section["stub_servers"] = sorted(roster)
+    if overrides:
+        section["stub_overrides"] = {name: overrides[name] for name in sorted(overrides)}
+    else:
+        # Drop the key rather than leave `{}` behind: absent and empty mean the
+        # same thing to the resolver, and an operator who has reverted every
+        # deviation should not be left with a residue suggesting otherwise.
+        section.pop("stub_overrides", None)
+
+
 def _freeze_stub_servers(section: dict, overlay: dict | None = None) -> None:
     """Materialize the resolved stub set into ``stub_servers``. Call BEFORE any
     other mutation of *section*.
@@ -2685,7 +2739,12 @@ def _freeze_stub_servers(section: dict, overlay: dict | None = None) -> None:
     if "stub_servers" not in section:
         effective = dict(section)
         effective.update(overlay or {})
-        section["stub_servers"] = sorted(set(_resolve_stub_servers(effective)))
+        # The ROSTER resolver, not the effective one: this materializes the base
+        # layer, and folding ``stub_overrides`` in here would write the operator's
+        # deviations INTO the roster -- making them indistinguishable from a
+        # shipped name and pinning them against every later roster change, which
+        # is the shadowing the override map exists to prevent.
+        section["stub_servers"] = sorted(set(_resolve_stub_roster(effective)))
 
 
 #: Serializes explicit pre-resolve refreshes. Installs are registry-bound and
@@ -3372,14 +3431,21 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
 
     async with _MCP_GATEWAY_APPLY_LOCK:
         overlay = _local_overlay_section()
-        shadowed = _overlay_shadowed_keys(overlay, ("stub_servers",))
+        # BOTH keys this handler can write. The decision lands in
+        # ``stub_overrides``, and ``config.local.json`` wins the deep merge
+        # per-key, so an overlay that names it would shadow the base write: the
+        # click would answer 200 while the gateway kept routing the previous way.
+        # That is the same silent never-takes-effect failure the guard prevents
+        # for the roster, so the check covers this key too.
+        shadowed = _overlay_shadowed_keys(overlay, ("stub_servers", "stub_overrides"))
         if shadowed:
             return web.json_response(
                 {
                     "error": (
-                        "config.local.json defines mcp_gateway.stub_servers, which "
-                        "overrides config.json. Edit that file instead — writing here "
-                        "would not change anything the gateway reads."
+                        "config.local.json defines "
+                        + " and ".join(f"mcp_gateway.{k}" for k in shadowed)
+                        + ", which overrides config.json. Edit that file instead — "
+                        "writing here would not change anything the gateway reads."
                     ),
                     "code": "overlay_owns_stub_servers",
                 },
@@ -3447,12 +3513,12 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
             # then persist only the server just clicked and silently unstub
             # everything the migration was preserving.
             _freeze_stub_servers(section, overlay)
-            servers_set = set(_resolve_stub_servers(section))
-            if stub:
-                servers_set |= set(written)
-            else:
-                servers_set -= set(written)
-            section["stub_servers"] = sorted(servers_set)
+            # The click is a DECISION about these names, recorded over the roster
+            # rather than replacing it -- see `_record_stub_decisions`. Freezing
+            # first is load-bearing: the prune compares against the roster, so it
+            # has to run after the roster is settled or a legacy install's
+            # migrated names would all read as deviations.
+            _record_stub_decisions(section, written, stub)
             return data
 
         try:

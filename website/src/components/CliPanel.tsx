@@ -4,14 +4,17 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import '@xterm/xterm/css/xterm.css'
 import { useMutation } from '@tanstack/react-query'
-import { MessageSquarePlus, Copy, Check, PlugZap } from 'lucide-react'
-import { ensureTerminalConnection, disposeTerminalConnection, getTerminalCwd, useTerminalConnStatus, useTerminalManualRetry, retryTerminalConnection } from '../utils/terminalRegistry'
+import { MessageSquarePlus, Copy, Check, PlugZap, AppWindow } from 'lucide-react'
+import { ensureTerminalConnection, disposeTerminalConnection, getTerminalCwd, useTerminalConnStatus, useTerminalManualRetry, useTerminalDisplaced, retryTerminalConnection } from '../utils/terminalRegistry'
 import { getTerminalFont, resolveTerminalFontFamily, subscribeTerminalFont } from '../hooks/useTerminalFont'
 import { ansiPaletteFromVars } from '../utils/terminalPalette'
 import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
 import { useTerminalTouchSelection, type TouchSelectStatus } from '../hooks/useTerminalTouchSelection'
 import TerminalCompletion from './TerminalCompletion'
 import TerminalKeyBar from './TerminalKeyBar'
+import ErrorNotice from './ErrorNotice'
+import { setTerminalCloseFailed } from '../hooks/useBottomTerminal'
+import { copyToClipboard } from '../utils/clipboard'
 
 import { i18nT } from '../i18n/t'
 /* ── Per-session xterm instance cache ──
@@ -189,13 +192,23 @@ export function disposeTerminalSession(sessionId: string): void {
  * backstopped by the server-side orphan reaper — but routing it through a
  * mutation gives it the standard write lifecycle instead of a bare fetch.
  * Local teardown stays synchronous in disposeTerminalSession().
+ *
+ * `keepalive` lets the request outlive the document that issued it: the
+ * terminal popout returns itself to the main window the moment its last tab
+ * closes, and without it that final DELETE would be aborted with the window.
+ * A rejection is recorded in the shared close-failed flag (every consumer
+ * reports it the same way), which the always-mounted panel root renders.
  */
 export function useDeleteTerminalSession() {
   return useMutation({
     mutationFn: async (sessionId: string) => {
-      const res = await fetch(`/api/terminal/sessions/${sessionId}`, { method: 'DELETE' })
+      const res = await fetch(`/api/terminal/sessions/${sessionId}`, { method: 'DELETE', keepalive: true })
       if (!res.ok) throw new Error(`Failed to delete terminal session (${res.status})`)
     },
+    // Mutation-level (not per-`mutate`) so it still fires after the caller has
+    // unmounted — closing the LAST tab hides the strip that would otherwise
+    // render the failure.
+    onError: () => setTerminalCloseFailed(true),
   })
 }
 
@@ -268,6 +281,11 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
   // presentation; on success it flips to 'connected' and the banner is gone.
   const reconnecting = manualRetry && connStatus === 'reconnecting'
   const showBanner = connStatus === 'disconnected' || reconnecting
+  // Parked because another window of this dashboard took the terminal (the
+  // server said so explicitly). Not a failure: neutral icon and copy that
+  // names the cause, so the user does not blame the network and does not
+  // reflexively click Reconnect and bounce the other window.
+  const displaced = useTerminalDisplaced(sessionId) && connStatus === 'disconnected'
 
   if (!entryRef.current) {
     entryRef.current = getOrCreateTerm(sessionId)
@@ -476,17 +494,16 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
     if (!sel?.text) return
     // Confirm only after the write actually lands; a denied/unavailable
     // clipboard shows "Copy failed" and keeps the selection so the user can
-    // fall back to the native copy shortcut.
-    const write = navigator.clipboard?.writeText(sel.text)
-    if (!write) { setCopied('failed'); return }
-    write.then(
-      () => {
-        setCopied('done')
-        // Keep the toolbar up briefly so the confirmation is visible.
-        setTimeout(dismissSelection, 900)
-      },
-      () => setCopied('failed'),
-    )
+    // fall back to the native copy shortcut. Routed through the shared
+    // helper, which falls back to execCommand('copy') on a plain-HTTP origin
+    // or a permission refusal — its fallback restores focus and the document
+    // selection afterwards, so it no longer costs this pane anything.
+    copyToClipboard(sel.text).then(ok => {
+      if (!ok) { setCopied('failed'); return }
+      setCopied('done')
+      // Keep the toolbar up briefly so the confirmation is visible.
+      setTimeout(dismissSelection, 900)
+    })
   }, [sel, dismissSelection])
 
   return (
@@ -516,7 +533,8 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
       >
         <div ref={containerRef} className="w-full h-full overflow-hidden" />
         {/* Owns xterm's SINGLE `attachCustomKeyEventHandler` slot for this term
-            (it reserves Tab/Enter/arrows/Escape while its menu is open). A later
+            (it reserves Tab/arrows/Escape while its menu is open, and Enter only once
+            a row has been arrowed onto). A later
             feature that attaches its own handler here would silently replace it —
             extend the handler inside TerminalCompletion instead. */}
         <TerminalCompletion term={term} sessionId={sessionId} active={visible} />
@@ -548,22 +566,44 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
         {showBanner && (
           <div
             className="absolute inset-x-0 top-0 z-30 flex items-center gap-2 border-b border-border bg-bg-elevated/95 px-3 py-1.5 text-[12px] text-text shadow-sm backdrop-blur"
-            role="status"
-            aria-live="polite"
+            role={displaced || reconnecting ? 'status' : undefined}
+            aria-live={displaced || reconnecting ? 'polite' : undefined}
           >
-            <PlugZap className={`h-3.5 w-3.5 shrink-0 ${reconnecting ? 'text-text-muted' : 'text-danger'}`} aria-hidden="true" />
-            <span className="min-w-0 flex-1 truncate">
-              {reconnecting
-                ? i18nT('components.cliPanel.reconnecting')
-                : i18nT('components.cliPanel.disconnected_message')}
-            </span>
+            {displaced || reconnecting ? (
+              <>
+                {/* Status, not failure: the terminal was handed to another
+                    window on purpose, or the user's own retry is in flight. */}
+                {displaced
+                  ? <AppWindow className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden="true" />
+                  : <PlugZap className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden="true" />}
+                <span className="min-w-0 flex-1 truncate">
+                  {reconnecting
+                    ? i18nT('components.cliPanel.reconnecting')
+                    : i18nT('components.cliPanel.displaced_message')}
+                </span>
+              </>
+            ) : (
+              /* The redial chain gave up: a FAILED outcome, so it renders through
+                 the shared error surface with the agent hand-off on. Nothing is
+                 lost by navigating away -- the PTY stays alive server-side and
+                 the cached xterm keeps its screen for the reconnect. */
+              <ErrorNotice
+                variant="inline"
+                askAgent
+                testId="cli-panel-disconnected"
+                className="min-w-0 flex-1"
+                message={i18nT('components.cliPanel.disconnected_message')}
+              />
+            )}
             <button
               type="button"
               onClick={() => retryTerminalConnection(sessionId)}
               disabled={reconnecting}
               className="shrink-0 rounded-md border border-border px-2 py-0.5 text-[12px] text-text hover:bg-bg-hover transition-colors disabled:cursor-default disabled:opacity-60 disabled:hover:bg-transparent"
             >
-              {i18nT('components.cliPanel.reconnect')}
+              {displaced
+                ? i18nT('components.cliPanel.use_here')
+                : i18nT('components.cliPanel.reconnect')}
             </button>
           </div>
         )}
@@ -579,7 +619,7 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
         // eslint-disable-next-line jsx-a11y/no-static-element-interactions
         <div
           ref={toolbarRef}
-          className="absolute z-20 flex items-center gap-0.5 rounded-lg border border-border bg-bg-elevated p-0.5 shadow-lg transition-opacity"
+          className="absolute z-20 flex flex-wrap items-center gap-0.5 rounded-lg border border-border bg-bg-elevated p-0.5 shadow-lg transition-opacity"
           style={{
             left: pos?.left ?? 0,
             top: pos?.top ?? 0,
@@ -601,7 +641,7 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
               className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] text-text hover:bg-bg-hover transition-colors ${sending === 'busy' ? 'opacity-60' : ''}`}
               title={sending === 'failed' ? i18nT('components.cliPanel.redaction_failed_retry') : i18nT('components.cliPanel.send_selection_to_chat')}
             >
-              <MessageSquarePlus className={`h-3.5 w-3.5 ${sending === 'failed' ? 'text-red-500' : ''}`} />
+              <MessageSquarePlus className={`h-3.5 w-3.5 ${sending === 'failed' ? 'text-danger' : ''}`} />
               {sending === 'busy' ? i18nT('components.cliPanel.sending') : sending === 'failed' ? i18nT('components.cliPanel.failed_retry') : i18nT('components.cliPanel.send_to_chat')}
             </button>
           )}
@@ -611,9 +651,31 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
             className="flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] text-text hover:bg-bg-hover transition-colors"
             title={i18nT('components.cliPanel.copy_selection')}
           >
-            {copied === 'done' ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className={`h-3.5 w-3.5 ${copied === 'failed' ? 'text-red-500' : ''}`} />}
+            {copied === 'done' ? <Check className="h-3.5 w-3.5 text-ok" /> : <Copy className={`h-3.5 w-3.5 ${copied === 'failed' ? 'text-danger' : ''}`} />}
             {copied === 'done' ? i18nT('components.cliPanel.copied') : copied === 'failed' ? i18nT('components.cliPanel.copy_failed') : i18nT('components.cliPanel.copy')}
           </button>
+          {/* Failures take their own flex line (`basis-full`) beneath the two
+              actions, so the notice's hand-off link never joins them in one
+              button row. Neither holds a draft — the selection stays put for the
+              retry — so the hand-off is on. */}
+          {sending === 'failed' && (
+            <ErrorNotice
+              variant="inline"
+              askAgent
+              testId="cli-panel-send-error"
+              className="basis-full px-2 pb-1"
+              message={i18nT('components.cliPanel.redaction_failed_retry')}
+            />
+          )}
+          {copied === 'failed' && (
+            <ErrorNotice
+              variant="inline"
+              askAgent
+              testId="cli-panel-copy-error"
+              className="basis-full px-2 pb-1"
+              message={i18nT('components.cliPanel.copy_failed')}
+            />
+          )}
         </div>
       )}
     </div>

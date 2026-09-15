@@ -11,6 +11,7 @@ import { useNavigate } from 'react-router-dom'
 import { MessageCirclePlus, ShoppingBag } from 'lucide-react'
 import { Btn, PageHeader } from '../../components/ui'
 import SegmentedControl from '../../components/SegmentedControl'
+import ErrorNotice from '../../components/ErrorNotice'
 import { PreferencesTab } from './PreferencesTab'
 import { HistoryTab } from './HistoryTab'
 import { SitesTab } from './SitesTab'
@@ -41,7 +42,12 @@ export default function PersonalShopperPage() {
     setCreating(true)
     setCreateError(null)
     try {
-      await dispatch(createSlot({ agent: ADVISOR_AGENT })).unwrap()
+      // App-owned workstreams choose their memory contract explicitly; a
+      // general chat preference must not silently alter their behavior.
+      await dispatch(createSlot({
+        agent: ADVISOR_AGENT,
+        memory_mode: 'persistent',
+      })).unwrap()
       navigate('/chat')
     } catch (e) {
       // Without this the rejection was unhandled and the button just cleared its
@@ -77,11 +83,17 @@ export default function PersonalShopperPage() {
           <p className="text-xs text-[var(--muted)] mt-0.5">
             {i18nT('apps.personalShopper.personalShopperPage.say_something_like_help_me_find_running_shoes_or')}
           </p>
-          {createError && (
-            <p role="alert" className="text-xs text-[var(--danger)] mt-1">
-              {i18nT('apps.personalShopper.personalShopperPage.start_conversation_failed', { code: createError })}
-            </p>
-          )}
+          {/* The hand-off is offered only on the History tab: the Preferences and
+              Sites tabs mount forms whose typed text is unsaved. */}
+          <ErrorNotice
+            className="mt-1"
+            message={
+              createError
+                ? i18nT('apps.personalShopper.personalShopperPage.start_conversation_failed', { code: createError })
+                : null
+            }
+            askAgent={activeTab === 'history'}
+          />
         </div>
         <Btn onClick={startAdvisorSession} disabled={creating} primary>
           <MessageCirclePlus size={14} />

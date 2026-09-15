@@ -88,7 +88,7 @@ class TestTheKeyIsInstalledForTheRunningTurn:
     @pytest.mark.asyncio
     async def test_a_linked_slot_publishes_the_session_it_runs_on(self, tmp_path) -> None:
         """A channel-born tab is bound before its turn starts, so the captured
-        identity IS the channel session — which is what keeps the #2462 fix."""
+        identity IS the channel session."""
         state, slot, client = _state_and_slot(tmp_path)
         slot.linked_session_key = LINKED_KEY
         seen: list[str] = []
@@ -227,9 +227,13 @@ class TestThePromptsGetReEntry:
     async def test_the_inner_invocation_owns_the_identity(self, tmp_path, monkeypatch) -> None:
         state, slot, client = _state_and_slot(tmp_path)
         seen: list[str] = []
+        # Stubbed at the resolver — the FILESYSTEM half — rather than at the
+        # coroutine the command calls, so the real offload and the real on-loop
+        # chip append stay in the path being measured. An empty chip appends
+        # nothing, which keeps this test about the identity and not the message.
         monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner._expand_prompt_mention",
-            lambda mention, st, sl: ("expanded prompt body", "ok"),
+            "kiro_crew.dashboard.chat_runner._resolve_prompt_mention",
+            lambda message, project_dir: ("expanded prompt body", "ok", ""),
         )
 
         async def _observe(msg):

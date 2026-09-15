@@ -84,7 +84,7 @@ class TestValidation:
 
     @pytest.mark.parametrize("name", ["registry", "registries", "blob", "install", "register"])
     def test_literal_route_segment_name_rejected(self, name):
-        """Issue #7111: the literal first-segment routes under /api/apps/ are
+        """The literal first-segment routes under /api/apps/ are
         shared routes registered before the /api/apps/{name} catch-all. Reserving
         these names is the defense-in-depth backstop that keeps NEW apps from
         claiming them (the token_auth carve-out is the primary boundary)."""
@@ -1683,11 +1683,11 @@ class TestContributedCommands:
         m.validate()
 
     def test_non_dict_entries_in_the_command_list_are_reported(self):
-        # This test previously asserted `validate() == []` -- that the bad entries were
-        # simply filtered out. That WAS the behaviour and it was the fail-open shape this
-        # class keeps producing: three entries vanished and the app installed with one
-        # row, its author told nothing. The parse still skips them (so one typo cannot
-        # take the whole array down), but validation now names the count.
+        # Bad entries must be REPORTED, not silently filtered out: dropping them is the
+        # fail-open shape this class keeps producing, where entries vanish and the app
+        # installs with fewer rows and its author is told nothing. The parse still skips
+        # them (so one typo cannot take the whole array down), but validation names the
+        # count.
         data = self._manifest(self._command())
         data["contributes"]["commands"] = ["approve-all", None, 7, self._command()]
         m = AppManifest.from_dict(data)
@@ -1720,3 +1720,234 @@ class TestContributedCommands:
         # Without autoSend the same command is fine.
         cmd.pop("autoSend")
         assert AppManifest.from_dict(self._manifest(cmd)).validate() == []
+# ---------------------------------------------------------------------------
+# contributes.panelTabs — declarative side-panel tab contribution
+# ---------------------------------------------------------------------------
+
+
+def _panel_tab(**overrides) -> dict:
+    tab = {
+        "id": "browser",
+        "title": "Pippin",
+        "menuLabel": "Pippin",
+        "menuDescription": "Browse and sync Pippin docs",
+        "icon": "BookOpen",
+        "entry": "panel.mjs",
+    }
+    tab.update(overrides)
+    return tab
+
+
+class TestContributesPanelTabs:
+    def test_paneltabs_only_manifest_is_covered_by_the_signing_payload(self):
+        """A tab's ``entry`` is an ESM module the AppHost imports and RUNS.
+
+        The payload guard would test ``commands or sessionControls``, and the body it
+        guarded serializes ALL of ``contributes`` — so a manifest contributing only
+        panelTabs was left out of the signed bytes entirely, making ``entry`` the one
+        part of a signed app an attacker could repoint with the signature still
+        verifying.
+        """
+        m = AppManifest.from_dict(_valid_manifest(contributes={"panelTabs": [_panel_tab()]}))
+        assert m.contributes.commands == [] and m.contributes.sessionControls == []
+        assert b"contributes" in m.signing_payload()
+        assert b"panel.mjs" in m.signing_payload()
+
+        # Repointing the executed module must change the signed bytes.
+        tampered = _valid_manifest(
+            contributes={"panelTabs": [{**_panel_tab(), "entry": "evil.mjs"}]}
+        )
+        assert AppManifest.from_dict(tampered).signing_payload() != m.signing_payload()
+
+        # So must the label a reader decides to trust the tab by.
+        relabelled = _valid_manifest(
+            contributes={"panelTabs": [{**_panel_tab(), "title": "System Settings"}]}
+        )
+        assert AppManifest.from_dict(relabelled).signing_payload() != m.signing_payload()
+
+    def test_no_contributions_still_omits_contributes_from_the_payload(self):
+        """Manifests signed before contributions existed must hash identically."""
+        m = AppManifest.from_dict(_valid_manifest())
+        assert b"contributes" not in m.signing_payload()
+
+    def test_parsed_into_typed_config(self):
+        m = AppManifest.from_dict(_valid_manifest(contributes={"panelTabs": [_panel_tab()]}))
+        assert m.validate() == []
+        assert len(m.contributes.panelTabs) == 1
+        tab = m.contributes.panelTabs[0]
+        assert tab.id == "browser"
+        assert tab.title == "Pippin"
+        assert tab.menuLabel == "Pippin"
+        assert tab.menuDescription == "Browse and sync Pippin docs"
+        assert tab.entry == "panel.mjs"
+
+    def test_roundtrips_through_to_dict(self):
+        m = AppManifest.from_dict(_valid_manifest(contributes={"panelTabs": [_panel_tab()]}))
+        assert AppManifest.from_dict(m.to_dict()).contributes == m.contributes
+
+    def test_absent_contributes_is_empty_not_error(self):
+        m = AppManifest.from_dict(_valid_manifest())
+        assert m.contributes.panelTabs == []
+        assert "contributes" not in m.to_dict()
+
+    def test_non_list_paneltabs_parses_empty_but_is_reported(self):
+        # A hand-edited manifest can carry contributes.panelTabs: null. The parser
+        # reads untrusted input, so it must degrade rather than raise -- but it must
+        # not degrade SILENTLY: coercing to [] is indistinguishable from a
+        # deliberately empty list, so the declaration would validate clean and then
+        # vanish from to_dict with the author seeing neither an error nor a tab.
+        m = AppManifest.from_dict(_valid_manifest(contributes={"panelTabs": None}))
+        assert m.contributes.panelTabs == []
+        assert m.contributes.bad_panel_tabs is True
+        assert any("contributes.panelTabs must be an array" in e for e in m.validate())
+
+    def test_non_object_paneltab_entries_are_counted_and_reported(self):
+        m = AppManifest.from_dict(
+            _valid_manifest(contributes={"panelTabs": [_panel_tab(), "nope", 7]})
+        )
+        assert len(m.contributes.panelTabs) == 1
+        assert m.contributes.dropped_panel_tabs == 2
+        assert any("2 entries" in e for e in m.validate())
+
+    def test_non_object_contributes_block_is_reported(self):
+        m = AppManifest.from_dict(_valid_manifest(contributes="nope"))
+        assert m.contributes.bad_block is True
+        assert any("contributes must be an object" in e for e in m.validate())
+
+    def test_commands_survive_alongside_paneltabs(self):
+        # The two contribution kinds share one `contributes` block; serializing one
+        # must not drop the other.
+        contributes = {
+            "panelTabs": [_panel_tab()],
+            "commands": [{"id": "do-thing", "title": "Do thing", "prompt": "Do it."}],
+        }
+        m = AppManifest.from_dict(_valid_manifest(contributes=contributes))
+        assert m.validate() == []
+        assert len(m.contributes.panelTabs) == 1
+        assert len(m.contributes.commands) == 1
+        round_tripped = AppManifest.from_dict(m.to_dict()).contributes
+        assert len(round_tripped.panelTabs) == 1
+        assert len(round_tripped.commands) == 1
+
+    def test_missing_id_is_error(self):
+        m = AppManifest.from_dict(
+            _valid_manifest(contributes={"panelTabs": [_panel_tab(id="")]})
+        )
+        assert any("entry missing id" in e for e in m.validate())
+
+    def test_over_long_menu_description_is_capped_like_the_labels(self):
+        # The launcher card renders `menuDescription`, so it is capped alongside
+        # `title`/`menuLabel` rather than being the one field that can blow out
+        # that surface's layout.
+        m = AppManifest.from_dict(
+            _valid_manifest(contributes={"panelTabs": [_panel_tab(menuDescription="x" * 121)]})
+        )
+        assert any("menuDescription exceeds 120" in e for e in m.validate())
+
+    def test_menu_description_at_the_cap_is_accepted(self):
+        m = AppManifest.from_dict(
+            _valid_manifest(contributes={"panelTabs": [_panel_tab(menuDescription="x" * 120)]})
+        )
+        assert not any("menuDescription exceeds" in e for e in m.validate())
+
+    def test_non_slug_id_is_error(self):
+        m = AppManifest.from_dict(
+            _valid_manifest(contributes={"panelTabs": [_panel_tab(id="Not A Slug")]})
+        )
+        assert any("storage-safe slug" in e for e in m.validate())
+
+    def test_trailing_newline_id_cannot_slip_through(self):
+        m = AppManifest.from_dict(
+            _valid_manifest(contributes={"panelTabs": [_panel_tab(id="browser\n")]})
+        )
+        assert any("storage-safe slug" in e for e in m.validate())
+
+    def test_duplicate_id_is_error(self):
+        m = AppManifest.from_dict(
+            _valid_manifest(contributes={"panelTabs": [_panel_tab(), _panel_tab()]})
+        )
+        assert any("duplicate id" in e for e in m.validate())
+
+    def test_missing_title_menulabel_entry_each_error(self):
+        m = AppManifest.from_dict(
+            _valid_manifest(
+                contributes={"panelTabs": [_panel_tab(title="", menuLabel="", entry="")]}
+            )
+        )
+        errs = m.validate()
+        assert any("missing title" in e for e in errs)
+        assert any("missing menuLabel" in e for e in errs)
+        assert any("missing entry" in e for e in errs)
+
+    def test_entry_path_traversal_rejected(self):
+        m = AppManifest.from_dict(
+            _valid_manifest(contributes={"panelTabs": [_panel_tab(entry="../../etc/passwd")]})
+        )
+        assert any("path traversal" in e for e in m.validate())
+
+    def test_too_many_tabs_rejected(self):
+        from kiro_crew.apps.manifest import _MAX_PANEL_TABS_PER_APP
+
+        tabs = [_panel_tab(id=f"t{i}") for i in range(_MAX_PANEL_TABS_PER_APP + 1)]
+        m = AppManifest.from_dict(_valid_manifest(contributes={"panelTabs": tabs}))
+        assert any("exceeds the limit of" in e for e in m.validate())
+
+
+class TestShippedManifestsAreWellFormedJson:
+    """Every shipped ``app.json`` must be JSON no reader can disagree about.
+
+    A duplicate key is not a parse error in Python or in JavaScript -- both keep the LAST
+    occurrence -- so a manifest carrying two ``"platform"`` blocks loads, validates, and
+    behaves, while saying two different things to anyone reading it. That is how five
+    built-in manifests came to declare ``"os": ["macos", "linux"]`` immediately above
+    ``"os": ["macos", "linux", "windows"]``: an edit appended a second block instead of
+    changing the first, and last-wins hid it.
+
+    Two reasons that is worth a test rather than a one-time cleanup. A stricter reader
+    rejects the file outright -- ``jq`` flags it, JSON Schema validators flag it, and Rust
+    and Go parsers error by default -- so the manifests are one tool away from being
+    unreadable. And an editor who later deletes "the" ``platform`` block has even odds of
+    deleting the live one, silently dropping a platform with nothing failing.
+    """
+
+    def _builtin_manifests(self) -> list[Path]:
+        paths = sorted((_REPO_ROOT / "src/kiro_crew/apps/builtins").glob("*/app.json"))
+        assert paths, "no built-in manifests found -- the glob or the layout moved"
+        return paths
+
+    def test_no_shipped_manifest_has_a_duplicate_key(self):
+        """Recursively: a duplicate anywhere, at any nesting depth, fails here."""
+        offenders: list[str] = []
+
+        def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict:
+            seen: set[str] = set()
+            for key, _value in pairs:
+                if key in seen:
+                    offenders.append(key)
+                seen.add(key)
+            return dict(pairs)
+
+        for manifest in self._builtin_manifests():
+            offenders.clear()
+            json.loads(manifest.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicates)
+            assert not offenders, (
+                f"{manifest.parent.name}/app.json declares {sorted(set(offenders))!r} "
+                "more than once. Both copies load and the LAST one wins, so the file "
+                "reads as two different manifests -- edit the existing block instead of "
+                "appending a second one."
+            )
+
+    def test_every_builtin_declares_its_platforms_exactly_once(self):
+        """The specific shape that went wrong, asserted on the shipped files.
+
+        Complements the general check: this one names ``platform`` so a regression here
+        reports the field a reader cares about rather than a generic duplicate.
+        """
+        for manifest in self._builtin_manifests():
+            raw = manifest.read_text(encoding="utf-8")
+            count = raw.count('"platform"')
+            assert count <= 1, (
+                f"{manifest.parent.name}/app.json contains {count} \"platform\" keys; "
+                "the effective value is whichever comes last, which is not what the "
+                "file appears to say."
+            )

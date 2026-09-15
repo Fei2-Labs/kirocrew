@@ -487,6 +487,57 @@ describe('attachUserScrollIntent', () => {
     detach()
   })
 
+  it('reports the wheel delta as the input direction', () => {
+    // The clamp-release path keys on confirmed UPWARD input: a wheel-down at
+    // the bottom is an ordinary streaming input and must not read as upward.
+    const { el, onUser, detach } = harness()
+    el.dispatchEvent(new WheelEvent('wheel', { deltaY: -40 }))
+    expect(onUser).toHaveBeenLastCalledWith('up')
+    el.dispatchEvent(new WheelEvent('wheel', { deltaY: 40 }))
+    expect(onUser).toHaveBeenLastCalledWith('down')
+    el.dispatchEvent(new WheelEvent('wheel', { deltaY: 0 }))
+    expect(onUser).toHaveBeenLastCalledWith(undefined)
+    detach()
+  })
+
+  it('partitions the scrolling keys by direction', () => {
+    const { el, onUser, detach } = harness()
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp' }))
+    expect(onUser).toHaveBeenLastCalledWith('up')
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageDown' }))
+    expect(onUser).toHaveBeenLastCalledWith('down')
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: ' ' }))
+    expect(onUser).toHaveBeenLastCalledWith('down')
+    // Horizontal arrows scroll neither way and stay directionless.
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft' }))
+    expect(onUser).toHaveBeenLastCalledWith(undefined)
+    detach()
+  })
+
+  it('a scrollbar grab is directionless', () => {
+    const { el, onUser, detach } = harness()
+    el.dispatchEvent(new Event('pointerdown'))
+    expect(onUser).toHaveBeenLastCalledWith()
+    detach()
+  })
+
+  it('derives touch direction from the finger path, with no guess on the first move', () => {
+    const touchAt = (clientY: number) =>
+      new TouchEvent('touchmove', {
+        touches: [new Touch({ identifier: 1, target: document.body, clientY })],
+      })
+    const { el, onUser, detach } = harness()
+    // First move has no baseline: no direction rather than a guess.
+    el.dispatchEvent(touchAt(300))
+    expect(onUser).toHaveBeenLastCalledWith(undefined)
+    // Finger moving DOWN the screen scrolls the content UP.
+    el.dispatchEvent(touchAt(340))
+    expect(onUser).toHaveBeenLastCalledWith('up')
+    el.dispatchEvent(touchAt(310))
+    expect(onUser).toHaveBeenLastCalledWith('down')
+    detach()
+  })
+
   it('fires on scrolling keys', () => {
     const { el, onUser, detach } = harness()
     for (const key of ['ArrowDown', 'PageUp', 'Home', 'End', ' ']) {

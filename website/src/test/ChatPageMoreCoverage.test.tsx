@@ -14,9 +14,9 @@
  *     rendering is covered by AssistantMessage.test.tsx.
  *
  *  2. The window-event listeners: `mc-config-changed` (chat-settings reload),
- *     `toggle-pin-chat-sidebar`, and `mc:run-in-terminal` (both the non-string
- *     guard and the PTY-never-connects timeout that reports failure back to the
- *     code block).
+ *     `toggle-pin-chat-sidebar`, `kirocrew-tool-call` (foreground browser
+ *     auto-open), and `mc:run-in-terminal` (both the non-string guard and the
+ *     PTY-never-connects timeout that reports failure back to the code block).
  *
  *  3. The welcome-state "Continue a previous chat?" suggestion list and
  *     `handleResumeSession`, reached by pre-filling the composer through the
@@ -35,7 +35,8 @@ import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
 import { store as appStore } from '../store'
-import { setVoicePlaying } from '../store/chatSlice'
+import { setVoicePlaying, switchSlot } from '../store/chatSlice'
+import { sseDisconnected } from '../store/dashboardSlice'
 import type { RootState } from '../store'
 import type { ChatMessage } from '../types'
 
@@ -55,7 +56,7 @@ interface AssistantProps {
 }
 let assistantProps: AssistantProps | null = null
 
-interface InputProps { value: string; onChange: (v: string) => void }
+interface InputProps { value: string; onChange: (v: string) => void; onScreenshot?: () => void }
 let inputProps: InputProps | null = null
 
 vi.mock('../pages/chat', async () => {
@@ -99,6 +100,21 @@ vi.mock('../components/FlyingQuote', async () => {
   return { default: () => React.createElement('div', { 'data-testid': 'flying-quote' }) }
 })
 
+// The split grid is stubbed to a prop recorder: what matters here is the
+// `openSideChat` capability ChatPage hands its panes (and when it withholds
+// it), not the grid's own layout, which SessionGridView's suite covers.
+interface GridProps { openSideChat?: (slot: string) => boolean | void | Promise<boolean | void> }
+let gridProps: GridProps | null = null
+vi.mock('../components/SessionGridView', async () => {
+  const React = await import('react')
+  return {
+    default: (props: GridProps) => {
+      gridProps = props
+      return React.createElement('div', { 'data-testid': 'session-grid' })
+    },
+  }
+})
+
 interface ProjectPickerProps { onSelect: (path: string) => void }
 let projectPickerProps: ProjectPickerProps | null = null
 vi.mock('../components/ProjectPicker', () => ({
@@ -118,7 +134,19 @@ vi.mock('../components/AgentDropdownList', () => ({ default: () => null, Default
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
 vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
-vi.mock('../components/WelcomeView', () => ({ default: () => null }))
+interface WelcomeProps {
+  onSwitchMode?: (mode: 'persistent' | 'incognito' | 'temporary') => void | Promise<void>
+}
+let welcomeProps: WelcomeProps | null = null
+vi.mock('../components/WelcomeView', async () => {
+  const React = await import('react')
+  return {
+    default: (props: WelcomeProps) => {
+      welcomeProps = props
+      return React.createElement('div', { 'data-testid': 'welcome' })
+    },
+  }
+})
 vi.mock('../pages/ChatSidebar', () => ({ default: () => null, SIDEBAR_MIN: 200, SIDEBAR_MAX: 500 }))
 vi.mock('../pages/chat/ActivityViewer', () => ({ default: () => null }))
 vi.mock('../pages/chat/SessionColorPicker', () => ({ default: () => null }))
@@ -163,6 +191,8 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(() => false),
+      farmIsMeasured: () => true,
+      farmRecord: vi.fn(() => true),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
       bottomSentinelRef: { current: null },
@@ -217,12 +247,20 @@ globalThis.fetch = vi.fn().mockResolvedValue({
 }) as never
 
 import ChatPage from '../pages/ChatPage'
+import { readSideChatDraft } from '../chat-core/composer/sideChatDrafts'
+import { ApiError } from '../api/apiError'
 
 // --- Fixtures ---------------------------------------------------------------
 
 const SLOT = {
   key: 'chat-1', title: 'chat-1', messages: 0, running: false,
   mode: '', created: '', last_ts: '',
+}
+const OTHER_SLOT = { ...SLOT, key: 'chat-2', title: 'chat-2' }
+const REMOTE_SLOT = {
+  ...SLOT,
+  memory_mode: 'temporary',
+  instance_id: 'crew-remote-1',
 }
 
 interface HistorySession { key: string; title: string; created: string; messages: number }
@@ -237,11 +275,16 @@ interface RenderOpts {
   /** Past sessions `api.sessions` yields — ChatPage fetches them on mount, so a
    *  preloaded `chat.history` would be overwritten before the first paint. */
   sessions?: HistorySession[]
+  /** The slot list, both preloaded and what `api.chatSlots` yields (ChatPage
+   *  refetches it on mount). Default: `chat-1` alone. A switch to a key the
+   *  list does not hold is undone by the page itself — its mode-guard clears
+   *  the active slot and the auto-select falls back to the first known one. */
+  slots?: (typeof SLOT)[]
 }
 
 function renderChatPage(messages: ChatMessage[], opts: RenderOpts = {}) {
-  const { chat = {}, sessions = [] } = opts
-  apiMocks.chatSlots = vi.fn().mockResolvedValue([SLOT])
+  const { chat = {}, sessions = [], slots = [SLOT] } = opts
+  apiMocks.chatSlots = vi.fn().mockResolvedValue(slots)
   apiMocks.chatSlotDetail = vi.fn().mockResolvedValue({
     messages, has_more: false, total: messages.length,
   })
@@ -255,7 +298,7 @@ function renderChatPage(messages: ChatMessage[], opts: RenderOpts = {}) {
       ...base.dashboard,
       status: { platform: 'darwin' } as unknown as RootState['dashboard']['status'],
       connected: true,
-      slots: [SLOT] as unknown as RootState['dashboard']['slots'],
+      slots: slots as unknown as RootState['dashboard']['slots'],
     },
     chat: {
       ...base.chat,
@@ -300,6 +343,8 @@ beforeEach(() => {
   assistantProps = null
   inputProps = null
   projectPickerProps = null
+  gridProps = null
+  welcomeProps = null
   chatSettings = { contentWidth: 'compact' }
   localStorage.clear()
   sessionStorage.clear()
@@ -312,6 +357,28 @@ afterEach(() => {
   vi.clearAllTimers()
   vi.useRealTimers()
   alertSpy.mockRestore()
+})
+
+describe('Welcome recreation preserves remote execution', () => {
+  it('carries instanceId through a memory mode change', async () => {
+    apiSpy('dashboardConfig').mockResolvedValue({ default_memory_mode: 'persistent' })
+    apiSpy('createChatSlot').mockResolvedValue({
+      ...REMOTE_SLOT,
+      key: 'chat-new',
+      memory_mode: 'persistent',
+    })
+    apiSpy('deleteChatSlot').mockResolvedValue({ ok: true })
+    renderChatPage([], { slots: [REMOTE_SLOT] })
+    await waitFor(() => expect(welcomeProps).not.toBeNull())
+
+    await act(async () => {
+      await welcomeProps!.onSwitchMode?.('persistent')
+    })
+
+    await waitFor(() => expect(apiMocks.createChatSlot).toHaveBeenCalled())
+    expect(apiMocks.createChatSlot.mock.calls.at(-1)?.[8]).toBe('crew-remote-1')
+    expect(apiMocks.deleteChatSlot).toHaveBeenCalledWith('chat-1')
+  })
 })
 
 describe('ChatPage row callbacks — fork', () => {
@@ -338,29 +405,34 @@ describe('ChatPage row callbacks — fork', () => {
     expect(apiMocks.forkChatSlot).toHaveBeenCalledWith('chat-1', 3, undefined, undefined, 'tail')
   })
 
-  it('reports a refused fork through an alert instead of switching sessions', async () => {
+  it('reports a refused fork through the in-page ErrorNotice instead of switching sessions', async () => {
     apiSpy('forkChatSlot').mockResolvedValue({ ok: false, error: 'slot is busy' })
     await renderTurn()
     await act(async () => { await assistantProps!.onFork!(1) })
-    await waitFor(() => expect(alertSpy).toHaveBeenCalled())
-    expect(String(alertSpy.mock.calls[0][0])).toContain('slot is busy')
+    // The surface is the shared ErrorNotice (role="alert" + agent hand-off),
+    // never a native alert(): the rule `errors-use-error-notice` forbids the
+    // browser dialog, which also carried no structured context to the agent.
+    const notice = await screen.findByTestId('action-error')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(notice.textContent).toContain('slot is busy')
+    expect(alertSpy).not.toHaveBeenCalled()
   })
 
-  it('still alerts when the fork request throws, naming the real reason', async () => {
+  it('still reports when the fork request throws, naming the real reason', async () => {
     apiSpy('forkChatSlot').mockRejectedValue(new Error('network down'))
     await renderTurn()
     await act(async () => { await assistantProps!.onFork!(1) })
-    await waitFor(() => expect(alertSpy).toHaveBeenCalled())
-    const said = String(alertSpy.mock.calls[0][0])
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
     expect(said).toContain('Fork failed')
     // Flipped, as this assertion's previous form asked to be: it pinned the
     // reason being LOST — `unwrap()` rejects with a redux-toolkit
     // SerializedError (a PLAIN OBJECT), so the handler's `e instanceof Error`
     // test was false and the `String(e)` fallback rendered '[object Object]'.
     // The handler now reads the message through `utils/thunkError.errMessage`,
-    // which knows that shape, so the alert carries the real text.
+    // which knows that shape, so the notice carries the real text.
     expect(said).toContain('network down')
     expect(said).not.toContain('[object Object]')
+    expect(alertSpy).not.toHaveBeenCalled()
   })
 })
 
@@ -378,10 +450,10 @@ describe('ChatPage row callbacks — plan from here', () => {
     apiSpy('forkChatSlot').mockResolvedValue({ ok: false, error: 'no orchestrator agent' })
     await renderTurn()
     await act(async () => { await assistantProps!.onPlanFromHere!(2) })
-    await waitFor(() => expect(alertSpy).toHaveBeenCalled())
-    const said = String(alertSpy.mock.calls[0][0])
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
     expect(said).toContain('no orchestrator agent')
     expect(said).not.toContain('Fork failed')
+    expect(alertSpy).not.toHaveBeenCalled()
   })
 
   it('surfaces a failed plan apply and resolves false', async () => {
@@ -390,7 +462,9 @@ describe('ChatPage row callbacks — plan from here', () => {
     let applied: boolean | undefined
     await act(async () => { applied = await assistantProps!.onApplyPlan!([]) })
     expect(applied).toBe(false)
-    expect(alertSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to apply plan'))
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
+    expect(said).toContain('Failed to apply plan')
+    expect(alertSpy).not.toHaveBeenCalled()
   })
 
   it('resolves true and leaves the page quiet when the plan is accepted', async () => {
@@ -409,7 +483,9 @@ describe('ChatPage row callbacks — plan from here', () => {
     let applied: boolean | undefined
     await act(async () => { applied = await assistantProps!.onApplyPlan!([]) })
     expect(applied).toBe(false)
-    expect(alertSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to apply plan'))
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
+    expect(said).toContain('Failed to apply plan')
+    expect(alertSpy).not.toHaveBeenCalled()
   })
 })
 
@@ -435,18 +511,89 @@ describe('ChatPage row callbacks — quote and ask', () => {
 
   it('routes Ask to the side panel and seeds it, leaving the main composer untouched', async () => {
     const { store } = await renderTurn()
-    const seeds: (string | undefined)[] = []
-    const onSeed = (e: Event) => { seeds.push((e as CustomEvent).detail?.text) }
-    window.addEventListener('side-seed', onSeed)
-    try {
-      act(() => { assistantProps!.onAsk!('why is this slow?') })
-      await waitFor(() => expect(seeds).toContain('why is this slow?'))
-    } finally {
-      window.removeEventListener('side-seed', onSeed)
-    }
+    act(() => { assistantProps!.onAsk!('why is this slow?') })
+    // The seed is a store write under the active slot (the shared chat-core
+    // seam), which is the slot the activity panel's Side Chat is bound to.
+    expect(readSideChatDraft(store.getState().chat.activeSlot!)).toBe('> why is this slow?\n\n')
     expect(store.getState().chat.activityTab).toBe('side')
     expect(store.getState().chat.activityOpen).toBe(true)
     expect(inputProps!.value).toBe('')
+  })
+
+  /** Enters split view through the header toggle and returns the grid's props.
+   *  Two known slots, so a switch to `chat-2` is a real re-bind rather than a
+   *  switch to a stranger the page would immediately undo. */
+  async function renderSplit() {
+    apiSpy('dashboardConfig').mockResolvedValue({ session_grid: true })
+    const { store } = await renderTurn({ slots: [SLOT, OTHER_SLOT] })
+    fireEvent.click(await screen.findByRole('button', { name: 'Enter split view' }))
+    await waitFor(() => expect(gridProps?.openSideChat).toBeTypeOf('function'))
+    return { store }
+  }
+
+  it('re-binds the activity panel to a split pane\'s slot before opening its Side Chat', async () => {
+    const { store } = await renderSplit()
+    let verdict: boolean | void | Promise<boolean | void>
+    act(() => { verdict = gridProps!.openSideChat!('chat-2') })
+    // A re-bind is a request the server can reject, so the opener reports its
+    // verdict only once the switch settled — the Side tab opens on the
+    // re-bound panel and the seam seeds on `true`.
+    expect(verdict!).toBeInstanceOf(Promise)
+    await expect(verdict!).resolves.toBe(true)
+    expect(store.getState().chat.activeSlot).toBe('chat-2')
+    expect(store.getState().chat.activityTab).toBe('side')
+    expect(store.getState().chat.activityOpen).toBe(true)
+  })
+
+  it('a re-bind the server rejects reports false and surfaces the failure — nothing is seeded', async () => {
+    const { store } = await renderSplit()
+    // The pane's session was deleted under it: the detail fetch 404s, so
+    // `switchSlot.rejected` falls back to the slot the page was on.
+    apiSpy('chatSlotDetail').mockRejectedValueOnce(new ApiError(404, 'no such slot'))
+    let verdict: boolean | void | Promise<boolean | void>
+    act(() => { verdict = gridProps!.openSideChat!('chat-2') })
+    await expect(verdict!).resolves.toBe(false)
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1'))
+    expect(store.getState().chat.activityTab).not.toBe('side')
+    // The failure is said out loud above the composer, not swallowed.
+    await screen.findByText(/Couldn't open a Side Chat for that pane/)
+  })
+
+  it('a re-bind overtaken by a later switch reports false — the Side tab is not opened for the wrong pane', async () => {
+    const { store } = await renderSplit()
+    // Pane B's detail fetch hangs; the user goes back to pane A meanwhile.
+    let release: (v: unknown) => void = () => {}
+    apiSpy('chatSlotDetail').mockImplementationOnce(() => new Promise(res => { release = res }))
+    let verdict: boolean | void | Promise<boolean | void>
+    act(() => { verdict = gridProps!.openSideChat!('chat-2') })
+    expect(store.getState().chat.activeSlot).toBe('chat-2')
+    await act(async () => { await store.dispatch(switchSlot('chat-1')) })
+    expect(store.getState().chat.activeSlot).toBe('chat-1')
+    // B's stale fulfilment lands: the slice ignores it (user switched away), and
+    // so must the opener — a `true` here would seed B while A's panel opens.
+    await act(async () => { release({}) })
+    await expect(verdict!).resolves.toBe(false)
+    expect(store.getState().chat.activeSlot).toBe('chat-1')
+    expect(store.getState().chat.activityTab).not.toBe('side')
+  })
+
+  it('withholds Ask from the panes while disconnected instead of switching slots offline', async () => {
+    const { store } = await renderSplit()
+    const askWhileConnected = gridProps!.openSideChat!
+    act(() => { store.dispatch(sseDisconnected()) })
+    // The capability is dropped, so the panes' toolbars offer Copy / Quote only…
+    await waitFor(() => expect(gridProps!.openSideChat).toBeUndefined())
+    // …and a call that slipped through in the frame before the re-render does
+    // NOT dispatch the switch a disconnected gateway would reject — the
+    // rejection clears the active pane's messages, blanking the transcript the
+    // reader just selected from. Nothing moves and no Side Chat bound to the
+    // wrong slot opens. The opener reports the refusal (`false`) so the
+    // selection seam does not seed a quote into a Side Chat that never opened.
+    let outcome: boolean | void | Promise<boolean | void>
+    act(() => { outcome = askWhileConnected('chat-2') })
+    expect(outcome).toBe(false)
+    expect(store.getState().chat.activeSlot).toBe('chat-1')
+    expect(store.getState().chat.activityTab).not.toBe('side')
   })
 })
 
@@ -519,6 +666,23 @@ describe('ChatPage window-event listeners', () => {
     const first = localStorage.getItem('mc-sidebar-pinned')
     act(() => { window.dispatchEvent(new Event('toggle-pin-chat-sidebar')) })
     await waitFor(() => expect(localStorage.getItem('mc-sidebar-pinned')).not.toBe(first))
+  })
+
+  it('opens the Browser panel when the foreground session starts a playwright-cli command', async () => {
+    const { store } = await renderTurn()
+    expect(store.getState().chat.activityOpen).toBe(false)
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('kirocrew-tool-call', {
+        detail: {
+          slot: 'chat-1',
+          is_shell: true,
+          input_preview: 'playwright-cli open https://example.test',
+        },
+      }))
+    })
+
+    await waitFor(() => expect(store.getState().chat.activityOpen).toBe(true))
   })
 
   it('ignores a run-in-terminal request that carries no command', async () => {
@@ -667,5 +831,33 @@ describe('ChatPage widget composer bridge', () => {
       window.dispatchEvent(new CustomEvent('mc-widget-send', { detail: {} }))
     })
     expect(inputProps!.value).toBe('')
+  })
+})
+
+// A failed screen capture used to be discarded by a bare `catch {}` commented
+// "user cancelled" -- but cancellation is NOT an error path: the route answers a
+// cancelled capture with 200 `{"path": ""}`, which the caller's `if (path)`
+// guard absorbs. So the only things that reached that catch were real failures
+// (the 400 off macOS, the 120s capture timeout, the request never reaching the
+// gateway), and the user saw nothing at all.
+describe('ChatPage screen capture failures', () => {
+  it('reports a failed capture instead of swallowing it', async () => {
+    apiSpy('screenshot').mockRejectedValue(new Error('screenshot timed out'))
+    await renderTurn()
+    await waitFor(() => expect(inputProps?.onScreenshot).toBeTypeOf('function'))
+    await act(async () => { inputProps!.onScreenshot!() })
+    // The notice names the action, not just the transport text: a bare
+    // "screenshot timed out" above the composer tells the user nothing about
+    // which click failed.
+    expect(await screen.findByText('Screenshot failed: screenshot timed out')).toBeInTheDocument()
+  })
+
+  it('stays silent when the user cancels, which is not a failure', async () => {
+    // The cancelled shape: HTTP 200, empty path. No notice, no attachment.
+    apiSpy('screenshot').mockResolvedValue({ path: '' })
+    await renderTurn()
+    await waitFor(() => expect(inputProps?.onScreenshot).toBeTypeOf('function'))
+    await act(async () => { inputProps!.onScreenshot!() })
+    expect(screen.queryByText(/unknown error/i)).not.toBeInTheDocument()
   })
 })

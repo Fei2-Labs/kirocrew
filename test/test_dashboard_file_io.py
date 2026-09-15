@@ -8,6 +8,7 @@ import os
 import stat
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import quote
 
 import pytest
 from aiohttp import web
@@ -268,6 +269,97 @@ class TestFileReadPathKind:
             assert "X-Path-Kind" not in resp.headers
 
 
+class TestFileReadReservedCharacterPaths:
+    """A path holding URL-reserved but filesystem-legal characters must serve.
+
+    The client percent-encodes the path into the query string, so the server
+    receives the characters literally and FILE_READ_SCHEMA's syntax gate is what
+    decides. A punctuation allowlist there answers 400 "invalid input" before
+    any disk access for a whole notes folder named by the "Name (alias).md"
+    convention, and the client cannot work around it: encodeURIComponent leaves
+    "(" and ")" literal by design. /api/file-diff, which has no such gate,
+    serves the same files.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Ada Lovelace (ada).md",
+            "Q1 2026 (draft) #2.md",
+            "is it done?.md",
+            "a & b, c'd.md",
+            "50% done [final]+1.md",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_read_serves_reserved_characters(self, name, mock_sel, home_patch):
+        folder = home_patch / "One on one (2026)"
+        folder.mkdir()
+        f = folder / name
+        f.write_text("note body", encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get("/api/file-read?path=" + quote(str(f), safe=""))
+            assert resp.status == 200
+            assert "note body" in await resp.text()
+
+    @pytest.mark.asyncio
+    async def test_write_serves_reserved_characters(self, mock_sel, home_patch):
+        folder = home_patch / "AI Projects" / "(AI) Fluency Workshop"
+        folder.mkdir(parents=True)
+        f = folder / "agenda (v2) #1.md"
+        f.write_text("before", encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post("/api/file-write", json={"path": str(f), "content": "after"})
+            assert resp.status == 200
+        assert f.read_text(encoding="utf-8") == "after"
+
+    @pytest.mark.parametrize(
+        "encoded",
+        [
+            # NUL: realpath raises ValueError on it.
+            "/tmp/a%00b",
+            # The same NUL wearing characters this gate now admits, so widening
+            # the body class cannot be what carries it to the filesystem.
+            "/tmp/(a%00b)",
+            # An ESC wearing characters this gate now admits. Sanitization hides
+            # it from the schema pattern, so only the path seam can refuse it.
+            "/tmp/(a%1B%5B2Jb)",
+            # CR and LF, which forge a line in the record below.
+            "/tmp/a%0Db",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_control_or_unusable_path_is_400_not_an_uncaught_500(
+        self, encoded, mock_sel, home_patch
+    ):
+        """A path the OS path layer cannot carry must be refused, not crash.
+
+        The schema gate matches the SANITIZED copy of the value, which has had
+        its control characters and surrogates stripped, while the raw string is
+        what reaches the filesystem. So a NUL-bearing path passed the gate as
+        its stripped spelling and reached an unguarded realpath, which raised
+        outside the handler's try and propagated as HTTP 500.
+
+        Only NUL is exercised here. The other unrepresentable shape -- a lone
+        surrogate -- cannot be delivered through this transport, because URL
+        decoding never yields one; it is covered against the seam itself in
+        test_hooks_coverage.py.
+        """
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get("/api/file-read?path=" + encoded)
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_read_still_refuses_a_newline_in_the_path(self, mock_sel, home_patch):
+        # The gate's remaining refusal: a CR/LF splits the log line the path is
+        # written into. It is not relaxed along with the punctuation.
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(
+                "/api/file-read?path=" + quote(str(home_patch / "a\nb.md"), safe="")
+            )
+            assert resp.status == 400
+
+
 class TestFileWrite:
     @pytest.mark.asyncio
     async def test_write_success(self, tmp_file, mock_sel, home_patch):
@@ -343,20 +435,19 @@ class TestFileWrite:
             assert resp.status == 200
 
         kwargs = captured["kwargs"]
-        # See the steering twin: a descriptor wherever one is needed, None only
-        # where holding a handle open would make os.replace fail (Windows). The
-        # kwarg itself must always be passed.
+        # See the steering twin: the handler's gate is PIN-FIRST, not
+        # xattr-first. When the parent pins, open_access_control_source hands
+        # back a descriptor even where the xattr syscalls are absent — the MODE
+        # carry needs it so the bits come off the pinned inode (macOS: openat
+        # and no listxattr). Only on the unpinned floor does the xattr flag
+        # decide, and None there (Windows) is what keeps os.replace working
+        # while any other handle is open. The kwarg itself must always be passed.
+        handler_pins = (
+            files_mod.pinned_fs.supports_pinned_walk()
+            and aw.pinned_parent_replace_supported()
+        )
         assert "preserve_access_control_from" in kwargs
-        # The branch keys on the PIN, not on xattr support. The handler pins the
-        # parent and passes parent_dir_fd, and open_access_control_source hands
-        # back a descriptor whenever dir_fd is given even where the xattr
-        # syscalls are absent -- macOS has openat and no listxattr, and the MODE
-        # carry needs a descriptor even when the ACL carry has nothing to read,
-        # or a by-name stat would reintroduce the pin/open mismatch. Keying on
-        # ACCESS_CONTROL_XATTRS_SUPPORTED alone predates that parent_dir_fd
-        # pinning and demanded None on macOS, where the descriptor is correct.
-        pinned = kwargs.get("parent_dir_fd")
-        if pinned is not None or aw.ACCESS_CONTROL_XATTRS_SUPPORTED:
+        if handler_pins or aw.ACCESS_CONTROL_XATTRS_SUPPORTED:
             assert isinstance(kwargs["preserve_access_control_from"], int)
             assert captured["source_bytes"] == b"hello world"
         else:  # pragma: no cover - exercised on Windows CI only
@@ -365,6 +456,7 @@ class TestFileWrite:
         # is what forces the mode to come off the same inode the ACL does instead
         # of being re-resolved by name inside a directory that could have been
         # swapped after the pin.
+        pinned = kwargs.get("parent_dir_fd")
         if pinned is not None:
             assert kwargs["preserve_access_control_from"] is not None
         assert kwargs["mode"] == stat.S_IMODE(tmp_file.stat().st_mode)
@@ -761,8 +853,8 @@ class TestSendMessage:
     async def test_send_message_session_origin_rehydrate_reads_off_the_loop(self):
         """The cold-slot rehydration must not parse the transcript on the loop.
 
-        Issue #7408: this handler called the SYNCHRONOUS rehydrate, which read and
-        JSON-parsed the whole transcript inline -- 100-300 ms on a large store,
+        This handler must not call the SYNCHRONOUS rehydrate, which reads and
+        JSON-parses the whole transcript inline -- 100-300 ms on a large store,
         stalling every other request. Asserted by thread identity rather than by
         the name of the function called, so the guarantee survives a rename.
         """

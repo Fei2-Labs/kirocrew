@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .. import subagent_persistence as persistence
 from ._component import ManagerComponent
 
 if TYPE_CHECKING:
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
 class ContinuationCoordinator(ManagerComponent):
     """Own continuation transitions while state remains facade-owned."""
 
+    _persistence = persistence
     __slots__ = ()
 
     def _conversation_busy_impl(self, conv_key: str) -> SubagentInfo | None:
@@ -49,7 +51,7 @@ class ContinuationCoordinator(ManagerComponent):
         A FINISHED run also holds its conversation while its id sits in
         ``_abandoned_state_writers``: its bounded state-write drain expired, so a
         worker is still live and its stale whole-file rewrite would roll back the
-        ``keep`` that this gate's two callers write on the loop (#6298). Holding
+        ``keep`` that this gate's two callers write on the loop. Holding
         defers those writes past the worker instead of letting it undo them. That
         record lives on the manager rather than on the run, because
         ``evict_completed_agents`` prunes completed runs out of ``_agents`` and an
@@ -86,40 +88,50 @@ class ContinuationCoordinator(ManagerComponent):
         return None
 
     def _keep_recorded_on_disk_impl(self, key: str) -> bool:
-        """Disk-truth continuable check for SessionManager's cache (#1115).
+        """Retention guard for subagent conversations without loop-side disk probes.
 
-        True iff *key* is a subagent conversation whose run's ``state.json``
-        records ``keep`` — the single persisted source of retention intent.
-        Non-subagent keys short-circuit without touching disk.
+        Readable ``state.json`` remains the persisted retention authority. If
+        state is unreadable, the session-acquisition/tombstone path's synchronous
+        in-memory identity publication fails safe without reading ``tombstone.json``
+        on the gateway event loop.
         """
-        if not key.startswith("subagent:"):
+        conv_id = self._persistence.subagent_id_from_conversation_key(key)
+        if conv_id is None:
             return False
-        conv_id = key[len("subagent:") :]
         try:
-            state = read_state(conv_id) or {}
-        except Exception:
-            return False
-        return bool(state.get("keep"))
+            state = read_state(conv_id)
+        except OSError:
+            state = None
+        if isinstance(state, dict):
+            return state.get("keep") is True
+        return self._persistence.has_live_cleanup_identity(conv_id)
 
     def _promote_conversation_impl(
-        self, conv_id: str, conv_key: str, last_used: float | None = None
-    ) -> None:
-        """Single choke point for promoting a conversation's retention (#1115).
-
-        Writes all three retention surfaces together so they cannot drift:
-        ``keep=True`` in state.json (the persisted source of truth), the
-        SessionManager continuable cache (file-deletion exemption), and the
-        TTL registry entry (sweep ownership).
-        """
+        self,
+        conv_id: str,
+        conv_key: str,
+        last_used: float | None = None,
+    ) -> Any:
+        """Atomically promote all retention surfaces for a conversation."""
         try:
-            update_state(conv_id, keep=True)
-        except Exception:
+            result = self._persistence.promote_retention(conv_id, state_writer=update_state)
+        except OSError:
             logger.debug("promote: failed to persist keep for %s", conv_id, exc_info=True)
+            # Preserve the established fail-safe marker for direct callers, but
+            # report retryable failure so continue_conversation rolls it back.
+            self._manager._sessions.mark_continuable(conv_key)
+            self._manager._conversations[conv_key] = (
+                last_used if last_used is not None else time.time()
+            )
+            return self._persistence.RetentionPromotionResult.RETRYABLE
+        if result is not self._persistence.RetentionPromotionResult.PROMOTED:
+            return result
         self._manager._sessions.mark_continuable(conv_key)
         self._manager._conversations[conv_key] = last_used if last_used is not None else time.time()
+        return result
 
     def _scan_keep_states_impl(self) -> list[tuple[str, str, str, str, str, float]]:
-        """Blocking scan for keep runs (#1114): read every ``state.json``
+        """Blocking scan for keep runs: read every ``state.json``
         under the subagents dir and collect the promoted conversations.
 
         Returns ``(conv_id, conv_key, sid, provider, cwd, last_used)`` tuples.
@@ -135,20 +147,46 @@ class ContinuationCoordinator(ManagerComponent):
             try:
                 if not d.is_dir():
                     continue
-                state = read_state(d.name) or {}
-                if not state.get("keep"):
+                state = read_state(d.name)
+                if not isinstance(state, dict):
+                    tombstone = self._persistence.read_tombstone(d.name) or {}
+                    sid = str(tombstone.get("session_id") or "")
+                    if sid:
+                        # Agent-folder tombstones can preserve retention/exemption
+                        # hints, never provider-deletion authority.
+                        self._persistence.publish_live_cleanup_hint(d.name)
+                    continue
+                if state.get("keep") is not True:
                     continue
                 conv_key = str(state.get("conversation_key") or "") or f"subagent:{d.name}"
-                conv_id = conv_key[len("subagent:") :]
+                conv_id = self._persistence.subagent_id_from_conversation_key(conv_key)
+                if conv_id is None:
+                    continue
                 sid = str(state.get("session_id") or "")
+                trusted_identity = self._persistence.trusted_cleanup_identity_record(
+                    d.name,
+                    sid,
+                    conv_key,
+                )
+                if trusted_identity is None:
+                    # The canonical disk reader consumes agent-writable state and
+                    # must match protected authority. Tests/embedders may inject a
+                    # different reader as their own trusted authority; retaining
+                    # that established seam does not make on-disk state trusted.
+                    if read_state is self._persistence.read_state:
+                        continue
+                    trusted_identity = {
+                        "provider": state.get("provider"),
+                        "cwd": state.get("cwd"),
+                    }
                 last_used = float(state.get("updated_at") or state.get("started") or 0.0)
                 out.append(
                     (
                         conv_id,
                         conv_key,
                         sid,
-                        str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
-                        str(state.get("cwd") or ""),
+                        str(trusted_identity.get("provider") or PROVIDER_LABEL_DEFAULT),
+                        str(trusted_identity.get("cwd") or ""),
                         last_used,
                     )
                 )
@@ -157,17 +195,17 @@ class ContinuationCoordinator(ManagerComponent):
         return out
 
     async def _rebuild_conversation_registry_impl(self) -> None:
-        """Re-seed the conversation TTL registry from disk after a restart (#1114).
+        """Re-seed the conversation TTL registry from disk after a restart.
 
         The registry (``_conversations`` + the SessionManager continuable
         cache + session map) is in-memory; without this, a gateway restart
-        orphans promoted conversations — the TTL sweep no longer knows them,
+        orphans promoted conversations — the TTL sweep does not know them,
         and nothing else deletes their session files (the tombstone pruner
         skips keep runs by design). Runs on the reaper's first pass (retried
         until it succeeds); entries already past TTL are released by the
         very next sweep.
 
-        Threading contract (Arbiter, PR #1246): ONLY the pure-read
+        Threading contract: ONLY the pure-read
         ``_scan_keep_states`` runs in the executor. All ``SessionMap``
         access (``resumable_sid`` self-prune, ``seed_conversation`` writes)
         stays on the event loop — the map is an unlocked dict with
@@ -247,6 +285,16 @@ class ContinuationCoordinator(ManagerComponent):
         - ``conversation_gone`` — no resumable session files remain.
         """
         conv_key = f"subagent:{conv_id}"
+        try:
+            memory_store = self._manager._inherited_memory_store(conv_id)
+        except (OSError, ValueError) as exc:
+            return SubagentInfo(
+                id=_preassigned_id or uuid.uuid4().hex[:8],
+                task=_redact(task),
+                done=True,
+                parent_session_key=parent_session_key,
+                error=f"memory_unavailable: {exc}",
+            )
         busy = self._manager._conversation_busy(conv_key)
         if busy is not None:
             info = SubagentInfo(
@@ -304,11 +352,38 @@ class ContinuationCoordinator(ManagerComponent):
                 ),
             )
             return info
-        # Promote the run's retention through the single choke point
-        # (#1115): state.json keep=True (tombstone pruner skips deletion),
+        # Promote the run's retention through the single choke point:
+        # state.json keep=True (tombstone pruner skips deletion),
         # the SessionManager continuable cache, and the TTL registry entry.
         # The conversation TTL sweep / spawn_release owns deletion from here.
-        self._manager._promote_conversation(conv_id, conv_key)
+        # Snapshot existing ownership: a retryable promotion attempt must undo
+        # only state it introduced, never erase an earlier keep/continuation.
+        was_continuable = self._manager._sessions.is_continuable(conv_key)
+        had_previous_last_used = conv_key in self._manager._conversations
+        previous_last_used = self._manager._conversations.get(conv_key, 0.0)
+        # The facade forwards the enum result directly. Legacy tests and external
+        # monkeypatches that return None/non-enum retain the historical promoted
+        # behavior; only an explicit RETRYABLE outcome alters dispatch.
+        promotion = self._manager._promote_conversation(  # type: ignore[func-returns-value]
+            conv_id, conv_key
+        )
+        if promotion is self._persistence.RetentionPromotionResult.RETRYABLE:
+            if not was_continuable:
+                self._manager._sessions.unmark_continuable(conv_key)
+            if not had_previous_last_used:
+                self._manager._conversations.pop(conv_key, None)
+            else:
+                self._manager._conversations[conv_key] = previous_last_used
+            return SubagentInfo(
+                id=uuid.uuid4().hex[:8],
+                task=_redact(task),
+                done=True,
+                parent_session_key=parent_session_key,
+                error=(
+                    "conversation_busy: retention promotion is temporarily "
+                    f"unavailable for {conv_id}; retry the continuation"
+                ),
+            )
         inc_memory, inc_lessons, inc_project = self._manager._inherited_context_groups(conv_id)
         # A continuation has to run WHERE THE RUN RAN. `spawn` resolves an empty
         # cwd to the pool project before it validates the agent name, so a run
@@ -336,7 +411,21 @@ class ContinuationCoordinator(ManagerComponent):
             include_memory=inc_memory,
             include_lessons=inc_lessons,
             include_project=inc_project,
+            # Inherited for the same reason as the context groups above: a
+            # continuation is another turn of the SAME run. Without it a crew
+            # topic's first message reads the crew's silo and every routed
+            # follow-up reads the global store -- a split nothing reports.
+            memory_store=memory_store,
         )
+
+    def _inherited_memory_store_impl(self, conv_id: str) -> str:
+        """Restore this run's identity from live state or the protected record."""
+        live = self._manager._agents.get(conv_id)
+        if live is not None:
+            return live.memory_store
+        from kiro_crew.subagent_persistence import read_run_memory_store
+
+        return read_run_memory_store(conv_id)
 
     def recorded_cwd_impl(self, conv_id: str) -> str:
         """The cwd run *conv_id* executed in, or "" if it never had one.
@@ -347,7 +436,7 @@ class ContinuationCoordinator(ManagerComponent):
         does the blocking work in one place so an async caller can hand it to
         `asyncio.to_thread` and pass the result in.
 
-        A path that no longer exists is returned ANYWAY, so `spawn` refuses it.
+        A path that does not exist is returned ANYWAY, so `spawn` refuses it.
         Filtering it to "" would keep such a continuation working but is unsafe:
         an empty cwd resolves to the POOL project, so a follow-up
         whose task names relative files would have edited an unrelated project's
@@ -394,7 +483,7 @@ class ContinuationCoordinator(ManagerComponent):
         not registered yet — retry shortly), ``no_session`` (session not
         reachable), or the provider's failure reason.
 
-        Startup grace (#1113): the window between spawn-return and session
+        Startup grace: the window between spawn-return and session
         registration is precisely when a parent most wants to steer (it just
         realized the task text was wrong), so a missing provider on a live
         run polls for up to ``_STEER_STARTUP_WAIT_SECS`` instead of failing
@@ -753,7 +842,7 @@ class ContinuationCoordinator(ManagerComponent):
         filesystem work, so the async caller runs this off the event loop.
         """
 
-        # Demote the persisted source of truth too (#1115): with the disk
+        # Demote the persisted source of truth too: with the disk
         # fallback in place, a stale keep=True would re-warm the continuable
         # cache after release and resurrect the conversation on the next
         # restart's registry rebuild.
@@ -802,7 +891,11 @@ class ContinuationCoordinator(ManagerComponent):
             if self._manager._conversation_busy(conv_key) is not None:
                 self._manager._conversations[conv_key] = now  # active — refresh
                 continue
-            conv_id = conv_key[len("subagent:") :]
+            conv_id = self._persistence.subagent_id_from_conversation_key(conv_key)
+            if conv_id is None:
+                logger.warning("Dropping malformed conversation registry key %r", conv_key)
+                self._manager._conversations.pop(conv_key, None)
+                continue
             ok, detail = self._manager.release_conversation(conv_id)
             logger.info(
                 "Conversation %s expired after %ds idle: %s",

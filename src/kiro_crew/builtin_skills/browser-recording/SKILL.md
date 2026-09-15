@@ -48,17 +48,22 @@ ffmpeg is available — converts it to mp4 and a palette-optimized GIF.
 ```
 python3 <skill-dir>/scripts/record_browser.py \
   --url http://127.0.0.1:5173/settings \
-  --scenario /tmp/demo-scenario.mjs \
+  --scenario $KIROCREW_SCRATCH/demo-scenario.mjs \
   --project /path/to/frontend \
-  --size 1280x800 --name settings-flow --out /tmp/rec
+  --size 1280x800 --name settings-flow --out $KIROCREW_SCRATCH/rec
 ```
+
+Two optional timing flags: `--settle-ms` (default 600) waits after page load
+before the scenario runs, and `--tail-ms` (default 400) waits after the scenario
+before the context closes. Raise `--tail-ms` when the last transition in your
+flow gets cut off at the end of the video.
 
 Last lines of stdout are machine-readable:
 
 ```
-WEBM /tmp/rec/settings-flow.webm
-MP4 /tmp/rec/settings-flow.mp4
-GIF /tmp/rec/settings-flow.gif
+WEBM $KIROCREW_SCRATCH/rec/settings-flow.webm
+MP4 $KIROCREW_SCRATCH/rec/settings-flow.mp4
+GIF $KIROCREW_SCRATCH/rec/settings-flow.gif
 ```
 
 ## Workflow
@@ -99,8 +104,10 @@ GIF /tmp/rec/settings-flow.gif
    and re-record; do not crop or blur the encoded artifact, which leaves the
    data recoverable underneath.
 5. **Deliver**: embed the GIF in chat with `![what it shows](/abs/path.gif)`.
-   If a GIF is too large to embed, trim the scenario or lower the frame rate
-   and re-record rather than shipping a blob no one can open.
+   If a GIF is too large to embed, trim the scenario or record a smaller
+   viewport (`--size`) and re-record rather than shipping a blob no one can
+   open — the GIF encode is fixed at fps=12 and max 800px wide, so there is no
+   frame-rate knob to turn.
    For a PR, follow the repository's own screenshot/media convention when it
    has one — many repos commit PR media on the feature branch under a known
    path so their review lanes and cleanup workflows can see it. Only when a
@@ -111,18 +118,12 @@ GIF /tmp/rec/settings-flow.gif
 
 ## Publishing to an assets branch
 
-This is the **fallback for a repo that has no media convention of its own** —
-prefer the repository's documented path when one exists. Recordings are
-binaries. Committing them onto the feature branch — or worse, main — bloats
-history permanently, since git keeps every revision of every blob forever.
-When a repo offers no place for media, publish them to a throwaway **assets
-branch** instead so main's history stays text-only. **Get the user's explicit OK
-before creating or pushing an assets branch — on any repo, owned or not.** An
-orphan assets branch is a permanent, outward-facing side effect, so it is a push
-like any other, and this repo's standing rule is that committing and pushing each
-require explicit user authorization and are never done proactively. On a repo you
-do not own you need the owner's OK as well, since some orgs restrict branch
-creation outright.
+Use this fallback only when the repo has no media convention; otherwise follow
+its documented path. An orphan assets branch keeps binary revisions out of main's
+history, but publishing is still a permanent outward-facing side effect.
+**Get the user's explicit authorization for creating the branch, committing and
+pushing; never do these proactively.** On a repo you do not own, also get the
+owner's OK.
 
 1. Shallow-clone the repo into a scratch directory and create (or check out)
    an **orphan** `<series>-assets` branch — one branch per recording series,

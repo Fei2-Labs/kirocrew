@@ -34,6 +34,37 @@ const state = (over: Partial<{ messages: ChatMessage[]; slotRunning: boolean; sl
   }) as never
 
 describe('selectContinuable', () => {
+  it('allows retry of an interrupted legacy turn carrying old setup metadata', () => {
+    const blocked = state({ messages: [msg('user'), msg('error', 'owner setup required', {
+      code: 'memory_unavailable',
+      recovery: { kind: 'initialize_member_memory', member: 'reviewer' },
+    })] })
+    expect(selectContinuable(blocked)).toBe(true)
+    expect(selectTurnInterrupted(blocked)).toBe(true)
+  })
+
+  it.each([
+    undefined,
+    { code: 'memory_unavailable' },
+    { code: 'memory_unavailable', recovery: { kind: 'initialize_member_memory', member: '' } },
+    { code: 'other_error', recovery: { kind: 'initialize_member_memory', member: 'reviewer' } },
+  ])('does not infer setup from error prose or malformed metadata: %j', meta => {
+    expect(selectContinuable(state({ messages: [msg('user'), msg('error',
+      'memory_unavailable: Create private memory', meta,
+    )] }))).toBe(true)
+  })
+
+  it.each(['user', 'assistant'])('ignores a prior setup refusal after a later %s turn', role => {
+    expect(selectContinuable(state({ messages: [
+      msg('user'),
+      msg('error', 'owner setup required', {
+        code: 'memory_unavailable',
+        recovery: { kind: 'initialize_member_memory', member: 'reviewer' },
+      }),
+      msg(role, 'the next turn'),
+    ] }))).toBe(true)
+  })
+
   it('is false for a brand-new chat with no messages', () => {
     // The composer's send button must stay disabled exactly as it is today —
     // there is no conversation to hand back.
@@ -214,6 +245,93 @@ describe('selectTurnInterrupted', () => {
     expect(selectTurnInterrupted(state({
       messages: [msg('user'), msg('assistant', 'Auto-compacted at 80%.', { kind: 'compaction' })],
     }))).toBe(true)
+  })
+
+  // The completed-/compact shapes, mirroring `is_turn_interrupted` in
+  // `src/kiro_crew/dashboard/state.py` (test_is_interrupted.py pins the same
+  // five tails). Only the PAIR -- a /compact user row whose compaction result
+  // row is present -- reads as finished; the tag alone must not decide (the
+  // auto-compaction case above is a real interruption carrying the same row).
+  it('is FALSE when /compact is answered by its compaction notice (case A)', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [
+        msg('user', 'q'), msg('assistant', 'a'),
+        msg('user', '/compact'),
+        msg('assistant', 'Conversation compacted: summary', { kind: 'compaction' }),
+      ],
+    }))).toBe(false)
+  })
+
+  it('already reads an untagged lookalike reply as the floor (case B)', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', '/compact'), msg('assistant', 'Conversation compacted: summary')],
+    }))).toBe(false)
+  })
+
+  it('is true when /compact got nothing back (case C)', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'q'), msg('assistant', 'a'), msg('user', '/compact')],
+    }))).toBe(true)
+  })
+
+  it('matches /compact on its first whitespace token, arguments included', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [
+        msg('user', '/compact focus on tests'),
+        msg('assistant', 'Conversation compacted: summary', { kind: 'compaction' }),
+      ],
+    }))).toBe(false)
+  })
+
+  it('does not let a stale completed /compact mask a later unanswered turn', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [
+        msg('user', '/compact'),
+        msg('assistant', 'Conversation compacted: summary', { kind: 'compaction' }),
+        msg('user', 'next request'),
+      ],
+    }))).toBe(true)
+  })
+
+  it('stays true when an error row trails the compaction notice', () => {
+    // Same evidence rule as the plain-assistant branch: a completed compaction
+    // followed by an error ended badly; hiding Resume there strands the user.
+    expect(selectTurnInterrupted(state({
+      messages: [
+        msg('user', '/compact'),
+        msg('assistant', 'Conversation compacted: summary', { kind: 'compaction' }),
+        msg('error', 'Connection lost -- please retry.'),
+      ],
+    }))).toBe(true)
+  })
+
+  it("matches the first token by Python's whitespace rule, not JS \\s", () => {
+    // The backend rule is content.split()[0]: U+0085 separates tokens, U+FEFF
+    // does not, and trim() must not eat a leading BOM. test_is_interrupted.py
+    // pins the same three tails so the mirrors cannot diverge on them.
+    const notice = msg('assistant', 'Conversation compacted: summary', { kind: 'compaction' })
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', '/compact\u0085focus'), notice],
+    }))).toBe(false)
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', '/compact\uFEFFcontinue'), notice],
+    }))).toBe(true)
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', '\uFEFF/compact'), notice],
+    }))).toBe(true)
+  })
+
+  it('does not let a borrowed-tag notice (stuck turn, recycle) complete a /compact', () => {
+    // Those writers reuse kind="compaction" for the follow-up scan's skip and
+    // mark themselves with meta.notice; a stuck /compact stays interrupted.
+    for (const noticeKind of ['stuck_turn', 'session_recycled']) {
+      expect(selectTurnInterrupted(state({
+        messages: [
+          msg('user', '/compact'),
+          msg('assistant', 'notice text', { kind: 'compaction', notice: noticeKind }),
+        ],
+      }))).toBe(true)
+    }
   })
 
   it('reads past an injected recovery row to the real floor beneath it', () => {

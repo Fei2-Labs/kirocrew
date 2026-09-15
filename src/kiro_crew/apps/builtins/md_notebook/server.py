@@ -15,6 +15,7 @@ Two kinds of vault: one this app cloned into ``<home>/vaults/``, and one
 the git CLI. The attached case is why saves are guarded against concurrent
 external edits and why the note listing is re-scanned rather than trusted.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path, PurePosixPath
@@ -39,8 +41,9 @@ from kiro_crew import hooks, platform_compat, security
 from kiro_crew.apps.builtins.md_notebook import git_ops
 from kiro_crew.apps.builtins.md_notebook import notes as notes_mod
 from kiro_crew.apps.proxy_auth import raw_request_target, verify_proxy_request
-from kiro_crew.atomic_write import atomic_write, replace_with_retry
+from kiro_crew.atomic_write import refuse_linked_parent, replace_with_retry
 from kiro_crew.config.paths import config_dir
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform_compat import restrict_to_owner
 from kiro_crew.sel import sel
@@ -50,12 +53,19 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", 9137))
 APP_NAME = os.environ.get("KIROCREW_APP_NAME", "md-notebook")
 
+#: The state writers' staging directory, a TOP-LEVEL leaf in the crew data home. Must stay
+#: byte-identical to ``sandbox._MD_NOTEBOOK_STAGING_LEAF``, which is what masks it from the
+#: agent and hands it back to this backend's own spawn — a mismatch would silently stage
+#: PAT bytes outside the mask. Spelled here rather than imported so this app backend does
+#: not pull the sandbox module into its own process; a test pins the two together.
+_STAGING_LEAF = "md-notebook-staging"
 
-# Data-home paths are resolved LAZILY, never at import time (issue #874): the
+
+# Data-home paths are resolved LAZILY, never at import time: the
 # active KiroCrew home depends on KIROCREW_HOME, which a pod, the legacy-home
 # migration, or the test-isolation fixture can change AFTER this module is
 # imported. `_HOME` is the override hook (None = live-resolve); tests do
-# `monkeypatch.setattr(server, "_HOME", tmp)`. See config/paths.py / issue #874.
+# `monkeypatch.setattr(server, "_HOME", tmp)`. See config/paths.py.
 _HOME: Optional[Path] = None
 
 
@@ -365,9 +375,11 @@ def _discard_staged_sync(tmp: Path) -> None:
 def _atomic_write_text_sync(path: Path, content: str) -> None:
     """Stage, publish, and clean up on failure -- the single-attempt whole.
 
-    Kept for callers that write a file with no freshness contract and no retry
-    (the settings store). The note save drives the two halves itself so it can
-    republish one temp across attempts.
+    Stages BESIDE the target (a note inside the vault, possibly a different
+    filesystem from the crew home). State files (vaults/settings/PAT) use
+    ``_write_state_staged_sync`` instead, which stages in the masked staging
+    dir. The note save drives the two halves itself so it can republish one
+    temp across attempts.
     """
     tmp = _new_staged_note_path(path)
     with git_ops.inflight_temp(tmp):
@@ -379,18 +391,94 @@ def _atomic_write_text_sync(path: Path, content: str) -> None:
             raise
 
 
+def _staging_dir() -> Path:
+    """The masked write-staging directory every STATE writer publishes through.
+
+    Every state writer (vaults/settings/PAT) stages its temp file HERE and renames onto
+    its target. A temp staged beside the target — the previous shape — carries the real PAT
+    bytes under a name the OS sandbox's three leaf masks do not cover, and a SIGKILL
+    between write and rename left that unmasked sibling readable by a same-uid sandboxed
+    agent forever.
+
+    A TOP-LEVEL directory in the crew data home (``sandbox._MD_NOTEBOOK_STAGING_LEAF``),
+    NOT a child of the state directory, for the reason the sibling ``aws-control-staging``
+    leaf records: a mask covers the leaf, not its ancestors, so a staging dir under the
+    agent-writable ``workspace/md-notebook`` could be renamed out from under its own mask
+    and a later PAT write would publish through the replacement, unmasked, into a live
+    agent's view. It stays on the same filesystem as the targets, so the publish rename is
+    still atomic. NOTE saves are deliberately untouched — they stage beside the note inside
+    the vault, which may be a different filesystem, and hold no secret.
+    """
+    # Mirrors ``_crew_data_home``'s resolution, minus the app subdirectory: the staging
+    # directory is a sibling of ``workspace``, not of the state files. Under the ``_HOME``
+    # test hook it sits beside that hook's directory, which keeps it on the same
+    # filesystem as the targets — the only property the rename depends on.
+    if _HOME is not None:
+        return _HOME.parent / _STAGING_LEAF
+    try:
+        base = config_dir()
+    except Exception:
+        override = os.environ.get("KIROCREW_HOME")
+        base = Path(override) if override else Path.home() / ".kiro" / "crew"
+    return base / _STAGING_LEAF
+
+
+def _write_state_staged_sync(target: Path, content: str, *, fsync_file: bool = False) -> None:
+    """Stage *content* in the masked staging dir, then rename onto *target*.
+
+    ``mkstemp`` opens the temp 0600 on POSIX before any payload byte;
+    ``restrict_to_owner`` adds the owner-only DACL on Windows (chmod is a no-op
+    there), warn-not-fail per the original PAT policy — losing the credential
+    write is worse than a permissions warning. On failure the temp is removed;
+    a removal that itself fails leaves the orphan inside the mask, not beside
+    the target.
+    """
+    staging = _staging_dir()
+    # The planted-link refusal atomic_write enforces:
+    # atomic_write(restrict_to_owner=True)
+    # refuses a secret write whose parent chain passes through a planted
+    # symlink/junction — otherwise mkdir(parents=True), mkstemp and the rename
+    # all follow the link and the token lands OUTSIDE the sensitive-path fence
+    # while the caller sees success. Moving the staging off atomic_write must
+    # not shed that guard. Both chains this write walks, checked BEFORE the
+    # mkdirs (mkdir walks THROUGH a planted link and would build the tree
+    # under its target); the probe name is never created, only its chain is
+    # judged.
+    refuse_linked_parent(target)
+    refuse_linked_parent(staging / ".chain-probe")
+    staging.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(staging), suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        try:
+            restrict_to_owner(tmp)
+        except OSError:
+            logger.warning("could not restrict a staged state temp to owner-only", exc_info=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(content)
+            if fsync_file:
+                fh.flush()
+                os.fsync(fh.fileno())
+        replace_with_retry(tmp, target)
+    except BaseException:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
 def _write_vaults_sync(vaults: list[dict[str, Any]]) -> None:
     """Replace the vault registry, retrying the Windows rename window.
 
     Same reason as the note writer above: this file is read back by every
     later request, so a handle can be open on it when the rename lands.
+    Staged in the masked staging dir — see :func:`_staging_dir`.
     """
-    target = _vaults_json()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f"vaults.json.{uuid.uuid4().hex}.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(vaults, fh, indent=2)
-    replace_with_retry(tmp, target)
+    _write_state_staged_sync(_vaults_json(), json.dumps(vaults, indent=2))
 
 
 def _read_pat_sync() -> Optional[str]:
@@ -411,22 +499,15 @@ def _read_pat_sync() -> Optional[str]:
 
 
 def _write_pat_sync(pat: str) -> None:
-    target = _pat_file()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # Write to an owner-only sibling temp, fsync, then atomically replace. A
-    # direct O_TRUNC open would empty the existing token before the new bytes
-    # land, so a failure partway (a full disk is the realistic one) would lose a
-    # valid credential.
-    #
-    # os.chmod's 0600 is a no-op on Windows (it only toggles read-only), leaving
-    # the token readable by other accounts. restrict_to_owner applies an
-    # owner-only DACL there and chmod 0600 on POSIX, and atomic_write applies it
-    # to the temp BEFORE any payload byte — narrower than the previous
-    # write-then-restrict here, which left the token in a parent-inherited-DACL
-    # file until the lockdown landed. restrict_on_error="warn"
-    # keeps the original policy: a chmod failure warns rather than losing the
-    # credential. Written 0600 and never echoed back (only a boolean).
-    atomic_write(target, pat, fsync=True, restrict_to_owner=True, restrict_on_error="warn")
+    # Stage in the MASKED staging dir, fsync, then atomically replace. A direct
+    # O_TRUNC open would empty the existing token before the new bytes land, so
+    # a failure partway (a full disk is the realistic one) would lose a valid
+    # credential — and a temp staged BESIDE the target would hold the real PAT
+    # bytes at a name the sandbox's leaf masks do not cover (see _staging_dir).
+    # The temp is 0600 from mkstemp on POSIX and owner-only-DACL'd on Windows
+    # before any payload byte, warn-not-fail; written 0600 and never echoed
+    # back (only a boolean).
+    _write_state_staged_sync(_pat_file(), pat, fsync_file=True)
 
 
 async def read_vaults() -> list[dict[str, Any]]:
@@ -521,13 +602,14 @@ def _read_settings_sync() -> dict[str, Any]:
 
 
 def _write_settings_sync(settings: dict[str, Any]) -> None:
-    # Create the settings file's OWN parent, like the PAT write does — since
-    # settings.json now resolves under the crew data home (or the _HOME test
-    # hook), not under _home(), the two dirs diverge and mkdir'ing _home() would
-    # leave the settings dir absent and the write failing with ENOENT.
-    target = _settings_json()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text_sync(target, json.dumps(settings, indent=2))
+    # Staged in the masked staging dir like the other state writers (see
+    # _staging_dir); the helper creates both the staging dir and the target's
+    # own parent, which diverges from _home() when the _HOME test hook is unset.
+    # fsync preserved from the previous path (_stage_note_text_sync fsync'd):
+    # settings carry the autoSync authorization bit and the lastSync stamp, and
+    # a rename published from an unflushed page cache can discard an
+    # acknowledged toggle on power loss.
+    _write_state_staged_sync(_settings_json(), json.dumps(settings, indent=2), fsync_file=True)
 
 
 async def read_settings() -> dict[str, Any]:
@@ -565,6 +647,32 @@ async def record_last_sync(vault_id: str) -> int:
 _gh_cache: dict[str, Any] = {"value": None, "at": 0.0}
 
 
+def _windows_gh_candidates() -> list[str]:
+    """Fixed GitHub-CLI install roots on Windows. PATH is still NOT consulted.
+
+    Only the machine-wide install roots: ``%ProgramFiles%`` and
+    ``%ProgramW6432%`` (where a 64-bit install lands when the host interpreter
+    is 32-bit and ``%ProgramFiles%`` resolves to the x86 tree). Both need an
+    admin-elevated installer to write to, matching the no-PATH-hijack property
+    ``_find_gh``'s docstring relies on.
+
+    Deliberately NOT ``%LOCALAPPDATA%\\Programs`` (winget's per-user install
+    root): unlike Program Files, it sits inside the user's own profile and is
+    writable by anything running as that user -- including this agent. Trusting
+    a ``gh.exe`` planted there would let it run unsandboxed the next time a
+    vault operation mints a gh-derived token, with the backend's PAT and proxy
+    secret in scope. A user who installed gh per-user only (no admin rights)
+    still authenticates via a stored PAT; this is a narrower gh-derived-auth
+    surface on Windows, not a hard requirement.
+    """
+    roots: list[str] = []
+    for var in ("ProgramFiles", "ProgramW6432"):
+        value = os.environ.get(var)
+        if value and value not in roots:
+            roots.append(value)
+    return [os.path.join(root, "GitHub CLI", "gh.exe") for root in roots]
+
+
 def _find_gh() -> Optional[str]:
     """Absolute path to a trusted ``gh``, or None. PATH is NOT consulted — a
     workspace-writable entry could shadow ``gh`` with a planted binary that runs
@@ -585,6 +693,11 @@ def _find_gh() -> Optional[str]:
             "/usr/bin/gh",
         ]
     )
+    if not override and platform_compat.IS_WINDOWS:
+        # None of the entries above can ever match on Windows, so gh-derived auth
+        # was unavailable there however the user had logged in. Same rule, same
+        # reason: fixed install roots only, never PATH.
+        candidates = _windows_gh_candidates()
     for candidate in candidates:
         if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
@@ -680,7 +793,74 @@ async def vault_path(vault: dict[str, Any], rel: Optional[str] = None) -> Path:
     return await asyncio.to_thread(_resolve)
 
 
-def require_note_path(rel: Any, field: str = "path") -> str:
+#: Characters Win32 forbids in a path component. Refused for a name the app is
+#: about to CREATE on every platform, and for every name when running on Windows,
+#: because a vault is meant to be portable: a note named ``a:b.md`` created on
+#: macOS makes the Windows clone of the same vault un-checkoutable (git's own
+#: ``core.protectNTFS`` refuses it, reported only as a clone failure), and on
+#: Windows the same move does not fail at all — ``os.replace`` writes an NTFS
+#: ALTERNATE DATA STREAM on a file named ``a``, which ``_list_note_files_sync``
+#: never walks, so the note silently disappears from the app instead of erroring.
+_UNPORTABLE_CHARS = frozenset('<>:"|?*')
+
+
+def _reject_unportable_component(part: str, field: str) -> None:
+    """Refuse one path component Win32 cannot represent. Raises ``ApiError`` 400.
+
+    Applied on EVERY platform for a name the caller is about to CREATE (a move
+    destination, a new-note folder, or a saved path's new components), so an
+    unportable name never enters a vault that is meant to travel; and on Windows
+    for every name, where such a path is not merely unwise but silently wrong. Reading and re-saving an oddly-named note that already
+    exists on a POSIX host stays allowed — that is the only way a user can rename
+    it to something portable.
+    """
+    if _UNPORTABLE_CHARS.intersection(part) or any(ord(ch) < 32 for ch in part):
+        raise ApiError(
+            f'{field} must not contain < > : " | ? * or a control character — '
+            "such a name cannot exist on Windows, so it would break any Windows "
+            "clone of this vault",
+            400,
+            code="path_not_a_note",
+        )
+    if part != part.rstrip(". "):
+        raise ApiError(
+            f"{field} must not have a path component ending in a dot or a space — "
+            "Windows silently strips it, so the name would not round-trip",
+            400,
+            code="path_not_a_note",
+        )
+    if part.split(".", 1)[0].lower() in WINDOWS_DEVICE_STEMS:
+        raise ApiError(
+            f"{field} uses '{part}', a name Windows reserves for a device",
+            400,
+            code="path_not_a_note",
+        )
+
+
+def _reject_unportable_new_components(root: Path, rel: str) -> None:
+    """Refuse a save that would CREATE a path component Win32 cannot hold.
+
+    A save mkdirs missing parents and may create the note itself, so every
+    component that does not exist yet is a NEW name entering the vault and is
+    held to the portability rule on every platform — the same rationale as
+    ``require_note_path``'s ``for_new``. Components that already exist are left
+    alone: re-saving an oddly-named note a POSIX vault already contains stays
+    allowed, which is the only way a user can rename it to something portable.
+
+    Runs one synchronous ``exists`` stat per component, so call it off the
+    event loop.
+    """
+    current = root
+    missing = False
+    for part in PurePosixPath(rel.replace("\\", "/")).parts:
+        if not missing:
+            current = current / part
+            missing = not current.exists()
+        if missing:
+            _reject_unportable_component(part, "path")
+
+
+def require_note_path(rel: Any, field: str = "path", *, for_new: bool = False) -> str:
     """Validate a caller-supplied path as one this app is allowed to touch.
 
     Containment is not enough. ``safe_join`` / ``vault_mutation_path`` only prove
@@ -698,6 +878,10 @@ def require_note_path(rel: Any, field: str = "path") -> str:
 
     Raises ``ApiError`` 400; callers pass ``field`` so the message names the
     parameter the caller actually sent (``from`` / ``to`` on a move).
+
+    ``for_new`` marks a path the caller is about to CREATE (a move destination).
+    Those are additionally held to what Win32 can represent, on every platform,
+    so a vault does not acquire a note only some of its clones can check out.
     """
     if not rel or not isinstance(rel, str):
         raise ApiError(f"{field} is required", 400, code="path_required")
@@ -708,16 +892,25 @@ def require_note_path(rel: Any, field: str = "path") -> str:
             400,
             code="path_not_a_note",
         )
+    if for_new or platform_compat.IS_WINDOWS:
+        for part in parts:
+            _reject_unportable_component(part, field)
     if not parts[-1].lower().endswith(".md"):
         raise ApiError(f"{field} must be a .md note", 400, code="path_not_a_note")
     return rel
 
 
-def require_folder_path(folder: Any) -> Optional[str]:
+def require_folder_path(folder: Any, *, for_new: bool = False) -> Optional[str]:
     """Validate an optional caller-supplied FOLDER (the new-note target).
 
     Same undotted rule as `require_note_path`, without the `.md` requirement: a
     folder is not a note. Without it a new note could be created inside `.git`.
+
+    ``for_new`` marks a folder the caller is about to CREATE (``api_note_new``
+    mkdirs it). Such a name is additionally held to what Win32 can represent,
+    on every platform — the same rationale as ``require_note_path``: a vault
+    travels, and a folder named ``CON`` written on a POSIX host makes every
+    Windows clone un-checkoutable (core.protectNTFS).
     """
     if folder is None or folder == "":
         return None
@@ -730,6 +923,13 @@ def require_folder_path(folder: Any) -> Optional[str]:
             400,
             code="path_not_a_note",
         )
+    if for_new or platform_compat.IS_WINDOWS:
+        # With ``for_new`` the folder IS about to be created, so the
+        # portability rule applies on every platform; without it the folder is
+        # merely resolved, and the check still stops a note being written into
+        # a folder Win32 cannot address when running ON Windows.
+        for part in parts:
+            _reject_unportable_component(part, "folder")
     return folder
 
 
@@ -747,7 +947,7 @@ async def trash_dir_path(vault: dict[str, Any]) -> Path:
     So any symlink is refused, escaping or not. `lstat` via `is_symlink()` is the
     only test that can see it — `exists()` and `is_dir()` both follow the link.
     On Windows the same redirection is possible via a directory JUNCTION, which
-    `is_symlink()` does NOT report, so `is_link_or_junction` is used to catch both.
+    `is_symlink()` does NOT report, so `is_link_or_junction` catches both.
     """
     trash_dir = await vault_mutation_path(vault, git_ops.TRASH_DIR)
     if await asyncio.to_thread(platform_compat.is_link_or_junction, trash_dir):
@@ -916,8 +1116,8 @@ async def read_note_text(path: Path) -> Optional[str]:
     not enough on its own. `safe_read_file_bytes` canonicalizes via realpath,
     refuses a sensitive resolved target and opens with O_NOFOLLOW.
 
-    Centralized deliberately: this gate was previously applied per call site and
-    each new read path was a fresh hole.
+    Centralized deliberately: applied per call site instead, every new read path
+    is a fresh hole.
     """
     try:
         data = await asyncio.to_thread(hooks.safe_read_file_bytes, str(path))
@@ -1201,7 +1401,7 @@ async def api_vault_clone(request: web.Request) -> web.Response:
         raise ApiError("url is required", 400, code="url_required")
     # Use a submitted token TRANSIENTLY for this clone; persist it only after the
     # clone succeeds. Writing it up front would let a failed clone (bad URL or
-    # bad token) overwrite a previously-valid stored PAT and break every existing
+    # bad token) overwrite a valid stored PAT and break every existing
     # vault's auth.
     submitted_pat = str(body["pat"]) if body.get("pat") else None
     pat = submitted_pat or await resolve_auth()
@@ -1442,13 +1642,14 @@ async def api_pat(request: web.Request) -> web.Response:
     if pat:
         await asyncio.to_thread(_write_pat_sync, str(pat))
     else:
-        def _remove() -> None:
-            try:
-                os.unlink(_pat_file())
-            except FileNotFoundError:
-                pass
-
-        await asyncio.to_thread(_remove)
+        # Clear by atomically REPLACING with an empty file, never by unlink:
+        # the empty file is the reader's absent-equivalent (_read_pat_sync maps
+        # "" to None), while removing the inode deletes the sandbox mask's
+        # mount target — a clear landing between the launcher's materialize and
+        # mount steps would leave that namespace maskless, and a later PAT save
+        # would be readable inside it. Routed through the same staged writer as
+        # the save so the guards match.
+        await asyncio.to_thread(_write_pat_sync, "")
     return web.json_response(
         {"hasPat": bool(await read_pat()), "hasGhAuth": bool(await gh_token())}
     )
@@ -1509,9 +1710,7 @@ async def api_note_read(request: web.Request) -> web.Response:
     )
 
 
-async def _assert_note_is_fresh(
-    abs_path: Path, rel: str, base_mtime: object
-) -> None:
+async def _assert_note_is_fresh(abs_path: Path, rel: str, base_mtime: object) -> None:
     """Raise 409 ESTALE if the note changed on disk since the client read it.
 
     Split out of the save handler so the retry below can re-run it. It must be
@@ -1567,9 +1766,7 @@ async def _observed_note_mtime(abs_path: Path) -> Optional[float]:
         return None
 
 
-async def _assert_note_unchanged(
-    abs_path: Path, rel: str, observed: Optional[float]
-) -> None:
+async def _assert_note_unchanged(abs_path: Path, rel: str, observed: Optional[float]) -> None:
     """Raise 409 ESTALE if the note moved off *observed* since it was sampled.
 
     The tokenless counterpart to `_assert_note_is_fresh`. A save with no
@@ -1645,9 +1842,7 @@ async def _publish_note_once(abs_path: Path, tmp: Path, attempt: int) -> bool:
         return False
 
 
-async def _save_note_contents(
-    abs_path: Path, rel: str, content: str, base_mtime: object
-) -> None:
+async def _save_note_contents(abs_path: Path, rel: str, content: str, base_mtime: object) -> None:
     """Publish *content*, retrying a contended rename without losing a write.
 
     The rename can fail on Windows with `PermissionError` while another handle is
@@ -1797,6 +1992,10 @@ async def api_note_save(request: web.Request) -> web.Response:
     # islink() misses, so check both to keep the guard from being POSIX-only.
     if await asyncio.to_thread(platform_compat.is_link_or_junction, abs_path):
         raise ApiError("cannot save through a symlink", 400, code="note_is_symlink")
+    root = await vault_path(vault)
+    # Components this save would CREATE are held to the portability rule on
+    # every platform; existing ones stay saveable (the rename escape hatch).
+    await asyncio.to_thread(_reject_unportable_new_components, root, rel)
     base_mtime = body.get("baseMtime")
     await _save_note_contents(abs_path, rel, content, base_mtime)
     mark_self_write(abs_path)
@@ -1805,7 +2004,6 @@ async def api_note_save(request: web.Request) -> web.Response:
         notes_mod.SearchDoc(path=rel, title=notes_mod.note_basename(rel), content=content)
     )
     # Backlinks are a whole-vault relation, so recompute them from disk.
-    root = await vault_path(vault)
     contents = {}
     for p in await list_note_files(root):
         text = await read_note_text(root / p)
@@ -1871,7 +2069,7 @@ async def api_note_delete(request: web.Request) -> web.Response:
     mark_self_write(trash_dir / trashed)
     # Rebuild rather than drop one index entry: the deleted note's own
     # [[wikilinks]] disappear with it, so every note it pointed at keeps a
-    # backlink to a note that no longer exists until the next rebuild.
+    # backlink to a missing note until the next rebuild.
     await rebuild_cache(vault)
     return web.json_response({"ok": True, "trashed": f"{git_ops.TRASH_DIR}/{trashed}"})
 
@@ -1886,7 +2084,7 @@ async def api_note_new(request: web.Request) -> web.Response:
     vault = await require_vault(request)
     require_writable(vault)
     body = await json_body(request)
-    folder = require_folder_path(body.get("folder"))
+    folder = require_folder_path(body.get("folder"), for_new=True)
     directory = await vault_path(vault, folder or None)
 
     def _create_unique() -> tuple[str, str]:
@@ -1995,7 +2193,7 @@ async def api_note_move(request: web.Request) -> web.Response:
     require_writable(vault)
     body = await json_body(request)
     src_rel = require_note_path(body.get("from"), "from")
-    dst_rel = require_note_path(body.get("to"), "to")
+    dst_rel = require_note_path(body.get("to"), "to", for_new=True)
     if src_rel == dst_rel:
         return web.json_response({"ok": True, "path": dst_rel})
     src = await vault_mutation_path(vault, src_rel)
@@ -2188,7 +2386,12 @@ async def api_pick_folder(request: web.Request) -> web.Response:
     process, so it can ask the OS and hand back what the user picked.
     """
     if not pick_folder_supported():
-        raise ApiError("folder chooser is only available on macOS", 501, code="folder_chooser_unsupported")
+        raise ApiError(
+            "the folder chooser is only available on macOS — on Windows and Linux, "
+            "paste the vault folder's absolute path into the field instead",
+            501,
+            code="folder_chooser_unsupported",
+        )
     path = await asyncio.to_thread(_pick_folder_sync)
     return web.json_response({"path": path, "cancelled": path is None})
 
@@ -2250,7 +2453,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     raise SystemExit(main())

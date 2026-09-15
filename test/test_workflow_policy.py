@@ -95,12 +95,16 @@ def test_the_keystone_leaf_is_agent_unreachable():
         "~/.kirocrew/workflow_policy.json",
     ):
         assert security.is_sensitive_path(path), path
-    for command in (
-        "cat ~/.kiro/crew/workflow_policy.json",
-        "echo x > ~/.kiro/crew/workflow_policy.json",
-        "tee ~/.kiro/crew/workflow_policy.json",
-    ):
-        assert security.is_sensitive_bash_command(command), command
+    # The SHELL gate deliberately no longer matches paths in command text: the
+    # upstream split removed every fence-literal matcher from it because a regex
+    # over an unnormalized command line cannot decide two spellings of one file,
+    # and it refused ordinary read-only work whenever a fenced path appeared as
+    # data (see docs/system-specs/modules/security.md). What stops a shell reaching
+    # this leaf is the OS sandbox, which masks the data home out of the agent's
+    # process tree, plus the path gate above on every resolved path a file tool
+    # opens. Asserting the removed layer here would pin a mechanism that is gone;
+    # asserting the layer that survives is what keeps the ceiling honest.
+    assert security.is_sensitive_path("~/.kiro/crew/workflow_policy.json")
 
 
 # ── git publication mode ──
@@ -138,17 +142,30 @@ def test_repository_governed_mode_widens_nothing_but_the_branch_name_floor(keyst
     rest of the gate with it.
     """
     _write(keystone, {"git_publication_mode": workflow_policy.GIT_PUBLICATION_REPOSITORY_GOVERNED})
+    # Controls that survive in this mode and are enforced BY THE DENY GATE. A
+    # credential-path READ is deliberately not among them: `is_denied` never
+    # matched paths in command text, and the upstream split removed the matcher
+    # that once did, so a `cat ~/.ssh/id_rsa` is stopped by the OS sandbox and the
+    # resolved-path gate rather than here (asserted below). Listing it here would
+    # pin the mode to a layer this predicate does not own, and the assertion would
+    # pass only while some OTHER rule in the same command happened to fire.
     for command in (
-        "git push origin main; cat ~/.aws/credentials",
         "git push origin main && env | grep AWS_SECRET",
         "rm -rf ~",
-        "cat ~/.ssh/id_rsa",
     ):
         assert security.is_denied(command), command
+    # The path gate is untouched by the mode -- this is what actually stops the
+    # credential read the compound command above carries.
+    for path in ("~/.aws/credentials", "~/.ssh/id_rsa"):
+        assert security.is_sensitive_path(path), path
     # The keystone fence is a different predicate, not a deny rule, and the mode
-    # must not reach it either: the file that holds the mode is behind it.
-    assert security.is_sensitive_bash_command("cat ~/.kiro/crew/security_policy.json")
-    assert security.is_sensitive_bash_command("cat ~/.kiro/crew/workflow_policy.json")
+    # must not reach it either: the file that holds the mode is behind it. Asserted
+    # on the PATH gate rather than the shell one, because the shell gate no longer
+    # matches paths in command text at all (see the note in
+    # ``test_the_keystone_leaf_is_agent_unreachable``) -- the surviving layers are
+    # this predicate and the OS sandbox.
+    assert security.is_sensitive_path("~/.kiro/crew/security_policy.json")
+    assert security.is_sensitive_path("~/.kiro/crew/workflow_policy.json")
 
 
 def test_the_mode_does_not_touch_the_ssh_agent_opt_in(keystone, monkeypatch):

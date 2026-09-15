@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { act, screen, waitFor } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { act, fireEvent, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
 import InstancesViewport from '../components/InstancesViewport'
@@ -83,7 +83,9 @@ describe('InstancesViewport', () => {
     // Default mock has cd-1 connected. On load we pre-mount its iframe (hidden,
     // since we land on Local) so it's instantly usable without a click.
     const { store } = renderWithProviders(<InstancesViewport />)
-    await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('cd-1'))
+    // Auto-warm is connected-only: it pre-mounts a tunnel that is already up
+    // and never asks the gateway to bring one up.
+    await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('cd-1', { onlyIfConnected: true }))
     await waitFor(() => expect(store.getState().instances.warm['cd-1']).toBeDefined())
     // Landed on Local (activeId null) -> the warmed iframe is mounted but hidden.
     expect(store.getState().instances.activeId).toBeNull()
@@ -133,12 +135,16 @@ describe('InstancesViewport', () => {
     expect((frame.parentElement as HTMLElement).style.display).toBe('none')
   })
 
-  it('delegates microphone and fullscreen to the cross-origin pane', async () => {
+  it('delegates microphone, fullscreen and clipboard-write to the cross-origin pane', async () => {
     // The pane is a cross-origin iframe (same host, different port), where
-    // both features are denied unless the parent delegates them. Dropping
-    // either regresses a user-visible capability: mic -> getUserMedia rejects
-    // with NotAllowedError; fullscreen -> the fullscreen button on native
-    // <video> controls inside the embedded chat renders disabled.
+    // these features are denied unless the parent delegates them. Dropping
+    // any of them regresses a user-visible capability: mic -> getUserMedia
+    // rejects with NotAllowedError; fullscreen -> the fullscreen button on
+    // native <video> controls inside the embedded chat renders disabled;
+    // clipboard-write -> navigator.clipboard.writeText() rejects in the pane,
+    // so every copy affordance fails (CliPanel's selection copy surfaces
+    // "Copy failed"; TerminalKeyBar and WebAppArtifactCard hit the same
+    // rejection).
     const store = createTestStore({
       instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
     })
@@ -148,7 +154,17 @@ describe('InstancesViewport', () => {
       if (!f) throw new Error('no iframe yet')
       return f as HTMLIFrameElement
     })
-    expect(frame.getAttribute('allow')).toBe('microphone; fullscreen')
+    expect(frame.getAttribute('allow')).toBe('microphone; fullscreen; clipboard-write')
+    // Contract pin: whatever shape the delegation list takes in the future,
+    // clipboard-write must survive it -- the pane's copy paths depend on it.
+    expect(frame.getAttribute('allow')).toContain('clipboard-write')
+    // Scope discipline: clipboard-read stays undelegated. Read is the more
+    // sensitive grant class and exceeds this fix's clipboard-write scope, so
+    // the pane's Paste key (TerminalKeyBar's readText) still fails inside
+    // embedded panes, visibly, with its named paste_permission_needed status.
+    // Delegating read is a maintainer decision; this pin makes a future grant
+    // a deliberate act rather than a drive-by.
+    expect(frame.getAttribute('allow')).not.toContain('clipboard-read')
     expect(frame.hasAttribute('allowfullscreen')).toBe(true)
   })
 
@@ -256,6 +272,43 @@ describe('InstancesViewport', () => {
     // underneath it. Without returning to Local the user keeps staring at this same
     // error panel and reads the button as dead, while every further click stacks
     // another copy of the prompt onto the hand-off queue.
+    expect(store.getState().instances.activeId).toBeNull()
+  })
+
+  it('the Settings → Remote Instances link returns to Local before navigating (same overlay rule as the hand-off)', async () => {
+    // The link soft-navigates the LOCAL SPA, which sits underneath this panel's
+    // opaque root overlay while a remote tab is active. Without leaving the
+    // remote tab the click looks dead. A modified click opens a new tab and
+    // must leave this tab's panel alone.
+    vi.mocked(api.listInstances).mockResolvedValue({
+      instances: [
+        {
+          id: 'cd-1',
+          name: 'Cloud One',
+          ssh_host: 'cd-1-alias',
+          remote_port: 7777,
+          local_port: 0,
+          ttl: '20h',
+          remote_bin: '',
+          was_connected: true,
+          status: { instance_id: 'cd-1', state: 'error', error: 'ssh unreachable', remote_port: 7777 },
+        },
+      ],
+      warm_set_cap: 5,
+    })
+    const store = createTestStore({
+      instances: { warm: {}, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+    expect(await screen.findByText(/Connection error/i)).toBeInTheDocument()
+
+    const link = screen.getByRole('link', { name: /Settings → Remote Instances/ }) as HTMLAnchorElement
+    expect(link.getAttribute('href')).toBe('/settings/instances')
+
+    fireEvent.click(link, { metaKey: true })
+    expect(store.getState().instances.activeId).toBe('cd-1')
+
+    fireEvent.click(link)
     expect(store.getState().instances.activeId).toBeNull()
   })
 
@@ -1063,5 +1116,413 @@ describe('InstancesViewport', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('journals iframe-mounted once per real attach, not once per re-render (stable ref callback)', async () => {
+    mockConnectedCd1()
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    try {
+      const store = createTestStore({
+        instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+      })
+      renderWithProviders(<InstancesViewport />, { store })
+      expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
+      const paneLines = () => info.mock.calls.map(c => String(c[0])).filter(l => l.startsWith('[pane]'))
+      const mounts = () => paneLines().filter(l => l.includes('iframe-mounted id=cd-1')).length
+      const unmounts = () => paneLines().filter(l => l.includes('iframe-unmounted id=cd-1')).length
+      expect(mounts()).toBe(1)
+      expect(unmounts()).toBe(0)
+
+      // Force several re-renders of the viewport WITHOUT touching the iframe:
+      // a host-model input (unread count) and a same-port/token warm write are
+      // both things the 10s poll and the broadcast effect do in production. An
+      // inline `ref={el => ...}` would journal an unmount+mount pair for each.
+      for (let i = 1; i <= 5; i++) {
+        act(() => {
+          window.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'mc-unread-slots', count: i },
+            origin: 'http://127.0.0.1:7778',
+          }))
+        })
+        act(() => { store.dispatch(setWarm({ id: 'cd-1', conn: { port: 7778, token: 'tok' } })) })
+      }
+      await waitFor(() => expect(store.getState().instances.unread['cd-1']).toBe(5))
+      expect(mounts()).toBe(1)
+      expect(unmounts()).toBe(0)
+
+      // A real detach (the pane leaves the warm set) still journals exactly once.
+      act(() => { store.dispatch(removeWarm('cd-1')) })
+      await waitFor(() => expect(unmounts()).toBe(1))
+      expect(mounts()).toBe(1)
+    } finally {
+      info.mockRestore()
+    }
+  })
+
+  it('journals the pane bundle\'s mc-embedded-boot stages from its tunnel origin, and only from a mapped origin', async () => {
+    mockConnectedCd1()
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    try {
+      const store = createTestStore({
+        instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+      })
+      renderWithProviders(<InstancesViewport />, { store })
+      expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
+      const bootLines = () => info.mock.calls.map(c => String(c[0])).filter(l => l.startsWith('[pane] boot '))
+
+      for (const stage of ['entry', 'render', 'bridge']) {
+        act(() => {
+          window.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'mc-embedded-boot', v: 1, stage },
+            origin: 'http://127.0.0.1:7778',
+          }))
+        })
+      }
+      expect(bootLines()).toEqual([
+        '[pane] boot id=cd-1 stage=entry',
+        '[pane] boot id=cd-1 stage=render',
+        '[pane] boot id=cd-1 stage=bridge',
+      ])
+      // Boot is a journal line, never readiness: the overlay stays up.
+      expect(store.getState().instances.ready['cd-1']).toBeUndefined()
+      expect(screen.getByText(/Loading pane/i)).toBeInTheDocument()
+
+      // A loopback origin the parent does not map is journaled as unattributed
+      // (mirrors ready-unattributed) rather than dropped: "no boot line" must
+      // keep meaning "no JavaScript of ours ran", not "the parent lost it".
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          data: { type: 'mc-embedded-boot', v: 1, stage: 'entry' },
+          origin: 'http://127.0.0.1:9999',
+        }))
+      })
+      expect(bootLines().length).toBe(3)
+      const unattributed = info.mock.calls.map(c => String(c[0])).filter(l => l.startsWith('[pane] boot-unattributed '))
+      expect(unattributed).toEqual(['[pane] boot-unattributed origin=http://127.0.0.1:9999 stage=entry knownPorts=7778'])
+
+      // A non-loopback origin stays silent.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          data: { type: 'mc-embedded-boot', v: 1, stage: 'entry' },
+          origin: 'https://example.com',
+        }))
+      })
+      expect(info.mock.calls.filter(c => String(c[0]).startsWith('[pane] boot')).length).toBe(4)
+    } finally {
+      info.mockRestore()
+    }
+  })
+
+  it('attributes a boot from a pane warmed in the same tick, before the warm effect has flushed', async () => {
+    mockConnectedCd1()
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    try {
+      const store = createTestStore({
+        instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+      })
+      renderWithProviders(<InstancesViewport />, { store })
+      expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
+
+      // Warm a second pane and let its bundle announce boot inside the SAME
+      // React flush. The render has already seen the new warm entry (warmRef
+      // is assigned during render) but no passive effect keyed on `warm` has
+      // run yet -- the exact window in which an effect-populated origin map
+      // still lacks port 7790 and would drop this boot as unattributed.
+      act(() => {
+        store.dispatch(setWarm({ id: 'cd-2', conn: { port: 7790, token: 'tok2' } }))
+        window.dispatchEvent(new MessageEvent('message', {
+          data: { type: 'mc-embedded-boot', v: 1, stage: 'entry' },
+          origin: 'http://127.0.0.1:7790',
+        }))
+      })
+      const lines = info.mock.calls.map(c => String(c[0])).filter(l => l.startsWith('[pane] boot'))
+      expect(lines).toContain('[pane] boot id=cd-2 stage=entry')
+      expect(lines.some(l => l.startsWith('[pane] boot-unattributed'))).toBe(false)
+    } finally {
+      info.mockRestore()
+    }
+  })
+
+  it('every auto-warm is connected-only, so one that fires after a disconnect is declined and warms nothing', async () => {
+    // Two connected crews: cd-1 warms at once, cd-2 is scheduled 1.5 s later.
+    const two = {
+      instances: [
+        { id: 'cd-1', name: 'One', ssh_host: 'a', remote_port: 7777, local_port: 7778, ttl: '20h', remote_bin: '',
+          status: { instance_id: 'cd-1', state: 'connected', local_port: 7778, remote_port: 7777 } },
+        { id: 'cd-2', name: 'Two', ssh_host: 'b', remote_port: 7777, local_port: 7779, ttl: '20h', remote_bin: '',
+          status: { instance_id: 'cd-2', state: 'connected', local_port: 7779, remote_port: 7777 } },
+      ],
+      warm_set_cap: 5,
+    }
+    vi.mocked(api.listInstances).mockResolvedValue(two as never)
+    // The gateway is the arbiter: cd-1 is up; cd-2 was disconnected before its
+    // warm arrived, so the connected-only connect declines it (200, state
+    // disconnected, no token) instead of re-opening the tunnel.
+    vi.mocked(api.connectInstance).mockImplementation(async (id: string, opts?: { onlyIfConnected?: boolean }) => {
+      expect(opts).toEqual({ onlyIfConnected: true })
+      return id === 'cd-1'
+        ? ({ state: 'connected', local_port: 7778, token: 'tok' } as never)
+        : ({ state: 'disconnected', local_port: 0, remote_port: 7777, code: 'instance_not_connected' } as never)
+    })
+    const { store } = renderWithProviders(<InstancesViewport />)
+    await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('cd-1', { onlyIfConnected: true }))
+    expect(api.connectInstance).not.toHaveBeenCalledWith('cd-2', expect.anything())
+    // The stagger timer was armed under real timers at render; let it fire.
+    await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('cd-2', { onlyIfConnected: true }), { timeout: 4_000 })
+    await new Promise(r => setTimeout(r, 20))
+    expect(store.getState().instances.warm['cd-1']).toBeDefined()
+    expect(store.getState().instances.warm['cd-2']).toBeUndefined()
+  })
+
+  it('a staggered auto-warm skips a crew something else already warmed in the meantime', async () => {
+    const two = {
+      instances: [
+        { id: 'cd-1', name: 'One', ssh_host: 'a', remote_port: 7777, local_port: 7778, ttl: '20h', remote_bin: '',
+          status: { instance_id: 'cd-1', state: 'connected', local_port: 7778, remote_port: 7777 } },
+        { id: 'cd-2', name: 'Two', ssh_host: 'b', remote_port: 7777, local_port: 7779, ttl: '20h', remote_bin: '',
+          status: { instance_id: 'cd-2', state: 'connected', local_port: 7779, remote_port: 7777 } },
+      ],
+      warm_set_cap: 5,
+    }
+    vi.mocked(api.listInstances).mockResolvedValue(two as never)
+    vi.mocked(api.connectInstance).mockImplementation(async (id: string) => ({
+      state: 'connected', local_port: id === 'cd-1' ? 7778 : 7779, token: 'tok',
+    }) as never)
+    const { store } = renderWithProviders(<InstancesViewport />)
+    await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('cd-1', { onlyIfConnected: true }))
+    // A click (or the fan-out) warms cd-2 before its stagger slot.
+    act(() => { store.dispatch(setWarm({ id: 'cd-2', conn: { port: 7779, token: 'tok' } })) })
+    await new Promise(r => setTimeout(r, 1_800))
+    expect(api.connectInstance).not.toHaveBeenCalledWith('cd-2', expect.anything())
+  })
+
+  it('Retry after a watchdog verdict on a navigated frame asks the gateway to rebuild the tunnel', async () => {
+    mockConnectedCd1()
+    vi.mocked(api.connectInstance).mockResolvedValue({ state: 'connected', local_port: 7778, token: 'tok' })
+    vi.useFakeTimers()
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+    await act(async () => {
+      vi.advanceTimersByTime(15_000)
+    })
+    expect(screen.getByText(/Pane failed to load/i)).toBeInTheDocument()
+    vi.useRealTimers()
+    // happy-dom's disabled-iframe load leaves the frame a same-origin blank
+    // document; make it read as navigated (cross-origin), the one case rebuild
+    // is meant for.
+    const frame = document.querySelector('iframe') as HTMLIFrameElement
+    Object.defineProperty(frame, 'contentWindow', {
+      get: () => ({ get location() { throw new DOMException('blocked', 'SecurityError') } }),
+    })
+
+    const u = userEvent.setup()
+    await u.click(screen.getByRole('button', { name: /Retry/i }))
+    await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('cd-1', { rebuild: true }))
+  })
+
+  it("Retry's own failure surfaces on the active pane's panel (variables keyed by id)", async () => {
+    // Stale warm: an iframe is mounted but the backend says the tunnel is down,
+    // so the panel is up and shows the LIST's error. Retry then fails with a
+    // NEWER reason; the mutation's error for THIS crew must win.
+    vi.mocked(api.listInstances).mockResolvedValue({
+      instances: [
+        {
+          id: 'cd-1', name: 'Cloud One', ssh_host: 'cd-1-alias', remote_port: 7777, local_port: 0, ttl: '20h', remote_bin: '',
+          was_connected: true,
+          status: { instance_id: 'cd-1', state: 'error', error: 'ssh unreachable', remote_port: 7777 },
+        },
+      ],
+      warm_set_cap: 5,
+    })
+    vi.mocked(api.connectInstance).mockRejectedValue(new Error('rebuild refused: EPERM'))
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+    expect(await screen.findByText(/ssh unreachable/i)).toBeInTheDocument()
+    const u = userEvent.setup()
+    await u.click(screen.getByRole('button', { name: /Retry/i }))
+    await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('cd-1'))
+    expect(await screen.findByText(/rebuild refused: EPERM/i)).toBeInTheDocument()
+    expect(screen.queryByText(/ssh unreachable/i)).toBeNull()
+  })
+
+
+  describe('script-error heal (poisoned HTTP cache)', () => {
+    // The pane's index.html shell posts this when its entry <script type=module>
+    // fires `error`: a chunk in the graph failed to fetch. On the desktop the one
+    // cause a plain reload cannot fix is a 404 the shell's HTTP cache is
+    // replaying under that origin, so the parent evicts the origin's cache and
+    // reloads -- exactly once per Retry, so a 404 the gateway is really serving
+    // cannot spin clear/reload forever.
+    const scriptError = (origin = 'http://127.0.0.1:7778') =>
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: { type: 'mc-embedded-boot', v: 1, stage: 'script-error', src: `${origin}/assets/main-krfrL6rl.js?token=x` },
+          origin,
+        }),
+      )
+    const withBridge = (impl: (origin: string) => Promise<boolean>) => {
+      const clear = vi.fn(impl)
+      ;(window as unknown as { electronAPI: unknown }).electronAPI = { clearPaneHttpCache: clear }
+      return clear
+    }
+    afterEach(() => {
+      delete (window as unknown as { electronAPI?: unknown }).electronAPI
+    })
+
+    it('evicts the pane origin cache and reloads the iframe once, journaling the src without its query', async () => {
+      mockConnectedCd1()
+      const clear = withBridge(async () => true)
+      const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+      try {
+        const store = createTestStore({
+          instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+        })
+        renderWithProviders(<InstancesViewport />, { store })
+        expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
+        const before = document.querySelector('iframe') as HTMLIFrameElement
+
+        scriptError()
+        await waitFor(() => expect(clear).toHaveBeenCalledWith('http://127.0.0.1:7778'))
+        await waitFor(() => expect(document.querySelector('iframe')).not.toBe(before))
+        const lines = info.mock.calls.map(c => String(c[0]))
+        const boot = lines.find(l => l.includes('boot id=cd-1 stage=script-error'))
+        expect(boot).toBeDefined()
+        expect(boot).toContain('src=http://127.0.0.1:7778/assets/main-krfrL6rl.js?token=<redacted>')
+        expect(boot).not.toContain('token=x')
+        expect(lines.some(l => l.includes('script-error-heal id=cd-1 origin=http://127.0.0.1:7778'))).toBe(true)
+
+        // A second script-error on the same load is NOT healed again: the
+        // watchdog owns it from here, and only Retry re-opens the budget.
+        const healed = document.querySelector('iframe') as HTMLIFrameElement
+        scriptError()
+        await new Promise(r => setTimeout(r, 20))
+        expect(clear).toHaveBeenCalledTimes(1)
+        expect(document.querySelector('iframe')).toBe(healed)
+      } finally {
+        info.mockRestore()
+      }
+    })
+
+    it('retracts readiness on script-error so the watchdog can arm again for a pane that WAS ready', async () => {
+      // A ready pane reloads itself (bundle change) and lands on a chunk 404: its
+      // shell posts script-error while the store still says ready. Left alone,
+      // the watchdog stays off (it skips ready panes) and a failed heal would be
+      // a blank pane with no Retry.
+      mockConnectedCd1()
+      const clear = withBridge(async () => true)
+      const store = createTestStore({
+        instances: {
+          warm: { 'cd-1': { port: 7778, token: 'tok' } },
+          activeId: 'cd-1',
+          mru: ['cd-1'],
+          unread: {},
+          ready: { 'cd-1': true },
+        },
+      })
+      renderWithProviders(<InstancesViewport />, { store })
+      expect(screen.queryByText(/Loading pane/i)).toBeNull()
+      scriptError()
+      await waitFor(() => expect(store.getState().instances.ready['cd-1']).toBeUndefined())
+      await waitFor(() => expect(clear).toHaveBeenCalledTimes(1))
+      // Readiness retracted -> the loading overlay is back and the watchdog owns the pane.
+      expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
+      // The retraction is not gated on the heal budget: a second script-error
+      // (budget spent, no reload) still leaves the pane un-ready.
+      window.dispatchEvent(
+        new MessageEvent('message', { data: { type: 'mc-embedded-ready', v: 1 }, origin: 'http://127.0.0.1:7778' }),
+      )
+      await waitFor(() => expect(store.getState().instances.ready['cd-1']).toBe(true))
+      scriptError()
+      await waitFor(() => expect(store.getState().instances.ready['cd-1']).toBeUndefined())
+      expect(clear).toHaveBeenCalledTimes(1)
+    })
+
+    it('gives an evicted-then-re-warmed pane its one-shot heal back', async () => {
+      // The budget is per load. Eviction (removeWarm) ends the load; a later
+      // re-warm is a new one and must be able to heal a poisoned cache again
+      // without a manual Retry.
+      mockConnectedCd1()
+      const clear = withBridge(async () => true)
+      const store = createTestStore({
+        instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+      })
+      renderWithProviders(<InstancesViewport />, { store })
+      expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
+      scriptError()
+      await waitFor(() => expect(clear).toHaveBeenCalledTimes(1))
+      // Budget spent for this load.
+      scriptError()
+      await new Promise(r => setTimeout(r, 20))
+      expect(clear).toHaveBeenCalledTimes(1)
+
+      await act(async () => { store.dispatch(removeWarm('cd-1')) })
+      await waitFor(() => expect(document.querySelector('iframe')).toBeNull())
+      await act(async () => { store.dispatch(setWarm({ id: 'cd-1', conn: { port: 7778, token: 'tok2' } })) })
+      await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+      scriptError()
+      await waitFor(() => expect(clear).toHaveBeenCalledTimes(2))
+    })
+
+    it('still reloads once when the bridge is absent or refuses (browser, non-Electron)', async () => {
+      mockConnectedCd1()
+      const store = createTestStore({
+        instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+      })
+      renderWithProviders(<InstancesViewport />, { store })
+      expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
+      const before = document.querySelector('iframe') as HTMLIFrameElement
+      scriptError()
+      await waitFor(() => expect(document.querySelector('iframe')).not.toBe(before))
+    })
+
+    it('ignores a script-error from an origin that is not a warm pane', async () => {
+      mockConnectedCd1()
+      const clear = withBridge(async () => true)
+      const store = createTestStore({
+        instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+      })
+      renderWithProviders(<InstancesViewport />, { store })
+      expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
+      const before = document.querySelector('iframe') as HTMLIFrameElement
+      scriptError('http://127.0.0.1:9999')
+      scriptError('https://evil.example.com')
+      await new Promise(r => setTimeout(r, 20))
+      expect(clear).not.toHaveBeenCalled()
+      expect(document.querySelector('iframe')).toBe(before)
+    })
+
+    it('Retry evicts the pane origin cache before reloading and re-opens the heal budget', async () => {
+      mockConnectedCd1()
+      vi.mocked(api.connectInstance).mockResolvedValue({ state: 'connected', local_port: 7778, token: 'tok' })
+      const clear = withBridge(async () => true)
+      vi.useFakeTimers()
+      const store = createTestStore({
+        instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+      })
+      renderWithProviders(<InstancesViewport />, { store })
+      await act(async () => {
+        vi.advanceTimersByTime(15_000)
+      })
+      expect(screen.getByText(/Pane failed to load/i)).toBeInTheDocument()
+      vi.useRealTimers()
+
+      const u = userEvent.setup()
+      await u.click(screen.getByRole('button', { name: /Retry/i }))
+      await waitFor(() => expect(clear).toHaveBeenCalledWith(`http://${window.location.hostname}:7778`))
+      await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('cd-1'))
+      // The evict resolved BEFORE the reconnect was issued.
+      expect(clear.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(api.connectInstance).mock.invocationCallOrder[0])
+      await waitFor(() => expect(screen.queryByText(/Pane failed to load/i)).toBeNull())
+
+      // Budget re-opened: a script-error after Retry is healed again.
+      const before = document.querySelector('iframe') as HTMLIFrameElement
+      scriptError()
+      await waitFor(() => expect(clear).toHaveBeenCalledTimes(2))
+      await waitFor(() => expect(document.querySelector('iframe')).not.toBe(before))
+    })
   })
 })

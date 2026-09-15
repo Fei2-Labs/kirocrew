@@ -14,6 +14,7 @@ import types
 import pytest
 
 import kiro_crew.subagent as subagent
+from conftest import absent_sysconf
 from kiro_crew.subagent import compute_max_subagents, resolve_max_subagents
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
@@ -99,7 +100,7 @@ def test_example_d_memory_binds(patch_host) -> None:
 
 def test_shared_marginal_cost_binds_on_provider_ceiling(patch_host) -> None:
     # Stage 1: with session-shared marginal costs (mem≈0.05 GB, cpu≈0.25 core),
-    # even a modest 8 GB / 4 core host is no longer RAM-bound — the cap rises to
+    # even a modest 8 GB / 4 core host is not RAM-bound — the cap rises to
     # the provider ceiling (hard_cap) instead of the legacy floor of 3.
     # mem_term = floor((8*0.8)/0.05) = 128; cpu_term = floor((4*0.8)/0.25) = 12;
     # min(128, 12, 16) = 12 (was 3 when the whole shared process was charged).
@@ -134,7 +135,7 @@ def test_floor_never_below_three(patch_host) -> None:
 
 
 def test_hard_cap_below_floor_is_raised_to_three(patch_host) -> None:
-    # A misconfigured subagent_auto_max < 3 no longer drops the cap below 3:
+    # A misconfigured subagent_auto_max < 3 does not drop the cap below 3:
     # compute_max_subagents enforces a hard floor of 3 (the loader also clamps
     # subagent_auto_max up to 3, but compute defends independently).
     patch_host(174.7, 48)
@@ -443,9 +444,9 @@ class TestQueuedDepthWiring:
 class TestQueuedIdentityRoundTrip:
     """A queued member must START under the id its caller was handed.
 
-    Regression: spawn() used to return a throwaway ``q<n>`` sentinel for any
-    spawn that hit the stagger/concurrency gate, and _drain_queue minted a FRESH
-    uuid when it actually started the agent. With the default 2s stagger that is
+    Without this, spawn() returns a throwaway ``q<n>`` sentinel for any
+    spawn that hits the stagger/concurrency gate, and _drain_queue mints a FRESH
+    uuid when it actually starts the agent. With the default 2s stagger that is
     every wave member after the first, so ``spawn_run``'s printed wave roster
     listed one real id plus N placeholders no agent ever had — the inline
     SubagentRunCard, which resolves a wave by matching those ids against live
@@ -826,7 +827,12 @@ class TestMacosMemoryProbe:
     def test_computes_available_gb_from_pages(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
-        monkeypatch.setattr(sub.os, "sysconf", lambda _n: 16384)  # 16 KiB pages
+        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            sub.os,
+            "sysconf",
+            lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n),  # 16 KiB pages
+        )
         monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: 200000)
         expected = round(200000 * 16384 / (1024 ** 3), 2)
         assert sub._macos_available_memory_gb() == pytest.approx(expected, abs=0.01)
@@ -834,22 +840,32 @@ class TestMacosMemoryProbe:
     def test_none_page_count_fails_open(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
-        monkeypatch.setattr(sub.os, "sysconf", lambda _n: 16384)
+        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            sub.os, "sysconf", lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n)
+        )
         monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: None)
         assert sub._macos_available_memory_gb() == -1.0
 
     def test_zero_page_count_fails_open(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
-        monkeypatch.setattr(sub.os, "sysconf", lambda _n: 16384)
+        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            sub.os, "sysconf", lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n)
+        )
         monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: 0)
         assert sub._macos_available_memory_gb() == -1.0
 
     def test_sysconf_error_fails_open(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
-        def _boom(_n):
-            raise ValueError("SC_PAGE_SIZE unavailable")
+        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
+
+        def _boom(n):
+            if n == "SC_PAGE_SIZE":
+                raise ValueError("SC_PAGE_SIZE unavailable")
+            return real_sysconf(n)
 
         monkeypatch.setattr(sub.os, "sysconf", _boom)
         assert sub._macos_available_memory_gb() == -1.0
@@ -857,7 +873,10 @@ class TestMacosMemoryProbe:
     def test_nonpositive_page_size_fails_open(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
-        monkeypatch.setattr(sub.os, "sysconf", lambda _n: 0)
+        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            sub.os, "sysconf", lambda n: 0 if n == "SC_PAGE_SIZE" else real_sysconf(n)
+        )
         # _macos_vm_reclaimable_pages must not even be consulted
         monkeypatch.setattr(
             sub, "_macos_vm_reclaimable_pages", lambda: pytest.fail("should not run")
@@ -868,10 +887,10 @@ class TestMacosMemoryProbe:
 class TestQueuedSpawnParamsPreserved:
     """A queued spawn must drain with ALL its spawn() kwargs intact.
 
-    The queue previously stored only (task, parent, agent, max_turns, cwd), so a
-    drained spawn silently lost approval_mode / silent / model / allowed_tools /
-    bare — an auto (headless) spawn hit the deny-by-default gate and a silent
-    spawn started emitting output.
+    Storing only (task, parent, agent, max_turns, cwd) would make a drained
+    spawn silently lose approval_mode / silent / model / allowed_tools /
+    bare — an auto (headless) spawn would hit the deny-by-default gate and a silent
+    spawn would start emitting output.
     """
 
     def test_drain_forwards_all_spawn_kwargs(self) -> None:
@@ -912,9 +931,9 @@ class TestQueuedSpawnParamsPreserved:
 class TestForceReapDrainsQueue:
     """_force_reap frees a slot; it must pump the queue so a queued spawn starts.
 
-    Previously _force_reap decremented _running_count but never called
-    _drain_queue, so queued spawns were stranded until an unrelated agent
-    finished normally or a new spawn arrived.
+    Without the pump, _force_reap would decrement _running_count but never call
+    _drain_queue, so queued spawns stay stranded until an unrelated agent
+    finishes normally or a new spawn arrives.
     """
 
     @pytest.mark.asyncio

@@ -95,11 +95,11 @@ _DIR_SLUG_STRIP_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # `core.hooksPath` sink. A NON-DIRECTORY, non-replaceable OS device: git finds no
 # `post-checkout` under it and there is no directory anyone could drop one into.
 #
-# Two earlier shapes were both wrong. An in-repo sentinel
+# Two other shapes are unsafe. An in-repo sentinel
 # (`.git/kirocrew-no-hooks`) is resolved relative to the repo, so whoever prepared
 # the checkout could create it and put `post-checkout` inside — the suppression
-# became the execution vector. A gateway-owned `mkdtemp` directory moved the path
-# out of the repo but left a same-uid, process-lifetime directory that a
+# becomes the execution vector. A gateway-owned `mkdtemp` directory moves the path
+# out of the repo but leaves a same-uid, process-lifetime directory that a
 # compromised agent could chmod and populate between calls. `os.devnull` has
 # no such window and needs no bookkeeping.
 _HOOKS_SINK = os.devnull
@@ -455,10 +455,10 @@ def _claim_branch(root: str, branch: str, base_sha: str) -> bool:
 
     The empty old-value argument means "the ref must not exist", so git's ref
     lock decides the winner: exactly one of N concurrent requests for the same
-    branch gets a zero exit. That replaces the earlier check-then-create
-    (``_branch_head`` followed by ``worktree add -b``), where two requests could
-    both observe the branch as absent and the loser's cleanup would then delete
-    the winner's branch and working tree.
+    branch gets a zero exit. A check-then-create (``_branch_head`` followed by
+    ``worktree add -b``) cannot do this: two requests could both observe the
+    branch as absent, and the loser's cleanup would then delete the winner's
+    branch and working tree.
 
     A True return is also this request's PROOF OF CREATION: only the claimant may
     later delete the branch.
@@ -684,8 +684,8 @@ def _match_allowed_root(candidate: str, roots: list[str]) -> str | None:
     Returns the value FROM ``roots`` (a server-held slot project), never the
     caller's string — every filesystem operation downstream then runs on a path
     the server chose, which is both the point of the barrier and why CodeQL's
-    "uncontrolled data used in path expression" no longer applies: the request
-    value is used for comparison only.
+    "uncontrolled data used in path expression" does not apply: the request value
+    is used for comparison only.
 
     ``candidate`` must be normalized by the caller. Comparison goes through
     ``os.path.normcase`` because Windows paths are case-insensitive and

@@ -5,6 +5,12 @@ The cross-platform process / signal / file-lock / metrics behavior is routed
 through `kiro_crew.platform_compat`, so macOS + Linux behavior is unchanged and
 the same code path also runs on Windows.
 
+Existing Memory V1 members remain usable on native Windows. New members require
+private Memory V2, so creation and explicit V1-to-V2 setup refuse before writing
+private files on a native Windows gateway. Use a WSL/Linux gateway with Crew's
+namespace sandbox and a supported member backend for those operations. Viewing
+and managing an already-owned V2 store remains available from the owner dashboard.
+
 ## Desktop installer
 
 CI's Windows lane (`build-windows.yml`) builds a Windows desktop app: an NSIS
@@ -70,6 +76,10 @@ Current status:
   Kiro Crew logo and ghost family in the native NSIS sidebar, and intermediate
   pages retain a compact branded header. Buttons, progress, install-mode copy,
   keyboard behavior, and localization remain the standard Windows experience.
+  On a fresh install, the Finish page also says that the default Kiro agent
+  needs Kiro CLI, names `kiro-cli login`, and links to the official external
+  setup guide before offering to launch Kiro Crew. The installer performs
+  neither prerequisite step. Auto-updates still skip this page.
   Native page boundaries use a short Win32 alpha-blended cross-fade and honor
   Windows' client-area animation setting. The fade contains no timer-driven
   bitmap swap or UI-thread sleep, so extraction keeps the native progress path;
@@ -116,17 +126,59 @@ Current status:
   palette remains centered on the window, and native minimize/maximize/close
   controls remain on the right.
 - **Precompiled Windows gateway startup** — packaging traces the real
-  `kiro_crew.cli_server` import after pruning and ships checked-hash bytecode for
+  `kiro_crew.cli_server` import after pruning and ships hash-based (unchecked) bytecode for
   that import closure beside its sources. Windows consumes those caches directly,
   avoiding the thousand-file cache-population burst that otherwise overlaps
   Defender's post-install scanning. macOS and Linux still redirect bytecode out
   of the signed/read-only app tree, and the `-I` isolated helpers that ignore that
-  redirect carry `-B` instead. The loading screen retains its extended
+  redirect carry `-B` instead. The Windows caches are **unchecked**-hash,
+  not checked. Both modes ignore mtime, which is the property that survives
+  extraction restamping the sources, but a checked-hash pyc makes the loader read
+  and hash each `.py` in *addition* to reading the `.pyc` — measured at 43.55 MB
+  and 1639 extra cold file opens per boot, a median 12.5 s on a cold file cache.
+  The macOS whole-tree caches remain checked-hash: a separate mechanism that does
+  not show this cost. The loading screen retains its extended
   Windows handoff window as a slow-machine fallback; a child exit or spawn error
-  still fails immediately and includes the launch-log cause. CI starts the
-  just-installed bundled interpreter against an isolated data home and requires
-  `/api/ready` within 30 seconds, so both the packaged caches and the full gateway
-  handoff are covered rather than only a synthetic import benchmark.
+  still fails immediately and includes the launch-log cause.
+  `.github/scripts/test-windows-installer.ps1` starts the just-installed
+  bundled interpreter against an isolated data home and requires `/api/ready`
+  within 30 seconds, covering both the packaged caches and the full gateway
+  handoff. **This runs on every qualifying PR.** `build.yml`'s installer job
+  bundles a real python-build-standalone runtime carrying the wheel `build-wheel`
+  produced, so the script's gateway leg has an interpreter to start and the job
+  no longer passes `-SkipGatewayValidation`. `KIROCREW_KIRO_BIN` points at the
+  fake ACP backend inside that same payload, so readiness needs no model and no
+  sign-in. The job also enforces the native installer's performance ceiling
+  against a real payload rather than a stub, and its install-location contract.
+- **The signed-artifact smoke runs NIGHTLY, not per PR.**
+  `build-windows.yml`'s `Smoke-install Windows installer (x64)` job downloads the
+  installer that workflow just built, installs it silently on a clean
+  `windows-latest` runner, and runs `scripts/smoke-windows-install.ps1`: it
+  asserts the uninstall registration and the `InstallLocation` in its paired
+  install-info key (`<hive>\Software\<GUID>`, which is where electron-builder
+  writes it and where its updater reads it back), that the install
+  claimed an owned subdirectory rather than the pre-existing directory it was
+  pointed at, that a Start Menu shortcut targets the executable THIS install
+  wrote, that the bundled CLI runs, that the installed gateway answers
+  `/api/health`, and that a silent uninstall removes the registration, the
+  install-info key and the tree. `build-windows.yml` is `workflow_call`-only from `nightly.yml` and
+  `release.yml` plus a `workflow_dispatch` packaging probe, so this leg costs a
+  PR nothing and a packaging change that only breaks a real install is caught by
+  the next nightly — or before merge by dispatching that probe. There is **no
+  `PATH` edit to check**: the installer makes none, so the CLI is exercised at
+  `resources\backend-dist\kirocrew-backend\bin\kirocrew.cmd` rather than by name.
+- **The fail-closed sandbox opt-in contract IS checked per PR.**
+  `test/test_windows_fail_closed_optin.py` runs on `windows-latest` in the
+  `backend-test-windows` shards and again in a dedicated
+  `Windows Fail-Closed Sandbox Contract` job that runs it by node id and greps
+  the pass count, so a silent skip cannot go green. It boots a real gateway
+  against the packaged fake ACP backend on a home with no `config.json` and a
+  host with no `~/.kiro/settings/amazon-internal.json`, requires one session and
+  one prompt turn to complete, and separately requires an unclassified spawn to
+  fail closed and the same spawn to run once
+  `agent.sandbox_allow_unsandboxed_exec=true` is on disk. See
+  [e2e-gate.md](../ci/e2e-gate.md) for how the distribution and contract legs
+  divide the work.
 
 The source install below remains the fully supported path.
 
@@ -135,7 +187,7 @@ The source install below remains the fully supported path.
 | Tool | Why | Get it |
 |------|-----|--------|
 | **Git for Windows** | clone the repo | https://git-scm.com/download/win |
-| **kiro-cli** | the agent backend (ACP); the first dashboard launch can install it | Kiro Crew setup page or kiro-cli's native Windows release |
+| **kiro-cli** | the default agent backend (ACP); install and sign in separately | https://kiro.dev/cli/ |
 | **Python 3.12-3.13** | the venv runtime. `python_requires` is `>=3.12` and 3.13 is in the supported range, but **3.12 is the tested Windows runtime** (it is what the Windows CI shard runs, and numpy 1.x ships no 3.13 Windows wheel) | https://python.org (install user-scoped), or `winget install Python.Python.3.12` |
 | **Node.js** (optional) | builds the full React dashboard; without it the gateway serves the prebuilt bundle | `winget install OpenJS.NodeJS.LTS` |
 
@@ -202,11 +254,12 @@ kirocrew gateway
 
 Open the dashboard URL printed by the gateway. On first launch, Kiro Crew checks
 the **Windows gateway host** for a runnable and authenticated Kiro CLI. If it is
-missing, choose **Install Kiro CLI** to download and run the fixed official
-PowerShell installer; if it is signed out, choose **Sign in to Kiro** and
-complete the device-code flow in the browser. The dashboard opens automatically
-after `kiro-cli whoami` succeeds. This setup runs on the gateway machine, which
-may be different from the computer running the browser.
+missing, follow the link to the official Kiro CLI setup guide and install it
+yourself; if it is signed out, run `kiro-cli login` (or the organization SSO
+command shown by the setup page) yourself. Kiro Crew does not download a remote
+installer or start a login process. The dashboard opens automatically after its
+read-only `kiro-cli whoami` probe succeeds. Run the prerequisite steps on the
+gateway machine, which may be different from the computer running the browser.
 
 The per-user Kiro CLI install under `%LOCALAPPDATA%\Kiro-Cli` is discovered
 independently of the gateway's inherited `PATH`. Installing it while the desktop
@@ -236,28 +289,43 @@ own sandbox, so Kiro Crew delegates the default chat backend, model list, accoun
 identity and usage reads to it automatically. A fresh desktop install therefore
 does **not** need a config edit before the first chat.
 
-This is deliberately not a Windows-wide bypass. Scripts, hooks, third-party ACP
-backends and other commands without a proven internal sandbox still fail closed.
-To run those paths without an OS sandbox, explicitly opt in at
-`%USERPROFILE%\.kiro\crew\config.json`:
+Everything else — scripts, hooks, third-party ACP backends, app backends, MCP
+probes and the `gh`/`glab` provider CLIs — has no proven internal sandbox to
+delegate to, and on Windows there is nothing installable that would give Kiro Crew
+one: no Linux user namespace, no macOS `sandbox-exec`. **Those paths therefore run
+UNCONFINED by default on Windows.** That is this platform's documented default,
+not a bypass you enabled and not a failure. It means an agent-driven subprocess
+can read your home directory, including `.aws` and `.ssh`, with no OS
+confinement; Kiro Crew still scrubs credential environment variables and records
+every such spawn in the audit log, but it cannot stop a hostile repo or document
+from reading files.
+
+To refuse them instead — accepting that MCP servers, app backends, script crons,
+hooks and the Papyrus compiler will report a sandbox error — declare the opt-out
+at `%USERPROFILE%\.kiro\crew\config.json`:
 
 ```json
-{ "agent": { "sandbox_allow_unsandboxed_exec": true } }
+{ "agent": { "sandbox_allow_unsandboxed_exec": false } }
 ```
 
-**`kirocrew setup` offers this for non-Kiro subprocesses.** Because Windows has no OS-level
-sandbox backend, the wizard detects that and asks once — stating that agent
-subprocesses will be able to read your home directory, including `.aws` and
-`.ssh`, with no OS confinement. It defaults to **no** and writes the key only if
-you answer yes, so the choice stays yours; the JSON above remains the manual
-equivalent if you skipped the prompt or run setup non-interactively. Answering no
-(or pressing Enter) leaves the fail-closed posture in place, and the wizard tells
-you how to opt in later.
+A declared value always wins over the platform default, in either direction, and
+a `sandbox.min_level` governance floor overrides both fleet-wide.
 
-Setting it means agent subprocesses run with your own user privileges, which is the
-same posture as running the tool yourself in a shell. Config is read live, so no
-gateway restart is needed. Without it, the affected paths answer a clear 422 naming
-the remedy rather than failing obscurely.
+**`kirocrew setup` surfaces this decision.** Because Windows has no OS-level
+sandbox backend, the wizard detects that and states the exposure once, then offers
+to refuse those spawns. It defaults to **no** — leaving the platform default in
+place — and writes nothing unless you answer yes, so the choice stays yours and
+the key stays undeclared. The JSON above is the manual equivalent if you skipped
+the prompt or run setup non-interactively; a non-interactive run still prints the
+notice, so an unattended install is told what its posture is.
+
+`kirocrew doctor` reports the effective state under **Sandbox** — whether these
+spawns are refused, unconfined because you declared it, or unconfined because of
+the platform default.
+
+Running unconfined means agent subprocesses run with your own user privileges,
+which is the same posture as running the tool yourself in a shell. Config is read
+live, so no gateway restart is needed after a change.
 
 **The model picker and the credit pill follow chat's Kiro delegation.**
 `/api/models`, the credit pill's `whoami` identity fetch and its `/usage` scrape
@@ -282,21 +350,22 @@ while the other 503s. Concretely:
 | Project skills (`<project>/.kiro/skills`) | not yet — Python on Windows does not expose handle-relative directory traversal that can reject every reparse point before resolving it. Catalog, consent and loading fail closed before canonicalizing the project path, preventing a raced junction to a UNC share from initiating SMB authentication. Global and installed skills continue to work. |
 | Theme-pack install, detail, assets, overlays, topbars, and removal | works — opened pack files are contained with `GetFinalPathNameByHandleW`; descriptor resolution fails closed instead of trusting a pathname-only check |
 | LLM cron jobs (the `message` kind) | works |
-| Script cron jobs | need the `agent.sandbox_allow_unsandboxed_exec` opt-in above — they run through `wrap_argv`, which fail-closes where no OS sandbox backend exists. Without it the job fails with a message naming that setting (it no longer raises an uncaught error) |
+| Script cron jobs | run unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse them) — they run through `wrap_argv`, which permits them on Windows because no backend is installable. With that opt-out declared the job fails with a message naming the setting (it no longer raises an uncaught error) |
 | Command cron jobs (`sh -c "…"`) | not supported on Windows — the stored command is vetted under POSIX-sh semantics, and Windows ships no shell whose language matches: cmd.exe is not POSIX at all, and Git-for-Windows's `sh.exe` is bash and performs brace expansion that hides `cat ~/.a{w,w}s/credentials` from the vet. The job fails-closed with an explanation. Use a **script cron** or an LLM `message` cron on this platform |
-| Script hooks (Settings → Hooks) | need the `agent.sandbox_allow_unsandboxed_exec` opt-in above (like script crons — the hook command routes through `wrap_argv`, which fail-closes where no OS sandbox backend exists; without it the hook returns that message as its `error`). With the opt-in they run in **cmd.exe** language: a hook `command` runs as `%ComSpec% /c "<command>"`, so read the context env vars as `%KIROCREW_HOOK_EVENT%` / `%KIROCREW_HOOK_CONTEXT%` (not `$VAR`), and group arguments with double quotes only (cmd.exe gives `'…'` no meaning). The line reaches cmd.exe verbatim, so a quoted interpreter path with a space works. A hook authored on macOS/Linux is not portable and must be rewritten |
+| Script hooks (Settings → Hooks) | run unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse them) (like script crons — the hook command routes through `wrap_argv`, which permits them on Windows because no backend is installable; with that opt-out declared the hook returns that message as its `error`). They run in **cmd.exe** language: a hook `command` runs as `%ComSpec% /c "<command>"`, so read the context env vars as `%KIROCREW_HOOK_EVENT%` / `%KIROCREW_HOOK_CONTEXT%` (not `$VAR`), and group arguments with double quotes only (cmd.exe gives `'…'` no meaning). The line reaches cmd.exe verbatim, so a quoted interpreter path with a space works. A hook authored on macOS/Linux is not portable and must be rewritten |
 | Pull-request source drawer provider fetch/check/resolve | not yet — and for a different reason than it used to be. The provider-CLI **trust** check now works here (see Issue Radar below), but the drawer does not share Issue Radar's spawn: it keeps its own async, sandbox-routed one (`source_providers._run_json`), which refuses on Windows because no OS sandbox backend exists. So the blocker is the sandbox, not the binary check |
-| Issue Radar | works — its `gh` spawn is not sandbox-routed, so the trust check is the only gate, and that is answered by reading the binary's Windows ACL (`kiro_crew.windows_acl`) in place of the POSIX `st_uid` + write-bit walk, which reports nothing on this platform. Refused when any principal outside `{you, SYSTEM, Administrators, TrustedInstaller}` can replace the binary or a parent directory, when the security descriptor is unreadable, or when the gateway token is **elevated** (an elevated gateway spawns elevated children, which makes the walk vacuous). GitHub only on this platform unless `glab` is installed. **If a `gh` you trust is refused**, the override variables (`KIROCREW_ISSUE_RADAR_GH`, `KIROCREW_GH_BIN`) re-enter the same check rather than bypassing it, so the recourse is to install `gh` somewhere only you and the system can write — a per-user `%LOCALAPPDATA%` install is accepted — or to file an issue quoting the refusal, which names the offending principal or the ACE type it could not evaluate |
+| Issue Radar | works — its `gh` spawn is not sandbox-routed, so the trust check is the only gate, and that is answered by reading the binary's Windows ACL (`kiro_crew.windows_acl`) in place of the POSIX `st_uid` + write-bit walk, which reports nothing on this platform. Refused when any principal outside `{you, SYSTEM, Administrators, TrustedInstaller}` can replace the binary or a parent directory, or when the security descriptor is unreadable. An **elevated** gateway (the built-in `Administrator` account, or a "Run as administrator" launch) is not refused for being elevated: Windows has no OS sandbox in this codebase, so the agent's shell already holds the gateway's full token and a refusal would remove the feature without removing any exposure — the same ACL walk applies, keyed on the gateway user's SID. GitHub only on this platform unless `glab` is installed. **If a `gh` you trust is refused**, the override variables (`KIROCREW_ISSUE_RADAR_GH`, `KIROCREW_GH_BIN`) re-enter the same check rather than bypassing it, so the recourse is to install `gh` somewhere only you and the system can write — a per-user `%LOCALAPPDATA%` install is accepted — or to file an issue quoting the refusal, which names the offending principal or the ACE type it could not evaluate |
 | Spec Builder | works, except **Duplicate** — crash-safe copy publication pins a staging directory and uses the platform's atomic no-replace rename (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS). Windows provides neither that native contract nor CPython's directory-descriptor operations, so the backend reports the capability as unavailable and the dashboard omits Duplicate instead of falling back to a check-then-rename race or a junction-prone path write. Approval, per-task runs, labels, archive/restore, chat, and whole-plan execution work normally |
 | Code Review Sage | not yet — the provider-CLI trust check now passes, but its review worker hands the session `python3 sage_lib/…` commands and `python3` is not an interpreter on Windows (the name resolves to the Microsoft Store app-execution alias, or to nothing). It refuses with that reason rather than starting a review that produces no result |
 | Browser automation (`playwright-cli`) | works (`npm install -g @playwright/cli@latest`, needs Node.js 20 or newer) |
+| `kirocrew pod` (isolated worktree test gateways) | works, through **Task Scheduler**, unelevated. A pod is a per-user disposable gateway, so `sc.exe` is the wrong tool twice over (it needs `SeCreateServiceNamePrivilege` and installs a machine-wide LocalSystem service); `schtasks.exe` creates a task in your own namespace with no elevation, matching `systemd --user` and launchd's `gui/<uid>`. A task carries no environment block, so the action is a generated `.cmd` wrapper under `KIROCREW_POD_ENV_DIR` that pins the pod plane and re-enters `kirocrew pod _run <name>` — a plane path containing a double quote or a newline is refused at `pod up`, since cmd.exe cannot quote it. The memory and fork-bomb ceiling IS enforced here, by a Job object attached to the gateway while it is still suspended (the same `resource_limits` config and the same seam the agent-subprocess path uses), but it is not parity with the Linux cgroup: the process bound counts processes where `TasksMax` counts threads, and there is no CPU cap. Two limits remain, neither of them silent: **no restart on crash** (Task Scheduler retries a failed *start*, not a non-zero exit, so a crashed pod stays down; the wrapper records the boot's exit code and `pod ls` / `pod up` read it as the crash signal), and **`pod api` refuses** because its authenticated request travels over the pod's private AF_UNIX dashboard socket with no TCP fallback and CPython here has no `AF_UNIX` — use `pod token` plus your own client against the loopback port. `pod up/down/ls/status/token/url/logs/prune/provision/scenarios` all work. Two Windows-specific mechanics worth knowing: `schtasks` output is **localized**, so the backend never parses it (liveness, the pid and the last result come from files the supervised process itself writes, and `schtasks` is used only where its exit code is the answer), and Windows has no `exec`, so the gateway is supervised as the wrapper's child with its pid plus creation-time identity recorded — that is what keeps `port_owner`'s ownership proof honest here. If `pod up` reports that your user cannot create a scheduled task, that is Group Policy, a disabled `Schedule` service, or a principal without `TASK_CREATE`; there is no non-admin workaround |
 | Vector memory / embeddings | works — embeddings run **in-process** through the vendored llama-cpp-python (`_vendor/llama_cpp_libs/win_amd64`), which loads the Qwen3-Embedding-0.6B GGUF from `~/.kiro/crew/models`. No remote endpoint, no Docker and no Ollama server is involved on any platform |
 | STT (whisper / optional cloud transcription) | works |
-| Voice reply (Piper TTS) | not yet — upstream rhasspy/piper ships no Windows binary; Polly (optional) works if the `aws` CLI is present **and** the `agent.sandbox_allow_unsandboxed_exec` opt-in above is set — the `aws polly` spawn routes through `wrap_argv`, which fail-closes where no OS sandbox backend exists. Without it synthesis returns no audio and the log names that setting |
+| Voice reply | works out of the box on the default `system` provider: it drives `System.Speech` through Windows PowerShell 5.1, needs no install, and deliberately does NOT route through `wrap_argv`, so the missing sandbox backend does not block it. `piper` and `polly` DO route through `wrap_argv` and therefore run unconfined under this platform's default; declare `sandbox_allow_unsandboxed_exec=false` and synthesis returns no audio, with the log naming that setting. `pip install piper-tts` does ship a Windows x64 wheel, so piper itself is installable |
 | SSH tunnel (`kirocrew cloud` remote dashboard) | not yet — needs the OpenSSH client on `PATH` and a signal-handling audit |
 | MCP server tool listing (dashboard MCP page, `kirocrew doctor`) | **built-in servers work, no opt-in** — `kirocrew-core` / `-cron` / `-computer` are probed for real: their command line is derived entirely inside the package (never user-config text), so the first-party carve-out spawns the handshake probe unconfined (env-scrubbed, SEL-audited as `unconfined`) even with no sandbox backend. When that probe cannot run (a transient sandbox failure, a governance sandbox floor, or a customized command for the server), the listing falls back to reading the package's own tool declaration and logs a WARNING noting that `ok` then means "declared" rather than "handshake succeeded". A **third-party** server has no declaration to read and never gets the carve-out, so its listing needs the `agent.sandbox_allow_unsandboxed_exec` opt-in — its binary is named by config and spawning it is what the sandbox exists to confine. The third-party server itself is unaffected: kiro-cli launches it from the agent config without this probe, so its tools still work in chat |
 | MCP gateway (opt-in, OFF by default) | works — a named-pipe transport replaces the AF_UNIX socket, and the peer check uses `GetNamedPipeClientProcessId` + a SID comparison in place of `SO_PEERCRED`. Still opt-in: set `mcp_gateway.enabled` to turn it on |
-| Papyrus (LaTeX editor, opt-in builtin) | works, **but compiling and git need the `agent.sandbox_allow_unsandboxed_exec` opt-in above** — unlike official Kiro, these processes have no proven internal sandbox, so `wrap_argv` keeps the no-backend fail-closed policy. Without it, compile and clone/commit/push/pull answer a clear 422 (`compiler_sandbox_unavailable` / `git_sandbox_unavailable`) naming the remedy rather than a bare "internal error". The managed Tectonic compiler is Windows-pinned (`x86_64-pc-windows-msvc`); Windows-on-ARM has no upstream asset and keeps the manual install path |
+| Papyrus (LaTeX editor, opt-in builtin) | works, and compiling and git run unconfined under this platform's default — unlike official Kiro, these processes have no proven internal sandbox, so `wrap_argv` applies the ordinary Windows no-backend policy, which permits them. With `sandbox_allow_unsandboxed_exec=false` declared, compile and clone/commit/push/pull answer a clear 422 (`compiler_sandbox_unavailable` / `git_sandbox_unavailable`) naming the remedy rather than a bare "internal error". The managed Tectonic compiler is Windows-pinned (`x86_64-pc-windows-msvc`); Windows-on-ARM has no upstream asset and keeps the manual install path |
 | Computer use — **reading** (`computer_list_apps`, `computer_get_state`) | works, still behind the operator's one keystone opt-in (Settings → Computer Use). Reads the UI Automation tree of a window and can attach a `PrintWindow` screenshot. Two Windows-specific limits: a **non-elevated gateway cannot see an elevated window** (UIPI, and the secure desktop is unreachable to any application — a security property, not a gap), and a window drawn on a swapchain surface **cannot be captured**, so WindowsTerminal returns a tree with no screenshot rather than a blank image. Walking is also markedly slower than macOS — a large Chromium window costs hundreds of milliseconds at the node budget — so raise `max_tree_nodes` deliberately |
 | Computer use — **input** (click, drag, type, key, set value, scroll, action) | works, behind the same keystone opt-in. **Element-addressed actions touch neither your cursor nor your focus** — they go through UI Automation control patterns, so the provider performs them inside the target application; prefer them, and they are what `click_method: "auto"` resolves to. The exceptions are forced by the platform: Windows has no per-process input delivery (no `CGEventPostToPid` analogue), so `type_text` / `press_key` TAKE your keyboard focus (the result says so), and a coordinate click needs `click_method: "global"` named explicitly because it moves your real cursor — `auto` refuses to resolve onto it. Every pointer gesture is confined to the authorized window first, comparing top-level handles rather than pids (one broker process fronts many packaged apps), and a drag confines every point of its path since the release is where a drop lands |
 
@@ -359,13 +428,19 @@ It runs **twice**, once before `sqlite3.connect` and once after. The first call
 is what stops the schema migrations running against a file another local user
 can still write; the second covers whatever SQLite has just created.
 
-The Windows cost is up to 11 `icacls` spawns per init — one for the directory
-plus one per file on each of the two passes, and a file that does not exist
-still spawns (icacls exits non-zero and the caller warns). That is more than it
-sounds and still cheap in context: once per workspace per process, beside the
-`sqlite3.connect`, the migrations and the FAISS index load already in that
-function — and `context.get_memory_for` caches the store and is reached from a
-worker thread, not the gateway event loop.
+The Windows cost is up to 11 in-process DACL operations per init — one for the
+directory plus one per file on each of the two passes; a file that does not
+exist is skipped by an existence check rather than paid for. Each per-file
+write costs roughly 0.24 ms. The directory write is priced differently: its
+inheritable grants propagate to every descendant object, so a directory whose
+DACL does not yet match pays about 0.24 ms per object in the tree — seconds on
+a large data home — once, to repair it. On every later boot the descriptor
+already matches and the write is skipped after an O(1) probe
+(`windows_acl.owner_only_dacl_matches`). That is cheap in context: once per
+workspace per process, beside the `sqlite3.connect`, the migrations and the
+FAISS index load already in that function — and `context.get_memory_for`
+caches the store and is reached from a worker thread, not the gateway event
+loop.
 
 It is fail-soft (warn, keep going), which is the contract `restrict_to_owner`
 documents for its callers: memory being unavailable is a supported degraded
@@ -429,7 +504,7 @@ The scope is deliberately only the signal-0 *probe* form. The tree contains many
 raw POSIX call sites — `fcntl`, `resource`, `os.killpg`, `pty`, `termios` — and
 nearly all are legitimately POSIX-gated implementation detail, so auditing them
 here would bury the signal in noise; those are governed by the shim table in
-`AGENTS.md` and by review. What makes signal-0 worth its own gate is that getting
+[platform-compat](../system-specs/common/platform-compat.md) and by review. What makes signal-0 worth its own gate is that getting
 it wrong is destructive rather than merely unavailable, and that the added-line CI
 check cannot see a probe which arrives by a file move or a rebase. This test reads
 the whole tree on every run.
@@ -464,8 +539,9 @@ Two details are load-bearing rather than incidental:
 - **The child is created suspended.** A Job object cannot be an argv prefix, so
   unlike the cgroup wrapper it has to be attached to a live pid — and job
   membership covers a member's *future* descendants only. Attaching to an
-  already-running `kiro-cli` would leave a window in which it could spawn an MCP
-  server that escapes the ceiling. Both ACP spawn sites therefore pass
+  already-running child would leave a window in which it could spawn descendants
+  that escape the ceiling. Both ACP spawn sites and the source-monitor provider
+  CLI transport therefore pass
   `creationflags |= CREATE_SUSPENDED`, apply the job, then call
   `platform_compat.resume_process_main_thread`. A process created suspended has
   executed no instructions, so it provably has no descendants: the window is
@@ -478,6 +554,27 @@ Two details are load-bearing rather than incidental:
   off also means the handle need not be held: a job stays alive while processes
   are assigned to it, so the limits persist after `CloseHandle` and there is no
   handle registry or teardown to get wrong.
+
+Windows pod teardown does not infer a clean stop from the gateway PID record
+vanishing. Before `/End`, it opens an exact handle to the recorded gateway and
+validates that handle's creation identity against the record, then retains exact
+handles for attributed descendants. Toolhelp preserves the PPID on a living
+direct child after its parent exits, so teardown performs a final snapshot of
+the root after it becomes inactive. This catches the reported direct-child race
+when creation follows the pre-signal snapshot and the root exits before the next
+poll; every descendant already retained by exact handle receives the same final
+scan. It does not claim to reconstruct a lineage through an intermediary that
+was never observed and is already gone. A root that cannot be anchored, an
+incomplete snapshot sequence, or a still-live retained handle fails closed: the
+scheduled task and pod HOME are preserved. The refusal distinguishes the two
+kinds of survivor: a process still active at the deadline is reported by pid
+(with its `tasklist` line), while "enumeration failed" is reserved for the case
+where nothing is live but a terminal snapshot never completed. There is no
+token-only fallback in this backend; it is dispatched only on win32, and the
+exact-handle primitives fail closed everywhere else. The existing Job object
+remains a resource ceiling; `KILL_ON_JOB_CLOSE` is still deliberately unset, so
+normal restart semantics do not change.
+
 
 Failure modes are asymmetric on purpose. The **ceiling** fails soft — any Win32
 error logs a SECURITY warning and returns `False`, because a missing ceiling must
@@ -511,13 +608,13 @@ branches read `/proc`, `sysctl` or `resource` instead of calling Win32.
 
 Taking `ctypes.POINTER()` is what pins the type, so a struct that is only ever
 instantiated (never pointed at) does not leak — but the distinction is too subtle
-to rely on, and `test_platform_compat.py::TestWin32StructsAreModuleScoped`
+to rely on, and `test_platform_compat.py::TestCtypesStructsAreModuleScoped`
 enforces the blanket rule by parsing each helper's source. That check runs on the
 POSIX fleet too, where the Windows branches never execute.
 
 ## The RSS-recycle ceiling measures real trees on Windows
 
-`session.watchdog_rss_max_mb` (opt-in, `0`/disabled by default) recycles a
+`session.watchdog_rss_max_mb` (default 1536 MiB; `0` disables) recycles a
 non-busy session whose process tree exceeds the ceiling. Its measurement is
 `/proc`-based, so `get_session_rss_mb` measured every tree as 0 MiB on Windows:
 the ceiling an operator had configured could never be reached and no session was
@@ -593,6 +690,6 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
 
 - [README](../../README.md) — quick-start Platforms note
 - [install](install.md) — the build-target table shared with macOS and Linux
-- [AGENTS.md](../../AGENTS.md) — the cross-platform shim table
+- [platform-compat](../system-specs/common/platform-compat.md) — the cross-platform shim table
 - `src/kiro_crew/platform_compat.py` — the cross-platform shim
 - `make.ps1` — the Windows build driver

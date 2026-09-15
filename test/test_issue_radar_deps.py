@@ -1,4 +1,4 @@
-"""Tests for Issue Radar's dependency edges + auto-unlock (issue #5187, M1).
+"""Tests for Issue Radar's dependency edges + auto-unlock.
 
 Four levels, matching how the six existing signals and the other caches are
 tested:
@@ -51,7 +51,7 @@ class DepsCacheStoreTest(unittest.TestCase):
     def test_round_trips(self):
         edges = [{"blocked": 10, "blocker": 5, "source": "native"}]
         nodes = {"5": {"kind": "issue", "state": "open", "title": "blocker"}}
-        store.write_deps_cache(OWNER, REPO, edges, nodes, root=self.root)
+        store.write_deps_cache(OWNER, REPO, edges, nodes, root=self.root, fetched_at=time.time())
         out = store.read_deps_cache(OWNER, REPO, self.root)
         self.assertIsNotNone(out)
         self.assertEqual(out["edges"], edges)
@@ -86,12 +86,15 @@ class DepsCacheStoreTest(unittest.TestCase):
             {"blocked": 10, "blocker": 5, "source": "inferred"},
             {"blocked": 10, "blocker": 5, "source": "native"},
         ]
-        store.write_deps_cache(OWNER, REPO, edges, {}, root=self.root)
+        t0 = time.time()
+        store.write_deps_cache(OWNER, REPO, edges, {}, root=self.root, fetched_at=t0)
         out = store.read_deps_cache(OWNER, REPO, self.root)
         self.assertEqual(out["edges"], [{"blocked": 10, "blocker": 5, "source": "native"}])
 
         # And the reverse append order collapses to the same native edge.
-        store.write_deps_cache(OWNER, REPO, list(reversed(edges)), {}, root=self.root)
+        store.write_deps_cache(
+            OWNER, REPO, list(reversed(edges)), {}, root=self.root, fetched_at=t0 + 1
+        )
         out = store.read_deps_cache(OWNER, REPO, self.root)
         self.assertEqual(out["edges"], [{"blocked": 10, "blocker": 5, "source": "native"}])
 
@@ -102,19 +105,24 @@ class DepsCacheStoreTest(unittest.TestCase):
             {"blocked": 8, "source": "native"},  # missing blocker
             {"blocked": 8, "blocker": 9, "source": "native"},  # the only valid one
         ]
-        store.write_deps_cache(OWNER, REPO, edges, {}, root=self.root)
+        store.write_deps_cache(OWNER, REPO, edges, {}, root=self.root, fetched_at=time.time())
         out = store.read_deps_cache(OWNER, REPO, self.root)
         self.assertEqual(out["edges"], [{"blocked": 8, "blocker": 9, "source": "native"}])
 
     def test_unknown_source_defaults_to_inferred(self):
         store.write_deps_cache(
-            OWNER, REPO, [{"blocked": 2, "blocker": 1, "source": "bogus"}], {}, root=self.root
+            OWNER,
+            REPO,
+            [{"blocked": 2, "blocker": 1, "source": "bogus"}],
+            {},
+            root=self.root,
+            fetched_at=time.time(),
         )
         out = store.read_deps_cache(OWNER, REPO, self.root)
         self.assertEqual(out["edges"][0]["source"], "inferred")
 
 
-# ── store: compare-and-set on fetched_at (#5638) ─────────────────────────────
+# ── store: compare-and-set on fetched_at ────────────────────────────────────
 
 
 class DepsCacheCompareAndSetTest(unittest.TestCase):
@@ -153,13 +161,6 @@ class DepsCacheCompareAndSetTest(unittest.TestCase):
         store.write_deps_cache(OWNER, REPO, self.NEW, {}, root=self.root, fetched_at=now)
         store.write_deps_cache(OWNER, REPO, self.OLD, {}, root=self.root, fetched_at=now)
         self.assertEqual(store.read_deps_cache(OWNER, REPO, self.root)["edges"], self.NEW)
-
-    def test_omitting_fetched_at_defaults_to_now(self):
-        # Same default as _write_labels_cache_unlocked: an unthreaded caller
-        # still writes, stamped at the write moment.
-        before = time.time()
-        store.write_deps_cache(OWNER, REPO, self.NEW, {}, root=self.root)
-        self.assertGreaterEqual(store.read_deps_cache(OWNER, REPO, self.root)["fetched_at"], before)
 
     def _craft_stored(self, edges: list[dict], fetched_at: float) -> None:
         # Written directly, bypassing write_deps_cache, so the test controls
@@ -280,7 +281,7 @@ class DepsCacheCompareAndSetTest(unittest.TestCase):
         # retreat (current-epoch stamp); the sweep's slower rebuild then lands
         # carrying its pre-retreat future stamp. The stamps cannot prove which
         # graph is newer, so the write is neither honoured raw (which would
-        # re-date the older graph fresh — #5638 inside the retreat window) nor
+        # re-date the older graph fresh inside the retreat window) nor
         # rejected (see the discarded-refresh test below): it is persisted with
         # a MAXIMALLY STALE stamp, so the very next TTL check refetches and
         # self-heals with a current-epoch write.
@@ -299,6 +300,74 @@ class DepsCacheCompareAndSetTest(unittest.TestCase):
         out = store.read_deps_cache(OWNER, REPO, self.root)
         self.assertEqual(out["edges"], self.NEW)
         self.assertEqual(out["fetched_at"], healed_at)
+
+    def test_a_sub_slack_retreat_cannot_re_date_an_older_graph_fresh(self):
+        # The same ambiguous quadrant as above, but with a clock retreat
+        # SMALLER than _DEPS_STAMP_FUTURE_SLACK_SEC. The slack exists to
+        # tolerate ordinary clock granularity on a STORED stamp; applying it to
+        # the INCOMING one classified this write as current-epoch, so the
+        # ambiguity branch never fired, the raw comparison honoured the older
+        # sweep's larger stamp, and the read clamped it to "now" — the older
+        # graph replaced the newer one reading FRESH for the whole TTL, which
+        # is the lost update inside a sub-slack retreat window. Any incoming stamp ahead
+        # of the wall clock is therefore treated as ambiguous.
+        post_retreat = time.time()  # the route wrote AFTER the retreat (newer)
+        pre_retreat = post_retreat + 2.0  # sweep's capture, < slack ahead of now
+        store.write_deps_cache(OWNER, REPO, self.NEW, {}, root=self.root, fetched_at=post_retreat)
+        store.write_deps_cache(OWNER, REPO, self.OLD, {}, root=self.root, fetched_at=pre_retreat)
+        raw = json.loads(store.deps_cache_path(OWNER, REPO, self.root).read_text(encoding="utf-8"))
+        self.assertEqual(raw["fetched_at"], 0.0)  # never re-dated fresh
+        out = store.read_deps_cache(OWNER, REPO, self.root)
+        self.assertEqual(out["edges"], self.OLD)  # persisted, not discarded
+        self.assertEqual(out["fetched_at"], 0.0)  # maximally stale → refetch fires
+        # Self-heal: the refetch the 0.0 stamp forces lands by the normal
+        # comparison and restores a real stamp.
+        healed_at = time.time()
+        store.write_deps_cache(OWNER, REPO, self.NEW, {}, root=self.root, fetched_at=healed_at)
+        out = store.read_deps_cache(OWNER, REPO, self.root)
+        self.assertEqual(out["edges"], self.NEW)
+        self.assertEqual(out["fetched_at"], healed_at)
+
+    def test_an_older_pre_retreat_write_cannot_pass_the_fail_open_branch(self):
+        # The fail-open branch exists for a STORED pre-retreat stamp beaten by a
+        # genuine post-retreat write. Applying the future slack to the INCOMING
+        # side let a second PRE-retreat write in through it: with a retreat
+        # beyond the slack and the two captures less than the slack apart, the
+        # older stamp lands under `now + slack` (so it read as current-epoch)
+        # while the newer one lands above it (so it read as future). The branch
+        # then accepted the OLDER graph over the NEWER one and kept its raw
+        # stamp, which the read clamps to "now" — a stale graph reading fresh
+        # for the full TTL, i.e. the lost update with both writes on the far side
+        # of the retreat. Classifying the incoming side strictly (`stamp <= now`)
+        # is what shuts this quadrant: the older write is not current-epoch,
+        # so it falls to the raw comparison and loses to the larger stored stamp.
+        now = time.time()
+        newer_pre_retreat = now + 6.0  # beyond the 5s slack → stored reads future
+        older_pre_retreat = now + 4.0  # captured 2s EARLIER, but still under now+slack
+        self._craft_stored(self.NEW, newer_pre_retreat)
+        store.write_deps_cache(
+            OWNER, REPO, self.OLD, {}, root=self.root, fetched_at=older_pre_retreat
+        )
+        raw = json.loads(store.deps_cache_path(OWNER, REPO, self.root).read_text(encoding="utf-8"))
+        # The newer pre-retreat graph survives, still carrying its own stamp.
+        self.assertEqual(raw["fetched_at"], newer_pre_retreat)
+        self.assertEqual(raw["edges"], self.NEW)
+
+    def test_a_stamp_exactly_at_the_wall_clock_is_current_epoch_not_ambiguous(self):
+        # Boundary of the ambiguity guard: "ahead of the wall clock" is STRICT.
+        # A stamp captured in the same clock tick as the write is ordinary, not
+        # a retreat, so it takes the normal comparison and keeps its real stamp.
+        # Treating equality as ambiguous would persist every same-tick write
+        # maximally stale and force a spurious refetch on the next check. The
+        # clock is frozen so the equality is exact rather than a race.
+        frozen = time.time()
+        self._craft_stored(self.OLD, frozen - 30.0)  # stored: older, current-epoch
+        with mock.patch.object(store.time, "time", return_value=frozen):
+            store.write_deps_cache(OWNER, REPO, self.NEW, {}, root=self.root, fetched_at=frozen)
+        raw = json.loads(store.deps_cache_path(OWNER, REPO, self.root).read_text(encoding="utf-8"))
+        self.assertEqual(raw["fetched_at"], frozen)  # real stamp, not zeroed
+        out = store.read_deps_cache(OWNER, REPO, self.root)
+        self.assertEqual(out["edges"], self.NEW)
 
     def test_a_completed_refresh_is_not_discarded_by_a_clock_retreat(self):
         # Ambiguous quadrant, reading (b): the stored cache is genuinely OLD —
@@ -725,7 +794,7 @@ class DepsHandlerTest(unittest.TestCase):
         fetch.assert_not_called()
 
     def test_a_stale_cache_is_served_immediately_and_revalidated_behind(self):
-        # Serve-stale-revalidate-behind (issue #5612): a stale cache is returned
+        # Serve-stale-revalidate-behind: a stale cache is returned
         # RIGHT NOW with stale=true and the ~11s rebuild is moved OFF the request
         # path, so the handler must NOT await fetch_dependency_edges inline.
         stale = {"edges": [], "nodes": {}, "fetched_at": time.time() - 100000}
@@ -770,7 +839,7 @@ class DepsHandlerTest(unittest.TestCase):
 
     def test_the_route_stamps_fetch_start_not_write_completion(self):
         # The stamp the route passes must predate the fetch, not record when
-        # the write happened — write-time stamping is the #5638 defect.
+        # the write happened — write-time stamping is the lost-update defect.
         seen: dict[str, float] = {}
 
         def fetch(owner, repo, issues, hints):
@@ -881,7 +950,7 @@ class DepsHandlerTest(unittest.TestCase):
         fetch.assert_not_called()
 
 
-# ── /deps serve-stale background revalidation (issue #5612) ───────────────────
+# ── /deps serve-stale background revalidation ───────────────────
 
 
 def _gh_key():
@@ -966,7 +1035,7 @@ class DepsBackgroundRefreshTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(app[routes._DEPS_REFRESH_TASKS_APP_KEY]), 0)
 
     async def test_a_slow_rebuild_cannot_overwrite_a_newer_one(self):
-        # GPT round 1: a stale GET starts background rebuild A; an edge changes;
+        # A stale GET starts background rebuild A; an edge changes;
         # refresh=1 starts synchronous rebuild B. B writes the fresh graph, then
         # the slower A lands on top with its OLDER edges -- and because
         # write_deps_cache stamps fetched_at at WRITE time, those older edges are
@@ -1299,6 +1368,7 @@ class SweepDepUnblockTest(unittest.IsolatedAsyncioTestCase):
             [{"blocked": 2201, "blocker": 5, "source": "native"}],
             {"5": {"kind": "issue", "state": blocker_state, "title": "blocker"}},
             root=self.root,
+            fetched_at=time.time(),
         )
 
     async def test_fires_once_when_the_last_blocker_closes(self):
@@ -1346,6 +1416,7 @@ class SweepDepUnblockTest(unittest.IsolatedAsyncioTestCase):
                 "6": {"kind": "issue", "state": "open", "title": ""},
             },
             root=self.root,
+            fetched_at=time.time(),
         )
         client = self._client()
         await self._sweep(client)
@@ -1365,6 +1436,7 @@ class SweepDepUnblockTest(unittest.IsolatedAsyncioTestCase):
                 "6": {"kind": "issue", "state": "open", "title": ""},
             },
             root=self.root,
+            fetched_at=time.time() + 1,
         )
         woken, wake = await self._sweep(client)
         self.assertEqual(woken, {})
@@ -1464,7 +1536,7 @@ class SweepDepsRefreshTest(unittest.TestCase):
 
     def test_the_sweep_stamps_before_the_snapshot_read_not_write_completion(self):
         # The stamp the sweep passes must predate its issues-snapshot read (the
-        # graph's scope input) — write-time stamping is the #5638 defect, and a
+        # graph's scope input) — write-time stamping is the lost-update defect, and a
         # post-snapshot stamp lets a stale-scoped rebuild outrank a fresher one.
         seen: dict[str, float] = {}
 
@@ -1484,7 +1556,7 @@ class SweepDepsRefreshTest(unittest.TestCase):
 
 
 class SlowRebuildInterleaveTest(unittest.TestCase):
-    """The #5638 interleave the route-only mutex cannot cover: the sweep's
+    """The lost-update interleave the route-only mutex cannot cover: the sweep's
     rebuild starts FIRST, the route's newer rebuild lands DURING it, and the
     sweep's write completes LAST. Driven by controlled captured timestamps
     against the real store — no sleeps."""

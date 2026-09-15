@@ -79,8 +79,7 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.security import (
     is_sensitive_path,
-    redact_credentials,
-    redact_exfiltration_urls,
+    redact_and_truncate,
 )
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
@@ -303,8 +302,10 @@ def _clone_github(url: str, dest: Path) -> str | None:
         if cleanup:
             Path(cleanup).unlink(missing_ok=True)
     if proc.returncode != 0:
-        _red, _ = redact_credentials(proc.stderr.strip()[:200])
-        _red, _ = redact_exfiltration_urls(_red)
+        # Redact the FULL text before the bound: a credential straddling the
+        # slice would otherwise be cut into fragments no redaction regex can
+        # match.
+        _red = redact_and_truncate(proc.stderr.strip(), 200)
         return f"git clone failed: {_red}"
     return None
 
@@ -339,8 +340,8 @@ def _copy_installed_theme(src: Path, dst: Path) -> None:
         # Windows JUNCTION, and `os.walk` reports a junction as an ordinary
         # directory, so an islink-only guard descends it. A pack carrying a
         # junction back to its own root would then recurse until a path-length
-        # OSError escaped as a 500 -- reachable as soon as local install is
-        # enabled on Windows, which is what this change does.
+        # OSError escapes as a 500 -- reachable wherever local install is
+        # enabled on Windows.
         for d in dirnames:
             if is_link_or_junction(os.path.join(dirpath, d)):
                 raise ValueError(
@@ -400,18 +401,15 @@ def _atomic_write_theme_json(target: Path, text: str) -> None:
     one. Callers MUST hold ``_theme_install_lock(slug)`` so the exists-check and
     this write are one critical section (closes the create/update TOCTOU).
 
-    Delegates to :func:`kiro_crew.atomic_write.atomic_write`, which is the same
-    ``mkstemp``-plus-rename shape this used to hand-roll -- including the
-    ``except BaseException`` temp cleanup, so a Ctrl-C mid-write still leaves no
-    scratch file -- plus the Windows sharing-violation rename retry. ``fsync``
-    stays off, as before.
+    Delegates to :func:`kiro_crew.atomic_write.atomic_write`: an
+    ``mkstemp``-plus-rename shape including the ``except BaseException`` temp
+    cleanup, so a Ctrl-C mid-write leaves no scratch file, plus the Windows
+    sharing-violation rename retry. ``fsync`` stays off.
 
-    ``mode=0o600`` is not a tightening, it is what this site already published:
-    ``mkstemp`` creates its file owner-only and the hand-rolled form never
-    chmod'd it, so the theme JSON landed at ``0o600`` and the rename carried
-    that through. Passing it explicitly keeps that, because ``atomic_write``
-    without a *mode* applies the umask default instead and would widen a
-    previously owner-only file to ``0o644``.
+    ``mode=0o600`` is what this site publishes: ``mkstemp`` creates its file
+    owner-only and the rename carries that through. Passing it explicitly is
+    required, because ``atomic_write`` without a *mode* applies the umask default
+    instead and would widen the file to ``0o644``.
     """
     atomic_write(target, text, mode=0o600)
 
@@ -495,10 +493,10 @@ def _do_install(stype: Any, source: dict[str, Any]) -> tuple[dict[str, Any] | No
 
         slug = summary["slug"]
         dest = _installed_theme_dir(slug)
-        # Historical guard kept for a clear message (with stage-first the copy
-        # out of dest already happened safely, but re-installing the installed
-        # dir onto itself is a user error worth naming). This is a source-path
-        # check, not a registry-state race, so it stays outside the lock.
+        # Kept for a clear message: staging first makes the copy out of dest
+        # safe anyway, but re-installing the installed dir onto itself is a user
+        # error worth naming. This is a source-path check, not a registry-state
+        # race, so it stays outside the lock.
         if src.resolve() == dest.resolve():
             shutil.rmtree(stage, ignore_errors=True)
             return None, "source is already the installed theme directory", 400

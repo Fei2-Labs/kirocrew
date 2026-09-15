@@ -9,7 +9,9 @@ here, plus TTL expiry, single-use consumption, and the endpoint refusals.
 from __future__ import annotations
 
 import json
+import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -96,6 +98,76 @@ class TestStepUpModule:
         with pytest.raises(update_stepup.StepUpError, match="no armed update request"):
             update_stepup.consume(pending.nonce)
 
+    def test_consume_refuses_when_the_nonce_cannot_be_removed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pending = update_stepup.arm("9.9.9", "stable")
+        path = update_stepup.pending_path()
+        original_unlink = Path.unlink
+
+        def refuse_nonce_unlink(target: Path, *args, **kwargs) -> None:
+            if target == path:
+                raise PermissionError("nonce file is locked")
+            original_unlink(target, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", refuse_nonce_unlink)
+            with pytest.raises(update_stepup.StepUpError, match="could not consume"):
+                update_stepup.consume(pending.nonce)
+
+        still_pending = update_stepup.read_pending()
+        assert still_pending is not None
+        assert still_pending.nonce == pending.nonce
+        update_stepup.clear_pending()
+
+    def test_in_flight_consume_cannot_unlink_a_concurrent_rearm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A consume that validated request A must never remove a request B
+        that a concurrent arm swapped in between the read and the unlink —
+        arm and approve run as executor threads in one process, so the
+        window is real. The mutex serializes them: the re-arm lands only
+        after the consume's critical section, and its nonce survives."""
+        first = update_stepup.arm("9.9.9", "stable")
+        in_window = threading.Event()
+        original_consume = update_stepup._consume_pending_file
+
+        def paused_consume() -> None:
+            in_window.set()
+            # Without the mutex this sleep is exactly the race window: the
+            # re-arm thread swaps its fresh request in, and the unlink
+            # below destroys it while the stale approval is accepted.
+            time.sleep(0.3)
+            original_consume()
+
+        rearmed: list[update_stepup.PendingUpdate] = []
+
+        def rearm() -> None:
+            # A False return means consume() raised before opening the
+            # window: do NOT arm — past teardown that write would land in
+            # the operator's real data home, not the test's.
+            if in_window.wait(timeout=5):
+                rearmed.append(update_stepup.arm("9.9.10", "stable"))
+
+        rearm_thread = threading.Thread(target=rearm)
+        with monkeypatch.context() as patch:
+            patch.setattr(update_stepup, "_consume_pending_file", paused_consume)
+            rearm_thread.start()
+            try:
+                consumed = update_stepup.consume(first.nonce)
+            finally:
+                # Always release and reap the worker INSIDE the fixture's
+                # scope, even when consume() raises — a leaked thread would
+                # outlive the isolated KIROCREW_HOME.
+                in_window.set()
+                rearm_thread.join(timeout=5)
+        assert not rearm_thread.is_alive()
+        assert consumed.request_id == first.request_id
+        still_pending = update_stepup.read_pending()
+        assert still_pending is not None
+        assert still_pending.request_id == rearmed[0].request_id
+        update_stepup.clear_pending()
+
     def test_wrong_nonce_refused_and_not_consumed(self) -> None:
         pending = update_stepup.arm("9.9.9", "stable")
         try:
@@ -114,8 +186,25 @@ class TestStepUpModule:
         monkeypatch.setattr(
             time, "time", lambda: pending.created_at + update_stepup.PENDING_TTL_SECS + 1
         )
-        assert update_stepup.read_pending() is None
+        assert update_stepup.read_pending(clear_expired=True) is None
         assert not update_stepup.pending_path().exists()
+
+    def test_cross_process_reader_never_deletes_the_file(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A DEFAULT read never writes. A reader outside the gateway (the
+        `kirocrew update approve` CLI) uses the default: its unlink cannot be
+        serialized against a gateway re-arm, so an expired read must report
+        absent WITHOUT touching the file — otherwise it could delete a fresh
+        request it never read (GPT review finding, head 82cd360d3). Cleanup
+        is the explicit clear_expired=True opt-in for gateway callers."""
+        pending = update_stepup.arm("9.9.9", "stable")
+        monkeypatch.setattr(
+            time, "time", lambda: pending.created_at + update_stepup.PENDING_TTL_SECS + 1
+        )
+        assert update_stepup.read_pending() is None
+        assert update_stepup.pending_path().exists()
+        update_stepup.clear_pending()
 
     def test_malformed_file_reads_as_absent(self) -> None:
         path = update_stepup.pending_path()
@@ -158,6 +247,145 @@ class TestArmEndpoint:
         assert resp.status == 409
         assert json.loads(resp.body.decode())["code"] == "arm_no_verdict"
 
+    async def test_arm_refuses_when_check_reports_nothing_to_apply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.platform import wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(updates, "resolve_provider", lambda: None)
+        updates._set_update_info(
+            update_available=False,
+            channel_move_pending=False,
+            latest_version="0.6.0",
+            channel="stable",
+        )
+        resp = await updates.api_update_arm(_request())
+        assert resp.status == 409
+        assert json.loads(resp.body.decode())["code"] == "arm_no_verdict"
+
+    async def test_arm_accepts_a_pending_channel_downgrade(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.platform import wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(updates, "resolve_provider", lambda: None)
+        monkeypatch.setattr(updates, "min_version", lambda: "0.5.0")
+        updates._set_update_info(
+            update_available=False,
+            channel_move_pending=True,
+            latest_version="0.6.0rc4",
+            channel="insider",
+        )
+        try:
+            resp = await updates.api_update_arm(_request())
+            assert resp.status == 200
+            pending = update_stepup.read_pending()
+            assert pending is not None
+            assert pending.version == "0.6.0rc4"
+            assert pending.channel == "insider"
+        finally:
+            update_stepup.clear_pending()
+            updates._set_update_info()
+
+    async def test_arm_refuses_a_channel_move_below_the_minimum_version(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.platform import wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(updates, "resolve_provider", lambda: None)
+        monkeypatch.setattr(updates, "min_version", lambda: "0.6.0")
+        monkeypatch.setattr(updates, "_local_version", "0.7.0")
+        audit = MagicMock()
+        import kiro_crew.sel as sel_mod
+
+        monkeypatch.setattr(sel_mod, "sel", lambda: audit)
+        updates._set_update_info(
+            update_available=False,
+            channel_move_pending=True,
+            latest_version="0.5.0",
+            channel="stable",
+        )
+        try:
+            resp = await updates.api_update_arm(_request())
+            payload = json.loads(resp.body.decode())
+            assert resp.status == 409
+            assert payload["code"] == "arm_below_min_version"
+            assert payload["governance"] is True
+            assert update_stepup.read_pending() is None
+            audit.log_api_access.assert_called_once_with(
+                caller="127.0.0.1",
+                operation="update.arm",
+                outcome="denied",
+                source="dashboard",
+                resources="v0.5.0 (stable)",
+                error="selected release is below the required minimum version",
+                critical=True,
+            )
+        finally:
+            update_stepup.clear_pending()
+            updates._set_update_info()
+
+    async def test_arm_floor_denial_survives_an_unwritable_audit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.platform import wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(updates, "resolve_provider", lambda: None)
+        monkeypatch.setattr(updates, "min_version", lambda: "0.6.0")
+        monkeypatch.setattr(updates, "_local_version", "0.7.0")
+
+        class _BrokenSel:
+            def log_api_access(self, **kwargs: object) -> None:
+                raise OSError(28, "no space left on device")
+
+        import kiro_crew.sel as sel_mod
+
+        monkeypatch.setattr(sel_mod, "sel", lambda: _BrokenSel())
+        updates._set_update_info(
+            update_available=False,
+            channel_move_pending=True,
+            latest_version="0.5.0",
+            channel="stable",
+        )
+        try:
+            resp = await updates.api_update_arm(_request())
+            payload = json.loads(resp.body.decode())
+            assert resp.status == 409
+            assert payload["code"] == "arm_below_min_version"
+            assert update_stepup.read_pending() is None
+        finally:
+            update_stepup.clear_pending()
+            updates._set_update_info()
+
+    async def test_arm_allows_an_upgrade_toward_the_minimum_version(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.platform import wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(updates, "resolve_provider", lambda: None)
+        monkeypatch.setattr(updates, "min_version", lambda: "0.6.0")
+        monkeypatch.setattr(updates, "_local_version", "0.4.0")
+        updates._set_update_info(
+            update_available=True,
+            channel_move_pending=False,
+            latest_version="0.5.0",
+            channel="stable",
+        )
+        try:
+            resp = await updates.api_update_arm(_request())
+            assert resp.status == 200
+            pending = update_stepup.read_pending()
+            assert pending is not None
+            assert pending.version == "0.5.0"
+        finally:
+            update_stepup.clear_pending()
+            updates._set_update_info()
+
     async def test_arm_response_carries_no_nonce(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.platform import wheel_engine
 
@@ -191,6 +419,7 @@ class TestArmEndpoint:
 
         monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
         monkeypatch.setattr(updates, "resolve_provider", lambda: None)
+        monkeypatch.setattr(updates, "min_version", lambda: "0.4.0")
         updates._set_update_info(
             update_available=True, latest_version="0.4.0rc14", channel="stable"
         )
@@ -271,6 +500,22 @@ class TestApproveEndpoint:
         finally:
             update_stepup.clear_pending()
 
+    async def test_minimum_version_landing_after_arm_refuses_approve(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stricter floor in the arm-to-approve window must win."""
+        pending = update_stepup.arm("0.5.0", "stable")
+        monkeypatch.setattr(updates, "resolve_provider", lambda: None)
+        monkeypatch.setattr(updates, "min_version", lambda: "0.6.0")
+        req = _request({"nonce": pending.nonce})
+        resp = await updates.api_update_approve(req)
+        payload = json.loads(resp.body.decode())
+        assert resp.status == 409
+        assert payload["code"] == "approve_below_min_version"
+        assert payload["governance"] is True
+        assert update_stepup.read_pending() is None
+        assert req.app["state"]._background_tasks == set()
+
     async def test_no_armed_request_refused(self) -> None:
         update_stepup.clear_pending()
         resp = await updates.api_update_approve(_request({"nonce": "abc"}))
@@ -284,7 +529,8 @@ class TestApproveEndpoint:
 
         restarted: list[object] = []
 
-        async def fake_restart(state: object) -> bool:
+        async def fake_restart(state: object, *, resolver: object) -> bool:
+            assert resolver is wheel_engine.respawn_executable
             restarted.append(state)
             return True
 
@@ -350,7 +596,7 @@ class TestApproveEndpoint:
 
         restarted: list[object] = []
 
-        async def fake_restart(state: object) -> bool:
+        async def fake_restart(state: object, *, resolver: object) -> bool:
             restarted.append(state)
             return True
 

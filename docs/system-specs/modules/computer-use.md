@@ -180,7 +180,7 @@ with a driver. `KIROCREW_SESSION_KEY` reaches a child only from a launcher that
 already knows which session it is spawning for — the ACP spawn path
 (`acp/client.py`) and the script-cron launcher (`cron_script.py`, which spawns one
 process per job under `cron:<job id>`) — and `KIROCREW_HOST_PID` only from the Linux
-sandbox launcher (`sandbox.py:666`). A GUI-launched kiro-cli has no such launcher
+sandbox launcher (`sandbox.main`, which exports it before re-exec). A GUI-launched kiro-cli has no such launcher
 above it, so it carries neither. An earlier revision refused in the shim on the
 reasoning that an unproven key is indistinguishable from an unattended surface —
 with the unattended rule gone, that left the feature returning *"the calling
@@ -2454,9 +2454,8 @@ computer use.
   `0o700` temp dir the agent can reach with `fs_read` — the same posture browse
   already ships. Computer use widens WHAT can be in frame (any window, not one
   browser tab). Mitigations: per-window capture only (never full-screen),
-  whole-window suppression when any node is secure, ring-trim to 200, and the
-  existing `cleanup-temp-screenshots.yml`. This design does not widen the posture
-  and does not claim to close it.
+  whole-window suppression when any node is secure, and ring-trim to 200. This
+  design does not widen the posture and does not claim to close it.
 - **"No screenshots" is not "no disclosure."** The accessibility tree itself
   leaked real paths, window titles and bundle ids in live probes, and a document
   path inside an `AXTitle` is not a credential so redaction will not catch it.

@@ -621,6 +621,31 @@ class TestReporting:
         assert "# Eval Results" in report
         assert "test" in report
 
+    def test_the_report_is_never_ascii(self):
+        """Every result carries a ✅ or ❌, so the report cannot be saved as ASCII.
+
+        This is the premise the artifact writer rests on: `_run_eval` hands this
+        string straight to `write_eval_artifacts`, and the coverage tests around
+        that call all patch this function out for a plain ASCII stub, so nothing
+        else pins what the writer is really given.
+        """
+        for ok in (True, False):
+            result = ScenarioResult(
+                name="test",
+                sessions=[SessionResult(name="s1", turns=[
+                    TurnResult(
+                        user_message="q",
+                        agent_response="r",
+                        assertion_results=[
+                            (Assertion(type=AssertionType.CONTAINS, value="r"), ok),
+                        ],
+                    ),
+                ])],
+            )
+            assert result.passed is ok
+            with pytest.raises(UnicodeEncodeError):
+                format_results([result]).encode("ascii")
+
     def test_format_results_with_dimensions(self):
         result = ScenarioResult(
             name="test",
@@ -785,3 +810,31 @@ class TestJudgeFiltering:
         result = await runner.run_scenario(scenario)
         # Both assertions should be in results
         assert result.total_assertions == 2
+
+
+@pytest.mark.asyncio
+async def test_eval_context_explicitly_reads_default_store_off_loop(tmp_path):
+    import threading
+
+    from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
+
+    loop_thread = threading.get_ident()
+    calls = []
+
+    class Context:
+        def build_session_context(self, *, session_key, memory_store):
+            assert threading.get_ident() != loop_thread
+            assert memory_store == DEFAULT_MEMORY_STORE
+            calls.append(session_key)
+            return "scenario context: "
+
+    provider = MockProvider(["answer"])
+    runner = EvalRunner(provider_factory=lambda key, **kwargs: provider)
+    result = await runner._run_session(
+        Session(name="second", turns=[Turn(user="question")]),
+        tmp_path,
+        ctx_builder=Context(),
+    )
+    assert result.passed
+    assert len(calls) == 1 and calls[0].startswith("eval_second_")
+    assert provider.messages == ["scenario context: question"]

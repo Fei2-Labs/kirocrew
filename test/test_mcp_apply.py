@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import json
@@ -51,7 +50,9 @@ class TestSetKirocrewEntry:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
         action = mcp_mod._set_kirocrew_entry("srv", enabled=True, spec={"command": "x"})
         assert action == "added"
-        assert json.loads(mc_path.read_text(encoding="utf-8"))["mcpServers"]["srv"] == {"command": "x"}
+        assert json.loads(mc_path.read_text(encoding="utf-8"))["mcpServers"]["srv"] == {
+            "command": "x"
+        }
 
     def test_disables_existing(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard.handlers import mcp as mcp_mod
@@ -61,28 +62,28 @@ class TestSetKirocrewEntry:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
         action = mcp_mod._set_kirocrew_entry("srv", enabled=False)
         assert action == "disabled"
-        assert json.loads(mc_path.read_text(encoding="utf-8"))["mcpServers"]["srv"]["disabled"] is True
+        assert (
+            json.loads(mc_path.read_text(encoding="utf-8"))["mcpServers"]["srv"]["disabled"] is True
+        )
 
     def test_enabling_disabled_removes_flag(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard.handlers import mcp as mcp_mod
 
         mc_path = tmp_path / "kirocrew.mcp.json"
-        mc_path.write_text(
-            json.dumps({"mcpServers": {"srv": {"command": "x", "disabled": True}}})
-        )
+        mc_path.write_text(json.dumps({"mcpServers": {"srv": {"command": "x", "disabled": True}}}))
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
         action = mcp_mod._set_kirocrew_entry("srv", enabled=True)
         assert action == "enabled"
-        assert "disabled" not in json.loads(mc_path.read_text(encoding="utf-8"))["mcpServers"]["srv"]
+        assert (
+            "disabled" not in json.loads(mc_path.read_text(encoding="utf-8"))["mcpServers"]["srv"]
+        )
 
     def test_disabling_missing_with_spec_seeds_entry(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard.handlers import mcp as mcp_mod
 
         mc_path = tmp_path / "kirocrew.mcp.json"
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
-        action = mcp_mod._set_kirocrew_entry(
-            "srv", enabled=False, spec={"command": "x"}
-        )
+        action = mcp_mod._set_kirocrew_entry("srv", enabled=False, spec={"command": "x"})
         assert action == "disabled"
         entry = json.loads(mc_path.read_text(encoding="utf-8"))["mcpServers"]["srv"]
         assert entry == {"command": "x", "disabled": True}
@@ -93,11 +94,11 @@ class TestSetScopeEntry:
         from kiro_crew.dashboard.handlers import mcp as mcp_mod
 
         kpath = tmp_path / "kiro.json"
-        action = mcp_mod._set_scope_entry(
-            kpath, "srv", enabled=True, spec={"command": "c"}
-        )
+        action = mcp_mod._set_scope_entry(kpath, "srv", enabled=True, spec={"command": "c"})
         assert action == "added"
-        assert json.loads(kpath.read_text(encoding="utf-8"))["mcpServers"]["srv"] == {"command": "c"}
+        assert json.loads(kpath.read_text(encoding="utf-8"))["mcpServers"]["srv"] == {
+            "command": "c"
+        }
 
     def test_removes_when_disabling_present(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard.handlers import mcp as mcp_mod
@@ -132,9 +133,7 @@ class TestSetScopeEntry:
         from kiro_crew.dashboard.handlers import mcp as mcp_mod
 
         kpath = tmp_path / "kiro.json"
-        monkeypatch.setattr(
-            mcp_mod, "_find_server_spec_anywhere", lambda name: None
-        )
+        monkeypatch.setattr(mcp_mod, "_find_server_spec_anywhere", lambda name: None)
         action = mcp_mod._set_scope_entry(kpath, "srv", enabled=True)
         assert action == "missing_spec"
         assert not kpath.exists()
@@ -169,11 +168,7 @@ class TestApplyEndpoint:
         monkeypatch.setattr(
             mcp_mod,
             "_find_server_spec_anywhere",
-            lambda name: (
-                {"command": "slack", "args": []}
-                if name == "slack-mcp"
-                else None
-            ),
+            lambda name: ({"command": "slack", "args": []} if name == "slack-mcp" else None),
         )
         # Stub rebuild_agent_config — we only care about file writes here.
         monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
@@ -210,7 +205,7 @@ class TestApplyEndpoint:
         assert "slack-mcp" in mc["mcpServers"]
         assert mc["mcpServers"]["slack-mcp"].get("disabled") is not True
 
-        # Kiro global should no longer have slack-mcp
+        # Kiro global does not have slack-mcp
         k = json.loads(kiro_path.read_text(encoding="utf-8"))
         assert "slack-mcp" not in k["mcpServers"]
 
@@ -231,7 +226,10 @@ class TestApplyEndpoint:
         # happens to be on PATH in the test/CI environment.  The handler
         # looks up `aim` via shutil.which; returning None short-circuits
         # the subprocess.run call entirely.
-        monkeypatch.setattr("kiro_crew.dashboard.handlers._shared._capability_manager", lambda: MagicMock(**{"available.return_value": False}))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers._shared._capability_manager",
+            lambda: MagicMock(**{"available.return_value": False}),
+        )
 
         monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
 
@@ -265,7 +263,10 @@ class TestApplyEndpoint:
         # The last change is an uninstall that would try to run `aim mcp
         # uninstall c` as a real subprocess if `aim` is on PATH in CI.
         # Return None from shutil.which to short-circuit that path.
-        monkeypatch.setattr("kiro_crew.dashboard.handlers._shared._capability_manager", lambda: MagicMock(**{"available.return_value": False}))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers._shared._capability_manager",
+            lambda: MagicMock(**{"available.return_value": False}),
+        )
 
         rebuild = MagicMock()
         monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", rebuild)
@@ -309,21 +310,21 @@ class TestHostileNameRejection:
     @pytest.mark.parametrize(
         "bad_name",
         [
-            "../../etc/passwd",       # classic path traversal
-            "./local",                # leading . (not alphanumeric)
-            "/abs/path",              # leading / (not alphanumeric)
-            "-rf",                    # leading dash looks like an argv flag
-            "a b",                    # whitespace — shouldn't smuggle into argv
-            "a\nb",                   # newline injection
-            "a;rm -rf /",             # command-sep chars
-            "a|whoami",               # pipe
-            "$(echo pwn)",            # command substitution shape
-            "`echo pwn`",             # backtick command substitution
-            "a\x00b",                 # NUL byte
-            "",                       # empty
-            "a" * 200,                # too long (> _MAX_MCP_NAME_LEN = 128)
-            "foo/../bar",             # embedded .. even with alphanumerics around
-            ":bad",                   # leading colon (colon is non-leading only)
+            "../../etc/passwd",  # classic path traversal
+            "./local",  # leading . (not alphanumeric)
+            "/abs/path",  # leading / (not alphanumeric)
+            "-rf",  # leading dash looks like an argv flag
+            "a b",  # whitespace — shouldn't smuggle into argv
+            "a\nb",  # newline injection
+            "a;rm -rf /",  # command-sep chars
+            "a|whoami",  # pipe
+            "$(echo pwn)",  # command substitution shape
+            "`echo pwn`",  # backtick command substitution
+            "a\x00b",  # NUL byte
+            "",  # empty
+            "a" * 200,  # too long (> _MAX_MCP_NAME_LEN = 128)
+            "foo/../bar",  # embedded .. even with alphanumerics around
+            ":bad",  # leading colon (colon is non-leading only)
         ],
     )
     async def test_rejects_hostile_names(self, tmp_path, monkeypatch, bad_name):
@@ -358,9 +359,7 @@ class TestHostileNameRejection:
 
         monkeypatch.setattr(mcp_mod, "_get_mcp_lock", lambda: _NoLock())
 
-        request = _make_request(
-            {"changes": [{"name": bad_name, "kirocrew": True}]}
-        )
+        request = _make_request({"changes": [{"name": bad_name, "kirocrew": True}]})
         resp = await mcp_mod.api_mcp_apply(request)
         body = json.loads(resp.body)
 
@@ -368,9 +367,10 @@ class TestHostileNameRejection:
         assert len(body["results"]) == 1
         # Either "invalid name" (regex/len reject) or "empty name" (empty string).
         err = body["results"][0].get("error", "")
-        assert err in {"invalid name", "empty name"}, (
-            f"expected invalid/empty name error for {bad_name!r}, got {body['results'][0]}"
-        )
+        assert err in {
+            "invalid name",
+            "empty name",
+        }, f"expected invalid/empty name error for {bad_name!r}, got {body['results'][0]}"
         # No file was created by the scope helpers.
         assert not mc_path.exists()
         assert not kiro_path.exists()
@@ -389,10 +389,11 @@ class TestHostileNameRejection:
         monkeypatch.setattr(
             mcp_mod, "_extra_mcp_scopes", lambda: [McpScope("cc", tmp_path / "cc.json", None)]
         )
+        monkeypatch.setattr(mcp_mod, "_find_server_spec_anywhere", lambda n: {"command": "x"})
         monkeypatch.setattr(
-            mcp_mod, "_find_server_spec_anywhere", lambda n: {"command": "x"}
+            "kiro_crew.dashboard.handlers._shared._capability_manager",
+            lambda: MagicMock(**{"available.return_value": False}),
         )
-        monkeypatch.setattr("kiro_crew.dashboard.handlers._shared._capability_manager", lambda: MagicMock(**{"available.return_value": False}))
 
         monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
 
@@ -412,8 +413,8 @@ class TestHostileNameRejection:
                         "name": "slack-mcp",
                         "kirocrew": True,
                         "toolOverrides": {
-                            "../evil": False,         # rejected
-                            "legit-tool": False,      # accepted
+                            "../evil": False,  # rejected
+                            "legit-tool": False,  # accepted
                         },
                     }
                 ]
@@ -443,10 +444,10 @@ class TestMcpNameValidator:
         "name",
         [
             "auto-improvement:auto-improvement",  # app-provided <app>:<server> key
-            "meetings:calendar-sync",             # ditto, differing halves
-            "auto-improvement",                   # plain name unchanged
-            "playwright-mcp",                     # plain name unchanged
-            "@org/server",                        # scoped name unchanged
+            "meetings:calendar-sync",  # ditto, differing halves
+            "auto-improvement",  # plain name unchanged
+            "playwright-mcp",  # plain name unchanged
+            "@org/server",  # scoped name unchanged
         ],
     )
     def test_accepts_well_formed_names(self, name):
@@ -457,11 +458,11 @@ class TestMcpNameValidator:
     @pytest.mark.parametrize(
         "name",
         [
-            ":bad",          # colon may not lead
-            "../evil",       # path traversal
-            "a:../evil",     # colon does not smuggle traversal past the .. check
-            "a;rm -rf /",    # argv-injection chars still rejected
-            "",              # empty
+            ":bad",  # colon may not lead
+            "../evil",  # path traversal
+            "a:../evil",  # colon does not smuggle traversal past the .. check
+            "a;rm -rf /",  # argv-injection chars still rejected
+            "",  # empty
         ],
     )
     def test_rejects_malformed_names(self, name):
@@ -484,9 +485,7 @@ class TestApplyAcceptsAppProvidedName:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
         monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", tmp_path / "kiro.json")
         monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [])
-        monkeypatch.setattr(
-            mcp_mod, "_find_server_spec_anywhere", lambda n: {"command": "x"}
-        )
+        monkeypatch.setattr(mcp_mod, "_find_server_spec_anywhere", lambda n: {"command": "x"})
         monkeypatch.setattr(
             "kiro_crew.dashboard.handlers._shared._capability_manager",
             lambda: MagicMock(**{"available.return_value": False}),
@@ -588,19 +587,20 @@ class TestSetStubNameGate:
         monkeypatch.setattr(loader_mod, "config_path", lambda: cfg)
         monkeypatch.setattr(mcp_mod, "_local_overlay_section", lambda: {})
 
-        request = _make_stub_request(
-            {"name": "auto-improvement:auto-improvement", "stub": True}
-        )
+        request = _make_stub_request({"name": "auto-improvement:auto-improvement", "stub": True})
         resp = await mcp_mod.api_mcp_gateway_set_stub(request)
         body = json.loads(resp.body)
 
         assert resp.status == 200, f"colon name was rejected: {body}"
         assert body["ok"] is True
         assert body["name"] == "auto-improvement:auto-improvement"
-        written = json.loads(cfg.read_text())
-        assert written["mcp_gateway"]["stub_servers"] == [
-            "auto-improvement:auto-improvement"
-        ]
+        written = json.loads(cfg.read_text())["mcp_gateway"]
+        # The click is recorded as a decision over the roster, so the colon name
+        # has to survive into `stub_overrides` and resolve into the effective set.
+        from kiro_crew.config.loader import _resolve_stub_servers
+
+        assert written["stub_overrides"] == {"auto-improvement:auto-improvement": True}
+        assert _resolve_stub_servers(written) == ["auto-improvement:auto-improvement"]
 
 
 # ---------------------------------------------------------------------------
@@ -877,8 +877,8 @@ class TestUninstallCrashWindowCleanup:
         request = _make_request(
             {
                 "changes": [
-                    {"name": "a", "kirocrew": True},           # aborts the loop
-                    {"name": "gone", "uninstall": True},        # never reached by loop
+                    {"name": "a", "kirocrew": True},  # aborts the loop
+                    {"name": "gone", "uninstall": True},  # never reached by loop
                 ]
             }
         )
@@ -1021,7 +1021,7 @@ class TestUninstallCrashWindowCleanup:
 
         remaining = json.loads(kiro_path.read_text(encoding="utf-8"))["mcpServers"]
         # Both were REQUESTED uninstalls the loop never reached → the sweep purges
-        # both by request (it no longer depends on the companion result being
+        # both by request (it does not depend on the companion result being
         # recorded, which cancellation could race). 'done's package was removed;
         # 'pending's may or may not have been — either way, removing config is the
         # user's intent and errs benign.

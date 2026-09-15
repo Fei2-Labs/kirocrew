@@ -7,7 +7,7 @@ is a decision. It is wrong for an RPC. A client that does not get a response
 inside its request timeout re-sends, and a retry is not a second decision -- it is
 the same request again. The kill path clears the target's ``_queue`` and
 ``_pending_steers``, so on that path a caller whose first request merely timed out
-silently gets the destructive variant of a verb it asked for once (issue #5074).
+silently gets the destructive variant of a verb it asked for once.
 
 This module holds the one fact that tells the two apart: whether this caller has
 already asked to stop this target recently. ``stop_target`` consults it and
@@ -19,7 +19,7 @@ costs the caller the stop it asked for.
 **The window is anchored at the caller's FIRST stop of a target and is not
 extended by the repeats it absorbs.** That bounds how long escalation is
 suppressed: a client that retries forever is absorbed for one window, after which
-a stop that still finds the target pending escalates as before. A sliding window
+a stop that still finds the target pending escalates normally. A sliding window
 would instead put escalation out of reach of any client polling faster than the
 window, trading one silent failure for another.
 

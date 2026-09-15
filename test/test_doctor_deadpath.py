@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import host_abs
 from kiro_crew import doctor_deadpath as dp
 from kiro_crew.agent_files import AGENT_FILENAME
 
@@ -44,7 +45,10 @@ def _write_spec(agents_dir: Path, name: str, servers: dict) -> Path:
 
 class TestLooksLikeSinglePath:
     def test_absolute_path_is_one(self) -> None:
-        assert dp._looks_like_single_absolute_path("/opt/tool/bin/x") is True
+        # Spelled for the host (see conftest.host_abs): the shape test is
+        # ``os.path.isabs``, which from Python 3.13 rejects a bare ``/opt/...``
+        # on Windows (no drive).
+        assert dp._looks_like_single_absolute_path(host_abs("opt", "tool", "bin", "x")) is True
 
     def test_relative_is_not(self) -> None:
         assert dp._looks_like_single_absolute_path("tool/bin/x") is False
@@ -101,8 +105,10 @@ class TestLooksLikeSinglePath:
         # slash-prefixed token), and doctor output routinely gets pasted into
         # bug reports -- so an env entry under a credential-shaped KEY must
         # never surface its value. The locator (env[KEY]) still names the
-        # entry, so the report stays actionable.
-        secret = "/" + "s3cr3t-b64-blob-that-does-not-exist"
+        # entry, so the report stays actionable. The value has to pass the
+        # single-absolute-path shape test to be examined at all, so it is spelled
+        # absolutely for the host rather than as a bare slash-prefixed token.
+        secret = host_abs("s3cr3t-b64-blob-that-does-not-exist")
         _write_spec(
             agents_dir,
             "foreign.json",
@@ -181,7 +187,7 @@ class TestManagedRepair:
         report = dp.check_dead_paths(repair=fake_repair)
 
         managed = report.managed_dead
-        # After a clean repair the spec is no longer counted as dead...
+        # After a clean repair the spec does not count as dead...
         assert managed == [] or all(r.repaired for r in managed)
         result = next(r for r in report.results if r.spec == AGENT_FILENAME)
         assert result.managed is True

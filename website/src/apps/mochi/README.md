@@ -29,7 +29,12 @@ at the `api` seam. Keeping the original's internal layout (including its own
 ported line-for-line. It is intentional, not a nesting mistake.
 
 - `src/renderer/`, `src/shared/` — vendored original code. Change sparingly;
-  prefer changing the seam.
+  prefer changing the seam. One sanctioned exception: `SpriteRenderer.tsx`'s
+  implementation lives in core (`website/src/components/appearancePacks/`),
+  shared by both companion apps and by the crew avatar that wears a sprite
+  pack; the file here is a one-line re-export shim, so the other vendored
+  files' `./SpriteRenderer` imports stay byte-identical to upstream and still
+  port line-for-line.
 - `src/mochiApi.ts` — **the** seam. The composed `api` handle every vendored
   file imports. Original IPC calls resolve here to HTTP routes, WS events, or
   Electron preload channels. Spread order matters (web transports win over

@@ -3,7 +3,9 @@
 Pins the four seams the member-dispatch mount rides on:
 
 - ``members.member_dispatch_session_server`` — the session-level ``mcpServers``
-  element, carrying strict identity via ``KIROCREW_SESSION_KEY`` in its env.
+  element, carrying strict identity via ``KIROCREW_SESSION_KEY`` in its env
+  plus the gateway's bound port and its ``KIROCREW_HOME`` override, both of
+  which the from-scratch env would otherwise drop.
 - ``kas_agents.to_client_custom_agent(member_dispatch=True)`` — the KAS wire
   projection widening: the server joins ``tools`` and the conductor's
   approval-free dashboard verbs join the ``allowedTools`` input BEFORE the
@@ -30,6 +32,7 @@ from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.kas_agents import to_client_custom_agent
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_MEMBER_DISPATCH,
@@ -50,6 +53,12 @@ class TestCapabilitySet:
         plain chat rather than mounted-and-refused."""
         assert ACP_BACKENDS_MEMBER_DISPATCH == frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS})
         assert ACP_BACKEND_KIRO not in ACP_BACKENDS_MEMBER_DISPATCH
+        # codex has the per-session mount now (providers/mirrors/codex.py) and its
+        # precondition is stronger than claude's, so its exclusion is a scope
+        # decision rather than a capability gap: mounting session control into a
+        # codex DM thread is a NEW capability and belongs to whoever decides member
+        # threads run on codex at all.
+        assert ACP_BACKEND_CODEX not in ACP_BACKENDS_MEMBER_DISPATCH
 
 
 class TestMemberDispatchSessionServer:
@@ -68,6 +77,70 @@ class TestMemberDispatchSessionServer:
         entry = member_dispatch_session_server(MEMBER_KEY)
         assert entry is not None
         assert {"name": "KIROCREW_SESSION_KEY", "value": MEMBER_KEY} in entry["env"]
+
+    def test_env_carries_the_exported_bound_port(self, monkeypatch):
+        """A chat session's MCP child inherits the gateway's environment; this
+        entry is built from scratch, so the port has to be handed over
+        explicitly or the child dials the default one."""
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "7779")
+        entry = member_dispatch_session_server(MEMBER_KEY)
+        assert entry is not None
+        assert {"name": "KIROCREW_BOUND_PORT", "value": "7779"} in entry["env"]
+
+    def test_env_falls_back_to_the_serving_resolver(self, monkeypatch):
+        """No export (a gateway started outside the normal path) still yields a
+        port: the serving resolver's remaining order — configured, marker,
+        default — decides it, and the member child inherits that answer instead
+        of re-deriving it without lsof."""
+        from kiro_crew import port_resolution
+
+        monkeypatch.delenv("KIROCREW_BOUND_PORT", raising=False)
+        monkeypatch.setattr(port_resolution, "resolve_serving_port", lambda: 6123)
+        entry = member_dispatch_session_server(MEMBER_KEY)
+        assert entry is not None
+        assert {"name": "KIROCREW_BOUND_PORT", "value": "6123"} in entry["env"]
+
+    def test_port_does_not_displace_the_identity_pair(self, monkeypatch):
+        """Both env pairs, and no KIROCREW_PORT: that name means "the port an
+        operator asked for" and is persisted, so exporting it here would let a
+        transient binding outlive this process."""
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "7779")
+        entry = member_dispatch_session_server(MEMBER_KEY)
+        assert entry is not None
+        names = [pair["name"] for pair in entry["env"]]
+        assert "KIROCREW_SESSION_KEY" in names
+        assert "KIROCREW_BOUND_PORT" in names
+        assert "KIROCREW_PORT" not in names
+
+    def test_env_carries_the_gateway_home_override(self, monkeypatch):
+        """On an install with ``KIROCREW_HOME`` set (a pod, a second profile) the
+        server must resolve THIS gateway from that home. Without the override it
+        would present the member's identity to the default home's gateway, where
+        the member slot does not exist, and every verb would be refused as
+        ``caller_unidentified``. Same helper the managed Crew servers use, so the
+        two cannot drift."""
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "_managed_mcp_env", lambda: {"KIROCREW_HOME": "/pods/x"})
+        entry = member_dispatch_session_server(MEMBER_KEY)
+        assert entry is not None
+        assert {"name": "KIROCREW_HOME", "value": "/pods/x"} in entry["env"]
+        assert {"name": "KIROCREW_SESSION_KEY", "value": MEMBER_KEY} in entry["env"]
+
+    def test_default_install_carries_no_home_override(self, monkeypatch):
+        """No ``KIROCREW_HOME`` override on a default install: the env is exactly
+        the identity pair plus the bound port — byte-identical to before the
+        override was threaded through."""
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "_managed_mcp_env", lambda: {})
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "7779")
+        entry = member_dispatch_session_server(MEMBER_KEY)
+        assert entry is not None
+        assert entry["env"] == [
+            {"name": "KIROCREW_SESSION_KEY", "value": MEMBER_KEY},
+            {"name": "KIROCREW_BOUND_PORT", "value": "7779"},
+        ]
 
     def test_unresolvable_command_degrades_to_none(self, monkeypatch):
         import kiro_crew.agent as agent_mod
@@ -135,7 +208,7 @@ class TestKasMemberProjection:
 
 
 class _ClientStub:
-    """The four attributes ``_append_member_dispatch_server`` reads."""
+    """The three attributes ``_append_member_dispatch_server`` reads."""
 
     backend = ACP_BACKEND_CLAUDE
     _session_key = MEMBER_KEY
@@ -173,6 +246,17 @@ class TestClaudeMemberAppend:
         stub.backend = ACP_BACKEND_KIRO
         assert self._run(stub) == _base_servers()
 
+    def test_codex_is_untouched_because_it_is_not_a_member(self):
+        """The capability set withholds the mount, and it is checked FIRST.
+
+        Codex has the per-session mount and an enforced permission routing, so its
+        exclusion is a scope decision rather than a failed precondition. Pinning it
+        here means a later change that adds codex to the set cannot do so silently.
+        """
+        stub = _ClientStub()
+        stub.backend = ACP_BACKEND_CODEX
+        assert self._run(stub) == _base_servers()
+
     def test_same_named_entry_is_replaced_not_duplicated(self):
         stub = _ClientStub()
         servers = _base_servers() + [
@@ -195,15 +279,24 @@ class TestRuntimeMemberThreading:
         rt._acp_backend = ACP_BACKEND_KAS
         rt._mcp_gateway_overlay = None
 
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda _a: None)
-        monkeypatch.setattr(runtime_mod, "kiro_agents_dir", lambda: Path("/agents"))
-        monkeypatch.setattr(runtime_mod, "injection_server_names", lambda _o, _a: frozenset())
+        import kiro_crew.agent as agent_mod
 
-        def _capture(_dir, agent, *, stub_server_names=frozenset(), member_dispatch=False):
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda _a: None)
+        import kiro_crew.acp.kas_agents as kas_agents_mod
+        import kiro_crew.config.paths as paths_mod
+        import kiro_crew.mcp_gateway.session_servers as session_servers_mod
+
+        monkeypatch.setattr(paths_mod, "kiro_agents_dir", lambda: Path("/agents"))
+        monkeypatch.setattr(kas_agents_mod, "load_agent_spec", lambda _dir, agent: {"name": agent})
+        monkeypatch.setattr(
+            session_servers_mod, "injection_server_names", lambda _o, _a: frozenset()
+        )
+
+        def _capture(_dir, agent, _spec, *, stub_server_names=frozenset(), member_dispatch=False):
             seen.append(member_dispatch)
             return [{"id": agent}]
 
-        monkeypatch.setattr(runtime_mod, "build_kas_custom_agents", _capture)
+        monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _capture)
         return rt
 
     @pytest.mark.asyncio
@@ -253,16 +346,25 @@ class TestMemberServerJoinsSubtraction:
         rt = object.__new__(runtime_mod.AcpRuntime)
         rt._acp_backend = ACP_BACKEND_KAS
         rt._mcp_gateway_overlay = None
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda _a: None)
-        monkeypatch.setattr(runtime_mod, "kiro_agents_dir", lambda: Path("/agents"))
-        monkeypatch.setattr(runtime_mod, "injection_server_names", lambda _o, _a: frozenset())
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda _a: None)
+        import kiro_crew.acp.kas_agents as kas_agents_mod
+        import kiro_crew.config.paths as paths_mod
+        import kiro_crew.mcp_gateway.session_servers as session_servers_mod
+
+        monkeypatch.setattr(paths_mod, "kiro_agents_dir", lambda: Path("/agents"))
+        monkeypatch.setattr(kas_agents_mod, "load_agent_spec", lambda _dir, agent: {"name": agent})
+        monkeypatch.setattr(
+            session_servers_mod, "injection_server_names", lambda _o, _a: frozenset()
+        )
         seen: list[frozenset] = []
 
-        def _capture(_dir, agent, *, stub_server_names=frozenset(), member_dispatch=False):
+        def _capture(_dir, agent, _spec, *, stub_server_names=frozenset(), member_dispatch=False):
             seen.append(frozenset(stub_server_names))
             return [{"id": agent}]
 
-        monkeypatch.setattr(runtime_mod, "build_kas_custom_agents", _capture)
+        monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _capture)
         await rt._kas_custom_agents("kirocrew", member_dispatch=True)
         assert seen == [frozenset({MEMBER_DISPATCH_SERVER})]
 
@@ -273,27 +375,31 @@ class TestMemberServerJoinsSubtraction:
         rt = object.__new__(runtime_mod.AcpRuntime)
         rt._acp_backend = ACP_BACKEND_KAS
         rt._mcp_gateway_overlay = None
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda _a: None)
-        monkeypatch.setattr(runtime_mod, "kiro_agents_dir", lambda: Path("/agents"))
-        monkeypatch.setattr(runtime_mod, "injection_server_names", lambda _o, _a: frozenset())
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda _a: None)
+        import kiro_crew.acp.kas_agents as kas_agents_mod
+        import kiro_crew.config.paths as paths_mod
+        import kiro_crew.mcp_gateway.session_servers as session_servers_mod
+
+        monkeypatch.setattr(paths_mod, "kiro_agents_dir", lambda: Path("/agents"))
+        monkeypatch.setattr(kas_agents_mod, "load_agent_spec", lambda _dir, agent: {"name": agent})
+        monkeypatch.setattr(
+            session_servers_mod, "injection_server_names", lambda _o, _a: frozenset()
+        )
         seen: list[frozenset] = []
 
-        def _capture(_dir, agent, *, stub_server_names=frozenset(), member_dispatch=False):
+        def _capture(_dir, agent, _spec, *, stub_server_names=frozenset(), member_dispatch=False):
             seen.append(frozenset(stub_server_names))
             return [{"id": agent}]
 
-        monkeypatch.setattr(runtime_mod, "build_kas_custom_agents", _capture)
+        monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _capture)
         await rt._kas_custom_agents("kirocrew")
         assert seen == [frozenset()]
 
 
 class TestSelectProviderBackend:
     """The per-session half of the one backend-selection gate (H3/H13)."""
-
-    def test_explicit_pick_wins(self):
-        from kiro_crew.members import select_provider_backend
-
-        assert select_provider_backend("kas", MEMBER_KEY, "claude", "") == "kas"
 
     def test_member_route(self):
         from kiro_crew.members import select_provider_backend

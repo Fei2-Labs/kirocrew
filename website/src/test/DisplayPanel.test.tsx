@@ -342,6 +342,23 @@ describe('DisplayPanel – font family setting', () => {
   })
 })
 
+describe('DisplayPanel – plain diffs setting lives on the Chat tab', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+  })
+
+  // The toggle governs how a diff READS in the transcript, so it belongs beside
+  // File change chips in Chat → Messages, not in Display → View, which holds
+  // Language and Interface (app-shell scope). Its behaviour is covered by
+  // ChatPanel.plainDiff.test.tsx; this guards only against it reappearing here
+  // and shipping as two switches over one localStorage key.
+  it('does not render the toggle', () => {
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.queryByRole('switch', { name: 'Plain diffs' })).toBeNull()
+  })
+})
+
 describe('DisplayPanel – zoom setting', () => {
   beforeEach(() => {
     vi.clearAllMocks()

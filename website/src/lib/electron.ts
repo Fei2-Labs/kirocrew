@@ -15,7 +15,7 @@
  * neither `.mac-electron` nor `.win-electron` applies, which is the correct
  * zero-inset layout, locked in by App.linuxElectron.test.tsx.
  */
-const mc = (window as { kirocrew?: { isElectron?: boolean; platform?: string; linuxFrameless?: boolean } }).kirocrew
+const mc = window.kirocrew
 
 export const isElectron = !!mc?.isElectron
 export const isMacElectron = isElectron && mc?.platform === 'darwin'
@@ -48,7 +48,7 @@ export const LINUX_CAPTION_CONTROLS_WIDTH = 108
  * does.
  */
 export function electronPlatform(): string | undefined {
-  return (window as { kirocrew?: { platform?: string } }).kirocrew?.platform
+  return window.kirocrew?.platform
 }
 
 /**
@@ -61,7 +61,7 @@ export function electronPlatform(): string | undefined {
  * `window.kirocrew` per-case without import-order coupling.
  */
 export function pathForFile(file: File): string {
-  const k = (window as { kirocrew?: { getPathForFile?: (f: File) => string } }).kirocrew
+  const k = window.kirocrew
   try {
     return k?.getPathForFile?.(file) || ''
   } catch {
@@ -72,6 +72,40 @@ export function pathForFile(file: File): string {
 /** Header left inset clearing the traffic lights: 16px inset + ~52px button group + 16px gap. */
 export const TRAFFIC_LIGHT_INSET_PX = 84
 
+/**
+ * Whether the "Open in editor" affordance can work in this window.
+ *
+ * True only when the desktop shell's `fileOpenAPI` preload bridge is present.
+ * A plain browser tab and the PWA expose no such bridge, so the caller hides
+ * the control there and the built-in viewer stays the only handoff — matching
+ * how `browserAPI`/`zoomAPI`/`wslAPI` consumers feature-detect their bridges.
+ * Read lazily (not a module-load capture) so a test can stub `window.fileOpenAPI`
+ * per-case, exactly as `pathForFile` stubs `window.kirocrew`.
+ */
+export function canOpenFileInEditor(): boolean {
+  return typeof (window as { fileOpenAPI?: { open?: unknown } }).fileOpenAPI?.open === 'function'
+}
+
+/**
+ * Hand a filesystem PATH to the desktop shell to open in the OS default handler
+ * on the user's own machine (via shell.openPath in the main process) — never a
+ * URL scheme. Resolves the main process's { ok, error? } verdict, or
+ * { ok: false, error: 'unavailable' } when no bridge is present, so a caller in
+ * a plain browser gets a definite negative rather than a thrown error.
+ */
+export async function openFileInEditor(
+  filePath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const api = (window as {
+    fileOpenAPI?: { open?: (p: string) => Promise<{ ok: boolean; error?: string }> }
+  }).fileOpenAPI
+  if (typeof api?.open !== 'function') return { ok: false, error: 'unavailable' }
+  try {
+    return await api.open(filePath)
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
 /**
  * Width reserved on the right for the Windows titleBarOverlay caption buttons
  * (minimize/maximize/close). The overlay is 138px wide at default DPI on

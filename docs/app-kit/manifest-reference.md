@@ -42,15 +42,26 @@ resolves it so the server starts under the interpreter its dependencies were
 installed against:
 
 - **A bare Python launcher** (`python`, `python3`, `py`, or the same with `.exe`)
-  resolves to the app's own venv interpreter (`.venv/bin/python3`, or
-  `.venv\Scripts\python.exe` on Windows) when it exists as a runnable file, else
-  to the gateway's own interpreter — never a PATH lookup. Exception: a server
-  whose `args` launch a `kiro_crew` module (`-m kiro_crew...`) always gets the
-  gateway's interpreter, since app venvs cannot import `kiro_crew`.
+  resolves to the gateway's own interpreter whenever the gateway has
+  provisioned the app's `requirements.txt` (a `pip install --target` into
+  `data/.kirocrew-deps/`; python launchers run through a `site.addsitedir`
+  shim so `.pth` files are processed, other commands see the dir on
+  `PYTHONPATH`; under `data/` so app updates keep the last good install) - those
+  wheels are built by that interpreter, so it is the only ABI-consistent
+  choice. Without an active provisioned tree (never provisioned, or
+  provisioning failed), it resolves to the app's own venv
+  interpreter (`.venv/bin/python3`, or `.venv\Scripts\python.exe` on Windows)
+  when it exists as a runnable file created by the same Python minor version
+  as the gateway, else again to the gateway's own interpreter - never a PATH
+  lookup. Exception: a server whose `args` launch a `kiro_crew` module
+  (`-m kiro_crew...`) always gets the gateway's interpreter and never the
+  app deps on `PYTHONPATH`, so an app cannot shadow the gateway's own code.
 - **Any other bare name** (no path separator, no drive qualifier) is rewritten
-  only when the app's venv provides that exact binary as a runnable file (a pip
-  console script — invisible to PATH because the venv is never activated). Note
-  this means a venv-provided binary shadows a same-named PATH dependency.
+  only when the app's provisioned deps dir or its venv provides that exact
+  binary as a runnable file (a pip console script - invisible to PATH because
+  neither layout is ever activated; the venv is consulted only when no deps
+  dir was provisioned). Note this means an app-provided binary shadows a
+  same-named PATH dependency.
   `node`, `npx`, `docker` and friends are otherwise left for PATH, as declared.
 - **A command carrying a path** (absolute or relative) is never rewritten. If it
   does not point at a runnable file at registration time, a warning naming the
@@ -131,17 +142,22 @@ installed against:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `ui.entry` | string | | Path to ESM bundle (relative to app root) |
+| `ui.entry` | string | | Path to ESM bundle (relative to ui/) |
 | `ui.pages[].route` | string | | URL path for the page |
 | `ui.pages[].label` | string | | Sidebar label |
 | `ui.pages[].icon` | string | | Lucide icon name (e.g. `"Shield"`, `"Package"`) |
 | `ui.pages[].iconUrl` | string | | Custom icon image path (relative to ui/) |
-| `ui.pages[].entryPoint` | string | | Per-page ESM bundle path (overrides `ui.entry`) |
+| `ui.pages[].entryPoint` | string | | Per-page ESM bundle path, relative to ui/ (overrides `ui.entry`) |
 | `ui.pages[].mountFunction` | string | `"mount"` | Exported function name in the ESM bundle |
 | `ui.sidebar.section` | string | `"Apps"` | Sidebar section name |
 | `ui.sidebar.order` | number | `10` | Sort order within section |
 | `ui.overlays[].id` | string | | Overlay id; must match a bundled overlay component (see below) |
 | `ui.overlays[].replaces` | string | | Host overlay slot this app takes over while enabled |
+| `contributes.sessionControls[].id` | string | | Control id, kebab-case; addressed as `<appName>:<id>` |
+| `contributes.sessionControls[].entryPoint` | string | | ESM bundle path for the control (relative to ui/) |
+| `contributes.sessionControls[].label` | string | | Accessible name, and the chip's tooltip |
+| `contributes.sessionControls[].icon` | string | | Icon name. Only `Shield`, `Bot`, `Search`, `Tag`, `Users`, `Zap`, `Star`, `Package` and `Cat` are rendered; any other name falls back to `Package` |
+| `contributes.sessionControls[].statusPath` | string | | Optional backend route reporting per-session chip state (see below) |
 
 ### `ui.overlays` — Replacing a Host Overlay Surface
 
@@ -302,6 +318,134 @@ for a legible reason instead. Unsigned apps are unaffected, as are signed apps t
 contribute nothing: the key is only added to the payload when non-empty, so every
 signature issued before this existed still verifies.
 
+### `contributes.sessionControls` — A Per-Chat Control in the Composer
+
+A session control is a compact chip the dashboard renders in the composer bar,
+beside the agent, model and project chips. Opening it mounts the app's own ESM
+module and hands it **the identity of the chat the user is currently in** -- which
+is the reason the slot exists, because nothing else in the app surface reports
+that. `ui.pages` is routed and session-blind, so a per-chat setting placed there
+makes the user leave the conversation to configure it.
+
+```json
+{
+  "contributes": {
+    "sessionControls": [
+      {
+        "id": "env-picker",
+        "entryPoint": "dist/session-control.mjs",
+        "label": "Environment",
+        "icon": "Tag",
+        "statusPath": "session-status"
+      }
+    ]
+  }
+}
+```
+
+Unlike `ui.overlays`, this **is** a third-party extension point: an installed app
+may declare it, and the control is loaded through the same lazy `import()` and
+import map `ui.pages` uses, so React stays a single instance.
+
+**What the control is handed.** The module's default export is rendered as
+`<Control session={…} onClose={…} />`, where `session` is:
+
+| Prop | Type | Meaning |
+|------|------|---------|
+| `session.sessionKey` | string | Session key, e.g. `dashboard:chat-2-1787502679`. Empty before a slot exists |
+| `session.folderId` | string? | Folder the chat is filed in, `''` at top level. A dashboard grouping with its own id -- **not** a directory, so key per-folder state on this and not on `cwd` |
+| `session.folderName` | string? | Folder's display name, to name it back to the user |
+| `session.cwd` | string | Working directory recorded for the session, when known |
+| `onClose` | function | Dismiss the control, e.g. after committing a change |
+
+The control is remounted when the session changes, so per-chat state cannot leak
+across a switch, and a control that throws renders an inline notice instead of
+disturbing the chat.
+
+**Two caps, and the second one drops.** The backend allows at most **2** controls
+per app. The dashboard renders at most **2** across all apps, and controls past
+that are dropped rather than moved into an overflow menu -- the bar shares one row
+with the message input. With three or more contributing apps, a declared control
+can therefore be absent.
+
+**`statusPath` — reporting state before the chip is opened.** Without it a control
+can only report anything once its module loads on first click, so a configured
+setting looks unset. When declared, the dashboard GETs the route under the app's
+own route base, with `session_key` always and `folder_id` / `folder_name`
+when the chat is in a folder, and reads:
+
+```json
+{ "state": "ok", "tooltip": "Bound to production" }
+```
+
+`state` is `ok`, `warn` or `none`; the chip tints for the first two and the
+tooltip is length-bounded. The path is charset-bounded at install and re-checked
+in the dashboard, and one that would leave the app's own route prefix is refused
+before any request rather than sanitized -- so a control with an invalid
+`statusPath` is simply never polled. Polling fails closed: an app that is down is
+not retried, and an unrecognized payload is treated as `none`.
+
+The route base follows how the app serves its backend, and the dashboard derives
+it -- an app declaring `backend.entryPoint` runs its own process and is
+reverse-proxied at `/apps/<app>/api/`, while one declaring only
+`backend.hooks.routes` is registered in-gateway under `/api/apps/<app>/`. Both
+prefixes are built by the host from the app name, so `statusPath` stays the only
+app-authored part of the URL. Declaring the wrong one is not possible: an app
+does not choose.
+
+### `contributes.fileMenuItems` — Rows in File / Tree / Folder Menus
+
+Declares rows an app adds to the file-editor overflow (⋮) menu, the workspace
+tree context menu, and the folder panel. Like `contributes.commands`, it is
+**declarative and host-rendered**: core reads the declaration, draws the rows,
+and POSTs to the app's own `endpoint` on activation — it never imports app code
+and holds no live callback, which is what makes the rows reachable by an app
+installed at runtime.
+
+```json
+{
+  "contributes": {
+    "fileMenuItems": [
+      {
+        "id": "send-to-store",
+        "label": "Send to store",
+        "icon": "Package",
+        "endpoint": "/api/apps/doc-store/send",
+        "surfaces": ["file-overflow", "tree-context", "folder-row"],
+        "when": { "extensions": ["md", "txt"], "kinds": ["file"] }
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `id` | string | Stable, app-owned row id (lowercase kebab slug, `[a-z0-9][a-z0-9-]*`), unique within the app |
+| `label` | string | Row label, max 120 characters (an app-owned literal — not a core i18n key) |
+| `icon` | string | Host glyph name: one of `Shield`, `Bot`, `Search`, `Tag`, `Users`, `Zap`, `Star`, `Package`, `Cat`. Any other name falls back to `Package` |
+| `endpoint` | string | App route core POSTs to; **must** sit under `/api/apps/<your-app>/` (in-gateway, for a `backend.hooks.routes` app) or `/apps/<your-app>/api/` (the reverse proxy, for a `backend.entryPoint` app). Core refuses to follow a redirect out of it, so the route must answer directly rather than forward |
+| `surfaces` | string[] | Any of `file-overflow`, `tree-context`, `folder-row` |
+| `when.extensions` | string[] | Match these file extensions (lowercase, no dot; empty = any) |
+| `when.kinds` | string[] | Match `file` and/or `dir` (empty = any) |
+
+At most **10** rows per app.
+
+On activation core POSTs `{ item_id, surface, path, kind?, root? }` to `endpoint`.
+
+**The file's PATH is sent, never its CONTENT.** A contributed row needs no
+permission to exist, so shipping file bytes with every activation would hand any
+app that declares a row the contents of whatever file the reader clicked, with no
+install-time declaration and no consent step. An app that needs the bytes reads
+them through a route its own `permissions` cover.
+
+`when` is evaluated by core, so an app cannot run code in the host to decide
+visibility. An endpoint outside the app's own namespace (or one using `..`
+traversal) is refused at install — the same allowlist `publishProvider` uses. For
+a signed app the rows are covered by the signature, because `endpoint` is where
+core sends the reader's chosen path. A stock build with no app declaring these
+renders nothing.
+
 ### App Icon
 
 `iconPath` is the App Store's card and row icon, and it is **top-level** — not
@@ -363,6 +507,52 @@ and detail cards. The path form depends on how the app is distributed:
 
 Hero images are illustrative marketing art. `screenshots` are separate and must
 show the real product UI; the detail page renders both when both are declared.
+
+## Contributions
+
+### `contributes` — Declarative contribution points
+
+`contributes` groups the surfaces an app adds to parts of the dashboard it does
+not own. Core reads each declaration as data and renders/dispatches it — it never
+imports app code — exactly like `publishProvider`. The block is inert when absent.
+
+#### `contributes.panelTabs` — Chat side-panel tabs
+
+A body-owning tab in the chat side panel, declared like a page and mounted through
+the **same in-process ESM app host `ui.pages` use** (never an iframe). The
+frontend keys the tab on `app:<app_name>:<id>` and persists it as metadata, so it
+survives a reload and re-mounts its `entry`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `contributes.panelTabs[].id` | string | | Stable tab id, unique within the app; storage-safe slug (`[a-z][a-z0-9_-]{0,63}`) |
+| `contributes.panelTabs[].title` | string | | Tab strip label |
+| `contributes.panelTabs[].menuLabel` | string | | Row label in the side-panel "+" menu and the empty-panel launcher |
+| `contributes.panelTabs[].menuDescription` | string | | Optional one-line description shown under the launcher card |
+| `contributes.panelTabs[].icon` | string | | Icon name from the app icon set below (e.g. `"BookOpen"`) |
+| `contributes.panelTabs[].entry` | string | | ESM bundle path mounted as the tab body, relative to the app's `ui/` directory |
+
+The `entry` base is the app's `ui/` directory, not the app root: the reader mounts
+it from the one static route apps are served through, `/apps/<name>/ui/<entry>`, so
+`"panel.mjs"` is the file at `<app root>/ui/panel.mjs` and a leading `"ui/"` would
+resolve to `ui/ui/`. Same base as `ui.entry`.
+
+An app may declare at most 8 panel tabs; the cap is enforced by the manifest and
+by the reader, so tabs past it are dropped with a warning rather than rendered.
+Labels are the app's own literals (the core has no i18n catalog key for a tab it
+does not know), so they render as declared. The tab body is a normal app UI
+bundle: it runs in-process behind the same permission-scoped API provider as an
+app page.
+
+`icon` accepts one of the following names. The set is fixed rather than the whole
+Lucide catalog, because resolving an arbitrary name would mean bundling every
+icon; an unrecognised or absent name renders a generic panel glyph.
+
+`Activity`, `Bell`, `BookOpen`, `Bot`, `Boxes`, `Bug`, `Cloud`, `Code`,
+`Database`, `FileText`, `Files`, `Folder`, `FolderTree`, `GitBranch`, `Globe`,
+`Inbox`, `Layers`, `Link`, `ListTodo`, `MessageSquare`, `Package`, `PanelRight`,
+`Pin`, `Search`, `Settings`, `Shield`, `Sparkles`, `Star`, `Table`, `Tag`,
+`Terminal`, `Users`, `Wrench`, `Zap`
 
 ## Backend
 
@@ -452,6 +642,43 @@ symlinked sibling resolves wherever it points. Do not use a bare
 shipping a `config.py` would end up sharing one module. `from kiro_crew...`
 absolute imports are for built-in apps only.
 
+**Python dependencies.** Runtime `requirements.txt` provisioning — the
+`data/.kirocrew-deps/` tree described in the stdio `command`-resolution passage
+above (see #7878 / #7901 for the mechanism) — runs only where app code executes
+as its own process: the `backend.entryPoint` spawn path (a real file entry
+point in the app's own tree) and stdio MCP server registration. Hook code gets
+nothing from it: the tree reaches processes **spawned on the app's behalf** —
+through a `site`-processing launch shim for Python commands, on `PYTHONPATH`
+for ABI-matched others — and is never placed on the Gateway's own import path,
+because hooks run inside the Gateway process, where an app-controlled tree
+ahead of the trusted modules could shadow the Gateway's own code. That is the
+same rule that keeps `-m kiro_crew...` servers off the app deps, and it binds
+your hook code too: do not push your own tree onto `sys.path` ahead of the
+Gateway's modules from inside a hook.
+
+What serves hooks instead is the **install-time build step**: a registry
+install (which clones the app's git source) runs `pip install .` (or
+`pip install -r requirements.txt` when there is no `pyproject.toml`/`setup.py`)
+into the Gateway's own interpreter — the one that imports your hooks (see the
+publishing guide's install flow) — but only when the app's source directory
+(the `subdirectory` when one is declared) has no `package.json`, which takes
+precedence and routes the build to npm instead. Two caveats: the desktop app's
+bundled interpreter fails the build step outright, and a failed `pip` run —
+including a Gateway interpreter that has no `pip` module — fails the install
+rather than skipping the build. An app installed by other means, one whose
+`package.json` routed the build to npm, or one declaring no
+`requirements.txt`/`pyproject.toml`/`setup.py` at all, imports only the stdlib
+plus whatever the Gateway's environment already provides.
+
+If you create a directory to hold your own dependencies, do **not** name it
+`.venv`. Interpreter resolution (`resolve_app_python`) runs only for spawned
+surfaces — a backend entry point or a stdio MCP server — so a purely
+hooks-only app never triggers it; but the moment your app also declares one of
+those (now or in a later version), a real, probe-usable virtual environment at
+`<app>/.venv` becomes the interpreter for anything spawned on the app's
+behalf whenever no provisioned deps tree is active, even when it holds no
+packages at all.
+
 ## Permissions
 
 ### `permissions` — Declared Capabilities
@@ -499,7 +726,7 @@ the platform does not rate-limit spawns per app today.
 API: `apps/spawn_sdk.py` — `SpawnSDK`, `build_spawn_impl`, `build_done_probe`,
 `SpawnError`.
 
-> **Advisory today, not enforced in-process.** These fields are **not** a runtime sandbox. The validator functions in `apps/permissions.py` (`validate_permissions`, `format_permissions_summary`) are currently **not wired into the install or runtime path** — they are only exercised by unit tests — so the manifest `permissions` block is neither enforced nor even surfaced today: `mcpTools` is not gated at tool dispatch and an empty `mcpTools` list is treated as unrestricted. What actually confines an app today is the HTTP app-token scope (`permissions.api` allowlist, deny-by-default — see `security.md`) plus the OS sandbox. Install-time path traversal is blocked separately by `_check_path_safety(name)` + `manifest.validate()`, not by the permission validator. Full in-process enforcement is tracked in [app-sandbox-roadmap.md](../request-for-change/rfc-app-sandbox-isolation.md).
+> **Advisory today, not enforced in-process.** These fields are **not** a runtime sandbox. The validator functions in `apps/permissions.py` (`validate_permissions`, `format_permissions_summary`) are currently **not wired into the install or runtime path** — they are only exercised by unit tests — so the manifest `permissions` block is neither enforced nor even surfaced today: `mcpTools` is not gated at tool dispatch and an empty `mcpTools` list is treated as unrestricted. What actually confines an app today is the HTTP app-token scope (`permissions.api` allowlist, deny-by-default — see `security.md`) plus the OS sandbox. Install-time path traversal is blocked separately by `_check_path_safety(name)` + `manifest.validate()`, not by the permission validator. Full in-process enforcement is tracked in [rfc-app-sandbox-isolation.md](../request-for-change/rfc-app-sandbox-isolation.md).
 
 ## Setup Hooks
 
@@ -620,12 +847,61 @@ Control how KiroCrew manages the app:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `platform.os` | string[] | `["macos", "linux"]` | Supported platforms |
+| `platform.os` | string[] | `["macos", "linux"]` | Supported platforms. Valid names: `macos`, `linux`, `windows`. **The default excludes `windows`** — see below |
 | `platform.arch` | string[] | `[]` (any) | Supported architectures |
 | `platform.requiresDesktopApp` | boolean | `false` | App's own UI needs the Electron desktop shell |
 | `platform.installMode` | string | `"server"` | `"server"` or `"client"` |
 | `platform.clientInstall.shell` | string | | One-liner for local install |
 | `platform.clientInstall.postInstall` | string | | Command to run after install |
+
+#### `platform.os` — a published claim, and silence publishes "no"
+
+For a **server-mode** app (every builtin), `platform.os` is a user-facing CLAIM,
+not an access control. It is rendered on the App Store detail page
+(`website/src/pages/AppDetailPage.tsx`), and that is its only non-test consumer.
+`apps/routes.py` reads it once, via `_client_install_manifest()`, which returns
+`None` unless `platform.installMode == "client"`; `handle_enable_app`'s docstring
+states the rest outright — "nothing else on the enable path consults that field".
+So omitting the block does **not** stop the app being enabled anywhere.
+
+What it does do is publish something untrue. The default is
+`["macos", "linux"]`, so **an app that omits the `platform` block tells every
+Windows user that it does not run there** — indistinguishable from a deliberate
+statement, and wrong if the app in fact runs fine.
+
+Declare the block explicitly and make it say what you mean:
+
+```json
+{ "platform": { "os": ["macos", "linux", "windows"] } }
+```
+
+For a `platform.installMode: "client"` app the field DOES gate behaviour: the
+`onEnable` script is skipped with `onEnable.skipped: "unsupported_platform"` when
+the gateway's OS is not listed, because that script addresses a separately
+distributed desktop application.
+
+Two things decide whether your app can honestly claim `windows`:
+
+1. **Does its code assume POSIX?** Route every platform decision through
+   `kiro_crew.platform_compat` (`IS_WINDOWS`, `IS_POSIX`, `file_lock`,
+   `rename_noreplace`, `trusted_system_bin`, …) rather than writing a raw
+   `sys.platform` test. Pass explicit `encoding="utf-8"` on text I/O — the
+   Windows default code page is not UTF-8. Prefer `os.replace` over
+   `os.rename`, and reject Windows-reserved file names (`CON`, `NUL`,
+   `COM1`–`COM9`, `LPT1`–`LPT9`, and names ending in a dot or space).
+
+2. **Does it need a backend CHILD PROCESS?** An app with no `backend`, or with
+   `backend.hooks` only, runs inside the Gateway process and spawns nothing, so
+   it is unaffected by the item below. An app with a `backend.entryPoint` is
+   spawned through `sandbox.wrap_argv` without the first-party carve-out, and
+   Kiro Crew has no native Windows sandbox backend — so on native Windows that
+   spawn runs unconfined under this platform's default, since no backend is
+   installable here; it is refused only where the operator declared
+   `agent.sandbox_allow_unsandboxed_exec=false` or a governance
+   `sandbox.min_level` floor is pinned. Say so in your app's `configuration`
+   copy rather than publishing "does not run here", so a locked-down host is
+   not a surprise. See `docs/guides/windows-install.md` and
+   `docs/system-specs/common/platform-compat.md`.
 
 When `installMode` is `"client"`, the App Store shows copy-paste terminal
 instructions instead of running the install on the server. This is used for

@@ -14,8 +14,10 @@ import { DndContext, DragOverlay, MeasuringStrategy, pointerWithin, type DragEnd
 import SegmentedControl from '../components/SegmentedControl'
 import { api } from '../api/client'
 import { Card, CardTitle, PageHeader, Btn, Badge, SearchInput, EmptyState, Input } from '../components/ui'
+import ErrorNotice from '../components/ErrorNotice'
 import SimpleSelect from '../components/SimpleSelect'
 import RemoteArtifactCard from '../components/RemoteArtifactCard'
+import { publishNoticeKey } from '../components/PublishHub'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '../components/ui/dropdown-menu'
 import { timeAgo as _timeAgo } from '../utils/timeAgo'
@@ -182,8 +184,8 @@ function FolderMiniThumb({ a }: { a: Artifact }) {
 
 /** Gallery folder card: click to enter, draggable (nest via drop on another
  * folder card / breadcrumb), droppable (receives artifacts and folders).
- * Carries the same mr-3/mb-3 gutters the masonry cards use so folder cards
- * line up column-for-column with the gallery below. */
+ * Carries the same mb-3 row gap the masonry cards use; the column gutter is
+ * the FolderCardGrid's `gap-x-3`, so the card must NOT add an `mr-3` of its own. */
 function FolderCard({ folder, folders, previewArtifacts, actions }: {
   folder: ArtifactFolder
   folders: ArtifactFolder[]
@@ -206,7 +208,7 @@ function FolderCard({ folder, folders, previewArtifacts, actions }: {
               tabIndex={0}
               onKeyDown={(e) => { if (!renaming && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); actions.onOpen(folder.id) } }}
               aria-label={i18nT('pages.artifactsPage.open_folder', { name: folder.name })}
-              className={`group mr-3 mb-3 rounded-lg border bg-card p-3 cursor-pointer transition-all hover:border-border-strong hover:shadow-md ${
+              className={`group mb-3 rounded-lg border bg-card p-3 cursor-pointer transition-all hover:border-border-strong hover:shadow-md ${
                 isOver ? 'border-accent ring-2 ring-accent/40 bg-accent/5' : 'border-border'
               }`}
               style={{
@@ -254,17 +256,25 @@ function FolderCard({ folder, folders, previewArtifacts, actions }: {
   )
 }
 
-/** Grid for folder cards using the same measurement + gutter scheme as
- * LibraryMasonry (-mr-3 container, cards carry mr-3/mb-3, identical 300px
- * min column width) so folder cards align column-for-column with the
- * masonry gallery below. */
+/** Width of one card gutter (`mr-3` on the masonry cards, `gap-x-3` here). */
+const CARD_GUTTER_PX = 12
+
+/** Grid for folder cards, sized to align column-for-column with the masonry
+ * gallery below (same 300px column pitch, same gutter).
+ *
+ * The gutter is a grid `gap`, NOT the masonry's `-mr-3` wrapper + per-card
+ * `mr-3` scheme. That scheme makes the wrapper one gutter WIDER than its
+ * parent, which is harmless in a padded page column but is 12px of scrollable
+ * overflow inside a scroll container — and once the gallery virtualizes this
+ * grid lives inside the capped, `overflow-y-auto` folder region (which makes
+ * its overflow-x `auto` too), so the wrapper painted a horizontal scrollbar
+ * under the folder cards. The gutter is passed to the column count so both
+ * grids still divide the same width and never disagree at a boundary. */
 function FolderCardGrid({ children }: { children: React.ReactNode }) {
-  const [ref, cols] = useColumnCount(300)
+  const [ref, cols] = useColumnCount(300, CARD_GUTTER_PX)
   return (
-    <div ref={ref} className="-mr-3">
-      <div className="grid" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
-        {children}
-      </div>
+    <div ref={ref} className="grid gap-x-3" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
+      {children}
     </div>
   )
 }
@@ -363,8 +373,8 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
               {a.publication && (
                 <Share2
                   size={12}
-                  className={a.publication.last_error ? 'text-danger shrink-0' : 'text-ok shrink-0'}
-                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
+                  className={a.publication.last_error ? 'text-danger shrink-0' : a.publication.notice ? 'text-warn shrink-0' : 'text-ok shrink-0'}
+                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : a.publication.notice ? i18nT(publishNoticeKey({ rolling_out: 'pages.artifactsPage.published_rolling_out', distribution_disabled: 'pages.artifactsPage.published_distribution_disabled', notice_generic: 'pages.artifactsPage.published_notice_generic' }, a.publication.notice_code)) : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
                 />
               )}
             </div>
@@ -961,7 +971,11 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   // The file's text is COPIED into artifact storage, so the artifact does not
   // stay bound to the file on disk (see lib/artifactImport.ts for why).
   const addFileInputRef = useRef<HTMLInputElement>(null)
+  // `addError` holds FAILURES (a rejected request, a refused import); the
+  // pure client-side pick checks (unsupported type, too large, empty, not
+  // text) are validation hints and live in `pickHint`, rendered as plain text.
   const [addError, setAddError] = useState<string | null>(null)
+  const [pickHint, setPickHint] = useState<string | null>(null)
   const addArtifactMut = useMutation({
     mutationFn: async (vars: ImportPlan & { folder: string }) => {
       // Create unfiled, then file by id. `POST /api/artifacts` resolves its
@@ -1024,6 +1038,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   })
   const handleAddArtifact = useCallback(() => {
     setAddError(null)
+    setPickHint(null)
     addFileInputRef.current?.click()
   }, [])
   const handleAddArtifactFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1033,9 +1048,12 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     e.target.value = ''
     if (!file) return
     setAddError(null)
+    setPickHint(null)
     const result = await planFileImport(file)
     if (!result.ok) {
-      setAddError(importRejectionText(result.reason))
+      // 'unreadable' is a caught read failure; the rest are pick validation.
+      if (result.reason === 'unreadable') setAddError(importRejectionText(result.reason))
+      else setPickHint(importRejectionText(result.reason))
       return
     }
     // File it into the folder being browsed, matching New Folder's placement.
@@ -1153,10 +1171,11 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   // can switch between tags without first resetting to "all tags". Without
   // this, allTags would be derived only from currently-filtered results and
   // co-occurring tags would disappear when one is selected.
-  const { data: allTagsData } = useQuery<{ artifacts: Artifact[] }>({
+  const allTagsQ = useQuery<{ artifacts: Artifact[] }>({
     queryKey: ['artifacts', 'all-tags'],
     queryFn: () => api.artifacts({}),
   })
+  const allTagsData = allTagsQ.data
 
   // Memoized so hooks depending on `artifacts` (the undo-bar useCallback and
   // the tag/starred useMemos) see a stable reference between fetches — the
@@ -1300,18 +1319,28 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   // Registered publish providers gate the ENTIRE remote-browse surface: the
   // public edition ships an empty registry, so this resolves to [] and no
   // remote section renders (zero extra requests beyond this one probe).
-  const { data: providersData } = useQuery<{ providers: PublishProviderDescriptor[] }>({
+  const providersQ = useQuery<{ providers: PublishProviderDescriptor[] }>({
     queryKey: ['publish-providers', 'widget'],
     queryFn: () => api.getArtifactPublishProviders('widget'),
     staleTime: 300_000,
   })
+  const providersData = providersQ.data
   const discoveryProviders = useMemo(
     () =>
       (providersData?.providers || []).filter(
         (p) =>
-          p.discovery_model.list_mine ||
-          p.discovery_model.list_shared_with_me ||
-          p.discovery_model.list_public,
+          // `available: false` means the provider's tooling is not installed on
+          // this machine, so every browse request it could make fails. The
+          // publish picker still lists such a provider — publishing installs the
+          // tooling on first use, so hiding the destination there would make it
+          // undiscoverable — but browsing has no equivalent: there is nothing to
+          // list and no action in this section that would install anything, so
+          // its only possible rendering is an error card. Omitted by older
+          // gateways, hence the explicit `!== false` rather than a truthy test.
+          p.available !== false &&
+          (p.discovery_model.list_mine ||
+            p.discovery_model.list_shared_with_me ||
+            p.discovery_model.list_public),
       ),
     [providersData],
   )
@@ -1462,6 +1491,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
 
   const errMessage = error ? (error instanceof Error ? error.message : String(error)) : null
   const asMessage = (e: unknown) => (e instanceof Error ? e.message : String(e))
+  // pinMut, createFolderMut and updateFolderMut report here too: the star and
+  // the folder controls live inside rows the library components own, so the
+  // page banner is the one surface every one of them can reach.
   const mutErr = deleteMut.error
     ? asMessage(deleteMut.error)
     : addArtifactMut.error
@@ -1470,7 +1502,21 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
         ? asMessage(newArtifactMut.error)
         : materializeMut.error
           ? asMessage(materializeMut.error)
-          : null
+          : pinMut.error
+            ? asMessage(pinMut.error)
+            : createFolderMut.error
+              ? asMessage(createFolderMut.error)
+              : updateFolderMut.error
+                ? asMessage(updateFolderMut.error)
+                : null
+  const resetMutErrors = () => {
+    deleteMut.reset(); addArtifactMut.reset(); newArtifactMut.reset(); materializeMut.reset()
+    pinMut.reset(); createFolderMut.reset(); updateFolderMut.reset()
+    setAddError(null)
+  }
+  // The inline folder-name inputs (new folder, rename) are the only unsaved
+  // drafts on this page; the filter box is a query, not content.
+  const handoffSafe = !creatingFolder && !renamingFolderId
 
   // Hooks must run before the `isLoading` early return below, so the scroll
   // wiring lives here rather than beside the JSX it feeds.
@@ -1591,16 +1637,37 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
           galleryOwnsScroll ? 'flex flex-col flex-1 min-h-0' : 'pb-8'
         }`}
       >
-        {(errMessage || mutErr || addError) && (
-          <div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise">
-            <span className="text-danger text-lg shrink-0"><AlertTriangle className="lucide-inline" /></span>
-            <div className="flex-1 min-w-0">
-              <div className="text-sm text-danger font-medium">{i18nT('pages.artifactsPage.error')}</div>
-              <div className="text-[13px] text-danger/90 mt-0.5">{errMessage || mutErr || addError}</div>
-            </div>
-            <Btn aria-label={i18nT('app.dismiss')} onClick={() => { deleteMut.reset(); addArtifactMut.reset(); newArtifactMut.reset(); materializeMut.reset(); setAddError(null) }} className="text-danger/60 hover:text-danger shrink-0"><X className="lucide-inline" /></Btn>
+        {/* No hand-off while a folder-name input (new folder / rename) is
+            open — its text is unsaved and the hand-off unmounts this page.
+            Otherwise every failure here is a read or an action on persisted
+            artifacts, so nothing is lost. */}
+        <ErrorNotice
+          message={errMessage || mutErr || addError}
+          onDismiss={resetMutErrors}
+          askAgent={handoffSafe}
+          className="mb-4 animate-rise"
+        />
+        {pickHint && (
+          <div role="status" className="mb-4 flex items-start gap-3 text-[13px] text-muted">
+            <span className="flex-1 min-w-0">{pickHint}</span>
+            <Btn aria-label={i18nT('app.dismiss')} onClick={() => setPickHint(null)} className="shrink-0"><X className="lucide-inline" /></Btn>
           </div>
         )}
+        {/* Auxiliary reads (tag options, remote providers, session docs): each
+            failure gets its own notice + Retry so the section it feeds does
+            not simply vanish. Same hand-off decision as the banner above. The
+            tag read hits the same endpoint as the list, so while the list's own
+            failure is up its notice would only repeat that one. */}
+        {([
+          [allTagsQ, 'all-tags'],
+          [providersQ, 'providers'],
+          [sessionDocsQ, 'session-docs'],
+        ] as const).map(([q, id]) => q.isError && !(id === 'all-tags' && errMessage) && (
+          <div key={id} className="mb-4 flex items-start gap-2">
+            <ErrorNotice message={asMessage(q.error)} askAgent={handoffSafe} className="flex-1" />
+            <Btn onClick={() => q.refetch()} className="shrink-0">{i18nT('pages.artifactsPage.retry')}</Btn>
+          </div>
+        ))}
 
         {collisionNotice && (
           <div ref={collisionNoticeRef} tabIndex={-1} className="mb-4 bg-warn-subtle border border-warn/20 rounded-lg p-3 flex items-start gap-3 animate-rise" role="status">
@@ -1828,7 +1895,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             {view === 'grid' && (subfolders.length > 0 || (creatingFolder && !filtersActive)) && (
               <FolderCardGrid>
                 {creatingFolder && !filtersActive && (
-                  <div className="mr-3 mb-3 rounded-lg border border-accent bg-card p-3" style={newFolderColor ? { borderLeft: `3px solid ${newFolderColor}` } : undefined}>
+                  <div className="mb-3 rounded-lg border border-accent bg-card p-3" style={newFolderColor ? { borderLeft: `3px solid ${newFolderColor}` } : undefined}>
                     <div className="h-[84px] rounded-md border border-dashed border-border flex items-center justify-center text-muted mb-2.5">
                       <FolderPlus size={22} className="opacity-50" />
                     </div>
@@ -2045,7 +2112,7 @@ function RemoteBrowseSection({ provider, onForked, onCloned }: {
     : provider.discovery_model.list_shared_with_me ? 'shared' : 'public'
   const useSearch = !!search && provider.discovery_model.full_text_search
   const {
-    data, isLoading, error, fetchNextPage, hasNextPage, isFetchingNextPage, isPlaceholderData,
+    data, isLoading, error, refetch, fetchNextPage, hasNextPage, isFetchingNextPage, isPlaceholderData,
   } = useInfiniteQuery<
     { artifacts: RemoteArtifact[]; next_page_token?: string | null }
   >({
@@ -2075,7 +2142,20 @@ function RemoteBrowseSection({ provider, onForked, onCloned }: {
   // Your Artifacts above, so listing them here too would be a duplicate.
   const notLocal = items.filter(a => !a.local_slug)
   if (isLoading && !notLocal.length) return null
-  if (error) return null
+  // A failed provider browse must not make the whole section vanish — say so,
+  // and offer the retry. The filter box holds a query, not a draft, so the
+  // hand-off is safe.
+  if (error) {
+    return (
+      <Card className="mt-4">
+        <CardTitle>{i18nT('pages.artifactsPage.on')} {provider.display_name}</CardTitle>
+        <div className="flex items-start gap-2">
+          <ErrorNotice message={error instanceof Error ? error.message : String(error)} askAgent className="flex-1" />
+          <Btn onClick={() => refetch()} className="shrink-0">{i18nT('pages.artifactsPage.retry')}</Btn>
+        </div>
+      </Card>
+    )
+  }
   if (!notLocal.length && !search) return null
   const filtered = search && !useSearch
     ? notLocal.filter(a => a.title.toLowerCase().includes(search.toLowerCase()) || a.tags?.some(t => t.toLowerCase().includes(search.toLowerCase())))

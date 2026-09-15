@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -38,11 +39,30 @@ def _sandbox_can_spawn() -> bool:
     probe: a spawn can fail for reasons a capability probe cannot see, and
     reusing wrap_argv() means this check can never drift from
     start_app_backend().
+
+    The probe runs under an EMPTY ``KIROCREW_HOME``. It is evaluated at
+    collection, before the per-test isolation fixture pins the data home, so a
+    bare ``wrap_argv()`` here reads the OPERATOR's real ``~/.kiro/crew/config.json``
+    -- and on a Windows or macOS developer machine that file routinely carries
+    ``agent.sandbox_allow_unsandboxed_exec=true`` (the only way Kiro Crew runs
+    there). That made the probe answer "can spawn" for a host with no sandbox
+    backend at all, and every test it gates then failed closed under the
+    fixture's default config, while CI (no operator config) skipped them. The
+    gate must observe what the tests will observe: the default config.
     """
     try:
         from kiro_crew import sandbox as _sb
 
-        argv, cleanup = _sb.wrap_argv([sys.executable, "-c", "pass"], mode="standard")
+        with tempfile.TemporaryDirectory() as empty_home:
+            saved = os.environ.get("KIROCREW_HOME")
+            os.environ["KIROCREW_HOME"] = empty_home
+            try:
+                argv, cleanup = _sb.wrap_argv([sys.executable, "-c", "pass"], mode="standard")
+            finally:
+                if saved is None:
+                    os.environ.pop("KIROCREW_HOME", None)
+                else:
+                    os.environ["KIROCREW_HOME"] = saved
     except Exception:  # noqa: BLE001 — any probe failure => treat as "can't spawn"
         return False
     try:
@@ -285,7 +305,7 @@ class TestFixedAndAutoPortIsolation:
     def test_a_fixed_port_app_claims_it_before_binding(self, tmp_path, app_env, monkeypatch):
         """The SPAWN PATH must claim a fixed manifest port, not just record it later.
 
-        Boot spawns concurrently, and a fixed-port app used to record its port only
+        Boot spawns concurrently, and a fixed-port app that records its port only
         AFTER binding. An auto-port app selecting inside that window could be handed
         the same number, so one of the two children would die of EADDRINUSE and its
         backend would stay unavailable. Asserted at the real seam: the port must
@@ -449,7 +469,7 @@ class TestBootSpawnLatency:
     def test_survival_check_exits_early_for_a_healthy_child(self, monkeypatch):
         """A living child must not cost the full survival window.
 
-        The poll used to sleep its whole ~1.6s budget on the happy path and only
+        The poll would sleep its whole ~1.6s budget on the happy path and only
         break when the child DIED, so every app added ~1.6s of dead time to boot.
         It must return as soon as the child is confirmed alive.
         """
@@ -665,7 +685,7 @@ class TestBootSpawnLatency:
     def test_boot_starts_app_backends_concurrently(self, monkeypatch):
         """Boot must not serialize per-app spawn latency.
 
-        N apps used to cost N x the survival window because each spawn ran to
+        N apps would cost N x the survival window because each spawn ran to
         completion before the next began. With 4 apps that is ~6.4s of pure boot
         latency on the happy path.
         """
@@ -1755,8 +1775,120 @@ class TestTheCacheOnlyChildCanSeeTheCacheItMustBootFrom:
         assert seen.get("visible") == ()
 
 
+class TestTheMdNotebookBackendCanSeeItsOwnStateFiles:
+    """The md-notebook spawn's isolated startup, which rides with its mask carve-out.
+
+    The carve-out itself is main's (``app_backend_visible_targets``, pinned in
+    ``test_sandbox_governance_mask.py``). What is pinned HERE is the startup shape that
+    has to accompany it: this is the one spawn whose namespace holds an unmasked PAT, so
+    a bare ``python -m`` — which runs ``sitecustomize`` / ``usercustomize`` and the user
+    site's ``.pth`` files from an agent-writable directory — would execute that injected
+    code right where the token is readable. The spawn therefore starts with ``-I`` and
+    re-states its import root explicitly, and that rewrite is scoped to this spawn alone.
+    """
+
+    @staticmethod
+    def _spy(bmod, monkeypatch):
+        seen: dict = {}
+
+        def _spy_wrap(argv, **kwargs):
+            seen["visible"] = kwargs.get("extra_visible_dirs")
+            seen["argv"] = list(argv)
+            return (list(argv), None)
+
+        monkeypatch.setattr(bmod, "wrap_argv", _spy_wrap)
+        monkeypatch.setattr(
+            bmod.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(OSError("stop"))
+        )
+        return seen
+
+    def test_the_shipped_builtin_spawn_starts_isolated_with_the_carveout(
+        self, app_env, monkeypatch
+    ):
+        import kiro_crew.apps.backend as bmod
+        from kiro_crew.apps.manager import register_builtin_apps
+        from kiro_crew.sandbox import MD_NOTEBOOK_APP_NAME, app_backend_visible_targets
+
+        register_builtin_apps()
+        seen = self._spy(bmod, monkeypatch)
+
+        bmod.start_app_backend("md-notebook")
+
+        assert seen.get("visible"), "the spawn passed no visible dirs at all"
+        for path in app_backend_visible_targets(MD_NOTEBOOK_APP_NAME):
+            assert path in seen["visible"], (
+                "md-notebook's own state stays masked from the one spawn that "
+                f"owns it, so attach/clone still EPERMs (missing {path!r}, "
+                f"saw {seen['visible']!r})"
+            )
+        # Startup isolation rides with the carve-out: a bare `python -m` runs
+        # sitecustomize/usercustomize, and the default user site is an
+        # agent-writable injection path that would execute inside the one
+        # namespace where the PAT is unmasked.
+        argv = seen["argv"]
+        assert "-I" in argv, f"module builtin spawned without isolated startup: {argv!r}"
+        assert "-m" not in argv and any(
+            "runpy" in a and "kiro_crew.apps.builtins.md_notebook" in a for a in argv
+        ), f"the module must run via runpy with an explicit import root: {argv!r}"
+
+    def test_other_module_builtins_keep_the_bare_module_launch(self, app_env, monkeypatch):
+        """The isolated-startup rewrite is scoped to the spawn that carries the
+        carve-out: the other module builtins have no unmasked secret in their
+        namespace, and rewriting their import environment would be a rider on a
+        fix scoped to one (First Principles review)."""
+        import kiro_crew.apps.backend as bmod
+        from kiro_crew.apps.manager import register_builtin_apps
+
+        register_builtin_apps()
+        seen = self._spy(bmod, monkeypatch)
+
+        bmod.start_app_backend("file-explorer")
+
+        argv = seen["argv"]
+        assert "-I" not in argv and "-m" in argv, (
+            f"a non-md-notebook module builtin changed launch shape: {argv!r}"
+        )
+        assert seen.get("visible") == (), (
+            "a non-md-notebook builtin received the state carve-out"
+        )
+
+    def test_a_third_party_app_wearing_the_name_keeps_the_mask(
+        self, app_env, tmp_path, monkeypatch
+    ):
+        """The carve-out is bought with provenance, never with a name: an app
+        NAMED md-notebook that executes from the mutable installed tree (here
+        via the blanket third-party toggle the fixture enables) must not see
+        the GitHub token."""
+        import kiro_crew.apps.backend as bmod
+
+        seen = self._spy(bmod, monkeypatch)
+
+        src = tmp_path / "source" / "md-notebook"
+        src.mkdir(parents=True)
+        (src / APP_MANIFEST_FILENAME).write_text(
+            json.dumps(
+                {
+                    "name": "md-notebook",
+                    "version": "9.9.9",
+                    "displayName": "Impostor",
+                    "description": "wears the builtin's name",
+                    "backend": {"entryPoint": "server.py", "healthCheck": "/health"},
+                }
+            )
+        )
+        (src / "server.py").write_text("import time\ntime.sleep(30)\n")
+        install_app(src)
+
+        bmod.start_app_backend("md-notebook")
+
+        assert seen.get("visible") == (), (
+            "a third-party app bought the md-notebook state carve-out with its "
+            f"name alone (saw {seen.get('visible')!r})"
+        )
+
+
 # =============================================================================
-# Post-startup liveness watch (#5726)
+# Post-startup liveness watch
 # =============================================================================
 
 
@@ -1771,7 +1903,7 @@ class _FakeProc:
 
 
 class TestBackendLivenessWatch:
-    """``healthy`` must be able to go back to False (#5726).
+    """``healthy`` must be able to go back to False.
 
     Before the watch, the startup poll wrote ``healthy = True`` once and nothing ever
     unwrote it, so a backend that died later kept the reverse proxy routing to its dead
@@ -1910,7 +2042,7 @@ class TestBackendLivenessWatch:
 
 
 class TestBackendRunningReflectsTheProcess:
-    """``/api/apps`` must not report an exited backend as running (#5726)."""
+    """``/api/apps`` must not report an exited backend as running."""
 
     def test_running_is_false_once_the_process_exits(self):
         ap = AppProcess(app_name="gone", port=9162, pid=7, proc=_FakeProc(returncode=0))
@@ -1996,7 +2128,7 @@ class TestHealthTransitionsRefuseAStaleRecord:
         bmod._demote(ap, reason="test")
 
         assert ap.healthy is True  # untouched
-        assert calls == []  # no scrub of a name this record no longer owns
+        assert calls == []  # no scrub of a name this record does not own
 
     def test_promote_refuses_an_untracked_record(self, gate_calls):
         bmod, calls = gate_calls
@@ -3068,7 +3200,7 @@ class TestRegistrationReportsAgentIoFailuresToo:
 
 
 class TestPromotionRequiresAConfirmedEnabledApp:
-    """A disabled app must not be resurrected by a health recovery (#5726 review).
+    """A disabled app must not be resurrected by a health recovery.
 
     `kirocrew app disable` runs in its OWN process: it deregisters the app's resources
     and never touches this process's tracking table. The record survives, so a later
@@ -3130,7 +3262,7 @@ class TestPromotionRequiresAConfirmedEnabledApp:
 
 
 class TestPromotionIsVerifiedAfterTheWrite:
-    """The enabled check cannot be atomic with the write (#5726 review).
+    """The enabled check cannot be atomic with the write.
 
     `kirocrew app disable` runs in another process, so there is no lock to share. Ordering
     closes the interleave where the flag is read after the resources come down; this
@@ -3199,7 +3331,7 @@ class TestPromotionIsVerifiedAfterTheWrite:
 
 
 class TestUndoIsRetriedUntilItCompletes:
-    """`deregister_app` reports softly, so a failed undo must not look clean (#5726 review).
+    """`deregister_app` reports softly, so a failed undo must not look clean.
 
     It returns problems in `RegistrationResult.errors` rather than raising, so recording
     the removal without reading that list leaves a disabled app's resources registered
@@ -3283,7 +3415,7 @@ class TestUndoIsRetriedUntilItCompletes:
 
 
 class TestDemotionRefreshIsGatedOnEnablement:
-    """The demotion's agent refresh must not restore a disabled app (#5726 review).
+    """The demotion's agent refresh must not restore a disabled app.
 
     A demotion does two things: it scrubs the MCP entry — always safe, and deliberately
     ungated — and it re-materializes the agent configs. The second is a WRITE, so for an
@@ -3343,7 +3475,7 @@ class TestDemotionRefreshIsGatedOnEnablement:
 
 
 class TestDisabledCleanupResultIsTheReconcileResult:
-    """A failed disabled-app cleanup is not a completed reconcile (#5726 review)."""
+    """A failed disabled-app cleanup is not a completed reconcile."""
 
     def test_a_failed_cleanup_reports_unlanded(self, monkeypatch):
         import kiro_crew.apps.backend as bmod
@@ -3371,9 +3503,9 @@ class TestDisabledCleanupResultIsTheReconcileResult:
 
 
 class TestTheUndoNeverTouchesASuccessor:
-    """Identity is checked BEFORE enablement (#5726 review).
+    """Identity is checked BEFORE enablement.
 
-    The undo deregisters by app NAME, so running it for a record that is no longer the
+    The undo deregisters by app NAME, so running it for a record that is not the
     tracked one deletes the SUCCESSOR's resources — and an unreadable enabled state is
     precisely what would send a retired watcher down that path.
     """
@@ -3403,7 +3535,7 @@ class TestTheUndoNeverTouchesASuccessor:
 
 
 class TestUnreadableManifestKeepsTheScrubUnlanded:
-    """Keeping the agents is right, but it leaves them stale (#5726 review).
+    """Keeping the agents is right, but it leaves them stale.
 
     `refresh_app_agents` gives up on the same unreadable manifest, so nothing else
     revisits those files. Recording the scrub as done would strand an agent config
@@ -3437,7 +3569,7 @@ class TestUnreadableManifestKeepsTheScrubUnlanded:
 
 
 class TestUnknownEnablementNeverDeletes:
-    """Fail-closed is right for ADDING and wrong for DELETING (#5726 review).
+    """Fail-closed is right for ADDING and wrong for DELETING.
 
     `installed.json` can fail to read transiently. Refusing to register when enablement
     is unknown is safe — the app stays as it is. Deregistering when it is unknown unlinks
@@ -3500,7 +3632,7 @@ class TestUnknownEnablementNeverDeletes:
 
 
 class TestATransitionAlwaysReconciles:
-    """`mcp_healthy` can be stale in the other direction (#5726 review).
+    """`mcp_healthy` can be stale in the other direction.
 
     An MCP write that landed followed by an agent write that did not leaves `mcp_healthy`
     unmoved while the entry IS on disk. If the verdict then flips, matching that stale
@@ -3548,7 +3680,7 @@ class TestATransitionAlwaysReconciles:
 
 
 class TestTheUndoPathsAlsoRefuseAnUnknownState:
-    """The tri-state rule applies to ALL THREE deletion sites (#5726 review).
+    """The tri-state rule applies to ALL THREE deletion sites.
 
     The demotion path was fixed first; the two undo calls inside `_set_backend_health`
     were not, and they reach the same `deregister_app` → `_deregister_agents` → unlink.
@@ -3613,7 +3745,7 @@ class TestTheUndoPathsAlsoRefuseAnUnknownState:
 
 
 class TestEnabledStateDistinguishesUnreadableFromDisabled:
-    """The tri-state has to be real, not nominal (#5726 review).
+    """The tri-state has to be real, not nominal.
 
     `is_app_enabled` returns False for BOTH a deliberate disable and an unreadable
     metadata file, because `_read_installed` answers None to both and never raises. Built
@@ -3665,3 +3797,56 @@ class TestEnabledStateDistinguishesUnreadableFromDisabled:
         meta.write_text("{ not json", encoding="utf-8")
 
         assert bmod._app_enabled_state("probe") is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="shebang semantics are POSIX-only")
+class TestExecBackendShebangShim:
+    def _spawn_cmd(self, tmp_path, shebang_line: str):
+        """Build the exec-arm inputs and return the resolved cmd."""
+        import kiro_crew.apps.backend as bk
+        from kiro_crew.apps.interpreter import app_deps_dir
+
+        root = tmp_path / "app"
+        root.mkdir()
+        (root / "requirements.txt").write_bytes(b"requests\n")
+        d = app_deps_dir(root)
+        d.mkdir(parents=True)
+        (d / bk._DEPS_STAMP_NAME).write_text(bk._deps_digest(b"requests\n"))
+        (d / bk._DEPS_ABI_NAME).write_text(bk._deps_abi_tag())
+        script = root / "run"
+        script.write_text(f"{shebang_line}\nimport requests\n")
+        script.chmod(0o755)
+        return bk, root, script
+
+    def test_an_abi_matched_shebang_script_launches_through_deps_boot(
+        self, tmp_path
+    ):
+        import sys as _sys
+
+        bk, root, script = self._spawn_cmd(tmp_path, f"#!{_sys.executable}")
+        got = bk._abi_shebang_of(root, str(script))
+        assert got == _sys.executable
+
+    def test_an_argument_bearing_shebang_keeps_its_flags(self, tmp_path):
+        """#!<python> -I keeps its kernel launch: the shared reader answers
+        None for argument-bearing shebangs, so no rewrite happens - and the
+        flag REMAINS in what actually executes. Both halves are asserted:
+        not a candidate, and the on-disk launch still carries -I exactly as
+        written (the kernel, not a rewrite, interprets the shebang)."""
+        import sys as _sys
+
+        bk, root, script = self._spawn_cmd(tmp_path, f"#!{_sys.executable} -I")
+        assert bk._abi_shebang_of(root, str(script)) is None
+        first_line = script.read_bytes().split(b"\n", 1)[0]
+        assert first_line == f"#!{_sys.executable} -I".encode()
+        # And a no-candidate script is launched as-is: simulate the exec-arm
+        # decision the spawn makes with this answer.
+        cmd = [str(script), "--serve"]
+        si = bk._abi_shebang_of(root, cmd[0])
+        assert si is None
+        # the arm leaves cmd untouched when there is no shim candidate
+        assert cmd == [str(script), "--serve"]
+
+    def test_a_foreign_shebang_is_not_a_shim_candidate(self, tmp_path):
+        bk, root, script = self._spawn_cmd(tmp_path, "#!/opt/foreign/python3.11")
+        assert bk._abi_shebang_of(root, str(script)) is None

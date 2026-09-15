@@ -402,13 +402,18 @@ class TestServedBackendAttribution:
         Scoped to the assignment: `_run_chat` legitimately reads
         `cfg.agent.provider` elsewhere, for the separate `provider_name` local the
         model-resolution branches use.
+
+        The expression is now a capability read. It replaced a
+        `"claude_code" if is_claude_backend(client) else "acp"` ternary, whose
+        literals `provider_seam` returns unchanged -- so the value this emits, KAS
+        residue included, is the same one.
         """
         import inspect
 
         from kiro_crew.dashboard import chat_runner
 
         src = inspect.getsource(chat_runner._run_chat)
-        assert "_provider_name = provider_label(client)" in src
+        assert "_provider_name = capabilities_of(client).provider_seam" in src
         assert "_provider_name = cfg.agent.provider" not in src
 
     def test_chat_runner_resolves_the_label_through_a_ratcheted_edge(self):
@@ -437,9 +442,11 @@ class TestServedBackendAttribution:
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 imported.update(alias.name for alias in node.names)
-        assert "provider_label" in imported
-        # Guard the guard: the harvest must actually see this module's imports.
-        assert "is_claude_backend" in imported
+        # The label is a capability read (`SessionCapabilities.provider_seam`),
+        # so chat_runner takes no ACP-layer import for it -- the boundary gate
+        # refuses one on any touched line.
+        assert "provider_label" not in imported
+        assert "is_claude_backend" not in imported
 
         baseline = (
             Path(__file__).resolve().parents[2] / ".github" / "agent-sdk-boundary-baseline.txt"
@@ -551,10 +558,10 @@ class TestAggregatorReportsAmountsWithoutMsKeys:
 class TestSpendAttributionByModel:
     """The `model` attribute has to survive the aggregator, not just the emitter.
 
-    The emitters stamp `model` on both spend histograms, but the turn block used to
-    fold every point into one pooled `_Hist`, so the attribute was recorded and
-    then discarded at the one place that reports the amount -- "which model spent
-    this" was unanswerable from the API despite being emitted.
+    The emitters stamp `model` on both spend histograms. A turn block that folds
+    every point into one pooled `_Hist` records the attribute and then discards it
+    at the one place that reports the amount, leaving "which model spent this"
+    unanswerable from the API despite being emitted.
     """
 
     def _aggregate(self, tmp_path: Path, points):

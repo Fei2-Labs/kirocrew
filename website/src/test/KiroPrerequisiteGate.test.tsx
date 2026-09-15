@@ -9,7 +9,7 @@ import KiroPrerequisiteGate, {
 import { renderWithProviders } from './helpers'
 
 vi.mock('../utils/clipboard', () => ({
-  copyToClipboard: vi.fn().mockResolvedValue(undefined),
+  copyToClipboard: vi.fn().mockResolvedValue(true),
   copyCode: vi.fn(),
 }))
 
@@ -748,6 +748,53 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.queryByText('Dashboard loaded')).not.toBeInTheDocument()
   })
 
+  it('shows the probe diagnostic when the backend backstop degrades a probe exception to 200', async () => {
+    // The backend's last-resort backstop reports an exception as a retryable
+    // not-ready 200 body (never a 500), so `prerequisite` resolves and the
+    // ApiError branch above never fires — this is the "Setup Check Unavailable
+    // with no reason" symptom the diagnostic exists to fix.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      probe_error: 'OSError: probe wedged',
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    expect(await screen.findByText('We could not check Kiro CLI.')).toBeInTheDocument()
+    expect(screen.getByText(/OSError: probe wedged/)).toBeInTheDocument()
+    expect(screen.queryByText('Dashboard loaded')).not.toBeInTheDocument()
+  })
+
+  it('names the probe exit status alongside the message when both are present', async () => {
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      probe_error: 'toolbox: kiro-cli is not registered',
+      probe_status: 127,
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    expect(
+      await screen.findByText(/toolbox: kiro-cli is not registered \(exit 127\)/),
+    ).toBeInTheDocument()
+  })
+
+  it('does not show a diagnostic screen when there is nothing to report', async () => {
+    // No probe_error at all: the ordinary first-run screen renders as before.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status())
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    expect(await screen.findByText('Set up Kiro')).toBeInTheDocument()
+    expect(screen.queryByTestId('kiro-gate-status-error')).not.toBeInTheDocument()
+  })
+
   it('terminates an unpunctuated gateway error before the next sentence', async () => {
     vi.mocked(api.kiroPrerequisite).mockRejectedValue(new ApiError(401, 'Token required'))
 
@@ -755,8 +802,13 @@ describe('KiroPrerequisiteGate', () => {
       <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
     )
 
+    // The gateway's message is the ErrorNotice (terminated as a sentence, since
+    // it is read as one), and the retry hint is its own line beneath it.
+    const alert = await screen.findByTestId('kiro-gate-status-error')
+    expect(alert).toHaveAttribute('role', 'alert')
+    expect(alert).toHaveTextContent('Token required.')
     expect(
-      await screen.findByText('Token required. Retry the gateway check before starting a session.'),
+      screen.getByText('Retry the gateway check before starting a session.'),
     ).toBeInTheDocument()
   })
 

@@ -391,7 +391,7 @@ def test_knowledge_documents_counts_sources(tmp_path):
 
     The fixture goes through ``KnowledgeStore``, so this is where a rename on either
     side of the coupling fails: the store renaming its table, or this module's
-    ``KNOWLEDGE_SOURCES_TABLE`` pointing at one that no longer exists. That matters
+    ``KNOWLEDGE_SOURCES_TABLE`` pointing at a table that does not exist. That matters
     because the probe deliberately never constructs a store (doing so would create
     the database), so nothing else observes the coupling -- and a drifted probe
     returns a CACHED gap indistinguishable from "never ingested".
@@ -529,6 +529,23 @@ def test_mcp_first_party_set_is_the_installer_constant_not_a_local_copy():
 def test_all_names_pass_core_namespace_validation():
     for name in ig.ALL_METRIC_NAMES:
         assert validate_name(name) == name
+
+
+def test_lifetime_totals_are_declared_for_the_consumer_that_must_know():
+    """A lifetime-total gauge is not interchangeable with a state gauge.
+
+    Its newest sample is "since this process started", so a consumer that reports
+    the newest sample as a reading shows a number that only grows. The dashboard
+    aggregator differences them instead, and it finds them through this tuple —
+    which must therefore name exactly the one whose reading accumulates, and
+    must stay a subset of the roster. Adding a lifetime-total gauge without
+    listing it here — or leaving a stale name in the tuple after a roster
+    change — would silently demote the series to newest-sample, with nothing
+    failing; this is the inventory half of the guard the process family already
+    has in ``test_process_gauges``.
+    """
+    assert set(ig.LIFETIME_TOTAL_METRICS) == {ig.GAUGE_PROBE_FAILURES}
+    assert set(ig.LIFETIME_TOTAL_METRICS) <= set(ig.ALL_METRIC_NAMES)
 
 
 def test_collection_yields_every_instrument_with_the_expected_shape():

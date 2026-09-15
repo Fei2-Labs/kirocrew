@@ -84,6 +84,13 @@ def _summarize(snapshot: dict) -> str:
             f"preserved — read them with `workflow_result('{run_id}')` under "
             "`partial_results` (keyed by agent call index)."
         )
+    result_count = snapshot.get("agent_result_count") or 0
+    if result_count:
+        lines.append(
+            f"\n{result_count} agent call result(s) recorded — read `agent_results` with "
+            f"workflow_result('{run_id}'). Finished means the workflow function returned; "
+            "required artifacts are not verified by this status."
+        )
     if error_count:
         lines.append(f"{error_count} agent call(s) failed; each reason is under `agent_errors`.")
     lines.append(
@@ -164,10 +171,9 @@ def inject_workflow_result(
             # message, one identity, so the bounded-read identity walk
             # recognises the persisted row instead of re-appending the
             # injection. append_and_surface delivers the live copy through
-            # exactly one identity-carrying door — the old unconditional
-            # explicit frame here carried no ``meta.mid``, so the client
-            # rendered the same result twice whenever append's own broadcast
-            # also fired (#5981 family).
+            # exactly one identity-carrying door — an unconditional explicit
+            # frame here carries no ``meta.mid``, so the client renders the same
+            # result twice whenever append's own broadcast also fires.
             window_mid = row_mid(
                 append_and_surface(
                     state,

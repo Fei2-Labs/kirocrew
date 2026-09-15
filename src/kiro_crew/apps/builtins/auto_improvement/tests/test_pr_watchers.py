@@ -154,7 +154,7 @@ def _await_status(
 
 
 def _await_gone(path: Path, timeout: float = WAIT_S) -> None:
-    """Poll until ``path`` no longer exists. Fails the test on timeout."""
+    """Poll until ``path`` is gone. Fails the test on timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not path.exists():
@@ -588,9 +588,9 @@ class TestGitOutputDecoding:
     `git diff` prints the CONTENT of changed files, and repositories legitimately contain
     binary (a PNG fixture) or non-UTF-8 text (a latin-1 source). Under a strict decode the
     UnicodeDecodeError is raised inside ``subprocess.communicate``, so it is NOT something
-    callers can read off ``returncode`` as data: it propagated out of `_export_is_durable`,
-    past `_run_agent_pass`, and killed the whole watcher with STATUS_ERROR — every PR in a
-    repo containing one binary file. Regression for the strict-decode default.
+    callers can read off ``returncode`` as data: it propagates out of `_export_is_durable`,
+    past `_run_agent_pass`, and kills the whole watcher with STATUS_ERROR — every PR in a
+    repo containing one binary file. These pin the lenient decode that avoids it.
     """
 
     def _repo_with_binary(self, tmp_path: Path) -> Path:
@@ -794,7 +794,13 @@ class TestCloneLifecycleAndExport:
             max_nudges=3,
             interval_s=0.0,
         )
-        _await_status(reg, "fp-once", {pr_watchers.STATUS_EXHAUSTED})
+        # Three times the file-wide budget, named: this test runs a REAL clone and
+        # then three passes that are each several git subprocesses on Windows-speed
+        # process spawns, on a host shared with five other workers. One full run
+        # in five saw every pass complete ("pass 3/3") with only the exhausted
+        # transition still outstanding at WAIT_S -- a bounded wait asserting too
+        # early, not a stuck watcher.
+        _await_status(reg, "fp-once", {pr_watchers.STATUS_EXHAUSTED}, timeout=WAIT_S * 3)
         assert marks == [False, True, True], "the clone must persist across passes"
 
 

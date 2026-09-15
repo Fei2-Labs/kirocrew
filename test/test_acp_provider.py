@@ -734,7 +734,7 @@ class TestEffortControl:
         provider._client.set_config_option = AsyncMock(side_effect=RuntimeError("rejected"))
         with pytest.raises(RuntimeError):
             await provider.change_effort("xhigh")
-        # Override rolled back (was previously unset).
+        # Override rolled back to unset.
         assert "claude-opus-4.7" not in provider._effort_per_model
 
     @pytest.mark.asyncio
@@ -778,7 +778,6 @@ class TestStartKiroRuntimeResume:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         # _model is a real string (not a MagicMock) so the DEFAULT_MODEL guard
         # in _start_kiro_runtime compares correctly.
@@ -822,8 +821,12 @@ class TestStartKiroRuntimeResume:
         runtime.create_session.assert_not_awaited()
         args = runtime.load_session.await_args.args
         loaded_path, loaded_sid = args[0], args[1]
-        # First positional is the full transcript path, never the bare sid.
-        assert loaded_path.endswith("/.kiro/sessions/cli/abc-123.json")
+        # First positional is the full transcript path under kiro-cli's session
+        # store -- wherever the resolver says that is (the test floor pins it) --
+        # never the bare sid.
+        from kiro_crew.config.paths import kiro_sessions_dir
+
+        assert loaded_path == str(kiro_sessions_dir() / "abc-123.json")
         assert loaded_path != "abc-123"
         # Second positional is the original sid, adopted as the resumed sessionId.
         assert loaded_sid == "abc-123"
@@ -931,7 +934,6 @@ class TestKiroStartupMetric:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         provider._client._resume_session_id = ""
         provider._client._model = model
@@ -1017,7 +1019,6 @@ class TestFixBDeadRuntimeRespawn:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         provider._client._model = "auto"
         return provider
@@ -1158,6 +1159,108 @@ class TestLoadSessionWithRetry:
         assert sleep_mock.await_count == 0
 
 
+class TestToolSearchResumeCompatibility:
+    """Dashboard-native ``session/load`` loses deferred-tool activation state.
+
+    A dashboard Tool Search session therefore resumes through a fresh native
+    session plus Kiro Crew's conversation-log replay. Operators who disable Tool
+    Search, and every non-dashboard dispatcher, keep native resume.
+    """
+
+    @staticmethod
+    def _provider(tool_search: bool) -> AcpProvider:
+        provider = _build_provider(backend="")
+        provider._client._work_dir = "/tmp/ws"
+        provider._client._agent = "kirocrew"
+        provider._client._sandbox_mode = "auto"
+        provider._client._extra_env = {}
+        provider._client._mcp_gateway_overlay = None
+        provider._client._mcp_gateway_socket = None
+        provider._client._resume_session_id = "old-sess-id"
+        provider._client._session_key = "dashboard:chat-1"
+        provider._client._channel_id = None
+        provider._client._model = "auto"
+        provider._tool_search = tool_search
+        return provider
+
+    @staticmethod
+    async def _start(provider: AcpProvider, *, load_succeeds: bool = True) -> MagicMock:
+        handle = MagicMock()
+        handle.session_id = "live-sess-id"
+        handle.available_models = []
+        handle.set_model = AsyncMock()
+
+        runtime = MagicMock()
+        runtime.pid = 4321
+        runtime.spawn = AsyncMock()
+        runtime.is_alive = MagicMock(return_value=True)
+        runtime.saw_not_logged_in = MagicMock(return_value=False)
+        runtime.kill = AsyncMock()
+        runtime.load_session = AsyncMock(return_value=handle if load_succeeds else None)
+        runtime.create_session = AsyncMock(return_value=handle)
+
+        with (
+            patch("kiro_crew.providers.acp.AcpRuntime", return_value=runtime),
+            patch(
+                "kiro_crew.providers.acp.AcpSessionProvider",
+                side_effect=lambda h, r, **kw: MagicMock(_handle=h, _runtime=r, resumed=False),
+            ),
+            patch("pathlib.Path.exists", return_value=True),
+        ):
+            await provider._start_kiro_runtime()
+        return runtime
+
+    @pytest.mark.asyncio
+    async def test_enabled_uses_fresh_session_with_history_replay(self):
+        provider = self._provider(tool_search=True)
+
+        runtime = await self._start(provider)
+
+        runtime.load_session.assert_not_awaited()
+        runtime.create_session.assert_awaited_once()
+        assert provider._history_replay_needed is True
+        assert provider._defer_replay_sid_promotion is True
+        assert provider.defer_replay_sid_promotion is True
+
+    @pytest.mark.asyncio
+    async def test_disabled_preserves_native_session_load(self):
+        provider = self._provider(tool_search=False)
+
+        runtime = await self._start(provider)
+
+        runtime.load_session.assert_awaited_once()
+        runtime.create_session.assert_not_awaited()
+        assert provider._history_replay_needed is False
+        assert provider._defer_replay_sid_promotion is False
+        assert provider.defer_replay_sid_promotion is False
+
+    @pytest.mark.asyncio
+    async def test_enabled_linked_slack_session_preserves_native_load(self):
+        provider = self._provider(tool_search=True)
+        provider._client._session_key = "dashboard:chat-linked"
+        provider._client._channel_id = "C123"
+
+        runtime = await self._start(provider)
+
+        runtime.load_session.assert_awaited_once()
+        runtime.create_session.assert_not_awaited()
+        assert provider._history_replay_needed is False
+        assert provider._defer_replay_sid_promotion is False
+        assert provider.defer_replay_sid_promotion is False
+
+    @pytest.mark.asyncio
+    async def test_native_load_fallback_replays_without_deferring_sid(self):
+        provider = self._provider(tool_search=False)
+
+        runtime = await self._start(provider, load_succeeds=False)
+
+        runtime.load_session.assert_awaited_once()
+        runtime.create_session.assert_awaited_once()
+        assert provider._history_replay_needed is True
+        assert provider._defer_replay_sid_promotion is False
+        assert provider.defer_replay_sid_promotion is False
+
+
 class TestStartKiroRuntimeModelEntitlement:
     """_start_kiro_runtime withholds a configured model the account cannot run.
 
@@ -1174,7 +1277,6 @@ class TestStartKiroRuntimeModelEntitlement:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         provider._client._model = model
         provider._client._resume_session_id = ""  # straight to create_session
@@ -1313,12 +1415,6 @@ def test_to_llm_event_preserves_mcp_identity_trusted():
 
 
 class TestBackendModelWireIds:
-    def test_codex_composite_id_is_effort_stripped(self):
-        from kiro_crew.dashboard.chat_handlers import _wire_model_id
-
-        provider = _build_provider(ACP_BACKEND_CODEX)
-        assert _wire_model_id(provider, "gpt-5.2[high]") == "gpt-5.2"
-
     def test_generic_spec_id_passes_through(self):
         from kiro_crew.dashboard.chat_handlers import _wire_model_id
 

@@ -23,8 +23,50 @@ describe('ShareMessageModal', () => {
         onClose={over.onClose ?? (() => {})}
         messageText={over.messageText ?? 'Triaged 47 issues overnight and opened two PRs.'}
         prevUserText={over.prevUserText}
+        shareEnabled={over.shareEnabled ?? true}
+        copy={over.copy}
       />,
     )
+
+  it('uses the chat wording when no copy override is given', () => {
+    // The load-bearing half for every existing call site: the defaults ARE the chat
+    // strings, so omitting `copy` must change nothing about this dialog.
+    renderModal({ prevUserText: 'How many issues did you triage?' })
+    expect(screen.getByText('Turn this reply into a share card you can post anywhere.'))
+      .toBeInTheDocument()
+    expect(screen.getByText('Include my question')).toBeInTheDocument()
+  })
+
+  it('lets a non-chat host replace the two strings that name the shared thing', () => {
+    // A surface sharing something that is not a reply needs its own wording; the chat
+    // defaults assert a reply and a question it does not have.
+    renderModal({
+      prevUserText: 'Feature videos',
+      copy: {
+        description: 'Turn this feature video into a share card you can post anywhere.',
+        includeQuestion: 'Include the video title',
+      },
+    })
+    expect(screen.getByText('Turn this feature video into a share card you can post anywhere.'))
+      .toBeInTheDocument()
+    expect(screen.getByText('Include the video title')).toBeInTheDocument()
+    // The defaults must be gone, not merely joined.
+    expect(screen.queryByText('Turn this reply into a share card you can post anywhere.'))
+      .not.toBeInTheDocument()
+    expect(screen.queryByText('Include my question')).not.toBeInTheDocument()
+  })
+
+  it('leaves the sharing mechanics copy alone when overridden', () => {
+    // Only the two subject-naming strings are parameterised. The export controls and
+    // the policy/limit copy describe the mechanics and are identical on every surface.
+    renderModal({
+      prevUserText: 'Feature videos',
+      copy: { description: 'Custom subtitle', includeQuestion: 'Custom checkbox' },
+    })
+    expect(screen.getByText('Share to social media')).toBeInTheDocument()
+    expect(screen.getByTestId('share-download')).toBeInTheDocument()
+    expect(screen.getByTestId('share-x')).toBeInTheDocument()
+  })
 
   it('renders the card with the message excerpt and a prefilled caption', () => {
     renderModal()
@@ -33,6 +75,25 @@ describe('ShareMessageModal', () => {
     expect(caption.value).toContain(SHARE_REPO_URL)
     // The template interpolates {{productName}} rather than hardcoding it.
     expect(caption.value).toMatch(/^Kiro Crew /)
+  })
+
+  it('seeds the post text from a host caption and hands THAT to the composer', async () => {
+    // `messageText` only reaches the card image. The composers and the clipboard
+    // receive `caption`, so a host whose subject is not a chat reply has to be
+    // able to replace the default sentence, or the post carries the wrong words
+    // while the image carries the right ones.
+    const tab = { opener: {} as unknown, location: { href: '' } }
+    vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window)
+    vi.stubGlobal('ClipboardItem', class { constructor(_items: unknown) {} })
+    Object.defineProperty(navigator, 'clipboard', { value: { write: vi.fn().mockResolvedValue(undefined) }, configurable: true })
+    renderModal({ copy: { caption: 'Feature videos: a clip per feature https://docs.example/x' } })
+    const caption = screen.getByRole('textbox', { name: 'Post text' }) as HTMLTextAreaElement
+    expect(caption.value).toBe('Feature videos: a clip per feature https://docs.example/x')
+    expect(caption.value).not.toMatch(/just did this for me/)
+    fireEvent.click(screen.getByTestId('share-x'))
+    await waitFor(() => expect(tab.location.href).toBe(
+      `https://x.com/intent/post?text=${encodeURIComponent('Feature videos: a clip per feature https://docs.example/x')}`,
+    ))
   })
 
   it('pairs the question by default and drops it when unchecked', () => {
@@ -188,5 +249,99 @@ describe('ShareMessageModal', () => {
     await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalled())
     expect(write).toHaveBeenCalledTimes(2) // multi-type item, then image-only retry
     expect(screen.getByRole('status')).toHaveTextContent(/downloaded/i)
+  })
+
+  it('keeps the compose and its edits when policy withdraws sharing mid-dialog, and says why', async () => {
+    // A centrally pushed policy can flip `capabilities.social_share` while this
+    // dialog is open. Unmounting would destroy the user's edited caption with
+    // no explanation; instead the actions are withdrawn and a notice names the
+    // cause, while the text the user typed stays where they left it.
+    const onClose = vi.fn()
+    const view = render(
+      <ShareMessageModal onClose={onClose} messageText="Triaged 47 issues overnight." shareEnabled />,
+    )
+    const caption = screen.getByRole('textbox', { name: 'Post text' }) as HTMLTextAreaElement
+    fireEvent.change(caption, { target: { value: 'my carefully edited caption' } })
+    // The card's text is editable too and vanishes on close just like the
+    // caption; the salvage copy must carry that edit as well.
+    const excerptBox = screen.getAllByRole('textbox', { name: /card text/i })[0]
+    Object.defineProperty(excerptBox, 'innerText', { value: 'my edited card excerpt', configurable: true })
+    fireEvent.input(excerptBox)
+    expect(screen.queryByTestId('share-withdrawn')).toBeNull()
+    expect(screen.getByTestId('share-x')).not.toBeDisabled()
+
+    view.rerender(
+      <ShareMessageModal onClose={onClose} messageText="Triaged 47 issues overnight." shareEnabled={false} />,
+    )
+    expect(screen.getByTestId('share-withdrawn')).toHaveTextContent(/policy/i)
+    for (const id of ['share-download', 'share-copy', 'share-x', 'share-linkedin']) {
+      expect(screen.getByTestId(id)).toBeDisabled()
+    }
+    // The edit survived the flip; nothing was silently discarded.
+    expect((screen.getByRole('textbox', { name: 'Post text' }) as HTMLTextAreaElement).value)
+      .toBe('my carefully edited caption')
+    // One local salvage path stays: plain-text copy of everything the user
+    // could have edited (no image, no third-party site), so Close never means
+    // silent loss.
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    fireEvent.click(screen.getByTestId('share-copy-text'))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('my carefully edited caption\n\nmy edited card excerpt'))
+    // The user still decides when to leave.
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it('says so and selects the caption when the withdrawn-state text copy is refused', async () => {
+    // The notice points the user at this one button; on a host where the
+    // clipboard refuses (plain HTTP) it must not look like success or sit
+    // inert — it reports the failure and leaves the text selected so a
+    // keyboard copy is the next keystroke.
+    renderModal({ shareEnabled: false })
+    const caption = screen.getByRole('textbox', { name: 'Post text' }) as HTMLTextAreaElement
+    fireEvent.change(caption, { target: { value: 'keep this' } })
+    // No async Clipboard API, and the legacy fallback reports failure.
+    Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true })
+    const execBefore = Object.getOwnPropertyDescriptor(document, 'execCommand')
+    const execCommand = vi.fn(() => false)
+    Object.defineProperty(document, 'execCommand', { value: execCommand, configurable: true })
+    const select = vi.spyOn(caption, 'select')
+    try {
+      fireEvent.click(screen.getByTestId('share-copy-text'))
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith('copy'))
+      expect(screen.getByTestId('share-copy-text')).toHaveTextContent(/failed/i)
+      expect(screen.getByTestId('share-copy-text-unavailable')).toHaveTextContent(/clipboard is blocked.*Ctrl\+C/i)
+      expect(select).toHaveBeenCalled()
+      expect(caption.value).toBe('keep this')
+    } finally {
+      if (execBefore) Object.defineProperty(document, 'execCommand', execBefore)
+      else delete (document as unknown as Record<string, unknown>).execCommand
+    }
+  })
+
+  it('does not hand the caption to the third-party site when policy withdraws sharing mid-export', async () => {
+    // The intent click pre-opens a blank tab, then awaits the export. If the
+    // permission flips during that await, the navigation that carries the
+    // caption off the machine must not happen, and the blank tab is closed.
+    vi.stubGlobal('ClipboardItem', class { constructor(_items: unknown) {} })
+    Object.defineProperty(navigator, 'clipboard', { value: { write: vi.fn().mockResolvedValue(undefined) }, configurable: true })
+    let releaseExport!: (b: Blob) => void
+    toBlobMock.mockImplementationOnce(() => new Promise<Blob>(res => { releaseExport = res }))
+    const tab = { opener: {} as unknown, location: { href: '' }, close: vi.fn() }
+    vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window)
+    const view = render(
+      <ShareMessageModal onClose={() => {}} messageText="Triaged 47 issues overnight." shareEnabled />,
+    )
+    fireEvent.click(screen.getByTestId('share-x'))
+    // html-to-image is imported on demand, so the rasterizer is reached a tick
+    // after the click; wait for the export to actually be in flight.
+    await waitFor(() => expect(toBlobMock).toHaveBeenCalled())
+    // Policy lands while the export is still in flight…
+    view.rerender(
+      <ShareMessageModal onClose={() => {}} messageText="Triaged 47 issues overnight." shareEnabled={false} />,
+    )
+    await act(async () => { releaseExport(new Blob(['png'], { type: 'image/png' })); await Promise.resolve() })
+    await waitFor(() => expect(tab.close).toHaveBeenCalledTimes(1))
+    // …so the pre-opened tab never receives the intent URL.
+    expect(tab.location.href).toBe('')
   })
 })

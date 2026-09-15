@@ -5,8 +5,19 @@ import { useState, useMemo, useRef } from 'react'
  *  Only used to seed the column estimate below; the real width is measured. */
 const PAGE_GUTTER = 16
 
+/**
+ * @param minColWidth  Target column pitch — a card PLUS its trailing gutter.
+ * @param gutter  Added to the measured width before dividing. Two grids that
+ *   must agree on a column count at every width need to divide the SAME number:
+ *   a grid that lays its gutters out as `gap` measures `N·card + (N−1)·gap`,
+ *   while one whose cards carry the gutter as a margin under a `-mr-N` wrapper
+ *   measures `N·(card + gap)` — one gutter wider. Passing that gutter here lets
+ *   the `gap` grid count on the same figure the margin grid does, instead of
+ *   dropping a column a few pixels before it at every width boundary.
+ */
 export function useColumnCount(
   minColWidth = 300,
+  gutter = 0,
 ): readonly [React.RefCallback<HTMLDivElement>, number] {
   // Seeded from the viewport instead of a constant because the page reads this
   // count to decide WHO OWNS THE SCROLL AXIS: a wrong first value hands the axis
@@ -39,14 +50,14 @@ export function useColumnCount(
       // exists.
       const measure = () => {
         const w = el.clientWidth
-        if (w > 0) setCols(Math.max(1, Math.floor(w / minColWidth)))
+        if (w > 0) setCols(Math.max(1, Math.floor((w + gutter) / minColWidth)))
       }
       measure()
       const ro = new ResizeObserver(measure)
       ro.observe(el)
       observerRef.current = ro
     },
-    [minColWidth],
+    [minColWidth, gutter],
   )
   return [refFn, cols] as const
 }

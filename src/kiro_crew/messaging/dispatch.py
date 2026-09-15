@@ -32,10 +32,17 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
+from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY, event_is_spawn_run
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.driver import DirectiveConsumer, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
+from kiro_crew.messaging.inbound_spool import (
+    InboundRoute,
+    spool_refused_turn,
+    spool_refused_turn_sync,
+)
 from kiro_crew.messaging.link import (
     DM_SCOPE_UNIFIED,
     ChannelLink,
@@ -44,7 +51,12 @@ from kiro_crew.messaging.link import (
     is_channel_session_key,
 )
 from kiro_crew.messaging.renderer import SilentRenderer
-from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    redact,
+    redact_credentials,
+    redact_exfiltration_urls,
+    redact_local_paths,
+)
 from kiro_crew.sel import sel
 
 # Imported from the leaf that DEFINES it rather than through kiro_crew.session:
@@ -54,6 +66,104 @@ from kiro_crew.sel import sel
 from kiro_crew.session_allocation import SessionClosingError
 
 logger = logging.getLogger(__name__)
+
+
+async def admit_inbound_callback(
+    sessions: Any,
+    *,
+    channel_type: str,
+    route: InboundRoute | None,
+    restricted: bool | Callable[[], Awaitable[bool]] = False,
+) -> bool:
+    """Reserve one handler task or durably refuse it before pre-turn effects.
+
+    A callable restriction is resolved only after admission refuses the task.
+    Resume-capable channels use that form because their effective session takes
+    an awaited routing decision to determine. The upstream client handler task
+    remains census-visible during that decision, while the happy path keeps the
+    synchronous reserve-before-effects boundary and pays no routing lookup.
+    """
+    reserve = getattr(sessions, "reserve_inbound_callback", None)
+    if not callable(reserve):
+        # Compatibility for focused embedders/test doubles that are not a
+        # SessionManager. Production channel dispatch always receives the real
+        # facade, whose structural contract requires this method.
+        return True
+    reservation = reserve()
+    if reservation is None:
+        try:
+            refusal_restricted = bool(await restricted()) if callable(restricted) else restricted
+        except Exception:
+            logger.warning(
+                "%s: could not resolve refused callback privacy; suppressing durable spool",
+                channel_type,
+                exc_info=True,
+            )
+            refusal_restricted = True
+        if not refusal_restricted:
+            if getattr(sessions, "update_restart_fenced", False):
+                spool_refused_turn_sync(channel_type=channel_type, route=route)
+            else:
+                await spool_refused_turn(channel_type=channel_type, route=route)
+        return False
+    task = asyncio.current_task()
+    if task is None:
+        reservation.release()
+        raise RuntimeError("inbound callback has no owning asyncio task")
+    task.add_done_callback(lambda _done: reservation.release())
+    return True
+
+
+class _InboundCallbackAdmission:
+    """Explicit callback lease for dispatchers running on a long-lived task."""
+
+    def __init__(
+        self,
+        sessions: Any,
+        *,
+        channel_type: str,
+        route: InboundRoute | None,
+        restricted: bool,
+    ) -> None:
+        self._sessions = sessions
+        self._channel_type = channel_type
+        self._route = route
+        self._restricted = restricted
+        self._reservation: Any = None
+
+    async def __aenter__(self) -> bool:
+        reserve = getattr(self._sessions, "reserve_inbound_callback", None)
+        if not callable(reserve):
+            return True
+        self._reservation = reserve()
+        if self._reservation is not None:
+            return True
+        if not self._restricted:
+            if getattr(self._sessions, "update_restart_fenced", False):
+                spool_refused_turn_sync(channel_type=self._channel_type, route=self._route)
+            else:
+                await spool_refused_turn(channel_type=self._channel_type, route=self._route)
+        return False
+
+    async def __aexit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        if self._reservation is not None:
+            self._reservation.release()
+
+
+def hold_inbound_callback(
+    sessions: Any,
+    *,
+    channel_type: str,
+    route: InboundRoute | None,
+    restricted: bool = False,
+) -> _InboundCallbackAdmission:
+    """Hold callback census ownership only for the surrounding async scope."""
+    return _InboundCallbackAdmission(
+        sessions,
+        channel_type=channel_type,
+        route=route,
+        restricted=restricted,
+    )
 
 
 @dataclass
@@ -206,6 +316,29 @@ class ChannelTurn:
     audit_caller: str = ""
     """SEL audit caller label; defaults to ``<channel_type>:unknown``."""
 
+    inbound_route: Optional[InboundRoute] = None
+    """How to reach this conversation if the SHUTDOWN GATE refuses the turn.
+
+    Supplying it opts the channel into the durable inbound spool: a turn refused
+    by ``_closing`` is written to disk with this route and replayed on the next
+    gateway start (:mod:`kiro_crew.messaging.inbound_spool`), instead of the
+    payload being discarded and the user answered with a generic fault.
+
+    It cannot be derived from :attr:`conversation_id`, which is a session
+    ATTRIBUTION id (``"weixin:{user}"``) rather than a reply target, so a channel
+    has to declare its own address here -- it is the only place holding the
+    normalized envelope. ``None`` (the default) means the channel has not adopted
+    the spool and its refusal path is byte-identical to before.
+    """
+
+    inbound_restricted: bool = False
+    """Suppress durable refusal spooling for an incognito/temporary session.
+
+    The dispatcher resolves this against the final session key before entering
+    the shared turn pipeline. It covers the later ``SessionClosingError`` race,
+    after callback admission succeeded but before the provider turn opened.
+    """
+
 
 #: Every spelling a channel accepts for "abort the running turn". The union of
 #: the per-channel command tables (``/stop`` and ``/cancel`` everywhere, plus
@@ -258,7 +391,7 @@ async def inbound_permitted(
 
     A PURE cancellation is the one exemption, matching the native Slack route's
     ``!stop`` carve-out: a denied channel must still be able to halt a runaway
-    session it previously STARTED, and on a channel with no interactive buttons
+    session it already STARTED, and on a channel with no interactive buttons
     (``max_buttons=0``) the typed cancel is the only affordance there is, so
     gating it makes the off-switch unreachable exactly when it is needed. Nothing
     else is exempt -- a restart is not a cancellation.
@@ -294,11 +427,12 @@ def build_tool_gate(ctx_builder: Any, *, session_key: str, agent: str) -> Callab
             agent=agent,
             tool_kind=getattr(event, "tool_kind", "") or "",
             raw_params=getattr(event, "raw_tool_params", None),
+            diff_path=getattr(event, "diff_path", "") or "",
             command=getattr(event, "shell_command", None),
             is_shell=bool(getattr(event, "is_shell", False)),
             mcp_server_name=getattr(event, "mcp_server_name", "") or "",
             mcp_tool_name=getattr(event, "tool_name", "") or "",
-            mcp_identity_ambiguous=bool(getattr(event, "mcp_identity_ambiguous", False)),
+            mcp_identity_trusted=bool(getattr(event, "mcp_identity_trusted", False)),
         )
         if result.action == TOOL_DENY:
             return "deny"
@@ -376,7 +510,14 @@ def build_directive_consumer(
         state: Any = getattr(dispatcher, "dashboard_state", None)
         if state is None:
             state = _ChannelDirectiveState(sessions=sessions)
-        result = await apply_session_directive(state, None, session_key, kind, args)
+        result = await apply_session_directive(
+            state,
+            None,
+            session_key,
+            kind,
+            args,
+            producer_is_channel=True,
+        )
         # The channel surface never renders tool results, so the applier's
         # confirmation has no user-facing sink here; this log is the operator's
         # record (the applier itself SEL-audits every outcome). Failures log at
@@ -540,6 +681,9 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         # always did. Widening the call for everyone would make the new field's
         # cost fall on channels that gain nothing from it.
         extra: dict[str, Any] = {"model": turn.model} if turn.model else {}
+        # A linked member session must validate its own memory before a cold
+        # provider start. The same identity is then used for this turn's prompt.
+        memory_store = await session_store_for_turn(ctx_builder, session_key)
         provider, is_new, resumed = await sessions.get_or_create(
             session_key, agent=turn.agent, channel_id=turn.conversation_id, **extra
         )
@@ -622,6 +766,15 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         await publish_turn_identity(sessions, session_key)
         from kiro_crew.providers.acp import provider_label
 
+        # This conversation's own silo, from the session's RECORDED binding and
+        # never from ``turn.agent``: that field carries a kiro-cli template id, a
+        # namespace disjoint from ``cfg.agents``, so a store derived from it
+        # resolves to ``default`` for exactly the crew that configured otherwise.
+        # Resolved on the shared seam rather than per adopter for the same reason
+        # ``minimal_context`` is: every channel on this pipeline has the same
+        # exposure, and one that forgot would silently read the operator's memory.
+        # The member tier was prepared before provider acquisition; unavailable
+        # private memory refuses the turn instead of substituting global memory.
         # Off-loop: build_message embeds the episodic query (blocking urllib).
         full_message, _ = await run_in_embed_pool(
             ctx_builder.build_message,
@@ -630,6 +783,7 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             session_key,
             channel_id=turn.conversation_id,
             agent=turn.agent,
+            memory_store=memory_store,
             resumed=resumed,
             minimal_context=turn.minimal_context,
             runtime_source=turn.channel_type,
@@ -742,6 +896,29 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             turn.channel_type,
             session_key,
         )
+        # Durability, at the ONE point where the payload is still in memory and
+        # the turn is provably unopened. Every other outcome of this
+        # dispatch — a completed turn, a turn that ran and failed — is already
+        # recorded somewhere, which is why nothing is spooled on those paths and
+        # why a replay cannot double-answer. Best-effort by construction: the
+        # helper never raises, so a full disk degrades to today's loss rather than
+        # becoming the thing that fails shutdown.
+        # ``route.text`` and ONLY ``route.text`` -- never ``turn.user_text``. The
+        # two differ wherever a channel transforms the prompt, and the difference
+        # is not cosmetic: WhatsApp's rules mode prepends the group's private
+        # operating rules to the model prompt, so spooling the turn text would
+        # quote those rules back into the group in the restart notice. A route
+        # whose text is empty is a media-only entry (or nothing), not a cue to
+        # reach for the prompt.
+        if not turn.inbound_restricted:
+            await spool_refused_turn(channel_type=turn.channel_type, route=turn.inbound_route)
+    except UnknownMemoryStore as exc:
+        logger.warning("%s member memory unavailable: %s", turn.channel_type, exc)
+        try:
+            await renderer.on_text_chunk(redact_local_paths(redact(str(exc)))[0][:1000])
+            await renderer.on_done()
+        except Exception:
+            logger.warning("%s: could not display memory refusal", turn.channel_type, exc_info=True)
     except Exception:
         logger.exception("%s transport_dispatch: error handling message", turn.channel_type)
         if _acquired:

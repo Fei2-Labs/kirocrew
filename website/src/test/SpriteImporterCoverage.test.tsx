@@ -33,7 +33,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, fireEvent, act, cleanup, within } from '@testing-library/react'
 
-import type { PackMeta } from '../apps/crew-companion/appearanceTypes'
+import type { PackMeta } from '../lib/appearancePacks/types'
 
 // ── Bridge double ──────────────────────────────────────────────────────────
 
@@ -48,7 +48,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../apps/crew-companion/petBridge', () => ({ galleryApi: mocks.api }))
 
-vi.mock('../apps/crew-companion/SpriteRenderer', () => ({
+vi.mock('../components/appearancePacks/SpriteRenderer', () => ({
   SpriteRenderer: ({ src, frameWidth, frameHeight, fps, displaySize }: {
     src: string
     frameWidth: number

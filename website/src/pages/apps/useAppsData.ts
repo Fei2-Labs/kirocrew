@@ -184,6 +184,14 @@ export type AppsData = {
   sources: SourceRow[]
   /** The Library list: installed apps with update state attached. */
   installedApps: LibraryApp[]
+  /**
+   * How many admissible Library rows the "enabled only" view is hiding — the
+   * count the "Show N disabled" affordance names. Zero when `showAll` is on
+   * (nothing is hidden) or when no admissible row is outside the enabled group.
+   * Computed from the same `libraryView` latch as `installedApps`, so the
+   * number and the rows it describes can never disagree.
+   */
+  disabledCount: number
   /** Library apps Update All would touch (gateway-lifecycle with a pending update). */
   updatables: LibraryApp[]
   /** Dispatch mc:apps-changed (module-level function, re-exported for convenience). */
@@ -242,10 +250,22 @@ export type LibrarySlot = { listed: boolean; wasEnabled: boolean }
  * place instead of moving it off-screen or deleting it. A previously concealed
  * row is promoted if an out-of-band action enables it, so the per-visit cache
  * cannot keep an enabled app unreachable. Uninstalled rows are forgotten.
+ *
+ * `showAll` is the reader's view control. When it is on, every admissible row is
+ * listed — the reachability the store depends on, since Library is the only
+ * surface that can enable a locally-shipped builtin. When it is off (the
+ * default), a row is listed only if it earned a place in the enabled group:
+ * either it is enabled now, or its slot remembers it was enabled when first
+ * placed this visit. That second clause is why the control clicked does not
+ * vanish — disabling a row flips `enabled` to false but the slot's `wasEnabled`
+ * still holds, so the row stays put; a builtin that was never enabled this visit
+ * is the clutter the off view drops. The decision runs through the SAME
+ * per-slot `wasEnabled` the ordering already reads, so the filter cannot
+ * contradict the latch it sits beside.
  */
 export function libraryView<
   T extends Pick<InstalledApp, 'origin' | 'enabled' | 'manifest'> & { name: string },
->(apps: T[], view: Map<string, LibrarySlot>): T[] {
+>(apps: T[], view: Map<string, LibrarySlot>, showAll = true): T[] {
   const live = new Set(apps.map(app => app.name))
   for (const name of view.keys()) {
     if (!live.has(name)) view.delete(name)
@@ -254,17 +274,40 @@ export function libraryView<
     const slot = view.get(app.name)
     if (!slot) {
       view.set(app.name, { listed: keepInLibrary(app), wasEnabled: !!app.enabled })
-    } else if (!slot.listed && keepInLibrary(app)) {
-      slot.listed = true
-      // The row was not previously visible, so this is its first placement in
-      // the visit. It appears enabled and belongs with the enabled group.
-      slot.wasEnabled = !!app.enabled
+    } else {
+      if (!slot.listed && keepInLibrary(app)) {
+        slot.listed = true
+        // The row was not previously visible, so this is its first placement in
+        // the visit. It appears enabled and belongs with the enabled group.
+        slot.wasEnabled = !!app.enabled
+      }
+      // Enablement latches for the visit: once a row has been enabled, it stays
+      // in the enabled group so a later disable keeps it listed under the off
+      // view instead of dropping under the cursor. A row enabled out-of-band
+      // AFTER it was first placed disabled reaches this branch (already
+      // `listed`, so the promotion above does not fire) — without this its
+      // `wasEnabled` would stay false and the off view would drop it the moment
+      // the reader disabled it. Monotonic: it never clears, so a never-enabled
+      // builtin stays out of the group and remains the clutter the off view hides.
+      if (app.enabled) slot.wasEnabled = true
     }
   }
-  const rows = apps.filter(app => view.get(app.name)?.listed)
+  // A slot is in the enabled group when it is enabled right now OR its latch
+  // remembers it was enabled at first placement — the same predicate the
+  // ordering below groups on. The off view keeps exactly that group, so a row
+  // disabled mid-visit (enabled false, wasEnabled still true) stays listed.
+  const inEnabledGroup = (app: T) => {
+    const slot = view.get(app.name)
+    return !!app.enabled || !!slot?.wasEnabled
+  }
+  const rows = apps.filter(app => {
+    const slot = view.get(app.name)
+    if (!slot?.listed) return false
+    return showAll || inEnabledGroup(app)
+  })
   return [
-    ...rows.filter(app => view.get(app.name)?.wasEnabled),
-    ...rows.filter(app => !view.get(app.name)?.wasEnabled),
+    ...rows.filter(inEnabledGroup),
+    ...rows.filter(app => !inEnabledGroup(app)),
   ]
 }
 
@@ -392,7 +435,7 @@ export async function registryQueryFn(): Promise<{
     }
 }
 
-export default function useAppsData(): AppsData {
+export default function useAppsData({ showAll = true }: { showAll?: boolean } = {}): AppsData {
   const libraryViewRef = useRef(new Map<string, LibrarySlot>())
   const { data: apps = [], isLoading: appsLoading, error: appsError } = useQuery<InstalledApp[]>({
     queryKey: ['apps'],
@@ -585,13 +628,28 @@ export default function useAppsData(): AppsData {
   const updateMap = useMemo(() => buildUpdateMap(registry), [registry])
   const installedApps: LibraryApp[] = useMemo(
     () =>
-      libraryView(apps, libraryViewRef.current)
+      libraryView(apps, libraryViewRef.current, showAll)
         .map(a => ({
           ...a,
           updateAvailable: updateMap.has(a.name),
           _newVersion: updateMap.get(a.name),
         })),
-    [apps, updateMap],
+    [apps, updateMap, showAll],
+  )
+  // Rows the "enabled only" view is hiding, from the SAME latch that produced
+  // `installedApps`: the full admissible list minus the enabled-group list. Off
+  // the toggle this is the count the "Show N disabled" label names; on the
+  // toggle nothing is hidden, so it is zero. Read against the same visit map, so
+  // a row held in place by the latch is counted as shown, never as hidden.
+  // Depends on `apps` alone: both `libraryView` calls read `apps` and mutate the
+  // ref (non-reactive), and neither reads `showAll` — the count is view-
+  // independent by construction (it always compares the full list to the
+  // enabled group).
+  const disabledCount = useMemo(
+    () =>
+      libraryView(apps, libraryViewRef.current, true).length
+      - libraryView(apps, libraryViewRef.current, false).length,
+    [apps],
   )
   const updatables = useMemo(
     // Keep this live-filtered rather than visit-held: `countUpdatables` powers
@@ -615,6 +673,7 @@ export default function useAppsData(): AppsData {
     categories,
     sources,
     installedApps,
+    disabledCount,
     updatables,
     announceAppsChanged,
   }

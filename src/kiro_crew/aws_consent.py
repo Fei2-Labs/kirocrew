@@ -76,7 +76,7 @@ logger = logging.getLogger(__name__)
 #: again) rather than silently authorizing the wrong service.
 SERVICE_POLLY = "polly"
 SERVICE_TRANSCRIBE = "transcribe"
-#: AWS Control's paid services (spec: docs/system-specs/features/aws-control.md).
+#: AWS Control's paid services (spec: docs/system-specs/modules/aws-control.md).
 #: Declared ahead of the first billable call — S3 backs the cloud drive (P1),
 #: Cost Explorer backs the bill page (~$0.01 per query) — so the consent cards
 #: can be confirmed per account before either capability ships.
@@ -106,13 +106,13 @@ _LOCK_FILENAME = ".aws_consent.lock"
 #: rather than as the value of the option before it. Constrain both to the
 #: charset AWS itself allows and require a leading alphanumeric.
 #:
-#: DELIBERATE semantic differences from ``constants.AWS_PROFILE_NAME_RE``
-#: (#6063), so this derives its class from the shared fragment instead of
+#: DELIBERATE semantic differences from ``constants.AWS_PROFILE_NAME_RE``,
+#: so this derives its class from the shared fragment instead of
 #: aliasing the compiled pattern: the first char is alphanumeric only
 #: (stricter), and the continuation class additionally admits ``@`` and ``=``
 #: (IAM entity charset; existing configs may carry them). ``\Z`` (not ``$``)
 #: so a trailing newline in a config-sourced value cannot slip past, matching
-#: #6055 at the four sibling sites. ``-`` stays last so the class is a
+#: the four sibling sites. ``-`` stays last so the class is a
 #: literal, never a range.
 _PROFILE_RE = re.compile(rf"^[A-Za-z0-9][{AWS_PROFILE_FIRST_CHARS}@=-]{{0,127}}\Z")
 _REGION_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -203,7 +203,7 @@ def _preserve_if_unreadable() -> None:
     Preserved rather than refused. Refusing the write would leave an operator
     with a corrupt file unable to re-confirm from the dashboard at all, needing
     manual file surgery to recover, which is a worse outcome than a sidecar copy
-    for a file that was already authorizing nothing. Found in review.
+    for a file that was already authorizing nothing.
     """
     path = aws_consent_path()
     try:
@@ -223,12 +223,12 @@ def _preserve_if_unreadable() -> None:
     sidecar = path.with_name(f"{path.name}.corrupt-{stamp}")
     try:
         # restrict_to_owner=True locks the temp file down BEFORE the preserved
-        # contents reach it (the previous post-rename lockdown left them readable
-        # under the inherited DACL on Windows for the write window, issue #5285)
+        # contents reach it (a post-rename lockdown would leave them readable
+        # under the inherited DACL on Windows for the write window)
         # and implies the owner-only POSIX mode. The default
         # restrict_on_error="raise" surfaces a lockdown failure into this
         # except, where the whole preservation attempt is already warn-only —
-        # and because the failure now happens before the rename, a sidecar that
+        # and because the failure happens before the rename, a sidecar that
         # could not be protected never exists at the final path at all.
         atomic_write(sidecar, raw, restrict_to_owner=True)
         logger.warning(
@@ -274,21 +274,20 @@ def _write_all(data: dict[str, Any]) -> None:
     path = aws_consent_path()
     # Fail-loud lockdown BEFORE any content lands, same as the sibling keystone
     # stores: ``restrict_to_owner=True`` applies the owner-only DACL to the temp
-    # file before the payload reaches it (the previous post-rename lockdown left
+    # file before the payload reaches it (a post-rename lockdown would leave
     # the authorization record readable under the inherited DACL on Windows for
-    # the write window, issue #5285) and implies the owner-only POSIX mode. The
+    # the write window) and implies the owner-only POSIX mode. The
     # default ``restrict_on_error="raise"`` refuses to write a record it cannot
     # protect.
     #
-    # No cleanup on failure any more. Every failure inside ``atomic_write`` —
+    # No cleanup on failure. Every failure inside ``atomic_write`` —
     # lockdown, payload write (ENOSPC), rename — happens BEFORE the final path
     # is touched: the helper removes its temp file and re-raises, so an
-    # unprotectable record never exists at ``path`` at all. The unlink the old
-    # code ran existed to remove a NEW store already PUBLISHED at a wide DACL
-    # when its post-write lockdown failed; that state is unreachable now, and
-    # keeping the unlink would instead delete the previous, healthy,
-    # already-locked-down store on any transient failure (both pre-push
-    # reviews flagged exactly that data loss).
+    # unprotectable record never exists at ``path`` at all. An unlink here would
+    # only make sense for a NEW store already PUBLISHED at a wide DACL whose
+    # post-write lockdown failed; that state is unreachable, and the unlink
+    # would instead delete the previous, healthy, already-locked-down store on
+    # any transient failure.
     atomic_write(path, json.dumps(data, indent=2, sort_keys=True), restrict_to_owner=True)
 
 
@@ -357,6 +356,45 @@ def revoke(service: str) -> bool:
     return True
 
 
+def revoke_for_profile(profile: str) -> list[str]:
+    """Drop every grant whose recorded profile is ``profile``; returns the services.
+
+    Grants are keyed by service, not by profile, so removing a profile from
+    the portal's registry has to scan the gated services for records naming
+    it. Leaving such a record behind would let a later re-registration of the
+    same name inherit an authorization the operator gave to a different key.
+
+    The match and the delete happen under ONE lock: a grant re-recorded for a
+    different profile between a read and an unconditional ``revoke`` would be
+    the fresh grant, not the stale one, and deleting it is the silent
+    confirmed-but-refuses state the lock exists to prevent.
+
+    Unlike every other reader here this one does NOT fail soft: an unreadable
+    store would read as "no grant names this profile", the sweep would write
+    nothing, and the caller would go on to forget the profile while its grant
+    stays on disk for the next registration under that name to inherit. A
+    missing store is the ordinary no-grants case; anything else raises so the
+    caller refuses before it mutates.
+    """
+    revoked: list[str] = []
+    with _ConsentLock():
+        try:
+            raw = json.loads(aws_consent_path().read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
+        data: dict[str, Any] = raw if isinstance(raw, dict) else {}
+        for service in sorted(GATED_SERVICES):
+            row = data.get(service)
+            if isinstance(row, dict) and str(row.get("profile", "")) == profile:
+                del data[service]
+                revoked.append(service)
+        if revoked:
+            _write_all(data)
+    for service in revoked:
+        audit_decision(service, outcome="revoked")
+    return revoked
+
+
 def is_granted(service: str, *, profile: str, region: str) -> tuple[bool, str]:
     """Whether a grant exists matching this profile+region. LOCAL only.
 
@@ -415,7 +453,7 @@ async def authorize(service: str, *, profile: str, region: str) -> tuple[bool, s
     if grant is None:
         # Withdrawn between the local check and here. Deny: an absent grant is
         # not a grant, and treating it as one let a call through moments after
-        # the operator revoked consent. Found in review.
+        # the operator revoked consent.
         return False, (
             f"{label} consent was withdrawn while this request was being checked. "
             f"Nothing was sent to AWS."
@@ -571,7 +609,7 @@ async def probe_identity(profile: str, region: str, *, use_cache: bool = True) -
     # validated a normalized COPY could record consent for a target the real
     # request never uses. A whitespace-padded value instead fails the shape
     # gate below (the charset admits no whitespace and ``\Z`` rejects a
-    # trailing newline, #6063), so the probe refuses it, consent is never
+    # trailing newline), so the probe refuses it, consent is never
     # granted, and every consumer sees the same verdict. Fix the value in
     # config; nothing here rewrites it.
     key = (profile, region)
@@ -629,7 +667,7 @@ async def probe_identity(profile: str, region: str, *, use_cache: bool = True) -
 def _aws_cli_resolvable() -> bool:
     """Thread-side probe: is the ``aws`` CLI invocable from where we spawn?
 
-    Routes through the deploy engine's shared well-known-dirs resolver (#4770)
+    Routes through the deploy engine's shared well-known-dirs resolver
     so a GUI-launched gateway's minimal PATH does not fail the consent gate
     closed before the voice sites' own resolved spawns ever run — the spawn
     below already resolves absolutely via ``cloud.aws.run_aws``, so the probe

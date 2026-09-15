@@ -337,14 +337,14 @@ def _crew_session_key() -> tuple[str, str]:
     directly attributable. Both crew tools send THIS key rather than resolving
     their own, so the identity that passed the gate is the identity on the wire.
     """
-    _crew_sk = mcp_core._resolve_session_key_strict()
+    _crew_sk, _crew_err = mcp_core.require_strict_session_key(
+        "Error: this tool needs a directly-identified dashboard session. "
+        "A subagent resolves to its parent's session, which would read and "
+        "write the parent crew's ledger. Run this from the crew's own "
+        "session."
+    )
     if not _crew_sk:
-        return "", (
-            "Error: this tool needs a directly-identified dashboard session. "
-            "A subagent resolves to its parent's session, which would read and "
-            "write the parent crew's ledger. Run this from the crew's own "
-            "session." + mcp_core.strict_identity_diagnosis()
-        )
+        return "", _crew_err
     return _crew_sk, ""
 
 
@@ -429,7 +429,7 @@ def ops_mission_control_api(name: str, args: dict[str, Any]) -> str:
     # systems and prior LLM turns, so a credential or exfil URL quoted
     # into one would otherwise flow straight into this agent's context.
     # Redact BEFORE truncating: slicing first could cut a credential in
-    # half at the cap so the redaction pattern no longer matches, leaking
+    # half at the cap so the redaction pattern would not match, leaking
     # the surviving fragment.
     _omc_text = redact(json.dumps(_omc_resp, ensure_ascii=False, default=str))
     _omc_cap = 60_000

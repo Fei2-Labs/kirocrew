@@ -213,9 +213,9 @@ def _parse_reply(text: str) -> object:
     """Pull a JSON object out of a model reply, tolerating fences and prose.
 
     Delegates to the shared ``llm_helpers._extract_json_of_type`` scanner
-    (fence markers are just prose to it), so a stray brace in the prose no
-    longer corrupts the extracted span the way the old outermost
-    ``find('{') .. rfind('}')`` slice did. Returns None when nothing parses —
+    (fence markers are just prose to it), so a stray brace in the prose does not
+    corrupt the extracted span the way an outermost
+    ``find('{') .. rfind('}')`` slice would. Returns None when nothing parses —
     the caller then keeps the previous cached summary — or when two DIFFERENT
     payload-shaped dicts make the choice ambiguous (the shared contract
     refuses to guess)."""
@@ -268,12 +268,12 @@ async def generate_session_summary(
         return False
 
     # Take the in-flight guard HERE -- immediately after the gate that reads it,
-    # and before every remaining await. On-demand generation gave this function a
-    # concurrent, user-driven entry point: two clicks from two clients (or a click
-    # racing a turn-end pass) both awaited the flush/mtime/read before either set
-    # the marker, so both passed the `in_flight` gate and both spent a model call.
-    # The signature guard made that safe but not free -- it prevents the second
-    # write, after the tokens are already gone.
+    # and before every remaining await. On-demand generation is a concurrent,
+    # user-driven entry point: setting the marker any later lets two clicks from
+    # two clients (or a click racing a turn-end pass) both await the
+    # flush/mtime/read, both pass the `in_flight` gate and both spend a model
+    # call. The signature guard makes that safe but not free -- it prevents only
+    # the second write, after the tokens are already gone.
     slot._summary_in_flight = True
     try:
         return await _generate_locked(state, slot, cfg, key, log, force=force)

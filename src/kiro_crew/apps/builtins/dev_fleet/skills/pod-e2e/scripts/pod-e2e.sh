@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# pod-e2e.sh <worktree-name> [--keep] [--no-stop] [--api-only] [--fe-only] [--video] [--no-suppress-first-run]
+# pod-e2e.sh <worktree-name> [--keep] [--no-stop] [--api-only] [--video] [--no-suppress-first-run]
 #
 # Run the full e2e flow for ONE worktree against an ISOLATED pod instance,
 # never touching the live gateway:
 #
-#   kirocrew pod up --json  →  health poll  →  auth check  →  API tests  →  Playwright  →  pod down
+#   kirocrew pod up --json  →  health poll  →  auth check  →  Playwright  →  pod down
+#
+# It does NOT run the worktree's test suite: scoped, change-relevant tests are
+# the dev agent's job in its own worktree, and CI runs the full suite on the
+# merge ref. This harness proves the pod boots, auths and renders.
 #
 # Everything runs on the pod's own port + its own KIROCREW_HOME. The live
 # gateway is never bounced. Teardown deletes the pod's HOME and verifies it is
@@ -20,14 +24,17 @@
 set -uo pipefail
 
 # ---------------------------------------------------------------- args ----
-NAME="" ; KEEP=0 ; NO_STOP=0 ; RUN_API=1 ; RUN_FE=1 ; VIDEO=0
+NAME="" ; KEEP=0 ; NO_STOP=0 ; RUN_FE=1 ; VIDEO=0
 NO_SUPPRESS_FIRST_RUN=0
 for a in "$@"; do
   case "$a" in
     --keep)     KEEP=1 ;;
     --no-stop)  NO_STOP=1 ;;
     --api-only) RUN_FE=0 ;;
-    --fe-only)  RUN_API=0 ;;
+    # Accepted no-op: with no test-suite phase to skip, "frontend only" is
+    # what every run already does. Kept so older invocations and stale agent
+    # prompts do not die on exit 64.
+    --fe-only)  : ;;
     --video)    VIDEO=1 ;;
     # Documented in SKILL.md and accepted by pod-playwright.py; without this
     # arm the catch-all below rejects the documented spelling with exit 64.
@@ -36,7 +43,7 @@ for a in "$@"; do
     *)          NAME="$a" ;;
   esac
 done
-[ -n "$NAME" ] || { echo "usage: pod-e2e.sh <worktree-name> [--keep] [--no-stop] [--api-only] [--fe-only] [--video] [--no-suppress-first-run]" >&2; exit 64; }
+[ -n "$NAME" ] || { echo "usage: pod-e2e.sh <worktree-name> [--keep] [--no-stop] [--api-only] [--video] [--no-suppress-first-run]" >&2; exit 64; }
 # Pod names are [a-zA-Z0-9._-] without leading dots — reject anything that
 # could traverse paths (slashes, '..') before NAME is used in any path.
 case "$NAME" in
@@ -215,7 +222,7 @@ FAILURES=0
 WARNINGS=0
 declare -a RESULTS=()
 
-# Initialize MANIFEST early (before both API and FE phases reference it).
+# Initialize MANIFEST early (before the FE phase references it).
 # Re-discovered below once CHECKOUT is fully resolved.
 MANIFEST=""
 for _m in "$CHECKOUT/.pod-test.sh" "$CHECKOUT/src/kiro_crew/.pod-test.sh"; do
@@ -255,6 +262,10 @@ if [ "$_pod_is_up" = "yes" ]; then
   ALREADY_UP=1
   POD_JSON="$_pod_status_json"
 else
+  # The health-wait budget of the `pod up` below is tunable from THIS shell:
+  # KIROCREW_POD_HEALTH_SECS is inherited by the spawned command (default 90s;
+  # see `kirocrew pod up --help`). Raise it on a loaded host where a healthy
+  # gateway boots slowly and pod-up.log ends mid-boot.
   POD_JSON=$("$KIROCREW_CLI" pod up "$NAME" --json 2>"$ARTIFACT_DIR/pod-up.log")
   if [ $? -ne 0 ]; then
     fail "up — pod failed to start (see $ARTIFACT_DIR/pod-up.log)"
@@ -293,7 +304,7 @@ fi
 # the HTTP code when the process a 127.0.0.1 connect reaches is this pod's own
 # gateway, 0 when nothing answers, and -2 when the responder is provably somebody
 # else's. Curling base_url here would accept a stranger's 200 and hand every
-# later phase -- auth, API tests, Playwright, the artifacts -- a pod this run
+# later phase -- auth, Playwright, the artifacts -- a pod this run
 # never booted.
 log "waiting for health on $NAME ($BASE_URL) ..."
 HEALTHY=0
@@ -362,25 +373,13 @@ if [ "$HEALTHY" -eq 1 ]; then
   fi
 fi
 
-# ---------------------------------------------------------------- API -----
-if [ "$RUN_API" -eq 1 ] && [ "$HEALTHY" -eq 1 ]; then
-  log "running API tests (cwd=$CHECKOUT) ..."
-  pushd "$CHECKOUT" >/dev/null
-  API_PY="$CHECKOUT/.venv/bin/python"
-  if [ ! -x "$API_PY" ]; then
-    fail "api-tests — worktree venv python not found at $API_PY (run: kirocrew pod provision $NAME)"
-  else
-    API_TEST_CMD="$API_PY -m pytest -q"
-    export POD_BASE_URL="$BASE_URL"
-    export POD_TOKEN="$TOKEN"
-    if "$API_PY" -m pytest -q > "$ARTIFACT_DIR/api-tests.log" 2>&1; then
-      pass "api-tests — $API_TEST_CMD → exit 0"
-    else
-      fail "api-tests — $API_TEST_CMD → exit $? (see api-tests.log)"
-    fi
-  fi
-  popd >/dev/null
-fi
+# There is deliberately NO test-suite phase here, and adding one is a
+# regression. A `python -m pytest -q` from the checkout root is the wrong tool
+# in the wrong place: ~62k tests that need no pod at all, that CI runs on the
+# merge ref anyway, and whose fan-out on a shared dev box costs more than the
+# browser check this harness exists for. Scoped, change-relevant tests belong
+# to the dev agent in its own worktree (see the kirocrew-worktree-dev skill);
+# pod-e2e proves the pod BOOTS, AUTHS and RENDERS.
 
 # ---------------------------------------------------------------- FE ------
 if [ "$RUN_FE" -eq 1 ] && [ "$HEALTHY" -eq 1 ]; then
@@ -425,7 +424,9 @@ if [ "$RUN_FE" -eq 1 ] && [ "$HEALTHY" -eq 1 ]; then
       esac
       PW_ARGS+=(--spec "$PLAYWRIGHT_SPEC")
     fi
-    # Every other phase here is bounded (health polling caps at 45s); this one
+    # Every other phase here is bounded (the `up` health wait defaults to 90s,
+    # tunable via KIROCREW_POD_HEALTH_SECS; this harness's own health poll caps
+    # at 60s); this one
     # used to be unbounded and could stall forever in browser teardown, burning
     # a whole agent budget after the verdict was already decided. `python -u`
     # keeps playwright.log flushed so a stall is still diagnosable.

@@ -160,9 +160,9 @@ def _audit_owner(parent_session: str) -> str:
 def _agent_roster_hint() -> str:
     """Valid agent names, for the ``agent``/``agents`` parameter descriptions.
 
-    The roster used to be reachable only through ``spawn_list``'s OUTPUT, so a
-    caller that went straight to ``spawn_run`` had never seen it and invented
-    plausible-sounding names instead (#4842). Putting it in the parameter
+    The roster is otherwise reachable only through ``spawn_list``'s OUTPUT, so a
+    caller that goes straight to ``spawn_run`` never sees it and invents
+    plausible-sounding names instead. Putting it in the parameter
     description puts it in front of exactly the caller that needs it.
 
     ADVISORY only, and deliberately never a gate: this process scans the
@@ -220,8 +220,10 @@ def schemas() -> list[dict[str, Any]]:
     # Advertise the live concurrent sub-agent cap so the model fans out with
     # confidence instead of self-limiting. resolve_max_subagents is the single
     # source of truth (auto-sizes from host mem/CPU + learned cost, or the
-    # explicit agent.max_subagents). A snapshot at tool-list time is fine: this
-    # is advisory guidance, not an enforced limit, and SubagentManager
+    # explicit agent.max_subagents) and the gateway's SubagentManager re-derives
+    # its ENFORCED cap through the same function on every config reload, so the
+    # two agree after a write from any writer. A snapshot at tool-list time is
+    # fine: this is advisory guidance, not an enforced limit, and SubagentManager
     # auto-queues any overflow regardless.
     try:
         _max_sub = resolve_max_subagents(KiroCrewConfig.load())
@@ -236,7 +238,7 @@ def schemas() -> list[dict[str, Any]]:
         else ""
     )
     # The valid agent names, read once and shared by every agent-taking field
-    # below, so a caller that never called spawn_list still sees them (#4842).
+    # below, so a caller that never called spawn_list still sees them.
     _agent_hint = _agent_roster_hint()
     # Context-scope switches, shared by spawn_run and spawn_sub_agents so the
     # rule cannot drift between them. The model reads these descriptions at
@@ -604,7 +606,7 @@ def _collapse_effort_verdicts(pairs: list[tuple[str, str]]) -> list[tuple[str, s
     ``reasoning_effort`` and ``model`` are batch-wide, so a wide fan-out
     usually yields the IDENTICAL verdict for every member — rendering it once
     per subagent injects N copies of the same line into the calling agent's
-    context (#6185). Collapse each group of 2+ ids sharing a verdict into one
+    context. Collapse each group of 2+ ids sharing a verdict into one
     row naming all of them ("a1, a2, a3"); a verdict unique to one subagent
     keeps its own row, so mixed batches keep full per-id attribution. Groups
     preserve first-seen dispatch order, and ids keep their dispatch order
@@ -636,6 +638,12 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     # Fire-and-forget — gateway's SubagentManager queues excess tasks
     # and auto-spawns them as slots free up.
     agent = args.get("agent") or ""
+    # The crew this run is DELEGATED to, distinct from `agent`: `agent` names a
+    # kiro-cli template, `crew` names a crew member and is what gives the child
+    # that crew's memory silo. Read here and forwarded below; the schema accepting
+    # the field is not enough, and a field the handler drops makes every documented
+    # `spawn_run(crew=...)` a silent no-op that runs on the operator's own memory.
+    crew = args.get("crew") or ""
     agents_list = args.get("agents") or []
     max_turns = args.get("max_turns") or 0
     cwd = args.get("cwd") or ""
@@ -706,7 +714,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     # Re-posting one cannot succeed: the refusal is a property of the NAME, not
     # of the task, so the rest of a wave that shares it is dead on arrival. The
     # observed cost of not knowing that was a whole wave of doomed dispatches on
-    # one invented name (#4842).
+    # one invented name.
     refused_agents: dict[str, str] = {}
     for i, t in enumerate(task_list):
         a = agents_list[i] if agents_list else agent
@@ -718,6 +726,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             _reconcile_lost(refused_agents[a])
             continue
         body: dict[str, Any] = {"task": t, "agent": a, "parent_session": parent_session}
+        if crew:
+            body["crew"] = crew
         if batch_id:
             body["batch_id"] = batch_id
             body["batch_total"] = len(task_list)
@@ -797,8 +807,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     if not parent_session and agent_ids:
         # Orphan alert: without a parent session key the subagents cannot
         # deliver completion events back to this conversation and will
-        # not appear in the Subagents panel for this session. This has
-        # historically failed silently — say it
+        # not appear in the Subagents panel for this session. This
+        # fails silently — say it
         # loudly so the agent/user can fall back to spawn_list +
         # result.txt polling instead of waiting forever.
         spawn_lines.append(
@@ -983,7 +993,7 @@ def spawn_list(name: str, args: dict[str, Any]) -> str:
             # no process and produced no turn, so reporting it as "running" is
             # actively misleading to a caller this module itself points here
             # ("Check spawn_list", above) -- it reads as work in progress when
-            # the truth is that a human has not approved it yet (#6484).
+            # the truth is that a human has not approved it yet.
             if a.get("done"):
                 status = "done"
             elif a.get("awaiting_approval"):

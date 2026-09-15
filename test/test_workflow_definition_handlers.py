@@ -113,10 +113,7 @@ async def test_definition_run_reports_executor_rejection_instead_of_not_found() 
     service = FakeService()
 
     async def reject_start(_workflow_ref, **_kwargs):
-        return {
-            "error": "Too many concurrent tasks (3/3).",
-            "admission_rejected": True,
-        }
+        return {"error": "Too many concurrent tasks (3/3)."}
 
     service.start_definition = reject_start  # type: ignore[method-assign]
     async with TestClient(TestServer(_app(service))) as client:
@@ -362,9 +359,14 @@ async def test_definition_disk_operations_are_offloaded_from_the_gateway_loop(
             )
         ).status == 200
 
+    # The definition read paths serialize their response off-loop too
+    # (_json_response_off_loop's worker), so each GET contributes two
+    # to_thread hops: the disk read, then redact + json.dumps.
     assert calls == [
         "list_definitions",
+        "_redact_and_serialize",
         "save_definition",
         "get_definition",
+        "_redact_and_serialize",
         "update_definition",
     ]

@@ -19,7 +19,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, AbstractSet, Any, Literal, overload
 
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, replace_with_retry
+from kiro_crew.chat_attachments import (
+    purge_staged_attachments,
+    restore_staged_attachments,
+    stage_attachments_removal,
+)
 from kiro_crew.history_cache import _FileChangeCacheEntry
 from kiro_crew.jsonl_util import bounded_raw_records
 
@@ -53,6 +58,66 @@ def _facade_flock_acquire_timeout() -> float:
 def _facade_strip_markdown_preview(text: str) -> str:
     """Honor post-construction patches of the facade preview helper."""
     return _history_facade().strip_markdown_preview(text)
+
+
+def drop_persisted_tail_prefix(
+    full_disk: list[dict], tail: list[dict], *, require_mid: bool = False
+) -> list[dict]:
+    """`tail` minus whatever of its head `full_disk` already ends with.
+
+    Two callers, one shape: a corpus read from disk, followed by rows that MAY
+    already be in it.
+
+    A fork rebuild appends the slot's unflushed tail onto a freshly read disk
+    corpus. "Unflushed" was decided against an EARLIER read, so a save landing
+    between the two reads leaves those rows in both lists.
+
+    ``read_messages_chained_full`` concatenates a key's rotated archive with its
+    live file. Rotation writes the archive first and rewrites the live file's head
+    second, so a crash between those two steps leaves the rotated rows in both
+    files permanently.
+
+    In both cases appending blind duplicates rows, and a duplicated row is not
+    cosmetic here: this is the index space pagination cursors and fork indices
+    resolve against, so one extra row shifts every index above it.
+
+    Rows are matched by their stable id (``meta.mid``) when BOTH carry one. That
+    id is what ``history`` assigns per row, so it is the only identity that
+    cannot collide. Without it the fallback requires ``(ts, role, content)`` to
+    all match: ``(ts, role)`` alone is a spot-check elsewhere, but here a match
+    DELETES a row, and two distinct rows can share a second and a role (the same
+    speaker twice inside one second, or two processes stamping the same ts), so
+    dropping on that alone would remove a genuinely unpersisted message. The
+    longest overlap wins, so a partially-written duplication is handled as well as
+    a whole one: both producers persist a PREFIX, never an interior slice.
+    """
+    if not full_disk or not tail:
+        return tail
+
+    def _same(a: dict, b: dict) -> bool:
+        a_meta, b_meta = a.get("meta"), b.get("meta")
+        a_mid = a_meta.get("mid") if isinstance(a_meta, dict) else None
+        b_mid = b_meta.get("mid") if isinstance(b_meta, dict) else None
+        if a_mid and b_mid:
+            return bool(a_mid == b_mid)
+        if require_mid:
+            # A match here DELETES a row. Callers whose overlap can only come
+            # from a re-archived prefix (whose rows always carry mids) opt in
+            # to mid-proven matching: an id-less coincidence on the fallback
+            # triple must be preserved, because deleting a genuine row is
+            # strictly worse than serving a duplicate.
+            return False
+        return (
+            a.get("ts", "") == b.get("ts", "")
+            and a.get("role") == b.get("role")
+            and a.get("content", "") == b.get("content", "")
+        )
+
+    for k in range(min(len(tail), len(full_disk)), 0, -1):
+        base = len(full_disk) - k
+        if all(_same(tail[i], full_disk[base + i]) for i in range(k)):
+            return tail[k:]
+    return tail
 
 
 class TranscriptReadProjection:
@@ -258,6 +323,331 @@ class TranscriptReadProjection:
         for chained_key in keys:
             messages.extend(self._log._read_messages(chained_key))
         return messages or self._log._read_messages(key)
+
+    def read_rotated_messages(self, key: str) -> list[dict]:
+        """Messages size-rotation archived out of *key*'s transcript, oldest first.
+
+        Only ``reason="rotate"`` segments participate: those are the transcript's
+        own head, moved aside verbatim when the file outgrew its byte budget.
+        Every other archive reason (``compact``, ``foreign-dedup``, rewrite
+        drops) is content the product DISCARDED — a rewind, a regenerate, a
+        dedup — and resurfacing it would undo that edit in the reader's view.
+
+        Cached per key on the segment files' stat signature: pagination re-reads
+        the corpus once per page and archives change only on a rotation, so the
+        multi-MB parse must not repeat per scroll step.
+        """
+        facade = _history_facade()
+        adir = facade._archive_dir(self._log._dir)
+        stem = facade._safe_key(key) + facade.ARCHIVE_SEGMENT_DELIMITER
+
+        def _seg_order(p: Path) -> tuple[str, int]:
+            # Same-second segments carry ``-N`` suffixes; lexicographic order
+            # puts ``-10`` before ``-2``, so split the numeric part out.
+            rest = p.name[len(stem) : -len(".jsonl")]
+            stamp, dash, suffix = rest.partition("-")
+            # The stamp itself contains one dash (YYYYMMDD-HHMMSS): re-join,
+            # then look for a SECOND dash carrying the collision counter.
+            if dash:
+                stamp2, dash2, suffix2 = suffix.partition("-")
+                stamp = f"{stamp}-{stamp2}"
+                suffix = suffix2 if dash2 else ""
+            try:
+                n = int(suffix) if suffix else 0
+            except ValueError:
+                n = 0
+            return (stamp, n)
+
+        try:
+            segs = sorted((p for p in adir.glob(f"{stem}*.jsonl")), key=_seg_order)
+        except OSError as exc:
+            # `return []` here is indistinguishable from "this session never
+            # rotated", and that is the one answer this function must not guess.
+            # An unreadable archive DIRECTORY hides an unknown number of rows, so
+            # every index above them moves and the reader is told their older
+            # history does not exist. Raise and let the handlers answer with the
+            # retryable 503 they already have.
+            raise OSError(f"rotated archive for {key} could not be enumerated") from exc
+        if not segs:
+            return []
+        sig: list[tuple[str, int, int]] = []
+        for p in segs:
+            try:
+                st = p.stat()
+            except OSError as exc:
+                # The signature is the cache key. A segment we cannot stat would
+                # be silently absent from it, so a later read of a CHANGED
+                # archive would hit a stale entry and serve the wrong corpus.
+                raise OSError(f"rotated segment {p.name} could not be stat'd") from exc
+            sig.append((p.name, st.st_size, st.st_mtime_ns))
+        cache: dict[str, tuple[list[tuple[str, int, int]], list[dict]]] | None = getattr(
+            self, "_rotated_cache", None
+        )
+        if cache is None:
+            cache = {}
+            self._rotated_cache = cache
+        hit = cache.get(key)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+        rows: list[dict] = []
+        prev_seg_rows: list[dict] = []
+        # A transient per-segment read failure must not be CACHED as "no
+        # archived rows": the stat signature of a finished rotation never
+        # changes again, so a poisoned empty entry would outlive the incident
+        # forever — the transcript's head silently unreachable until the next
+        # process restart.
+        #
+        # It must not be SERVED either. This corpus is an index space: the
+        # `before`/`next_before` cursors and the fork index path both resolve a
+        # rendered row's position against it, so dropping a segment does not
+        # merely hide those rows, it shifts every index above them. A reader then
+        # pages a corpus whose positions no longer mean what they meant, and an
+        # index-addressed fork copies a different cutoff than the one on screen —
+        # silently, with nothing to retry. Both consumers already turn a raised
+        # read failure into a retryable 503, which is strictly better than a
+        # truncated transcript nobody can see is truncated.
+        complete = True
+        for p in segs:
+            try:
+                lines = p.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                _HISTORY_LOGGER.warning("rotated segment unreadable: %s", p.name, exc_info=True)
+                complete = False
+                continue
+            if not lines:
+                # A zero-byte segment. Archiving is a PRECONDITION of the live-file
+                # rewrite, so a rotation that got this far and no further never
+                # rewrote the live file — those rows are still in it, and a healthy
+                # read of an empty file contributes nothing either. Skipping here
+                # changes no index.
+                continue
+            try:
+                header = json.loads(lines[0])
+            except ValueError:
+                # A damaged header on a segment whose rows may be perfectly intact.
+                # Unlike the classification skip below, a healthy read WOULD have
+                # contributed those rows, so dropping them shortens the corpus and
+                # shifts every index above it. Worse, a retry rotation can archive
+                # the same rows successfully, and then a partial read of this
+                # segment duplicates them.
+                _HISTORY_LOGGER.warning("rotated segment header unparseable: %s", p.name)
+                complete = False
+                continue
+            if not isinstance(header, dict):
+                # DAMAGE, not classification. A header that parses as valid JSON
+                # but is not an object (`[]`, a bare string) is not "some other
+                # archive reason" -- no writer produces that shape, so the segment
+                # is corrupt and its rows are unaccounted for.
+                _HISTORY_LOGGER.warning("rotated segment header is not an object: %s", p.name)
+                complete = False
+                continue
+            if header.get("reason") != "rotate":
+                # CLASSIFICATION, not damage: `compact`, `foreign-dedup` and rewrite
+                # archives are other reasons, and this corpus is size-rotation only
+                # (see the docstring). A healthy read skips these too, so this one
+                # must stay a plain skip.
+                continue
+            seg_rows: list[dict] = []
+            for ln in lines[1:]:
+                if not ln.strip():
+                    continue
+                try:
+                    row = json.loads(ln)
+                except ValueError:
+                    # Same reasoning as the header: a healthy read yields this row,
+                    # so silently dropping it moves every index above it.
+                    _HISTORY_LOGGER.warning("rotated segment row unparseable in %s", p.name)
+                    complete = False
+                    continue
+                if not isinstance(row, dict):
+                    # Damage again, for the same reason the header check gives.
+                    _HISTORY_LOGGER.warning("rotated segment row is not an object in %s", p.name)
+                    complete = False
+                    continue
+                if "_type" not in row:
+                    # `_type` rows are deliberate control records, not messages --
+                    # skipping them IS the classification this corpus wants.
+                    seg_rows.append(row)
+            # Rotation archives the live file's head BEFORE rewriting the live
+            # file. A hard crash between those two writes leaves the archived
+            # rows at the head of the live file too, so the NEXT rotation
+            # re-archives them: this corpus is the index space pagination
+            # cursors and fork indices resolve against, and a duplicated row
+            # silently shifts every index above it. Two proofs may drop a
+            # row here, and an id-less interior coincidence satisfies
+            # neither, because deleting a genuine row is strictly worse than
+            # serving a duplicate:
+            #
+            # 1. PROVENANCE. A failed rewrite leaves segment N's rows at the
+            #    live file's head, so the next rotation re-archives them
+            #    field-for-field: segment N+1 either begins with ALL of N
+            #    (enough new rows accrued) or is itself a shorter verbatim
+            #    prefix of N (the rotation kept a tail). Both reduce to the
+            #    first min(len) rows of ADJACENT segments being identical
+            #    records -- a shape an organic transcript cannot reproduce,
+            #    and one that needs no row ids.
+            # 2. IDENTITY. Beyond that shared prefix, a row is dropped only
+            #    when proven by stable ``meta.mid`` equality
+            #    (``require_mid=True``); the ``(ts, role, content)`` fallback
+            #    does not apply at this seam.
+            #
+            # This covers segment-to-segment overlap only: the archive-to-live
+            # seam in read_messages_chained_full still needs its own
+            # drop_persisted_tail_prefix call.
+            provenance = 0
+            k = min(len(prev_seg_rows), len(seg_rows))
+            if k and seg_rows[:k] == prev_seg_rows[:k]:
+                provenance = k
+            remainder = seg_rows[provenance:]
+            merged = drop_persisted_tail_prefix(rows, remainder, require_mid=True)
+            dropped = provenance + (len(remainder) - len(merged))
+            if dropped:
+                # A fired dedupe is the on-disk signature of a rotation that
+                # crashed inside the archive-to-rewrite window. Every other
+                # anomaly in this reader logs; dropping rows silently would
+                # make a genuine (mis)drop unattributable in the field.
+                _HISTORY_LOGGER.warning(
+                    "rotated segment %s overlaps the corpus: dropped %d duplicate row(s)",
+                    p.name,
+                    dropped,
+                )
+            rows.extend(merged)
+            prev_seg_rows = seg_rows
+        if complete:
+            if not rows:
+                # Segments exist yet no rotate rows parsed — the exact signature
+                # of the live incident where the transcript head went missing.
+                # Loud on purpose: this state should be impossible for a healthy
+                # rotation archive.
+                _HISTORY_LOGGER.warning(
+                    "rotated archive for %s: %d segment(s) matched but 0 rows parsed",
+                    key,
+                    len(segs),
+                )
+            cache[key] = (sig, rows)
+            # One entry per key is enough; a stale key's rows would pin MBs forever.
+            if len(cache) > 8:
+                cache.pop(next(iter(cache)))
+            return rows
+        raise OSError(
+            f"rotated archive for {key} is incomplete: at least one segment could not be read"
+        )
+
+    def read_messages_chained_full(self, key: str) -> list[dict]:
+        """`read_messages_chained` plus each key's size-rotated archive head.
+
+        Per chain key the rotated rows PRECEDE the live file's rows — rotation
+        drops the file's head, so segment order (filename timestamp) followed by
+        the surviving file is that key's true chronology, and whole-key blocks
+        are already chronological in chain order. This is the pagination corpus:
+        the index space `before`/`next_before` cursors live in, shared with the
+        fork index path so a rendered row's index resolves to the same message
+        everywhere.
+        """
+        metadata = self._log.get_metadata(key)
+        tab_id = metadata.get("tab_id")
+        keys: list[str] = []
+        if tab_id:
+            with self._log._lock:
+                if self._log._tab_id_index is None:
+                    self._log._rebuild_tab_id_index()
+                index = self._log._tab_id_index or {}
+                keys = list(index.get(tab_id, []))
+        if not keys:
+            keys = [key]
+        messages: list[dict] = []
+        for chained_key in keys:
+            # LIVE FIRST, then the archive. These are two separate snapshots, so a
+            # rotation can land between them, and the ORDER decides which way that
+            # race fails. Archive-then-live loses rows: the archive snapshot
+            # predates the rotation so it lacks the newly-archived rows, the live
+            # snapshot postdates the head rewrite that removed them, and those rows
+            # appear in NEITHER — silently absent, with every index above them
+            # shifted. Live-then-archive can only ever DUPLICATE them, which is the
+            # exact condition `drop_persisted_tail_prefix` below already removes.
+            live = self._log._read_messages(chained_key)
+            rotated = self.read_rotated_messages(chained_key)
+            # Rotation archives the dropped lines FIRST and rewrites the live
+            # file's head second, deliberately (archiving is a precondition, so it
+            # fails closed rather than losing the only copy of those rows). That
+            # ordering leaves a window in which both files hold them, and a crash
+            # or a kill inside it makes the duplication permanent — after which a
+            # blind concatenation here serves every archived row twice.
+            #
+            # A duplicated row is not cosmetic in this corpus: it is the index
+            # space `before`/`next_before` cursors and fork indices resolve
+            # against, so one extra row shifts every index above it and a fork
+            # taken at a rendered row lands on a different message.
+            live = drop_persisted_tail_prefix(rotated, live)
+            messages.extend(rotated)
+            messages.extend(live)
+        return messages
+
+    def read_rotated_messages_chained(self, key: str) -> list[dict]:
+        """All rotate-archived rows across *key*'s tab chain, chain order."""
+        metadata = self._log.get_metadata(key)
+        tab_id = metadata.get("tab_id")
+        keys: list[str] = []
+        if tab_id:
+            with self._log._lock:
+                if self._log._tab_id_index is None:
+                    self._log._rebuild_tab_id_index()
+                index = self._log._tab_id_index or {}
+                keys = list(index.get(tab_id, []))
+        if not keys:
+            keys = [key]
+        rows: list[dict] = []
+        for chained_key in keys:
+            rows.extend(self.read_rotated_messages(chained_key))
+        return rows
+
+    def chain_mid_rotation(self, key: str) -> bool:
+        """True when any chain member AFTER the first has archive segments.
+
+        The slot-detail fast path advertises the whole archived head as one
+        `next_before` cursor, which is exact only while the archived rows are
+        a contiguous PREFIX of the chained corpus -- i.e. only the first chain
+        member ever rotated. A later member's archive is sandwiched between
+        rows the fast response already carries, so no single cursor can hand
+        it to the client; the caller must serve the true chained corpus
+        instead.
+
+        Stat-only (segment existence, nothing parsed), and conservative on
+        purpose: a non-rotate segment (``compact`` etc.) also answers True,
+        which routes the caller to the always-correct full corpus -- slower,
+        never wrong. The precise filter would cost a parse per segment.
+        """
+        metadata = self._log.get_metadata(key)
+        tab_id = metadata.get("tab_id")
+        keys: list[str] = []
+        if tab_id:
+            with self._log._lock:
+                if self._log._tab_id_index is None:
+                    self._log._rebuild_tab_id_index()
+                index = self._log._tab_id_index or {}
+                keys = list(index.get(tab_id, []))
+        if len(keys) <= 1:
+            return False
+        facade = _history_facade()
+        adir = facade._archive_dir(self._log._dir)
+        for chained_key in keys[1:]:
+            stem = facade._safe_key(chained_key) + facade.ARCHIVE_SEGMENT_DELIMITER
+            try:
+                if next(adir.glob(f"{stem}*.jsonl"), None) is not None:
+                    return True
+            except OSError as exc:
+                # NOT `continue`. This predicate is consumed as a decision, not a
+                # hint: False selects the prefix-cursor path, which is correct only
+                # when the rotation is on the FIRST chain member. Swallowing the
+                # failure lets the loop finish and answer False, so "cannot tell"
+                # becomes "definitely not mid-chain" -- and if it actually was, the
+                # sandwiched archived rows go unreachable and an index-addressed
+                # fork picks the wrong cutoff. Both callers turn this into their
+                # retryable 503.
+                raise OSError(
+                    f"mid-rotation probe for {chained_key} could not enumerate the archive"
+                ) from exc
+        return False
 
     def _rebuild_tab_id_index(self) -> None:
         """Rebuild the tab-id chain index while the owner lock is held."""
@@ -552,7 +942,19 @@ class TranscriptReadProjection:
         key: str,
         sanitize: Callable[[str], str] | None = None,
     ) -> tuple[str, float]:
-        """Return the newest message preview and that row's epoch timestamp."""
+        """Return the newest message preview and the thread's recency epoch.
+
+        The two can come from different rows: the preview text is the newest
+        CONVERSATIONAL row, while the epoch reads a newer skipped stop row
+        when one exists (a stop is activity — see the comment on
+        ``newest_epoch`` below). Every other skip keeps the timestamp with
+        the previewed row.
+        """
+        # Function-local: dashboard.state imports kiro_crew.history at module
+        # scope, which lands back here, so a top-level import would be a
+        # cycle. By preview time the dashboard module is long since loaded.
+        from kiro_crew.dashboard.state import is_stop_event_row
+
         path = self._log._path(key)
         try:
             size = path.stat().st_size
@@ -562,6 +964,28 @@ class TranscriptReadProjection:
             self._log._PREVIEW_TAIL_BYTES,
             self._log._PREVIEW_TAIL_BYTES * 16,
         )
+
+        def _row_epoch(row: dict) -> float:
+            timestamp = row.get("ts")
+            if isinstance(timestamp, str) and timestamp:
+                try:
+                    return datetime.fromisoformat(
+                        timestamp.strip().replace("Z", "+00:00")
+                    ).timestamp()
+                except ValueError:
+                    pass
+            return 0.0
+
+        # Recency carried over from a SKIPPED STOP row only. The stop-row skip
+        # below moves the preview TEXT to an earlier row, but a stop IS
+        # activity — callers order by this epoch (members.py: "Order by the
+        # newest MESSAGE"), and returning the previewed row's timestamp would
+        # sink a just-stopped thread below genuinely older ones. Scoped to
+        # stop rows deliberately: every OTHER non-previewable row (a
+        # zero-width-space-only quiet monitor reply, an empty content row)
+        # keeps the long-standing contract that the timestamp travels with
+        # the row the preview came from (test_preview_text.py pins it).
+        newest_epoch = 0.0
         for window in windows:
             try:
                 with open(path, "rb") as handle:
@@ -583,6 +1007,17 @@ class TranscriptReadProjection:
                     continue
                 if data.get("_type") == "metadata":
                     continue
+                # A Stop press's card is a `system` row whose content IS the
+                # JSON stop payload (see the is_stop_event_row docstring), so
+                # surfacing it hands `{"kind": "stop_event", …}` to every
+                # preview caller — the Crew Members roster subtitle and the
+                # session-list preview both render it verbatim otherwise.
+                # Reuse the shared predicate rather than a fresh kind check:
+                # its docstring documents why matching one carrier is the trap.
+                if is_stop_event_row(data):
+                    if not newest_epoch:
+                        newest_epoch = _row_epoch(data)
+                    continue
                 text = self._log._content_text(data.get("content"))
                 if not text:
                     continue
@@ -595,19 +1030,10 @@ class TranscriptReadProjection:
                     preview = sanitize(preview)
                 if len(preview) > self._log._PREVIEW_MAX_CHARS:
                     preview = preview[: self._log._PREVIEW_MAX_CHARS].rstrip() + "…"
-                timestamp = data.get("ts")
-                epoch = 0.0
-                if isinstance(timestamp, str) and timestamp:
-                    try:
-                        epoch = datetime.fromisoformat(
-                            timestamp.strip().replace("Z", "+00:00")
-                        ).timestamp()
-                    except ValueError:
-                        pass
-                return preview, epoch
+                return preview, newest_epoch or _row_epoch(data)
             if size <= window:
                 break
-        return "", 0.0
+        return "", newest_epoch
 
     @staticmethod
     def _content_text(content: object) -> str:
@@ -664,7 +1090,7 @@ class TranscriptReadProjection:
                     return cached[2], True
                 with open(path, encoding="utf-8") as handle:
                     first = handle.readline().strip()
-            except OSError:
+            except (OSError, UnicodeError):
                 if attempt + 1 < attempts:
                     self._log._pause_for_transient_retry()
                     continue
@@ -684,7 +1110,10 @@ class TranscriptReadProjection:
                     data if isinstance(data, dict) and data.get("_type") == "metadata" else {}
                 )
             except json.JSONDecodeError:
-                metadata = {}
+                # A damaged first line cannot establish whether this was a
+                # member session. Keep get_metadata's legacy empty-dict view,
+                # but tell identity-sensitive readers to refuse the operation.
+                return {}, False
             self._log._publish_if_current(
                 self._log._meta_cache,
                 key,
@@ -759,10 +1188,69 @@ class SessionMetadataProjection:
                         return None
                 path = self._log._path(key)
                 existed = path.exists()
+                # The search index holds a copy of this session's message text, so
+                # it goes FIRST. Removing it before the transcript means a failure
+                # here has destroyed nothing yet and the delete can abort cleanly;
+                # the reverse order would leave the text readable in the index
+                # after the transcript was already gone. drop() reports failure
+                # rather than swallowing it for exactly this reason.
+                #
+                # EVERY spelling of the key is dropped, not the caller's one. Rows
+                # are written under ``list_sessions``' key, which is the file's
+                # ``stem``; a caller holding the logical form (``dashboard:mochi``)
+                # names a row that does not exist, and an empty match is a
+                # successful drop -- so the transcript would be unlinked while its
+                # indexed text stayed readable. ``_cache_key_identities`` is the
+                # existing owner of "every spelling of this transcript", used by
+                # cache invalidation for the same reason.
+                search_index = self._log._catalog_projection.search_index
+                identities = set(self._log._cache_key_identities(key)) | {key, path.stem}
+                if existed and search_index.available and not search_index.drop(identities):
+                    _HISTORY_LOGGER.warning(
+                        "delete_session: could not remove the search index row, "
+                        "not deleting key=%s",
+                        key,
+                    )
+                    return False
+                # An index that exists on disk but cannot be opened is the one case
+                # that must fail CLOSED: a copy of this session's text may be in it
+                # and nothing here can remove it, so reporting the delete as done
+                # would be a claim we cannot support. Removing the index file
+                # unblocks it, which is why the path is named in the log.
+                if existed and not search_index.available and search_index.store_exists():
+                    _HISTORY_LOGGER.warning(
+                        "delete_session: search index present but unreadable, so a "
+                        "copy of this session's text may remain; not deleting "
+                        "key=%s (remove the index to proceed)",
+                        key,
+                    )
+                    return False
+                # The images this session's messages showed are its content,
+                # served by ``/api/file-raw`` the way the transcript's text is
+                # served by the session view. They leave with the transcript in
+                # three all-or-nothing steps: the attachments directory is moved
+                # aside in ONE rename (a failure aborts with everything intact),
+                # the transcript is unlinked (a failure moves the directory back,
+                # so the retained rows still resolve), and only then are the
+                # staged bytes purged -- nothing references them any more, so a
+                # leftover is an orphan for an operator, never a served image.
+                try:
+                    staged = stage_attachments_removal(path.parent, path.stem)
+                except OSError:
+                    _HISTORY_LOGGER.warning(
+                        "delete_session: cannot move attachments aside for key=%s, not deleting",
+                        key,
+                        exc_info=True,
+                    )
+                    return False
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
+                    if staged is not None:
+                        restore_staged_attachments(staged, path.parent, path.stem)
                     return False
+                if staged is not None:
+                    purge_staged_attachments(staged)
                 for sidecar in (
                     self._log._summary_cache_path(key),
                     self._log._intent_summary_cache_path(key),
@@ -847,7 +1335,13 @@ class SessionMetadataProjection:
                 os.write(descriptor, data)
             finally:
                 os.close(descriptor)
-            os.replace(temporary, str(path))
+            # The shared retrying rename, not a bare ``os.replace``: on Windows the
+            # rename fails with ``PermissionError`` while any other handle -- a
+            # concurrent transcript READER -- is open on the destination, and this
+            # path is hit right after a session writes, when readers are busiest.
+            # Three unrelated test files flaked on exactly this line in five full
+            # runs; the retry is what every other tmp-plus-rename writer here has.
+            replace_with_retry(temporary, path)
         except Exception:
             try:
                 os.unlink(temporary)
@@ -871,8 +1365,8 @@ class SessionMetadataProjection:
         only_if_closed_before: float | None = None,
     ) -> None:
         """Remove a stale closed marker with an optional compare-and-clear."""
-        path = self._log._path(key)
         with self._log._locked(key):
+            path = self._log._path(key)
             if not path.exists():
                 return
             previous_mtime = _history_facade()._safe_mtime(path)

@@ -1,6 +1,7 @@
 """``_kiro.dev/metadata`` unconsumed-field reporting.
 
-``parse_metadata`` reads two keys and drops everything else. These tests pin the
+``parse_metadata`` reads its known keys (usage, credits, and the refusal
+envelope) and drops everything else. These tests pin the
 diagnostic that names what was dropped, so a field kiro-cli starts sending (a
 prompt-cache counter, a new billing unit) becomes visible instead of silent.
 """

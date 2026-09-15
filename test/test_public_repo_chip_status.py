@@ -1,6 +1,6 @@
 """Public-repo chip-status gate: a non-owner dashboard user sees PR/MR status
 for PUBLIC repos, while private/unknown repos stay owner-only and app tokens
-see nothing (issue #6786).
+see nothing.
 
 Covers the three cooperating pieces:
   * ``source_providers`` repo-visibility cache + fetch + scheduler,
@@ -23,6 +23,18 @@ ISSUE_URL = "https://github.com/acme/repo/issues/9"
 GLAB_URL = "https://gitlab.com/grp/sub/-/merge_requests/4"
 
 
+def _visibility_tasks_for(loop: asyncio.AbstractEventLoop) -> list[asyncio.Task]:
+    """The subset of ``source._VISIBILITY_TASKS`` this loop can legally await.
+
+    The set is process-wide, and a task is awaitable only on the loop that created
+    it. ``schedule_visibility_refresh`` prunes entries whose loop is CLOSED, but a
+    task from another still-live loop (the previous test's, torn down a moment
+    later) can sit in the set at drain time, and gathering it raises ``attached to
+    a different loop`` -- once in five full runs here. Drain only what is ours.
+    """
+    return [task for task in list(source._VISIBILITY_TASKS) if task.get_loop() is loop]
+
+
 @pytest.fixture(autouse=True)
 def _clear_caches():
     source._visibility_cache.clear()
@@ -34,6 +46,23 @@ def _clear_caches():
     source._visibility_inflight.clear()
     source._visibility_force_gen.clear()
     source._check_cache.clear()
+    # A task a test spawned via schedule_visibility_refresh but never awaited
+    # (e.g. the test raised before its own gather, or simply forgot to drain
+    # it) is bound to THIS test's event loop, which pytest-asyncio strict mode
+    # tears down at teardown. The task then lingers in the module-global set
+    # forever — its done-callback never fires because the loop that would run
+    # it is gone — and a LATER test on a fresh loop that gathers the set
+    # crashes with "Future belongs to a different loop" (no-test-side-effects).
+    # Cancel each leftover so its coroutine is properly closed rather than
+    # silently dropped, then clear the set so the next test starts empty. A
+    # sync fixture's teardown can run after pytest-asyncio has already closed
+    # the loop; ``Task.cancel`` schedules through ``call_soon`` and raises on a
+    # closed loop, so a task whose loop is gone is only dropped (production
+    # prunes dead-loop tasks on the next schedule anyway).
+    for task in list(source._VISIBILITY_TASKS):
+        if not task.get_loop().is_closed():
+            task.cancel()
+    source._VISIBILITY_TASKS.clear()
     # A test that armed the debounced update (force visibility refresh /
     # status-change path) can leave a pending global TimerHandle bound to this
     # test's now-closing event loop; if it survives, a later test's callback
@@ -99,7 +128,7 @@ async def test_fetch_github_visibility_maps_isprivate(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fetch_github_internal_is_not_public(monkeypatch):
-    # GPT #6789 round-9: isPrivate is False for internal (Enterprise) repos too,
+    # isPrivate is False for internal (Enterprise) repos too,
     # but internal is NOT anonymously readable — must not classify as public.
     async def fake_run(*argv, **kw):
         return {"isPrivate": False, "visibility": "internal"}
@@ -150,7 +179,7 @@ async def test_fetch_gitlab_public_with_public_features_is_public(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fetch_gitlab_public_but_private_pipelines_is_not_public(monkeypatch):
-    # GPT #6789 round-6: public_jobs=false hides pipeline/CI status from
+    # public_jobs=false hides pipeline/CI status from
     # non-members even when builds_access_level is "enabled".
     async def fake_run(*argv, **kw):
         return {
@@ -167,7 +196,7 @@ async def test_fetch_gitlab_public_but_private_pipelines_is_not_public(monkeypat
 
 @pytest.mark.asyncio
 async def test_fetch_gitlab_public_but_member_only_mr_is_not_public(monkeypatch):
-    # GPT #6789 round-5: a public project can restrict MR/CI to members, so
+    # a public project can restrict MR/CI to members, so
     # visibility=="public" alone must NOT authorize non-owner status.
     async def fake_run(*argv, **kw):
         return {
@@ -212,7 +241,7 @@ async def test_refresh_keeps_prior_known_value_on_failure(monkeypatch):
     monkeypatch.setattr(source, "_run_json", boom)
     source._visibility_inflight.add(source._visibility_key(ref))
     await source._refresh_repo_visibility(ref)
-    # A failed read must not erase a previously-known public flag (within TTL).
+    # A failed read must not erase an already-known public flag (within TTL).
     assert source.is_repo_public(PR_URL) is True
 
 
@@ -288,7 +317,7 @@ async def test_schedule_dedups_by_repo_and_skips_issue_and_jira(monkeypatch):
         [PR_URL, ISSUE_URL, "https://github.com/acme/repo/pull/99", "not-a-url"]
     )
     # Let the created tasks run.
-    await asyncio.gather(*list(source._VISIBILITY_TASKS), return_exceptions=True)
+    await asyncio.gather(*_visibility_tasks_for(asyncio.get_running_loop()), return_exceptions=True)
     assert calls == [source._visibility_key(source.parse_source_url(PR_URL))]
 
 
@@ -304,13 +333,13 @@ async def test_schedule_respects_fresh_ttl(monkeypatch):
 
     monkeypatch.setattr(source, "_refresh_repo_visibility", fake_refresh)
     source.schedule_visibility_refresh([PR_URL])
-    await asyncio.gather(*list(source._VISIBILITY_TASKS), return_exceptions=True)
+    await asyncio.gather(*_visibility_tasks_for(asyncio.get_running_loop()), return_exceptions=True)
     assert called is False
 
 
 @pytest.mark.asyncio
 async def test_force_synchronously_invalidates_public_before_refresh(monkeypatch):
-    # GPT #6789 round-4 race: a forced refresh runs concurrently with the forced
+    # Race: a forced refresh runs concurrently with the forced
     # status read; if status finishes first it must NOT see a still-cached-public
     # visibility. force=True drops a public entry to unknown SYNCHRONOUSLY (before
     # the task is spawned), so is_repo_public fails closed for the in-flight window.
@@ -332,12 +361,12 @@ async def test_force_synchronously_invalidates_public_before_refresh(monkeypatch
     await started.wait()
     assert source.is_repo_public(PR_URL) is None
     release.set()
-    await asyncio.gather(*list(source._VISIBILITY_TASKS), return_exceptions=True)
+    await asyncio.gather(*_visibility_tasks_for(asyncio.get_running_loop()), return_exceptions=True)
 
 
 @pytest.mark.asyncio
 async def test_force_invalidates_public_even_when_refresh_already_inflight(monkeypatch):
-    # GPT #6789 round-14: the force path must fail a cached-public entry closed
+    # The force path must fail a cached-public entry closed
     # BEFORE the inflight-dedup return — otherwise a force=True call that arrives
     # while a (pre-flip) refresh is already running would `continue` without
     # invalidating, and the in-flight positive read could restore public after a
@@ -362,7 +391,7 @@ async def test_force_invalidates_public_even_when_refresh_already_inflight(monke
 
 @pytest.mark.asyncio
 async def test_stale_inflight_positive_cannot_restore_public_across_force(monkeypatch):
-    # GPT #6789 round-14: a visibility refresh whose positive read predates a
+    # A visibility refresh whose positive read predates a
     # force-invalidation (public->private flip) must NOT write ``public`` back —
     # doing so would re-open the leak the force path just closed. The generation
     # guard makes it record unknown instead, so is_repo_public stays None.
@@ -392,14 +421,14 @@ async def test_stale_inflight_positive_cannot_restore_public_across_force(monkey
     # Let the stale positive read complete.
     release.set()
     await asyncio.gather(task, return_exceptions=True)
-    await asyncio.gather(*list(source._VISIBILITY_TASKS), return_exceptions=True)
+    await asyncio.gather(*_visibility_tasks_for(asyncio.get_running_loop()), return_exceptions=True)
     # The stale positive did NOT restore public — is_repo_public stays fail-closed.
     assert source.is_repo_public(PR_URL) is None
 
 
 @pytest.mark.asyncio
 async def test_force_bumps_generation_even_when_entry_already_unknown(monkeypatch):
-    # GPT #6789 round-15: the generation bump must fire on EVERY forced refresh
+    # The generation bump must fire on EVERY forced refresh
     # (before inflight dedup), not only when the cached entry is currently
     # public. Otherwise a second force arriving while the entry is already
     # unknown (first force landed, pre-privacy fetch still in flight) would skip
@@ -421,7 +450,7 @@ async def test_force_bumps_generation_even_when_entry_already_unknown(monkeypatc
 
 @pytest.mark.asyncio
 async def test_force_public_to_private_transition_queues_hide_update(monkeypatch):
-    # GPT #6789 round-7: a forced refresh pre-invalidates a cached-public entry
+    # A forced refresh pre-invalidates a cached-public entry
     # to unknown before spawning the refresh. If the repo genuinely went private,
     # the refresh must STILL queue an on_update so connected non-owners hide the
     # now-stale public chip — the comparison must measure the flip against the
@@ -440,7 +469,7 @@ async def test_force_public_to_private_transition_queues_hide_update(monkeypatch
         fired["n"] += 1
 
     source.schedule_visibility_refresh([PR_URL], on_update=on_update, force=True)
-    await asyncio.gather(*list(source._VISIBILITY_TASKS), return_exceptions=True)
+    await asyncio.gather(*_visibility_tasks_for(asyncio.get_running_loop()), return_exceptions=True)
     # The hide-the-chip update was queued (public -> private is a rendered flip).
     assert on_update in source._check_update_callbacks or fired["n"] >= 1
     assert source.is_repo_public(PR_URL) is False
@@ -448,7 +477,7 @@ async def test_force_public_to_private_transition_queues_hide_update(monkeypatch
 
 @pytest.mark.asyncio
 async def test_status_change_forces_visibility_revalidation(monkeypatch):
-    # GPT #6789 round-8: a status refresh can land a freshly-fetched status while
+    # A status refresh can land a freshly-fetched status while
     # this URL's visibility entry is still within its TTL, so a plain (non-force)
     # visibility schedule would SKIP the read and is_repo_public would authorize
     # the new status against a stale-fresh public flag. A confirmed status change
@@ -480,7 +509,7 @@ async def test_status_change_forces_visibility_revalidation(monkeypatch):
 
 
 def test_full_payload_status_change_forces_visibility_revalidation(monkeypatch):
-    # GPT #6789 round-9: record_full_payload_status is a SECOND authoritative
+    # record_full_payload_status is a SECOND authoritative
     # status writer (the detail panel). A public->private change refreshed here
     # must also force-revalidate visibility, or a non-owner is served the new
     # status against a stale-fresh public flag. Fix the writer, do NOT drop the
@@ -505,7 +534,7 @@ def test_full_payload_status_change_forces_visibility_revalidation(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_status_change_forces_visibility_before_flap_and_await(monkeypatch):
-    # GPT #6789 round-11 finding 2: the force visibility invalidation must run
+    # The force visibility invalidation must run
     # IMMEDIATELY after 'changed' is detected — before flap handling (which can
     # early-return) and before the first await (_invalidate_full_payload_cache).
     # Otherwise a public->private repo whose transition is flapping would return
@@ -606,7 +635,7 @@ def test_issue_link_never_gets_status_even_for_owner():
 
 
 def test_non_owner_public_status_grant_is_sel_audited(monkeypatch):
-    # GPT #6789 round-12: granting a non-owner status on a confirmed-public repo
+    # Granting a non-owner status on a confirmed-public repo
     # is an access-control decision and MUST leave an SEL allow event
     # (AUTOSDE backend-security-controls: grants, not only denials). Owner and
     # app-token paths do NOT go through this grant, so they emit nothing here.
@@ -640,7 +669,7 @@ def test_non_owner_public_status_grant_is_sel_audited(monkeypatch):
     _project_source_links([_link(PR_URL_2)], True, dashboard_user=False)
     assert events == []
 
-    # DENY decision (GPT #6789 round-15): a non-owner on a NON-public repo is
+    # DENY decision: a non-owner on a NON-public repo is
     # denied status and that denial must ALSO be SEL-audited (deduped per url).
     events.clear()
     _seed_status(PR_URL_2, {"state": "open", "ci": "passed"})
@@ -650,3 +679,26 @@ def test_non_owner_public_status_grant_is_sel_audited(monkeypatch):
     # Deduped within the window.
     _project_source_links([_link(PR_URL_2)], False, dashboard_user=True)
     assert len(events) == 1
+
+
+def test_visibility_tasks_for_skips_a_live_foreign_loops_task():
+    """A task another LIVE loop registered must not be handed to this loop's gather.
+
+    The dead-loop prune in ``schedule_visibility_refresh`` cannot see it (its loop is
+    still open), and gathering it raises ``attached to a different loop`` -- the
+    1-in-5 failure the loop-scoped drain exists to remove.
+    """
+    mine = asyncio.new_event_loop()
+    other = asyncio.new_event_loop()
+    try:
+        foreign = other.create_task(asyncio.sleep(0))
+        own = mine.create_task(asyncio.sleep(0))
+        source._VISIBILITY_TASKS.update({foreign, own})
+
+        assert _visibility_tasks_for(mine) == [own]
+        assert _visibility_tasks_for(other) == [foreign]
+        mine.run_until_complete(own)
+        other.run_until_complete(foreign)
+    finally:
+        mine.close()
+        other.close()

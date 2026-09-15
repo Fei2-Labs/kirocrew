@@ -19,8 +19,10 @@ The properties that must hold before anything billable ever ships on this app:
    attacker-shaped names are never echoed into a guidance card.
 5. **The consent enum grew without changing the mechanism**: ``s3``/``ce``
    are gated services with labels, and their (profile, region) target resolves
-   from the deploy registry default — the same resolution the engine will use
-   for the calls those grants authorize.
+   through the SAME healthy-first policy the engine uses for the calls those
+   grants authorize — the registry default picks the account, ``_pick_profile``
+   picks the key, and only a state with no working key at all falls back to
+   naming the default so the card can still explain itself.
 """
 
 from __future__ import annotations
@@ -51,12 +53,15 @@ P0_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/drive/{account}"),
     ("GET", "/drive/{account}/list"),
     ("GET", "/drive/{account}/download"),
+    ("GET", "/drive/{account}/preview"),
+    ("GET", "/drive/{account}/search"),
     ("GET", "/costs/{account}"),
     ("GET", "/library/{account}"),
     ("GET", "/backup/{account}"),
     ("GET", "/shares"),
     ("GET", "/iam-policy"),
     ("POST", "/profiles/register"),
+    ("POST", "/profiles/unregister"),
     ("POST", "/drive/{account}/bootstrap"),
     ("POST", "/drive/{account}/upload"),
     ("POST", "/drive/{account}/delete"),
@@ -70,6 +75,10 @@ P0_ROUTES: tuple[tuple[str, str], ...] = (
     ("POST", "/backup/{account}/run"),
     ("POST", "/backup/{account}/nightly"),
     ("POST", "/backup/{account}/restore"),
+    # Not account-scoped: an install is the same install whichever account it
+    # backs up to, so a name per account would mint the confusion the install id
+    # exists to remove.
+    ("POST", "/install/label"),
 )
 
 #: Every POST is a mutation and must also refuse restricted sessions.
@@ -123,6 +132,22 @@ def _payload(response: web.StreamResponse) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
+def _denial(audit: mock.Mock, error: str) -> str:
+    """The operation a patched ``_audit`` recorded ``denied`` with ``error``.
+
+    Asserted BEFORE any field is read: a regression that stops auditing leaves
+    nothing to match, and returning early with an assertion reports the event
+    that went missing instead of an IndexError on an empty list.
+    """
+    calls = [
+        call
+        for call in audit.call_args_list
+        if call.args[2:3] == ("denied",) and call.kwargs.get("error") == error
+    ]
+    assert calls, f"no denial audited with error={error!r}"
+    return calls[0].args[0]
+
+
 def _identity(ok: bool, account: str = "", arn: str = "", detail: str = "") -> aws_consent.Identity:
     return aws_consent.Identity(ok=ok, account=account, arn=arn, detail=detail)
 
@@ -142,6 +167,29 @@ def _entry(name: str, region: str = "us-east-1", account: str = "") -> dict:
     return {"name": name, "region": region, "account": account, "verified_at": "", "note": ""}
 
 
+def _snapshot_of(
+    registry: dict,
+    identities: dict[str, aws_consent.Identity],
+    kind: str = accounts_mod.KIND_SSO,
+) -> dict:
+    """Build a real account snapshot from a registry plus canned probe results.
+
+    Goes through ``list_accounts`` rather than hand-writing the payload so the
+    grouping, the default marking and the recorded-account fallback under test
+    are the module's own, not the fixture's.
+    """
+
+    async def probe(profile: str, region: str, **_kw) -> aws_consent.Identity:
+        return identities[profile]
+
+    with (
+        mock.patch.object(accounts_mod.deploy_profiles, "load_registry", return_value=registry),
+        mock.patch.object(accounts_mod.aws_consent, "probe_identity", side_effect=probe),
+        mock.patch.object(accounts_mod, "classify_profile", AsyncMock(return_value=kind)),
+    ):
+        return asyncio.run(accounts_mod.list_accounts(refresh=True))
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
@@ -149,17 +197,7 @@ def _entry(name: str, region: str = "us-east-1", account: str = "") -> dict:
 
 class TestAggregation:
     def _snapshot(self, registry: dict, identities: dict[str, aws_consent.Identity]) -> dict:
-        async def probe(profile: str, region: str, **_kw) -> aws_consent.Identity:
-            return identities[profile]
-
-        with (
-            mock.patch.object(accounts_mod.deploy_profiles, "load_registry", return_value=registry),
-            mock.patch.object(accounts_mod.aws_consent, "probe_identity", side_effect=probe),
-            mock.patch.object(
-                accounts_mod, "classify_profile", AsyncMock(return_value=accounts_mod.KIND_SSO)
-            ),
-        ):
-            return asyncio.run(accounts_mod.list_accounts(refresh=True))
+        return _snapshot_of(registry, identities)
 
     def test_profiles_group_by_resolved_account(self):
         snap = self._snapshot(
@@ -408,17 +446,6 @@ class TestConsentExtension:
         assert aws_consent.SERVICE_POLLY in aws_consent.GATED_SERVICES
         assert aws_consent.SERVICE_TRANSCRIBE in aws_consent.GATED_SERVICES
 
-    def test_effective_target_resolves_deploy_registry_default(self):
-        from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
-        from kiro_crew.deploy import profiles as deploy_profiles
-
-        with mock.patch.object(
-            deploy_profiles, "resolve_profile", return_value=("acct-key", "eu-west-1")
-        ):
-            for service in (aws_consent.SERVICE_S3, aws_consent.SERVICE_COST_EXPLORER):
-                target = asyncio.run(consent_handlers._effective_target(service))
-                assert target == ("acct-key", "eu-west-1")
-
     def test_effective_target_names_the_default_chain_when_registry_is_empty(self):
         from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
         from kiro_crew.deploy import profiles as deploy_profiles
@@ -428,6 +455,264 @@ class TestConsentExtension:
         # Empty profile = the CLI default chain, which the card labels
         # explicitly (credential_source names it); the region still defaults.
         assert target == ("", deploy_profiles.DEFAULT_REGION)
+
+
+class TestConsentTargetTracksTheOperation:
+    """The card must bind to the key the operation would actually run under.
+
+    One policy, three readers: the consent card, the HTTP routes and the nightly
+    backup loop all take a HEALTHY key of the account the registry default names.
+    A second, unfiltered resolution is what these cases guard against — an
+    unhealthy default binds the card to a key with no resolvable account,
+    ``Confirm and enable`` refuses without one, and an account whose healthy
+    sibling key serves every operation then cannot be granted consent at all. The
+    same read in the nightly loop turns that into a silent forever-skip.
+    """
+
+    #: One account, two keys: the registry default is broken, its sibling works.
+    #: This is the shape that deadlocks when health filtering is skipped.
+    ACCOUNT = "111122223333"
+
+    def _broken_default_snapshot(self) -> dict:
+        return _snapshot_of(
+            _registry(
+                [
+                    _entry("broken", region="us-east-1", account=self.ACCOUNT),
+                    _entry("good", region="eu-west-1"),
+                ],
+                default="broken",
+            ),
+            {
+                "broken": _identity(False, detail="ExpiredToken: the security token expired"),
+                "good": _identity(True, account=self.ACCOUNT, arn="arn:good"),
+            },
+        )
+
+    def test_a_broken_default_does_not_hide_the_accounts_healthy_key(self):
+        from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
+
+        snapshot = self._broken_default_snapshot()
+        with mock.patch.object(accounts_mod, "list_accounts", AsyncMock(return_value=snapshot)):
+            target = asyncio.run(consent_handlers._effective_target(aws_consent.SERVICE_S3))
+        assert target == ("good", "eu-west-1")
+
+    def test_the_card_and_the_operation_resolve_the_same_key(self):
+        """The invariant, asserted as an equality rather than a literal.
+
+        A change to the resolution policy has to move both sides or fail here —
+        the drift this class exists to catch.
+        """
+        from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
+
+        snapshot = self._broken_default_snapshot()
+        with mock.patch.object(accounts_mod, "list_accounts", AsyncMock(return_value=snapshot)):
+            operation = asyncio.run(accounts_mod.resolve_account_profile(self.ACCOUNT))
+            for service in (aws_consent.SERVICE_S3, aws_consent.SERVICE_COST_EXPLORER):
+                card = asyncio.run(consent_handlers._effective_target(service))
+                assert card == operation
+
+    def test_a_healthy_default_still_wins_over_its_siblings(self):
+        from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
+
+        snapshot = _snapshot_of(
+            _registry([_entry("first"), _entry("chosen", region="ap-south-1")], default="chosen"),
+            {
+                "first": _identity(True, account=self.ACCOUNT),
+                "chosen": _identity(True, account=self.ACCOUNT),
+            },
+        )
+        with mock.patch.object(accounts_mod, "list_accounts", AsyncMock(return_value=snapshot)):
+            target = asyncio.run(consent_handlers._effective_target(aws_consent.SERVICE_S3))
+        assert target == ("chosen", "ap-south-1")
+
+    def test_another_accounts_healthy_key_is_never_substituted(self):
+        """Health filtering must not walk out of the account the default names.
+
+        Picking any healthy key in the registry would let the card offer a
+        confirmation for someone else's account — a wrong bill, not a dead end.
+        """
+        from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
+        from kiro_crew.deploy import profiles as deploy_profiles
+
+        snapshot = _snapshot_of(
+            _registry(
+                [_entry("broken", account=self.ACCOUNT), _entry("elsewhere")], default="broken"
+            ),
+            {
+                "broken": _identity(False, detail="ExpiredToken"),
+                "elsewhere": _identity(True, account="444455556666"),
+            },
+        )
+        with (
+            mock.patch.object(accounts_mod, "list_accounts", AsyncMock(return_value=snapshot)),
+            mock.patch.object(
+                deploy_profiles, "resolve_profile", return_value=("broken", "us-east-1")
+            ),
+        ):
+            target = asyncio.run(consent_handlers._effective_target(aws_consent.SERVICE_S3))
+        assert target == ("broken", "us-east-1")
+
+    def test_nothing_healthy_still_names_the_default_so_the_card_can_explain(self):
+        """The fallback still names a key, so the card can render its error.
+
+        With no working key there is no operation to agree with, so the honest
+        surface is the default's own STS error — that is what tells the reader
+        the account has to be reconnected.
+        """
+        from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
+        from kiro_crew.deploy import profiles as deploy_profiles
+
+        snapshot = _snapshot_of(
+            _registry([_entry("broken", account=self.ACCOUNT)], default="broken"),
+            {"broken": _identity(False, detail="ExpiredToken")},
+        )
+        with (
+            mock.patch.object(accounts_mod, "list_accounts", AsyncMock(return_value=snapshot)),
+            mock.patch.object(
+                deploy_profiles, "resolve_profile", return_value=("broken", "us-east-1")
+            ),
+        ):
+            for service in (aws_consent.SERVICE_S3, aws_consent.SERVICE_COST_EXPLORER):
+                target = asyncio.run(consent_handlers._effective_target(service))
+                assert target == ("broken", "us-east-1")
+
+    def test_a_default_that_resolves_to_no_account_falls_back_too(self):
+        """A default in the unresolved pseudo-row names no account to filter within."""
+        from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
+        from kiro_crew.deploy import profiles as deploy_profiles
+
+        snapshot = _snapshot_of(
+            _registry([_entry("mystery"), _entry("good")], default="mystery"),
+            {
+                "mystery": _identity(False, detail="no credentials"),
+                "good": _identity(True, account=self.ACCOUNT),
+            },
+        )
+        with (
+            mock.patch.object(accounts_mod, "list_accounts", AsyncMock(return_value=snapshot)),
+            mock.patch.object(
+                deploy_profiles, "resolve_profile", return_value=("mystery", "us-east-1")
+            ),
+        ):
+            target = asyncio.run(consent_handlers._effective_target(aws_consent.SERVICE_S3))
+        assert target == ("mystery", "us-east-1")
+
+    def test_the_fallback_scrubs_a_credential_shaped_profile_name(self):
+        """The registry is agent-writable, and its charset is an access key's shape.
+
+        The snapshot path is scrubbed as it is built; the fallback reads the
+        registry directly, so it has to be scrubbed on the same side of the
+        return or a profile named after a secret reaches the card's JSON verbatim.
+        """
+        from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
+        from kiro_crew.deploy import profiles as deploy_profiles
+
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        snapshot = _snapshot_of(
+            _registry([_entry(secret, account=self.ACCOUNT)], default=secret),
+            {secret: _identity(False, detail="ExpiredToken")},
+        )
+        with (
+            mock.patch.object(accounts_mod, "list_accounts", AsyncMock(return_value=snapshot)),
+            mock.patch.object(
+                deploy_profiles, "resolve_profile", return_value=(secret, "us-east-1")
+            ),
+        ):
+            profile, region = asyncio.run(
+                consent_handlers._effective_target(aws_consent.SERVICE_S3)
+            )
+        assert secret not in profile
+        assert profile == "[REDACTED: credential]"
+        assert region == "us-east-1"
+
+    def test_a_failed_probe_sweep_degrades_instead_of_failing_the_surface(self):
+        """The sweep spawns the AWS CLI; it must not be able to 500 the card.
+
+        The degraded answer is the provider default chain, whose two values are
+        module constants — with the resolver unreachable there is no scrubbed
+        registry read to fall back on, and an unscrubbed one must not take its
+        place.
+        """
+        from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
+        from kiro_crew.deploy import profiles as deploy_profiles
+
+        with mock.patch.object(
+            accounts_mod,
+            "resolve_consent_target",
+            AsyncMock(side_effect=RuntimeError("no sandbox")),
+        ):
+            target = asyncio.run(consent_handlers._effective_target(aws_consent.SERVICE_S3))
+        assert target == ("", deploy_profiles.DEFAULT_REGION)
+
+    def test_the_nightly_loop_runs_under_the_key_the_grant_names(self):
+        """The unattended path is the one nobody watches fail.
+
+        The loop's consent check compares the grant against the key it is about
+        to use, so a loop resolving the raw default while the grant names the
+        account's healthy sibling skips on every wake, forever, with only a log
+        line to say so.
+        """
+        from kiro_crew.apps.builtins.aws_control import hooks
+
+        snapshot = self._broken_default_snapshot()
+        gated: list[tuple[str, str]] = []
+
+        async def refuse_and_log(service: str, *, profile: str, region: str) -> bool:
+            gated.append((profile, region))
+            return False  # stop before any AWS work; the argv is what is pinned
+
+        with (
+            mock.patch.object(accounts_mod, "list_accounts", AsyncMock(return_value=snapshot)),
+            mock.patch.object(
+                hooks.aws_consent,
+                "probe_identity",
+                AsyncMock(return_value=aws_consent.Identity(ok=True, account=self.ACCOUNT)),
+            ),
+            mock.patch.object(hooks.backup_mod, "due_for_nightly", return_value=True),
+            mock.patch.object(hooks.aws_consent, "refuse_and_log", refuse_and_log),
+        ):
+            asyncio.run(hooks._run_once())
+            operation = asyncio.run(accounts_mod.resolve_account_profile(self.ACCOUNT))
+
+        assert gated == [("good", "eu-west-1")]
+        assert gated[0] == operation
+
+    def test_the_nightly_loop_skips_when_no_key_is_healthy(self):
+        from kiro_crew.apps.builtins.aws_control import hooks
+
+        snapshot = _snapshot_of(
+            _registry([_entry("broken", account=self.ACCOUNT)], default="broken"),
+            {"broken": _identity(False, detail="ExpiredToken")},
+        )
+        with (
+            mock.patch.object(accounts_mod, "list_accounts", AsyncMock(return_value=snapshot)),
+            mock.patch.object(hooks.aws_consent, "probe_identity") as probe,
+            mock.patch.object(hooks.backup_mod, "due_for_nightly") as due,
+            mock.patch.object(hooks, "_audit") as audit,
+        ):
+            asyncio.run(hooks._run_once())
+        # No probe, no due-check, no consent check, no audit: there is no key to
+        # run under, so the loop stops before it can name one.
+        probe.assert_not_called()
+        due.assert_not_called()
+        audit.assert_not_called()
+
+    def test_the_voice_services_do_not_touch_the_account_snapshot(self):
+        """Polly and Transcribe read their own config; only s3/ce use the registry."""
+        from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
+        from kiro_crew.slack.handler import _vc
+
+        swept = AsyncMock(side_effect=AssertionError("voice must not sweep the registry"))
+        with (
+            mock.patch.object(accounts_mod, "list_accounts", swept),
+            mock.patch.object(_vc, "aws_profile", "voice"),
+            mock.patch.object(_vc, "region", "eu-west-1"),
+        ):
+            assert asyncio.run(consent_handlers._effective_target("polly")) == (
+                "voice",
+                "eu-west-1",
+            )
+        swept.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +987,7 @@ class TestDriveGuards:
             mock.patch.object(
                 routes_mod.storage_mod, "find_drive", return_value="kirocrew-drive-abc"
             ),
-            mock.patch.object(routes_mod.storage_mod, "object_exists", return_value=True),
+            mock.patch.object(routes_mod.storage_mod, "head_object_meta", return_value={}),
             mock.patch.object(
                 routes_mod.storage_mod, "presign", return_value="https://signed"
             ) as presign,
@@ -810,13 +1095,116 @@ class TestShares:
         shares.record_share(account=ACCOUNT, section="drive", key="first.txt", expires_secs=3600)
         assert [e["key"] for e in shares.list_shares(ACCOUNT)] == ["first.txt"]
 
-    def test_a_corrupt_share_store_still_repairs_on_write(self, tmp_path):
-        # Existing tolerance, pinned alongside the new guard.
+    def test_a_corrupt_share_store_refuses_the_mutation_and_is_left_intact(self, tmp_path):
+        # A corrupt ledger is refused, never rewritten. The old tolerance
+        # read it as empty and let the whole-file rewrite destroy records a
+        # truncated JSON still held verbatim -- and this ledger is the only local
+        # record of live presigned URLs, which are unrevokable bearer grants.
+        import json as _json
+
         from kiro_crew.apps.builtins.aws_control.backend import shares
 
-        (tmp_path / "shares.json").write_text("[not json", encoding="utf-8")
-        shares.record_share(account=ACCOUNT, section="drive", key="after.txt", expires_secs=3600)
-        assert [e["key"] for e in shares.list_shares(ACCOUNT)] == ["after.txt"]
+        corrupt = '[{"id": "recoverable-share", "key": "live.txt"}'  # truncated
+        (tmp_path / "shares.json").write_text(corrupt, encoding="utf-8")
+        with pytest.raises(_json.JSONDecodeError):
+            shares.record_share(
+                account=ACCOUNT, section="drive", key="after.txt", expires_secs=3600
+            )
+        with pytest.raises(_json.JSONDecodeError):
+            shares.forget_share("recoverable-share")
+        assert (tmp_path / "shares.json").read_text(
+            encoding="utf-8"
+        ) == corrupt, "a mutation rewrote a corrupt share ledger instead of refusing"
+        # The display read stays lenient: the Access section renders (empty)
+        # rather than failing on a file only a person can repair.
+        assert shares.list_shares(ACCOUNT) == []
+
+    def test_a_share_store_that_is_not_utf8_takes_the_corruption_path(self, tmp_path):
+        # UnicodeDecodeError is a ValueError but NOT a JSONDecodeError; unwrapped
+        # it would slip past every corruption clause at the callers.
+        import json as _json
+
+        from kiro_crew.apps.builtins.aws_control.backend import shares
+
+        (tmp_path / "shares.json").write_bytes(b"\xff\xfe not utf8")
+        with pytest.raises(_json.JSONDecodeError):
+            shares.record_share(account=ACCOUNT, section="drive", key="x.txt", expires_secs=3600)
+        assert (tmp_path / "shares.json").read_bytes() == b"\xff\xfe not utf8"
+        # And the DISPLAY read tolerates the same bytes (a
+        # UnicodeDecodeError escaped it): the Access section renders
+        # empty rather than failing on a file only a person can repair.
+        assert shares.list_shares(ACCOUNT) == []
+
+    def test_a_share_store_that_parses_to_a_non_array_refuses_the_mutation(self, tmp_path):
+        # Valid JSON with the wrong root parses without raising, so coercing it
+        # to [] would let the rewrite destroy a document nobody could read.
+        import json as _json
+
+        from kiro_crew.apps.builtins.aws_control.backend import shares
+
+        (tmp_path / "shares.json").write_text('{"not": "a list"}', encoding="utf-8")
+        with pytest.raises(_json.JSONDecodeError):
+            shares.record_share(account=ACCOUNT, section="drive", key="x.txt", expires_secs=3600)
+        assert (tmp_path / "shares.json").read_text(encoding="utf-8") == '{"not": "a list"}'
+
+    def test_damaged_rows_refuse_the_mutation_instead_of_being_pruned_away(self, tmp_path):
+        # The loss arrives one call later than the parse: both mutations pipe
+        # the ledger through _prune, whose damage path silently DROPS any row
+        # it cannot read an expiresAt from, and the whole-file rewrite takes
+        # those rows with it. Measured in review (Opus): a valid-JSON ledger
+        # holding one non-object row, one row with no expiry, and one with a
+        # mangled expiry lost all three to a single record_share. Every damaged
+        # shape must refuse; the deliberate expiry drop stays retention.
+        import json as _json
+
+        from kiro_crew.apps.builtins.aws_control.backend import shares
+
+        for damaged in (
+            "a-damaged-row-that-is-not-an-object",
+            {"id": "no-expiry", "key": "secret-report.pdf", "account": "111"},
+            {"id": "bad-expiry", "key": "b.pdf", "expiresAt": "NOT-A-DATE"},
+        ):
+            doc = _json.dumps(
+                [damaged, {"id": "healthy", "key": "c.pdf", "expiresAt": "2999-01-01T00:00:00"}]
+            )
+            (tmp_path / "shares.json").write_text(doc, encoding="utf-8")
+            with pytest.raises(_json.JSONDecodeError):
+                shares.record_share(
+                    account=ACCOUNT, section="drive", key="new.txt", expires_secs=3600
+                )
+            with pytest.raises(_json.JSONDecodeError):
+                shares.forget_share("healthy")
+            assert (tmp_path / "shares.json").read_text(encoding="utf-8") == doc, damaged
+
+    def test_the_damaged_row_refusal_names_no_entry_content(self, tmp_path):
+        # The refusal names the row's index and nothing else: a share note or
+        # key from a hand-edited ledger must not ride on an exception that
+        # crosses into responses and logs.
+        import json as _json
+
+        from kiro_crew.apps.builtins.aws_control.backend import shares
+
+        (tmp_path / "shares.json").write_text(
+            _json.dumps([{"id": "x", "key": "leakable-object-key.pdf"}]), encoding="utf-8"
+        )
+        with pytest.raises(_json.JSONDecodeError) as excinfo:
+            shares.record_share(account=ACCOUNT, section="drive", key="n.txt", expires_secs=3600)
+        assert "leakable-object-key.pdf" not in str(excinfo.value)
+        assert "leakable-object-key.pdf" not in excinfo.value.doc
+
+    def test_an_expired_row_is_still_retention_not_damage(self, tmp_path):
+        # The keep/expire decision must survive the strict per-row check: a
+        # parseable stamp in the past is the deliberate drop, not a refusal.
+        import json as _json
+
+        from kiro_crew.apps.builtins.aws_control.backend import shares
+
+        (tmp_path / "shares.json").write_text(
+            _json.dumps([{"id": "dead", "key": "old.txt", "expiresAt": "2000-01-01T00:00:00"}]),
+            encoding="utf-8",
+        )
+        shares.record_share(account=ACCOUNT, section="drive", key="new.txt", expires_secs=3600)
+        assert [e["key"] for e in shares.list_shares(ACCOUNT)] == ["new.txt"]
 
     def test_expired_shares_are_pruned_and_forget_removes(self):
         from kiro_crew.apps.builtins.aws_control.backend import shares
@@ -1061,7 +1449,7 @@ class TestDriveIamTier:
                 "DriveObject"
             ):
                 for arn in statement["Resource"]:
-                    # Partition-neutral (round 21): the scoping that matters is
+                    # Partition-neutral: the scoping that matters is
                     # the bucket-name pattern, not the commercial partition.
                     assert arn.startswith("arn:*:s3:::kirocrew-drive-"), arn
         # Round-14 pin: the recommended tier can WRITE backups but never read
@@ -1471,7 +1859,7 @@ class TestRound16Hardening:
             mock.patch.object(
                 routes_mod.storage_mod, "find_drive", return_value="kirocrew-drive-abc"
             ),
-            mock.patch.object(routes_mod.storage_mod, "object_exists", return_value=True),
+            mock.patch.object(routes_mod.storage_mod, "head_object_meta", return_value={}),
             mock.patch.object(routes_mod.storage_mod, "presign", return_value="https://signed"),
             mock.patch.object(routes_mod, "_audit") as audit,
         ):
@@ -1533,13 +1921,24 @@ class TestRound17Hardening:
         staging.mkdir(parents=True)
         target = tmp_path / "victim.txt"
         target.write_text("original", encoding="utf-8")
-        (staging / "a.tar.gz").symlink_to(target)
+        # Named the way the code names it -- the staging filename is derived from the
+        # whole key, so the guard is only exercised if the decoy sits where the
+        # download would actually land.
+        (staging / backup._staging_name("snapshots/a.tar.gz")).symlink_to(target)
 
         monkeypatch.setattr(backup, "app_data_dir", lambda name: tmp_path)
         with mock.patch.object(backup.storage, "get_file") as get_file:
             with pytest.raises(ValueError):
                 backup.restore_download(
-                    "p", "us-west-2", "b", "snapshots/a.tar.gz", account="111122223333"
+                    "p",
+                    "us-west-2",
+                    "b",
+                    "snapshots/a.tar.gz",
+                    account="111122223333",
+                    # Flat legacy-shaped key: the gate refuses anything it cannot prove is
+                    # this install's own, and this test is about the staging path, not
+                    # ownership, so it states the override.
+                    foreign_ok=True,
                 )
         get_file.assert_not_called()
         assert target.read_text(encoding="utf-8") == "original"
@@ -1558,16 +1957,77 @@ class TestRound17Hardening:
 
         with mock.patch.object(backup.storage, "get_file", side_effect=fake_get):
             out = backup.restore_download(
-                "p", "us-west-2", "b", "snapshots/a.tar.gz", account="111122223333"
+                "p",
+                "us-west-2",
+                "b",
+                "snapshots/a.tar.gz",
+                account="111122223333",
+                # Flat legacy-shaped key: the gate refuses anything it cannot prove is
+                # this install's own, and this test is about the staging path, not
+                # ownership, so it states the override.
+                foreign_ok=True,
             )
 
-        final = tmp_path / "restore" / "a.tar.gz"
+        final = tmp_path / "restore" / backup._staging_name("snapshots/a.tar.gz")
         assert out["path"] == str(final)
         assert final.read_text(encoding="utf-8") == "payload"
+        # Not the bare basename: two installs can name an archive the same, and the
+        # staged copies must not land on one file.
+        assert final.name != "a.tar.gz" and final.name.endswith("-a.tar.gz")
         # The download target was NOT the final name.
         assert seen and seen[0] != str(final)
         # No temp residue.
-        assert [p.name for p in (tmp_path / "restore").iterdir()] == ["a.tar.gz"]
+        assert [p.name for p in (tmp_path / "restore").iterdir()] == [final.name]
+
+    def test_the_staged_name_stays_within_the_filesystem_limit(self):
+        """A near-max key segment must still produce a file, not ENAMETOOLONG.
+
+        The prefix is added to a basename the route's validator already allows up to
+        255 characters, so an unbounded name overruns NAME_MAX and the restore fails
+        with an OSError instead of staging anything. Only a co-tenant or the console
+        can place such a name: this app's own writer produces short fixed ones.
+        """
+        from kiro_crew.apps.builtins.aws_control.backend import backup
+
+        longest = "x" * 255
+        name = backup._staging_name(f"snapshots/{'a' * 32}/{longest}")
+        assert len(name.encode("utf-8")) <= backup.STAGING_NAME_MAX_BYTES
+        # Truncation must not undo the collision fix: the digest covers the whole key.
+        other = backup._staging_name(f"snapshots/{'b' * 32}/{longest}")
+        assert name != other
+        assert len(other.encode("utf-8")) <= backup.STAGING_NAME_MAX_BYTES
+
+    def test_same_named_archives_from_two_installs_stage_side_by_side(self, tmp_path, monkeypatch):
+        """Namespacing creates this collision, so the staging name has to resolve it.
+
+        Two installs each write ``kirocrew-snapshot-X.tar.gz`` under their own
+        prefix. Restoring both must leave two files: a basename-only destination
+        would have the second silently replace the first.
+        """
+        from pathlib import Path
+
+        from kiro_crew.apps.builtins.aws_control.backend import backup
+
+        monkeypatch.setattr(backup, "app_data_dir", lambda name: tmp_path)
+        keys = [f"snapshots/{'a' * 32}/same.tar.gz", f"snapshots/{'b' * 32}/same.tar.gz"]
+
+        def fake_get(profile, region, bucket, section, key, dest, *, account=None):
+            Path(dest).write_text(key, encoding="utf-8")
+
+        with mock.patch.object(backup.storage, "get_file", side_effect=fake_get):
+            paths = [
+                backup.restore_download(
+                    "p", "us-west-2", "b", k, account="111122223333", foreign_ok=True
+                )["path"]
+                for k in keys
+            ]
+
+        assert len(set(paths)) == 2
+        staged = sorted(p.name for p in (tmp_path / "restore").iterdir())
+        assert len(staged) == 2, staged
+        # Each file still holds the archive it was downloaded for.
+        for key, path in zip(keys, paths):
+            assert Path(path).read_text(encoding="utf-8") == key
 
     def test_every_string_display_field_is_redacted(self):
         planted = "AKIAIOSFODNN7EXAMPLE"
@@ -1622,7 +2082,15 @@ class TestRound18Hardening:
         with mock.patch.object(backup.storage, "get_file") as get_file:
             with pytest.raises(ValueError):
                 backup.restore_download(
-                    "p", "us-west-2", "b", "snapshots/a.tar.gz", account="111122223333"
+                    "p",
+                    "us-west-2",
+                    "b",
+                    "snapshots/a.tar.gz",
+                    account="111122223333",
+                    # Flat legacy-shaped key: the gate refuses anything it cannot prove is
+                    # this install's own, and this test is about the staging path, not
+                    # ownership, so it states the override.
+                    foreign_ok=True,
                 )
         get_file.assert_not_called()
         # Nothing was written through the link.
@@ -1717,7 +2185,7 @@ class TestRound19Hardening:
             mock.patch.object(
                 routes_mod.storage_mod, "find_drive", return_value="kirocrew-drive-abc"
             ),
-            mock.patch.object(routes_mod.storage_mod, "object_exists", return_value=False),
+            mock.patch.object(routes_mod.storage_mod, "head_object_meta", return_value=None),
             mock.patch.object(routes_mod.storage_mod, "presign") as presign,
         ):
             req = _request(
@@ -1833,7 +2301,9 @@ class TestRound22Hardening:
 
         with (
             mock.patch.object(
-                hooks.deploy_profiles, "resolve_profile", return_value=("p", "us-west-2")
+                hooks.accounts_mod,
+                "resolve_default_account_profile",
+                AsyncMock(return_value=("p", "us-west-2")),
             ),
             mock.patch.object(
                 hooks.aws_consent,
@@ -1862,7 +2332,9 @@ class TestRound22Hardening:
 
         with (
             mock.patch.object(
-                hooks.deploy_profiles, "resolve_profile", return_value=("p", "us-west-2")
+                hooks.accounts_mod,
+                "resolve_default_account_profile",
+                AsyncMock(return_value=("p", "us-west-2")),
             ),
             mock.patch.object(
                 hooks.aws_consent,
@@ -1920,7 +2392,15 @@ class TestRound23Junctions:
         ):
             with pytest.raises(ValueError):
                 backup.restore_download(
-                    "p", "us-west-2", "b", "snapshots/a.tar.gz", account="111122223333"
+                    "p",
+                    "us-west-2",
+                    "b",
+                    "snapshots/a.tar.gz",
+                    account="111122223333",
+                    # Flat legacy-shaped key: the gate refuses anything it cannot prove is
+                    # this install's own, and this test is about the staging path, not
+                    # ownership, so it states the override.
+                    foreign_ok=True,
                 )
         get_file.assert_not_called()
 
@@ -2293,6 +2773,287 @@ class TestProfileDiscovery:
         assert _payload(resp) == {"added": 0, "skipped": 1}
         assert len(reg["profiles"]) == routes_mod._MAX_REGISTERED
 
+    def test_available_reports_a_failed_scan_rather_than_an_empty_list(self):
+        # A 200 carrying no profiles is the page's authoritative "none left to
+        # add", so a scan that could not run must not borrow it -- on AWS CLI v1
+        # that would report every configured profile as absent.
+        handlers = _registered()
+        p1, p2 = self._env()
+        with (
+            p1,
+            p2,
+            mock.patch.object(routes_mod.os, "name", "posix"),
+            mock.patch.object(
+                routes_mod.deploy_profiles, "discover_aws_profiles", return_value=None
+            ),
+            mock.patch.object(routes_mod.deploy_profiles, "load_registry") as registry,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/profiles/available")](  # type: ignore[operator]
+                    _request("GET", "/profiles/available")
+                )
+            )
+        assert resp.status == 503
+        assert _payload(resp)["code"] == "profiles_unavailable"
+        # Nothing was read either: the answer does not depend on the registry.
+        registry.assert_not_called()
+
+    def test_available_on_windows_keeps_the_platform_answer(self):
+        # Windows cannot enumerate profiles at all, and the page has copy naming
+        # WSL for exactly that. It stays a 200 so the operator reads the remedy
+        # instead of a retryable failure they cannot clear by retrying.
+        handlers = _registered()
+        p1, p2 = self._env()
+        with (
+            p1,
+            p2,
+            mock.patch.object(routes_mod.os, "name", "nt"),
+            mock.patch.object(
+                routes_mod.deploy_profiles, "discover_aws_profiles", return_value=None
+            ),
+            mock.patch.object(
+                routes_mod.deploy_profiles,
+                "load_registry",
+                return_value={"version": 2, "profiles": [], "default": ""},
+            ),
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/profiles/available")](  # type: ignore[operator]
+                    _request("GET", "/profiles/available")
+                )
+            )
+        assert resp.status == 200
+        body = _payload(resp)
+        assert body["supported"] is False
+        assert body["profiles"] == []
+
+    def test_register_refuses_the_batch_when_the_scan_could_not_run(self):
+        # The refusal an operator cannot act on is "not profiles on this
+        # machine", when the profiles are there and only the listing failed.
+        handlers = _registered()
+        p1, p2 = self._env()
+        with (
+            p1,
+            p2,
+            mock.patch.object(routes_mod.os, "name", "posix"),
+            mock.patch.object(
+                routes_mod.deploy_profiles, "discover_aws_profiles", return_value=None
+            ),
+            mock.patch.object(routes_mod.deploy_profiles, "locked_registry") as locked,
+            mock.patch.object(routes_mod.accounts_mod, "invalidate_cache") as invalidated,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/profiles/register")](  # type: ignore[operator]
+                    self._post({"names": ["real"]})
+                )
+            )
+        assert resp.status == 503
+        payload = _payload(resp)
+        assert payload["code"] == "profiles_unavailable"
+        assert "not profiles on this machine" not in payload["error"]
+        locked.assert_not_called()
+        invalidated.assert_not_called()
+
+    def test_register_does_not_ask_windows_to_retry(self):
+        # 503 means "try again", which clears a failed scan and never clears a
+        # platform that cannot scan. Windows gets the answer that stays true.
+        handlers = _registered()
+        p1, p2 = self._env()
+        with (
+            p1,
+            p2,
+            mock.patch.object(routes_mod.os, "name", "nt"),
+            mock.patch.object(
+                routes_mod.deploy_profiles, "discover_aws_profiles", return_value=None
+            ),
+            mock.patch.object(routes_mod.deploy_profiles, "locked_registry") as locked,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/profiles/register")](  # type: ignore[operator]
+                    self._post({"names": ["real"]})
+                )
+            )
+        assert resp.status == 501
+        assert _payload(resp)["code"] == "unsupported_platform"
+        locked.assert_not_called()
+
+
+class TestProfileUnregister:
+    """Removing a key is registry-only: it must never reach ``~/.aws`` or AWS,
+    and it must withdraw the consent grants that named the removed key."""
+
+    def _env(self):
+        return (
+            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(routes_mod, "is_owner_dashboard_request", return_value=True),
+        )
+
+    def _post(self, body):
+        req = _request("POST", "/profiles/unregister")
+        req.json = AsyncMock(return_value=body)  # type: ignore[method-assign]
+        return req
+
+    def _run(self, reg, body, *, grants=None, revoke_raises=None):
+        """Drive the handler over an in-memory registry.
+
+        ``grants`` maps a profile name to the services whose grant names it, which
+        is what the (mocked) ``revoke_for_profile`` sweep answers. Returns
+        ``(response, revoke_mock, invalidated_mock, credential_writers)``;
+        ``credential_writers`` are the two mocks that must stay uncalled for the
+        route to be registry-only.
+        """
+        handlers = _registered()
+        grants = grants or {}
+        trace: list[str] = []
+
+        @contextlib.contextmanager
+        def _fake_locked():
+            trace.append("registry")
+            yield reg
+
+        def _fake_revoke(profile: str) -> list[str]:
+            trace.append(f"revoke:{profile}")
+            if revoke_raises is not None:
+                raise revoke_raises
+            return sorted(grants.get(profile, []))
+
+        p1, p2 = self._env()
+        with (
+            p1,
+            p2,
+            mock.patch.object(routes_mod.deploy_profiles, "load_registry", return_value=reg),
+            mock.patch.object(routes_mod.deploy_profiles, "locked_registry", _fake_locked),
+            mock.patch.object(routes_mod.deploy_profiles, "create_aws_profile") as configure,
+            mock.patch.object(routes_mod.deploy_profiles, "discover_aws_profiles") as discover,
+            mock.patch.object(
+                routes_mod.aws_consent, "revoke_for_profile", side_effect=_fake_revoke
+            ) as revoke,
+            mock.patch.object(routes_mod.accounts_mod, "invalidate_cache") as invalidated,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/profiles/unregister")](self._post(body))  # type: ignore[operator]
+            )
+        revoke.trace = trace  # type: ignore[attr-defined]
+        return resp, revoke, invalidated, (configure, discover)
+
+    @pytest.mark.parametrize("body", [{}, {"names": []}, {"names": "alpha"}])
+    def test_rejects_an_empty_or_non_list_body(self, body):
+        reg = {"version": 2, "profiles": [{"name": "alpha"}], "default": "alpha"}
+        resp, _revoke, invalidated, _ = self._run(reg, body)
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_names"
+        assert [p["name"] for p in reg["profiles"]] == ["alpha"]
+        invalidated.assert_not_called()
+
+    def test_rejects_a_name_that_fails_the_shared_pattern(self):
+        reg = {"version": 2, "profiles": [{"name": "alpha"}], "default": "alpha"}
+        resp, _revoke, invalidated, _ = self._run(reg, {"names": ["bad name; rm -rf ~"]})
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_names"
+        assert [p["name"] for p in reg["profiles"]] == ["alpha"]
+        invalidated.assert_not_called()
+
+    def test_all_unknown_names_answer_404_and_change_nothing(self):
+        reg = {"version": 2, "profiles": [{"name": "alpha"}], "default": "alpha"}
+        resp, revoke, invalidated, _ = self._run(reg, {"names": ["ghost"]})
+        assert resp.status == 404
+        assert _payload(resp)["code"] == "unknown_profile"
+        assert [p["name"] for p in reg["profiles"]] == ["alpha"]
+        revoke.assert_not_called()
+        invalidated.assert_not_called()
+
+    def test_removes_the_entry_repicks_the_default_and_skips_absent_names(self):
+        reg = {
+            "version": 2,
+            "profiles": [{"name": "alpha"}, {"name": "beta"}, {"name": "gamma"}],
+            "default": "alpha",
+        }
+        resp, _revoke, invalidated, _ = self._run(reg, {"names": ["alpha", "ghost"]})
+        assert resp.status == 200
+        assert _payload(resp) == {"removed": 1, "skipped": 1, "consentWithdrawn": []}
+        assert [p["name"] for p in reg["profiles"]] == ["beta", "gamma"]
+        # The default must keep naming a registered profile: the nightly
+        # backup and the deploy engine both resolve through it.
+        assert reg["default"] == "beta"
+        invalidated.assert_called_once()
+
+    def test_removing_the_last_profile_empties_the_default(self):
+        reg = {"version": 2, "profiles": [{"name": "alpha"}], "default": "alpha"}
+        resp, *_ = self._run(reg, {"names": ["alpha"]})
+        assert resp.status == 200
+        assert reg["profiles"] == []
+        assert reg["default"] == ""
+
+    def test_a_default_that_survives_is_left_alone(self):
+        reg = {"version": 2, "profiles": [{"name": "alpha"}, {"name": "beta"}], "default": "beta"}
+        self._run(reg, {"names": ["alpha"]})
+        assert reg["default"] == "beta"
+
+    def test_withdraws_the_removed_profiles_grants_before_touching_the_registry(self):
+        reg = {"version": 2, "profiles": [{"name": "alpha"}, {"name": "beta"}], "default": "beta"}
+        grants = {"alpha": ["s3"], "beta": ["ce"]}
+        resp, revoke, _inv, _ = self._run(reg, {"names": ["alpha", "ghost"]}, grants=grants)
+        assert _payload(resp)["consentWithdrawn"] == ["s3"]
+        # Only the registered name is swept -- never a caller-supplied one -- and
+        # the sweep runs BEFORE the registry write, so a request that dies between
+        # the two leaves a registered-but-unconsented profile, not the reverse.
+        revoke.assert_called_once_with("alpha")
+        assert revoke.trace == ["revoke:alpha", "registry"]  # type: ignore[attr-defined]
+        assert [p["name"] for p in reg["profiles"]] == ["beta"]
+
+    def test_a_failed_withdrawal_leaves_the_registry_untouched(self):
+        reg = {"version": 2, "profiles": [{"name": "alpha"}], "default": "alpha"}
+        resp, revoke, invalidated, _ = self._run(
+            reg, {"names": ["alpha"]}, revoke_raises=OSError("consent store unwritable")
+        )
+        assert resp.status == 500
+        assert _payload(resp)["code"] == "consent_unwritable"
+        assert revoke.trace == ["revoke:alpha"]  # type: ignore[attr-defined]
+        assert [p["name"] for p in reg["profiles"]] == ["alpha"]
+        invalidated.assert_not_called()
+
+    def test_never_reaches_a_credential_writer_or_the_aws_cli(self):
+        # Structural pin: the only ``aws configure`` writer and the profile
+        # discovery subprocess are both off this path, so ``~/.aws`` is
+        # untouched by construction rather than by a check.
+        reg = {"version": 2, "profiles": [{"name": "alpha"}], "default": "alpha"}
+        with mock.patch.object(routes_mod, "run_aws", create=True) as run_aws:
+            _resp, _revoke, _inv, (configure, discover) = self._run(reg, {"names": ["alpha"]})
+        configure.assert_not_called()
+        discover.assert_not_called()
+        run_aws.assert_not_called()
+
+    def test_success_is_audited_as_a_profiles_unregister_mutation(self):
+        handlers = _registered()
+        reg = {"version": 2, "profiles": [{"name": "alpha"}], "default": "alpha"}
+
+        @contextlib.contextmanager
+        def _fake_locked():
+            yield reg
+
+        p1, p2 = self._env()
+        with (
+            p1,
+            p2,
+            mock.patch.object(routes_mod.deploy_profiles, "load_registry", return_value=reg),
+            mock.patch.object(routes_mod.deploy_profiles, "locked_registry", _fake_locked),
+            mock.patch.object(routes_mod.aws_consent, "revoke_for_profile", return_value=[]),
+            mock.patch.object(routes_mod.accounts_mod, "invalidate_cache"),
+            mock.patch.object(routes_mod, "_audit") as audit,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/profiles/unregister")](  # type: ignore[operator]
+                    self._post({"names": ["alpha"]})
+                )
+            )
+        assert resp.status == 200
+        outcomes = [
+            (call.args[0], call.args[2])
+            for call in audit.call_args_list
+            if call.args[0] == "profiles_unregister"
+        ]
+        assert outcomes == [("profiles_unregister", "success")]
+
 
 class TestBootstrapReauthorizes:
     """Round-28 pin: the billable create re-checks authorization INSIDE the lock.
@@ -2332,6 +3093,7 @@ class TestBootstrapReauthorizes:
             mock.patch.object(routes_mod, "_consent", AsyncMock(return_value=None)),
             mock.patch.object(routes_mod, "_drive_bucket", AsyncMock(return_value="")),
             mock.patch.object(routes_mod.storage_mod, "create_drive") as create,
+            mock.patch.object(routes_mod, "_audit") as audit,
         ):
             resp = asyncio.run(
                 handlers[("POST", "/drive/{account}/bootstrap")](  # type: ignore[operator]
@@ -2341,6 +3103,117 @@ class TestBootstrapReauthorizes:
         assert resp.status == 409
         assert _payload(resp)["code"] == "account_mismatch"
         create.assert_not_called()
+        # The refusal is also a permission DECISION, so it reaches SEL from the
+        # point of decision: `_mutating` records that a response left with a 4xx,
+        # which does not say WHY the confirmed bucket was never created.
+        assert _denial(audit, "account_mismatch") == "drive_bootstrap"
+
+    def test_the_app_disabled_mid_create_refuses_and_creates_nothing(self):
+        # `_guarded` checks the app BEFORE the lock, and the wait for the lock is
+        # unbounded -- so a queued confirm can outlive the app being switched off
+        # and still reach the BILLABLE `create_drive`. Guard 1 of the module
+        # promises a disabled app answers 403 `app_disabled` to everyone; the
+        # recheck inside the lock is what makes the billable path keep it.
+        handlers = _registered()
+        target = (ACCOUNT, "prof-a", "us-west-2")
+        # Enabled at the door, switched off by the time the lock is held.
+        enabled_results = [True, False]
+
+        def _enabled(_name):
+            return enabled_results.pop(0) if enabled_results else False
+
+        with (
+            mock.patch.object(routes_mod, "is_app_enabled", side_effect=_enabled),
+            mock.patch.object(routes_mod, "is_owner_dashboard_request", return_value=True),
+            mock.patch.object(routes_mod, "_account_target", AsyncMock(return_value=target)),
+            mock.patch.object(routes_mod, "_consent", AsyncMock(return_value=None)),
+            mock.patch.object(routes_mod, "_drive_bucket", AsyncMock(return_value="")),
+            # A real bucket name, so a missing gate fails on the 403 contract
+            # below rather than on an unserializable mock in the 200 body.
+            mock.patch.object(
+                routes_mod.storage_mod, "create_drive", return_value="kirocrew-drive-abc123def456"
+            ) as create,
+            mock.patch.object(routes_mod, "_audit") as audit,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/bootstrap")](  # type: ignore[operator]
+                    self._confirm_request()
+                )
+            )
+        assert resp.status == 403
+        assert _payload(resp)["code"] == "app_disabled"
+        # The decisive assertion: no bucket was made, so nothing was billed.
+        create.assert_not_called()
+        assert _denial(audit, "app_disabled") == "drive_bootstrap"
+
+    def test_an_account_that_stops_resolving_mid_create_is_audited(self):
+        # The other shape the in-lock re-probe returns: not a different triple
+        # but a refusal response, because the profile does not resolve to the
+        # requested account at all.
+        handlers = _registered()
+        # The code here is deliberately NOT `account_unavailable`: `_resolve_target`
+        # answers with three different codes, so a test whose fixture happens to use
+        # the one the audit hard-coded would pass against the bug. `account_mismatch`
+        # is the case an incident review most needs to see correctly.
+        unavailable = routes_mod._conflict("profile no longer resolves", "account_mismatch")
+        targets = [(ACCOUNT, "prof-a", "us-west-2"), unavailable]
+
+        async def _target(_request_obj):
+            return targets.pop(0)
+
+        with (
+            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(routes_mod, "is_owner_dashboard_request", return_value=True),
+            mock.patch.object(routes_mod, "_account_target", side_effect=_target),
+            mock.patch.object(routes_mod, "_consent", AsyncMock(return_value=None)),
+            mock.patch.object(routes_mod, "_drive_bucket", AsyncMock(return_value="")),
+            mock.patch.object(routes_mod.storage_mod, "create_drive") as create,
+            mock.patch.object(routes_mod, "_audit") as audit,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/bootstrap")](  # type: ignore[operator]
+                    self._confirm_request()
+                )
+            )
+        assert resp is unavailable
+        create.assert_not_called()
+        assert _denial(audit, "account_mismatch") == "drive_bootstrap"
+
+    def test_the_app_disabled_during_the_consent_read_still_creates_nothing(self):
+        # A gate at the TOP of the lock is already stale by the time `create_drive`
+        # runs: the identity re-probe and the consent read are both awaits after it.
+        # Switching the app off DURING the last of those awaits is the case only a
+        # gate placed immediately before the billable call can catch.
+        handlers = _registered()
+        enabled = {"value": True}
+
+        async def _consent_and_disable(*_a, **_k):
+            enabled["value"] = False  # owner switches the app off mid-read
+            return None
+
+        with (
+            mock.patch.object(
+                routes_mod, "is_app_enabled", side_effect=lambda *_a, **_k: enabled["value"]
+            ),
+            mock.patch.object(routes_mod, "is_owner_dashboard_request", return_value=True),
+            mock.patch.object(
+                routes_mod,
+                "_account_target",
+                AsyncMock(return_value=(ACCOUNT, "prof-a", "us-west-2")),
+            ),
+            mock.patch.object(routes_mod, "_consent", side_effect=_consent_and_disable),
+            mock.patch.object(routes_mod, "_drive_bucket", AsyncMock(return_value="")),
+            mock.patch.object(routes_mod.storage_mod, "create_drive") as create,
+            mock.patch.object(routes_mod, "_audit") as audit,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/bootstrap")](  # type: ignore[operator]
+                    self._confirm_request()
+                )
+            )
+        assert resp.status == 403
+        create.assert_not_called()
+        assert _denial(audit, "app_disabled") == "drive_bootstrap"
 
     def test_consent_withdrawn_mid_create_refuses_and_creates_nothing(self):
         handlers = _registered()
@@ -2489,7 +3362,7 @@ class TestRound36Hardening:
 
     def test_a_timezone_less_last_run_reads_as_due_instead_of_crashing(self):
         # The nastier half of this class: a timezone-LESS ISO stamp parses fine,
-        # so it escapes the try/except entirely and used to raise TypeError on the
+        # so it escapes the try/except entirely and would raise TypeError on the
         # aware subtraction that sits OUTSIDE the guard -- in the nightly loop,
         # every wake, so a backup the owner enabled silently never ran.
         from kiro_crew.apps.builtins.aws_control.backend import backup

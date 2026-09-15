@@ -9,6 +9,7 @@ that workaround.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 from typing import Any
@@ -28,6 +29,35 @@ INTERNAL_CLIENT_ID_KEY = "clientId"
 #: with the provider's default grant instead of the scopes the card promised.
 KIRO_SCOPES_KEY = "oauthScopes"
 KIRO_OAUTH_KEY = "oauth"
+
+
+def registry_accepts_query(registry_op: Any) -> bool:
+    """True when a ``CapabilityManager.registry`` op takes the ``query`` hint.
+
+    Feature-detected rather than assumed: the seam's original signature was
+    zero-arg, so an edition pinned to an older core -- and every test double
+    written against it -- still satisfies the Protocol without the parameter.
+    Calling with the hint regardless and catching ``TypeError`` would be worse: a
+    genuine ``TypeError`` raised INSIDE the manager would be silently retried as
+    an unfiltered listing, hiding a real edition bug behind a degraded search.
+
+    A ``**kwargs`` op counts as accepting -- it swallows the hint without error,
+    which is the ignore-and-stay-correct case the caller's own filter covers.
+
+    Lives here, in the dependency-free helper module, because BOTH ends of the
+    seam need it: ``mcp_providers.capability`` to decide whether to send the hint,
+    and ``platform.capability_bound`` to decide whether to forward it inward.
+    """
+    try:
+        params = inspect.signature(registry_op).parameters
+    except (TypeError, ValueError):  # builtins / C callables expose no signature
+        return False
+    for param in params.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "query" and param.kind is not inspect.Parameter.POSITIONAL_ONLY:
+            return True
+    return False
 
 
 def _scopes_shape(raw: object) -> str:
@@ -75,9 +105,7 @@ def _wire_scopes(raw: object, *, server: str = "") -> list[str] | None:
     """
     if raw is None or raw == []:
         return None
-    if isinstance(raw, list) and all(
-        isinstance(scope, str) and scope.strip() for scope in raw
-    ):
+    if isinstance(raw, list) and all(isinstance(scope, str) and scope.strip() for scope in raw):
         return list(raw)
     if server:
         logger.warning(

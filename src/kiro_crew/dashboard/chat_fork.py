@@ -11,15 +11,19 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop, session_was_deleted
 from kiro_crew.dashboard.chat_utils import (
     _sync_dashboard_slots,
+    drained_to_thread,
     effective_session_key,
+    history_corpus_unreadable,
     slot_history_key,
 )
 from kiro_crew.dashboard.state import (
     MAX_LIVE_SLOTS,
+    VALID_MEMORY_MODES,
     DashboardState,
     request_slot_origin,
 )
 from kiro_crew.history import carry_provenance
+from kiro_crew.history_projection import drop_persisted_tail_prefix as _drop_persisted_tail_prefix
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -38,6 +42,51 @@ _FORK_DIRECTION_HEAD = "head"
 _FORK_DIRECTION_TAIL = "tail"
 _FORK_DIRECTIONS = (_FORK_DIRECTION_HEAD, _FORK_DIRECTION_TAIL)
 _MAX_MESSAGE_ID_CHARS = 256
+
+
+def drop_persisted_tail_prefix(full_disk: list[dict], tail: list[dict]) -> list[dict]:
+    """Re-exported from ``history_projection``, which owns the identity rule.
+
+    Kept importable from here because this module was its first consumer and is
+    where callers and tests reach for it.
+    """
+    return _drop_persisted_tail_prefix(full_disk, tail)
+
+
+def _fork_private_memory_store(session_key: str, agent: str, recorded_store: str) -> str:
+    """A fork inherits private authority from its parent, never from copied rows."""
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.memory_stores import UnknownMemoryStore, require_member_memory_store
+
+    protected = read_private_session_store(session_key)
+    config = KiroCrewConfig.load()
+    selected = agent or config.default_agent
+    if selected not in config.agents:
+        if protected or recorded_store not in ("", "default"):
+            raise UnknownMemoryStore("The fork source's member binding is unavailable")
+        return ""
+    store = require_member_memory_store(config, selected)
+    if recorded_store and recorded_store != store:
+        raise UnknownMemoryStore("The fork source's recorded memory binding has changed")
+    record = config.memory_stores.get(store)
+    if record is not None and record.memory_version == 2:
+        if protected != store:
+            raise UnknownMemoryStore(
+                "The fork source has no verified assignment to this member's private memory"
+            )
+        return store
+    if protected:
+        raise UnknownMemoryStore("The fork source retains a different private memory assignment")
+    return ""
+
+
+def _bind_private_fork_memory(source: tuple[str, str, str], child_key: str, store: str) -> None:
+    from kiro_crew.member_memory_auth import bind_private_session_store
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    if _fork_private_memory_store(*source) != store:
+        raise UnknownMemoryStore("The fork source's private memory assignment changed")
+    bind_private_session_store(child_key, store)
 
 
 async def api_chat_slot_fork(request: web.Request) -> web.Response:
@@ -107,22 +156,27 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             # (CWE-204). The true reason is recorded server-side via SEL above.
             return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
 
-    if slot.memory_mode != "persistent":
-        sel().log_api_access(
-            caller=request_app or "dashboard",
-            operation="chat.slot_fork",
-            outcome="denied",
-            source="dashboard",
-            resources=f"slot={name},memory_mode={slot.memory_mode}",
-            error="non-persistent slot",
-        )
-        return web.json_response(
-            {
-                "error": "cannot fork a non-persistent session",
-                "code": "slot_not_persistent",
-            },
-            status=400,
-        )
+    source_memory_identity = (
+        effective_session_key(slot),
+        slot.agent,
+        slot.memory_store,
+        slot.memory_mode,
+        slot_history_key(slot),
+    )
+
+    # Incognito and temporary sessions fork like any other. Nothing about a fork
+    # engages what those modes actually guarantee -- no consolidation or lessons
+    # (``is_restricted``), no memory-context injection (``blocks_reads``) -- and
+    # the transcript being copied is already on disk: ``_save_slot_to_history``
+    # has no ``memory_mode`` gate, so the parent's JSONL holds it for tab recovery
+    # (see docs/system-specs/modules/history.md). A refusal here would buy no
+    # privacy; it would only force the user to reselect the mode and lose the
+    # conversation.
+    #
+    # The one thing a fork must never do is LOOSEN the mode: copying an incognito
+    # transcript into a persistent slot would hand content the user marked
+    # no-write to consolidation. So the child inherits the parent's mode below,
+    # and the request body carries no way to pick one.
     if request.body_exists:
         try:
             body = await request.json()
@@ -156,10 +210,10 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
         )
     prompt = body.get("prompt")
     mode_override = body.get("mode")
-    if mode_override is not None and mode_override not in ("", "orchestrator", "crew"):
+    if mode_override is not None and mode_override not in ("", "orchestrator"):
         return web.json_response(
             {
-                "error": "mode must be '', 'orchestrator' or 'crew'",
+                "error": "mode must be '' or 'orchestrator'",
                 "code": "invalid_mode",
             },
             status=400,
@@ -517,6 +571,7 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                     },
                     status=503,
                 )
+        _fork_tail_len = len(new_msgs) if (all_messages and new_msgs) else 0
         if all_messages and new_msgs:
             # REBIND, never ``extend``. ``read_messages_chained`` hands back the
             # SHARED ``_msg_cache`` list BY IDENTITY whenever it falls through to
@@ -618,7 +673,10 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             slot._resumed_count = len(slot.messages)
             slot._dirty = False
         if not all_messages:
+            # The whole corpus is the in-memory window: disk contributed
+            # nothing, so for the mid-rotation rebuild below it is ALL tail.
             all_messages = list(slot.messages)
+            _fork_tail_len = len(all_messages)
         # Direct delete check, independent of the flush arms above: if the
         # periodic 5s flush hit the delete-won guard first, it cleared
         # ``_dirty`` and this handler's own flush arms never ran — the disk
@@ -640,6 +698,96 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+    # Fork indices arrive in the PAGINATED corpus's visible-row space, which
+    # prepends each chain key's size-rotated archive head
+    # (read_messages_chained_full). Mirror that corpus here, or every index
+    # sent after the reader paged past a rotation boundary resolves short by
+    # the archived visible-row count, silently forking the WRONG message —
+    # and archived rows could not be forked at all. Rotated rows are BY
+    # DEFINITION no longer in the live files, so this cannot duplicate
+    # anything the flush arms above already placed in ``all_messages``.
+    #
+    # Two shapes, matching the slot-detail handler exactly:
+    # - Archive only on the FIRST chain member: the archived rows are a
+    #   contiguous prefix of the chained corpus, so a flat prepend is exact.
+    # - A LATER member also rotated (``chain_mid_rotation``): the paginated
+    #   corpus interleaves rot/live per key, so a flat prepend would shift
+    #   ``at_message_index`` by the sandwiched rows. Rebuild the disk part
+    #   from the true chained corpus and re-append the unflushed tail the
+    #   arms above collected (``_fork_tail_len`` rows).
+    if state.conversation_log:
+        try:
+            _rotated_head = await asyncio.to_thread(
+                state.conversation_log.read_rotated_messages_chained,
+                slot_history_key(slot),
+            )
+        except Exception:
+            # NOT `_rotated_head = []`. Empty means "no archive" here, so folding
+            # the failure into it drops the archived head and shifts every index
+            # below it -- and this path forks BY INDEX, so it would copy a
+            # different cutoff than the one the reader pointed at, silently. Same
+            # retryable shape the snapshot loop below already returns.
+            logger.warning("rotated-archive read failed for fork", exc_info=True)
+            return history_corpus_unreadable("fork_corpus_unreadable")
+        if _rotated_head:
+            _mid_rotation = False
+            try:
+                _mid_rotation = await asyncio.to_thread(
+                    state.conversation_log.chain_mid_rotation,
+                    slot_history_key(slot),
+                )
+            except Exception:
+                # Same reasoning as the slot-detail probe: a False fallback picks
+                # the flat-prepend path, which is only correct when the rotation is
+                # on the first chain member. Getting that wrong here forks BY INDEX
+                # off a misindexed corpus, so it copies different messages than the
+                # ones the reader pointed at.
+                logger.warning("mid-rotation probe failed for fork", exc_info=True)
+                return history_corpus_unreadable("fork_corpus_unreadable")
+            _rebuilt = False
+            if _mid_rotation:
+                try:
+                    _full_disk = await asyncio.to_thread(
+                        state.conversation_log.read_messages_chained_full,
+                        slot_history_key(slot),
+                    )
+                    _tail = (
+                        all_messages[len(all_messages) - _fork_tail_len :] if _fork_tail_len else []
+                    )
+                    # `_tail` was derived as "unflushed" against the corpus the
+                    # snapshot loop read. THIS is a later read, and two
+                    # `to_thread` suspensions separate them, so a save landing in
+                    # that window puts those same rows on disk — appending the
+                    # tail blind then duplicates them, surfacing as an ambiguous
+                    # fork id or a doubled fork tail. The loop's stability
+                    # guarantee does not reach across this read, so re-derive
+                    # against what this read actually returned.
+                    all_messages = _full_disk + drop_persisted_tail_prefix(_full_disk, _tail)
+                    _rebuilt = True
+                except Exception:
+                    # FAIL CLOSED. The flat prepend below puts only THIS key's
+                    # rotated head in front, so when the rotation is on a later
+                    # chain member the earlier members' rotated rows are still
+                    # missing and every index shifts. An index-addressed fork
+                    # then copies DIFFERENT messages than the ones the reader
+                    # pointed at, silently — worse than not forking at all,
+                    # which the reader can see and retry. Same retryable shape
+                    # the snapshot loop above already returns.
+                    logger.warning("chained-full fork corpus read failed", exc_info=True)
+                    return history_corpus_unreadable("fork_corpus_unreadable")
+            if not _rebuilt:
+                # Same crash window as `read_messages_chained_full`'s concatenation,
+                # reached by a different branch: rotation archives the dropped lines
+                # first and rewrites the live file's head second, so a kill between
+                # those two steps leaves the archived rows in BOTH files. Prepending
+                # blind then serves them twice, and in this corpus a duplicated row
+                # is what makes a legacy fork index select the wrong cutoff.
+                #
+                # This branch is not covered by that function's own guard because it
+                # runs when the chained-full read was not used at all.
+                all_messages = _rotated_head + drop_persisted_tail_prefix(
+                    _rotated_head, all_messages
+                )
     visible = [m for m in all_messages if m.get("role") in ("user", "assistant")]
     if not visible:
         return web.json_response(
@@ -726,18 +874,91 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     else:
         fork_mode = slot.mode
 
+    # The child inherits the parent's mode, so the parent's value is what the
+    # slot constructor validates against ``VALID_MEMORY_MODES``. The API checks
+    # the field on the way in, but rehydration copies the transcript header's
+    # ``memory_mode`` onto the slot as written, so a hand-edited or partially
+    # written header can leave an unrecognised value on a live parent. That
+    # value is refused HERE, with a code and before any child exists, rather
+    # than raising out of ``_ChatSlot.__init__`` as a 500. Fail closed: a mode
+    # this code cannot read is a memory boundary it cannot honour.
+    inherited_memory_mode = slot.memory_mode
+    if inherited_memory_mode not in VALID_MEMORY_MODES:
+        sel().log_api_access(
+            caller=request_app or "dashboard",
+            operation="chat.slot_fork",
+            outcome="denied",
+            source="dashboard",
+            resources=f"slot={name},memory_mode={inherited_memory_mode!r}",
+            error="source slot memory_mode is not a recognised mode",
+        )
+        return web.json_response(
+            {
+                "error": "the source session's memory mode is not recognised",
+                "code": "fork_source_memory_mode_invalid",
+            },
+            status=409,
+        )
+
+    from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    def _source_identity_unchanged() -> bool:
+        return state._slots.get(name) is slot and source_memory_identity == (
+            effective_session_key(slot),
+            slot.agent,
+            slot.memory_store,
+            slot.memory_mode,
+            slot_history_key(slot),
+        )
+
+    try:
+        inherited_store = await asyncio.to_thread(
+            _fork_private_memory_store, *source_memory_identity[:3]
+        )
+        if not _source_identity_unchanged():
+            raise UnknownMemoryStore("The fork source changed while its memory was verified")
+    except (OSError, ValueError) as exc:
+        return _store_unavailable_response(source_memory_identity[2], exc)
+
     new_slot = state.get_or_create_slot(
         name=None,
         agent=slot.agent,
         workspace=slot.workspace,
         model=slot.model,
         mode=fork_mode,
+        # Inherited at BIRTH, not stamped afterwards: get_or_create_slot is what
+        # registers the child's ``dashboard:`` key as restricted, and every memory
+        # gate (lessons, consolidation, artifact registration) reads that
+        # registry. A later assignment would leave a window where the child of
+        # an incognito parent is a persistent slot. The value is the one
+        # validated above, so the constructor cannot raise on it.
+        memory_mode=inherited_memory_mode,
         app=request_app,
         origin=request_slot_origin(request_app),
         # Human request-layer path: a person forking a conversation. The
         # origin conjunct in state.py still excludes app-token callers.
         count_user_session=True,
     )
+    if inherited_store:
+        try:
+            # The destination is still empty: no transcript can grant this pin,
+            # and the unchanged first-turn guard will verify it on continuation.
+            await drained_to_thread(
+                _bind_private_fork_memory,
+                source_memory_identity[:3],
+                effective_session_key(new_slot),
+                inherited_store,
+            )
+            if not _source_identity_unchanged():
+                raise UnknownMemoryStore("The fork source changed before its history was copied")
+            new_slot.memory_store = inherited_store
+        except BaseException as exc:
+            state._slots.pop(new_slot.key, None)
+            state._restricted_keys.discard(effective_session_key(new_slot))
+            if isinstance(exc, (OSError, ValueError)):
+                return _store_unavailable_response(inherited_store, exc)
+            raise
     new_slot.forked_from = effective_session_key(slot)
     new_slot.reasoning_effort = slot.reasoning_effort
     # Inherit the active project directory so the fork keeps the parent's working
@@ -748,6 +969,11 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     new_slot.folder_id = slot.folder_id
     # Inherit tags (copied, so later edits to either slot's list stay independent).
     new_slot.tags = list(slot.tags)
+    # "tags changed => revision changed": the slot was constructed with an empty
+    # list under its birth revision; a snapshot of that newborn state (a slot
+    # fetch racing the fork) must not share a revision with the inherited list,
+    # or a delayed empty frame could become a client's next toggle base.
+    new_slot.bump_tags_revision()
     parent_title = slot.title if slot._titled else "Untitled"
     parent_title, _ = redact_exfiltration_urls(parent_title)
     parent_title, _ = redact_credentials(parent_title)
@@ -876,7 +1102,8 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             f"at_index={at_index if at_index is not None else 'last'},"
             f"direction={direction},"
             f"head_count={len(head_messages)},"
-            f"prompt_len={len(prompt)},mode={new_slot.mode}"
+            f"prompt_len={len(prompt)},mode={new_slot.mode},"
+            f"memory_mode={new_slot.memory_mode}"
         ),
     )
     _sync_dashboard_slots(state)
@@ -890,5 +1117,8 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             "prompt": prompt,
             "folder_id": new_slot.folder_id or None,
             "direction": direction,
+            # The mode the child was born with (always the parent's), so the tab
+            # can render the incognito/temporary badge before the slots refresh.
+            "memory_mode": new_slot.memory_mode,
         }
     )

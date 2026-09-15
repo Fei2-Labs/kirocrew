@@ -12,14 +12,15 @@ from typing import Any
 
 from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp.client import (
-    _NOT_LOGGED_IN_MESSAGE,
     DEFAULT_MODEL,
     AcpAuthRequired,
     AcpClient,
     AcpError,
     SpecAdapterAcpClient,
+    _is_config_value_rejection,
     advertised_model_ids,
     model_is_unusable,
+    resolve_pin_spelling,
 )
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeError
 from kiro_crew.acp.session_handle import AcpSessionHandle
@@ -32,10 +33,9 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
-    ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
-    ACP_BACKENDS_KIRO_IDENTITY_STORE,
+    ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_SESSION_SHARING,
     EVENT_COMPACTION_STATUS,
@@ -43,9 +43,13 @@ from kiro_crew.acp.types import (
     PROVIDER_LABELS_BY_BACKEND,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
+    acp_runtime_backends,
+    effort_config_option_id,
 )
 from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
+from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
+from kiro_crew.agent_sdk.capabilities import SessionCapabilities, capabilities_for
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
@@ -117,7 +121,7 @@ def _write_cli_overlay(work_dir: Path, model: str, effort: str) -> None:
     existing["chat.modelDefaults"] = model_defaults
     atomic_write(
         cli_json, json.dumps(existing, indent=2)
-    )  # atomic: readers never see a partial file (#426)
+    )  # atomic: readers never see a partial file
 
 
 #: kiro-cli's own Tool Search activation thresholds. Mirrored as the defaults of
@@ -203,7 +207,7 @@ def _write_tool_search_overlay(
         existing.pop("toolSearch.minTokens", None)
     atomic_write(
         cli_json, json.dumps(existing, indent=2)
-    )  # atomic: readers never see a partial file (#426)
+    )  # atomic: readers never see a partial file
 
 
 def _clear_cli_overlay_effort(work_dir: Path, model: str) -> None:
@@ -238,7 +242,7 @@ def _clear_cli_overlay_effort(work_dir: Path, model: str) -> None:
         if not model_cfg:
             model_defaults.pop(model, None)
     try:
-        atomic_write(cli_json, json.dumps(data, indent=2))  # atomic (#426)
+        atomic_write(cli_json, json.dumps(data, indent=2))  # atomic
     except OSError:
         logger.debug("ACP effort overlay clear failed", exc_info=True)
 
@@ -291,7 +295,9 @@ _RESUME_BACKOFF_BASE_S = 1.0  # backoff = base * 2**attempt → 1s, 2s, 4s betwe
 class AcpProvider(LLMProvider):
     """LLMProvider backed by ACP JSON-RPC over stdio (kiro-cli or claude-agent-acp)."""
 
-    _client_type = AcpClient
+    # A subclass may pin its own client class; the base resolves ``AcpClient``
+    # at call time so a module-level patch of the name still takes effect.
+    _client_type: "type[AcpClient] | None" = None
 
     def __init__(
         self,
@@ -309,11 +315,11 @@ class AcpProvider(LLMProvider):
         tool_search_min_pct: object = None,
         tool_search_min_tokens: object = None,
         mcp_gateway_overlay: str | Path | None = None,
-        mcp_gateway_settings_mcp_json: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
         crew_agent: str | None = None,
         allow_ungated_tools: bool = False,
+        private_memory: bool = False,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -334,7 +340,6 @@ class AcpProvider(LLMProvider):
             "extra_env": extra_env,
             "acp_backend": acp_backend,
             "mcp_gateway_overlay": mcp_gateway_overlay,
-            "mcp_gateway_settings_mcp_json": mcp_gateway_settings_mcp_json,
             "mcp_gateway_socket": mcp_gateway_socket,
             # Claude permission mode (Auto-mode/permission-UI parity). None on the
             # kiro-cli path — fully inert; a companion-registered backend threads
@@ -344,7 +349,14 @@ class AcpProvider(LLMProvider):
         }
         if agent:
             kwargs["agent"] = agent
-        self._client = self._client_type(**kwargs)
+        self._private_memory = private_memory is True
+        # Retain the original identity when start() swaps the placeholder client
+        # for a runtime handle whose session key is not yet populated.
+        self._private_memory_session_key = session_key
+        self._private_memory_prepared = False
+        if self._private_memory:
+            kwargs["private_memory"] = True
+        self._client = (self._client_type or AcpClient)(**kwargs)
         # Consumer opt-in for the low-fidelity child permission downgrade
         # (see child_fidelity_aware property). Set by fidelity-aware
         # consumers (dashboard chat) BEFORE startup; re-applied when
@@ -362,6 +374,11 @@ class AcpProvider(LLMProvider):
         # conversation_log into the fresh session on the first prompt so the slot
         # is not context-free.
         self._history_replay_needed: bool = False
+        # Only the direct-dashboard Tool Search compatibility path owns the
+        # dashboard runner's durable replay settlement contract. Generic
+        # session/load recovery (including channel dispatchers) still requests
+        # history replay but must publish its fresh SID immediately.
+        self._defer_replay_sid_promotion: bool = False
         # Terminal compaction status captured by compact() while draining its
         # prompt turn; consumed by wait_for_compaction() (see compact()).
         self._compact_result: dict | None = None
@@ -501,6 +518,25 @@ class AcpProvider(LLMProvider):
         return is_claude_backend_name(self._client.backend)
 
     @property
+    def capabilities(self) -> SessionCapabilities:
+        """What the backend serving this session can DO -- ask this, not who it is.
+
+        The one attribute application code reads to branch on backend behaviour.
+        Every ``is_*_backend`` property beside it names an IDENTITY, and an
+        identity branch hands each new harness whichever arm the old comparison
+        happened to leave behind (harness-parity H6). Those properties stay for
+        the call sites inside this package and for the migration still in front of
+        this one; a consumer outside the boundary reads this instead, and
+        ``test_agent_sdk_capabilities`` pins that the six that already moved do
+        not go back.
+
+        Rebuilt per read rather than cached in ``__init__``: each field is a set
+        membership or a dict lookup over four ids, and an edition can register a
+        backend after this provider was constructed.
+        """
+        return capabilities_for(self._client.backend)
+
+    @property
     def is_codex_backend(self) -> bool:
         """True when this ACP provider talks to the codex-acp adapter."""
         return self._client.backend == ACP_BACKEND_CODEX
@@ -564,6 +600,11 @@ class AcpProvider(LLMProvider):
         return acp_backends.is_spec_dialect(self._client.backend)
 
     @property
+    def defer_replay_sid_promotion(self) -> bool:
+        """Whether this fresh session waits for replay settlement before SID publish."""
+        return self._defer_replay_sid_promotion
+
+    @property
     def is_kiro_backend(self) -> bool:
         """True when this ACP provider talks to kiro-cli.
 
@@ -583,8 +624,16 @@ class AcpProvider(LLMProvider):
         spelled ``not is_claude_backend`` — which would hand the kiro-family
         path to every harness added later. The claude AcpClient is deliberately
         not a member: it runs one process per session and shares no runtime.
+
+        Reads ``acp_runtime_backends()`` rather than the set directly, so the
+        codex preview switch (``KIROCREW_CODEX_ACP_RUNTIME``, off by default) has
+        one home instead of one per foreground call site. With the switch off the
+        function returns ``ACP_BACKENDS_ACP_RUNTIME`` verbatim and this property
+        answers exactly the frozenset. This is the switch's ONLY reader in ``src``:
+        ``session._bg_runtime_backends`` reads the set, so background handles stay
+        off a codex runtime even with the switch on.
         """
-        return self._client.backend in ACP_BACKENDS_ACP_RUNTIME
+        return self._client.backend in acp_runtime_backends()
 
     @property
     def is_session_sharing_eligible(self) -> bool:
@@ -610,8 +659,8 @@ class AcpProvider(LLMProvider):
         in-prompt, while KAS treats the prompt as ordinary text and never emits
         a status — its ``summarization_*`` frames fire only for KAS-initiated
         auto-summarization — so an ungated dispatch strands
-        ``wait_for_compaction()`` for the full ``COMPACT_WAIT_TIMEOUT_SECS``
-        (#7800). Read off the backend STRING, not the ``is_*_backend``
+        ``wait_for_compaction()`` for the full ``COMPACT_WAIT_TIMEOUT_SECS``.
+        Read off the backend STRING, not the ``is_*_backend``
         properties, matching ``provider_label``'s MagicMock caution; a
         non-``str`` value answers ``None`` so a spec'd double never reads as a
         refusal. The empty string is ``ACP_BACKEND_KIRO`` (a member), so a
@@ -626,13 +675,13 @@ class AcpProvider(LLMProvider):
     def uses_kiro_identity_store(self) -> bool:
         """True when this provider's child signs in from kiro-cli's own store.
 
-        Membership in ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` (harness-parity
+        Membership in ``backends_retired_by_host_logout()`` (harness-parity
         H5/H14). Declaring it here is what lets the session layer ask the
         question through the ABC instead of probing private attributes, so an
         adapted provider is classified by its own declaration rather than by
         whichever internal shape it happens to expose.
         """
-        return self._client.backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        return self._client.backend in host_auth.backends_retired_by_host_logout()
 
     @property
     def mcp_config_hot_reload(self) -> bool:
@@ -748,6 +797,28 @@ class AcpProvider(LLMProvider):
         except Exception:  # never let telemetry break session startup
             logger.debug("kiro startup metric emit failed", exc_info=True)
 
+    def _owning_session_key(self) -> str:
+        """The Kiro Crew session key this provider serves, or ``""``.
+
+        Handed to the runtime's session-creation paths so the session's broker
+        stubs carry a token bound to THIS session (see
+        ``AcpRuntime._own_stub_session``). Read off the placeholder client the
+        same way :meth:`_member_session_key` does; empty for a pooled worker
+        spawned before any session claimed it, whose ``rekey()`` names it later.
+        """
+        skey = getattr(self._client, "_session_key", None)
+        return skey if isinstance(skey, str) else ""
+
+    def _owning_channel_id(self) -> str | None:
+        """The channel this provider's session belongs to, or ``None``.
+
+        Carried on the claim frame beside the session key so a channel-driven
+        session's forwarded calls keep naming their channel. Read off the
+        placeholder client like :meth:`_owning_session_key`.
+        """
+        channel = getattr(self._client, "_channel_id", None)
+        return channel if isinstance(channel, str) and channel else None
+
     def _member_session_key(self) -> str:
         """This session's key when it is a member DM on a dispatch-capable backend.
 
@@ -777,6 +848,7 @@ class AcpProvider(LLMProvider):
         work_dir: str | Path | None,
         agent: str | None,
         member_session_key: str = "",
+        session_key: str = "",
     ) -> AcpSessionHandle | None:
         """Resume via session/load, retrying past a stale native session lock.
 
@@ -802,6 +874,7 @@ class AcpProvider(LLMProvider):
                     cwd=work_dir,
                     agent=agent or None,
                     member_session_key=member_session_key,
+                    session_key=session_key,
                 )
                 if attempt:
                     logger.info(
@@ -868,13 +941,38 @@ class AcpProvider(LLMProvider):
         sandbox_mode = getattr(self._client, "_sandbox_mode", "auto")
         extra_env = getattr(self._client, "_extra_env", None) or {}
         mcp_gateway_overlay = getattr(self._client, "_mcp_gateway_overlay", None)
-        mcp_gateway_settings_mcp_json = getattr(
-            self._client, "_mcp_gateway_settings_mcp_json", None
-        )
         mcp_gateway_socket = getattr(self._client, "_mcp_gateway_socket", None)
+        if self._private_memory:
+            mcp_gateway_socket = getattr(self._client, "_private_mcp_gateway_socket", "")
 
-        # Check for session resume
+        # Check for session resume. A direct dashboard turn (dashboard session
+        # key with no channel identity) can restore the transcript without
+        # restoring Tool Search's activated schemas: the loader still runs, but
+        # a tool it reports as loaded remains absent on the next inference. A
+        # fresh native session rebuilds that registry, while
+        # ``_history_replay_needed`` preserves the Kiro Crew conversation. Linked
+        # Slack and other channel dispatchers keep native resume until they own
+        # the same replay-lease contract end to end.
         resume_sid = getattr(self._client, "_resume_session_id", "")
+        session_key = getattr(self._client, "_session_key", None)
+        channel_id = getattr(self._client, "_channel_id", None)
+        if (
+            resume_sid
+            and self._tool_search is True
+            and self._client.backend == ACP_BACKEND_KIRO
+            and not channel_id
+            and telemetry_channel_of(session_key if isinstance(session_key, str) else None)
+            == "dashboard"
+        ):
+            logger.info(
+                "Tool Search is enabled; replacing native session/load for %s "
+                "with a fresh session and conversation replay",
+                resume_sid,
+            )
+            self._history_replay_needed = True
+            self._defer_replay_sid_promotion = True
+            meta["resume_outcome"] = "tool_search_replay"
+            resume_sid = ""
 
         # Preserve the configured model so we can re-apply it once the session
         # is live. AcpClient sends session/set_model in its handshake; the runtime
@@ -882,16 +980,17 @@ class AcpProvider(LLMProvider):
         # would silently run on the agent's default.
         configured_model = getattr(self._client, "_model", "") or ""
 
+        private_kwargs: dict[str, Any] = {"private_memory": True} if self._private_memory else {}
         runtime = AcpRuntime(
             work_dir=work_dir,
             agent=agent or "kirocrew",
             sandbox_mode=sandbox_mode,
             extra_env=extra_env,
             mcp_gateway_overlay=mcp_gateway_overlay,
-            mcp_gateway_settings_mcp_json=mcp_gateway_settings_mcp_json,
             mcp_gateway_socket=mcp_gateway_socket,
             acp_backend=self._client.backend,
             crew_agent=self._crew_agent,
+            **private_kwargs,
         )
         _t_spawn = time.monotonic()
         try:
@@ -901,7 +1000,15 @@ class AcpProvider(LLMProvider):
             # surface an actionable login prompt (parity with AcpClient) rather
             # than a generic runtime-death error.
             if runtime.saw_not_logged_in():
-                raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
+                # ``self._client`` is still the placeholder AcpClient at this
+                # point, and it carries the backend this runtime was spawned for
+                # (it is the value passed as ``acp_backend`` above) — so the
+                # sign-in advice names the harness that actually failed to
+                # authenticate rather than assuming kiro-cli.
+                raise AcpAuthRequired(
+                    host_auth.signed_out_message(self._client.backend),
+                    backend=self._client.backend,
+                ) from exc
             raise
         finally:
             # subprocess launch + ACP `initialize` handshake
@@ -927,11 +1034,24 @@ class AcpProvider(LLMProvider):
             handle = None
             resumed = False
             if resume_sid:
-                if self.is_kas_backend:
-                    # KAS locates the transcript itself from sessionId, and in
-                    # remote-session mode there are no local files to stat at
-                    # all. Attempt the load and let failure fall through to a
-                    # fresh session/new with history replay.
+                if self.is_kas_backend or self._client.backend in (
+                    ACP_BACKENDS_HARNESS_OWNED_SESSIONS
+                ):
+                    # Nothing local to stat. KAS locates the transcript itself
+                    # from sessionId, and in remote-session mode there are no
+                    # local files at all; a member of
+                    # ``ACP_BACKENDS_HARNESS_OWNED_SESSIONS`` keeps its own
+                    # session records and resolves a resume from the id alone.
+                    # Attempt the load and let failure fall through to a fresh
+                    # session/new with history replay.
+                    #
+                    # Pre-checking the kiro transcript for those hosts makes
+                    # ``should_load`` permanently False — the file is never
+                    # written for them — so every reopen would silently start a
+                    # fresh session and drop the conversation. ``AcpClient``
+                    # reads the same set for the same reason (client.py's
+                    # ``file_ok`` branch). KAS is named separately because it is
+                    # NOT a member: adding it would change that client path too.
                     session_file = None
                     should_load = True
                 else:
@@ -954,6 +1074,7 @@ class AcpProvider(LLMProvider):
                             work_dir,
                             agent,
                             member_session_key=self._member_session_key(),
+                            session_key=self._owning_session_key(),
                         )
                     finally:
                         phases["session_load"] = (time.monotonic() - _t_load) * 1000.0
@@ -980,7 +1101,10 @@ class AcpProvider(LLMProvider):
                         runtime.pid,
                     )
                     try:
-                        await runtime.kill()
+                        # Reap of an already-dead runtime: _mark_dead refuses
+                        # the expected-downgrade when the child exited on its
+                        # own, so this only labels the genuinely-deliberate case.
+                        await runtime.kill(expected=True, reason="reap before resume respawn")
                     except Exception:
                         pass
                     runtime = AcpRuntime(
@@ -989,26 +1113,33 @@ class AcpProvider(LLMProvider):
                         sandbox_mode=sandbox_mode,
                         extra_env=extra_env,
                         mcp_gateway_overlay=mcp_gateway_overlay,
-                        mcp_gateway_settings_mcp_json=mcp_gateway_settings_mcp_json,
                         mcp_gateway_socket=mcp_gateway_socket,
                         acp_backend=self._client.backend,
                         crew_agent=self._crew_agent,
+                        **private_kwargs,
                     )
                     try:
                         await runtime.spawn()
                     except AcpRuntimeError as exc:
                         if runtime.saw_not_logged_in():
-                            raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
+                            raise AcpAuthRequired(
+                                host_auth.signed_out_message(self._client.backend),
+                                backend=self._client.backend,
+                            ) from exc
                         raise
                 try:
                     handle = await runtime.create_session(
                         cwd=work_dir,
                         agent=agent or None,
                         member_session_key=self._member_session_key(),
+                        session_key=self._owning_session_key(),
                     )
                 except AcpRuntimeError as exc:
                     if runtime.saw_not_logged_in():
-                        raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
+                        raise AcpAuthRequired(
+                            host_auth.signed_out_message(self._client.backend),
+                            backend=self._client.backend,
+                        ) from exc
                     raise
                 finally:
                     # In a finally, mirroring session_load: a start that BLEW its
@@ -1033,7 +1164,15 @@ class AcpProvider(LLMProvider):
                 # Leaving it unset keeps the session on the backend's own
                 # default, so the turn succeeds.
                 _advertised = advertised_model_ids(handle.available_models)
+                _send_model = configured_model
                 if model_is_unusable(configured_model, _advertised):
+                    # A literal miss can be a stale `<namespace>::` qualifier on
+                    # a model the backend fully serves: resolve to the
+                    # advertised spelling and send THAT — same fold the display
+                    # verdict uses, so chip and wire agree. A pin absent under
+                    # either spelling still takes the withhold.
+                    _send_model = resolve_pin_spelling(configured_model, _advertised)
+                if not _send_model:
                     logger.warning(
                         "Configured model %s is not available to this account; "
                         "leaving the session on the backend default (advertised: %s)",
@@ -1043,19 +1182,28 @@ class AcpProvider(LLMProvider):
                 else:
                     _t_model = time.monotonic()
                     try:
-                        await handle.set_model(configured_model)
-                        logger.info("Kiro runtime model set: %s", configured_model)
+                        await handle.set_model(_send_model)
+                        logger.info("Kiro runtime model set: %s", _send_model)
                     except Exception:
                         logger.warning(
                             "Failed to set model %s on kiro runtime session",
-                            configured_model,
+                            _send_model,
                             exc_info=True,
                         )
                     finally:
                         phases["set_model"] = (time.monotonic() - _t_model) * 1000.0
 
             # Replace the placeholder AcpClient with the real AcpSessionProvider
-            provider = AcpSessionProvider(handle, runtime, owns_runtime=True)
+            provider = AcpSessionProvider(
+                handle,
+                runtime,
+                owns_runtime=True,
+                # This path is the COLD start, which never rekeys — so the
+                # correlation keys have to arrive here or the per-turn re-claim
+                # pushes a keyless claim gatewayd throws away.
+                session_key=self._owning_session_key(),
+                channel_id=self._owning_channel_id(),
+            )
             if resumed:
                 provider.resumed = True
             # Re-apply the consumer's fidelity opt-in: it was set on THIS
@@ -1071,7 +1219,7 @@ class AcpProvider(LLMProvider):
             # setup doesn't leak an orphaned kiro-cli process. Best-effort:
             # the cleanup kill must not mask the original exception.
             try:
-                await runtime.kill()
+                await runtime.kill(expected=True, reason="failed session setup cleanup")
             except Exception:
                 logger.debug(
                     "Cleanup kill of runtime after failed session setup failed",
@@ -1122,7 +1270,18 @@ class AcpProvider(LLMProvider):
         return model_supports_effort(self._client._model)
 
     def _resolve_effort(self) -> str | None:
-        """Resolve effort for the current model via the shared priority chain."""
+        """Resolve effort for the current model via the shared priority chain.
+
+        Both the slot overrides and the workspace defaults key on the model id as
+        RECORDED, which on an ``ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS`` harness is the
+        advertised suffixed spelling (``openai.gpt-6-astra[max]``). So a default
+        stored under the bare ``openai.gpt-6-astra`` does not answer for a session
+        that picked the ``[max]`` row, and the row's own effort stands. That is the
+        intended precedence -- an explicit pick of one advertised row is more
+        specific than a per-model default -- and not an aliasing gap to close.
+        ``change_effort`` writes the override under the same recorded spelling
+        this reads, so the override path matches by construction.
+        """
         return resolve_effort_for_model(
             self._client._model,
             slot_overrides=self._effort_per_model,
@@ -1197,6 +1356,14 @@ class AcpProvider(LLMProvider):
         ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` arrives here, and the
         adapter-behaviour notes below are what that channel does in practice.
 
+        WHICH option id carries the effort is resolved per backend through
+        ``effort_config_option_id``: claude-agent-acp spells it ``effort`` and
+        codex-acp spells it ``reasoning_effort``. Naming one spelling here writes
+        an id the other adapter does not know, which comes back as "unknown
+        config option" -- and the branch below reads that as "no effort selector"
+        and skips, so the session keeps whatever effort it already had while the
+        dashboard reports the level the user picked.
+
         claude-agent-acp validates the value against the *current model's*
         ``supportedEffortLevels`` and throws ``Invalid value for config option
         effort: <level>`` (surfaced as an ``AcpError``) for anything the model
@@ -1205,39 +1372,33 @@ class AcpProvider(LLMProvider):
         dashboard reset the whole session and silently drop to the adapter
         default), fall back down the effort ladder so the model still lands at
         the highest level it actually supports. Only the value-rejection error
-        is retried; any other failure (transport, timeout) propagates.
+        is retried; any other failure (transport, timeout) propagates. codex-acp
+        refuses a value with a bare ``-32602`` and no message instead of naming
+        the option, so the shared ``_is_config_value_rejection`` reader answers
+        for both shapes.
 
-        Older claude-agent-acp builds expose no ``effort`` config option at all
-        and reject the push with ``Unknown config option: effort`` (a -32603
-        Internal error). When the session advertises no effort selector, skip
-        the push entirely — there is nothing to set, and attempting it would
-        spam errors and trigger a session reset on every turn.
-
-        The option ID comes from the backend descriptor's ``effort_config_id``
-        rather than being fixed to ``effort``, because it is part of each
-        adapter's own ACP surface: claude-agent-acp advertises ``effort`` and
-        codex-acp advertises ``reasoning_effort``. A single hardcoded id makes
-        the wrong adapter answer "no effort selector" and lose effort control
-        entirely — silently, since the skip is a debug log. Reading it from the
-        descriptor keeps this a data row rather than a per-backend branch at the
-        push site (harness-parity H6).
+        An adapter build may expose no effort config option at all and reject the
+        push with ``Unknown config option: <id>`` (a -32603 Internal error). When
+        the session advertises no effort selector, skip the push entirely — there
+        is nothing to set, and attempting it would spam errors and trigger a
+        session reset on every turn.
         """
-        option_id = acp_backends.descriptor_for(self._client.backend).effort_config_id
-        if not self._client.supports_config_option(option_id):
-            logger.debug("adapter exposes no %r config option; skipping effort push", option_id)
+        effort_option = effort_config_option_id(self._client.backend)
+        if not self._client.supports_config_option(effort_option):
+            logger.debug("adapter exposes no %r config option; skipping effort push", effort_option)
             return
         # Descend from the requested level through lower levels (e.g.
         # max → xhigh → high). Never escalate above what was asked.
         try:
             start = EFFORT_LEVELS.index(level)
         except ValueError:
-            await self._client.set_config_option(option_id, level)
+            await self._client.set_config_option(effort_option, level)
             return
         ladder = [lvl for lvl in reversed(EFFORT_LEVELS[: start + 1])]
         last_exc: Exception | None = None
         for candidate in ladder:
             try:
-                await self._client.set_config_option(option_id, candidate)
+                await self._client.set_config_option(effort_option, candidate)
                 if candidate != level:
                     logger.info(
                         "CC effort %r unsupported by model %s — applied %r instead",
@@ -1247,13 +1408,12 @@ class AcpProvider(LLMProvider):
                     )
                 return
             except AcpError as exc:
-                msg = str(exc)
-                if "unknown config option" in msg.lower():
+                if "unknown config option" in str(exc).lower():
                     # Adapter has no effort option at all (older build) —
                     # nothing to set; skip silently rather than reset.
-                    logger.debug("adapter rejected %r as unknown; skipping", option_id)
+                    logger.debug("adapter rejected %r as unknown; skipping", effort_option)
                     return
-                if f"config option {option_id}" not in msg:
+                if not _is_config_value_rejection(exc, effort_option):
                     raise  # not a value-rejection — a real failure
                 last_exc = exc
                 continue
@@ -1290,8 +1450,11 @@ class AcpProvider(LLMProvider):
         # An adapter build may advertise no 'effort' config option; attempting to
         # push would fail with 'Unknown config option' and reset the session.
         # Report unsupported so the dashboard leaves the UI as-is.
-        if via_config_option and not self._client.supports_config_option("effort"):
-            logger.info("change_effort skipped — adapter build exposes no 'effort' option")
+        _effort_option = effort_config_option_id(self._client.backend)
+        if via_config_option and not self._client.supports_config_option(_effort_option):
+            logger.info(
+                "change_effort skipped — adapter build exposes no %r option", _effort_option
+            )
             return False
         # Accept any level the dynamic validation set knows about — ACP backends
         # can report levels beyond the canonical five (effort.py), and those are
@@ -1385,7 +1548,39 @@ class AcpProvider(LLMProvider):
         logger.info("ACP effort cleared (kiro); session reset needed for built-in default")
         return False
 
+    async def prepare_private_memory(self) -> None:
+        """Resolve the trusted process fence before allocation or direct startup."""
+        if self._private_memory_prepared:
+            return
+        from kiro_crew.member_memory_auth import (
+            private_memory_store_for_session,
+            require_private_memory_mcp_backend,
+        )
+
+        store = (
+            await asyncio.to_thread(
+                private_memory_store_for_session, self._private_memory_session_key
+            )
+            if self._private_memory_session_key
+            else ""
+        )
+        # An explicitly trusted private constructor must never lose its fence.
+        # Factory extra kwargs cannot supply this decision; the factory ignores
+        # them and this read derives identity from protected session state.
+        private_memory = self._private_memory or bool(store)
+        if private_memory:
+            require_private_memory_mcp_backend(self._client.backend)
+        # The worker only reads. Publish flags and routing together on the loop,
+        # after validation, so cancellation cannot leave a partly prepared client.
+        self._private_memory = private_memory
+        self._client._private_memory = private_memory
+        if private_memory:
+            self._client._mcp_gateway_overlay = None
+            self._client._mcp_gateway_socket = None
+        self._private_memory_prepared = True
+
     async def start(self) -> None:
+        await self.prepare_private_memory()
         # Re-apply the overlay on every (re)start to cover resume / model swap.
         # (no-op for claude backend — that path applies effort live below.)
         self._apply_effort_overlay()
@@ -1404,14 +1599,27 @@ class AcpProvider(LLMProvider):
         await self._apply_initial_effort()
 
     async def _apply_initial_effort(self) -> None:
-        """Apply the resolved effort to a fresh session that takes it live.
+        """Apply the resolved effort to a fresh session on the config-option channel.
 
-        Gated on ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` membership rather
-        than on "not kiro": the adapters in that set take effort only through a
-        live ``session/set_config_option`` after the session is ready, while the
-        kiro family reads it from the cli.json overlay at spawn and a harness in
-        neither set has no live effort channel to push into at all. Best-effort:
-        an unsupported model or option must not break session start.
+        claude-agent-acp does NOT read ``CLAUDE_CODE_EFFORT_LEVEL`` from the
+        environment — effort only takes hold via settings.json files or a live
+        ``session/set_config_option``. So for the claude backend we push the
+        resolved level once after the session is ready. Best-effort: a model
+        that does not support effort, or an adapter that rejects the value,
+        must not break session start.
+
+        Gated on ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` -- the set that names
+        the CHANNEL -- rather than on ``is_acp_runtime_backend``, for the reason
+        harness-parity H6 gives: which harnesses take effort over
+        ``session/set_config_option`` is a fact the table already holds, and
+        "runs on the shared runtime" is a different fact. The kiro family is
+        outside the channel set because it reads effort from the spawn-time
+        cli.json overlay instead, so it still skips the push; opencode is
+        outside it because its ``session/new`` advertises no ``effort`` option at
+        all. Reading the runtime answer here instead drops a codex session's
+        configured effort as soon as the preview switch puts codex on the
+        runtime, because codex IS in the channel set and takes effort no other
+        way.
         """
         if self._client.backend not in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION:
             return
@@ -1421,11 +1629,15 @@ class AcpProvider(LLMProvider):
         try:
             await self._set_effort_config_option(level)
             logger.info(
-                "ACP initial effort applied: model=%s effort=%s", self._client._model, level
+                "ACP initial effort applied: backend=%s model=%s effort=%s",
+                self._client.backend,
+                self._client._model,
+                level,
             )
         except Exception:
             logger.warning(
-                "ACP initial effort apply failed (model=%s effort=%s)",
+                "ACP initial effort apply failed (backend=%s model=%s effort=%s)",
+                self._client.backend,
                 self._client._model,
                 level,
                 exc_info=True,
@@ -1441,10 +1653,12 @@ class AcpProvider(LLMProvider):
             text=e.text,
             tool_call_id=e.tool_call_id,
             title=e.title,
+            wire_title=e.wire_title,
             tool_kind=e.tool_kind,
             tool_purpose=e.tool_purpose,
             context_usage_pct=e.context_usage_pct,
             stop_reason=e.stop_reason,
+            refusal=e.refusal,
             synthetic_completion=e.synthetic_completion,
             request_id=e.request_id,
             options=e.options,
@@ -1672,6 +1886,16 @@ class AcpProvider(LLMProvider):
     def is_process_alive(self) -> bool:
         """True if the underlying OS process has not exited (ignores I/O staleness)."""
         return self._client.is_process_alive()
+
+    @property
+    def process_instance(self) -> str:
+        """Per-spawn identity of the client's current child process (see base).
+
+        A direct read on purpose: a `getattr` hedge would convert a future
+        wiring break into "no banner is ever live", indistinguishable from
+        correct expiry.
+        """
+        return self._client.process_instance
 
     def has_active_turn(self) -> bool:
         """True if a prompt is in flight (and not yet cancelled) on the client."""

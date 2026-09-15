@@ -22,10 +22,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
-from chat_test_helpers import stub_acp_identity
 
 from kiro_crew.acp.client import AcpModelUnavailable
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO
+from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO
+from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.dashboard import chat_handlers as ch
 from kiro_crew.dashboard.chat_persistence import get_reasoning_effort_values
 from kiro_crew.dashboard.state import _MAX_PENDING_CONTEXT, DashboardState, _ChatSlot
@@ -66,15 +66,18 @@ def _app(state: DashboardState, method: str, path: str, handler) -> web.Applicat
     return app
 
 
-def _acp(backend=ACP_BACKEND_KIRO, **attrs):
+def _acp(*, backend=ACP_BACKEND_KIRO, **attrs):
     """An AcpProvider double that still satisfies ``isinstance``.
 
-    Defaults to the kiro-cli identity, stubbed as a SET: an unstubbed
-    ``spec=`` property answers a truthy Mock, so leaving the other ``is_*``
-    flags out would make this double claim to be every harness at once.
+    ``backend`` names which harness the double is talking to, and the double
+    carries the REAL capability record for it. ``_wire_model_id`` asks
+    ``SessionCapabilities.model_id_namespace`` rather than which backend it is, and
+    ``capabilities_of`` requires a genuine record -- a ``MagicMock(spec=...)``'s
+    attributes are all truthy, so an attribute-shaped flag would let the double
+    claim every capability at once.
     """
     provider = MagicMock(spec=AcpProvider)
-    stub_acp_identity(provider, backend)
+    provider.capabilities = capabilities_for(backend)
     provider.has_active_turn = MagicMock(return_value=False)
     provider.available_models = MagicMock(return_value=[])
     provider.supports_effort = MagicMock(return_value=False)
@@ -247,12 +250,13 @@ class TestHasConversation:
 
 class TestWireModelId:
     def test_claude_backend_cannot_express_default(self):
-        assert ch._wire_model_id(_acp(ACP_BACKEND_CLAUDE), "sonnet-4.5") == "sonnet-4.5"
-        assert ch._wire_model_id(_acp(ACP_BACKEND_CLAUDE), "") == ""
-        assert ch._wire_model_id(_acp(ACP_BACKEND_CLAUDE), "auto") == ""
+        claude = ACP_BACKEND_CLAUDE
+        assert ch._wire_model_id(_acp(backend=claude), "sonnet-4.5") == "sonnet-4.5"
+        assert ch._wire_model_id(_acp(backend=claude), "") == ""
+        assert ch._wire_model_id(_acp(backend=claude), "auto") == ""
 
     def test_claude_backend_translates_canonical_key(self):
-        wire = ch._wire_model_id(_acp(ACP_BACKEND_CLAUDE), "opus-4.8-1m")
+        wire = ch._wire_model_id(_acp(backend=ACP_BACKEND_CLAUDE), "opus-4.8-1m")
         assert wire == "global.anthropic.claude-opus-4-8[1m]"
 
     def test_kiro_default_needs_auto_to_be_advertised(self):
@@ -1012,13 +1016,94 @@ class TestSlotWorkspace:
             assert resp.status == 400
 
     @pytest.mark.asyncio
-    async def test_switch_is_refused_once_the_conversation_started(self):
+    async def test_switch_is_allowed_once_the_conversation_started(self):
+        # A started conversation switches rather than answering 409,
+        # because the transcript is workspace-independent -- only the live
+        # agent process is restarted, exactly as the sibling switches do.
         slot = _ChatSlot("s1")
         slot.workspace = "default"
         slot.total_messages = 3
-        status, body = await self._post(_state(slot), "s1", {"workspace": "other"})
+        state = _state(slot)
+        with patch(f"{MOD}._reset_slot_session", new=AsyncMock()) as reset:
+            with patch(f"{MOD}.default_project_dir", return_value="/tmp/ws-other"):
+                status, body = await self._post(state, "s1", {"workspace": "other"})
+
+        assert (status, body) == (200, {"ok": True, "workspace": "other"})
+        assert slot.workspace == "other"
+        assert slot.project == "/tmp/ws-other"
+        reset.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_op_switch_does_not_reset(self):
+        # Re-picking the workspace the slot already has changes nothing, so it
+        # must not tear the live session down.
+        slot = _ChatSlot("s1")
+        slot.workspace = "same-ws"
+        slot.project = "/tmp/ws-same"
+        slot.total_messages = 3
+        state = _state(slot)
+        with patch(f"{MOD}._reset_slot_session", new=AsyncMock()) as reset:
+            with patch(f"{MOD}.default_project_dir", return_value="/tmp/ws-same"):
+                status, body = await self._post(state, "s1", {"workspace": "same-ws"})
+
+        assert (status, body) == (200, {"ok": True, "workspace": "same-ws"})
+        reset.assert_not_awaited()
+        assert slot.project == "/tmp/ws-same"
+        assert slot._dirty is False
+
+    @pytest.mark.asyncio
+    async def test_switch_on_started_conversation_marks_the_slot_dirty(self):
+        # The periodic flush persists a slot's metadata only while _dirty is
+        # set. Without this a crash before the
+        # next message restores the OLD workspace over a switch the user saw
+        # succeed. Only reachable now that a started conversation may switch.
+        slot = _ChatSlot("s1")
+        slot.workspace = "default"
+        slot.total_messages = 3
+        slot._dirty = False
+        with patch(f"{MOD}._reset_slot_session", new=AsyncMock()):
+            with patch(f"{MOD}.default_project_dir", return_value="/tmp/ws-other"):
+                status, _ = await self._post(_state(slot), "s1", {"workspace": "other"})
+
+        assert status == 200
+        assert slot._dirty is True
+
+    @pytest.mark.asyncio
+    async def test_switch_refused_while_subagents_attached(self):
+        # The reset kills the runtime attached children run on, so the switch
+        # refuses like every sibling switch handler. Before the commit:
+        # workspace/project untouched.
+        slot = _ChatSlot("s1")
+        slot.workspace = "default"
+        slot.project = "/tmp/ws-default"
+        slot.total_messages = 3
+        state = _state(slot)
+        refusal = web.json_response(
+            {"error": "sub-agents are running", "code": "slot_subagents_running"}, status=409
+        )
+        with patch(f"{MOD}._subagents_attached_response", return_value=refusal) as probe:
+            with patch(f"{MOD}._reset_slot_session", new=AsyncMock()) as reset:
+                status, body = await self._post(state, "s1", {"workspace": "other"})
+
         assert status == 409
-        assert "new session" in body["error"]
+        assert body["code"] == "slot_subagents_running"
+        assert probe.call_args.args[3] == "slot_workspace"
+        reset.assert_not_awaited()
+        assert slot.workspace == "default"
+        assert slot.project == "/tmp/ws-default"
+
+    @pytest.mark.asyncio
+    async def test_non_string_workspace_is_400(self):
+        # With the message-count refusal lifted this value reaches
+        # `default_project_dir` and the slot header on a live conversation, so
+        # it is type-checked at the boundary (the sibling project handler's
+        # guard).
+        slot = _ChatSlot("s1")
+        slot.workspace = "default"
+        status, body = await self._post(_state(slot), "s1", {"workspace": {"evil": 1}})
+        assert status == 400
+        assert body["code"] == "invalid_workspace"
+        assert "string" in body["error"]
         assert slot.workspace == "default"
 
     @pytest.mark.asyncio

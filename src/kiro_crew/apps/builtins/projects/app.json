@@ -17,6 +17,13 @@
     "Keeps a history of past runs and their outcomes"
   ],
   "defaultEnabled": true,
+  "platform": {
+    "os": [
+      "macos",
+      "linux",
+      "windows"
+    ]
+  },
   "iconUrl": "/app-assets/projects/icon.svg",
   "heroImage": "/app-assets/projects/hero-light.svg",
   "heroImageDark": "/app-assets/projects/hero-dark.svg",

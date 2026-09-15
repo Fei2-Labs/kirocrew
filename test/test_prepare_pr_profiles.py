@@ -263,7 +263,7 @@ def test_charter_budgets_match_the_ci_workflows():
     )
 
     # The GPT lane's budget lives with the contract that applies it -- the
-    # shared review-core prompt (#5852) -- not in the workflow that splices it.
+    # shared review-core prompt -- not in the workflow that splices it.
     gpt_contract = (
         REPO_ROOT / ".github" / "review-prompts" / "gpt-review-core.md"
     ).read_text(encoding="utf-8")
@@ -283,17 +283,28 @@ def test_charter_budgets_match_the_ci_workflows():
 
 
 def _ci_workflow_run_text() -> str:
-    """ci.yml with comment-only lines removed.
+    """Every blocking CI workflow, with comment-only lines removed.
 
     Every scan here matches a COMMAND, never a comment. ci.yml explains in
     prose why the Type check step uses `tsc -b` and not `npm run typecheck`,
     so a naive grep for `npm run <script>` finds a script CI deliberately does
     NOT run -- the same trap as reading a ratchet number out of a comment.
+
+    Both blocking workflows are read, not just ci.yml. The cheap lint gates now
+    live in fast-gate.yml and ci.yml blocks on it through `await-fast-gate`, so a
+    gate in either one is a gate CI enforces and the floor must mirror. Reading
+    ci.yml alone silently dropped eleven jobs' worth of gates out of this scan's
+    view, which is the exact rot this test exists to catch.
     """
-    text = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    return "\n".join(
-        line for line in text.splitlines() if not line.lstrip().startswith("#")
-    )
+    parts = []
+    for name in ("ci.yml", "fast-gate.yml"):
+        text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        parts.append(
+            "\n".join(
+                line for line in text.splitlines() if not line.lstrip().startswith("#")
+            )
+        )
+    return "\n".join(parts)
 
 
 def test_every_floor_command_names_a_real_target():
@@ -335,6 +346,12 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     # future blocking CI check disappear from later prepare-pr passes.
     floor = "\n".join(data["gates"])
 
+    # CI-only capability gate: "Require real FAISS edit invalidation regressions"
+    # installs an optional native accelerator in an isolated Linux venv and
+    # requires all four versioned cases to pass. The local scoped-test gate
+    # retains those tests with their declared capability skips; prepare-pr does
+    # not provision optional native runtimes, just as it does not grant Linux
+    # namespaces or supply the Darwin kernel. Its absence is not FAISS evidence.
     exempt_scripts = {
         # Chooses WHICH tests to run for the changed surface; not itself a gate.
         "scripts/ci-surface-tests.py",
@@ -352,12 +369,34 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         # Invoked BY packaging/build-desktop.sh to write the beacon provenance
         # module, never standalone. Gating on it would gate on the build script.
         "scripts/stamp-distribution.sh",
+        # Optional synthetic Qwen measurement, not a blocking score gate. The
+        # bounded CI step records unavailable evidence on failure; local
+        # prepare-pr must not download a model or claim a calibration score.
+        "scripts/ci-member-memory-benchmark.py",
     }
 
     invoked = set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", run_text))
+    # The scan must actually see the gates that live in fast-gate.yml. If a
+    # rename or a further workflow split drops them out of `run_text`, every
+    # assertion below passes by measuring nothing -- green because it looked at
+    # an empty set, which is indistinguishable from green because the floor is
+    # complete. Name a few of the moved gates outright so that silence fails.
+    moved_to_fast_gate = {
+        "scripts/verify_vendor_manifest.py",
+        "scripts/check_brand_name.py",
+        "scripts/docs_lint.py",
+    }
+    assert moved_to_fast_gate <= invoked, (
+        "these gates are no longer visible to this scan: "
+        f"{sorted(moved_to_fast_gate - invoked)}. They ran in ci.yml, then moved to "
+        "fast-gate.yml; if they have moved again, add that workflow to "
+        "_ci_workflow_run_text() -- otherwise this test silently stops checking the "
+        "floor against them."
+    )
+
     missing = sorted(s for s in invoked - exempt_scripts if s not in floor)
     assert not missing, (
-        "ci.yml runs these scripts but the prepare-pr floor does not: "
+        "ci.yml/fast-gate.yml run these scripts but the prepare-pr floor does not: "
         f"{missing}. Add them to profiles/kirocrew.json gates[] in their "
         "CI-exact form, or exempt them here with a reason."
     )
@@ -698,7 +737,7 @@ def test_symlinked_config_is_refused(tmp_path):
 # TreeReader interface parity
 # --------------------------------------------------------------------------
 def test_tree_reader_worktree_and_pinned_parity(tmp_path):
-    """#6236: WorktreeReader and PinnedTreeReader share the TreeReader contract."""
+    """WorktreeReader and PinnedTreeReader share the TreeReader contract."""
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)

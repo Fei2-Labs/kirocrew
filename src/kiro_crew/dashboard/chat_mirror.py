@@ -18,6 +18,7 @@ back to normal dashboard-token + CSRF auth. They must NOT be added to the strict
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 from typing import Any
@@ -25,13 +26,18 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.constants import strip_control_comments
 from kiro_crew.dashboard.chat_backfill import (
     backfill_content,
     gap_summary,
     select_backfill_messages,
     session_deep_link,
 )
-from kiro_crew.dashboard.chat_runner import _resolve_channel_target, _resolve_mirror_target
+from kiro_crew.dashboard.chat_runner import (
+    _authorize_recipient,
+    _resolve_channel_target,
+    _resolve_mirror_target,
+)
 from kiro_crew.dashboard.chat_slack import list_slack_channels
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.state import DashboardState
@@ -96,23 +102,32 @@ async def api_channel_targets(request: web.Request) -> web.Response:
     return web.json_response(targets)
 
 
-def _resumes_inbound(transport: Any) -> bool:
-    """Does a binding on this transport actually route replies back to the session?
+def _resumes_inbound(
+    transport: Any,
+    conversation_id: str,
+    thread_id: str | None,
+) -> bool:
+    """Whether this resolved target may route replies back to the session.
 
-    Only a transport whose inbound path resolves the mirror binding may claim
-    ``accepts_inbound``. Discord's dispatcher looks the conversation up; the
-    others build a session key from the route and never consult the binding, so
-    a reply there runs in a SEPARATE session no matter what the binding says.
-    Claiming inbound for them would not make replies come back — it would only
-    make the dashboard say they do, and the slot row would report
-    ``direction: both`` on a promise nothing keeps.
-
-    Reads the capability rather than testing ``channel_type == "discord"``, so a
-    transport earns the claim by declaring it next to its own inbound path. The
-    ``getattr`` chain is the conservative branch: a transport with no capability
-    object at all degrades to outbound-only.
+    The capability proves the transport has an inbound binding resolver. The
+    transport's target hook then applies roster- and topology-specific ownership
+    policy; Telegram, for example, permits only its single configured owner DM.
+    A missing hook keeps legacy test doubles capability-driven, while a real hook
+    error fails closed to outbound-only.
     """
-    return bool(getattr(getattr(transport, "capabilities", None), "supports_session_resume", False))
+    capable = bool(
+        getattr(getattr(transport, "capabilities", None), "supports_session_resume", False)
+    )
+    if not capable:
+        return False
+    check = getattr(transport, "may_resume_from", None)
+    if not callable(check):
+        return True
+    try:
+        return bool(check(conversation_id, thread_id))
+    except Exception:
+        logger.warning("mirror-link: target resume policy failed", exc_info=True)
+        return False
 
 
 async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
@@ -246,13 +261,23 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
     # conversation (for example, Discord creates a DM channel). Re-enter the
     # shared fail-closed governance ladder before that network side effect,
     # including when a profile changed after the transport connected.
+    #
+    # check_recipient=False, deliberately: this provisional link carries the
+    # configured-target SPELLING (``user:<id>``), not a conversation id, and
+    # ``may_send_to`` is a recipient predicate over conversation ids — the
+    # prefixed spelling can never match a roster of bare ids, so the recipient
+    # question is unanswerable at this point. Channel-scope governance and
+    # transport capability still run HERE, before the resolve's side effect;
+    # the recipient leg is decided below, against the resolved conversation id.
     provisional_link = ChannelLink(
         channel_type=channel_type,
         channel_id=target_id,
         thread_id=thread_id,
     )
     governed = await asyncio.to_thread(
-        _resolve_channel_target, state, session_key, provisional_link
+        functools.partial(
+            _resolve_channel_target, state, session_key, provisional_link, check_recipient=False
+        )
     )
     if governed is None:
         return web.json_response(
@@ -284,11 +309,44 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         )
     conversation_id, thread_id = resolved
 
+    # Recipient authorization, decided against the RESOLVED conversation id —
+    # the leg the pre-resolve ladder call above skipped (check_recipient=False),
+    # because only now does an id of the kind ``may_send_to`` judges exist. One
+    # shared spelling: ``_authorize_recipient`` is the exact function the
+    # ladder's own recipient leg runs, so the two paths cannot drift. The
+    # principal comes from the target spelling, the posture
+    # ``handlers/messaging._deliver_channel_dm`` established for a ``user:<id>``
+    # target: the id came off the transport's own allow-list (the resolver just
+    # enforced membership), which is the authoritative answer a session-key
+    # derivation cannot reach here — a dashboard key names no channel peer. A
+    # non-``user:`` target (Webex ``room:``, Discord ``thread:``) names no single
+    # principal, and the empty string tells the transport so rather than handing
+    # a room id to a check that tests user rosters.
+    #
+    # audit_allowed=True: this decision admits a recipient once per link, sits
+    # beside the resolver's both-outcome audit, and the SEL trail must show the
+    # authorization that admitted the recipient, not only refusals.
+    target_kind, target_sep, target_value = target_id.partition(":")
+    recipient_principal = target_value if (target_sep and target_kind == "user") else ""
+    if not _authorize_recipient(
+        transport,
+        channel_type,
+        conversation_id,
+        thread_id,
+        principal=recipient_principal,
+        session_key=session_key,
+        audit_allowed=True,
+    ):
+        return web.json_response(
+            {"error": "channel is not permitted", "code": "channel_not_permitted"}, status=403
+        )
+
     link = ChannelLink(
         channel_type=channel_type,
         channel_id=conversation_id,
         thread_id=thread_id,
     )
+    accepts_inbound = _resumes_inbound(transport, conversation_id, thread_id)
 
     # Refuse an occupied conversation BEFORE anything is posted into it. The
     # authoritative check is the atomic one inside ``set_mirror_link`` at the
@@ -313,7 +371,7 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
     # refusal would look like a real conflict. Only an actual list is an answer.
     try:
         rivals = state.sessions.mirror_claim_blockers(
-            session_key, link, accepts_inbound=_resumes_inbound(transport)
+            session_key, link, accepts_inbound=accepts_inbound
         )
     except Exception:
         logger.debug("mirror-link: occupancy precheck unavailable", exc_info=True)
@@ -335,11 +393,153 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             status=409,
         )
 
+    # Claim the binding BEFORE anything is posted into the conversation.
+    #
+    # The notice announces a link that does not exist yet, and the catch-up
+    # transcript after it is delivered one message at a time against the
+    # transport's rate limit — Telegram is roughly one per second — so the gap
+    # between the announcement and the claim is as many seconds as there are
+    # backfill messages, not an instant. An inbound reply arriving in it resolves
+    # no binding and runs in the channel's NATIVE session: the very session the
+    # notice just said the user had left, with none of this transcript.
+    #
+    # Claiming first is what this module's own precheck reasoning argues for — a
+    # binding can be unwound, posted messages cannot — so the unwindable half goes
+    # first and every failure path below releases it. The prior state is captured
+    # rather than assumed, because linking is also how an EXISTING mirror is
+    # rebound: a failed rebind must leave the old binding exactly as it was, not
+    # unlink the session.
+    previous_link = state.sessions.get_mirror_link(session_key)
+    previous_inbound = False
+    if previous_link is not None:
+        try:
+            previous_inbound = session_key in state.sessions.find_mirror_sessions(
+                previous_link, inbound_only=True
+            )
+        except Exception:
+            logger.debug("mirror-link: could not read the prior inbound flag", exc_info=True)
+    previous_opt_out: bool | None
+    try:
+        # Off the loop: this READ writes. On a legacy row ``mirror_opt_out``
+        # promotes it inside ``batched_save``, which rewrites the whole map file —
+        # the same synchronous stall the claim below is offloaded to avoid.
+        previous_opt_out = bool(await asyncio.to_thread(state.sessions.mirror_opt_out, session_key))
+    except Exception:
+        # UNKNOWN, not False. A failed read must not mutate state: defaulting here
+        # would let the rollback below write an opt-out the user never chose,
+        # silently clearing a standing refusal to mirror. Unknown means the
+        # rollback leaves that flag alone.
+        logger.debug("mirror-link: could not read the prior opt-out", exc_info=True)
+        previous_opt_out = None
+
+    def _claim_binding() -> None:
+        # Off the loop, and one critical section: ``batched_save`` holds the map
+        # lock across the block and rewrites the whole map file on the way out, so
+        # on the loop this write stalls every other task. Await-free by
+        # construction, because the lock is per-thread reentrant.
+        with state.sessions.batched_save():
+            # The LINK first, deliberately. ``set_mirror_link`` is the call that can
+            # refuse (``ConversationOwnershipConflict``), and it refuses before
+            # mutating, so ordering it first means a refused claim leaves nothing
+            # behind. Withdrawing the opt-out first would flip a standing refusal
+            # for a link that never happened. Both writes share this one critical
+            # section and one file write, so the order costs nothing.
+            state.sessions.set_mirror_link(
+                session_key,
+                link,
+                # Mark the binding inbound-capable only where the transport's
+                # inbound path actually resolves it. Without this the connect
+                # writes an outbound-only binding, ``resumed_session`` skips it,
+                # and the user's reply starts a brand-new session with none of
+                # this transcript.
+                accepts_inbound=accepts_inbound,
+            )
+            # An explicit bind is explicit intent to mirror, so it withdraws any
+            # standing refusal of the AUTOMATIC bind. Without this the two
+            # disagree: a channel that re-asserts its own conversation every turn
+            # would keep declining while the user is looking at a link they just
+            # made, and a later automatic pass would have to guess which of the
+            # two the user meant.
+            state.sessions.set_mirror_opt_out(session_key, False)
+
+    def _release_binding() -> None:
+        with state.sessions.batched_save():
+            # Conditional, and the check shares this critical section with the
+            # writes below so it cannot go stale between them. A rebind — from the
+            # dashboard, another channel, or a second link request — may have landed
+            # between the claim and this failure, and it takes no lock of ours. Undo
+            # only while the binding is still THIS request's claim; anything newer is
+            # deliberate state and outranks a stale restore, the opt-out included.
+            if state.sessions.get_mirror_link(session_key) != link:
+                logger.info(
+                    "mirror-link: leaving a newer binding for %s in place after a failed link",
+                    session_key,
+                )
+                return
+            if previous_opt_out is not None:
+                state.sessions.set_mirror_opt_out(session_key, previous_opt_out)
+            if previous_link is None:
+                state.sessions.clear_mirror_link(session_key, reason=UNBIND_REASON_DASHBOARD_UNLINK)
+            else:
+                state.sessions.set_mirror_link(
+                    session_key,
+                    previous_link,
+                    accepts_inbound=previous_inbound,
+                    reason=UNBIND_REASON_DASHBOARD_UNLINK,
+                )
+
+    async def _release_after_failure() -> None:
+        """Undo the claim, best-effort: the caller is already returning an error."""
+        try:
+            await asyncio.to_thread(_release_binding)
+        except Exception:
+            logger.warning(
+                "mirror-link: could not release the claim for %s after a failed link",
+                session_key,
+                exc_info=True,
+            )
+
+    try:
+        await asyncio.to_thread(_claim_binding)
+    except ConversationOwnershipConflict:
+        # The precheck above covers the common case; this is the genuine race —
+        # someone claimed the conversation while this request was resolving. Report
+        # the same conflict rather than a 500, so the client offers "unlink there
+        # first" instead of inviting a retry of a request that is behaving
+        # correctly. Nothing has been posted, so there is nothing to take back.
+        logger.info("mirror-link refused: conversation claimed before the notice")
+        sel().log_api_access(
+            caller="dashboard",
+            operation="chat.mirror_link",
+            outcome="denied",
+            source="dashboard",
+            resources=f"{slot.key} -> {channel_type}:{conversation_id} (raced)",
+        )
+        return web.json_response(
+            {
+                "error": "another session claimed this conversation",
+                "code": "conversation_occupied",
+            },
+            status=409,
+        )
+    except Exception:
+        # A batch mutates memory inside the block and writes the file on the way
+        # OUT, so a failed write leaves a binding that is live but not durable:
+        # inbound routing would resolve a session whose link no restart can
+        # recover. Put the pre-claim state back and fail with a controlled error
+        # rather than letting the 500 leave that binding standing.
+        logger.warning("mirror-link: the claim for %s did not persist", session_key, exc_info=True)
+        await _release_after_failure()
+        return web.json_response(
+            {"error": "failed to create channel link", "code": "channel_link_failed"}, status=502
+        )
+
     try:
         # Recheck at the actual send boundary as well: target resolution can
         # yield while governance is updated.
         governed = await asyncio.to_thread(_resolve_channel_target, state, session_key, link)
         if governed is None:
+            await _release_after_failure()
             return web.json_response(
                 {"error": "channel is not permitted", "code": "channel_not_permitted"}, status=403
             )
@@ -351,6 +551,7 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         )
     except Exception:
         logger.debug("mirror-link initial delivery failed", exc_info=True)
+        await _release_after_failure()
         return web.json_response(
             {"error": "failed to create channel link", "code": "channel_link_failed"}, status=502
         )
@@ -381,7 +582,9 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         # without passing a renderer, so a markdown-collapse credential would be
         # reassembled whole by the client. Same floor and same context-aware
         # redactor as the live legs in ``chat_runner``.
-        text, _ = redact_for_display(backfill_content(row), redact_via_context)
+        text, _ = redact_for_display(
+            strip_control_comments(backfill_content(row)), redact_via_context
+        )
         return split_markdown_safe(f"{speaker}: {text}", max_chars)
 
     # Bound the INLINE delivery. Unlike the Slack drain this cannot be
@@ -466,11 +669,11 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             # Stop immediately if policy narrows while the loop is yielding.
             governed = await asyncio.to_thread(_resolve_channel_target, state, session_key, link)
             if governed is None:
-                # Policy narrowed mid-delivery: fail closed. Do NOT fall
-                # through to set_mirror_link (which would persist a link the
-                # latest governance decision denied) and do NOT report
-                # success. The denial is already SEL-audited inside
+                # Policy narrowed mid-delivery: fail closed. Release the claim so
+                # no binding outlives the latest governance decision, and do NOT
+                # report success. The denial is already SEL-audited inside
                 # _resolve_channel_target via vet_and_audit.
+                await _release_after_failure()
                 return web.json_response(
                     {"error": "channel is not permitted", "code": "channel_not_permitted"},
                     status=403,
@@ -484,46 +687,6 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         except Exception:
             logger.debug("mirror-link context delivery failed", exc_info=True)
 
-    try:
-        with state.sessions.batched_save():
-            # An explicit bind is explicit intent to mirror, so it withdraws any
-            # standing refusal of the AUTOMATIC bind. Without this the two
-            # disagree: a channel that re-asserts its own conversation every turn
-            # would keep declining while the user is looking at a link they just
-            # made, and a later automatic pass would have to guess which of the
-            # two the user meant.
-            state.sessions.set_mirror_opt_out(session_key, False)
-            state.sessions.set_mirror_link(
-                session_key,
-                link,
-                # Mark the binding inbound-capable only where the transport's
-                # inbound path actually resolves it. Without this the connect
-                # writes an outbound-only binding, ``resumed_session`` skips it,
-                # and the user's reply starts a brand-new session with none of
-                # this transcript.
-                accepts_inbound=_resumes_inbound(transport),
-            )
-    except ConversationOwnershipConflict:
-        # The precheck above covers the common case; this is the genuine race —
-        # someone claimed the conversation while we were delivering. Report the
-        # same conflict rather than a 500, so the client offers "unlink there
-        # first" instead of inviting a retry of a request that is behaving
-        # correctly.
-        logger.info("mirror-link refused: conversation claimed during delivery")
-        sel().log_api_access(
-            caller="dashboard",
-            operation="chat.mirror_link",
-            outcome="denied",
-            source="dashboard",
-            resources=f"{slot.key} -> {channel_type}:{conversation_id} (raced)",
-        )
-        return web.json_response(
-            {
-                "error": "another session claimed this conversation",
-                "code": "conversation_occupied",
-            },
-            status=409,
-        )
     sel().log_api_access(
         caller="dashboard",
         operation="chat.mirror_link",

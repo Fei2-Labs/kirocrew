@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -202,17 +203,11 @@ def test_the_launch_config_is_write_protected_from_the_agent(
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
     path = str(mod.launch_config_path())
 
-    # 1. the file-edit gate
+    # The file-edit gate. The shell gate matches no paths in command text, and the
+    # sandbox keeps this leaf VISIBLE on purpose (the CLI opens it on every
+    # invocation), so a shell write is the accepted residual: the agent can already
+    # point PLAYWRIGHT_MCP_CONFIG at a file of its own.
     assert security.is_sensitive_write_path(path) is True
-    # 2. the shell gate, across the spellings it does cover
-    for command in (
-        "echo x > ~/.kiro/crew/playwright-cli-config.json",
-        "echo x > $HOME/.kiro/crew/playwright-cli-config.json",
-        "echo x > ~/.kirocrew/playwright-cli-config.json",  # legacy data home
-        "tee ~/.kiro/crew/playwright-cli-config.json",
-        "cp /tmp/evil.json ~/.kiro/crew/playwright-cli-config.json",
-    ):
-        assert security.is_sensitive_bash_command(command) is not None, command
     # Readable through Python: the CLI opens it on every invocation.
     assert security.is_sensitive_path(path) is False
 
@@ -220,15 +215,9 @@ def test_the_launch_config_is_write_protected_from_the_agent(
 def test_launch_config_shell_protection_matches_an_existing_protected_leaf() -> None:
     """The shell gate treats this leaf exactly as it treats a long-standing one.
 
-    Parity is the honest assertion, and the durable one. The leaf is deliberately
-    ANCHORED rather than bare-token: per the scope note on
-    ``_BARE_TOKEN_PROTECTED_LEAVES``, a leaf earns anchor-independent matching only
-    when the filename IS the grant, and here it is not -- the agent can point
-    ``PLAYWRIGHT_MCP_CONFIG`` at a file of its own. So a ``cd``-relative write is
-    the accepted residual, exactly as it is for the on-call schedule.
-
-    Asserting parity is what protects the invariant: it fails if someone protects
-    one leaf and not the other, and it does not pretend a gap is closed.
+    Parity is the honest assertion, and the durable one: the gate matches no paths
+    in command text, so neither leaf is refused there, and this fails the moment
+    someone fences one of the two by text without the other.
     """
     from kiro_crew import security
 
@@ -241,9 +230,7 @@ def test_launch_config_shell_protection_matches_an_existing_protected_leaf() -> 
         "tee ~/.kiro/crew/{leaf}",
         "cd ~/.kiro/crew && printf x > {leaf}",
     ):
-        assert (
-            security.is_sensitive_bash_command(form.format(leaf=ours)) is not None
-        ) == (
+        assert (security.is_sensitive_bash_command(form.format(leaf=ours)) is not None) == (
             security.is_sensitive_bash_command(form.format(leaf=existing)) is not None
         ), form
 
@@ -390,7 +377,7 @@ def test_browser_socket_env_prepares_stable_owner_only_dirs(
     monkeypatch.setattr(mod, "socket_dir", lambda _session, _base=None: sockets)
     monkeypatch.setattr(mod, "daemon_dir", lambda _session, _base=None: daemons)
     monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
-    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
     monkeypatch.setattr(
         mod.platform_compat, "make_owner_only_dir", lambda path: prepared.append(Path(path))
     )
@@ -414,7 +401,7 @@ def test_browser_socket_env_namespaces_configured_bases(
     )
     monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
     monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
-    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
 
     env = {
         mod.SESSION_ENV: "kc-a1b2c3d4",
@@ -431,13 +418,122 @@ def test_browser_socket_env_namespaces_configured_bases(
     ]
 
 
+def test_browser_socket_env_ignores_an_inherited_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root already under ours arrived by inheritance, not by intent.
+
+    Both spawn sites build the child env from ``{**os.environ, ...}``, so a
+    gateway started from inside an agent process passes its own lifecycle roots
+    down. Namespacing under them nested every session one level deeper inside
+    the parent's root instead of beside it.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr(mod, "config_dir", lambda: home)
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", lambda _path: None)
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
+    root = home / mod._LIFECYCLE_DIR
+
+    env = {
+        mod.SESSION_ENV: "kc-a1b2c3d4",
+        # what a parent agent process exports
+        mod.SOCKETS_ENV: str(root / "deadbeef" / "s"),
+        mod.DAEMON_DIR_ENV: str(root / "deadbeef" / "d"),
+    }
+    assert mod.browser_socket_env(env) == {
+        mod.SOCKETS_ENV: str(root / "a1b2c3d4" / "s"),
+        mod.DAEMON_DIR_ENV: str(root / "a1b2c3d4" / "d"),
+    }
+
+
+def test_nesting_cannot_deepen_however_long_the_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The end-to-end property: depth stays 1, so the AF_UNIX budget is fixed.
+
+    Feeding each generation's output back in as the next generation's
+    environment is what a gateway-inside-an-agent-inside-a-gateway does.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr(mod, "config_dir", lambda: home)
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", lambda _path: None)
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
+    root = home / mod._LIFECYCLE_DIR
+
+    env = {mod.SESSION_ENV: "kc-00000000"}
+    for generation in range(6):
+        env = {mod.SESSION_ENV: f"kc-0000000{generation}", **mod.browser_socket_env(env)}
+        socket_root = Path(env[mod.SOCKETS_ENV])
+        assert socket_root.parent.parent == root, f"generation {generation} nested"
+        assert len(socket_root.relative_to(root).parts) == 2
+
+
+def test_a_foreign_configured_root_is_still_honoured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard must not cost an operator their deliberate override."""
+    home = tmp_path / "home"
+    elsewhere = tmp_path / "operator-chosen"
+    monkeypatch.setattr(mod, "config_dir", lambda: home)
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", lambda _path: None)
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
+
+    env = {mod.SESSION_ENV: "kc-a1b2c3d4", mod.SOCKETS_ENV: str(elsewhere)}
+    additions = mod.browser_socket_env(env)
+    assert additions[mod.SOCKETS_ENV] == str(elsewhere / "a1b2c3d4" / "s")
+    # the unset sibling still falls to the default root
+    assert additions[mod.DAEMON_DIR_ENV] == str(home / mod._LIFECYCLE_DIR / "a1b2c3d4" / "d")
+
+
+def test_browser_socket_env_ignores_an_inherited_root_from_another_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trigger flows change ``KIROCREW_HOME``, so identity would miss them.
+
+    ``dev-backend.sh`` exports its own ``KIROCREW_HOME`` and a pod runs an
+    isolated one, so the inherited root sits under the PARENT's home. Testing
+    location against the child's own ``config_dir()`` would read that as a
+    foreign operator base and keep nesting -- and it would also let a pod write
+    its sockets outside its isolated home. Recognition is by shape instead.
+    """
+    parent_home = tmp_path / "parent-home"
+    child_home = tmp_path / "pod-home"
+    monkeypatch.setattr(mod, "config_dir", lambda: child_home)
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", lambda _path: None)
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
+    parent_root = parent_home / mod._LIFECYCLE_DIR
+
+    env = {
+        mod.SESSION_ENV: "kc-a1b2c3d4",
+        mod.SOCKETS_ENV: str(parent_root / "deadbeef" / "s"),
+        mod.DAEMON_DIR_ENV: str(parent_root / "deadbeef" / "d"),
+    }
+    additions = mod.browser_socket_env(env)
+
+    child_root = child_home / mod._LIFECYCLE_DIR
+    assert additions == {
+        mod.SOCKETS_ENV: str(child_root / "a1b2c3d4" / "s"),
+        mod.DAEMON_DIR_ENV: str(child_root / "a1b2c3d4" / "d"),
+    }
+    # and nothing was written into the parent's home
+    assert parent_home not in Path(additions[mod.SOCKETS_ENV]).parents
+
+
 def test_browser_socket_env_fails_without_partial_additions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def _fail(_path: Path) -> None:
         raise OSError("no space")
 
-    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
     monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", _fail)
 
     assert mod.browser_socket_env({mod.SESSION_ENV: "kc-a1b2c3d4"}) == {}
@@ -448,7 +544,7 @@ def test_browser_socket_env_refuses_an_overlong_unix_root(
 ) -> None:
     long_root = tmp_path / ("x" * 100)
     monkeypatch.setattr(mod, "socket_dir", lambda _session, _base=None: long_root)
-    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
     monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
 
     assert mod.browser_socket_env({mod.SESSION_ENV: "kc-a1b2c3d4"}) == {}
@@ -461,7 +557,7 @@ def test_browser_socket_env_refuses_non_generated_session() -> None:
 def test_browser_socket_env_fails_back_when_upstream_contract_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: False)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.UNSUPPORTED, ""))
     # No lifecycle directory may be created when the installed CLI does not
     # prove it honors both environment variables.
     called: list[Path] = []
@@ -478,7 +574,7 @@ def test_browser_socket_env_fails_back_when_upstream_contract_is_missing(
 def test_browser_socket_env_refuses_relative_configured_roots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
     env = {
         mod.SESSION_ENV: "kc-a1b2c3d4",
         mod.SOCKETS_ENV: "relative/sockets",
@@ -486,3 +582,226 @@ def test_browser_socket_env_refuses_relative_configured_roots(
     }
 
     assert mod.browser_socket_env(env) == {}
+
+
+def _lifecycle_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_an_unverified_seam_warns_about_attribution_not_capability(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing about the CLI was measured, so nothing may be claimed about it.
+
+    The warning has to carry the launcher it could not attribute and the remedy
+    for that, because a capability claim here sends the operator to upgrade a CLI
+    whose bundles already carry both hooks.
+    """
+    monkeypatch.setattr(mod, "_warned_lifecycle_losses", set())
+    monkeypatch.setattr(
+        mod,
+        "cli_lifecycle_env_support",
+        lambda: (
+            mod.SeamSupport.UNVERIFIED,
+            "no @playwright/cli package directory is attributable to the resolved "
+            "launcher /opt/shims/playwright-cli",
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        assert mod.browser_socket_env({mod.SESSION_ENV: "kc-a1b2c3d4"}) == {}
+
+    assert len(_lifecycle_warnings(caplog)) == 1
+    message = _lifecycle_warnings(caplog)[0]
+    assert "could not verify" in message
+    assert "/opt/shims/playwright-cli" in message
+    assert mod.ATTRIBUTION_REMEDY in message
+    assert "does not expose" not in message
+
+
+def test_a_measured_missing_hook_still_names_the_installed_cli(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Both bundles were read and a hook is gone: the capability claim is earned."""
+    monkeypatch.setattr(mod, "_warned_lifecycle_losses", set())
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.UNSUPPORTED, ""))
+
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        assert mod.browser_socket_env({mod.SESSION_ENV: "kc-a1b2c3d4"}) == {}
+
+    message = _lifecycle_warnings(caplog)[0]
+    assert "installed playwright-cli does not expose" in message
+    assert "could not verify" not in message
+
+
+def test_one_line_per_distinct_reason_not_one_per_session_start(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The gate runs on every session start; a repeat of the SAME reason is noise.
+
+    A reason that CHANGED is a different host state and must still be reported.
+    """
+    monkeypatch.setattr(mod, "_warned_lifecycle_losses", set())
+    verdicts = [
+        (mod.SeamSupport.UNVERIFIED, "reason one"),
+        (mod.SeamSupport.UNVERIFIED, "reason one"),
+        (mod.SeamSupport.UNVERIFIED, "reason two"),
+    ]
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: verdicts.pop(0))
+
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        for _ in range(3):
+            assert mod.browser_socket_env({mod.SESSION_ENV: "kc-a1b2c3d4"}) == {}
+
+    messages = _lifecycle_warnings(caplog)
+    assert len(messages) == 2
+    assert "reason one" in messages[0]
+    assert "reason two" in messages[1]
+
+
+# ── ui_socket_env: the root the gateway's OWN CLI children share ──────────────
+
+
+def test_ui_socket_env_reports_an_unverified_reason(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    detail = "launcher /opt/shims/playwright-cli is not attributable"
+    monkeypatch.setattr(mod, "_warned_lifecycle_losses", set())
+    monkeypatch.setattr(
+        mod,
+        "cli_lifecycle_env_support",
+        lambda: (mod.SeamSupport.UNVERIFIED, detail),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        assert mod.ui_socket_env({}) == {}
+
+    messages = _lifecycle_warnings(caplog)
+    assert len(messages) == 1
+    assert detail in messages[0]
+    assert mod.ATTRIBUTION_REMEDY in messages[0]
+    assert "does not expose" not in messages[0]
+
+
+def test_ui_socket_env_does_not_repeat_a_browser_socket_env_reason(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    detail = "launcher /opt/shims/playwright-cli is not attributable"
+    monkeypatch.setattr(mod, "_warned_lifecycle_losses", set())
+    monkeypatch.setattr(
+        mod,
+        "cli_lifecycle_env_support",
+        lambda: (mod.SeamSupport.UNVERIFIED, detail),
+    )
+    original_warn = mod._warn_lifecycle_loss
+    calls: list[tuple[mod.SeamSupport, str]] = []
+
+    def record_warning(support: mod.SeamSupport, reason: str) -> None:
+        calls.append((support, reason))
+        original_warn(support, reason)
+
+    monkeypatch.setattr(mod, "_warn_lifecycle_loss", record_warning)
+
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        assert mod.browser_socket_env({mod.SESSION_ENV: "kc-a1b2c3d4"}) == {}
+        assert mod.ui_socket_env({}) == {}
+
+    assert calls == [
+        (mod.SeamSupport.UNVERIFIED, detail),
+        (mod.SeamSupport.UNVERIFIED, detail),
+    ]
+    messages = _lifecycle_warnings(caplog)
+    assert len(messages) == 1
+    assert detail in messages[0]
+
+
+def test_ui_socket_env_prepares_the_shared_owner_only_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared: list[Path] = []
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
+    monkeypatch.setattr(
+        mod.platform_compat, "make_owner_only_dir", lambda path: prepared.append(Path(path))
+    )
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+
+    expected = tmp_path / "pw" / "ui" / "s"
+    registry = tmp_path / "pw" / "ui" / "d"
+    both = {mod.SOCKETS_ENV: str(expected), mod.DAEMON_DIR_ENV: str(registry)}
+    assert mod.ui_socket_env({}) == both
+    # Both directories prepared owner-only: the socket root and, beside it, the
+    # daemon session registry the panel's sessions register in.
+    assert prepared == [expected, registry]
+    # Deterministic: the show child and the launcher must land on ONE root, and
+    # a gateway life after a crash on the same registry as the one before it.
+    assert mod.ui_socket_env({}) == both
+
+
+def test_ui_root_is_never_a_generated_session_namespace() -> None:
+    """``ui`` is not 8-hex, so no reaper or lifecycle helper can read the
+    gateway's own root as an agent session's."""
+    assert mod._session_leaf("kc-ui") == ""
+    assert not mod._is_generated_leaf("ui")
+
+
+def test_ui_socket_env_namespaces_an_operator_root_and_ignores_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path / "home")
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", lambda _path: None)
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+
+    operator_root = tmp_path / "operator-sockets"
+    assert mod.ui_socket_env({mod.SOCKETS_ENV: str(operator_root)}) == {
+        mod.SOCKETS_ENV: str(operator_root / "ui" / "s"),
+        mod.DAEMON_DIR_ENV: str(operator_root / "ui" / "d"),
+    }
+    # Our own root arriving by inheritance is regenerated, never nested.
+    own = tmp_path / "elsewhere" / "pw" / "ui" / "s"
+    assert mod.ui_socket_env({mod.SOCKETS_ENV: str(own)}) == {
+        mod.SOCKETS_ENV: str(tmp_path / "home" / "pw" / "ui" / "s"),
+        mod.DAEMON_DIR_ENV: str(tmp_path / "home" / "pw" / "ui" / "d"),
+    }
+    # A generated session's root arriving by inheritance likewise.
+    agent = tmp_path / "elsewhere" / "pw" / "a1b2c3d4" / "s"
+    assert mod.ui_socket_env({mod.SOCKETS_ENV: str(agent)}) == {
+        mod.SOCKETS_ENV: str(tmp_path / "home" / "pw" / "ui" / "s"),
+        mod.DAEMON_DIR_ENV: str(tmp_path / "home" / "pw" / "ui" / "d"),
+    }
+
+
+def test_ui_socket_env_fails_back_to_the_cli_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path)
+    monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
+    created: list[Path] = []
+    monkeypatch.setattr(
+        mod.platform_compat, "make_owner_only_dir", lambda p: created.append(Path(p))
+    )
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+
+    # The installed CLI does not expose the hook: no directory, no override.
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.UNSUPPORTED, ""))
+    assert mod.ui_socket_env({}) == {}
+    assert created == []
+    # A root that would overflow AF_UNIX (a pod's long home): no override.
+    monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.SUPPORTED, ""))
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path / ("x" * 100))
+    assert mod.ui_socket_env({}) == {}
+    # A relative operator root is refused, as browser_socket_env refuses it.
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    assert mod.ui_socket_env({mod.SOCKETS_ENV: "relative/root"}) == {}
+    # An unpreparable directory: no partial answer.
+    monkeypatch.setattr(mod, "config_dir", lambda: tmp_path)
+
+    def refuse(_path: Path) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", refuse)
+    assert mod.ui_socket_env({}) == {}

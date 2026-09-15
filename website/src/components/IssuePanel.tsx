@@ -20,13 +20,16 @@ import {
   MAX_PULL_REQUEST_SOURCES,
   type PullRequestLink,
 } from '../utils/pullRequestLinks'
+import { sourceTabQualifier } from '../utils/sourceProviderMeta'
 import GithubLogo from './icons/GithubLogo'
 import GitlabLogo from './icons/GitlabLogo'
 import JiraLogo from './icons/JiraLogo'
 import { timeAgo } from '../utils/timeAgo'
 import MarkdownRenderer from './MarkdownRenderer'
 import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
+import { SOURCE_DETAIL_GC_MS, SOURCE_REMOUNT_REVALIDATE_MS } from './PullRequestPanel'
 import { Btn } from './ui'
+import ErrorNotice from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 
@@ -310,6 +313,15 @@ export default function IssuePanel({
 }) {
   const cappedIssues = issues.slice(0, MAX_PULL_REQUEST_SOURCES)
   const selected = cappedIssues.find(issue => issue.url === selectedUrl) || cappedIssues[0]
+  // Same ambiguity as the Changes panel's source strip: issue numbers are only
+  // unique per project, so a session naming group-a/svc#1 and group-b/svc#1
+  // renders two identical `#1` tabs. Qualify with the project when the strip
+  // spans more than one; Jira keeps its own `KEY-1` grammar (the qualifier is
+  // null for it by construction).
+  const tabQualifier = useMemo(
+    () => sourceTabQualifier(issues.slice(0, MAX_PULL_REQUEST_SOURCES)),
+    [issues],
+  )
   const [tab, setTab] = useState<IssueTab>('description')
   // A ref, not state: the flag is consumed inside queryFn and must not itself
   // trigger a render (which would re-run the effect chain around the query).
@@ -337,6 +349,15 @@ export default function IssuePanel({
     // under the user, so a background poll would spend provider calls (and SEL
     // audit entries) for nothing.
     staleTime: Infinity,
+    // Same retention and the same stale-while-revalidate as the pull-request
+    // detail: a reopened Issues tab paints the retained payload instead of a
+    // spinner, and revalidates in the background once that payload is older
+    // than the gateway's cache window -- an issue has no turn-boundary or
+    // status-delta invalidation at all, so without this the retention alone
+    // would present an hour-old discussion as current.
+    gcTime: SOURCE_DETAIL_GC_MS,
+    refetchOnMount: query =>
+      Date.now() - query.state.dataUpdatedAt > SOURCE_REMOUNT_REVALIDATE_MS ? 'always' : false,
     retry: false,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
@@ -349,6 +370,7 @@ export default function IssuePanel({
     const raw = typeof err?.body === 'string' ? err.body : ''
     try { return (JSON.parse(raw) as { code?: string }).code || '' } catch { return '' }
   })()
+  const refreshFailure = i18nT('components.pullRequestPanel.could_not_refresh_showing_cached')
   const sourceUrl = safeExternalUrl(source?.url || '')
   const handleRefresh = () => {
     forceRefreshRef.current = true
@@ -384,7 +406,9 @@ export default function IssuePanel({
           aria-label={i18nT('components.issuePanel.issues')}
           className="shrink-0 border-b border-border px-2 py-2 flex items-center gap-1 overflow-x-auto"
         >
-          {cappedIssues.map(item => (
+          {cappedIssues.map(item => {
+            const qualifier = tabQualifier(item)
+            return (
             <Btn
               key={item.url}
               type="button"
@@ -399,40 +423,51 @@ export default function IssuePanel({
                 : item.provider === 'jira'
                 ? <JiraLogo size={13} className="shrink-0" />
                 : <GitlabLogo size={13} className="shrink-0" />}
+              {/* No CSS truncation: the qualifier is already shortened to its
+                  minimal unique trailing suffix; the full url is in the title. */}
+              {qualifier && <span>{qualifier}</span>}
               <span>{item.provider === 'jira' ? `${item.repo}-${item.number}` : `#${item.number}`}</span>
             </Btn>
-          ))}
+            )
+          })}
         </div>
       )}
 
       {query.isLoading && <LoadingSkeleton />}
-      {query.error && errorCode !== 'jira_no_credentials' && (
+      {/* Full-height card only while nothing is on screen; a failed background
+          revalidation over a loaded issue renders as a compact notice instead
+          (see the pull-request panel for the reasoning). */}
+      {query.error && !source && errorCode !== 'jira_no_credentials' && (
         <div className="flex-1 flex items-center justify-center px-6">
-          <div role="alert" className="max-w-md flex flex-col items-center">
-            <AlertCircle
-              className={`lucide-inline mb-2 ${queryError.loginCommand ? 'text-warn' : 'text-danger'}`}
-              aria-hidden="true"
-            />
-            <div className="text-[13px] font-medium text-text">
-              {queryError.loginCommand
-                ? i18nT('components.issuePanel.cli_login_required', {
-                    provider: queryError.loginCommand === 'gh auth login' ? 'GitHub' : 'GitLab',
-                  })
-                : i18nT('components.issuePanel.could_not_load_this_issue')}
-            </div>
+          <div className="max-w-md w-full flex flex-col items-center">
+            {/* askAgent on: the panel is read-only (no draft), and a provider
+                CLI that is missing, logged out or answering 404 is exactly the
+                kind of failure the agent can diagnose. The login-required
+                branch keeps the command as the remedy text beneath. */}
             {queryError.loginCommand ? (
               <>
-                <div className="text-[12px] text-muted mt-1 text-center">
-                  {i18nT('components.issuePanel.kiro_crew_uses_your_local_provider_cli_to_load_i')}
-                </div>
+                <ErrorNotice
+                  className="w-full"
+                  title={i18nT('components.issuePanel.cli_login_required', {
+                    provider: queryError.loginCommand === 'gh auth login' ? 'GitHub' : 'GitLab',
+                  })}
+                  message={i18nT('components.issuePanel.kiro_crew_uses_your_local_provider_cli_to_load_i')}
+                  askAgent
+                  testId="issue-panel-load-error"
+                />
                 <code className="inline-block mt-2 px-2 py-1 rounded bg-bg-hover text-[12px] text-text">
                   {queryError.loginCommand}
                 </code>
               </>
             ) : (
-              <div className="mt-2 w-full max-h-64 overflow-y-auto rounded-md bg-bg-hover/50 border border-border px-3 py-2 text-left text-[12px] text-muted whitespace-pre-wrap break-words font-mono leading-relaxed">
-                {queryError.message}
-              </div>
+              <ErrorNotice
+                className="w-full max-h-64 overflow-y-auto leading-relaxed"
+                messageClassName="font-mono"
+                title={i18nT('components.issuePanel.could_not_load_this_issue')}
+                message={queryError.message}
+                askAgent
+                testId="issue-panel-load-error"
+              />
             )}
             <Btn
               type="button"
@@ -447,12 +482,17 @@ export default function IssuePanel({
 
       {selected?.provider === 'jira' && !query.isLoading && !source && errorCode === 'jira_no_credentials' && (
         <div className="flex-1 flex items-center justify-center px-6">
-          <div className="max-w-md flex flex-col items-center text-center">
-            <ExternalLink className="lucide-inline mb-2 text-muted" aria-hidden="true" />
+          <div className="max-w-md w-full flex flex-col items-center text-center">
             <div className="text-[13px] font-medium text-text">{selected.repo}-{selected.number}</div>
-            <div className="text-[12px] text-muted mt-1">
-              {i18nT('components.issuePanel.jira_no_credentials')}
-            </div>
+            {/* The value is a query error (backend code jira_no_credentials), so
+                it renders as one; the Open-in-Jira link stays as the remedy.
+                askAgent on: configuring Jira credentials is agent-fixable. */}
+            <ErrorNotice
+              className="mt-2 w-full text-left"
+              message={i18nT('components.issuePanel.jira_no_credentials')}
+              askAgent
+              testId="issue-panel-jira-credentials-error"
+            />
             <a
               href={selected.url}
               target="_blank"
@@ -466,6 +506,24 @@ export default function IssuePanel({
         </div>
       )}
 
+      {source && query.error && errorCode !== 'jira_no_credentials' && (
+        <div className="shrink-0 flex items-center gap-2 px-4 py-1.5 border-b border-border bg-bg-hover/40 text-[11px]">
+          {/* A failed background revalidation over a loaded issue: compact,
+              but still the shared notice (askAgent on — read failure). */}
+          <ErrorNotice
+            variant="inline"
+            className="min-w-0 text-[11px]"
+            messageClassName="line-clamp-1"
+            message={refreshFailure}
+            askAgent
+            testId="issue-panel-refresh-error"
+          />
+          {/* The login command is the one actionable fix, so it must survive a narrow
+              panel: it sits outside the clamped message and never clips. */}
+          {queryError.loginCommand && <code className="shrink-0 text-text" title={queryError.loginCommand}>{queryError.loginCommand}</code>}
+          <Btn type="button" onClick={handleRefresh} className="ml-auto shrink-0 whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-border bg-transparent text-[11px] text-muted hover:text-text hover:bg-bg-hover cursor-pointer"><RefreshCw className="lucide-inline" aria-hidden="true" />{i18nT('components.issuePanel.retry')}</Btn>
+        </div>
+      )}
       {source && (
         <>
           <div className="shrink-0 px-4 py-3 border-b border-border">

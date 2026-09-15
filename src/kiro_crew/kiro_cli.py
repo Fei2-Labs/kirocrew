@@ -182,7 +182,16 @@ def known_kiro_cli_dirs(
     *,
     include_inherited_path: bool = True,
 ) -> list[str]:
-    """Return fixed and inherited directories where Kiro CLI may be installed."""
+    """Return fixed and inherited directories where Kiro CLI may be installed.
+
+    Every home-derived path comes from the ``home`` argument, never from a live
+    ``os.path.expanduser("~")``, so a caller that pins ``(platform_name, home,
+    environ)`` gets the same account's directories from this function and from
+    :func:`find_kiro_cli_candidates`, and may report them as the directories
+    that were searched. (:func:`~kiro_crew.env.mise_data_dir` still honours the
+    process-level ``MISE_DATA_DIR``/``XDG_DATA_HOME`` overrides, so the mise
+    shim entry is home-pinned only in their absence.)
+    """
 
     if platform_name == "win32":
         local_app_data = Path(environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
@@ -211,8 +220,19 @@ def known_kiro_cli_dirs(
         # standard user tool directories and the venv Scripts fallback.
         dirs.extend(part for part in augmented_path("", home=str(home)).split(os.pathsep) if part)
     elif include_inherited_path:
+        # `home=` is forwarded for the same reason the win32 branch above does it:
+        # `augmented_path` falls back to a LIVE `os.path.expanduser("~")` when the
+        # keyword is omitted, so the `{home}`-templated extras and the Node/mise bin
+        # dirs would come from the process's account while the `.local/bin` and
+        # `.cargo/bin` entries above come from the caller's `home`. That makes this
+        # function's result depend on state outside its arguments, which is exactly
+        # what the ACP resolver's "the directories named in a not-found message are
+        # the directories that were actually searched" contract relies on it NOT
+        # doing (see acp/client.py's `_resolve_kiro_cli_for_spawn` docstring).
         dirs.extend(
-            part for part in augmented_path(environ.get("PATH", "")).split(os.pathsep) if part
+            part
+            for part in augmented_path(environ.get("PATH", ""), home=str(home)).split(os.pathsep)
+            if part
         )
     return _unique(dirs)
 
@@ -258,8 +278,20 @@ def resolve_kiro_cli(
     platform_name: str | None = None,
     home: Path | None = None,
     environ: Mapping[str, str] | None = None,
+    include_inherited_path: bool = True,
 ) -> str | None:
-    """Return the first executable Kiro CLI candidate, if one exists."""
+    """Return the first executable Kiro CLI candidate, if one exists.
+
+    ``include_inherited_path=False`` forwards to
+    :func:`find_kiro_cli_candidates` and drops the inherited ``PATH`` from the
+    candidate set. What remains is the fixed known install directories plus the
+    explicit ``KIROCREW_KIRO_BIN`` override, which is deliberately still
+    honoured: it is set by the operator who starts the gateway, not named by a
+    directory an agent can plant a file in. Unattended callers pass the keyword
+    so a ``PATH`` leading with an agent-writable directory cannot choose what
+    they execute; interactive ones keep the default, where a nonstandard install
+    on ``PATH`` is a convenience rather than an exposure.
+    """
 
     resolved_platform = platform_name or sys.platform
     resolved_home = home or Path.home()
@@ -268,6 +300,6 @@ def resolve_kiro_cli(
         resolved_platform,
         resolved_home,
         resolved_environ,
-        include_inherited_path=True,
+        include_inherited_path=include_inherited_path,
     )
     return candidates[0] if candidates else None

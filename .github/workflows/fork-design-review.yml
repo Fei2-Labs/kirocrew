@@ -27,8 +27,18 @@ name: Fork Design Review
 # verdict fails the check.
 
 on:
+  # Fast Gate, not CI. This lane is stage 2 of the fork design -- it may not start
+  # until a trusted workflow has vouched for the head commit -- but waiting for
+  # ALL of CI put the verdict ~54 minutes out (CI's median wall clock), and 73.7%
+  # of that is the backend matrix, which tells this reviewer nothing. Fast Gate
+  # carries the eleven cheap blocking gates and finishes in about a minute.
+  #
+  # This does not weaken the fork trust boundary: the steps below still harden the
+  # runner, check out the BASE commit, and read the fork's diff as data that never
+  # reaches the tree. CI's green was a quality precondition here, never a security
+  # one.
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["Fast Gate"]
     types: [completed]
 
 permissions:
@@ -70,6 +80,7 @@ jobs:
             github.com:443
             api.github.com:443
             objects.githubusercontent.com:443
+            github-production-user-asset-6210df.s3.amazonaws.com:443
             codeload.github.com:443
             registry.npmjs.org:443
 
@@ -154,11 +165,22 @@ jobs:
       # head_sha, so the status always surfaces (advisory-neutral even if a later
       # step dies).
       #
-      # `external_id` carries the PR number, which is what makes the finalize
-      # sweep safe: a check-run of this name on this head can belong to ANOTHER
-      # pull request (two PRs may share a commit), and completing that one would
-      # publish a verdict computed from a different diff. The sweep matches on
-      # this id, so it can only ever finish a run this pull request created.
+      # `external_id` carries the PR number AND the triggering run id + attempt,
+      # which is what makes the finalize sweep and the readiness read safe: a
+      # check-run of this name on this head can belong to ANOTHER pull request
+      # (two PRs may share a commit), and completing that one would publish a
+      # verdict computed from a different diff. A rerun on an unchanged head --
+      # of Fast Gate, or of THIS lane directly via a human-override
+      # `gh api .../runs/<id>/rerun` -- must also not reuse the previous
+      # attempt's verdict, because a model verdict can differ between attempts
+      # on the same head. A lane-direct rerun leaves `WR_RUN_ID`/`WR_RUN_ATTEMPT`
+      # unchanged, so the old failed attempt and the new one share this id; the
+      # reader resolves that by collapsing every check-run matching the id to
+      # the newest by CHECK-RUN id (distinct per POST, monotonically
+      # increasing), so the fresh row always wins regardless of how many share
+      # the external_id. The sweep matches on this id's PR dimension, so a
+      # verdict can only ever answer for the run this pull request created at
+      # this attempt.
       #
       # `details_url` carries this run's URL: a workflow_run-triggered run is
       # keyed to the DEFAULT branch context, so this stamp is the only link
@@ -172,11 +194,13 @@ jobs:
           REPO: ${{ github.repository }}
           HEAD: ${{ steps.pr.outputs.head_sha }}
           PR: ${{ steps.pr.outputs.pr }}
+          WR_RUN_ID: ${{ github.event.workflow_run.id }}
+          WR_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
           set -uo pipefail
           id="$(gh api --method POST "repos/$REPO/check-runs" \
             -f name="Design Review" -f head_sha="$HEAD" -f status="in_progress" \
-            -f external_id="design-pr-$PR" \
+            -f external_id="design-pr-$PR-$WR_RUN_ID-$WR_RUN_ATTEMPT" \
             -f details_url="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID" \
             --jq '.id')"
           echo "id=$id" >> "$GITHUB_OUTPUT"
@@ -244,6 +268,55 @@ jobs:
           # The reviewer reads the fork's changes from the diff file as DATA.
           echo "Fetched authentic diff ($(wc -c < "$PATCH") bytes); reviewing against the trusted base tree."
 
+      # Rendered-evidence list for the missing-evidence trigger. The reviewer
+      # has no shell to fetch with, so a bare URL in the description would
+      # otherwise count as evidence whether or not it renders; this step
+      # downloads and types every attachment the description offers (the
+      # same allowlisted, anonymous fetch both UX lanes source)
+      # and writes one file the prompt is told to read, so the predicate is
+      # what the workflow could actually see, never the description's text.
+      # A transport failure is listed as such rather than failing this step:
+      # the UX lane fails its run on the same failure, so readiness already
+      # holds, and this lane reports presence as unconfirmed.
+      - name: Collect rendered evidence
+        id: evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.pr }}
+          FETCH_DIR: ${{ runner.temp }}/design-fetch
+          DEST_DIR: ${{ runner.temp }}/design-evidence
+          NAME_STEM: attachment
+          SHOTS: ${{ runner.temp }}/design-images.txt
+          SHOT_MAP: ${{ runner.temp }}/design-image-map.txt
+          CLIPS: ${{ runner.temp }}/design-recordings.txt
+          MAX_SHOTS: "40"
+          MAX_CLIPS: "4"
+          EVIDENCE: ${{ runner.temp }}/design-evidence.txt
+        run: |
+          set -uo pipefail
+          rm -rf "$FETCH_DIR" "$DEST_DIR"
+          mkdir -p "$FETCH_DIR" "$DEST_DIR"
+          : > "$SHOTS"
+          : > "$SHOT_MAP"
+          : > "$CLIPS"
+          # Sourced from the trusted base checkout, never from the fork's tree.
+          . "$GITHUB_WORKSPACE/.github/scripts/pr-attachment-evidence.sh"
+          {
+            echo "RENDERED EVIDENCE OF THIS REVISION -- written by the workflow. The description's text is not the predicate; this file is."
+            echo "attachments downloaded and typed as images: $n"
+            echo "attachments downloaded and typed as recordings: $clips"
+            echo "committed images this revision adds or changes: not checked (the fork head is never checked out; a committed image is not evidence in this lane)"
+            echo "attachment downloads that failed for a transport reason (presence unconfirmed, not absent): ${failed:-0}"
+            echo
+            echo "images (opaque copies, body order):"
+            if [ -s "$SHOTS" ]; then cat "$SHOTS"; else echo "(none)"; fi
+            echo
+            echo "recordings:"
+            if [ -s "$CLIPS" ]; then cat "$CLIPS"; else echo "(none)"; fi
+          } > "$EVIDENCE"
+          echo "Rendered evidence: $n image(s), $clips recording(s); ${failed:-0} download(s) failed."
+
       # Mint short-lived, Bedrock-only creds immediately before the model call,
       # via the SAME dedicated least-privilege role the same-repo design reviewer
       # uses. No dependabot special-casing: forks never run as dependabot[bot].
@@ -301,6 +374,19 @@ jobs:
             `git diff` against a fork ref. Read the PR title/description for the
             stated problem and intent.
 
+            RENDERED EVIDENCE: before you judge the missing-evidence trigger below,
+            Read ${{ runner.temp }}/design-evidence.txt. The workflow wrote it: it
+            downloaded every github.com/user-attachments asset the description
+            offers, typed each by its bytes, and (on a same-repo pull request)
+            listed the committed images this revision adds or changes. That
+            file is the predicate for "rendered evidence of THIS revision": a
+            URL in the description that is not in it did not download or is
+            not an image, and is not evidence. A non-zero "failed for a
+            transport reason" count means presence is unconfirmed, not
+            absent -- do not BLOCK on that basis (the UX lane fails its run on
+            the same failure, so readiness already holds); cap at CONCERNS and
+            name the re-run.
+
             REPO CONTEXT: KiroCrew is an open-source AI agent platform (Python
             backend + React/TS dashboard), a de-Amazoned public fork. Do NOT flag
             the absence of Brazil/AUTOSDE build tooling or internal-only infra.
@@ -334,6 +420,8 @@ jobs:
             speculative surface.
 
             CLAUDE.md and AGENTS.md (root and website/) hold the conventions.
+            AGENTS.md is a router, so open the doc its routing table names for
+            the area under review.
 
             THIS IS A DESIGN REVIEW, NOT A LINE-LEVEL REVIEW. Two OTHER automated
             reviewers already cover line-level correctness, security, style,
@@ -351,7 +439,9 @@ jobs:
             consequence — and quote the diff hunk or description sentence it is
             grounded in. If you cannot trace a concrete consequence, DROP the
             finding. When unsure, lower the concern (prefer CONCERNS over BLOCK),
-            never invent one.
+            never invent one -- except where a BLOCK TRIGGER under VERDICT is
+            read off the diff or the description rather than judged; those are
+            facts, and a fact is not lowered.
 
             THE DESIGN GATE (INTERNAL REASONING — think through each silently;
             do NOT echo these questions or their answers in your output. They
@@ -415,18 +505,69 @@ jobs:
               story. BLOCK **FAILS this check and blocks PR readiness** -- a
               contributor cannot merge past it without fixing the design or
               getting an explicit human override. Treat it accordingly.
-            Tie-breaker: when torn between BLOCK and CONCERNS, choose CONCERNS.
+            Tie-breaker, SCOPED BY REVERSIBILITY -- when torn between BLOCK and
+            CONCERNS, the consequence decides, not your comfort:
+            - unclear AND the consequence is REVERSIBLE (a bad default a user can
+              flip, a regression a revert fixes cleanly, a slower path) -> CONCERNS.
+            - unclear AND the consequence is that a PLATFORM, a PROVIDER, or a CORE
+              PATH (session start, spawn, auth, gateway boot) STOPS WORKING, with no
+              in-product remedy short of disabling a safety control -> BLOCK.
+              "the user can turn the sandbox off" is not a remedy.
+            An UNVERIFIED premise is a BLOCK INPUT, not a reason to lower the
+            verdict. You have no shell, no Windows host and no provider account, so
+            a platform or provider claim is ALWAYS unclear to you -- if "unclear"
+            lowered the verdict, BLOCK would be unreachable for exactly the class
+            that takes a platform down. The AUTHOR can verify it and you cannot: so
+            BLOCK, and name the evidence that clears it.
             Only reach for BLOCK when the DESIGN is wrong — never merely because
             the change is large or far-reaching.
+            BLOCK TRIGGERS (each is a BLOCK on its own; still write its consequence
+            chain and its `Clears when:` line):
+            - the change gates a core availability path on a probe, file or setting
+              whose semantics ON THE AFFECTED PLATFORM this repo never establishes
+              (an absent file read as False is a decision, not a default);
+            - the change deletes, weakens or rewrites a test or assertion that
+              pinned the OPPOSITE behaviour and the PR treats that old pin as a GAP
+              rather than as a DECISION -- read the test's own message and its git
+              history before you accept "gap"; a pin that names the behaviour it
+              forbids is a decision until a human says otherwise;
+            - the PR says "Manual verification: N/A" (or equivalent) for a branch
+              that only runs on a platform or in an environment CI does not
+              exercise;
+            - CANNOT EVALUATE -- REQUIRED EVIDENCE MISSING: the change adds or
+              reshapes a user-visible surface (a page, panel, control set, or
+              the default mode of an existing one, under website/src/) and the
+              PR carries no rendered evidence of THIS revision -- the evidence
+              list the workflow wrote (RENDERED EVIDENCE above) names no image
+              or recording downloaded from its description (a
+              github.com/user-attachments asset the workflow fetched and typed;
+              a URL that did not download is not evidence) and none committed
+              at HEAD that THIS checkout can render (on a fork pull request the head is
+              never checked out, so a committed image is not evidence here --
+              the same rule the fork UX lane applies; the attachment is). An
+              image hosted off a commit outside this PR, or one the description
+              itself says shows another PR's state, is not evidence of this
+              revision. You cannot judge the shape of a surface you have not
+              seen, and a verdict you cannot reach must not read as advisory:
+              BLOCK, punchline opening `cannot evaluate: missing <screenshot or
+              recording of X>`, and `Clears when:` names the artifact. Absence
+              is read off the evidence list and the diff, not judged, so the
+              tie-breaker above does not reach it. A change that renders
+              nothing new (a refactor, a test, a type) needs no evidence.
             FALSIFY BEFORE YOU BLOCK (mandatory, because BLOCK now blocks): for
             each BLOCK candidate, actively try to KILL it -- name the specific
             requirement the design fails, the concrete alternative that is
             better, and the consequence of shipping as-is. A candidate survives
             ONLY if you can state all three from the diff and the code you
-            opened. If any is "might", "unclear", or a matter of taste, it is a
-            CONCERNS at most -- never a BLOCK. Budget: at most 1 BLOCK per
-            review; if you have two, you are almost certainly describing one
-            root design problem, so merge them.
+            opened (for the missing-evidence trigger the three are: the surface
+            the diff adds or reshapes, the evidence list naming no downloaded
+            attachment and no committed image for it, and the shape
+            question you therefore could not answer). A matter of taste is
+            never a BLOCK; "might" and "unclear"
+            lower it ONLY when the tie-breaker above finds the consequence
+            reversible. Budget: at most 1 BLOCK per review; if you have two, you
+            are almost certainly describing one root design problem, so merge
+            them. Size is never a BLOCK.
 
             FINAL OUTPUT (authoritative — this is your LAST message; the workflow
             captures it verbatim from the run transcript, so do NOT call any tool
@@ -455,12 +596,20 @@ jobs:
             ### Blockers
             <ONLY when verdict is BLOCK. Each: one-line title, then a single
             consequence chain (cause → mechanism → consequence) quoting the diff/
-            description, then a one-line fix. These are the things that must be
-            resolved or human-overridden.>
+            description, then a one-line fix, then a LAST line of exactly this
+            shape:
+            `Clears when: <the concrete evidence or change that resolves this>`
+            These are the things that must be resolved or human-overridden.>
 
             ### Watch
             <ONLY for a genuine CONCERNS-level design risk a human should see
-            before merging. One or two lines each. Skip if none.>
+            before merging. One or two lines each, then a LAST line of exactly
+            this shape:
+            `Clears when: <the concrete evidence or change that resolves this>`
+            Every Blocker AND every Watch item carries that line, because a coding
+            loop reads it as the thing to go do -- an item with no `Clears when:`
+            is not actionable, so either write the line or drop the item. Skip the
+            section if none.>
 
             ### Suggestions
             <0–3 genuinely valuable design optimizations or simplifications
@@ -581,19 +730,115 @@ jobs:
               echo "_The design review did not produce a verdict for \`$HEAD\` ($why). See the Fork Design Review job logs. Advisory — does not block merge._"
             } > "$RUNNER_TEMP/design-comment.md"
           fi
-          # Author-filtered per-page jq lookup so a PR commenter can't plant the
-          # marker and have us PATCH their comment. head -n1 across pages.
-          existing="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\"))) | .id" 2>/dev/null \
-            | head -n1 || true)"
-          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
-            gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
-              --field body="$(cat "$RUNNER_TEMP/design-comment.md")" >/dev/null || true
-            echo "Updated existing design-review comment #$existing"
-          else
-            gh pr comment "$PR" --body-file "$RUNNER_TEMP/design-comment.md" || true
-            echo "Created new design-review comment"
-          fi
+          # Guarded upsert (#8292, #8344): the shared function below is defined
+          # byte-identically in every review lane; test_ai_review_workflows.py
+          # pins all copies to one canonical body so the invariant cannot
+          # drift lane by lane.
+          guarded_comment_upsert() {
+            local marker="$1" stamp="$2" lane="$3" out_file="$4"
+            local matches existing lookup_ok pr_head="" attempt withhold=""
+            # Find the bot's existing marker comment (first match wins) and
+            # capture its id. Author filter: only a github-actions[bot]
+            # comment can match, so a PR commenter cannot plant the marker and
+            # have this step PATCH their comment with the write-scoped token.
+            # Only the id is read: no decision below inspects the current
+            # body, so this function has no read-modify-write window on it.
+            # Capture the paginated query's FULL output first and select the
+            # first id off the captured value -- a `... | head -n1` inside the
+            # pipeline lets head's early exit SIGPIPE the api call and misread
+            # a successful lookup as a failure under pipefail (#8350).
+            # Retry a transient failure: whether a comment exists is a gating
+            # input here, and one blip is not evidence that none does.
+            lookup_ok=0
+            for attempt in 1 2 3; do
+              if matches="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" 2>/dev/null)"; then
+                lookup_ok=1
+                break
+              fi
+              matches=""
+              echo "Reading this PR's comments failed on attempt $attempt."
+              if [ "$attempt" -lt 3 ]; then
+                sleep "$attempt"
+              fi
+            done
+            existing="$(printf '%s\n' "$matches" | awk 'NR == 1')"
+            # This lane's marker comment is ONE slot shared by every run on the
+            # PR, and the REST comments API has no If-Match, so a write to it
+            # is last-writer-wins with no way to detect the loss afterwards --
+            # it exposes no edit history either (#8292). Exactly one kind of
+            # run may therefore claim the slot: a COMPLETED verdict for the
+            # PR's CURRENT head. Every other case leaves an existing comment
+            # untouched, because each of them can lose a live verdict.
+            if ! grep -Fq "$stamp $HEAD" "$out_file"; then
+              # No "<stamp> $HEAD" proof marker: this is a review FAILURE
+              # notice, and PATCHing one over a completed verdict buries that
+              # verdict -- blocking findings included -- where no reader or
+              # tool looks. Note that PRESERVING the verdict and prepending a
+              # staleness notice is not a safe alternative: it reads the body
+              # and writes a merge of it back, so a verdict published between
+              # the read and the write is restored away.
+              withhold="run for $HEAD produced no completed verdict"
+            else
+              # A completed verdict for a SUPERSEDED head is the same loss
+              # arriving late: an older run can finish after a newer one has
+              # already published, and the fork lanes' concurrency group is
+              # keyed per head so they are not cancelled -- while a cancelled
+              # same-repo run still executes this if:always() step. So confirm
+              # this run is still the PR's head before claiming the slot.
+              # Retry a transient read the way this lane's other gating reads
+              # do, then treat an unreadable head as NOT confirmed: writing is
+              # the destructive half, so it must not proceed on an unknown.
+              for attempt in 1 2 3; do
+                if pr_head="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')" \
+                  && [ -n "$pr_head" ]; then
+                  break
+                fi
+                pr_head=""
+                echo "Reading this PR's head sha failed on attempt $attempt."
+                if [ "$attempt" -lt 3 ]; then
+                  sleep "$attempt"
+                fi
+              done
+              if [ -z "$pr_head" ]; then
+                withhold="this PR's head was unreadable after 3 attempts, so $HEAD cannot be confirmed current"
+              elif [ "$pr_head" != "$HEAD" ]; then
+                withhold="$HEAD is no longer this PR's head ($pr_head)"
+              fi
+            fi
+            if [ -n "$withhold" ]; then
+              # A lookup that ERRORED is not "no comment exists": taking the
+              # create path there plants a second marker comment over a
+              # possibly-live verdict, which no later run undoes.
+              if [ "$lookup_ok" -eq 0 ]; then
+                echo "Withholding $lane comment for $HEAD ($withhold); the comment lookup also failed, so nothing was posted"
+                return 0
+              fi
+              if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+                echo "Withholding $lane comment for $HEAD ($withhold); left existing comment #$existing untouched"
+                return 0
+              fi
+              # The lookup SUCCEEDED and found nothing, so there is no verdict
+              # to lose: posting the body as a NEW comment buries nothing.
+              gh pr comment "$PR" --body-file "$out_file" || true
+              echo "Created new $lane comment"
+              return 0
+            fi
+            if [ "$lookup_ok" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
+              gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+                --field body="$(cat "$out_file")" >/dev/null || true
+              echo "Updated existing $lane comment #$existing"
+            else
+              # No existing comment -- or a lookup that could not confirm one
+              # -- falls through to CREATE either way: a completed verdict for
+              # the confirmed current head must never be dropped because the
+              # comment lookup failed, since a duplicate comment is
+              # recoverable and an unposted verdict is not (#8350).
+              gh pr comment "$PR" --body-file "$out_file" || true
+              echo "Created new $lane comment"
+            fi
+          }
+          guarded_comment_upsert "$MARKER" "[DESIGN-REVIEWED]" "Fork Design Review" "$RUNNER_TEMP/design-comment.md"
 
       # Finalize the "Design Review" check-run, keyed to head_sha. ADVISORY
       # contract: FAILURE only on a real BLOCK verdict; SUCCESS on PASS/CONCERNS;
@@ -608,16 +853,50 @@ jobs:
           HEAD: ${{ steps.pr.outputs.head_sha || github.event.workflow_run.head_sha }}
           CHECK_ID: ${{ steps.check.outputs.id }}
           PR: ${{ steps.pr.outputs.pr }}
+          WR_RUN_ID: ${{ github.event.workflow_run.id }}
+          WR_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           VERDICT: ${{ steps.verdict.outputs.verdict }}
         run: |
           set -uo pipefail
           case "${VERDICT:-UNKNOWN}" in
             PASS)     conclusion="success"; title="PASS — sound design" ;;
-            CONCERNS) conclusion="success"; title="CONCERNS (advisory)" ;;
+            CONCERNS) conclusion="neutral"; title="CONCERNS — read the Watch items" ;;
             BLOCK)    conclusion="failure"; title="BLOCK — design concern (advisory)" ;;
             *)        conclusion="neutral"; title="review incomplete (advisory)" ;;
           esac
           summary="Advisory fork design review for $HEAD. See the PR comment for details."
+          # CONCERNS is where a design/premise/UX risk actually lives, and today
+          # it is invisible: the check reports green and 31 of 57 CONCERNS drew
+          # no human reply at all. Distil the punchline and the Watch section so
+          # the Checks UI itself can carry them -- no new command, no convention
+          # to learn. Reads the ALREADY-REDACTED body, so the redaction and
+          # withhold gates upstream stay the only publish boundary. Caps with a
+          # Bash substring rather than a pipe into `head`: a piped cap SIGPIPEs
+          # the writer, and `pipefail` turns that into a step failure on exactly
+          # the long body the cap exists for.
+          concerns_digest() {
+            local file="$1" header="$2" marker="$3" digest=""
+            [ -f "$file" ] || return 0
+            digest="$(awk -v header="^$header" -v marker="$marker" '
+              index($0, marker) == 1 { exit }
+              !seen && $0 ~ header { seen = 1; next }
+              !seen { next }
+              seen == 1 && NF { print; seen = 2; next }
+              /^### / { watch = ($0 ~ /^### Watch[[:space:]]*$/) }
+              watch { print }
+            ' "$file")"
+            printf '%s' "${digest:0:2000}"
+          }
+          # `neutral` reads as a PASS to pr-readiness.yml (it counts success and
+          # neutral alike), so this changes what a human SEES, never whether the
+          # PR can merge -- and unlike `success` it renders as its own state in
+          # the Checks list instead of a green tick nobody opens.
+          if [ "${VERDICT:-}" = "CONCERNS" ]; then
+            digest="$(concerns_digest "${RUNNER_TEMP:-/tmp}/design-review-output.md" "Design-Verdict:" "[DESIGN-REVIEWED]")"
+            if [ -n "$digest" ]; then
+              summary="$(printf '%s\n\n_CONCERNS is advisory and does not block merge. Full review in the PR comment for %s._\n' "$digest" "$HEAD")"
+            fi
+          fi
           # complete <check-run id> <conclusion> <title> — one retry, because a
           # single transient 5xx here is what strands the run: the check-run stays
           # `in_progress` forever, and pr-readiness counts ANY non-completed run of
@@ -640,13 +919,16 @@ jobs:
             complete "$CHECK_ID" "$conclusion" "$title" || true
           elif [ -n "${HEAD:-}" ]; then
             # external_id makes this fallback check-run discoverable by the
-            # override handler's fork rerun lookup, same as the opening POST.
-            # PR can be empty in exactly this branch (HEAD has a workflow_run
-            # fallback, PR does not), and a malformed "design-pr-" id would
-            # match nothing -- stamp it only when the PR is known.
+            # override handler's fork rerun lookup and attributable by the
+            # readiness read, same as the opening POST: PR + triggering run id +
+            # attempt. PR can be empty in exactly this branch (HEAD has a
+            # workflow_run fallback, PR does not) -- stamp the id only when the
+            # PR is known. With no id the row carries no attribution, so the
+            # bound reader cannot see it and reads the lane as pending, which
+            # still holds the merge: the miss fails CLOSED, not open.
             ext_args=()
             if [ -n "${PR:-}" ]; then
-              ext_args=(-f external_id="design-pr-$PR")
+              ext_args=(-f external_id="design-pr-$PR-$WR_RUN_ID-$WR_RUN_ATTEMPT")
             fi
             gh api --method POST "repos/$REPO/check-runs" \
               -f name="Design Review" -f head_sha="$HEAD" \
@@ -657,10 +939,14 @@ jobs:
           fi
           # Sweep any still-incomplete run of this name that THIS pull request
           # created (ours, if the PATCH above lost both attempts, or one stranded
-          # by a previous run). Scoped by `external_id`: a check-run of this name
-          # on this head can belong to another PR that shares the commit, and
-          # completing that one would publish a verdict computed from a different
-          # diff -- the wedge is closed without ever touching a sibling's review.
+          # by a previous run). Scoped by `external_id`'s PR dimension (prefix
+          # match, so it spans attempts): a check-run of this name on this head
+          # can belong to another PR that shares the commit, and completing that
+          # one would publish a verdict computed from a different diff -- the
+          # wedge is closed without ever touching a sibling's review, while still
+          # catching a row stranded by a PREVIOUS attempt (which carries a
+          # different run+attempt suffix). The trailing hyphen keeps -pr-9 from
+          # matching -pr-99.
           # Completed with THIS run's computed verdict, not a hardcoded neutral:
           # a genuine BLOCK whose own PATCH lost both attempts must not be
           # swept into a verdict pr-readiness no longer gates on. With no
@@ -671,7 +957,8 @@ jobs:
               "repos/$REPO/commits/$HEAD/check-runs?check_name=$enc&per_page=100" \
               --jq ".check_runs[]
                     | select(.status != \"completed\")
-                    | select(.external_id == \"design-pr-$PR\")
+                    | select(.external_id != null)
+                    | select(.external_id | startswith(\"design-pr-$PR-\"))
                     | .id" 2>/dev/null || true)"
             for id in $stranded; do
               echo "completing stranded check-run $id for $HEAD (PR #$PR)"

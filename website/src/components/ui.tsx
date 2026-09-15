@@ -182,13 +182,20 @@ export function Badge({ variant, children, className, ...rest }: { variant: 'ok'
   )
 }
 
-export function SourceBadge({ source }: { source: string }) {
+/** `source` picks the colour; pass `children` to show a translated label instead
+ *  of the raw field value, which is an internal identifier in every language.
+ *  `tone="neutral"` forces the grey style for every source — used where several
+ *  of these sit together (the template list) and one coloured chip among grey
+ *  peers reads as "why is this one different?" rather than as a category. */
+export function SourceBadge({ source, children, tone = 'auto' }: { source: string; children?: React.ReactNode; tone?: 'auto' | 'neutral' }) {
+  const neutral = 'bg-bg-elevated text-muted border-border'
   const cls =
-    source === 'package' ? 'bg-aim-subtle text-aim border-aim/30'
-    : source === 'kirocrew' ? 'bg-bg-elevated text-muted border-border'
+    tone === 'neutral' ? neutral
+    : source === 'package' ? 'bg-aim-subtle text-aim border-aim/30'
+    : source === 'kirocrew' ? neutral
     : source === 'project' ? 'text-ok border-ok/30'
-    : 'bg-bg-elevated text-muted border-border'
-  return <span className={`px-1.5 py-[2px] rounded-full text-[11px] font-bold border shrink-0 ${cls}`}>{source}</span>
+    : neutral
+  return <span className={`px-1.5 py-[2px] rounded-full text-[11px] font-bold border shrink-0 ${cls}`}>{children ?? source}</span>
 }
 
 export function StatCard({ label, value, accent, colorClass, delay, onClick, active, title, className, ...rest }: { label: string; value?: string | number | null; accent?: boolean; colorClass?: string; delay?: number; onClick?: () => void; active?: boolean; title?: string } & Omit<React.ComponentPropsWithoutRef<'div'>, 'title' | 'onClick' | 'dangerouslySetInnerHTML'>) {
@@ -401,7 +408,7 @@ export function PageHeader({ title, subtitle, actions }: { title: React.ReactNod
     // read worse -- the title then sat inside the cards directly beneath it. The
     // defect was always in the chrome, not in the content column.
     //
-    // Measured budget and the full rationale: website/docs/page-layout.md.
+    // Measured budget and the full rationale: website/docs/narrow-viewport.md.
     <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2 px-4 md:px-6 pt-2 pb-3" data-testid="page-header">
       <div className="min-w-0">
         <div className="text-2xl font-bold tracking-tight text-text-strong" data-testid="page-title">{title}</div>
@@ -460,6 +467,10 @@ export interface SliderProps {
   ticks?: boolean
   /** When true, the knob pulses an accent halo while parked at the max notch. */
   emphasizeMax?: boolean
+  /** Independent reference marker on the same axis, such as a configured default. */
+  markerValue?: number
+  /** Visible and accessible label for markerValue. */
+  markerLabel?: string
   className?: string
   'aria-label'?: string
 }
@@ -470,7 +481,7 @@ export interface SliderProps {
  *  (arrows = step, Shift+arrow / PageUp-Down = ×10, Home/End = min/max). */
 export function Slider({
   value, onChange, min = 0, max = 100, step = 1, disabled,
-  label, showValue, formatValue, ticks, emphasizeMax, className = '', 'aria-label': ariaLabel,
+  label, showValue, formatValue, ticks, emphasizeMax, markerValue, markerLabel, className = '', 'aria-label': ariaLabel,
 }: SliderProps) {
   const trackRef = React.useRef<HTMLDivElement>(null)
   const [dragging, setDragging] = React.useState(false)
@@ -490,6 +501,13 @@ export function Slider({
   const pct = ((current - min) / range) * 100
   const display = formatValue ? formatValue(current) : String(current)
   const atMax = emphasizeMax && current >= max
+  const markerCurrent = markerValue === undefined ? null : clamp(markerValue)
+  const markerFrac = markerCurrent === null ? null : (markerCurrent - min) / range
+  const markerTransform = markerCurrent === min
+    ? 'translateX(0)'
+    : markerCurrent === max
+      ? 'translateX(-100%)'
+      : 'translateX(-50%)'
 
   // Discrete-stepper detection: a small, even number of steps. Discrete sliders
   // render tick marks AND spring to each notch even while dragging; continuous
@@ -638,6 +656,17 @@ export function Slider({
             style={{ left: center(f) }}
           />
         ))}
+        {markerFrac !== null && markerLabel && markerValue === markerCurrent && (
+          <span
+            role="img"
+            aria-label={markerLabel}
+            data-slider-marker
+            className="absolute bottom-[calc(100%+4px)] z-10 whitespace-nowrap text-[10px] font-medium text-accent"
+            style={{ left: center(markerFrac), transform: markerTransform }}
+          >
+            {markerLabel}
+          </span>
+        )}
         {/* hover/drag tooltip — value of the step under the cursor */}
         {hoverVal !== null && (
           <div

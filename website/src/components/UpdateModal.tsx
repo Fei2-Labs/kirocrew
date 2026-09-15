@@ -23,12 +23,8 @@ import type { UpdateState } from '../hooks/useUpdateSubscription'
  * the Electron preload), so it's safe to mount unconditionally in App.
  */
 
-type UpdateAPI = {
-  install: () => Promise<unknown>
-}
-
 function getUpdateApi(): UpdateAPI | undefined {
-  return (window as unknown as { updateAPI?: UpdateAPI }).updateAPI
+  return window.updateAPI
 }
 
 export default function UpdateModal() {

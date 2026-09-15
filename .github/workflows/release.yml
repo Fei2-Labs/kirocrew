@@ -5,10 +5,13 @@ on:
     tags: ["v*"]
 
 # Prerelease tags build, sign, publish, and record one immutable promotion
-# bundle. A bare stable tag never rebuilds source: it resolves the newest
-# successful prerelease run for this exact commit/release line, verifies the
-# GitHub artifact archive by its API-recorded digest, and promotes those exact
-# bytes. Reusable workflows own the per-lane publish details.
+# bundle. A bare stable tag REBUILDS that same commit under the bare version, so
+# the shipped bytes advertise "X.Y.Z" rather than the candidate's stamp; it still
+# requires a successful prerelease run for this exact commit, so stable only ever
+# ships code that soaked. Setting vars.STABLE_PROMOTE_BYTES to that base version
+# switches to republishing the candidate's exact bytes instead, at the cost of
+# shipping its prerelease version. Reusable workflows own the per-lane publish
+# details.
 
 # Serialize release runs: insider/stable feed writes are last-writer-wins;
 # two tags pushed close together must publish in order or the channel feed
@@ -32,9 +35,25 @@ jobs:
       base_version: ${{ steps.channel.outputs.base_version }}
       channel: ${{ steps.channel.outputs.channel }}
       wheel_version: ${{ steps.channel.outputs.wheel_version }}
+      # rebuild: "true" for an ordinary stable release. Stable is BUILT fresh
+      # from the cleared commit under the bare "X.Y.Z" the tag names, because
+      # republishing the candidate's bytes would ship its "-insider.N"/"rcN"
+      # stamp to stable users and nothing downstream can re-stamp them.
+      rebuild: ${{ steps.channel.outputs.rebuild }}
+      # promote_mode: "true" only when STABLE_PROMOTE_BYTES names this exact base
+      # version -- the escape hatch that republishes the candidate's own bytes so
+      # stable runs the exact binary insiders validated, at the cost of an
+      # RC-stamped version number. Every downstream "promotion or fresh?" choice
+      # keys off THIS, never off channel, so the two modes cannot half-apply.
+      promote_mode: ${{ steps.channel.outputs.promote_mode }}
     steps:
       - name: Derive version + channel from tag
         id: channel
+        env:
+          # Scoped to ONE version on purpose (mirrors STABLE_GATE_OVERRIDE): it
+          # must equal the base being released, so it cannot be left switched on
+          # for every future stable tag.
+          STABLE_PROMOTE_BYTES: ${{ vars.STABLE_PROMOTE_BYTES }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
@@ -69,7 +88,32 @@ jobs:
           echo "base_version=$BASE" >> "$GITHUB_OUTPUT"
           echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
           echo "wheel_version=$WHEEL_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Releasing $VERSION on channel $CHANNEL (base: $BASE, wheel: $WHEEL_VERSION)"
+
+          # A stable release ships a BARE "$BASE" version, so it REBUILDS from
+          # the cleared commit by default. Promotion -- republishing the
+          # candidate's own bytes -- cannot do that: those bytes were stamped
+          # from the prerelease tag, so a promoted stable ships "0.5.0rc9" in
+          # the wheel name, the feed, `pip show` and `kirocrew --version`, and
+          # nothing downstream can re-stamp them without invalidating the
+          # recorded digests and macOS signatures.
+          #
+          # Byte-for-byte promotion stays reachable, because it is the only mode
+          # that guarantees stable runs the exact binary insiders validated. It
+          # is an escape hatch rather than the default precisely because that
+          # guarantee costs an RC-stamped version number: it must NAME the base
+          # version being released (mirroring STABLE_GATE_OVERRIDE), so it
+          # cannot be left switched on and silently stamp every later release.
+          PROMOTE_MODE="false"
+          if [ "$CHANNEL" = "stable" ] && [ "${STABLE_PROMOTE_BYTES:-}" = "$BASE" ]; then
+            PROMOTE_MODE="true"
+          fi
+          REBUILD="false"
+          if [ "$CHANNEL" = "stable" ] && [ "$PROMOTE_MODE" != "true" ]; then
+            REBUILD="true"
+          fi
+          echo "rebuild=$REBUILD" >> "$GITHUB_OUTPUT"
+          echo "promote_mode=$PROMOTE_MODE" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION on channel $CHANNEL (base: $BASE, wheel: $WHEEL_VERSION, rebuild: $REBUILD, promote_mode: $PROMOTE_MODE)"
 
   # Release tags do not trigger ci.yml, so prerelease candidates run a
   # dedicated backend test gate against the exact commit being packaged. The
@@ -103,7 +147,7 @@ jobs:
 
       # cache disabled: published artifacts must not restore a cache writable from
       # lower-trust branches (zizmor cache-poisoning)
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: false
 
@@ -132,7 +176,7 @@ jobs:
 
   resolve-promotion:
     name: Resolve Tested Candidate
-    if: needs.version.outputs.channel == 'stable'
+    if: needs.version.outputs.promote_mode == 'true'
     needs: version
     runs-on: ubuntu-latest
     permissions:
@@ -221,6 +265,9 @@ jobs:
         env:
           CHANNEL: ${{ needs.version.outputs.channel }}
           VERSION: ${{ needs.version.outputs.version }}
+          # Which of the two stable modes this run took, so the gate can say in
+          # the log whether the shipped bytes will carry a bare version.
+          PROMOTE_MODE: ${{ needs.version.outputs.promote_mode }}
           # Scoped to ONE version on purpose: it must equal the version being
           # released, so it cannot be left switched on for every future tag.
           OVERRIDE: ${{ vars.STABLE_GATE_OVERRIDE }}
@@ -296,8 +343,53 @@ jobs:
             fi
           fi
 
+          # ── 3. Source declares the BARE stable version ──────────────────
+          # A stable release must declare "$VERSION" in all three version files,
+          # with no RC spelling left over from the line it soaked under. This is
+          # the 0.4.0 near-miss made mechanical: that promotion was nearly tagged
+          # on a commit still declaring `0.4.0-rc.9`, because only the tag name
+          # was checked and nothing compared the declarations to it.
+          #
+          # It matters even though a rebuild re-stamps these files at build time.
+          # The stamp makes the ARTIFACT right; this check makes the BRANCH right.
+          # A mismatch means the drop-RC-suffix PR the runbook requires never
+          # landed, so a source install, a `pip install -e .` and every later
+          # RC on this branch still advertise the stale spelling.
+          for spec in \
+            "src/kiro_crew/__init__.py:^__version__ = \"\\(.*\\)\"$" \
+            "pyproject.toml:^version = \"\\(.*\\)\"$" \
+            "website/electron/package.json:^  \"version\": \"\\(.*\\)\",$"
+          do
+            file="${spec%%:*}"
+            pattern="${spec#*:}"
+            # Guarded rather than left to `set -e`: an absent file would abort
+            # the script on sed's own error, skipping both the failure summary
+            # and the override path -- the same trap the tag lookup above avoids.
+            if [ ! -f "$file" ]; then
+              echo "::error::$file is missing from the tagged tree, so its version declaration cannot be verified."
+              failures=$((failures + 1))
+              continue
+            fi
+            declared="$(sed -n "s/${pattern}/\\1/p" "$file" | head -n 1)"
+            if [ "$declared" = "$VERSION" ]; then
+              echo "version stamp: $file declares $VERSION"
+            else
+              echo "::error::$file declares '${declared:-<no version line matched>}', not the bare '$VERSION' this stable tag names. Land the drop-RC-suffix PR on the release branch before tagging."
+              failures=$((failures + 1))
+            fi
+          done
+
+          # Not a failure, but it must be visible in the log which mode shipped:
+          # promotion republishes the candidate's bytes, so a promoted stable
+          # advertises that candidate's RC-stamped version to stable users.
+          if [ "$PROMOTE_MODE" = "true" ]; then
+            echo "::warning::STABLE_PROMOTE_BYTES names $VERSION, so this release republishes the candidate's bytes and will ship an RC-stamped version (wheel name, feed, pip show, kirocrew --version). Unset the variable to rebuild and ship a bare $VERSION instead."
+          else
+            echo "mode: rebuilding from source so the shipped bytes carry the bare $VERSION"
+          fi
+
           if [ "$failures" -eq 0 ]; then
-            echo "stable gate: both preconditions satisfied for $VERSION"
+            echo "stable gate: all preconditions satisfied for $VERSION"
             exit 0
           fi
 
@@ -315,7 +407,7 @@ jobs:
 
   build-wheel:
     name: Build Wheel
-    if: needs.version.outputs.channel == 'insider'
+    if: needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true'
     needs: [version, dependency-vulnerability-gate]
     uses: ./.github/workflows/build-wheel.yml
     with:
@@ -323,7 +415,7 @@ jobs:
 
   build-desktop:
     name: Build Desktop
-    if: needs.version.outputs.channel == 'insider'
+    if: needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true'
     needs: [version, dependency-vulnerability-gate]
     uses: ./.github/workflows/build-desktop.yml
     with:
@@ -366,8 +458,8 @@ jobs:
     needs: [version, stable-gate, build-wheel, resolve-promotion]
     if: >-
       ${{ always() && needs.version.result == 'success' && needs.stable-gate.result == 'success' &&
-          ((needs.version.outputs.channel == 'insider' && needs.build-wheel.result == 'success') ||
-           (needs.version.outputs.channel == 'stable' && needs.resolve-promotion.result == 'success')) }}
+          (((needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true') && needs.build-wheel.result == 'success') ||
+           (needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.result == 'success')) }}
     permissions:
       contents: read
       id-token: write
@@ -376,8 +468,8 @@ jobs:
     with:
       channel: ${{ needs.version.outputs.channel }}
       version: ${{ needs.version.outputs.version }}
-      wheel_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'cli-wheel' }}
-      promote: ${{ needs.version.outputs.channel == 'stable' }}
+      wheel_artifact: ${{ needs.version.outputs.promote_mode == 'true' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'cli-wheel' }}
+      promote: ${{ needs.version.outputs.promote_mode == 'true' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
     # Explicit passthrough, not `secrets: inherit`: the callee declares
     # the secret it consumes, so this hands over that one and nothing
@@ -412,8 +504,8 @@ jobs:
     needs: [version, stable-gate, build-desktop, resolve-promotion]
     if: >-
       ${{ always() && needs.version.result == 'success' && needs.stable-gate.result == 'success' &&
-          ((needs.version.outputs.channel == 'insider' && needs.build-desktop.result == 'success') ||
-           (needs.version.outputs.channel == 'stable' && needs.resolve-promotion.result == 'success')) }}
+          (((needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true') && needs.build-desktop.result == 'success') ||
+           (needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.result == 'success')) }}
     permissions:
       contents: read
       id-token: write
@@ -421,12 +513,12 @@ jobs:
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: ${{ needs.version.outputs.channel }}
-      version: ${{ needs.version.outputs.channel == 'stable' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
+      version: ${{ needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
       arch: x64
       format: appimage
       publish: true
-      build_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-x64' }}
-      promote: ${{ needs.version.outputs.channel == 'stable' }}
+      build_artifact: ${{ needs.version.outputs.promote_mode == 'true' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-x64' }}
+      promote: ${{ needs.version.outputs.promote_mode == 'true' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
     secrets:
       AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
@@ -436,8 +528,8 @@ jobs:
     needs: [version, stable-gate, build-desktop, resolve-promotion]
     if: >-
       ${{ always() && needs.version.result == 'success' && needs.stable-gate.result == 'success' &&
-          ((needs.version.outputs.channel == 'insider' && needs.build-desktop.result == 'success') ||
-           (needs.version.outputs.channel == 'stable' && needs.resolve-promotion.result == 'success')) }}
+          (((needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true') && needs.build-desktop.result == 'success') ||
+           (needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.result == 'success')) }}
     permissions:
       contents: read
       id-token: write
@@ -445,12 +537,12 @@ jobs:
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: ${{ needs.version.outputs.channel }}
-      version: ${{ needs.version.outputs.channel == 'stable' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
+      version: ${{ needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
       arch: arm64
       format: appimage
       publish: true
-      build_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-arm64' }}
-      promote: ${{ needs.version.outputs.channel == 'stable' }}
+      build_artifact: ${{ needs.version.outputs.promote_mode == 'true' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-arm64' }}
+      promote: ${{ needs.version.outputs.promote_mode == 'true' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
     secrets:
       AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
@@ -460,8 +552,8 @@ jobs:
     needs: [version, stable-gate, build-desktop, resolve-promotion]
     if: >-
       ${{ always() && needs.version.result == 'success' && needs.stable-gate.result == 'success' &&
-          ((needs.version.outputs.channel == 'insider' && needs.build-desktop.result == 'success') ||
-           (needs.version.outputs.channel == 'stable' && needs.resolve-promotion.result == 'success')) }}
+          (((needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true') && needs.build-desktop.result == 'success') ||
+           (needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.result == 'success')) }}
     permissions:
       contents: read
       id-token: write
@@ -469,12 +561,12 @@ jobs:
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: ${{ needs.version.outputs.channel }}
-      version: ${{ needs.version.outputs.channel == 'stable' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
+      version: ${{ needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
       arch: x64
       format: deb
       publish: true
-      build_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-x64' }}
-      promote: ${{ needs.version.outputs.channel == 'stable' }}
+      build_artifact: ${{ needs.version.outputs.promote_mode == 'true' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-x64' }}
+      promote: ${{ needs.version.outputs.promote_mode == 'true' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
     secrets:
       AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
@@ -484,8 +576,8 @@ jobs:
     needs: [version, stable-gate, build-desktop, resolve-promotion]
     if: >-
       ${{ always() && needs.version.result == 'success' && needs.stable-gate.result == 'success' &&
-          ((needs.version.outputs.channel == 'insider' && needs.build-desktop.result == 'success') ||
-           (needs.version.outputs.channel == 'stable' && needs.resolve-promotion.result == 'success')) }}
+          (((needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true') && needs.build-desktop.result == 'success') ||
+           (needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.result == 'success')) }}
     permissions:
       contents: read
       id-token: write
@@ -493,12 +585,12 @@ jobs:
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: ${{ needs.version.outputs.channel }}
-      version: ${{ needs.version.outputs.channel == 'stable' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
+      version: ${{ needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
       arch: arm64
       format: deb
       publish: true
-      build_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-arm64' }}
-      promote: ${{ needs.version.outputs.channel == 'stable' }}
+      build_artifact: ${{ needs.version.outputs.promote_mode == 'true' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-arm64' }}
+      promote: ${{ needs.version.outputs.promote_mode == 'true' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
     secrets:
       AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
@@ -508,8 +600,8 @@ jobs:
     needs: [version, stable-gate, build-desktop, resolve-promotion]
     if: >-
       ${{ always() && needs.version.result == 'success' && needs.stable-gate.result == 'success' &&
-          ((needs.version.outputs.channel == 'insider' && needs.build-desktop.result == 'success') ||
-           (needs.version.outputs.channel == 'stable' && needs.resolve-promotion.result == 'success')) }}
+          (((needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true') && needs.build-desktop.result == 'success') ||
+           (needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.result == 'success')) }}
     permissions:
       contents: read
       id-token: write
@@ -517,12 +609,12 @@ jobs:
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: ${{ needs.version.outputs.channel }}
-      version: ${{ needs.version.outputs.channel == 'stable' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
+      version: ${{ needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
       arch: x64
       format: rpm
       publish: true
-      build_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-x64' }}
-      promote: ${{ needs.version.outputs.channel == 'stable' }}
+      build_artifact: ${{ needs.version.outputs.promote_mode == 'true' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-x64' }}
+      promote: ${{ needs.version.outputs.promote_mode == 'true' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
     secrets:
       AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
@@ -532,8 +624,8 @@ jobs:
     needs: [version, stable-gate, build-desktop, resolve-promotion]
     if: >-
       ${{ always() && needs.version.result == 'success' && needs.stable-gate.result == 'success' &&
-          ((needs.version.outputs.channel == 'insider' && needs.build-desktop.result == 'success') ||
-           (needs.version.outputs.channel == 'stable' && needs.resolve-promotion.result == 'success')) }}
+          (((needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true') && needs.build-desktop.result == 'success') ||
+           (needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.result == 'success')) }}
     permissions:
       contents: read
       id-token: write
@@ -541,12 +633,12 @@ jobs:
     uses: ./.github/workflows/publish-linux.yml
     with:
       channel: ${{ needs.version.outputs.channel }}
-      version: ${{ needs.version.outputs.channel == 'stable' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
+      version: ${{ needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
       arch: arm64
       format: rpm
       publish: true
-      build_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-arm64' }}
-      promote: ${{ needs.version.outputs.channel == 'stable' }}
+      build_artifact: ${{ needs.version.outputs.promote_mode == 'true' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-linux-arm64' }}
+      promote: ${{ needs.version.outputs.promote_mode == 'true' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
     secrets:
       AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
@@ -571,8 +663,8 @@ jobs:
     needs: [version, stable-gate, build-windows, resolve-promotion]
     if: >-
       ${{ always() && needs.version.result == 'success' && needs.stable-gate.result == 'success' &&
-          (needs.version.outputs.channel == 'insider' ||
-           (needs.version.outputs.channel == 'stable' && needs.resolve-promotion.result == 'success')) }}
+          (needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true' ||
+           (needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.result == 'success')) }}
     permissions:
       contents: read
       # A called workflow cannot exceed the caller job's grants, so the probe's
@@ -600,10 +692,10 @@ jobs:
       # is the insider one, so the feed has to advertise that same version or
       # every client's version comparison is made against a number the binary
       # does not carry. Mirrors publish-linux.yml's caller exactly.
-      version: ${{ needs.version.outputs.channel == 'stable' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
+      version: ${{ needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
       publish: true
-      installer_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-windows-x64' }}
-      promote: ${{ needs.version.outputs.channel == 'stable' }}
+      installer_artifact: ${{ needs.version.outputs.promote_mode == 'true' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'build-windows-x64' }}
+      promote: ${{ needs.version.outputs.promote_mode == 'true' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
     secrets:
       AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
@@ -619,8 +711,8 @@ jobs:
     needs: [version, stable-gate, build-wheel, resolve-promotion]
     if: >-
       ${{ always() && needs.version.result == 'success' && needs.stable-gate.result == 'success' &&
-          ((needs.version.outputs.channel == 'insider' && needs.build-wheel.result == 'success') ||
-           (needs.version.outputs.channel == 'stable' && needs.resolve-promotion.result == 'success')) }}
+          (((needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true') && needs.build-wheel.result == 'success') ||
+           (needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.result == 'success')) }}
     permissions:
       contents: read
       packages: write
@@ -635,9 +727,9 @@ jobs:
       # anonymously, so a release that lands behind a private package is a
       # broken release. Fail the lane rather than advertise an unpullable tag.
       require_public_access: true
-      wheel_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'cli-wheel' }}
-      promote: ${{ needs.version.outputs.channel == 'stable' }}
-      promote_digest: ${{ needs.version.outputs.channel == 'stable' && needs.resolve-promotion.outputs.docker_digest || '' }}
+      wheel_artifact: ${{ needs.version.outputs.promote_mode == 'true' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || 'cli-wheel' }}
+      promote: ${{ needs.version.outputs.promote_mode == 'true' }}
+      promote_digest: ${{ needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.outputs.docker_digest || '' }}
     # No `secrets: inherit`: the lane authenticates with GITHUB_TOKEN only
     # (implicitly available to reusable workflows). Inheriting would expose
     # every repo secret (signing, CDN) to a lane documented as needing none.
@@ -653,8 +745,8 @@ jobs:
     needs: [version, stable-gate, build-wheel, build-desktop, resolve-promotion]
     if: >-
       ${{ always() && needs.version.result == 'success' && needs.stable-gate.result == 'success' &&
-          ((needs.version.outputs.channel == 'insider' && needs.build-wheel.result == 'success' && needs.build-desktop.result == 'success') ||
-           (needs.version.outputs.channel == 'stable' && needs.resolve-promotion.result == 'success')) }}
+          (((needs.version.outputs.channel == 'insider' || needs.version.outputs.rebuild == 'true') && needs.build-wheel.result == 'success' && needs.build-desktop.result == 'success') ||
+           (needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.result == 'success')) }}
     permissions:
       id-token: write
       contents: read
@@ -670,10 +762,10 @@ jobs:
       CDSIGNER_API_ENDPOINT: ${{ secrets.CDSIGNER_API_ENDPOINT }}
     with:
       channel: ${{ needs.version.outputs.channel }}
-      version: ${{ needs.version.outputs.channel == 'stable' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
+      version: ${{ needs.version.outputs.promote_mode == 'true' && needs.resolve-promotion.outputs.source_version || needs.version.outputs.version }}
       write_feed: true
-      promote: ${{ needs.version.outputs.channel == 'stable' }}
-      promotion_artifact: ${{ needs.version.outputs.channel == 'stable' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || '' }}
+      promote: ${{ needs.version.outputs.promote_mode == 'true' }}
+      promotion_artifact: ${{ needs.version.outputs.promote_mode == 'true' && format('KiroCrew-notarized-stable-{0}', needs.version.outputs.version) || '' }}
       promotion_base_version: ${{ needs.version.outputs.base_version }}
 
   # `needs` alone is not enough here. With no `if:`, the default condition is
@@ -687,9 +779,19 @@ jobs:
   # to Stable with no GitHub Release page and no assets. Naming each dependency
   # explicitly is the documented workaround and the pattern every other lane in
   # this file already uses.
+  #
+  # `build-windows` is in `needs` as a WAIT EDGE and deliberately not in the
+  # `if:` below. Without the edge, `download-artifact` collects whatever exists
+  # the moment it runs, so a Windows build still queued on a slow runner would
+  # be omitted from the page with nothing going red -- the same silent-omission
+  # failure this job's Windows asset exists to end. Without the exemption from
+  # the `if:`, a Windows problem would take the whole release page down with it,
+  # and per-platform independence (soft_fail, an optional bundle role, a
+  # probe-and-skip publish lane) is the one thing every other Windows hop here
+  # already preserves.
   github-release:
     name: Create GitHub Release
-    needs: [version, stable-gate, sign-and-notarize]
+    needs: [version, stable-gate, sign-and-notarize, build-windows]
     if: >-
       ${{ always() && needs.version.result == 'success' &&
           needs.stable-gate.result == 'success' &&
@@ -708,7 +810,7 @@ jobs:
           path: artifacts
 
       - name: Verify promoted release bytes
-        if: needs.version.outputs.channel == 'stable'
+        if: needs.version.outputs.promote_mode == 'true'
         run: |
           python3 scripts/release_promotion.py verify \
             --bundle-dir "artifacts/KiroCrew-notarized-stable-${{ needs.version.outputs.version }}" \
@@ -719,11 +821,86 @@ jobs:
       # only from the exact gated artifact emitted after notarization, stapling,
       # and Gatekeeper verification. The unsigned electron-builder zip/DMG are
       # inter-job inputs only and must never become GitHub Release assets.
+      #
+      # The extension list is an ALLOWLIST, so a platform whose extension is
+      # missing is silently absent from the release page rather than failing
+      # anything. The Windows installer was absent exactly that way from v0.2.0
+      # through v0.5.0: every one of those releases published one to the CDN and
+      # to the update feed while the GitHub Release page offered none, and
+      # nothing went red. `test_release_promotion_contract.py` now pins the
+      # collected set against the publishing lanes so a new platform cannot be
+      # forgotten the same way.
+      #
+      # The extension glob is only sound for a format with exactly ONE producer
+      # in the run. macOS and Windows each have two, so both are selected by an
+      # explicit path instead -- see the Windows block below for why an `*.exe`
+      # entry in this glob would put a never-promoted installer on a stable page.
+      #
+      # Deliberately NOT collected: `*.exe.blockmap` (a differential-update
+      # sidecar the feed consumes, not something a human downloads) and
+      # `latest*.yml` (channel feed pointers, which are published to the CDN by
+      # their own lanes and would be misleading as release assets).
       - name: Assemble release assets (require gated macOS artifacts)
+        env:
+          PROMOTE_MODE: ${{ needs.version.outputs.promote_mode }}
+          # CHANNEL/REBUILD drive the symbols-manifest fail-closed gate below,
+          # which fires on exactly the runs that build the desktop legs.
+          CHANNEL: ${{ needs.version.outputs.channel }}
+          REBUILD: ${{ needs.version.outputs.rebuild }}
         run: |
           set -euo pipefail
           mkdir -p release
           find artifacts -type f \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} release/ \;
+
+          # The symbols pin has to outlive the build that wrote it. Each desktop
+          # leg uploads symbols-manifest.json into its own CI artifact, and that
+          # artifact expires in 14 days -- but the crash reports it exists to
+          # decode arrive from users on released builds, months later. A GitHub
+          # Release asset does not expire, so the pin travels with the release it
+          # describes. A few hundred bytes each.
+          #
+          # Renamed per leg on the way in: every artifact holds a file with the
+          # same basename, and `release/` is flat, so a plain copy would leave
+          # one arbitrary winner and silently drop the rest.
+          manifests=0
+          for manifest in artifacts/*/symbols-manifest.json; do
+            [ -e "$manifest" ] || continue
+            slug="$(basename "$(dirname "$manifest")")"
+            slug="${slug#unsigned-}"
+            slug="${slug#build-}"
+            cp "$manifest" "release/symbols-manifest-${slug}.json"
+            manifests=$((manifests + 1))
+          done
+          # Fail closed -- but only for a run whose desktop legs actually built.
+          # The requirement fires on exactly `build-desktop`'s own condition
+          # (`channel == 'insider' || rebuild == 'true'`): those are the runs that
+          # build a macOS and Linux leg, so a zero manifest count means the emit
+          # step stopped producing one -- a green build shipping undecodable crash
+          # reports, the failure this file exists to make impossible rather than
+          # unlikely. An ordinary stable release is one of them: stable ships a
+          # BARE version and so REBUILDS from source (`rebuild == 'true'`), running
+          # the same desktop legs an insider does, so a fresh stable build that
+          # stopped emitting a manifest must red here too.
+          #
+          # Byte-for-byte promotion (`promote_mode`, i.e. stable with
+          # `rebuild != 'true'`) is the one mode exempt, and correctly: it builds
+          # no macOS or Linux leg at all, republishing the exact bytes of an
+          # already-released insider build whose pin already sits permanently on
+          # that insider release. It is also never zero regardless -- `build-windows`
+          # has no channel condition and runs on every release, and this job now
+          # `needs` it, so the leg has finished and the loop above has copied its
+          # manifest before this check.
+          #
+          # Known limit, stated rather than implied: this counts manifests, so the
+          # Windows leg alone satisfies it and a macOS leg that silently stopped
+          # emitting one would still pass. Closing that needs a per-lane
+          # expectation keyed off which legs ran, a bigger change than the loss it
+          # prevents; the count still catches the emit step breaking outright.
+          if { [ "$CHANNEL" = "insider" ] || [ "$REBUILD" = "true" ]; } && [ "$manifests" -eq 0 ]; then
+            echo "::error::No symbols-manifest.json found in any build artifact;" \
+                 "see the 'Record symbols manifest' step in build-desktop.yml."
+            exit 1
+          fi
 
           NOTARIZED_DIR="artifacts/KiroCrew-notarized-${{ needs.version.outputs.channel }}-${{ needs.version.outputs.version }}"
           NOTARIZED_ZIP="${NOTARIZED_DIR}/notarized.zip"
@@ -785,6 +962,39 @@ jobs:
 
           cp "$NOTARIZED_ZIP" "release/KiroCrew-${{ needs.version.outputs.version }}-universal-mac.zip"
           cp "$NOTARIZED_DMG" "release/KiroCrew-${{ needs.version.outputs.version }}-universal.dmg"
+
+          # The Windows installer, selected per MODE rather than by extension.
+          # A promotion run holds TWO installers: the candidate's promoted bytes
+          # inside the gated bundle, and a fresh one from `build-windows`, which
+          # carries no `if:` and so rebuilds even when nothing consumes it.
+          # electron-builder's default name embeds the version, so the two names
+          # differ and an `*.exe` glob attaches BOTH -- putting an installer that
+          # was never soaked or promoted on a stable page, looking the more
+          # official of the pair for carrying the version number.
+          if [ "${PROMOTE_MODE:-}" = "true" ]; then
+            WINDOWS_INSTALLER="${NOTARIZED_DIR}/KiroCrew-Setup.exe"
+            [ -s "$WINDOWS_INSTALLER" ] || WINDOWS_INSTALLER=""
+          else
+            # Scoped to the producing artifact, and two is a bug rather than a
+            # coin flip: this must never guess which installer to publish.
+            # Mirrors record-promotion's at_most_one selector.
+            mapfile -t installers < <(find artifacts -type f -path '*build-windows-x64*' -name '*.exe')
+            if [ "${#installers[@]}" -gt 1 ]; then
+              echo "::error::expected at most one Windows installer, found ${#installers[@]}"
+              printf '%s\n' "${installers[@]}"
+              exit 1
+            fi
+            WINDOWS_INSTALLER="${installers[0]:-}"
+          fi
+          # Absence is a NOTICE, not a failure. build-windows is soft-fail so a
+          # Windows problem cannot hold back mac, Linux and the CLI; the bundle
+          # role is optional for the same reason. Loud in the run summary is the
+          # most this hop may do without reintroducing that coupling.
+          if [ -n "$WINDOWS_INSTALLER" ]; then
+            cp "$WINDOWS_INSTALLER" "release/KiroCrew-${{ needs.version.outputs.version }}-Setup-x64.exe"
+          else
+            echo "::notice::no Windows installer available to this run; the release page will offer none."
+          fi
           ls -la release/
 
       # Only a stable release has a CHANGELOG.md section to show (the stable
@@ -796,15 +1006,88 @@ jobs:
       # softprops/action-gh-release pre-pends `body`/`body_path` to the
       # `generate_release_notes` output rather than replacing it, so the
       # native "New Contributors" block (rendered from this repository's own
-      # commit history, per commit range) still appears after our section --
-      # do not hand-write a contributors list here, see AGENTS.md's changelog
-      # rule for why a hand-written list would duplicate that block.
+      # commit history, per commit range) still appears after our section.
+      #
+      # Two transforms are applied on the way, because the CHANGELOG section is
+      # written for a rendered FILE and the release body is a comment field:
+      #
+      #  - `### Contributors` is DROPPED. The section is required to carry it
+      #    (it ships in the wheel and feeds the dashboard's Releases page, where
+      #    no native block exists), but the release page renders its own
+      #    contributor block from the tag range, so copying ours in duplicates
+      #    the list directly above GitHub's. That duplicated on v0.3.0 and again
+      #    on v0.5.0 -- as a hand-written list was blamed both times, when the
+      #    copy is what actually carries it.
+      #  - Paragraphs and list items are JOINED onto one line. GitHub renders a
+      #    release body with GFM line breaks ON, so the CHANGELOG's ~76-column
+      #    wrapping becomes real <br>s and the page shows a fixed-width column
+      #    with a wide empty gutter (reported on v0.5.0). The same text is
+      #    correct in CHANGELOG.md, where a rendered file does not do this.
       - name: Extract CHANGELOG section for the release body
         run: |
           python3 - "${{ needs.version.outputs.channel }}" "${{ needs.version.outputs.base_version }}" <<'PY_EXTRACT'
+          import re
           import sys
           sys.path.insert(0, "src")
           from kiro_crew.changelog import parse_sections
+
+          FENCE = re.compile(r"^\s*(```|~~~)")
+          HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
+          LIST_ITEM = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+")
+          # Table rows, block quotes and thematic breaks own their line.
+          STANDALONE = re.compile(r"^\s*(\||>|---\s*$|\*\*\*\s*$|___\s*$)")
+
+
+          def drop_contributors(body: str) -> str:
+              """Remove the trailing `### Contributors` subsection, if present."""
+              out, skipping = [], False
+              for line in body.split("\n"):
+                  if HEADING.match(line):
+                      skipping = line.strip().lower().startswith("### contributors")
+                  if not skipping:
+                      out.append(line)
+              return "\n".join(out)
+
+
+          def unwrap(body: str) -> str:
+              """Join each paragraph / list item onto one line, keeping structure."""
+              out, buf, in_fence, marker = [], [], False, ""
+
+              def flush():
+                  if buf:
+                      out.append(" ".join(part.strip() for part in buf))
+                      buf.clear()
+
+              for raw in body.split("\n"):
+                  if in_fence:
+                      out.append(raw)
+                      if FENCE.match(raw) and raw.strip().startswith(marker):
+                          in_fence = False
+                      continue
+                  fence = FENCE.match(raw)
+                  if fence:
+                      flush()
+                      in_fence, marker = True, fence.group(1)
+                      out.append(raw)
+                  elif not raw.strip():
+                      flush()
+                      out.append("")
+                  elif HEADING.match(raw) or STANDALONE.match(raw):
+                      flush()
+                      out.append(raw.rstrip())
+                  elif LIST_ITEM.match(raw):
+                      flush()
+                      buf.append(raw.rstrip())
+                  else:
+                      buf.append(raw.rstrip())
+              flush()
+              collapsed = []
+              for line in out:
+                  if line == "" and collapsed and collapsed[-1] == "":
+                      continue
+                  collapsed.append(line)
+              return "\n".join(collapsed).strip() + "\n"
+
 
           channel, base_version = sys.argv[1], sys.argv[2]
           notes = ""
@@ -816,7 +1099,7 @@ jobs:
                       f"::error::CHANGELOG.md has no '## [{base_version}]' section; "
                       "the stable gate should have caught this earlier."
                   )
-              notes = sections[0] + "\n"
+              notes = unwrap(drop_contributors(sections[0]))
           with open("release-notes.md", "w", encoding="utf-8") as out:
               out.write(notes)
           PY_EXTRACT

@@ -23,6 +23,16 @@ AGENT_FILENAME = "kirocrew.json"
 LITE_AGENT_FILENAME = "kirocrew-lite.json"
 CONDUCTOR_AGENT_FILENAME = "kirocrew-conductor.json"
 PIPELINE_CONDUCTOR_AGENT_FILENAME = "kirocrew-pipeline-conductor.json"
+# The goal conductor's work-ledger variant, and a SEPARATE spec rather than a flag
+# on ``kirocrew-conductor``. The ledger flow inverts that agent's dispatch order
+# (bind before seed) and replaces its patrol cycle (a ledger read instead of a
+# transcript read), so mounting it on the shipped conductor would move every
+# existing conductor user onto a different procedure without their asking. Same
+# installer and the same no-file-write properties; what differs is the
+# ``kirocrew-work`` mount and the prompt that drives it.
+LEDGER_CONDUCTOR_AGENT_FILENAME = "kirocrew-ledger-conductor.json"
+SECURITY_CONDUCTOR_AGENT_FILENAME = "kirocrew-security-conductor.json"
+WORKER_AGENT_FILENAME = "kirocrew-worker.json"
 KNOWLEDGE_AGENT_FILENAME = "kirocrew-knowledge.json"
 RESEARCH_AGENT_FILENAME = "kirocrew-research.json"
 HEARTBEAT_AGENT_FILENAME = "kirocrew-heartbeat.json"
@@ -36,6 +46,9 @@ OWNED_KIRO_AGENT_FILES = (
     LITE_AGENT_FILENAME,
     CONDUCTOR_AGENT_FILENAME,
     PIPELINE_CONDUCTOR_AGENT_FILENAME,
+    LEDGER_CONDUCTOR_AGENT_FILENAME,
+    SECURITY_CONDUCTOR_AGENT_FILENAME,
+    WORKER_AGENT_FILENAME,
     KNOWLEDGE_AGENT_FILENAME,
     RESEARCH_AGENT_FILENAME,
     HEARTBEAT_AGENT_FILENAME,

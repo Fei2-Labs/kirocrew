@@ -16,6 +16,11 @@ from kiro_crew import platform_compat
 
 _needs_gh = pytest.mark.skipif(shutil.which("gh") is None, reason="gh CLI not installed")
 
+#: A fake resolved ``gh`` that is ABSOLUTE on this host. ``github_runner.run_gh``
+#: refuses any argv[0] failing ``os.path.isabs``, which from Python 3.13 rejects a
+#: bare ``/resolved-gh/gh`` on Windows (no drive). See test_discovery._FAKE_GH.
+_FAKE_GH = os.path.abspath(os.path.join(os.sep, "resolved-gh", "gh"))
+
 
 class TestParseRepoUrl(unittest.TestCase):
     def test_plain_repo_url(self):
@@ -75,7 +80,7 @@ class TestParseRepoUrl(unittest.TestCase):
 @_needs_gh
 class TestListOpenPrs(unittest.TestCase):
     def setUp(self):
-        patcher = patch.object(pipeline.discovery, "gh_bin", return_value="/resolved-gh/gh")
+        patcher = patch.object(pipeline.discovery, "gh_bin", return_value=_FAKE_GH)
         self._mock_gh_bin = patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -102,11 +107,68 @@ class TestListOpenPrs(unittest.TestCase):
         self.assertEqual(len(prs), 2)
         self.assertEqual(prs[0], {"url": "https://github.com/o/r/pull/1", "number": 1,
                                   "head_sha": "abc", "title": "one", "author": "ann",
-                                  "updated_at": "2026-07-01T00:00:00Z", "draft": False})
+                                  "updated_at": "2026-07-01T00:00:00Z", "draft": False,
+                                  "labels": []})
         # Fields absent from the payload degrade to empty/false, never KeyError —
         # the picker renders them directly.
         self.assertEqual(prs[1]["author"], "")
         self.assertFalse(prs[1]["draft"])
+        # Same contract for labels: a PR with none, and a payload with the key
+        # missing entirely, both read as an empty list. The picker narrows on this
+        # without a presence check, so a missing key would be a TypeError there.
+        self.assertEqual(prs[1]["labels"], [])
+
+    def test_labels_are_projected_and_kept_in_order(self):
+        """The whole point of the label filter: names arrive with the PR list,
+        in GitHub's order, with no second request."""
+        jsonl = json.dumps({
+            "url": "https://github.com/o/r/pull/7", "number": 7,
+            "head_sha": "abc", "title": "seven", "author": "ann",
+            "updated_at": "2026-07-01T00:00:00Z", "draft": False,
+            "labels": ["readiness: checking", "fork", "area: apps"],
+        })
+        with patch.object(pipeline.subprocess, "run", return_value=self._cp(stdout=jsonl)):
+            prs = pipeline.list_open_prs("o", "r")
+        self.assertEqual(prs[0]["labels"], ["readiness: checking", "fork", "area: apps"])
+
+    def test_label_projection_is_requested_in_the_same_call(self):
+        """No extra request and no repo-labels endpoint: `.labels` must be asked
+        for inside the ONE `gh api` argv that lists the PRs, or the filter would
+        cost a call per repo (or per PR) to populate."""
+        captured = {}
+
+        def fake_run(argv, **kw):
+            captured["argv"] = argv
+            return self._cp(stdout="")
+
+        with patch.object(pipeline.subprocess, "run", side_effect=fake_run):
+            pipeline.list_open_prs("o", "r")
+        argv = captured["argv"]
+        jq = argv[argv.index("--jq") + 1]
+        self.assertIn("labels", jq)
+        # One invocation, and the PR list path is the only path requested — a
+        # second `gh` call would not show up in this argv at all, so the argv is
+        # asserted to still be the pulls list.
+        self.assertEqual(len([a for a in argv if a.startswith("repos/")]), 1)
+        self.assertTrue(argv[2].startswith("repos/o/r/pulls?state=open"))
+
+    def test_a_non_list_labels_value_narrows_to_empty_not_to_a_truthy_value(self):
+        """Fail toward showing the PR. A malformed `labels` must not become a
+        truthy value, because a labelled view narrows on membership — a wrong
+        value there HIDES a pull request from review, which is the one direction
+        that loses work rather than merely showing too much."""
+        rows = [
+            json.dumps({"url": "u1", "number": 1, "labels": "docs"}),        # string
+            json.dumps({"url": "u2", "number": 2, "labels": {"name": "x"}}),  # object
+            json.dumps({"url": "u3", "number": 3, "labels": None}),           # null
+            json.dumps({"url": "u4", "number": 4, "labels": ["ok", "", 5, None]}),
+        ]
+        with patch.object(pipeline.subprocess, "run",
+                          return_value=self._cp(stdout="\n".join(rows))):
+            prs = pipeline.list_open_prs("o", "r")
+        self.assertEqual([p["labels"] for p in prs[:3]], [[], [], []])
+        # Non-strings and empty strings are dropped; a usable name survives.
+        self.assertEqual(prs[3]["labels"], ["ok"])
 
     def test_spawn_carries_the_minimal_env(self):
         """The bare-subprocess regression class this suite exists to keep out:
@@ -120,7 +182,7 @@ class TestListOpenPrs(unittest.TestCase):
 
         with unittest.mock.patch.dict(os.environ, {"AWS_SECRET_ACCESS_KEY": "aws-secret",
                                                    "GH_TOKEN": "gho_token"}), \
-                patch.object(pipeline.discovery, "gh_bin", return_value="/resolved-gh/gh"), \
+                patch.object(pipeline.discovery, "gh_bin", return_value=_FAKE_GH), \
                 patch.object(pipeline.subprocess, "run", side_effect=fake_run):
             pipeline.list_open_prs("o", "r")
         env = captured["kw"].get("env")

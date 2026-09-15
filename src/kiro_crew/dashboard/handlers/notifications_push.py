@@ -45,9 +45,9 @@ def _resolve_app_channels(app_name: str) -> dict[str, str] | None:
         return None
     if app_name in RESERVED_APP_NAMES:
         # Defense-in-depth: manifest validation rejects reserved names at
-        # install, but an app installed before that rule existed (or via a
-        # path that skipped validation) must still be unable to push into
-        # the "<reserved>.*" channel namespace (e.g. "system.approval").
+        # install, but an app that reached disk by a path which skipped
+        # validation must still be unable to push into the "<reserved>.*"
+        # channel namespace (e.g. "system.approval").
         return None
     manifest = get_app_manifest(app_name)
     if manifest is None:
@@ -73,8 +73,8 @@ async def api_push_notification(request: web.Request) -> web.Response:
         )
 
     # Bound the body BEFORE decoding via the shared helper so the cap and the
-    # 413/400 contract cannot drift from the strict-internal push endpoint
-    # (issue #490). Chunked transfer-encoding carries no Content-Length, so the
+    # 413/400 contract cannot drift from the strict-internal push endpoint.
+    # Chunked transfer-encoding carries no Content-Length, so the
     # helper reads incrementally, bounding the allocation to the cap + one chunk
     # instead of buffering the whole body on the event-loop thread.
     body, _cap_err = await read_bounded_json(request)

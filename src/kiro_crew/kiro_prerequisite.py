@@ -53,7 +53,7 @@ from typing import Any
 
 from kiro_crew import hooks, identity_stores, platform_compat
 from kiro_crew._sqlite_compat import sqlite3
-from kiro_crew.agent_files import AGENT_FILENAME
+from kiro_crew.agent_files import AGENT_FILENAME, LITE_AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import CRED_KIRO_API_KEY, read_env_file_credential
 from kiro_crew.config.paths import config_dir
@@ -70,6 +70,15 @@ from kiro_crew.sandbox import (
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
+
+# Dashboard-facing text for a spec-repair arm that reported success while the
+# overlay still lists missing specs (the no-op-is-failure rule documented on
+# ``repair_agent_specs``). Shared by the main-rebuild and auxiliary arms so the
+# remediation command cannot drift between them.
+_SPECS_STILL_MISSING_ERROR = (
+    "The repair reported success but the specs are still missing. "
+    "Run `kirocrew setup --agent-only --clean` on the gateway host."
+)
 
 OFFICIAL_INSTALL_DOCS_URL = "https://kiro.dev/cli/"
 # The exact command the user runs to sign in. A CODE CONSTANT, never a catalog
@@ -107,8 +116,8 @@ _ACP_SUBCOMMAND = "acp"
 # read-only probes; sized to match the auto-update path's own 120s budget in
 # ``slack/gateway.py`` rather than the 10s probe ceiling.
 _UPDATE_TIMEOUT_SECS = 120
-# Compatibility shim, not live state. Nothing performs an operation any more, but a
-# dashboard loaded BEFORE this change reads ``status.operation.status``
+# Compatibility shim, not live state. Nothing performs an operation any more, but an
+# OLDER dashboard build reads ``status.operation.status``
 # unconditionally in its refetch-interval callback — the optional chain there
 # guards ``status``, not ``operation`` — and that callback runs for every user, not
 # only the first-run gate. A tab left open across a gateway upgrade would therefore
@@ -460,8 +469,8 @@ class PrerequisiteStatus:
     sandbox_detail: str = ""
     # Machine-readable host mechanism behind a Linux userns denial — one of the
     # sandbox ``REMEDY_*`` tokens, or "" when unknown. Without it the gate could
-    # only show the raw errno, which is the dead end reported in issue #1660: the
-    # probe knows the fix is an AppArmor profile and the user cannot tell.
+    # only show the raw errno, which is a dead end: the probe knows the fix is an
+    # AppArmor profile and the user cannot tell.
     sandbox_remedy: str = ""
     # The verification probe hit ``_PROBE_TIMEOUT_SECS`` instead of answering. A
     # THIRD condition, distinct from both a missing binary and a sandbox refusal:
@@ -471,9 +480,19 @@ class PrerequisiteStatus:
     # combination that does not merely fail to help, it actively rules out the true
     # cause and sends the operator to reinstall or re-login, neither of which can
     # work on a host whose CLI is installed, signed in, and serving turns the whole
-    # time (issue #4577: 4081 SEL ``probe_version`` events, every one
-    # ``outcome=failed error=timeout``, on exactly such a host).
+    # time (such a host records ``probe_version`` events in SEL with
+    # ``outcome=failed error=timeout`` and nothing else to go on).
     probe_timed_out: bool = False
+    # Why the last version probe did not verify the CLI when NONE of the typed
+    # conditions above (sandbox refusal, timeout) explains it: the probe's own
+    # failure text, or the tail of its output when it exited non-zero. Empty
+    # when the probe passed, never ran (no candidate) or a typed field carries
+    # the cause. Shown verbatim, untranslated — the desktop's "Setup Check
+    # Unavailable" screen otherwise has NOTHING to say about why.
+    probe_error: str = ""
+    # The failed probe's exit status, ``None`` when it did not exit (never ran,
+    # timed out, sandbox refused) or when it passed.
+    probe_status: int | None = None
     # Kiro Crew's own agent specs (~/.kiro/agents/kirocrew*.json). ``ready``
     # requires these on disk, not merely a viable binary and a good ``whoami``:
     # without them kiro-cli answers every ``session/set_mode`` with
@@ -587,6 +606,41 @@ def _terminal_audit_detail(result: ProcessResult, succeeded: bool) -> str:
     return "nonzero exit"
 
 
+#: Longest ``probe_error`` served. The value is a diagnostic line for a status
+#: screen, not a log: the tail of a failing ``--version`` is where the CLI names
+#: its own complaint, and anything longer is a stack trace the screen cannot use.
+_PROBE_ERROR_MAX_CHARS = 400
+
+
+def _probe_failure_text(result: ProcessResult | None) -> str:
+    """What a failed version probe has to say for itself, bounded.
+
+    The typed failures (sandbox refusal, timeout) are reported through their own
+    fields and never reach here. What remains is a probe that RAN and did not
+    verify. The CLI's own output is the text: that is where a launcher wrapper
+    or a broken install names its complaint, and it is what the operator can act
+    on. The spawn layer's ``error`` is only a fallback for a probe that printed
+    nothing -- for an ordinary non-zero exit it is just the generic exit code,
+    which ``probe_status`` already carries and the gate already renders as
+    ``(exit N)``, so appending it here would say the exit code twice. Empty
+    when there is nothing to say (no probe ran, or it passed).
+    """
+
+    if result is None or result.ok:
+        return ""
+    text = (result.output or "").strip() or (result.error or "").strip()
+    # The probe's stdout/stderr is untrusted text that can echo a token or an
+    # authority-bearing URL (a launcher wrapper printing the environment it
+    # sees), and this string travels to the status payload and the setup
+    # screen, so it is redacted BEFORE the cut: truncating first could leave
+    # the recognisable half of a secret in the kept tail.
+    text, _ = redact_credentials(text)
+    text, _ = redact_exfiltration_urls(text)
+    if len(text) > _PROBE_ERROR_MAX_CHARS:
+        text = text[-_PROBE_ERROR_MAX_CHARS:]
+    return text
+
+
 def _canonical_candidate(path: str) -> str:
     try:
         return os.path.realpath(path)
@@ -695,12 +749,12 @@ def snapshot_trusted_acp_executable(
     dispatching on ``argv[0]``, a wrapper reading a sibling registry, or a
     self-updating install whose payload lives beside it.
 
-    An earlier design copied the bytes into a private snapshot (sealed memfd on
-    Linux, verified copy on macOS) to close the resolve-to-exec window in which
-    the file could be swapped. That is deliberately **not** done anymore: it
+    Copying the bytes into a private snapshot (sealed memfd on Linux, verified
+    copy on macOS) would close the resolve-to-exec window in which the file could
+    be swapped. That is deliberately **not** done: it
     defends against an attacker who already has write access to the user's own
     machine — a threat the rest of the product does not defend against either —
-    and the cost was breaking every multi-call and multiplexer install outright.
+    and it breaks every multi-call and multiplexer install outright.
 
     Trust is "the CLI runs": install source, owner, and path do not gate launch,
     so a toolbox / Homebrew / self-updated Kiro CLI launches like any other.
@@ -1077,6 +1131,43 @@ def identity_fingerprint(path: Path) -> str:
     return hashlib.sha256("\n".join(sorted(parts)).encode()).hexdigest()
 
 
+#: Separator between the kiro-cli store's fingerprint and the Crew vault's in the
+#: combined identity string. Only present when the vault holds an identity, so a
+#: host with no Crew sign-in fingerprints exactly as before.
+_CREW_VAULT_FINGERPRINT_SEP = "+crew:"
+
+
+def _crew_vault_fingerprint() -> str:
+    """The Crew vault's own identity digest, or ``""`` when it holds nothing.
+
+    Deferred import: ``kiro_crew.auth`` brings the ``cryptography`` wheel, which
+    must stay off this module's import graph (it is on the gateway's boot path)
+    and is loaded here on the first identity read instead. Never raises; the
+    bridge helper reports an unreadable vault as empty. Blocking file IO -- the
+    caller already runs on a worker thread.
+    """
+    from kiro_crew.auth.bridge import vault_identity_fingerprint
+
+    return vault_identity_fingerprint()
+
+
+def _combine_identity_fingerprints(cli: str, crew_vault: str) -> str:
+    """One fingerprint over BOTH credential sources a running child may have loaded.
+
+    kiro-cli's store answers for the kiro backend and for a KAS relay spawned
+    cli-owned; the Crew vault answers for a KAS relay spawned Crew-owned
+    (:mod:`kiro_crew.acp.kas_host_auth`). A sign-out in EITHER must read as an
+    identity change, so the per-turn sweep retires -- and keeps re-sweeping until
+    it completes -- children that loaded the previous identity, whichever source
+    it came from. The vault component is appended only when present, so a host
+    with no Crew sign-in keeps the kiro-cli-only fingerprint byte-for-byte and
+    ``""`` still means "no identity anywhere".
+    """
+    if not crew_vault:
+        return cli
+    return f"{cli}{_CREW_VAULT_FINGERPRINT_SEP}{crew_vault}"
+
+
 def _claim_digest(value: object) -> str:
     """Hash one claim value so no credential material can leave the reader."""
 
@@ -1146,9 +1237,7 @@ def _auth_store_mappings(
         # them from overwriting each other. macOS/Linux have a single location
         # per product, so no group. (The env-var source-side honouring and the
         # fixed staged side are already applied by ``store_mappings``.)
-        group = (
-            f"win32:{row.product.value}" if platform_name == "win32" else None
-        )
+        group = f"win32:{row.product.value}" if platform_name == "win32" else None
         mappings.append(
             _AuthStoreMapping(
                 source=row.source,
@@ -1170,7 +1259,7 @@ def _ensure_auth_staging_parent(home: Path) -> Path:
     # staging root holds credential material, and moving an unexpected file to a
     # sibling name would leave its (possibly sensitive) contents readable outside
     # the sandbox-hidden staging prefix. unlink() acts on the symlink itself,
-    # never its target. (#561)
+    # never its target.
     if staging_parent.is_symlink() or (staging_parent.exists() and not staging_parent.is_dir()):
         try:
             staging_parent.unlink()
@@ -1550,8 +1639,8 @@ async def _prepare_sandboxed_spawn(
     """Prepare filesystem-heavy sandbox state on a worker thread.
 
     Delegates to the shared :func:`shielded_prepare_off_loop`, which owns the
-    shield-and-recover pattern (including the repeat-cancellation semantics of
-    #5841) for every async caller of the chokepoint.  The chokepoint call itself
+    shield-and-recover pattern (including its repeat-cancellation semantics)
+    for every async caller of the chokepoint.  The chokepoint call itself
     stays in this module so the ``mode``/``strip_python_env`` policy — and this
     module's own seam over ``sandboxed_spawn_argv`` — remain local.
     """
@@ -1628,11 +1717,11 @@ async def _run_process(
             # mutable package path would also let a same-UID agent replace code
             # immediately before an owner-triggered install.
             #
-            # It also carries the resource limits (``--rlimits=``) that used to
-            # ride on ``preexec_fn``. See resource_limit_supervisor_argv: a
+            # It also carries the resource limits (``--rlimits=``) rather than a
+            # ``preexec_fn``. See resource_limit_supervisor_argv: a
             # preexec_fn forces a plain fork() of this multi-threaded gateway and
-            # runs Python in the child before exec, which is how a child wedged
-            # in a futex and pinned the fds it had inherited. The supervisor
+            # runs Python in the child before exec, which can wedge that child
+            # in a futex with the fds it inherited pinned. The supervisor
             # applies the same setrlimits after exec, single-threaded, and the
             # exec'd child inherits them.
             # -B because -I implies -E: this child ignores ``PYTHONPYCACHEPREFIX``, so
@@ -2172,6 +2261,40 @@ class KiroPrerequisiteService:
         logger.info("Agent specs repaired from the readiness gate")
         return ""
 
+    async def _repair_auxiliary_specs(self, missing: list[str]) -> str:
+        """Write the missing AUXILIARY required specs. Returns failure text, or ``""``.
+
+        The counterpart to :meth:`_repair_agent_specs` for the required specs
+        other than the main one — today only the lite agent spec. Unlike the
+        main-spec rebuild, this write is NOT in the lost-update class that
+        method's docstring gates on: ``_install_lite_agent_fallback`` is an
+        atomic whole-file JSON write, and no ``tools``/``allowedTools`` half is
+        toggle-merged into the lite spec, so there is no concurrent edit to
+        lose — and the spec is only written here when it is absent anyway.
+
+        An auxiliary name this method does not know how to write is deliberately
+        left alone: it stays missing, and the caller's post-repair overlay
+        reports it through the still-missing error text instead of a false
+        success.
+        """
+
+        def _write() -> None:
+            from kiro_crew.agent import _install_lite_agent_fallback  # circular import
+
+            if LITE_AGENT_FILENAME in missing:
+                _install_lite_agent_fallback()
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as exc:
+            logger.error(
+                "Auxiliary agent spec repair from the readiness gate failed",
+                exc_info=True,
+            )
+            return _sanitize_detail(f"{type(exc).__name__}: {exc}")
+        logger.info("Auxiliary agent specs repaired from the readiness gate")
+        return ""
+
     async def repair_agent_specs(self, caller: str = "") -> dict[str, Any]:
         """Repair the managed agent specs, then return the post-repair snapshot.
 
@@ -2209,6 +2332,26 @@ class KiroPrerequisiteService:
             # what the card's button offers.
             repairable = AGENT_FILENAME in missing_before
             if not repairable:
+                auxiliary_missing = [name for name in missing_before if name != AGENT_FILENAME]
+                error = ""
+                if auxiliary_missing:
+                    # Only auxiliary required specs are missing. The main-spec
+                    # gate above keeps rebuild_agent_config away from a present
+                    # main spec, but the auxiliary specs have their own writers
+                    # with no such lost-update class (see
+                    # _repair_auxiliary_specs), so refusing to write them would
+                    # leave the gate blocking on a file the button never
+                    # writes. Runs even when a spec is REJECTED: acceptance is
+                    # only evaluated for PRESENT specs, so a rejected main spec
+                    # and a missing lite spec can coexist, and writing a MISSING
+                    # file rewrites nothing — the lost-update reasoning behind
+                    # the rejection guard does not apply to it.
+                    error = await self._repair_auxiliary_specs(auxiliary_missing)
+                elif not rejected_before:
+                    # Nothing to repair: a concurrent repair already wrote the
+                    # specs. Report, do not write.
+                    before["agent_spec_repair_error"] = ""
+                    return before
                 if rejected_before:
                     # Not a no-op: acceptance is only re-answerable by the binary,
                     # and the stat-only overlay cannot ask it. force=True because
@@ -2218,14 +2361,11 @@ class KiroPrerequisiteService:
                         await self._probe(force=True)
                     except Exception:  # noqa: BLE001 — stale state beats a 500
                         logger.warning("Re-probe of rejected agent specs failed", exc_info=True)
-                    result = await self._agent_spec_overlay(self._snapshot_dict())
-                    result["agent_spec_repair_error"] = ""
-                    return result
-                # Nothing to repair, only an auxiliary spec is missing (which the
-                # main-spec gate deliberately excludes), or a concurrent repair
-                # already wrote it. Report, do not write.
-                before["agent_spec_repair_error"] = ""
-                return before
+                result = await self._agent_spec_overlay(self._snapshot_dict())
+                if not error and auxiliary_missing and (result.get("missing_agent_specs") or []):
+                    error = _SPECS_STILL_MISSING_ERROR
+                result["agent_spec_repair_error"] = error
+                return result
             error = await self._repair_agent_specs()
             if not error and AGENT_FILENAME in rejected_before:
                 # Acceptance is only re-answerable by the binary, and the overlay
@@ -2239,10 +2379,7 @@ class KiroPrerequisiteService:
                     logger.warning("Re-probe after agent-spec repair failed", exc_info=True)
             result = await self._agent_spec_overlay(self._snapshot_dict())
             if not error and (result.get("missing_agent_specs") or []):
-                error = (
-                    "The rebuild reported success but the specs are still missing. "
-                    "Run `kirocrew setup --agent-only --clean` on the gateway host."
-                )
+                error = _SPECS_STILL_MISSING_ERROR
             result["agent_spec_repair_error"] = error
             return result
 
@@ -2429,10 +2566,12 @@ class KiroPrerequisiteService:
                         "identity as absent instead of reading the fixed anchor",
                         self._platform,
                     )
-                return _AUTH_FINGERPRINT_ABSENT
-            return identity_fingerprint(
-                kiro_identity_store_path(self._platform, self._home, self._environ)
-            )
+                cli = _AUTH_FINGERPRINT_ABSENT
+            else:
+                cli = identity_fingerprint(
+                    kiro_identity_store_path(self._platform, self._home, self._environ)
+                )
+            return _combine_identity_fingerprints(cli, _crew_vault_fingerprint())
 
         try:
             fingerprint = await asyncio.to_thread(_read)
@@ -2744,9 +2883,15 @@ class KiroPrerequisiteService:
                     self._last_probe_at = self._clock()
                     self._has_probed = True
                     return self._status
+                # Neither typed condition explains the failure, so carry the
+                # probe's own account of it: without this the bare default below
+                # says only installed=False and the gate has no diagnostic to
+                # show (the desktop "Setup Check Unavailable" dead end).
                 self._status = PrerequisiteStatus(
                     platform=_platform_label(self._platform),
                     initial_setup_complete=self._initial_setup_complete,
+                    probe_error=_probe_failure_text(version_probe),
+                    probe_status=version_probe.returncode if version_probe else None,
                 )
                 self._stamp_probe(probe_identity)
                 return self._status
@@ -2776,9 +2921,7 @@ class KiroPrerequisiteService:
             rejection_detail = ""
             acp_supported = True
             if whoami.ok:
-                rejected, rejection_detail = await self._probe_spec_acceptance(
-                    self._viable_binary
-                )
+                rejected, rejection_detail = await self._probe_spec_acceptance(self._viable_binary)
                 acp_supported = await self._probe_acp_support(self._viable_binary)
             self._status = PrerequisiteStatus(
                 platform=_platform_label(self._platform),
@@ -2954,9 +3097,7 @@ class KiroPrerequisiteService:
             # deliberately omitted because `update` fetches a binary, it does
             # not authenticate.
             update_environment = dict(probe_environment)
-            update_environment.update(
-                _allowlisted_env(self._environ, _IDENTITY_PROXY_ENV_KEYS)
-            )
+            update_environment.update(_allowlisted_env(self._environ, _IDENTITY_PROXY_ENV_KEYS))
             await self._audit(
                 action="update_cli",
                 outcome="invoked",
@@ -2977,9 +3118,7 @@ class KiroPrerequisiteService:
                     extra_hidden_dirs=self._hidden_probe_dirs,
                 )
             except asyncio.CancelledError:
-                await self._set_terminal_audit(
-                    "update_cli", "failed", "gateway-setup", "cancelled"
-                )
+                await self._set_terminal_audit("update_cli", "failed", "gateway-setup", "cancelled")
                 raise
             except Exception as exc:
                 logger.warning("kiro-cli update failed to run", exc_info=True)

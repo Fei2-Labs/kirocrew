@@ -83,31 +83,37 @@ def _grant(service=aws_consent.SERVICE_POLLY, *, profile="", region="us-east-1",
 class TestProviderDefaultIsLocal:
     """Turning voice on without naming a provider must not reach AWS."""
 
-    def test_dataclass_default_is_piper(self):
+    def test_dataclass_default_is_local(self):
         from kiro_crew.slack.handler import _VoiceConfig
-        from kiro_crew.voice_reply import DEFAULT_PROVIDER, PROVIDER_PIPER
+        from kiro_crew.voice_reply import DEFAULT_PROVIDER, PROVIDER_POLLY
 
-        assert DEFAULT_PROVIDER == PROVIDER_PIPER
-        assert _VoiceConfig().provider == PROVIDER_PIPER
+        # Pinned as "not the paid provider" rather than as one provider name:
+        # which local provider is the default is a product decision that may
+        # move, while "the default never bills an AWS account" is the property
+        # this class exists to hold.
+        assert DEFAULT_PROVIDER != PROVIDER_POLLY
+        assert _VoiceConfig().provider == DEFAULT_PROVIDER
 
-    def test_absent_provider_key_loads_as_piper(self, home):
+    def test_absent_provider_key_loads_as_local(self, home):
         """The regression: a config with voice ON but no provider named."""
         from kiro_crew.config.loader import config_path
         from kiro_crew.slack.handler import _vc, load_voice_reply_config
-        from kiro_crew.voice_reply import PROVIDER_PIPER
+        from kiro_crew.voice_reply import DEFAULT_PROVIDER, PROVIDER_POLLY
 
         config_path().write_text(json.dumps({"voice_reply": {"enabled": True}}))
         load_voice_reply_config()
-        assert _vc.provider == PROVIDER_PIPER
+        assert _vc.provider == DEFAULT_PROVIDER
+        assert _vc.provider != PROVIDER_POLLY
 
-    def test_invalid_provider_falls_back_to_piper(self, home):
+    def test_invalid_provider_falls_back_to_local(self, home):
         from kiro_crew.config.loader import config_path
         from kiro_crew.slack.handler import _vc, load_voice_reply_config
-        from kiro_crew.voice_reply import PROVIDER_PIPER
+        from kiro_crew.voice_reply import DEFAULT_PROVIDER, PROVIDER_POLLY
 
         config_path().write_text(json.dumps({"voice_reply": {"provider": "ploly"}}))
         load_voice_reply_config()
-        assert _vc.provider == PROVIDER_PIPER
+        assert _vc.provider == DEFAULT_PROVIDER
+        assert _vc.provider != PROVIDER_POLLY
 
 
 # ── Step 2: the gate, and where the grant lives ──
@@ -117,22 +123,15 @@ class TestGrantIsOnTheKeystoneFloor:
     """The agent must not be able to consent on the operator's behalf."""
 
     def test_leaf_is_fenced_for_read_and_write(self):
+        from kiro_crew import sandbox
         from kiro_crew.config.loader import aws_consent_path
-        from kiro_crew.security import (
-            _CREW_SECRET_LEAVES,
-            is_sensitive_bash_command,
-            is_sensitive_path,
-        )
+        from kiro_crew.security import _CREW_SECRET_LEAVES, is_sensitive_path
 
         assert "aws_service_consent.json" in _CREW_SECRET_LEAVES
         assert aws_consent_path().name == "aws_service_consent.json"
         assert is_sensitive_path("~/.kiro/crew/aws_service_consent.json") is True
-        for command in (
-            "cat ~/.kiro/crew/aws_service_consent.json",
-            "echo x > ~/.kiro/crew/aws_service_consent.json",
-            "tee ~/.kiro/crew/aws_service_consent.json",
-        ):
-            assert is_sensitive_bash_command(command)
+        # The shell plane is sealed by the sandbox, not matched by text.
+        assert "aws_service_consent.json" in sandbox._CREW_READONLY_LEAVES
 
     def test_file_is_owner_only(self, home):
         import stat
@@ -156,10 +155,10 @@ class TestGrantIsOnTheKeystoneFloor:
 
         On Windows the POSIX mode bits are a no-op, so the owner-only DACL from
         ``restrict_to_owner`` is the only protection; applying it after the
-        rename left the record readable under the inherited ACL for the write
-        window (issue #5285). Asserted by measuring the file's SIZE at lockdown
-        time — zero means no payload byte existed yet. A post-write stat passes
-        on the buggy ordering too, so it would not be a regression test.
+        rename would leave the record readable under the inherited ACL for the
+        write window. Asserted by measuring the file's SIZE at lockdown time —
+        zero means no payload byte existed yet. A post-write stat passes on the
+        wrong ordering too, so it cannot distinguish the two.
         """
         from kiro_crew import platform_compat
 
@@ -181,7 +180,7 @@ class TestGrantIsOnTheKeystoneFloor:
 
     def test_sidecar_preservation_lockdown_precedes_content(self, home, monkeypatch):
         """The corrupt-store sidecar carries whatever the old store held, so its
-        write gets the same lockdown-before-content ordering (issue #5285)."""
+        write gets the same lockdown-before-content ordering."""
         from kiro_crew import platform_compat
         from kiro_crew.config.loader import aws_consent_path
 
@@ -373,6 +372,34 @@ class TestGate:
         assert aws_consent.revoke(aws_consent.SERVICE_POLLY) is True
         assert aws_consent.read_grant(aws_consent.SERVICE_POLLY) is None
         assert aws_consent.read_grant(aws_consent.SERVICE_TRANSCRIBE) is not None
+
+    def test_revoke_for_profile_withdraws_every_grant_naming_that_profile(self, home):
+        # Grants are keyed by service, so a profile leaving the portal's registry
+        # has to sweep the services for records that named it -- and only those.
+        _grant(aws_consent.SERVICE_POLLY, profile="alpha")
+        _grant(aws_consent.SERVICE_TRANSCRIBE, profile="alpha")
+        _grant("s3", profile="beta")
+        assert aws_consent.revoke_for_profile("alpha") == sorted(
+            [aws_consent.SERVICE_POLLY, aws_consent.SERVICE_TRANSCRIBE]
+        )
+        assert aws_consent.read_grant(aws_consent.SERVICE_POLLY) is None
+        assert aws_consent.read_grant(aws_consent.SERVICE_TRANSCRIBE) is None
+        assert aws_consent.read_grant("s3") is not None
+        assert aws_consent.revoke_for_profile("alpha") == []
+
+    def test_revoke_for_profile_raises_on_an_unreadable_store(self, home):
+        # Every other reader fails soft to "no grant"; this one must not, because
+        # its caller goes on to forget the profile and an unread grant would
+        # survive to be inherited by the next registration under that name.
+        _grant("s3", profile="alpha")
+        path = aws_consent.aws_consent_path()
+        path.write_text("{not json", encoding="utf-8")
+        with pytest.raises(ValueError):
+            aws_consent.revoke_for_profile("alpha")
+        assert path.read_text(encoding="utf-8") == "{not json"
+        # A store that does not exist yet is the ordinary no-grants case.
+        path.unlink()
+        assert aws_consent.revoke_for_profile("alpha") == []
 
     def test_unknown_service_cannot_be_granted(self, home):
         with pytest.raises(ValueError):
@@ -1186,7 +1213,7 @@ class TestIdentityProbeInputs:
     def test_cli_probe_resolves_under_minimal_path(self, home, monkeypatch, tmp_path):
         """A GUI-launched gateway's minimal PATH must not fail the consent gate
         closed: the probe routes through the deploy engine's well-known-dirs
-        resolver (#4770), agreeing with the resolved spawn below it."""
+        resolver, agreeing with the resolved spawn below it."""
         import os as _os
 
         if _os.name == "nt":

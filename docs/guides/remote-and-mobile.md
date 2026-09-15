@@ -376,6 +376,14 @@ the same and the difference is the whole security story:
   something else there by hand, `up` and `down` both stop and print the command
   instead of overwriting or deleting your mapping.
 
+  A serve configuration that sits entirely on **other** ports — another project
+  on this machine published on port 80 or 8443, say — blocks neither direction.
+  Publishing touches only `443/`, so when Tailscale's own status shows every
+  mapping on some other port, the card and `tailnet up` treat 443 as free and
+  proceed, and `down` leaves the other mappings alone. Only a serve entry
+  naming port 443, or a status this build cannot read or attribute, triggers
+  the refusal.
+
   At startup the setting reads your own MagicDNS name from the local Tailscale
   daemon and trusts `https://<that name>` as an origin, so you do **not** have to
   look the name up and hand-write `dashboard.url`. The Overview one-click flow
@@ -555,7 +563,7 @@ an error. `kirocrew token` defaults straight to `20h`. The 5-minute click window
 is not the session length: it only means a link left sitting in a DM overnight is
 dead and you need a fresh one.
 
-**When you do need a fresh link.** Four things end a refresh chain:
+**When you do need a fresh link.** Five things end a refresh chain:
 
 - **30 days idle** — nothing opened the dashboard inside the window.
 - **Signing out in the dashboard** (`POST /api/auth/logout`) — revokes that
@@ -569,9 +577,25 @@ dead and you need a fresh one.
   (RFC 6819 §5.2.2.3). The frontend reports `refresh_chain_revoked` and stops
   scheduling refreshes; the mint screen appears once the remaining access session
   runs out.
+- **Turning tailnet identity trust off**, for a chain that was opened under it.
+  See device binding below; the chain is refused rather than revoked, so one
+  fresh link restores you.
 
-Chains persist in `~/.kiro/crew/refresh_chains.json` (mode `0600`), so they
-survive a gateway restart. On a gateway old enough to predate the feature,
+**Device binding (tailnet identity trust only).** With
+`dashboard.tailscale.trust_identity` on, a chain is bound to the tailnet peer
+that opened it and only that peer can renew it, so a stolen refresh cookie
+cannot be replayed from another one of your allowed machines. What counts as
+"that peer" is `pin_scope`: at the default `node` it is the one device, at
+`login` it is your Tailscale identity, so one session follows you between your
+own devices. If you need one session to roam between devices at `node` scope, set
+`dashboard.tailscale.bind_refresh_chains: false` — the tradeoff is that a stolen
+refresh cookie then renews from any allowed node, which is what the binding
+exists to stop. Sessions that already exist keep whatever binding they were
+opened with; a chain bound this way stops renewing if you later turn identity
+trust off, and a fresh `kirocrew token` link gets you going again.
+
+Chains persist in `~/.kiro/crew/refresh_chains.json` (mode `0600`) — including
+the device binding above — so they survive a gateway restart. On a gateway old enough to predate the feature,
 `GET /api/auth/me` returns 404; the frontend logs once and falls back to the
 20-hour URL-mint behaviour.
 
@@ -648,7 +672,18 @@ the browser holds, on the same clocks as [Session duration](#session-duration).
 ### Persistent SSH tunnel on macOS (LaunchAgent)
 
 A terminal-held tunnel dies with the terminal. A LaunchAgent survives reboots
-and reconnects after sleep. A ready-made plist is at
+and reconnects after sleep.
+
+If the desktop app should act only as a client for this remote gateway, turn off
+**Settings → Developer → Gateway → Run a local gateway**, then quit the app so
+its supervised gateway releases port 5476. Start the tunnel, verify the health
+probe below, and only then reopen the app. Turning the switch off does not create
+or supervise a tunnel; on the next launch the app expects a gateway to already
+answer on port 5476. A connected entry on the Instances page does not satisfy
+this requirement because those tunnels are supervised by the local gateway
+itself and use separate loopback ports.
+
+A ready-made plist is at
 [`assets/com.kirocrew.tunnel.plist`](assets/com.kirocrew.tunnel.plist):
 
 ```bash
@@ -910,5 +945,5 @@ servers and tool calls fail with ENOENT.
 - [install.md](install.md): all build and install methods
 - [docker.md](docker.md): container deployment, including `KIROCREW_BIND`
 - [slack-setup.md](slack-setup.md): chat app creation and configuration
-- [../system-specs/features/dashboard-token-auth.md](../system-specs/features/dashboard-token-auth.md): the full access + refresh cookie design
+- [../system-specs/modules/dashboard-token-auth.md](../system-specs/modules/dashboard-token-auth.md): the full access + refresh cookie design
 - [../architecture/security-deep-dive.md](../architecture/security-deep-dive.md): token auth, origin checks, the local-request gate

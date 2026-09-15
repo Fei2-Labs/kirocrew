@@ -10,8 +10,9 @@ File format (``<data>/dictionary.toml``)::
     correct = "DynamoDB"
     aliases = ["dynamo db", "dynamo d.b."]
 
-Matching is case-insensitive with word boundaries; the longest alias wins so a
-multi-word alias is not shadowed by one of its own prefixes.
+Matching is case-insensitive and bounded to a standalone occurrence (see
+:func:`_bounded_pattern`); the longest alias wins so a multi-word alias is not
+shadowed by one of its own prefixes.
 
 The parse is deliberately paranoid: this file is user-editable AND writable by
 the agent's own file tools, so a malformed or hostile document must degrade to
@@ -46,12 +47,24 @@ from kiro_crew.atomic_write import atomic_write
 
 logger = logging.getLogger("kirocrew.app.meetings")
 
-# An alias is matched with \b…\b, so a regex-special alias must be escaped (it
-# is) and an absurdly long one must be refused (a 10k-char alias compiled 500
+# An alias is matched as a bounded regex, so a regex-special alias must be escaped
+# (it is) and an absurdly long one must be refused (a 10k-char alias compiled 500
 # times is a cheap CPU sink for something the user never intended).
 _MAX_ALIAS_LEN = 120
 _MAX_CORRECT_LEN = 120
 _DICTIONARY_HEADER = "# Domain dictionary for meetings speech-to-text correction\n"
+
+# A code point in U+D800–U+DFFF is half of a UTF-16 pair and is not a character.
+# Python's JSON decoder still produces one from a request body spelling it out
+# (``{"correct": "\ud800"}``), and a `str` can hold it — but UTF-8 has no encoding
+# for it, so such a term can never round-trip through the dictionary file. It is
+# refused at the mutation boundary, where `add_term` already rejects the empty and
+# the over-long term, rather than at the serializer: raising once the in-memory
+# terms have been replaced would leave the shared dictionary holding a term that
+# `save` can never write, so the corrections applied to live transcripts and the
+# document on disk would disagree until the next reload.
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_WORD_CHAR_RE = re.compile(r"\w")
 
 
 def _literal_replacement(value: str) -> Callable[[re.Match[str]], str]:
@@ -70,6 +83,27 @@ def _literal_replacement(value: str) -> Callable[[re.Match[str]], str]:
     lambda``), and this reads as what it is.
     """
     return lambda _match: value
+
+
+def _bounded_pattern(alias: str) -> str:
+    """Build the standalone-occurrence pattern for *alias*.
+
+    ``\\b`` asserts that a word character sits on exactly ONE side of the position,
+    so it delimits an alias only where the alias's own edge is itself a word
+    character. On an alias that begins or ends with punctuation it asserts the
+    opposite of what the term means: ``\\b\\.net\\b`` requires a word character
+    before the dot, so it skips the standalone ".net" the speaker said and fires
+    inside "asp.net" instead.
+
+    Each edge therefore takes ``\\b`` only when the alias's own character there is a
+    word character, and a lookaround for a neighbouring word character otherwise.
+    On a word-character edge the two spellings are equivalent, so an alias that is
+    entirely alphanumeric keeps exactly the pattern it had.
+    """
+
+    prefix = r"\b" if _WORD_CHAR_RE.match(alias[:1]) else r"(?<!\w)"
+    suffix = r"\b" if _WORD_CHAR_RE.match(alias[-1:]) else r"(?!\w)"
+    return f"{prefix}{re.escape(alias)}{suffix}"
 
 
 class DomainDictionary:
@@ -134,7 +168,9 @@ class DomainDictionary:
         ]
         replacements.sort(key=lambda pair: len(pair[0]), reverse=True)
         for alias, correct in replacements:
-            self._compiled.append((correct, re.compile(rf"\b{re.escape(alias)}\b", re.IGNORECASE)))
+            self._compiled.append(
+                (correct, re.compile(_bounded_pattern(alias), re.IGNORECASE))
+            )
 
     # -- applying --
 
@@ -158,14 +194,26 @@ class DomainDictionary:
         strings share an escaping grammar for the characters that matter here —
         so a quote or backslash in a term can never break out of its string and
         inject a new ``[[term]]`` table.
+
+        They are dumped with ``ensure_ascii=False`` because the two grammars part
+        company above U+FFFF: JSON escapes a supplementary character as a UTF-16
+        surrogate PAIR, which TOML refuses ("Escaped character is not a Unicode
+        scalar value"), and the whole document was then discarded on the next
+        load. Written literally it round-trips. DEL is the one character JSON
+        leaves raw that a TOML basic string forbids, so it is escaped by hand.
+
+        Writing them literally means the terms have to BE encodable, which is why
+        :meth:`add_term` refuses a surrogate code point (``_SURROGATE_RE``) and the
+        parse in :meth:`load` cannot produce one — ``read_text`` would have failed
+        on the bytes first.
         """
         parts = [_DICTIONARY_HEADER]
         for correct, aliases in self.terms:
             parts.append(
-                f"\n[[term]]\ncorrect = {json.dumps(correct)}\n"
-                f"aliases = {json.dumps(aliases)}\n"
+                f"\n[[term]]\ncorrect = {json.dumps(correct, ensure_ascii=False)}\n"
+                f"aliases = {json.dumps(aliases, ensure_ascii=False)}\n"
             )
-        return "".join(parts)
+        return "".join(parts).replace("\x7f", "\\u007f")
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,6 +229,8 @@ class DomainDictionary:
             raise ValueError("correct and at least one alias are required")
         if len(correct) > _MAX_CORRECT_LEN or any(len(a) > _MAX_ALIAS_LEN for a in clean):
             raise ValueError("term or alias is too long")
+        if _SURROGATE_RE.search(correct) or any(_SURROGATE_RE.search(a) for a in clean):
+            raise ValueError("term or alias contains an unpaired surrogate code point")
         if len(self.terms) >= k.MAX_DICTIONARY_TERMS:
             raise ValueError(f"dictionary is limited to {k.MAX_DICTIONARY_TERMS} terms")
         existing = [(c, a) for c, a in self.terms if c.lower() != correct.lower()]

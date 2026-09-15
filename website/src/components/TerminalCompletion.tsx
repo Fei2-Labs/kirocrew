@@ -20,8 +20,8 @@ const ROW_H = 22
 /** Prompt-marker rows retained. Bounded so a long session cannot grow the map
  *  without limit; only the cursor's own row is ever read. */
 const MARKER_LIMIT = 64
-/** Grace window after `compositionend` in which Enter still belongs to the IME.
- *  Browsers disagree on whether the committing Enter is flagged as composing. */
+/** Grace window after `compositionend` in which a choose key still belongs to the IME.
+ *  Browsers disagree on whether the committing Enter or Tab is flagged as composing. */
 const IME_GRACE_MS = 60
 
 interface Entry {
@@ -84,7 +84,7 @@ interface Suggestions {
   /** The command context these entries were computed for. Part of the staleness
    *  identity: the token alone does NOT identify a command-tier suggestion, since
    *  `gh pr c` and `git c` share the token `c`. Without this, editing the command
-   *  word while a menu is open lets Enter insert the OTHER tool's subcommand. */
+   *  word while a menu is open lets an accept insert the OTHER tool's subcommand. */
   argv: string[]
 }
 
@@ -148,6 +148,17 @@ export default function TerminalCompletion({ term, sessionId, active }: {
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   /** When the last IME composition finished — see `IME_GRACE_MS`. */
   const imeEndAt = useRef(0)
+  /**
+   * Whether the user has moved the highlight (ArrowUp/ArrowDown) on the CURRENT
+   * listing. Enter accepts the highlighted row only after that; otherwise it
+   * reaches the shell and submits the line exactly as typed. The menu opens
+   * unbidden on almost every word, so an Enter that accepted the top row by
+   * default rewrote commands the user had already finished typing (`git status`
+   * became `git stash`), and every submit needed an Escape first. This is the
+   * convention every other completer the user has met follows (fish, zsh
+   * autosuggest, VS Code's terminal): Enter runs, Tab/arrows pick.
+   */
+  const navigated = useRef(false)
   // Key handling reads the live suggestion list; a ref keeps xterm's single
   // custom-key-handler slot from being re-attached on every state change.
   const stateRef = useRef<{ sug: Suggestions | null; selected: number }>({ sug: null, selected: 0 })
@@ -159,6 +170,7 @@ export default function TerminalCompletion({ term, sessionId, active }: {
     if (timer.current) { clearTimeout(timer.current); timer.current = null }
     setSug(null)
     setSelected(0)
+    navigated.current = false
   }, [])
 
   /* ── Prompt markers from shell integration ── */
@@ -352,6 +364,9 @@ export default function TerminalCompletion({ term, sessionId, active }: {
       argv: req.argv,
     })
     setSelected(0)
+    // A fresh listing resets the highlight, so a pick made on the previous one
+    // no longer stands: typing on after arrowing must leave Enter to the shell.
+    navigated.current = false
   }, [data, isError, req, close])
 
   /* ── Recompute on cursor movement ── */
@@ -484,21 +499,49 @@ export default function TerminalCompletion({ term, sessionId, active }: {
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true
       // An IME candidate is committed with a keydown the browser marks as
-      // composing (Chrome reports keyCode 229 for it); swallowing that Enter
-      // would accept a path instead of the text the user just composed. Some
-      // browsers report the committing key as non-composing, hence the grace
-      // window after `compositionend`.
+      // composing (Chrome reports keyCode 229 for it). Leave that native action
+      // alone. Some browsers clear both flags before the committing key arrives,
+      // hence the grace window after `compositionend`: Enter keeps its established
+      // pass-through behavior, while Tab must be consumed so it can neither accept
+      // the menu suggestion nor escape to xterm as shell completion.
       if (e.isComposing || e.keyCode === 229) return true
-      if (e.key === 'Enter' && Date.now() - imeEndAt.current < IME_GRACE_MS) return true
+      if (Date.now() - imeEndAt.current < IME_GRACE_MS) {
+        if (e.key === 'Enter') return true
+        if (e.key === 'Tab') return claim(e)
+      }
+      // Ctrl+Shift+C copies the selection. Nothing in this app answers the
+      // chord: xterm's evaluateKeyboardEvent yields no key for
+      // Ctrl+Shift+letter, and the ctrl pass-through below would drop it
+      // before the switch — so without this branch it is a no-op in the
+      // desktop shell. (A browser-level binding like Chrome's DevTools
+      // shortcut fires outside the page either way; this branch handles what
+      // reaches the page.) Fire the native `copy` event (the same route as
+      // Electron's right-click `role: copy`): xterm's own `copy` listener
+      // serialises the selection, so there is no textarea and no focus move,
+      // and unlike navigator.clipboard.writeText it needs no clipboard
+      // permission — the packaged app denies that permission, which is what
+      // broke the toolbar path in #9740. Matched on e.code so the physical
+      // key works on layouts whose C position types another glyph. With no
+      // selection the chord passes through, leaving shell behaviour
+      // unchanged. This handler is the single owner of the custom-key-handler
+      // slot — a second attachCustomKeyEventHandler elsewhere would shadow
+      // this one.
+      if (e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey && e.code === 'KeyC') {
+        if (!term.hasSelection()) return true
+        document.execCommand('copy')
+        return claim(e)
+      }
       const s = stateRef.current.sug
       if (!s) return true
       if (e.ctrlKey || e.metaKey || e.altKey) return true
       const n = s.entries.length
       switch (e.key) {
         case 'ArrowDown':
+          navigated.current = true
           setSelected(i => (i + 1) % n)
           return claim(e)
         case 'ArrowUp':
+          navigated.current = true
           setSelected(i => (i - 1 + n) % n)
           return claim(e)
         case 'Escape':
@@ -506,7 +549,10 @@ export default function TerminalCompletion({ term, sessionId, active }: {
           close()
           return claim(e)
         case 'Enter':
-          if (stale(s)) { close(); return true }
+          // Enter is the shell's key unless the user has arrowed onto a row.
+          // The menu closes either way: the line is about to be submitted, so
+          // a listing left open would describe a command that no longer exists.
+          if (!navigated.current || stale(s)) { close(); return true }
           accept(s.entries[stateRef.current.selected], s)
           return claim(e)
         case 'Tab': {

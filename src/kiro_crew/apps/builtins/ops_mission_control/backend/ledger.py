@@ -196,34 +196,58 @@ def read_entries() -> list[LedgerEntry]:
     and trust, highest use count), so a read after a merge agrees with what a local
     upsert of the same two entries would have produced. First occurrence keeps its
     position, so ordering stays stable for callers that rank by it.
+
+    Collapsing a FAILED read to ``[]`` is only safe for read-only callers (``match``,
+    ``stats``, the GET routes), where the worst outcome is an empty answer. A
+    read-modify-write that starts from this read must use ``read_entries_for_update``
+    instead: rewriting from the collapsed ``[]`` would truncate the whole ledger on a
+    transient ``EACCES``.
+    """
+    try:
+        return read_entries_for_update()
+    except OSError:
+        logger.exception("ops-mission-control: failed to read ledger")
+        return []
+
+
+def read_entries_for_update() -> list[LedgerEntry]:
+    """The mutation-path read: same parse and reconcile, but ``OSError`` PROPAGATES.
+
+    Every locked read → mutate → ``_write_all`` in this module must start here, not at
+    ``read_entries``. The lenient read answers a failed open with ``[]``, and each of
+    those callers then rewrites the file from what it read — so a transient read fault
+    became a silent full truncation of the team's shared ledger (``hygiene``), a
+    ``404`` claiming an entry never existed while it is still on disk (``remove``), or
+    a "new" entry replacing the merge it should have joined (``upsert``). Refusing is
+    the same posture the incident store's ``_read_index_for_update`` takes, and the
+    route handlers already translate the escape into their coded 503.
+
+    A malformed LINE is still skipped, deliberately: content-level damage is per-line
+    on a JSONL file, the surviving lines are real, and ``hygiene`` rewriting without
+    the broken line is repair. A failed OPEN says nothing about the content at all —
+    there is no partial result to preserve, only a file this process cannot see.
     """
     path = ledger_path()
     if not path.exists():
         return []
     ordered: list[str] = []
     by_id: dict[str, LedgerEntry] = {}
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line_no, line in enumerate(handle, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = LedgerEntry.from_dict(json.loads(line))
-                except (TypeError, ValueError):
-                    logger.warning(
-                        "ops-mission-control: skipping malformed ledger line %d", line_no
-                    )
-                    continue
-                prior = by_id.get(entry.entry_id)
-                if prior is None:
-                    ordered.append(entry.entry_id)
-                    by_id[entry.entry_id] = entry
-                else:
-                    by_id[entry.entry_id] = _reconcile(prior, entry)
-    except OSError:
-        logger.exception("ops-mission-control: failed to read ledger")
-        return []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = LedgerEntry.from_dict(json.loads(line))
+            except (TypeError, ValueError):
+                logger.warning("ops-mission-control: skipping malformed ledger line %d", line_no)
+                continue
+            prior = by_id.get(entry.entry_id)
+            if prior is None:
+                ordered.append(entry.entry_id)
+                by_id[entry.entry_id] = entry
+            else:
+                by_id[entry.entry_id] = _reconcile(prior, entry)
     return [by_id[eid] for eid in ordered]
 
 
@@ -284,13 +308,21 @@ def _reconcile(prior: LedgerEntry, other: LedgerEntry) -> LedgerEntry:
 def _write_all(entries: list[LedgerEntry]) -> None:
     """Rewrite the whole ledger. Only the hygiene pass should call this."""
     payload = "".join(json.dumps(entry.to_dict(), sort_keys=True) + "\n" for entry in entries)
-    atomic_write(ledger_path(), payload)
+    # ``newline="\n"`` is load-bearing, not tidiness. This file is COMMITTED and PUSHED to
+    # the team's shared remote by ``ledger_sync``, and ``atomic_write`` defaults to
+    # ``newline=None`` (universal translation), so a hygiene pass on a Windows host would
+    # rewrite every line with CRLF. Reads survive it, so it is invisible locally — but on
+    # a teammate's clone the whole ledger turns into one all-lines diff, and every merge
+    # after that conflicts on lines nobody edited.
+    atomic_write(ledger_path(), payload, newline="\n")
 
 
 def _append(entry: LedgerEntry) -> None:
     path = ledger_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
+    # ``newline="\n"`` for the same shared-repo reason as ``_write_all``, and this is the
+    # hotter path: it runs on every single lesson written, not once a day.
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(entry.to_dict(), sort_keys=True) + "\n")
 
 
@@ -306,7 +338,7 @@ def upsert(entry: LedgerEntry) -> LedgerEntry:
 
 
 def _upsert_locked(entry: LedgerEntry) -> LedgerEntry:
-    existing = {e.entry_id: e for e in read_entries()}
+    existing = {e.entry_id: e for e in read_entries_for_update()}
     prior = existing.get(entry.entry_id)
     if prior is None:
         _append(entry)
@@ -347,7 +379,7 @@ def match(
     provider_key: str = "",
     limit: int = MAX_MATCHES_PER_SIGNAL,
 ) -> list[LedgerEntry]:
-    """Entries that have previously matched this failure.
+    """Entries that match this failure.
 
     Two keys, tried in order of how much they can be trusted:
 
@@ -449,7 +481,7 @@ def record_use(entry_id: str, fingerprint: str = "", provider_key: str = "") -> 
     differently-worded alarm gets attached to the entry that already knows the
     fix. Binding the ``provider_key`` is what turns the FIRST fuzzy match into an
     exact one for every later occurrence — the entry learns the provider's own identity
-    for the failure, so the next recurrence no longer depends on the shape hash.
+    for the failure, so the next recurrence does not depend on the shape hash.
 
     Locked read-modify-write: a bare ``read_entries``/``_write_all`` here would clobber a
     concurrent ``upsert`` or hygiene rewrite. See ``_LedgerLock``.
@@ -459,7 +491,7 @@ def record_use(entry_id: str, fingerprint: str = "", provider_key: str = "") -> 
 
 
 def _record_use_locked(entry_id: str, fingerprint: str, provider_key: str) -> LedgerEntry | None:
-    entries = read_entries()
+    entries = read_entries_for_update()
     changed = False
     hit: LedgerEntry | None = None
     for entry in entries:
@@ -509,7 +541,7 @@ def record_miss(entry_id: str) -> LedgerEntry | None:
 
 
 def _record_miss_locked(entry_id: str) -> LedgerEntry | None:
-    entries = read_entries()
+    entries = read_entries_for_update()
     hit: LedgerEntry | None = None
     for entry in entries:
         if entry.entry_id != entry_id:
@@ -532,7 +564,7 @@ def _record_miss_locked(entry_id: str) -> LedgerEntry | None:
 def remove(entry_id: str) -> bool:
     # Locked read-modify-write; see ``_LedgerLock``.
     with _LedgerLock():
-        entries = read_entries()
+        entries = read_entries_for_update()
         remaining = [e for e in entries if e.entry_id != entry_id]
         if len(remaining) == len(entries):
             return False
@@ -608,8 +640,8 @@ def hygiene(*, now: datetime | None = None) -> dict[str, int]:
     - ``decayed`` — nobody needed this for ``DECAY_AFTER_DAYS``. Says nothing about
       whether the fix works; the estate moved on.
     - ``demoted`` — the fix was cited and the failure came back (``miss_count``). This is
-      evidence AGAINST the entry, which is the movement the ledger previously had no
-      mechanism for at all.
+      evidence AGAINST the entry: the one downward movement that says the entry is
+      wrong rather than merely unused.
 
     Collapsing them into one number would let "your ledger is going stale" and "your
     ledger is wrong" arrive as the same sentence.
@@ -626,7 +658,7 @@ def hygiene(*, now: datetime | None = None) -> dict[str, int]:
 
 def _hygiene_locked(now: datetime | None) -> dict[str, int]:
     current = now or datetime.now(timezone.utc)
-    entries = read_entries()
+    entries = read_entries_for_update()
     before = len(entries)
 
     # Dedupe by content-addressed id, merging fingerprints and keeping the
@@ -745,14 +777,14 @@ def stats() -> dict[str, int]:
         "verified": sum(1 for e in entries if e.trust == TRUST_VERIFIED),
         "high_confidence": sum(1 for e in entries if e.confidence == CONFIDENCE_HIGH),
         "total_uses": sum(e.use_count for e in entries),
-        # ``verified`` and ``high_confidence`` are each one HALF of the old fast-path bar,
-        # so neither answers "how much of this ledger would an agent actually propose
-        # without checking". This does, and it now includes the track-record floor — which
-        # is why it can be strictly smaller than either of the two above and why showing
-        # them alone overstated the ledger's authority.
+        # ``verified`` and ``high_confidence`` are each one HALF of the fast-path bar, so
+        # neither answers "how much of this ledger would an agent actually propose
+        # without checking". This does, and it includes the track-record floor — which
+        # is why it can be strictly smaller than either of the two above, and why showing
+        # them alone overstates the ledger's authority.
         "proven": sum(1 for e in entries if entry_unlocks_fast_path(e)),
         # Entries carrying evidence their fix did not hold. The number an operator most
-        # needs and the one the app could not previously produce at all.
+        # needs, and the one no other field in this dict can express.
         "demoted": sum(1 for e in entries if is_demoted(e)),
         "total_misses": sum(e.miss_count for e in entries),
     }

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { Zap } from 'lucide-react'
 import { api } from '../api/client'
 import { Input, SendBtn } from './ui'
 import { SettingsToggle } from './settings'
@@ -8,6 +9,7 @@ import SimpleSelect from './SimpleSelect'
 import type { CronJob } from '../types'
 import type { CronPrefill } from '../utils/schedulePresets'
 import { SaveCreateLabel, expandDow } from '../utils/cronUtils'
+import { adviseCronMode } from '../utils/cronModeAdvice'
 
 import { i18nT } from '../i18n/t'
 import { fmtWeekday } from '../i18n/format'
@@ -55,14 +57,44 @@ export function jobKindOf(job?: CronJob): JobKind {
 
 /** Parse a CronJob into initial form state */
 function parseJobDefaults(job?: CronJob) {
-  if (!job) return { name: '', message: '', agent: '', model: '', channel: '', approvalMode: '', silent: false, strictSchedule: false, hideInChat: false, jobKind: 'message' as JobKind, schedMode: 'interval' as const, intVal: 1, intUnit: 'hours' as const, weekDays: [] as number[], weekTime: '09:00', cronExpr: '' }
+  if (!job) return { name: '', message: '', agent: '', model: '', channel: '', approvalMode: '', silent: false, strictSchedule: false, hideInChat: false, minimalContext: false, jobKind: 'message' as JobKind, schedMode: 'interval' as const, intVal: 1, intUnit: 'hours' as const, weekDays: [] as number[], weekTime: '09:00', cronExpr: '' }
   const isInterval = !!(job.every_secs || (job.schedule || '').match(/^every\s+\d+/))
-  const secs = job.every_secs || (() => { const m = (job.schedule || '').match(/^every\s+(\d+)\s*([sh])/); if (!m) return 3600; return m[2] === 'h' ? parseInt(m[1]) * 3600 : parseInt(m[1]) })()
-  const intUnit = secs >= 86400 ? 'days' as const : secs >= 3600 ? 'hours' as const : 'minutes' as const
+  const secs = job.every_secs || (() => { const m = (job.schedule || '').match(/^every\s+(\d+)\s*([smh])/); if (!m) return 3600; return parseInt(m[1]) * (m[2] === 'h' ? 3600 : m[2] === 'm' ? 60 : 1) })()
+  // Largest unit that divides `secs` EVENLY, not the largest unit that is merely
+  // <= `secs`. The magnitude test sent 5400s to 'hours', where Math.round(1.5) is
+  // 2, and buildBody re-serialises `intVal * 3600` — so opening a 90-minute job
+  // and saving an unrelated field silently rewrote its schedule to 2 hours. That
+  // is the #8469 class on the interval side: 90 minutes IS representable here, and
+  // the magnitude choice discarded that representation before rounding ever ran.
+  const evenUnit = secs % 86400 === 0 ? 'days' as const
+    : secs % 3600 === 0 ? 'hours' as const
+    : secs % 60 === 0 ? 'minutes' as const
+    : null
+  // Nothing divides evenly (e.g. 90s): no unit offered here can represent that
+  // schedule, so keep the pre-existing nearest-magnitude choice rather than widen
+  // the unit set. Sub-minute precision is a separate question from this defect.
+  const intUnit = evenUnit ?? (secs >= 86400 ? 'days' as const : secs >= 3600 ? 'hours' as const : 'minutes' as const)
   const intVal = Math.max(1, Math.round(intUnit === 'days' ? secs / 86400 : intUnit === 'hours' ? secs / 3600 : secs / 60))
   const cronRaw = job.cron_expr || ''
   const cronParts = cronRaw.split(/\s+/)
+  // Weekly mode can only represent a single plain minute/hour pair plus a day
+  // set expandDow understands. A list, range, or step in the minute or hour
+  // field (e.g. `0 9,12,15 * * 1-5`) must fall through to cron mode, where the
+  // raw expression round-trips verbatim — parseInt would silently truncate
+  // '9,12,15' to 9 and a save would drop the other run times (#8469).
+  // /^\d{1,2}$/ matches cronClock's plain-field grammar in cronUtils so the
+  // list view and the editor classify the same job the same way.
+  const isPlainField = (s: string, max: number) => /^\d{1,2}$/.test(s) && parseInt(s, 10) <= max
+  // The day-of-week field must be FULLY representable: expandDow drops
+  // segments it cannot parse (`1,3-5/2` expands to just [1]), so a whole-field
+  // non-empty check would still collapse the unsupported part on save. Each
+  // comma segment must expand on its own, and numeric tokens must stay in
+  // cron's 0-7 range — parseDowToken wraps 8 to Monday via % 7, which would
+  // silently rewrite the expression.
+  const isRepresentableDow = (field: string) => field.split(',').every(seg =>
+    !seg.split('-').some(tok => /^\d+$/.test(tok) && parseInt(tok, 10) > 7) && expandDow(seg).length > 0)
   const isWeekly = !isInterval && cronParts.length === 5 && cronParts[4] !== '*' && cronParts[2] === '*' && cronParts[3] === '*'
+    && isPlainField(cronParts[0], 59) && isPlainField(cronParts[1], 23) && isRepresentableDow(cronParts[4])
   const schedMode = isInterval ? 'interval' as const : isWeekly ? 'weekly' as const : 'cron' as const
   // Read cron time and days directly (stored in job timezone, not UTC)
   let weekDays: number[] = []
@@ -72,7 +104,7 @@ function parseJobDefaults(job?: CronJob) {
     weekDays = expandDow(cronParts[4]).map(d => CRON_DOW_TO_GRID[d] || 1)
     weekTime = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`
   }
-  return { name: job.name, message: job.message, agent: job.agent || '', model: job.model || '', channel: job.channel || '', approvalMode: job.approval_mode || '', silent: job.silent || false, strictSchedule: job.strict_schedule || false, hideInChat: job.hide_in_chat || false, jobKind: jobKindOf(job), schedMode, intVal, intUnit, weekDays, weekTime, cronExpr: cronRaw }
+  return { name: job.name, message: job.message, agent: job.agent || '', model: job.model || '', channel: job.channel || '', approvalMode: job.approval_mode || '', silent: job.silent || false, strictSchedule: job.strict_schedule || false, hideInChat: job.hide_in_chat || false, minimalContext: job.minimal_context || false, jobKind: jobKindOf(job), schedMode, intVal, intUnit, weekDays, weekTime, cronExpr: cronRaw }
 }
 
 /** Build the API body from form state. Returns null if validation fails (sets error). */
@@ -81,6 +113,7 @@ function buildBody(
   tz: string,
   setError: (e: string) => void,
   isEdit = false,
+  prefill?: CronPrefill,
 ): Record<string, string | number | boolean> | null {
   const isLlmless = f.jobKind === 'script' || f.jobKind === 'command'
   // Script/command crons have no agent message — only the agent/message kind
@@ -98,6 +131,10 @@ function buildBody(
     // persists; create mode omits it when empty like other optional fields.
     if (isEdit || f.model) body.model = f.model
     if (f.approvalMode) body.approval_mode = f.approvalMode
+    // Only the agent kind has an injected context to trim. A script or command
+    // job takes no agent turn, so sending this would store a flag that can
+    // never do anything.
+    body.minimal_context = f.minimalContext
   }
   if (f.channel) body.channel = f.channel
   body.silent = f.silent
@@ -115,6 +152,16 @@ function buildBody(
     if (expr.split(/\s+/).length !== 5) { setError(i18nT('components.jobForm.enter_a_valid_5_field_cron_expression')); return null }
     body.cron = expr
     body.timezone = tz
+  }
+  // Provenance stamp, create-only: the template this job was seeded from, plus
+  // the template's prompt AS IT WAS when picked (the snapshot the Schedule page
+  // compares against the template's current prompt to detect a template change,
+  // independent of any edit the user makes to the Message field below). The
+  // PATCH endpoint does not accept either (provenance is fixed at creation), so
+  // they are never sent on edit.
+  if (!isEdit && prefill?.sourcePreset) {
+    body.source_preset = prefill.sourcePreset
+    body.source_template_prompt = prefill.sourceTemplatePrompt ?? ''
   }
   return body
 }
@@ -138,6 +185,9 @@ interface Props {
    *  that embed the form inside a single crew's own surface, where offering a
    *  crew picker would just be a way to file the job in the wrong place. */
   lockedAgent?: string
+  /** Durable member identity, distinct from its provider template. */
+  memberId?: string
+  providerAgent?: string
   onSaved: () => void
   /** Vertical layout for side panel, horizontal for inline create */
   layout?: 'vertical' | 'horizontal'
@@ -156,9 +206,11 @@ interface Props {
   onDirtyChange?: (dirty: boolean) => void
 }
 
-export default function JobForm({ job, prefill, agents, defaultAgent, rosterFailure, lockedAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange, onDirtyChange }: Props) {
+export default function JobForm({ job, prefill, agents, defaultAgent, rosterFailure, lockedAgent, memberId, providerAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange, onDirtyChange }: Props) {
   // "" and undefined both mean unlocked, so render and submit share one truth.
-  const locked = lockedAgent || undefined
+  const boundMember = job?.member_id || memberId
+  const privateMember = !!boundMember && boundMember !== 'default'
+  const locked = boundMember || lockedAgent || undefined
   const defaults = parseJobDefaults(job)
   // In create mode (no job), a preset can seed the prompt + schedule fields.
   // Edit mode always reflects the job as-stored and ignores any prefill.
@@ -200,6 +252,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
   const [silent, setSilent] = useState(init.silent)
   const [strictSchedule, setStrictSchedule] = useState(defaults.strictSchedule)
   const [hideInChat, setHideInChat] = useState(defaults.hideInChat)
+  const [minimalContext, setMinimalContext] = useState(defaults.minimalContext)
   const [schedMode, setSchedMode] = useState(init.schedMode)
   const [intVal, setIntVal] = useState(init.intVal)
   const [intUnit, setIntUnit] = useState(init.intUnit)
@@ -220,6 +273,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
     channel !== defaults.channel || approvalMode !== defaults.approvalMode ||
     silent !== init.silent || strictSchedule !== defaults.strictSchedule ||
     hideInChat !== defaults.hideInChat || schedMode !== init.schedMode ||
+    minimalContext !== defaults.minimalContext ||
     intVal !== init.intVal || intUnit !== init.intUnit ||
     weekTime !== init.weekTime || cronExpr !== init.cronExpr ||
     weekDays.length !== init.weekDays.length || weekDays.some((d, i) => d !== init.weekDays[i])
@@ -251,6 +305,11 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
   const jobKind = defaults.jobKind
   const isLlmless = jobKind === 'script' || jobKind === 'command'
 
+  // Recomputed as the prompt is typed, which is why it is a local regex pass
+  // and not a round trip. Reads minimalContext too, so the hint stops once the
+  // reader has acted on it.
+  const advice = useMemo(() => privateMember ? 'none' : adviseCronMode(msg, minimalContext), [msg, minimalContext, privateMember])
+
   /** Model-override rows as the two parallel arrays `SimpleSelect` takes.
    *
    *  "" (inherit) is the `clearLabel` row rather than an option, so `options`
@@ -267,15 +326,19 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
 
   const submit = async () => {
     setError(''); setSaving(true)
-    const f = { name, message: msg, agent: locked ?? agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
-    const body = buildBody(f, tz, setError, !!job)
+    const f = { name, message: msg, agent: locked ?? agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, minimalContext, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
+    const body = buildBody(f, tz, setError, !!job, job ? undefined : prefill)
     if (!body) { setSaving(false); return }
+    if (boundMember && !isLlmless) {
+      body.member_id = boundMember
+      body.agent = providerAgent || job?.agent || ''
+    }
     try {
       const res = job
         ? await api.updateCron(job.id, body)
         : await api.createCron(body).catch((e: Error) => ({ error: e.message }))
       if (res.error) { setError(res.error); setSaving(false); return }
-      if (!job) { setName(''); setMsg(''); setWeekDays([]); setIntVal(1); setChannel(''); setModel(''); setApprovalMode(''); setSilent(false); setStrictSchedule(false); setHideInChat(false) }
+      if (!job) { setName(''); setMsg(''); setWeekDays([]); setIntVal(1); setChannel(''); setModel(''); setApprovalMode(''); setSilent(false); setStrictSchedule(false); setHideInChat(false); setMinimalContext(false) }
       onSaved()
     } catch { setError(i18nT('components.jobForm.failed_to_save')); setSaving(false) }
   }
@@ -360,6 +423,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
           <label htmlFor="jobform-silent" className="flex items-center gap-1.5 text-muted text-[13px] cursor-pointer"><input id="jobform-silent" aria-label={i18nT('components.jobForm.silent')} type="checkbox" checked={silent} onChange={e => setSilent(e.target.checked)} /> {i18nT('components.jobForm.silent')}</label>
           <label htmlFor="jobform-strict-schedule" className="flex items-center gap-1.5 text-muted text-[13px] cursor-pointer"><input id="jobform-strict-schedule" aria-label={i18nT('components.jobForm.strict_schedule')} type="checkbox" checked={strictSchedule} onChange={e => setStrictSchedule(e.target.checked)} /> {i18nT('components.jobForm.strict_schedule')}</label>
           <label htmlFor="jobform-hide-in-chat" className="flex items-center gap-1.5 text-muted text-[13px] cursor-pointer"><input id="jobform-hide-in-chat" aria-label={i18nT('components.jobForm.hide_in_chat')} type="checkbox" checked={hideInChat} onChange={e => setHideInChat(e.target.checked)} /> {i18nT('components.jobForm.hide_in_chat')}</label>
+          <label htmlFor="jobform-minimal-context" className="flex items-center gap-1.5 text-muted text-[13px] cursor-pointer"><input id="jobform-minimal-context" aria-label={i18nT('components.jobForm.minimal_context')} type="checkbox" checked={minimalContext} onChange={e => setMinimalContext(e.target.checked)} /> {i18nT('components.jobForm.minimal_context')}</label>
         </div>
       )}
 
@@ -465,6 +529,34 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
           checked={hideInChat}
           onChange={setHideInChat}
         />
+        {!isLlmless && (
+          <div className="flex flex-col gap-1">
+            {/* Advice, not a warning, so accent rather than warn. Sits directly
+                above the control it refers to: a hint that names a setting the
+                reader then has to hunt for is a worse hint. */}
+            {advice !== 'none' && (
+              <div
+                className="flex items-start gap-2 px-3 py-2 rounded-lg bg-accent-subtle text-[12.5px] text-accent"
+                role="note"
+                aria-live="polite"
+                data-testid="jobform-mode-advice"
+              >
+                <Zap size={14} className="shrink-0 mt-0.5" aria-hidden="true" />
+                <span>
+                  {advice === 'script'
+                    ? i18nT('components.jobForm.mode_advice_script')
+                    : i18nT('components.jobForm.mode_advice_minimal_context')}
+                </span>
+              </div>
+            )}
+            <SettingsToggle
+              label={i18nT('components.jobForm.minimal_context')}
+              description={i18nT(privateMember ? 'components.jobForm.private_minimal_context_description' : 'components.jobForm.minimal_context_description')}
+              checked={minimalContext}
+              onChange={setMinimalContext}
+            />
+          </div>
+        )}
         {vertical && !externalSubmit && (
           <SendBtn onClick={submit} disabled={saving}>
             <SaveCreateLabel isEdit={!!job} saving={saving} />

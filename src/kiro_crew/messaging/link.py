@@ -16,6 +16,24 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+# ``SLACK_NAMESPACE`` and ``CHANNEL_SESSION_NAMESPACES`` are RE-EXPORTED from
+# ``kiro_crew.constants``, which is their canonical home, because the roster has
+# readers on both sides of an import cycle. This module is itself stdlib-only, but
+# importing a name FROM it executes ``messaging/__init__.py`` first, which pulls in
+# ``driver`` -> ``acp`` -> ``hooks``; since ``hooks`` -> ``webhooks`` ->
+# ``validation`` is already an edge, a reader like ``validation`` would get a
+# partially-initialized ``hooks``. Readers inside ``messaging`` and its dependents
+# keep importing from here; readers outside it read ``constants`` directly.
+#
+# The semantics are documented at the definition. Summary: every session-key prefix
+# a conversation started OUTSIDE the dashboard can carry, excluding the non-channel
+# namespaces (``dashboard:``, ``cron:``, ``hook:``, ``subagent:``, ``channel:``).
+# ``autonudge._CHANNEL_KEY_PREFIXES`` is a SEPARATE hand-kept copy, not a narrower
+# one -- both hold the same 11 namespaces today. It answers a different question
+# (does this key SHAPE belong to a channel rather than a dashboard slot), so do not
+# assume the two have diverged, and do not assume they are kept in step either.
+from kiro_crew.constants import CHANNEL_SESSION_NAMESPACES, SLACK_NAMESPACE
+
 logger = logging.getLogger(__name__)
 
 #: Slack ts format: ``"{epoch_seconds}.{microseconds}"`` -- pure digits + one dot.
@@ -26,35 +44,6 @@ logger = logging.getLogger(__name__)
 #: conversation), so the input is not guaranteed to be a real timestamp. A real
 #: ts is 10 digits + 6; 20 each leaves an order of magnitude of headroom.
 _SLACK_TS_RE = re.compile(r"\d{1,20}\.\d{1,20}")
-
-SLACK_NAMESPACE = "slack"
-
-#: Session-key namespaces owned by a messaging channel, i.e. every prefix a
-#: conversation started OUTSIDE the dashboard can carry. Slack keys are
-#: ``slack:<thread_ts>``; every other transport uses
-#: ``{channel}:{agent}:{chatType}:{user}[:genN]`` (see
-#: :func:`build_dm_session_key`), plus the ``unified:`` bucket that
-#: ``dm_scope="unified"`` collapses direct DMs into.
-#:
-#: Deliberately excludes the non-channel namespaces that also contain a colon
-#: (``dashboard:``, ``cron:``, ``hook:``, ``subagent:``, ``channel:``) — those
-#: are surfaced by their own owners, not by the channel-session reconciler.
-#:
-#: NOTE: ``autonudge._CHANNEL_KEY_PREFIXES`` is a deliberately NARROWER set —
-#: only the transports that support unattended nudge fires. Do not merge them.
-CHANNEL_SESSION_NAMESPACES: tuple[str, ...] = (
-    SLACK_NAMESPACE,
-    "discord",
-    "telegram",
-    "whatsapp",
-    "webex",
-    "wecom",
-    "teams",
-    "weixin",
-    "imessage",
-    "feishu",
-    "unified",
-)
 
 #: Both separators a namespace can be followed by. A live session key uses ``:``;
 #: ``ConversationLog.list_sessions()`` reports the persisted FILENAME STEM, where
@@ -160,10 +149,14 @@ TELEMETRY_CHANNELS: frozenset[str] = frozenset(
 
 
 def telemetry_channel_of(key: str | None) -> str:
-    """Classify *key* into a bounded metric label for the conversation source.
+    """Classify *key* into the bounded canonical conversation-source label.
 
     Answers "who paid this cost" for latency instruments, which otherwise record
-    a duration with no way to group it by where the conversation came from.
+    a duration with no way to group it by where the conversation came from. The
+    same closed classification is also a behavioral dispatch contract for callers
+    that need to distinguish dashboard, channel, and non-interactive sessions;
+    reclassifying a key shape is therefore an application behavior change, not a
+    metrics-only refactor, and must preserve the pinned surface tests below.
 
     Returns a member of :data:`TELEMETRY_CHANNELS`: a transport namespace
     (``telegram``, ``slack``, …) for channel keys, a local label
@@ -399,6 +392,32 @@ DM_SCOPE_UNIFIED = "unified"
 #: stays separate; ``unified`` opts into one shared bucket per agent.
 DEFAULT_DM_SCOPE = DM_SCOPE_PER_CHANNEL_PEER
 
+
+def split_dm_session_key(key: str) -> tuple[str, int] | None:
+    """Return ``(bucket, generation)`` for a canonical DM session key.
+
+    The strict RFC parser owns normal channel keys. ``dm_scope=unified`` uses
+    the shorter ``unified:{agent}[:genN]`` shape, so this helper recognizes only
+    that one named exception. Keeping both shapes beside the key builder avoids
+    copying generation grammar into picker or persistence code.
+    """
+    parsed = parse_session_key(key)
+    if parsed is not None:
+        return parsed.bucket, parsed.gen
+
+    segments = key.split(":")
+    if len(segments) == 2 and segments[0] == DM_SCOPE_UNIFIED and segments[1]:
+        return key, 0
+    if (
+        len(segments) == 3
+        and segments[0] == DM_SCOPE_UNIFIED
+        and segments[1]
+        and (match := _GEN_SUFFIX_RE.match(segments[2])) is not None
+    ):
+        return ":".join(segments[:2]), int(match.group(1))
+    return None
+
+
 #: ``direct`` (1:1 DM) is the baseline; ``forum`` keys a Telegram supergroup
 #: forum Topic ``(chat_id, thread_id)`` to its own session (Slack-thread style).
 CHAT_TYPE_DIRECT = "direct"
@@ -470,7 +489,7 @@ def legacy_dashboard_mirror_key(channel_session_key: str) -> str:
     key itself, so that key is where its mirror binding belongs and where the
     turn path reads it back. Bindings created before that unification live on
     ``"dashboard:" + history._safe_key(channel_session_key)`` — the runtime key
-    of the derived slot that used to own the conversation.
+    of the derived slot that owned the conversation under the earlier scheme.
 
     Retained for compat only: reads and clears fall back to this spelling
     (``SessionMap._mirror_key``) so a link a user set earlier still resolves,

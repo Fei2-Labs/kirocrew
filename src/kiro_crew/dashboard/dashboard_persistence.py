@@ -1,9 +1,9 @@
 """Dashboard slot and context-snapshot persistence coordination.
 
-The dashboard facade continues to own every mutable field used here.  This
-component deliberately retains no slot map, dirty flag, lock, or task reference:
-each operation reads the current value from its owner so existing direct access,
-test replacement, and shutdown ordering remain valid after delegation.
+The dashboard facade owns every mutable field used here.  This component
+deliberately retains no slot map, dirty flag, lock, or task reference: each
+operation reads the current value from its owner, so direct access, test
+replacement, and shutdown ordering all stay valid.
 """
 
 from __future__ import annotations

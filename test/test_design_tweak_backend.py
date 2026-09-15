@@ -14,12 +14,16 @@ import io
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+if sys.platform == "win32":  # pragma: no cover - platform-gated
+    import _winapi
 
 from conftest import requires_symlinks
 from kiro_crew.apps.builtins.design_tweak.backend import server
@@ -213,7 +217,7 @@ class TestValidTarget:
         """A bad PORT must be refused at the barrier, not at the first reader.
 
         `urlsplit` accepts `http://localhost:notaport` and resolves `.hostname`
-        happily — `.port` is a lazily-parsed property, so the ValueError used to
+        happily — `.port` is a lazily-parsed property, so the ValueError would
         surface far downstream. The URL got persisted onto the project and then
         every `/projects` poll raised while reading `.port`, turning one typo into
         a permanent 500 on project loading.
@@ -518,8 +522,8 @@ class TestStopStaticPreview:
 class TestWhatIsWrittenStaysReadable:
     """The write ceiling and the read ceiling must be the SAME number.
 
-    A record the writer accepts but the reader refuses is a draft the user can
-    no longer see: `_read_request` reports it absent, so `/queue` stops listing
+    A record the writer accepts but the reader refuses is a draft the user cannot
+    see: `_read_request` reports it absent, so `/queue` stops listing
     it and the queued work is effectively gone. Refusing the append that would
     have crossed the line is strictly better — the user keeps the draft and is
     told it is full. Each individual payload is under `MAX_BODY_BYTES`, so the
@@ -972,7 +976,8 @@ class TestProxyAuthDenialIsAudited:
         h = _H()
         assert server.Handler._authorized(h, "GET", b"") is False
         assert h.sent and h.sent[0][0] == 401
-        # Machine-readable code, per AGENTS.md's non-2xx body contract.
+        # Machine-readable code, per the non-2xx body contract in
+        # docs/system-specs/common/code-style.md.
         assert h.sent[0][1].get("code") == "invalid_proxy_signature"
 
         assert len(calls) == 1, "the 401 emitted no audit record"
@@ -1415,6 +1420,67 @@ class TestHtmlScanDoesNotFollowSymlinks:
         code, _ctype, body = server._static_response(str(root), "/", "/p/")
         assert code == 404
         assert b"private-notes" not in body
+
+    def test_a_junctioned_directory_is_not_enumerated(self, tmp_path, monkeypatch):
+        """A junction is the case that actually reaches a Windows user.
+
+        Every other test in this class is `@requires_symlinks` and therefore skipped
+        on Windows, because a symlink there needs a privilege. A junction needs none
+        — so the one link type a Windows user can plant was the one the guard did not
+        cover. `is_symlink()` does not report a junction and a junction IS a
+        directory, so the walk fell to the `is_dir()` arm and listed the linked tree.
+        """
+        secret = tmp_path / "protected"
+        secret.mkdir()
+        (secret / "private-notes.html").write_text("<h1>secret</h1>")
+        root = tmp_path / "site"
+        root.mkdir()
+        link = root / "docs"
+        link.mkdir()
+        (link / "private-notes.html").write_text("<h1>secret</h1>")
+        (root / "real.html").write_text("<h1>ok</h1>")
+
+        monkeypatch.setattr(server, "is_link_or_junction", lambda p: Path(p) == link)
+        found = server._scan_html(root)
+
+        assert "real.html" in found
+        assert not any("private-notes" in f for f in found), found
+
+    def test_the_scan_consults_the_shared_link_helper(self, tmp_path, monkeypatch):
+        """A junction is only refused if the walk ASKS the shared helper about it —
+        the seam, not the outcome, is what `is_symlink()` got wrong."""
+        root = tmp_path / "site"
+        (root / "public").mkdir(parents=True)
+        (root / "public" / "a.html").write_text("x")
+        seen = []
+
+        def _spy(p):
+            seen.append(Path(p).name)
+            return False
+
+        monkeypatch.setattr(server, "is_link_or_junction", _spy)
+        server._scan_html(root)
+
+        assert "public" in seen
+
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="junctions are a Windows reparse point"
+    )
+    def test_a_real_windows_junction_is_not_enumerated(self, tmp_path):
+        """No stub and no elevation: the real reparse point, so the stubbed tests
+        above stand in for something rather than for nothing."""
+        secret = tmp_path / "protected"
+        secret.mkdir()
+        (secret / "private-notes.html").write_text("<h1>secret</h1>")
+        root = tmp_path / "site"
+        root.mkdir()
+        (root / "real.html").write_text("<h1>ok</h1>")
+        _winapi.CreateJunction(str(secret), str(root / "docs"))
+
+        found = server._scan_html(root)
+
+        assert "real.html" in found
+        assert not any("private-notes" in f for f in found), found
 
     def test_ordinary_nested_html_is_still_found(self, tmp_path):
         """The refusal must not break the diagnostic page it feeds."""
@@ -2548,8 +2614,8 @@ class TestPersistedDevUrlIsFrontedWithProxy:
     def test_proxy_failure_leaves_the_preview_unreachable(self, tmp_path, monkeypatch):
         """No preview beats a leaking one.
 
-        This previously asserted the opposite — that framing the bare dev server
-        was an acceptable degradation "without select-to-edit". It is not: the
+        Framing the bare dev server is not an acceptable degradation, even
+        "without select-to-edit": the
         proxy is also what strips the dashboard's `Cookie` header, and cookies
         ignore the port, so the bare dev server on the same host receives the
         session cookie. An empty `previewUrl` renders the unreachable state.
@@ -2574,8 +2640,8 @@ class TestPersistedDevUrlIsFrontedWithProxy:
         """The allow-list is re-asserted at the sink: this value is read off disk
         and would become a proxy UPSTREAM.
 
-        It is CLEARED, not handed back. This previously asserted "left exactly as
-        today (framed bare)", which is the credential leak: framing it directly
+        It is CLEARED, not handed back. Handing it back — "left exactly as
+        today (framed bare)" — is the credential leak: framing it directly
         bypasses the proxy that strips `Cookie`/`Authorization`, and cookies are
         host-scoped but port-agnostic, so the dashboard's own session cookie
         reached whatever the value named.
@@ -3242,7 +3308,7 @@ class TestDevProcCrossPlatform:
 class TestDeliveryAcknowledgement:
     """`/send` seals; the panel dispatches afterwards. Two steps need an ack.
 
-    A tab closed between the seal and the prompt reaching the agent used to leave
+    A tab closed between the seal and the prompt reaching the agent would leave
     the request sealed and undeliverable: the send bar only renders for a draft,
     so the batch was stranded with no retry. `deliveredAt` records that the
     dispatch actually happened, which is what lets the panel offer a resend for

@@ -419,6 +419,10 @@ class _Loop:
         self.max_cycles = 24
         self.cycle_count = 3
         self.stop_sentinel_path = ""
+        # Read by the fire path to decide whether the transcript row shows a
+        # short banner instead of the full message. "" keeps the historical
+        # verbose row, which is what these tests assert on.
+        self.banner = ""
 
 
 def _bg_slot(key: str) -> MagicMock:
@@ -567,8 +571,8 @@ class TestIdleCleanupSparesArmedLoops:
     async def test_the_users_close_still_retires_the_loop(self, tmp_path, monkeypatch) -> None:
         """ "Respect the close" survives adopt_closed=True.
 
-        The rule used to be an emergent property of the fire path's rehydrate
-        miss. Now that the fire path adopts a closed session, the ✕ handler has
+        The rule is not an emergent property of the fire path's rehydrate
+        miss: since the fire path adopts a closed session, the ✕ handler has
         to retire the loop itself — otherwise a dismissed tab would be
         resurrected by its own loop on the next cycle.
         """
@@ -657,9 +661,9 @@ class TestIdleCleanupSparesArmedLoops:
     ) -> None:
         """The app learns of the ✕ even when tearing the ACP session down throws.
 
-        REGRESSION: the notification used to run AFTER ``sessions.remove``. An ACP
-        teardown error therefore propagated out of the handler with the app never
-        told, leaving a live crew whose watchdog re-armed the very tab the user had
+        The notification must not run AFTER ``sessions.remove``: an ACP
+        teardown error would then propagate out of the handler with the app never
+        told, leaving a live crew whose watchdog re-arms the very tab the user had
         just closed — the resurrection this hook exists to prevent, reachable by an
         error in an unrelated subsystem.
         """

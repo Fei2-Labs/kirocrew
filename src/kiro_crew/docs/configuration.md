@@ -14,6 +14,7 @@ kirocrew config get agent.model        # print a specific value
 kirocrew config set agent.model auto   # set a value (auto type detection)
 kirocrew config set --local agent.model auto   # write config.local.json instead
 kirocrew config edit                   # open in $EDITOR
+kirocrew config defaults               # stored values holding a superseded default
 ```
 
 Every config change is audit-logged to the security event log.
@@ -22,6 +23,43 @@ Every config change is audit-logged to the security event log.
 `--local` writes to. Its values win over `config.json`.
 
 The dashboard port is **not** a config key: set `KIROCREW_PORT` instead.
+
+## When a Shipped Default Changes
+
+`config.json` is written as a full materialization of the schema, so every key is
+on disk even if you never set it — and a stored value always beats the shipped
+default. Changing a default therefore reaches new installs only: yours keeps
+whatever was written the last time it saved.
+
+Kiro Crew now fixes that for itself on the two agent timeout budgets — the subagent
+timeout and the chat-turn ceiling. On the first start after an upgrade, a stored value
+that is exactly an old shipped default is removed so the current default applies, in
+that same run. It happens once per key: set one back afterwards and it stays yours.
+Affirming a value with `--keep` before that first start also keeps it.
+
+Everything else is reported, not changed, because a stored value can be a real
+choice: `stt.streaming: false` is how you turn live dictation text off, and on disk
+that is identical to the old default. On startup Kiro Crew prints one line naming any
+key still holding an old default.
+
+`kirocrew config defaults` shows each one with its stored value, the current
+default, and the release that changed it. Two ways to answer it:
+
+```bash
+kirocrew config defaults --adopt       # take the current defaults
+kirocrew config defaults --keep        # affirm your values, stop the notice
+```
+
+Both accept specific keys — `kirocrew config defaults --keep session.autocompact_pct`
+if you chose 90 on purpose and want the rest adopted. `--adopt` removes the keys so
+the current defaults apply from the next start; `--keep` records the exact values
+you affirmed, so changing one later brings the notice back. `kirocrew doctor` lists
+everything, affirmed values included.
+
+The same command also clears a stored value Kiro Crew has to replace — a retired
+`stt.provider` such as `whisper`, which already runs on `local`. That one cannot be
+kept, because the stored name has no engine behind it; `--adopt` drops the dead
+value and the notice with it.
 
 ## Sandbox
 
@@ -81,14 +119,18 @@ id); that is deferred to the session-lifecycle work, not the display path.
 
 
 **KAS is served by kiro-cli's own ACP relay.** Kiro Crew spawns
-`kiro-cli acp --agent-engine v3 --auth-method cli` and speaks ordinary ACP to it;
-the relay forwards frames to KAS in both directions. Two consequences worth
-knowing:
+`kiro-cli acp --agent-engine v3` and speaks ordinary ACP to it; the relay
+forwards frames to KAS in both directions. Two consequences worth knowing:
 
-- **Credentials stay in kiro-cli.** `--auth-method cli` makes the relay resolve
-  access tokens from kiro-cli's own store, so Kiro Crew never handles a KAS
-  token. This works on any machine where `kiro-cli login` has succeeded; sign in
-  with kiro-cli before switching.
+- **Credentials come from one of two places, chosen per spawn.** If you have
+  signed in through Kiro Crew's own login (the KAS login gate), Kiro Crew is the
+  engine's auth owner: the relay is started without `--auth-method`, the engine
+  asks Kiro Crew for an access token over its `_kiro/auth/getAccessToken`
+  callback, and Kiro Crew answers from its encrypted vault (the refresh token
+  never leaves Kiro Crew). Otherwise Kiro Crew adds `--auth-method cli` and the
+  relay resolves tokens from kiro-cli's own store — this works on any machine
+  where `kiro-cli login` has succeeded. A sign-in or sign-out takes effect on the
+  next KAS process, not on one already running.
 - **No KAS assets to locate.** Kiro Crew does not read kiro-cli's extracted KAS
   bundle or its Node runtime, so there is nothing to point at and no override to
   set. What it does need is a kiro-cli new enough to offer `--agent-engine v3`;
@@ -111,7 +153,6 @@ Set via `kirocrew config set agent.acp_backend kas`.
     "reasoning_effort": "",
     "sandbox": "auto",
     "bot_name": "",
-    "conductor_skill": false,
     "max_channels": 1,
     "max_channel_agents": 3,
     "max_subagents": 0,
@@ -146,8 +187,8 @@ Set via `kirocrew config set agent.acp_backend kas`.
   },
   "stt": {
     "enabled": true,
-    "provider": "whisper",
-    "streaming": false,
+    "provider": "local",
+    "streaming": true,
     "transcribe_region": "us-east-1",
     "language_code": "en-US"
   },
@@ -184,7 +225,6 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `agent.sandbox` | `"auto"` (use Kiro Crew OS-level sandbox, or defer to the kiro-cli internal sandbox on macOS) or `"off"` (skip the Kiro Crew sandbox) | `"auto"` |
 | `agent.streaming` | Stream response text as it is generated | `true` |
 | `agent.bot_name` | Custom name the bot identifies as | `""` |
-| `agent.conductor_skill` | Enable agent delegation conductor | `false` |
 | `agent.session_sharing` | Reuse a shared ACP runtime for subagents on the kiro-cli backend; alternate ACP backends ignore it | `true` |
 | `agent.tool_search` | On the kiro-cli backend, defer MCP tool definitions when either threshold below is exceeded; alternate ACP backends ignore it | `true` |
 | `agent.tool_search_min_pct` | Tool-definition context threshold as a percentage; `0` with the token threshold also `0` always defers | `5` |
@@ -201,19 +241,22 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `agent.completion_keep_chars` | Max characters retained in the completion event after applying `completion_keep`. `0` disables truncation. The full transcript stays on disk (see `subagent_result_ttl_secs`) | `3000` |
 | `agent.subagent_result_ttl_secs` | How long a delivered subagent's `result.txt` is retained before the reaper prunes it, so the parent can read the full transcript on demand instead of re-running the subagent. Measured from the moment the completion reaches the parent, not from when the run finished | `3600` (1h) |
 
+**Tool Search restart compatibility:** automatic fresh-session replay after a restart currently applies to direct dashboard conversations. Messaging-channel and dashboard-linked channel sessions continue using native session resume; if a deferred tool remains unavailable after one of those sessions resumes, set `agent.tool_search` to `false` until channel dispatchers support the same replay-settlement contract.
+
 ### Session
 
 | Key | Description | Default |
 |-----|-------------|---------|
 | `session.timeout_secs` | Idle session timeout in seconds (0 disables the idle sweep) | `3600` (60 min) |
-| `session.empty_response_auto_continue` | After two consecutive empty model responses, send one transcript-visible `continue` nudge per user message | `true` |
+| `session.empty_response_auto_continue` | After two consecutive empty model responses, send transcript-visible `continue` nudges on the same session | `true` |
+| `session.empty_response_max_continues` | How many `continue` nudges may run back to back before the give-up card (clamped 1-10; above 1 the notice shows "recovery N of M") | `1` |
 | `session.autocompact_pct` | Context usage percentage at which auto-compaction triggers (5-90). Lower compacts sooner and keeps per-turn cost down; higher retains more conversation before rewriting it. Applies to new installs: an existing `config.json` keeps its stored value | `70.0` |
 | `session.pool_size` | Number of pre-spawned kiro-cli processes kept ready for instant session start. 0 disables | `0` |
 | `session.pool_agent` | Agent for warm-pool processes. Empty uses `agent.default_agent` | `""` |
 | `session.pool_ttl_secs` | Max age in seconds for pooled processes, discarded at claim time. 0 disables | `1800` |
 | `session.eager_spawn` | Create a chat session when its slot is created, switched, or retargeted instead of waiting for the first message | `true` |
 | `session.archive_retention_days` | Days to keep compacted/rotated session archives before auto-cleanup. `-1` disables cleanup | `30` |
-| `session.watchdog_rss_max_mb` | Recycle a session when its process tree resident memory exceeds this many MiB. 0 disables. A session with a turn in flight is never recycled | `0` |
+| `session.watchdog_rss_max_mb` | Recycle an idle session when its process tree resident memory exceeds this many MiB, so a runaway session tree is bounded by default. 0 disables. A session with a turn in flight is never recycled. `kirocrew status` and `kirocrew doctor` show the ceiling next to the gateway's own resident memory | `1536` |
 
 ### Dashboard
 
@@ -226,6 +269,9 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `dashboard.merge_queued_messages` | Concatenate follow-up messages while the agent is busy | `false` |
 | `dashboard.mcp_probe_timeout_secs` | Seconds to wait for an MCP server handshake during a probe (5-120) | `15` |
 | `dashboard.link_previews` | Fetch and render HTTP(S) link metadata in assistant messages. Off by default because each linked site receives a request from this machine | `false` |
+| `dashboard.feature_videos_enabled` | Play a short intro clip for a feature this install has not used yet. Instance-wide kill switch; see [Feature Videos](feature-videos.md). Off until real clips ship | `false` |
+| `dashboard.link_patterns` | Rewrite matching plain text in transcripts into links at display time, through the same autolink rule engine editions register vocabulary on. Each rule pairs a JavaScript regex with an absolute http(s) URL template in which `{match}` inserts the matched text percent-encoded (no userinfo, placeholder outside the host), e.g. `{"pattern": "\\bPROJ-\\d+\\b", "url": "https://tracker.example.com/browse/{match}"}`. Code blocks and existing links are never rewritten; an inline code span whose whole text matches becomes a link chip. At most 50 rules with distinct patterns, each carrying at most one wide quantifier (`*`, `+`, `{n,}` or a wide `{n,m}`; narrow ranges may accompany it), scanning at most 2000 characters per text block | `[]` |
+| `dashboard.feature_videos_cache_max_mb` | Disk budget for downloaded clips. Whole release folders are removed oldest-first to fit; the release you are running is never removed. `0` = no cap | `500` |
 
 ### Slack
 
@@ -242,8 +288,9 @@ Only the owner (`KIROCREW_OWNER_ID`) is authorized to interact over Slack.
 Multi-user access and open channels are refused regardless of what these lists
 contain, so treat them as bookkeeping rather than an access grant.
 
-Other channels (Discord, Telegram, Teams, Webex, WeCom, WeChat) are configured
-from the dashboard — see each channel's doc for keys and credentials.
+Every other messaging channel is configured from the dashboard — the roster is in
+[the documentation index](index.md#chat-channels), and each channel's own doc
+lists its keys and credentials.
 
 ### Speech-to-text
 
@@ -303,8 +350,14 @@ AWS client are the optional `voice` extra, installed as its own dependencies
 - Compressed audio still passes through ffmpeg internally: a voice note arrives
   as ogg/Opus and a browser recording as webm. Desktop releases bundle and verify
   a pinned decoder, so there is no separate FFmpeg installation step. Source
-  environments use a system FFmpeg from the fixed platform paths instead of an
-  executable inside an agent-writable project venv.
+  environments use a system FFmpeg from the fixed platform paths — never an
+  executable inside an agent-writable project venv — and where the host packages
+  none, **Settings > Voice offers a one-click decoder download** that fetches the
+  same pinned upstream bytes into `<data home>/models/ffmpeg/` and verifies them
+  against a built-in SHA-256 digest before anything is executed. The digest is the
+  trust anchor, so `~/.local/bin` is still not a place a decoder can be installed
+  for Kiro Crew's use. If that download fails, the page offers to hand the failure
+  to a chat session, which is given the host details and the trusted locations.
 
 #### Retired providers
 
@@ -349,8 +402,9 @@ permission to spend. The authenticated dashboard is the only writer — there is
 deliberately no CLI verb, because a terminal command that records a grant on
 request is a grant an automated caller can take.
 
-Both local defaults (`piper` for TTS, `local` for STT) need no AWS account and no
-confirmation.
+Both local defaults (`system` for TTS, `local` for STT) need no AWS account and no
+confirmation. `system` additionally needs nothing installed on macOS and Windows,
+which is why it is the TTS default rather than `piper`.
 
 ### Memory and embeddings
 
@@ -362,10 +416,12 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 |-----|-------------|---------|
 | `memory.embedding_provider` | Vector embedding backend. `"llama_cpp"` is the only accepted value; any other value in an existing config (including a legacy `"ollama"` or `"none"`) is coerced to it on load | `"llama_cpp"` |
 | `memory.embedding_dim` | Output width of the embedding model in use. Must match a custom model's real width, or the load is refused | `1024` |
-| `memory.embedding_threads` | CPU threads llama.cpp may use per embedding call; clamped to the machine core count | `4` |
+| `memory.embedding_threads` | CPU threads llama.cpp may use per embedding call; explicit settings are clamped to the machine core count | `4` |
+| `memory.embedding_bulk_threads` | Threads used for background embedding; `0` inherits `embedding_threads` | `1` |
+| `memory.embedding_bulk_duty` | Target fraction of worker time spent on background embedding; interactive queries take priority | `0.2` |
 | `memory.embed_model_url` | Override HTTPS URL for the embedding-model GGUF download (mirrored or airgapped hosts). Empty uses the public Kiro Crew CDN. `KIROCREW_EMBED_MODEL_URL` wins over both. Downloads are sha256-verified regardless of source | `""` |
 | `memory.embed_model_path` | Absolute path to a local GGUF to run **instead of** the bundled Qwen3-Embedding-0.6B. When set, the default model is never downloaded, so a custom model survives a default-model version change. Set `embedding_dim` to the model's output width. Changing the model changes the vector space, so stored embeddings are regenerated in the background. A configured-but-unreadable path fails closed (keyword search still works) rather than silently reverting to the default and re-embedding your corpus. Editable from the dashboard (Memory → Embedding Model). `KIROCREW_EMBED_MODEL_PATH` wins over this | `""` |
-| `memory.embed_model_id` | Stable identifier for a custom model's vector space. Defaults to `custom:<filename>:<size>`, which cannot distinguish two different models of identical byte size, so set it explicitly if you swap between such models | `""` |
+| `memory.embed_model_id` | Optional label for a custom model. The vector-space identity is `<label>:sha256:<digest>` of the model file's bytes, so two different models of identical name and size are always told apart and this key cannot pin or override that identity. Applying a model from the dashboard writes the resulting id together with `memory.embed_model_stamp` (the file's device, inode, size and timestamps); an unchanged file reuses the stored digest at startup instead of re-hashing the weights | `""` |
 | `memory.semantic_confidence_threshold` | Minimum similarity score for a semantic search result | `0.8` |
 | `memory.episodic_dedup_threshold` | Similarity threshold for deduplicating episodic memories | `0.88` |
 | `memory.episodic_max_results` | Max episodic memories injected per session | `8` |
@@ -373,6 +429,80 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.decay_rates` | Per-tag episodic recency decay rates, per day (score factor `exp(-rate * days_old)`). Keys are memory tags (case-insensitive); the reserved `default` key replaces the built-in `0.03` for memories matching no configured tag. A memory carrying several configured tags uses the slowest (smallest) rate, so a broad tag can never age out a long-retention one. `0` never ages out of retrieval ranking; `1` falls out of retrieval within about a day. Ranking only: `episodic_max_count` cap eviction (lowest importance, then oldest) still applies regardless of decay rate. Values are clamped to `0..10`; non-numeric values are ignored with a logged warning. Example: `{"legal_precedents": 0.0, "trading_data": 1.0}` | `{}` |
 | `memory.history_idle_hours` | Hours of inactivity before history consolidation | `3.0` |
 | `memory.history_max_days` | Days of history to retain before pruning | `365` |
+| `memory.private_provisioning_enabled` | Allow new private V2 stores for member creation, discovery sync and explicit V1-to-V2 setup; turning off leaves existing stores and their isolation active | `true` |
+| `memory.backup_enabled` | Periodic rotating backups of active member V2 stores only; V1 backups remain manual and retention does not delete active V2 memories | `true` |
+| `memory.backup_keep` | Backup copies retained per store, with a minimum of one | `7` |
+
+Decay, episodic capacity eviction and history age pruning apply to V1 only.
+V2 keeps memory until explicit correction, replacement, forgetting or restoration.
+Global V1 retains its session-start retrieval; V2 injects essential member and
+project guidance and recalls memory fragments on demand. The shared embedding
+worker and its thread defaults affect both versions.
+
+To pause new private memory creation, set `memory.private_provisioning_enabled`
+to the JSON boolean `false` in `config.json`, or use the existing owner-authenticated
+`PATCH /api/config/kirocrew` with this body:
+
+```json
+{"path": "memory.private_provisioning_enabled", "value": false}
+```
+
+Set the value to `true` to resume. The next creation admission reads the setting;
+no gateway restart is needed. Dashboard and CLI member creation, discovery sync
+that would add members, and explicit V1-to-V2 setup refuse while paused. They do
+not create V1 members instead. Existing V1 members keep their bindings, and
+existing V2 execution, memory reads, edits, backups and recovery keep their
+normal isolation checks. Repeating setup for an already-owned V2 store remains
+valid. The setting does not cancel operations already admitted, disable memory
+preparation or withdraw shared startup changes. An absent field defaults to
+`true`; a present non-boolean value pauses creation, and the owner API rejects
+non-boolean writes.
+An unreadable or malformed configuration file or `memory` section also refuses
+new creation until repaired; the default does not override unreadable settings.
+
+#### Named memory stores
+
+Each Crew Member receives its own empty private V2 memory when it is created.
+The generated store is recorded in `agents.<crew>.memory_store` and declared in
+`memory_stores` with its version and owner. Existing Global Memory V1 remains
+with the built-in default assistant; creating a member never copies or migrates it.
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `memory_stores` | Store declarations; member entries include `memory_version: 2` and `owner_member`. A missing declaration is an error | `{"default": {}}` |
+| `default_memory_store` | Retained for configuration compatibility; never repairs a missing or invalid member binding | `"default"` |
+| `agents.<crew>.memory_store` | Existing members retain their declared V1 binding; new or opted-in members have an immutable private V2 store identity | Allocated on member creation |
+
+The `default` store keeps the files it already has — `~/.kiro/crew/workspace/memory/`,
+`~/.kiro/crew/memory.db` and `~/.kiro/crew/memory_index.db`. Nothing moves when you
+add a named store. A named store gets `~/.kiro/crew/memory_stores/<name>/`,
+owner-only, holding that crew's markdown memory, its full-text index and its own
+vector database. `kirocrew snapshot` covers the `default` store; a named store's files
+are not in a snapshot yet.
+
+**Store names are strict, and a bad one is refused rather than guessed at.** A name
+is lowercase, 1–80 characters, made of letters, digits and inner hyphens
+(`^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$`), a single path segment, not a Windows
+device name (`con`, `nul`, `aux`, `prn`, `com1`–`com9`, `lpt1`–`lpt9`), and does not
+end in a dot or a space. A name that breaks any of those is reported when the config
+loads and no memory directory is created for it — guessing what was meant is how two
+crews would end up sharing one directory. Your entry stays in `config.json` exactly as
+you wrote it so you can fix the spelling; until you do, a member bound to it
+refuses execution with an explicit memory error.
+
+An undeclared name, mismatched owner, missing directory or unreadable database
+also refuses execution. There is no fallback to `default_memory_store` or Global
+Memory V1. Existing members keep working on their declared V1 store until the
+owner chooses empty V2 memory in member settings, or runs
+`kirocrew agent update <name> --provision-memory`. Their existing memory stays
+untouched. Recover a damaged existing private store from its own
+backup instead of rebinding it to another store.
+
+**Private member execution requires OS filesystem isolation.** File tools fence
+`memory_stores/`, and the process sandbox withholds private stores and Global V1
+memory from member subprocesses. Memory tools reach only the member's bound store
+through the gateway. An unsupported or unavailable sandbox refuses private
+execution; member management and existing V1 bindings remain available.
 
 ### Skills
 
@@ -403,9 +533,10 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `knowledge.auto_add_documents` | Let the agent add documents it reads while working to the Knowledge Library (one aggregate "Auto-added" source). The agent fetches the content with its own tools under your approval; Kiro Crew fetches nothing, so `doc_ingest_hosts` does not apply. Renamed from `auto_ingest_doc_links`, which is still accepted on read | `false` |
 | `knowledge.folder_ingest_chunk_budget` | Chunks a folder you add by hand may ingest per watcher sweep, including the first scan started by confirming the source. Nothing is skipped — newest files land first and the rest continue on later sweeps — so this paces spend rather than limiting what is ingested. 0 removes the bound; a per-source `chunk_budget` property overrides it for one folder | `300` |
 | `knowledge.dedup_every_n_sweeps` | Run a full duplicate-collapsing pass every Nth watcher sweep (the per-write gate only catches byte-identical documents). 0 disables | `12` |
-| `knowledge.extraction_pool_size` | Concurrent LLM workers for document extraction; requires restart | `3` |
+| `knowledge.extraction_pool_size` | Concurrent LLM workers for document extraction. Applies live: the pool resizes once its in-flight extractions finish | `3` |
 | `knowledge.embed_rate_limit` | Maximum embedding generations per minute across all sources. `0` removes the bound | `120` |
 | `knowledge.sweep_chunk_budget` | Maximum chunks ingested across all sources in one watcher sweep. `0` removes the bound | `500` |
+| `knowledge.import_chunk_budget` | Maximum chunks ingested through the explicit one-shot import paths (single-file add, agent add, direct text ingest, remote sync) within a rolling ~60s window -- the cross-file cost ceiling those paths otherwise lack. When exhausted the next import is refused with a reason rather than silently truncated; a single file stays bounded by the 50-chunk per-file cap independently. `0` (the default) removes the bound; opt in by setting it (e.g. `500`). Limitation if enabled: reservation is worst-case (each in-flight import books the 50-chunk per-file maximum up front and reconciles to the real count only on completion), so concurrent imports throttle below the nominal number until that accounting is refined. | `0` |
 
 ### Top level
 
@@ -426,6 +557,12 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `KIROCREW_SKIP_MODEL_DOWNLOAD` | Set to `1` to skip the background embedding-model download at gateway startup (tests, CI, airgapped hosts) | unset |
 | `KIROCREW_EMBED_MODEL_URL` | Override HTTPS URL for the embedding-model GGUF; wins over `memory.embed_model_url` and the CDN default | unset |
 | `KIROCREW_EMBED_MODEL_PATH` | Absolute path to a local GGUF to use instead of the bundled model; wins over `memory.embed_model_path` and suppresses the default download entirely | unset |
+
+Use a dedicated directory for `KIROCREW_HOME`. Startup applies owner-only
+permissions or an owner-only Windows ACL to the data home, including homes that
+use only named stores. A deliberately group-shared directory will have those
+permissions tightened. This is shared data-home hardening and affects V1 as well
+as V2 installations.
 
 ### Timezone
 
@@ -475,7 +612,10 @@ rules so they cannot be opted out of at all.
 | `~/.kiro/crew/notifications.jsonl` | Notification history |
 | `~/.kiro/crew/models/` | Embedding model, downloaded in the background at startup |
 | `~/.kiro/crew/history/` | Chat history (JSONL) |
-| `~/.kiro/crew/workspace/memory/` | Memory files |
+| `~/.kiro/crew/workspace/memory/` | Memory files (default store) |
+| `~/.kiro/crew/memory_index.db` | Full-text search index (default store) |
+| `~/.kiro/crew/memory.db` | Semantic, episodic and lesson memory (default store) |
+| `~/.kiro/crew/memory_stores/<name>/` | A named memory store: one crew's private memory, unreadable by the agent's file tools |
 | `~/.kiro/crew/session_map.json` | Session resume mapping |
 | `~/.kiro/crew/snapshots/` | Default output of `kirocrew snapshot` |
 | `~/.kiro/agents/kirocrew.json` | Installed agent config |

@@ -99,6 +99,109 @@ class TestTaskRun:
 
 class TestWorkflowRunIntegration:
     @pytest.mark.asyncio
+    async def test_closed_gateway_admission_rejects_background_start(self, tmp_path: Path) -> None:
+        sessions = _make_mock_sessions()
+        sessions.admission_closed = True
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        spec_path = tmp_path / "blocked.md"
+        spec_path.write_text("# Blocked task\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="gateway admission is closed"):
+            await runner.start_background(spec_path)
+
+        assert runner._runs == {}
+        assert runner._tasks == {}
+
+    def test_in_flight_planning_counts_as_running(self, tmp_path: Path) -> None:
+        runner = TaskRunner(sessions=_make_mock_sessions(), auto_test=False, work_dir=tmp_path)
+
+        runner._start_ids_in_flight.add("plan-racing")
+
+        assert runner.running is True
+
+    @pytest.mark.asyncio
+    async def test_closed_gateway_admission_rejects_planning(self, tmp_path: Path) -> None:
+        sessions = _make_mock_sessions()
+        sessions.admission_closed = True
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+
+        with pytest.raises(ValueError, match="gateway admission is closed"):
+            await runner.plan("draft a plan")
+
+        assert runner._start_ids_in_flight == set()
+        assert runner._runs == {}
+
+    @pytest.mark.asyncio
+    async def test_pause_during_background_preparation_stays_visible(self, tmp_path: Path) -> None:
+        sessions = _make_mock_sessions()
+        sessions.admission_closed = False
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        spec_path = tmp_path / "racing.md"
+        spec_path.write_text("# Racing task\n", encoding="utf-8")
+        visible_during_pause: list[bool] = []
+
+        async def close_admission_during_persist() -> None:
+            sessions.admission_closed = True
+            visible_during_pause.append(runner.running)
+
+        runner._apersist_runs = close_admission_during_persist  # type: ignore[method-assign]
+        execute = AsyncMock()
+        with patch.object(runner, "run", execute):
+            task_id = await runner.start_background(spec_path)
+            assert visible_during_pause == [True]
+            assert task_id in runner._tasks
+            assert runner._start_ids_in_flight == set()
+            await runner._tasks[task_id]
+
+        execute.assert_awaited_once()
+        assert runner._tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_plan_memory_inheritance_releases_reservation(
+        self, tmp_path: Path
+    ) -> None:
+        runner = TaskRunner(sessions=_make_mock_sessions(), auto_test=False, work_dir=tmp_path)
+
+        with patch(
+            "kiro_crew.context.inherit_session_memory",
+            AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await runner.plan("cancel during inherited memory")
+
+        assert runner._start_ids_in_flight == set()
+        assert runner.running is False
+        assert runner._runs == {}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_workflow_begin_rolls_back_background_start(
+        self, tmp_path: Path
+    ) -> None:
+        runner = TaskRunner(sessions=_make_mock_sessions(), auto_test=False, work_dir=tmp_path)
+        spec_path = tmp_path / "workflow-cancel.md"
+        spec_path.write_text("# Cancel during workflow publication\n", encoding="utf-8")
+        delete_link = AsyncMock()
+        persist = AsyncMock()
+
+        async def cancel_after_link(run) -> None:
+            run.workflow_run_id = "wf-partial"
+            raise asyncio.CancelledError()
+
+        runner._workflow_begin = cancel_after_link  # type: ignore[method-assign]
+        runner._workflow_delete_link = delete_link  # type: ignore[method-assign]
+        runner._apersist_runs = persist  # type: ignore[method-assign]
+
+        with pytest.raises(asyncio.CancelledError):
+            await runner.start_background(spec_path, session_key="dashboard:test")
+
+        delete_link.assert_awaited_once()
+        persist.assert_awaited_once()
+        assert runner._runs == {}
+        assert runner._run_session_keys == {}
+        assert runner._start_ids_in_flight == set()
+        assert runner.running is False
+
+    @pytest.mark.asyncio
     async def test_cancelled_background_start_removes_unowned_workflow_run(
         self, tmp_path: Path
     ) -> None:
@@ -114,21 +217,31 @@ class TestWorkflowRunIntegration:
         spec_path = tmp_path / "background.md"
         spec_path.write_text("# Background task\n", encoding="utf-8")
         persistence_started = asyncio.Event()
+        persistence_release = asyncio.Event()
+        persist_calls = 0
 
         async def block_placeholder_persistence() -> None:
-            persistence_started.set()
-            await asyncio.Future()
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 1:
+                persistence_started.set()
+                await persistence_release.wait()
 
         runner._apersist_runs = block_placeholder_persistence  # type: ignore[method-assign]
         starting = asyncio.create_task(runner.start_background(spec_path))
         await asyncio.wait_for(persistence_started.wait(), timeout=1)
         starting.cancel()
+        persistence_release.set()
 
         with pytest.raises(asyncio.CancelledError):
             await starting
 
+        assert persist_calls == 2
+
         assert runner._runs == {}
         assert runner._tasks == {}
+        assert runner._start_ids_in_flight == set()
+        assert runner.running is False
         assert workflows.list_runs() == []
         assert WorkflowService(sessions=sessions, store=workflow_store).list_runs() == []
 
@@ -1155,11 +1268,11 @@ class TestResourceManagement:
     """Verify sessions are released for all task lifecycle paths."""
 
     @pytest.mark.asyncio
-    async def test_single_task_session_reset_after_success(self) -> None:
+    async def test_single_task_session_reset_after_success(self, tmp_path: Path) -> None:
         """After a single task succeeds, its session must be reset."""
         sessions = _make_mock_sessions()
         sessions.reset = AsyncMock()
-        runner = TaskRunner(sessions=sessions, auto_test=False)
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
 
         async def mock_execute(run, task, hk="", session_key=""):
             task.status = StepStatus.PASSED
@@ -1179,11 +1292,11 @@ class TestResourceManagement:
         assert "taskrunner:r1:task1" in reset_keys
 
     @pytest.mark.asyncio
-    async def test_parallel_tasks_all_sessions_reset(self) -> None:
+    async def test_parallel_tasks_all_sessions_reset(self, tmp_path: Path) -> None:
         """After a parallel group completes, ALL task sessions must be reset."""
         sessions = _make_mock_sessions()
         sessions.reset = AsyncMock()
-        runner = TaskRunner(sessions=sessions, auto_test=False)
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
 
         async def mock_execute(run, task, hk="", session_key=""):
             task.status = StepStatus.PASSED
@@ -1204,11 +1317,11 @@ class TestResourceManagement:
             assert f"taskrunner:r2:task{i}" in reset_keys
 
     @pytest.mark.asyncio
-    async def test_parallel_failure_still_resets_all_sessions(self) -> None:
+    async def test_parallel_failure_still_resets_all_sessions(self, tmp_path: Path) -> None:
         """If one task in a parallel group fails, ALL sessions in the group must still be reset."""
         sessions = _make_mock_sessions()
         sessions.reset = AsyncMock()
-        runner = TaskRunner(sessions=sessions, auto_test=False)
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
 
         call_count = 0
 
@@ -1270,10 +1383,10 @@ class TestResourceManagement:
             assert ri < si, f"release must precede reset for {key}: {call_order}"
 
     @pytest.mark.asyncio
-    async def test_pending_tasks_hold_no_sessions(self) -> None:
+    async def test_pending_tasks_hold_no_sessions(self, tmp_path: Path) -> None:
         """Tasks that never execute (PENDING) should not create any sessions."""
         sessions = _make_mock_sessions()
-        runner = TaskRunner(sessions=sessions, auto_test=False)
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
 
         async def mock_execute(run, task, hk="", session_key=""):
             task.status = StepStatus.FAILED
@@ -1303,11 +1416,11 @@ class TestResourceManagement:
         assert "taskrunner:r4:task3" not in reset_keys
 
     @pytest.mark.asyncio
-    async def test_cancel_running_project_cleans_up_sessions(self) -> None:
+    async def test_cancel_running_project_cleans_up_sessions(self, tmp_path: Path) -> None:
         """cancel() on a running project must trigger _cleanup_run_sessions."""
         sessions = _make_mock_sessions()
         sessions.cancel_current = AsyncMock()
-        runner = TaskRunner(sessions=sessions, auto_test=False)
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
 
         # Simulate a long-running task that blocks until cancelled
         blocked = asyncio.Event()
@@ -1362,11 +1475,11 @@ class TestResourceManagement:
         assert sessions.reset.call_count >= 1
 
     @pytest.mark.asyncio
-    async def test_cancel_mid_parallel_group_resets_all(self) -> None:
+    async def test_cancel_mid_parallel_group_resets_all(self, tmp_path: Path) -> None:
         """Cancelling during a parallel group must clean up all sessions in the group."""
         sessions = _make_mock_sessions()
         sessions.cancel_current = AsyncMock()
-        runner = TaskRunner(sessions=sessions, auto_test=False)
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
 
         started = asyncio.Event()
 
@@ -1421,7 +1534,7 @@ class TestResourceManagement:
                 assert key in cleaned_keys, f"Session {key} not cleaned up"
 
     @pytest.mark.asyncio
-    async def test_cancel_mid_parallel_group_reset_completes(self) -> None:
+    async def test_cancel_mid_parallel_group_reset_completes(self, tmp_path: Path) -> None:
         """reset() must run to completion under CancelledError (shield fix)."""
         sessions = _make_mock_sessions()
         sessions.cancel_current = AsyncMock()
@@ -1432,7 +1545,7 @@ class TestResourceManagement:
             reset_completed.append(key)
 
         sessions.reset = slow_reset
-        runner = TaskRunner(sessions=sessions, auto_test=False)
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
 
         started = asyncio.Event()
 
@@ -3098,7 +3211,7 @@ class TestEdgeCases:
 
         review_calls = 0
 
-        async def _review_once(r, s, sessions, agent, session_key=""):
+        async def _review_once(r, s, sessions, agent, session_key="", *, ctx=None):
             nonlocal review_calls
             review_calls += 1
             if review_calls == 1:
@@ -3189,7 +3302,7 @@ class TestEdgeCases:
         with patch.object(runner, "self_review", return_value=True):
             result = await runner.run(spec)
 
-        # Step 1 denied → run pauses (denial no longer skips)
+        # Step 1 denied → run pauses (denial does not skip)
         assert result.tasks[0].status == StepStatus.PENDING
         assert result.status == "paused"
 
@@ -3472,6 +3585,941 @@ class TestGitCoord:
 
         # Cleanup
         await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_workspace_is_valid_true_for_a_live_worktree(self, tmp_path: Path) -> None:
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "valid_test"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+
+        assert await git_coord.workspace_is_valid(run) is True
+
+        await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_workspace_is_valid_false_for_a_legacy_run_without_repo_root(
+        self, tmp_path: Path
+    ) -> None:
+        """A run persisted before ``repo_root`` was recorded cannot be fully
+        verified or recovered. Path identity alone would accept a DIFFERENT
+        repository at the expected path, so validation fails closed and the
+        retry is refused with a clear error instead of resuming on a
+        workspace whose identity cannot be established."""
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "legacy_no_root"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        assert await git_coord.workspace_is_valid(run) is True
+
+        # Simulate the legacy persisted shape: everything intact except the
+        # recorded repo_root.
+        saved_root = run.repo_root
+        run.repo_root = ""
+        assert await git_coord.workspace_is_valid(run) is False
+
+        run.repo_root = saved_root
+        await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_workspace_is_valid_true_for_a_run_with_no_worktree(self, tmp_path: Path) -> None:
+        """A run that never had a worktree (non-git-folder mode) is trivially
+        valid -- there is nothing broken to detect."""
+        from kiro_crew import git_coord
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "nogit_valid"
+        run.work_dir = str(tmp_path)
+        assert run.branch_name == ""
+
+        assert await git_coord.workspace_is_valid(run) is True
+
+    @pytest.mark.asyncio
+    async def test_reinit_recovers_an_orphaned_worktree(self, tmp_path: Path) -> None:
+        """Reproduce the reported state precisely -- the worktree
+        directory still exists on disk, but its registration under the main
+        repo's ``.git/worktrees/`` was removed out from under it (what an
+        interrupted ``git worktree remove`` leaves behind: deregistration and
+        directory deletion are separate steps). ``workspace_is_valid`` must
+        catch this (directory-exists alone would miss it), and
+        ``reinit_workspace_for_retry`` must recover using the ORIGINAL repo
+        (``run.repo_root``) and the run's EXISTING branch -- not fail with
+        "branch already exists", which a naive re-``init_workspace()`` call
+        would hit."""
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "orphan_test"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        assert run.git_enabled is True
+        worktree_dir = run.worktree_path
+        branch = run.branch_name
+
+        # Simulate the orphaned state: deregister the worktree from the main
+        # repo's admin metadata directly, WITHOUT removing the directory --
+        # the exact "dir exists, `git status` says not a git repo" shape
+        # the issue reports, distinct from the directory being deleted.
+        worktree_name = Path(worktree_dir).name
+        admin_dir = Path(run.repo_root) / ".git" / "worktrees" / worktree_name
+        assert admin_dir.exists()
+        import shutil
+
+        shutil.rmtree(admin_dir)
+        assert Path(worktree_dir).exists()  # directory itself is untouched
+
+        assert await git_coord.workspace_is_valid(run) is False
+
+        recovered = await git_coord.reinit_workspace_for_retry(run)
+
+        assert recovered is True
+        assert run.git_enabled is True
+        assert run.branch_name == branch  # reused, not a fresh branch
+        assert await git_coord.workspace_is_valid(run) is True
+        assert (Path(run.work_dir) / "file.txt").exists()  # branch content intact
+
+        await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_reinit_fails_closed_when_the_original_repo_is_also_gone(
+        self, tmp_path: Path
+    ) -> None:
+        """If even run.repo_root cannot be recovered from, reinit must
+        report failure rather than silently disabling git."""
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "gone_test"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+
+        import shutil
+
+        from kiro_crew.platform_compat import rmtree_force
+
+        shutil.rmtree(run.worktree_path, ignore_errors=True)
+        # Plain shutil.rmtree(..., ignore_errors=False) fails closed on Windows:
+        # git writes loose objects under .git/objects read-only, and Windows
+        # (unlike POSIX) checks the file's own read-only attribute rather than
+        # the parent directory's write bit, so os.unlink raises WinError 5
+        # before the repo is actually gone. rmtree_force clears the attribute
+        # and retries, and its return value confirms the ORIGINAL repo really
+        # is gone -- which this test's premise depends on.
+        assert rmtree_force(run.repo_root) is True
+
+        recovered = await git_coord.reinit_workspace_for_retry(run)
+
+        assert recovered is False
+
+    @pytest.mark.asyncio
+    async def test_workspace_is_valid_false_when_only_an_enclosing_repo_answers(
+        self, tmp_path: Path
+    ) -> None:
+        """A deregistered worktree whose directory survives INSIDE another
+        repository must not read as valid. ``git rev-parse`` walks UP from the
+        directory it is run in, so an ordinary directory nested anywhere inside
+        an enclosing repo still reports "inside a work tree" -- and resuming on
+        that answer would commit every remaining step into the enclosing
+        checkout while reporting those steps completed. Validity therefore has
+        to be identity (is this MY worktree?), not mere repo-ness."""
+        from kiro_crew import git_coord
+
+        enclosing = tmp_path / "enclosing"
+        enclosing.mkdir()
+        await git_coord._git(str(enclosing), "init")
+        (enclosing / "file.txt").write_text("content")
+        await git_coord._git(str(enclosing), "add", "-A")
+        await git_coord._git(str(enclosing), "commit", "-m", "init")
+
+        # The run's worktree was deregistered and its contents cleaned up, but
+        # the directory itself survived -- and it sits inside `enclosing`.
+        stale = enclosing / ".kirocrew-work" / "nested_test"
+        stale.mkdir(parents=True)
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "nested_test"
+        run.work_dir = str(stale)
+        run.worktree_path = str(stale)
+        run.repo_root = str(enclosing)
+        run.branch_name = "kirocrew/task/nested_test"
+        run.git_enabled = True
+
+        # Precondition, and the whole point: git DOES report this directory as
+        # being inside a work tree -- the ENCLOSING one. A repo-ness check
+        # answers True here, which is why it cannot be the validity test.
+        assert await git_coord._is_git_repo(str(stale)) is True
+
+        assert await git_coord.workspace_is_valid(run) is False
+
+    @pytest.mark.asyncio
+    async def test_workspace_is_valid_false_for_a_different_repo_at_the_same_path(
+        self, tmp_path: Path
+    ) -> None:
+        """A DIFFERENT repository standing at the run's worktree path must not
+        read as valid.
+
+        Matching paths are not identity: something else can create a repo
+        exactly where the lost worktree stood, and then
+        ``rev-parse --show-toplevel`` answers with that path -- the expected
+        one. Resuming on that would commit the run's remaining steps into a
+        repository that is not the run's own. A linked worktree shares its main
+        repository's git directory, so the common git dir is what actually
+        distinguishes them."""
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "impostor_test"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        worktree_dir = run.worktree_path
+        assert await git_coord.workspace_is_valid(run) is True
+
+        # Replace the worktree with an unrelated repository at the SAME path.
+        await git_coord.finalize(run)
+        from kiro_crew.platform_compat import rmtree_force
+
+        rmtree_force(worktree_dir)
+        Path(worktree_dir).mkdir(parents=True)
+        await git_coord._git(worktree_dir, "init")
+        (Path(worktree_dir) / "impostor.txt").write_text("not ours")
+        await git_coord._git(worktree_dir, "add", "-A")
+        await git_coord._git(worktree_dir, "commit", "-m", "impostor")
+
+        # Precondition, and the whole point: the path check alone is satisfied
+        # -- git reports this very directory as the repository root -- so only
+        # the git-common-dir comparison can tell the impostor apart.
+        toplevel = (await git_coord._git(worktree_dir, "rev-parse", "--show-toplevel")).strip()
+        assert git_coord._same_dir(toplevel, worktree_dir) is True
+
+        assert await git_coord.workspace_is_valid(run) is False
+
+    @pytest.mark.asyncio
+    async def test_workspace_is_valid_false_for_a_worktree_on_the_wrong_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """Repository identity is not worktree identity: a worktree of THIS
+        repo, checked out on a DIFFERENT branch at the run's own path, must
+        not read as valid -- resuming would commit the run's remaining steps
+        onto somebody else's branch while reporting success."""
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "wrong_branch_test"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        assert await git_coord.workspace_is_valid(run) is True
+
+        # Move the worktree onto a different branch of the SAME repo -- path
+        # and repo identity both still match; only the branch differs.
+        await git_coord._git(run.work_dir, "checkout", "-b", "someone-elses-branch")
+
+        assert await git_coord.workspace_is_valid(run) is False
+
+        await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_git_probe_propagates_a_transient_spawn_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A TRANSIENT spawn failure must propagate, not be read as "non-git".
+
+        ``EMFILE`` / ``ENOMEM`` / ``EAGAIN`` are ``OSError`` too, but they say
+        nothing about whether the directory is a repository. Answering False to
+        them would report a real repo as non-git, and ``init_workspace`` would
+        then set ``git_enabled = False`` -- running every step directly against
+        the user's own checkout, with no worktree isolation and no per-step
+        commits. So the guard names only the two "it is not there" errors and
+        lets the rest fail the run."""
+        import errno
+
+        from kiro_crew import git_coord
+
+        async def exhausted(*args: object, **kwargs: object) -> object:
+            raise OSError(errno.EMFILE, "Too many open files")
+
+        monkeypatch.setattr(git_coord, "create_subprocess_limited", exhausted)
+
+        with pytest.raises(OSError) as excinfo:
+            await git_coord._is_git_repo(str(tmp_path))
+        assert excinfo.value.errno == errno.EMFILE
+
+    @pytest.mark.asyncio
+    async def test_git_probe_fails_closed_when_the_directory_itself_is_gone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Probing a directory that does not exist must read as "not a git
+        repo", never raise.
+
+        The two platforms disagree on how the spawn fails: POSIX reports a
+        missing cwd as ``FileNotFoundError``, while Windows raises
+        ``NotADirectoryError`` (WinError 267) out of ``CreateProcess``. Guarding
+        only ``FileNotFoundError`` therefore failed closed on POSIX and
+        propagated on Windows -- exactly the lost-worktree state the retry path
+        exists to detect. Both are ``OSError``, which is what the guard tests.
+        """
+        from kiro_crew import git_coord
+
+        async def refuse_to_spawn(*args: object, **kwargs: object) -> object:
+            raise NotADirectoryError(267, "The directory name is invalid")
+
+        monkeypatch.setattr(git_coord, "create_subprocess_limited", refuse_to_spawn)
+
+        assert await git_coord._is_git_repo(str(tmp_path / "gone")) is False
+
+        # And the retry path built on it fails closed rather than propagating.
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "spawn_gone"
+        run.repo_root = str(tmp_path / "gone")
+        run.work_dir = str(tmp_path / "gone")
+        run.branch_name = "kirocrew/task/spawn_gone"
+
+        assert await git_coord.reinit_workspace_for_retry(run) is False
+
+    @pytest.mark.asyncio
+    async def test_recovery_revalidates_the_captured_tree_before_deleting_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ownership must hold for the tree that is actually deleted.
+
+        The proof runs against the saved path; the capture then renames whatever
+        occupies that path at rename time. Those are two different moments, so a
+        directory swapped in between them would be captured and destroyed on the
+        strength of a proof about a different tree. Recovery therefore proves
+        ownership a SECOND time, against the captured name, and this pins that:
+        the swap is injected in exactly that gap, and its data must survive.
+        """
+        import shutil as _shutil
+
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "capture_swap"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        worktree_dir = Path(run.worktree_path)
+
+        # The orphaned state: deregistered, checkout still on disk, so the first
+        # proof legitimately passes and recovery proceeds to capture.
+        admin_dir = Path(run.repo_root) / ".git" / "worktrees" / worktree_dir.name
+        assert admin_dir.exists()
+        _shutil.rmtree(admin_dir)
+
+        real_proof = git_coord._leftover_dir_is_ours
+        treasure = worktree_dir / "not-ours.txt"
+        swapped = False
+
+        async def proving_then_swapping(run_arg: object, path: object = None) -> bool:
+            """Pass the first proof, then swap the path out from under it."""
+            nonlocal swapped
+            verdict = await real_proof(run_arg, path)
+            if not swapped and path is None:
+                swapped = True
+                if worktree_dir.exists():
+                    _shutil.rmtree(worktree_dir)
+                worktree_dir.mkdir(parents=True)
+                treasure.write_text("someone else's data")
+            return verdict
+
+        monkeypatch.setattr(git_coord, "_leftover_dir_is_ours", proving_then_swapping)
+
+        recovered = await git_coord.reinit_workspace_for_retry(run)
+
+        assert swapped, "the post-proof gap was never exercised"
+        assert treasure.exists(), (
+            "recovery deleted the tree it captured without re-proving ownership "
+            "of THAT tree -- a post-proof swap was destroyed"
+        )
+        assert treasure.read_text() == "someone else's data"
+        assert recovered is False
+        # The stranger's directory is put back, not left under a stale name.
+        assert not list(worktree_dir.parent.glob("*.kirocrew-stale-*"))
+
+    @pytest.mark.asyncio
+    async def test_recovery_never_deletes_a_tree_swapped_in_after_the_proof(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The destructive step must act on a CAPTURED tree, not on a path it
+        re-resolves after awaiting git.
+
+        Ownership is proved against ``run.worktree_path``, and a ``git``
+        subprocess is awaited before anything is deleted. A delete that
+        re-resolved that path would destroy whatever occupied it by then -- not
+        the tree the proof actually validated. This plants an unrelated
+        directory at the saved path from INSIDE that awaited git call, which is
+        the exact window, and asserts its contents survive.
+        """
+        import shutil as _shutil
+
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "swap_race"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        worktree_dir = Path(run.worktree_path)
+
+        # The orphaned state: deregistered, but the checkout survives on disk, so
+        # the ownership proof passes and recovery proceeds to delete.
+        admin_dir = Path(run.repo_root) / ".git" / "worktrees" / worktree_dir.name
+        assert admin_dir.exists()
+        _shutil.rmtree(admin_dir)
+        assert worktree_dir.exists()
+
+        real_git = git_coord._git
+        treasure = worktree_dir / "not-ours.txt"
+        planted = False
+
+        async def racing_git(cwd: str, *args: str) -> str:
+            """Swap an unrelated directory onto the saved path mid-recovery --
+            after the capture (and its proofs), immediately before the
+            ``worktree add`` resolves the saved path again."""
+            nonlocal planted
+            if not planted and args[:2] == ("worktree", "add"):
+                planted = True
+                if worktree_dir.exists():
+                    _shutil.rmtree(worktree_dir)
+                worktree_dir.mkdir(parents=True)
+                treasure.write_text("someone else's data")
+            return await real_git(cwd, *args)
+
+        monkeypatch.setattr(git_coord, "_git", racing_git)
+
+        recovered = await git_coord.reinit_workspace_for_retry(run)
+
+        assert planted, "the race window was never exercised"
+        assert treasure.exists(), (
+            "recovery deleted a directory that only appeared AFTER the "
+            "ownership proof -- the delete re-resolved the saved path"
+        )
+        assert treasure.read_text() == "someone else's data"
+        # The saved path is occupied by something that is not ours, so the
+        # re-add must fail rather than clobber it.
+        assert recovered is False
+
+    @pytest.mark.asyncio
+    async def test_reinit_parks_the_stale_checkout_instead_of_deleting_it(
+        self, tmp_path: Path
+    ) -> None:
+        """Recovery PARKS the captured leftover; nothing deletes it.
+
+        The only evidence an orphaned checkout can offer is a plain-text
+        ``.git`` pointer file a forgery reproduces exactly, so no leftover
+        that reaches the destructive step carries evidence strong enough to
+        authorize destruction. The rename is what frees the path for the
+        re-add; the tree survives on disk under the set-aside name.
+        """
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "park_test"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        worktree_dir = Path(run.worktree_path)
+        (worktree_dir / "scratch.txt").write_text("uncommitted scratch")
+
+        # The orphaned state: deregistered, directory intact.
+        import shutil
+
+        admin_dir = Path(run.repo_root) / ".git" / "worktrees" / worktree_dir.name
+        assert admin_dir.exists()
+        shutil.rmtree(admin_dir)
+
+        assert await git_coord.reinit_workspace_for_retry(run) is True
+
+        parked = list(worktree_dir.parent.glob(f"{worktree_dir.name}.kirocrew-stale-*"))
+        assert parked, "the captured leftover was deleted instead of parked"
+        assert (parked[0] / "scratch.txt").read_text() == "uncommitted scratch"
+
+        await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_orphaned_gitdir_reader_rejects_unc_and_uncontained_targets(
+        self, tmp_path: Path
+    ) -> None:
+        """The pointer target is attacker-writable text: no spelling of it may
+        reach a filesystem probe unless it is lexically an entry directly
+        under the repository's own ``worktrees`` directory. On Windows, a mere
+        ``exists()`` on a UNC target performs outbound SMB authentication --
+        a credential exposure -- so UNC/device forms are rejected on the raw
+        string before any syscall."""
+        from kiro_crew import git_coord
+
+        worktrees_dir = str(tmp_path / "repo" / ".git" / "worktrees")
+        tree = tmp_path / "leftover"
+        tree.mkdir()
+
+        def forge(target: str) -> str:
+            (tree / ".git").write_text(f"gitdir: {target}\n")
+            return git_coord._orphaned_worktree_gitdir(str(tree), worktrees_dir)
+
+        # UNC and device spellings: rejected on the raw string.
+        assert forge(r"\\attacker-host\share\worktrees\x") == ""
+        assert forge("//attacker-host/share/worktrees/x") == ""
+        assert forge(r"\\.\pipe\evil") == ""
+        assert forge(r"\\?\C:\anything") == ""
+        # Local but outside the repo's worktrees dir: rejected lexically.
+        assert forge(str(tmp_path / "elsewhere" / "wt")) == ""
+        # Dot-dot escape normalizing outside the worktrees dir: rejected.
+        assert forge(f"{worktrees_dir}/../../../elsewhere") == ""
+        # A genuine dangling entry directly under the worktrees dir: accepted.
+        # Compare normalized: on Windows the reader returns backslash paths.
+        import os as _os
+
+        genuine = f"{worktrees_dir}/gone-entry"
+        assert _os.path.normcase(_os.path.normpath(forge(genuine))) == _os.path.normcase(
+            _os.path.normpath(genuine)
+        )
+
+    @pytest.mark.asyncio
+    async def test_recovery_metadata_readers_never_follow_links(self, tmp_path: Path) -> None:
+        """The recovery-path invariant: no filesystem operation on the
+        worktree-recovery path ever follows a link. A planted symlink -- as
+        the ``.git`` pointer leaf, as a ``worktrees`` entry, or as the
+        pointer's target leaf -- is refused or skipped, never dereferenced.
+        (On Windows the same applies to junctions/reparse points.)"""
+        import os as _os
+
+        from kiro_crew import git_coord
+
+        if not hasattr(_os, "symlink"):
+            pytest.skip("no symlink support on this platform")
+
+        # 1. A symlinked .git leaf is refused by the no-follow open even
+        #    though a symlink can masquerade via follow-based reads.
+        tree = tmp_path / "leftover"
+        tree.mkdir()
+        real_pointer = tmp_path / "elsewhere.txt"
+        worktrees_dir = str(tmp_path / "repo" / ".git" / "worktrees")
+        real_pointer.write_text(f"gitdir: {worktrees_dir}/gone\n")
+        try:
+            _os.symlink(str(real_pointer), str(tree / ".git"))
+        except OSError:
+            pytest.skip("cannot create symlinks in this environment")
+        assert git_coord._orphaned_worktree_gitdir(str(tree), worktrees_dir) == ""
+
+        # 2. A symlinked entry inside the worktrees dir is skipped, not
+        #    traversed, by _run_worktree_admin_dir.
+        wt_dir = tmp_path / "wt"
+        real_entry_home = tmp_path / "outside-entry"
+        real_entry_home.mkdir()
+        (real_entry_home / "gitdir").write_text(f"{wt_dir}/.git\n")
+        admin = tmp_path / "admin" / "worktrees"
+        admin.mkdir(parents=True)
+        _os.symlink(str(real_entry_home), str(admin / "linked-entry"))
+        assert git_coord._run_worktree_admin_dir(str(admin), str(wt_dir)) == ""
+
+        # 3. A symlink LEAF at the pointer target reads as existing via the
+        #    no-follow probe, so the pointer is rejected as evidence -- the
+        #    link is never dereferenced.
+        tree2 = tmp_path / "leftover2"
+        tree2.mkdir()
+        real_admin = tmp_path / "repo2" / ".git" / "worktrees"
+        real_admin.mkdir(parents=True)
+        _os.symlink(str(tmp_path / "no-such-place"), str(real_admin / "link-leaf"))
+        (tree2 / ".git").write_text(f"gitdir: {real_admin}/link-leaf\n")
+        assert git_coord._orphaned_worktree_gitdir(str(tree2), str(real_admin)) == ""
+
+        # 4. Validation happens on the OPENED handle (atomic -- no
+        #    check-then-open window): a non-regular file is refused by the
+        #    fstat of the handle itself, and a symlink leaf is refused by the
+        #    open, never dereferenced.
+        with pytest.raises(OSError):
+            with git_coord._open_nofollow_text(str(tmp_path)):  # a directory
+                pass
+        link_file = tmp_path / "leaf-link"
+        _os.symlink(str(real_pointer), str(link_file))
+        with pytest.raises(OSError):
+            with git_coord._open_nofollow_text(str(link_file)):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_reinit_refuses_to_delete_a_foreign_repo_at_the_worktree_path(
+        self, tmp_path: Path
+    ) -> None:
+        """A completely different, unrelated repository sitting at the run's
+        worktree path must not be recursively deleted during recovery --
+        that would be silent, unrecoverable data loss for whatever that
+        repository holds. Recovery must refuse and fail the run instead."""
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "foreign_repo_test"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        worktree_dir = run.worktree_path
+
+        # Replace the worktree with an unrelated, independent repository at
+        # the SAME path -- exactly the shape a foreign occupant would take.
+        await git_coord.finalize(run)
+        from kiro_crew.platform_compat import rmtree_force
+
+        rmtree_force(worktree_dir)
+        Path(worktree_dir).mkdir(parents=True)
+        await git_coord._git(worktree_dir, "init")
+        (Path(worktree_dir) / "precious.txt").write_text("someone else's data")
+        await git_coord._git(worktree_dir, "add", "-A")
+        await git_coord._git(worktree_dir, "commit", "-m", "unrelated")
+
+        recovered = await git_coord.reinit_workspace_for_retry(run)
+
+        assert recovered is False
+        assert (
+            Path(worktree_dir) / "precious.txt"
+        ).exists(), "recovery deleted a repository it does not own"
+
+    @pytest.mark.asyncio
+    async def test_reinit_refuses_to_delete_an_arbitrary_non_git_directory(
+        self, tmp_path: Path
+    ) -> None:
+        """A non-Git directory is not evidence of an orphaned worktree.
+
+        The retry path may only remove a broken checkout that still carries
+        Git's pointer back to this run's original repository.  A replacement
+        directory with unrelated files must survive byte-for-byte.
+        """
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "non_git_replacement"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        worktree_dir = Path(run.worktree_path)
+
+        await git_coord.finalize(run)
+        worktree_dir.mkdir(parents=True)
+        precious = worktree_dir / "precious.txt"
+        precious.write_bytes(b"someone else's bytes\x00")
+
+        assert await git_coord.reinit_workspace_for_retry(run) is False
+        assert precious.read_bytes() == b"someone else's bytes\x00"
+
+    @pytest.mark.asyncio
+    async def test_reinit_refuses_to_delete_the_same_repo_on_another_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """Repository identity alone does not authorize destructive recovery."""
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "wrong_branch_replacement"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        worktree_dir = Path(run.worktree_path)
+        await git_coord._git(run.work_dir, "checkout", "-b", "someone-elses-branch")
+        precious = worktree_dir / "precious.txt"
+        precious.write_text("branch owner's data")
+
+        assert await git_coord.workspace_is_valid(run) is False
+        assert await git_coord.reinit_workspace_for_retry(run) is False
+        assert precious.read_text() == "branch owner's data"
+
+        await git_coord._git(str(worktree_dir), "checkout", run.branch_name)
+        await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_reinit_never_deletes_a_tree_with_a_forged_worktree_pointer(
+        self, tmp_path: Path
+    ) -> None:
+        """A forged ``.git`` pointer must not authorize deletion.
+
+        The stale-checkout proof accepts a regular ``.git`` file naming a
+        MISSING entry under the repository's ``worktrees`` directory -- but
+        that file is plain text anyone can write, and a forged pointer to a
+        nonexistent entry is indistinguishable from a genuine one (a missing
+        target is exactly what makes a genuine pointer stale). Evidence that
+        weak may move the tree aside so recovery can proceed; it must never
+        destroy the tree's contents. This forges such a pointer over an
+        unrelated directory at the run's worktree path and asserts the
+        contents survive recovery on disk.
+        """
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "forged_pointer"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        worktree_dir = Path(run.worktree_path)
+
+        # Replace the worktree with an unrelated directory carrying a FORGED
+        # pointer: a regular ``.git`` file naming a nonexistent entry under
+        # the real repository's ``worktrees`` directory. The ownership checks
+        # accept it as a stale checkout, which on its own would authorize deletion.
+        await git_coord.finalize(run)
+        worktree_dir.mkdir(parents=True)
+        forged_target = Path(run.repo_root) / ".git" / "worktrees" / "no-such-entry"
+        assert not forged_target.exists()
+        (worktree_dir / ".git").write_text(f"gitdir: {forged_target}\n")
+        precious = worktree_dir / "precious.txt"
+        precious.write_text("someone else's data")
+
+        recovered = await git_coord.reinit_workspace_for_retry(run)
+
+        # The forged tree may be parked aside so recovery can proceed, but
+        # its contents must survive SOMEWHERE on disk -- at the saved path or
+        # under the private set-aside name.
+        survivors = [
+            candidate / "precious.txt"
+            for candidate in (
+                [worktree_dir]
+                + list(worktree_dir.parent.glob(f"{worktree_dir.name}.kirocrew-stale-*"))
+            )
+            if (candidate / "precious.txt").exists()
+        ]
+        assert survivors, (
+            "recovery deleted a tree whose only ownership evidence was a "
+            "forged .git pointer to a nonexistent worktrees entry"
+        )
+        assert survivors[0].read_text() == "someone else's data"
+        if recovered:
+            await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_workspace_is_valid_false_when_the_branch_lost_the_runs_commits(
+        self, tmp_path: Path
+    ) -> None:
+        """Same branch NAME is not the same HISTORY.
+
+        A branch force-moved after the run's steps committed keeps its name
+        while dropping those commits. Resuming on it would leave the earlier
+        steps marked passed although their work is gone, so every remaining
+        step builds on the wrong tree and reports success. The run's own
+        commit ledger is the ground truth the branch tip must still descend
+        from.
+        """
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "rewritten_branch"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+
+        (Path(run.work_dir) / "step.py").write_text("print('step')")
+        step = Step(index=1, title="Add step.py", description="d")
+        assert await git_coord.commit_step(run, step) != ""
+        assert await git_coord.workspace_is_valid(run) is True
+
+        # Rewind the branch past the run's recorded commit -- the shape a
+        # force-move leaves behind: same name, the run's commit gone.
+        await git_coord._git(run.work_dir, "reset", "--hard", "HEAD~1")
+
+        assert await git_coord.workspace_is_valid(run) is False
+
+        await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_reinit_refuses_to_re_add_a_branch_that_lost_the_runs_commits(
+        self, tmp_path: Path
+    ) -> None:
+        """Recovery must not re-add a branch whose history was rewritten.
+
+        ``worktree add`` by branch NAME would resume the run on whatever the
+        branch now points at; with the run's recorded commits gone, earlier
+        steps stay marked passed while their output is absent. Recovery must
+        refuse -- and refuse BEFORE touching the leftover tree on disk.
+        """
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "rewritten_reinit"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        worktree_dir = Path(run.worktree_path)
+
+        (Path(run.work_dir) / "step.py").write_text("print('step')")
+        step = Step(index=1, title="Add step.py", description="d")
+        assert await git_coord.commit_step(run, step) != ""
+
+        # Rewind the branch past the run's commit, then orphan the checkout
+        # (deregistered admin entry) so retry lands in recovery.
+        await git_coord._git(run.work_dir, "reset", "--hard", "HEAD~1")
+        marker = worktree_dir / "leftover-marker.txt"
+        marker.write_text("still here")
+        admin_dir = Path(run.repo_root) / ".git" / "worktrees" / worktree_dir.name
+        assert admin_dir.exists()
+        import shutil
+
+        shutil.rmtree(admin_dir)
+
+        assert await git_coord.reinit_workspace_for_retry(run) is False
+        # Refused before any capture: the leftover sits untouched at its path.
+        assert marker.exists()
+        assert marker.read_text() == "still here"
+
+    @pytest.mark.asyncio
+    async def test_reinit_rejects_a_branch_rewritten_during_the_re_add(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The re-added worktree is validated AFTER ``worktree add``.
+
+        Every history check before the add reasons about the branch as it was
+        THEN; a branch force-updated inside that window is checked out by the
+        add with the run's earlier commits gone, and those steps would stay
+        marked passed. Recovery must revalidate the checkout it actually
+        produced and fail closed on mismatch.
+        """
+        import shutil as _shutil
+
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        (work_dir / "file.txt").write_text("content")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+        base_sha = (await git_coord._git(str(work_dir), "rev-parse", "HEAD")).strip()
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "midadd_rewrite"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+        worktree_dir = Path(run.worktree_path)
+
+        (Path(run.work_dir) / "step.py").write_text("print('step')")
+        step = Step(index=1, title="Add step.py", description="d")
+        assert await git_coord.commit_step(run, step) != ""
+
+        # The orphaned state: checkout on disk, admin entry gone. The
+        # branch is still intact here, so every PRE-add check passes.
+        admin_dir = Path(run.repo_root) / ".git" / "worktrees" / worktree_dir.name
+        assert admin_dir.exists()
+        _shutil.rmtree(admin_dir)
+
+        real_git = git_coord._git
+        rewrote = False
+
+        async def racing_git(cwd: str, *args: str) -> str:
+            """Force-move the branch from INSIDE the worktree-add call --
+            after every precheck, before the checkout lands."""
+            nonlocal rewrote
+            if not rewrote and args[:2] == ("worktree", "add"):
+                rewrote = True
+                await real_git(
+                    run.repo_root,
+                    "update-ref",
+                    f"refs/heads/{run.branch_name}",
+                    base_sha,
+                )
+            return await real_git(cwd, *args)
+
+        monkeypatch.setattr(git_coord, "_git", racing_git)
+
+        recovered = await git_coord.reinit_workspace_for_retry(run)
+
+        assert rewrote, "the add-window race was never exercised"
+        assert recovered is False, (
+            "recovery accepted a worktree whose branch was force-updated "
+            "between the prechecks and the add"
+        )
 
     @pytest.mark.asyncio
     async def test_commit_and_revert(self, tmp_path: Path) -> None:

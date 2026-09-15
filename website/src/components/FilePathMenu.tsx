@@ -30,18 +30,20 @@
  * so the backend degrades an `open` to a clipboard copy), which would make the
  * row promise a launch it can never perform. Reveal still works on Windows.
  */
-import { type ReactNode, useEffect, useRef, useState } from 'react'
-import { ExternalLink, FolderOpen, Copy, Check, AlertCircle } from 'lucide-react'
+import { type ReactNode, useCallback, useEffect, useId, useRef, useState } from 'react'
+import { ExternalLink, FolderOpen, Copy, Check, AlertCircle, PenLine } from 'lucide-react'
 import {
   ContextMenu,
   ContextMenuTrigger,
   ContextMenuContent,
   ContextMenuItem,
 } from './ui/context-menu'
+import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
 import { useBranding } from '../hooks/useBranding'
 import { useGatewayPlatform } from '../hooks/useGatewayPlatform'
 import { api, ApiError } from '../api/client'
 import { copyToClipboard } from '../utils/clipboard'
+import { canOpenFileInEditor, openFileInEditor } from '../lib/electron'
 import { i18nT } from '../i18n/t'
 
 /** What the wrapped path is on disk. Directories cannot be "opened".
@@ -83,10 +85,17 @@ type FilePathKind = 'file' | 'dir'
  * boolean is the only evidence the clipboard actually changed; claiming a write
  * that did not happen is worse than saying nothing, because the user then pastes
  * whatever was there before.
+ *
+ * A failed reveal/open is reported through `onError` with the (already
+ * localized) message, and the caller renders it in place through the shared
+ * `ErrorNotice` (the `errors-use-error-notice` rule) — there is no blocking
+ * `alert()` path any more. `useRevealFailure` below is the ready-made state for
+ * a caller that has nothing else to hang it on.
  */
 export async function revealOrOpen(
   filePath: string,
-  action: 'open' | 'reveal' = 'reveal',
+  action: 'open' | 'reveal',
+  { onError }: { onError: (message: string) => void },
 ): Promise<{ copied: boolean; copyFailed: boolean }> {
   try {
     const r = await api.revealPath(filePath, action)
@@ -99,11 +108,29 @@ export async function revealOrOpen(
     // eslint-disable-next-line no-console -- surface reveal failures for diagnostics
     console.error('revealPath failed', err)
     const blockedByPolicy = err instanceof ApiError && err.status === 403 && !err.authRequired
-    alert(i18nT(blockedByPolicy
+    onError(i18nT(blockedByPolicy
       ? 'components.filePathMenu.reveal_blocked'
       : 'components.filePathMenu.reveal_failed'))
     return { copied: false, copyFailed: false }
   }
+}
+
+/**
+ * The failure state a `revealOrOpen` caller renders: pass `onError` to the
+ * helper, render `<ErrorNotice message={error} onDismiss={clear} …/>` where the
+ * click happened. Shared so every reveal button (folder panels, file viewer,
+ * deck viewer, transcript chips) reports the same way instead of each holding
+ * its own copy of the state.
+ */
+export function useRevealFailure(subject?: string) {
+  const [error, setError] = useState<string | null>(null)
+  // A failure belongs to the path it was raised for: when the caller moves on
+  // to another file / folder, a late rejection for the old one must not be
+  // shown under the new one.
+  useEffect(() => { setError(null) }, [subject])
+  const onError = useCallback((message: string) => setError(message), [])
+  const clear = useCallback(() => setError(null), [])
+  return { error, onError, clear }
 }
 
 /**
@@ -204,16 +231,29 @@ export function useCopyAck(filePath: string) {
   // (files.py cannot drive a file manager there), so acknowledge that instead of
   // leaving a click that silently copied looking like a no-op — no blocking
   // alert, no new toast surface.
+  //
+  // A reveal/open that FAILED (policy-blocked path, backend error) is held here
+  // too, so the consumer renders it in place through the shared `ErrorNotice`
+  // rather than the legacy blocking `alert()`. Cleared when the path changes,
+  // on the next attempt, and by the consumer's dismiss.
+  const [revealError, setRevealError] = useState<string | null>(null)
+  useEffect(() => { setRevealError(null) }, [filePath])
   const revealOrOpenWithAck = async (action: 'open' | 'reveal') => {
     const attempt = ++copyAttemptRef.current
-    const { copied, copyFailed } = await revealOrOpen(filePath, action)
+    setRevealError(null)
+    const { copied, copyFailed } = await revealOrOpen(filePath, action, {
+      // Guarded like the copy ack: a stale failure must not land on a path
+      // this component has already moved on from.
+      onError: (message) => { if (attempt === copyAttemptRef.current) setRevealError(message) },
+    })
     if (copied) flashCopyStatus(attempt, 'copied')
     // A degrade that could not reach the clipboard flips to the same
     // `copy_failed` wording, rather than leaving a click that did nothing
     // looking like one that worked.
     else if (copyFailed) flashCopyStatus(attempt, 'failed')
   }
-  return { copyStatus, copyPath, revealOrOpenWithAck }
+  const clearRevealError = () => setRevealError(null)
+  return { copyStatus, copyPath, revealOrOpenWithAck, revealError, clearRevealError }
 }
 
 /**
@@ -221,6 +261,8 @@ export function useCopyAck(filePath: string) {
  * ContextMenu items. Drop these into any ContextMenuContent.
  */
 function FilePathMenuItems({ filePath, kind }: FilePathMenuItemsProps) {
+  const revealErrorId = useId()
+  const editorErrorId = useId()
   const isLocal = useBranding().directLocal
   // Shared owner of the platform-aware reveal label (see useRevealLabel) — the
   // same wording MarkdownPanel's overflow and FileViewer's overflow use.
@@ -234,15 +276,80 @@ function FilePathMenuItems({ filePath, kind }: FilePathMenuItemsProps) {
   // (see useCopyAck, shared with the Office card). The Copy item keeps the menu
   // open on select so the confirmation is not taken off screen the instant it is
   // earned.
-  const { copyStatus, copyPath, revealOrOpenWithAck } = useCopyAck(filePath)
+  const { copyStatus, copyPath, revealOrOpenWithAck, revealError, clearRevealError } = useCopyAck(filePath)
   const copyLabel = copyStatus === 'copied'
     ? i18nT('components.filePathMenu.path_copied')
     : copyStatus === 'failed'
       ? i18nT('components.filePathMenu.copy_failed')
       : i18nT('components.filePathMenu.copy_path')
 
+  // "Open in editor" hands the PATH to the desktop shell's shell.openPath bridge
+  // so the file opens in the user's own OS default handler — the one place the
+  // built-in viewer and the gateway-host reveal cannot reach. Shown only when
+  // the fileOpenAPI preload bridge exists (desktop shell, not a browser tab or
+  // the PWA) and the target is a file, not a directory. Its own error line,
+  // separate from the gateway reveal's, since this launch happens entirely in
+  // the shell and never touches /api/reveal.
+  const canOpenInEditor = kind !== 'dir' && canOpenFileInEditor()
+  const openInEditorLabel = i18nT('components.markdownPanel.open_in_editor')
+  const [editorError, setEditorError] = useState<string | null>(null)
+  useEffect(() => { setEditorError(null) }, [filePath])
+  const openInEditor = async () => {
+    setEditorError(null)
+    const r = await openFileInEditor(filePath)
+    // The bridge always names a reason on failure (bad path, unsupported type,
+    // or the OS refusal string), so there is no English fallback to translate.
+    if (!r.ok) setEditorError(r.error || 'error')
+  }
+
   return (
     <>
+      {/* A failed reveal/open renders IN the menu (which the rows keep open on
+          select) instead of the old blocking alert(). askAgent on: a context
+          menu holds no draft, and a policy-blocked or failed reveal is a
+          gateway-side condition the agent can explain. */}
+      {revealError && (
+        <div className="px-2 py-1.5 max-w-[260px]">
+          <ErrorNotice
+            id={revealErrorId}
+            variant="inline"
+            className="whitespace-normal"
+            message={revealError}
+            onDismiss={clearRevealError}
+            testId="file-path-menu-error"
+          />
+        </div>
+      )}
+      {editorError && (
+        <div className="px-2 py-1.5 max-w-[260px]">
+          <ErrorNotice
+            id={editorErrorId}
+            variant="inline"
+            className="whitespace-normal"
+            message={editorError}
+            onDismiss={() => setEditorError(null)}
+            testId="file-path-menu-editor-error"
+          />
+        </div>
+      )}
+      {canOpenInEditor && (
+        <ContextMenuItem
+          // preventDefault keeps the menu open so a launch failure can render
+          // in place through editorError rather than vanishing with the menu.
+          onSelect={(e) => { e.preventDefault(); void openInEditor() }}
+          aria-label={openInEditorLabel}
+        >
+          <PenLine size={14} className="lucide-inline" />
+          {openInEditorLabel}
+        </ContextMenuItem>
+      )}
+      {editorError && (
+        <ErrorNoticeMenuItem
+          Item={ContextMenuItem}
+          message={editorError}
+          describedBy={editorErrorId}
+        />
+      )}
       {canOpen && (
         <ContextMenuItem
           // preventDefault keeps the menu open, matching the Copy row: on a
@@ -264,6 +371,13 @@ function FilePathMenuItems({ filePath, kind }: FilePathMenuItemsProps) {
           <FolderOpen size={14} className="lucide-inline" />
           {revealLabel}
         </ContextMenuItem>
+      )}
+      {revealError && (
+        <ErrorNoticeMenuItem
+          Item={ContextMenuItem}
+          message={revealError}
+          describedBy={revealErrorId}
+        />
       )}
       <ContextMenuItem
         onSelect={(e) => { e.preventDefault(); void copyPath() }}

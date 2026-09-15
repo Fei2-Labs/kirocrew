@@ -90,6 +90,51 @@ REJECTED (install fails), so do not invent variables; the allowlist is
   `--json-str`, `--json-num`, `--json-bool`) are allowlisted — set them directly
   in `variables.json` like any other palette entry. No overrides.css workaround
   is needed for them.
+- Two terminal hues (`--term-magenta`, `--term-cyan`) and the seven `--diff-*`
+  vars are allowlisted too. The other fourteen terminal colors are derived from
+  `--bg` / `--text` / `--danger` / `--ok` / `--warn` / `--info`, so a pack that
+  wants its own terminal palette sets only those two.
+
+### Omitted tokens are derived from your palette
+
+You only have to declare the three required vars, so most packs omit most of the
+56. Those omissions are **derived from your own `--bg` / `--text` / `--accent`**
+by `buildCustomThemeCss` (`website/src/hooks/themeCss.ts`) — they are not
+inherited from a built-in theme:
+
+- **Surfaces and borders** (`--card`, `--bg-elevated`, `--chrome`, `--panel`,
+  `--bg-accent`, `--bg-hover`, `--card-hl`, `--panel-strong`, `--border*`) are
+  4–30% steps from `--bg` toward `--text`, so they track your palette's polarity.
+- **`--muted` / `--muted-strong`** are 75% / 85% along the same axis — the floor
+  that still clears WCAG AA against the derived `--card`.
+- **`--text-strong`** and **`--card-fg`** fall back to `--text`; **`--muted-fg`**
+  falls back to `--bg`.
+- **A foreground on a saturated fill** (`--accent-fg`, `--ok-fg`, `--warn-fg`,
+  `--danger-fg`, `--info-fg`, `--aim-fg`) is black or white, whichever that fill
+  can carry. It is only derived when you declared the fill itself.
+- **The designed sets** — the four `--json-*` syntax colors and the seven
+  `--diff-*` tokens — cannot be mixed from a palette, so they fall back to the
+  built-in theme's own set for whichever polarity your `--bg` has. Without this
+  they would inherit the DARK values and land light-on-light on the derived light
+  surfaces.
+
+Two consequences worth knowing before you tune a palette:
+
+- Declaring a token always wins — derivation only fills what you left out. So
+  override any step whose derived value you dislike rather than working around it.
+- The derivation reads `--bg` and `--text` as hex, `rgb()`/`rgba()` or
+  `color(srgb …)`. In any other form (a named color, `hsl()`) the ramp is skipped
+  and those tokens fall back to the stylesheet default, which is dark — so a light
+  pack should not write its `--bg` as `hsl()`. A **translucent** `--bg`/`--text` is
+  refused for the same reason: what it renders as depends on what is behind it.
+
+Polarity is read from your `--bg`, not from which block you are writing, so a pack
+that deliberately ships a dark `light` block gets the dark sets in both.
+
+The remaining allowlisted tokens are not derived and do fall back to the
+stylesheet default: `--accent-hover` / `--accent-subtle` / `--accent-glow` /
+`--ring`, whose direction is polarity-dependent, and the two `--term-*` hues.
+Declare those yourself if they matter to you.
 
 ## overrides.css — what installs is NOT what renders
 
@@ -107,9 +152,34 @@ Two different filters run, and they disagree by design:
 
 Consequence: a rule can pass install and never render. The browser console
 lists any rules the runtime dropped from the active theme (`[theme]
-overrides.css: dropped …`), and builds with the Settings notice show the same
-list under the theme selector in Settings → Display. If a rule you wrote has no
-effect, check there BEFORE suspecting specificity.
+overrides.css: dropped …`), and Settings → Display shows the same list under the
+theme selector whenever the active theme has any, with a link to the theming
+contract. That notice is condition-derived: it disappears on its own once you fix
+the pack and re-install, and that vanishing IS the confirmation. If a rule you
+wrote has no effect, check there BEFORE suspecting specificity.
+
+A compound on the same base survives, so `.topbar.compact:hover` is fine, and
+the scoping prefix may be written `html[data-theme="…"]` too. One failing
+selector kills the WHOLE comma group, so keep a risky selector in its own rule.
+`@media` wrappers survive — the wrapper is kept and its inner rules filtered by
+the same allowlist — while every other at-rule (`@font-face`, `@supports`,
+`@import`) is dropped at runtime.
+
+Each level also caps the pack as a whole: 32 entries / 256 KB at level 0, 64 /
+2 MB at level 1, 160 / 5 MB at level 2. With 512 KB per font face, the level-1
+total is what a font-heavy pack actually hits — budget the faces against 2 MB,
+not against the count of 6.
+
+Beyond `theme.json`, `variables.json`, `readme.md`, `styles/` and `LICENSE.txt`,
+the classifier also recognizes `branding/logo.{svg,png}`,
+`branding/favicon.{ico,png,svg}`, `branding/wordmark.{svg,png}` and
+`branding/preview.{png,webp}` at level 1, and `persona.md`, `overlays/*.html`,
+`topbar/{dark,light}.html`, `audio/manifest.json` and `audio/*.{mp3,ogg,wav}` at
+level 2. `styles/variables.json` is accepted as an alternative to the top-level
+file. Every path is classified against that fixed table, so an unrecognized file
+fails the install — do not park notes or scratch files in the pack (only VCS and
+LICENSE metadata is tolerated). Level-2 caps: at most 5 overlays, 2000 characters
+of `persona.md`, 48 characters of bot name.
 
 ## Validate and install
 

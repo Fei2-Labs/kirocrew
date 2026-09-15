@@ -70,19 +70,11 @@ export interface MemorySample {
  *  is unchanged while the quantity measured is not. */
 const SAMPLE_MS = 5000
 
-interface Bridge {
-  reportMemorySample?: (s: MemorySample) => void
-  /** Electron's `process.getHeapStatistics()` surfaced through the preload. The
-   *  main world has no `process` under contextIsolation, so the object-heap half
-   *  of the subtraction has to be handed over the bridge. */
-  heapStatisticsKB?: () => { usedHeapKB: number | null } | null
-}
-
 let timer: ReturnType<typeof setInterval> | null = null
 let realmLabel = 'main'
 
-function bridge(): Bridge | undefined {
-  return (globalThis as unknown as { electronAPI?: Bridge }).electronAPI
+function bridge(): ElectronAPI | undefined {
+  return window.electronAPI
 }
 
 /** Reads `performance.memory` defensively. It is a non-standard Chromium

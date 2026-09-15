@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -105,6 +106,66 @@ def test_delete_removes_token(tmp_path: Path):
 
 def test_delete_missing_is_noop(tmp_path: Path):
     TokenStore(tmp_path).delete("social")  # no store yet — must not raise
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="contention timing assumes POSIX flock")
+def test_delete_waits_for_the_identity_refresh_lock(tmp_path: Path):
+    """``delete`` serializes with a refresh holding the identity's lock, so a
+    logout can never land in the middle of a refresh's read-renew-save and be
+    undone by the save that follows."""
+    import os
+    import threading
+
+    from kiro_crew.platform_compat import acquire_lock, release_lock
+
+    store = TokenStore(tmp_path)
+    store.save(_token())
+    fd = os.open(str(store.lock_path("social")), os.O_RDWR | os.O_CREAT, 0o600)
+    acquire_lock(fd, exclusive=True)
+    done = threading.Event()
+    worker = threading.Thread(target=lambda: (store.delete("social"), done.set()))
+    try:
+        worker.start()
+        assert not done.wait(0.3), "delete must block while the refresh lock is held"
+        assert store.load("social") is not None
+    finally:
+        release_lock(fd)
+        os.close(fd)
+    assert done.wait(5), "delete must proceed once the lock is released"
+    worker.join(5)
+    assert store.load("social") is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="contention timing assumes POSIX flock")
+def test_save_waits_for_the_identity_refresh_lock(tmp_path: Path):
+    """A sign-in landing a NEW account in a slot is ordered against a refresh of
+    the OLD one, so the refresher's save cannot overwrite it; the refresher itself
+    saves with ``hold_refresh_lock=False`` because it already holds the lock."""
+    import os
+    import threading
+
+    from kiro_crew.platform_compat import acquire_lock, release_lock
+
+    store = TokenStore(tmp_path)
+    store.save(_token())
+    fd = os.open(str(store.lock_path("social")), os.O_RDWR | os.O_CREAT, 0o600)
+    acquire_lock(fd, exclusive=True)
+    # The lock holder (a refresher) can still write.
+    store.save(_token(access_token="refreshed"), hold_refresh_lock=False)
+    assert store.load("social").access_token == "refreshed"
+    done = threading.Event()
+    new_account = _token(access_token="new-account", provider="Github")
+    worker = threading.Thread(target=lambda: (store.save(new_account), done.set()))
+    try:
+        worker.start()
+        assert not done.wait(0.3), "save must block while the refresh lock is held"
+        assert store.load("social").access_token == "refreshed"
+    finally:
+        release_lock(fd)
+        os.close(fd)
+    assert done.wait(5), "save must proceed once the lock is released"
+    worker.join(5)
+    assert store.load("social").provider == "Github"
 
 
 def test_delete_propagates_store_failure(tmp_path: Path, monkeypatch):
@@ -222,3 +283,59 @@ def test_linked_vault_subdir_is_refused(tmp_path: Path):
     store = TokenStore(tmp_path)
     with pytest.raises(TokenStoreError):
         store.save(_token())
+
+
+# ---- is_usable + the refresh-rejected marker -----------------------------------
+
+
+def test_is_usable_is_live_token_or_renewable():
+    """The one predicate the spawn decision, doctor and the sign-in card share."""
+    assert _token().is_usable() is True
+    assert _token(expires_in=-60).is_usable() is True  # expired but renewable
+    assert _token(expires_in=-60, refresh_token=None).is_usable() is False
+    assert _token(expires_in=REFRESH_MARGIN_SECS - 5, refresh_token=None).is_usable() is False
+
+
+def test_refresh_rejected_marker_round_trips_and_is_token_free(tmp_path: Path):
+    store = TokenStore(tmp_path)
+    assert store.refresh_rejected("social") is None
+    store.mark_refresh_rejected("social")
+    when = store.refresh_rejected("social")
+    assert when is not None and when.tzinfo is not None
+    # A plain timestamp sidecar beside the vault: nothing secret in it, and it is
+    # per identity so a Builder ID refusal does not read as a social one.
+    marker = tmp_path / "kas" / "refresh-rejected-social"
+    assert marker.is_file()
+    assert "at-value" not in marker.read_text() and "rt-value" not in marker.read_text()
+    assert store.refresh_rejected("builder_id") is None
+
+
+def test_save_clears_refresh_rejected_marker(tmp_path: Path):
+    """A credential landing in the slot supersedes the refusal recorded against
+    the one it replaces -- otherwise the card would call a fresh sign-in expired."""
+    store = TokenStore(tmp_path)
+    store.save(_token())
+    store.mark_refresh_rejected("social")
+    assert store.refresh_rejected("social") is not None
+    store.save(_token(access_token="renewed"))
+    assert store.refresh_rejected("social") is None
+
+
+def test_delete_clears_refresh_rejected_marker(tmp_path: Path):
+    store = TokenStore(tmp_path)
+    store.save(_token())
+    store.mark_refresh_rejected("social")
+    store.delete("social")
+    assert store.refresh_rejected("social") is None
+    assert not (tmp_path / "kas" / "refresh-rejected-social").exists()
+
+
+def test_refresh_rejected_ignores_unknown_identity_and_garbage(tmp_path: Path):
+    store = TokenStore(tmp_path)
+    # Unknown identity kind: a hint, never a raise.
+    assert store.refresh_rejected("nope") is None
+    store.mark_refresh_rejected("nope")  # no-op, no raise
+    # A malformed marker reads as absent rather than crashing status.
+    (tmp_path / "kas").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "kas" / "refresh-rejected-social").write_text("not a timestamp")
+    assert store.refresh_rejected("social") is None

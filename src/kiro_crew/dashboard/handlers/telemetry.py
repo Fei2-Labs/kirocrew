@@ -152,13 +152,12 @@ def _lifetime_total_gauge_names() -> "frozenset[str]":
 # or "unknown" (minted by this aggregator for attribute-less points) — the
 # cross-module test enforces that, so a dead entry cannot linger and mislead
 # readers about what fault_rate counts.
-# "cancelled" is deliberately ABSENT, and its absence is a FIX rather than an
-# omission: a user cancel used to fold into "error", so every press of Stop
-# landed in this numerator and the one outcome the operator caused on purpose
-# was reported as the system failing. It now has its own label and stays out of
-# the numerator, while remaining in the DENOMINATOR alongside "ok" and the
-# recovered stalls — a cancelled turn did run, so removing it would shrink the
-# population fault_rate is a share of.
+# "cancelled" is deliberately ABSENT rather than omitted by accident: folding a
+# user cancel into "error" would put every press of Stop in this numerator and
+# report the one outcome the operator caused on purpose as the system failing. It
+# has its own label and stays out of the numerator, while remaining in the
+# DENOMINATOR alongside "ok" and the recovered stalls — a cancelled turn did run,
+# so removing it would shrink the population fault_rate is a share of.
 # "unclassified" is deliberately ABSENT: it marks a turn whose surface had no
 # stop reason to give (a bare TurnUsage at a helper call site), so counting it
 # would invent a fault for every clean background turn the moment this metric
@@ -308,8 +307,9 @@ class _Hist:
 
     Merging them positionally fabricates values. Two generations with the same
     bucket-count length would pass a naive length check while meaning entirely
-    different things — a pre-change sample sitting in the old ``+Inf`` bucket
-    would be added to the new ``+Inf`` bucket, and a 5s sample could be counted
+    different things — a sample from one generation sitting in its ``+Inf``
+    bucket would be added to the other's ``+Inf`` bucket, and a 5s sample could be
+    counted
     into a 5-minute bucket, letting ``_pct_from_buckets`` report a p90 that no
     turn ever took. Grouping also keeps ``count``/``sum``/``min``/``max``
     consistent with the percentiles: accumulating those across generations while
@@ -321,9 +321,9 @@ class _Hist:
     long as it out-counted the new one: right after a boundary change the window
     still holds up to ``_WINDOW_DAYS`` of old samples against a handful of new
     ones, so the OLD bounds would be reported — for the turn metric that means
-    continuing to serve the very ceiling-pinned percentiles this grouping exists
-    to eliminate, while omitting the new samples entirely. Recency makes the
-    change take effect on the first post-change sample. The reported population
+    serving the very ceiling-pinned percentiles this grouping exists to eliminate,
+    while omitting the new samples entirely. Recency makes a boundary change take
+    effect on the first sample after it. The reported population
     is then small but truthful, and ``count`` says so; fuller-but-wrong is the
     failure mode being fixed.
 
@@ -561,9 +561,9 @@ def _finite(raw: Any) -> float | None:
     ``_aggregate`` and every field ``_Hist.add`` consumes. Shards are
     external input and Python's ``json`` accepts ``Infinity``/``NaN``
     literals, so a bare ``float(...)`` admits values that poison sums and an
-    ``int(float(...))`` timestamp conversion raises ``OverflowError`` — four
-    review rounds landed in this branch before this invariant: every scalar
-    passes through here, and anything non-numeric or non-finite becomes None.
+    ``int(float(...))`` timestamp conversion raises ``OverflowError``. The
+    invariant: every scalar passes through here, and anything non-numeric or
+    non-finite becomes None.
     """
     try:
         v = float(raw)

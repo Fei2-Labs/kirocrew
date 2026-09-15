@@ -164,10 +164,10 @@ def _open_catalog(req: urllib.request.Request) -> Any:
 
     A named function rather than an inline `urlopen`, because tests must be able
     to intercept the network at a place that cannot drift: patching
-    `urllib.request.urlopen` used to work here, and when this function started
-    using an opener instead, those tests silently stopped intercepting anything
-    and began making real requests to the live CDN. A seam that belongs to this
-    module cannot be bypassed by changing how this module calls out.
+    `urllib.request.urlopen` does not survive this module switching to an opener:
+    such tests silently stop intercepting anything and make real requests to the
+    live CDN. A seam that belongs to this module cannot be bypassed by changing
+    how this module calls out.
 
     The opener is built per call: an opener is mutable shared state, and one
     built at import time is something any other import can reach in and
@@ -303,13 +303,40 @@ def _resolve_ref(ref: Any) -> str:
     return OFFICIAL_CATALOG_BASE + ref
 
 
+def _resolve_ref_list(refs: Any) -> list[str]:
+    """Resolve a published LIST of asset refs, dropping every unusable one.
+
+    For ``screenshotRefs``. Each member goes through :func:`_resolve_ref`, so a
+    member that is the wrong type, carries a scheme, or tries to traverse is
+    dropped -- the same rule the scalar refs already enforce, applied per entry.
+
+    The absent case and the unreadable case are kept DISTINCT, which is the
+    whole reason this returns a list and the caller sets the field on a truthy
+    result. A non-``list`` input (absent, or a hostile non-list type) answers
+    ``[]``, and a list whose every member is unusable also answers ``[]`` -- so
+    the caller leaves the field UNSET in both, and "no screenshots" never
+    renders as a present-but-empty gallery. A dropped member is a swallowed
+    miss on purpose: the alternative is emitting a ref this client already knows
+    a browser cannot load, which is the guaranteed-404 ``<img>`` this module
+    exists to avoid. Order is preserved for the members that survive; a catalog
+    screenshot list is not index-paired with anything, so dropping one shifts
+    only its own position.
+
+    ``list`` specifically, not any iterable: a bare ``str`` is iterable and
+    would resolve one ref per character.
+    """
+    if not isinstance(refs, list):
+        return []
+    return [resolved for ref in refs if (resolved := _resolve_ref(ref))]
+
+
 def _curated_str(value: Any) -> str:
     """A curated display string, or ``""`` for anything that is not one.
 
     Every field below arrives from a document fetched over the network, so its
     TYPE is as untrusted as its content. A wrong type is not hypothetical
-    tidiness: ``{"tags": 5}`` used to reach ``list(5)`` and turn one malformed
-    entry into an HTTP 500 for the whole store, and a non-string
+    tidiness: unguarded, ``{"tags": 5}`` reaches ``list(5)`` and turns one
+    malformed entry into an HTTP 500 for the whole store, and a non-string
     ``displayName`` reaches the browser to be sorted and lowercased there.
     Returning ``""`` collapses both into the falsy case the callers already
     handle, so a bad field degrades that field and nothing else.
@@ -422,8 +449,8 @@ def inventory(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     This is what makes the catalog the SHELF rather than a decoration on one:
     :func:`annotate` can only change a row that already exists, so an app the
-    catalog lists but the bundled seed does not was previously unlistable and
-    therefore uninstallable -- adding one required shipping a release.
+    catalog lists but the bundled seed does not would otherwise be unlistable and
+    therefore uninstallable -- adding one would require shipping a release.
 
     ``builtin`` entries produce nothing here on purpose. Their code ships in the
     wheel and is discovered from disk; a row for code this client does not have
@@ -511,6 +538,10 @@ def inventory(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if hero_detail := _resolve_ref(entry.get("heroDetailRef")):
+            row["heroImageDetail"] = hero_detail
+        if shots := _resolve_ref_list(entry.get("screenshotRefs")):
+            row["screenshots"] = shots
         if (stars := _curated_stars(entry)) is not None:
             row["stargazersCount"] = stars
         seen.add(name)
@@ -696,6 +727,10 @@ def annotate(rows: list[dict[str, Any]], entries: list[dict[str, Any]]) -> None:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if hero_detail := _resolve_ref(entry.get("heroDetailRef")):
+            row["heroImageDetail"] = hero_detail
+        if shots := _resolve_ref_list(entry.get("screenshotRefs")):
+            row["screenshots"] = shots
         # ``stargazersCount`` is deliberately NOT overlaid here. This function
         # matches rows by NAME, and a same-name SEED row can pin a DIFFERENT
         # repository than the catalog entry (seed collisions keep the pin by
@@ -746,6 +781,10 @@ def list_catalog_rows() -> list[dict[str, Any]]:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if hero_detail := _resolve_ref(entry.get("heroDetailRef")):
+            row["heroImageDetail"] = hero_detail
+        if shots := _resolve_ref_list(entry.get("screenshotRefs")):
+            row["screenshots"] = shots
         source = entry.get("source")
         if isinstance(source, dict):
             # The source TYPE is a display marker (builtin vs git), not install

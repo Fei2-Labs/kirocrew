@@ -1,6 +1,6 @@
 """A name-based auto-approve must not be honoured for a shadowed program name.
 
-Upstream issue #4438: trust grants and the read-only allowlist authorize a
+Trust grants and the read-only allowlist authorize a
 command by program NAME, while the shell resolves that name afterwards through a
 ``PATH`` that can lead with directories the agent itself writes. These tests pin
 both halves -- the decision function and the tiers wired to it.
@@ -109,8 +109,8 @@ class TestProgramNames:
     )
     def test_execution_affecting_assignment_refuses(self, assignment):
         # GPT 5.6 round-10: `PATH=/writable/bin head file` decides which `head`
-        # runs, and the loader variables decide what code runs inside it. The walk
-        # used to skip every assignment and vouch for the system `head`.
+        # runs, and the loader variables decide what code runs inside it. A
+        # leading assignment must not be skipped to vouch for the system `head`.
         assert name_grant.program_names(f"{assignment} head file") is None
 
     @pytest.mark.parametrize(
@@ -836,8 +836,8 @@ class TestDispatchers:
     @pytest.mark.parametrize("shell", ["sh", "bash", "zsh", "dash", "fish"])
     def test_command_shell_is_refused(self, world, shell):
         # GPT 5.6 round-12: `sh -c 'head file'` runs an arbitrary command string,
-        # so vouching for `/bin/sh` says nothing about what executes. Scoped out in
-        # round 9 and asked for here; a grant naming a shell is a grant to run
+        # so vouching for `/bin/sh` says nothing about what executes: a grant
+        # naming a shell is a grant to run
         # anything, which belongs on the approval card.
         system_dir, _ = world
         _program(system_dir, shell)
@@ -948,7 +948,7 @@ class TestDispatchers:
 
     def test_a_legacy_bare_name_function_export_refuses(self, world, monkeypatch):
         # The pre-2014 spelling: the key is the bare function name and only the
-        # `() {` value marks it as a function. Supported bash no longer imports
+        # `() {` value marks it as a function. Supported bash does not import
         # this, so it is belt-and-braces -- but the value form costs one check.
         system_dir, _ = world
         _program(system_dir, "head")
@@ -988,6 +988,98 @@ class TestDispatchers:
         assert name_grant.name_grant_refusal("head file") is None
 
 
+class TestInheritedHostEnvironment:
+    """The rootdir conftest scrubs the inherited entries name_grant refuses on.
+
+    RHEL-family hosts export ``which`` as a shell function from
+    ``/etc/profile.d/which2.sh``, so ``BASH_FUNC_which%%`` is inherited by every
+    login shell -- and the AMBIGUOUS_ENV refusal above is checked before every
+    narrower code, so without the scrub 79 of the 163 tests in this file observed
+    ``inherited_env_can_redefine_programs`` instead of the code they assert.
+    ``_inherited_preload()``'s OTHER half is host state just as
+    easily: a login profile exporting ``BASH_ENV``, or a container image setting
+    ``ENV``, reproduces the same shape with no ``which2.sh`` anywhere. Ubuntu CI
+    carries neither, which is why this class injects both itself: the defect has
+    to be reproducible everywhere, not only on the hosts that revealed it.
+    """
+
+    _RHEL_KEY = "BASH_FUNC_which%%"
+    _RHEL_VALUE = "() {  ( alias; eval ${which_declare} ) | /usr/bin/which $@; }"
+    _PRELOAD_KEY = "BASH_ENV"
+    _PRELOAD_VALUE = "/etc/kc-inherited-rc"
+
+    @pytest.fixture(scope="class")
+    def _inherited_shell_environment(self):
+        """Make the variables INHERITED state, not something the test created.
+
+        Class-scoped on purpose: pytest instantiates higher-scoped fixtures
+        first, so this runs before the function-scoped autouse scrub in the
+        rootdir conftest -- both variables are already in the environment when
+        the scrub looks, exactly as a login shell's exports are. The deliberate
+        AMBIGUOUS_ENV tests above are the opposite shape: they construct their
+        entries inside the test body, AFTER the scrub, which is why a global
+        scrub costs them nothing. Raw ``os.environ`` rather than ``monkeypatch``
+        because the built-in monkeypatch fixture is function-scoped.
+
+        The teardown asserts the variables are BACK before putting the host's own
+        values back: the scrub's contract is save-and-restore, and the restore half
+        is observable only here, after the last test's own fixtures -- monkeypatch's
+        undo included -- have finished. The prior values are snapshotted first, so a
+        worker on a genuinely RHEL-family host keeps its real export: what this
+        fixture injects is removed, what the host actually had is restored.
+        """
+        saved = {key: os.environ.get(key) for key in (self._RHEL_KEY, self._PRELOAD_KEY)}
+        os.environ[self._RHEL_KEY] = self._RHEL_VALUE
+        os.environ[self._PRELOAD_KEY] = self._PRELOAD_VALUE
+        try:
+            yield
+        finally:
+            missing = [key for key in (self._RHEL_KEY, self._PRELOAD_KEY) if key not in os.environ]
+            for key, prior in saved.items():
+                if prior is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prior
+            assert not missing, (
+                "the conftest scrub removed these inherited entries but did not "
+                f"restore them after the test: {missing}"
+            )
+
+    def test_a_narrower_code_survives_an_inherited_hostile_environment(
+        self, _inherited_shell_environment, world
+    ):
+        # With the rootdir scrub disabled this fails three times over: both
+        # variables are still visible here, and the refusal below comes back
+        # AMBIGUOUS_ENV -- the broadest code, checked first -- instead of the
+        # DISPATCHER code this command actually earns. That inversion is the
+        # whole issue: one host-inherited variable rewrote what 79 unrelated
+        # assertions saw.
+        assert self._RHEL_KEY not in os.environ
+        assert self._PRELOAD_KEY not in os.environ
+        system_dir, _ = world
+        _program(system_dir, "env")
+        _program(system_dir, "head")
+        refusal = name_grant.name_grant_refusal("env head file")
+        assert refusal is not None
+        assert refusal.code == name_grant.DISPATCHER
+
+    def test_a_monkeypatched_same_key_does_not_defeat_the_restore(
+        self, _inherited_shell_environment, monkeypatch
+    ):
+        # The teardown-ordering trap: this test overrides the SAME key the host
+        # inherited. The scrub removed it first, so monkeypatch records "was
+        # absent" and its undo DELETES the key -- the inherited value survives
+        # only because the scrub records its removals on the same shared
+        # monkeypatch instance, whose LIFO undo deletes this override first and
+        # restores the inherited value after. A hand-rolled restore in the
+        # scrub would run BEFORE monkeypatch's undo and be deleted by it. The
+        # class fixture's teardown assertion is the observer that fails when
+        # the inherited entry leaks out of the worker's environment.
+        assert self._RHEL_KEY not in os.environ
+        monkeypatch.setenv(self._RHEL_KEY, "() { overridden; }")
+        assert os.environ[self._RHEL_KEY] == "() { overridden; }"
+
+
 class TestInterpreterChain:
     """A pinned script binds its bytes; its interpreter must face the same rules."""
 
@@ -999,7 +1091,7 @@ class TestInterpreterChain:
         script = user_dir / "tool"
         # The env path must be the fixture's OWN system env, not a literal
         # `/usr/bin/env`: the shebang's env binary is now held to the same
-        # standard as any program (round 21), and a host path would make this
+        # standard as any program, and a host path would make this
         # test depend on the runner's filesystem, which the fixture exists to
         # avoid.
         system_env = _program(system_dir, "env")
@@ -1217,7 +1309,7 @@ class TestHookTierIsUntouched:
         assert HookManager(cfg).on_tool_call("ReadFile").action == TOOL_AUTO_APPROVE
 
     def test_non_system_program_is_granted_here_and_judged_by_the_caller(self, world):
-        # The hook layer no longer defers a non-system program: it grants, and the
+        # The hook layer does not defer a non-system program: it grants, and the
         # async caller decides. `TestDowngradePath` is where the decision is
         # pinned; this only records that the hook layer stopped doing filesystem
         # work of its own.

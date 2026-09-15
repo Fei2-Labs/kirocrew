@@ -366,15 +366,17 @@ def test_the_updater_offers_exactly_the_channels_that_publish_windows() -> None:
         for job in _workflow("release.yml")["jobs"].values()
         if str(job.get("uses", "")).endswith("publish-windows.yml")
     )
-    # Both of release.yml's channels publish, and stable must reach the lane
-    # through PROMOTION rather than a fresh build: it republishes the bundle
-    # resolve-promotion verified, so the caller has to gate on that job and pass
-    # promote plus the base version the manifest is checked against.
+    # Both of release.yml's channels publish. Stable reaches the lane by either
+    # mode: a rebuild builds and signs a fresh installer, while byte reuse
+    # republishes the bundle resolve-promotion verified -- so the caller gates on
+    # rebuild OR on that job, and passes promote plus the base version the
+    # manifest is checked against.
     assert "channel == 'insider'" in release["if"]
-    assert "channel == 'stable'" in release["if"]
+    assert "outputs.rebuild == 'true'" in release["if"]
+    assert "outputs.promote_mode == 'true'" in release["if"]
     assert "needs.resolve-promotion.result == 'success'" in release["if"]
     assert "resolve-promotion" in release["needs"]
-    assert "channel == 'stable'" in release["with"]["promote"]
+    assert "promote_mode == 'true'" in release["with"]["promote"]
     assert release["with"]["promotion_base_version"], "stable promotion needs a base version"
     # The stable installer comes from the verified handoff artifact, never from a
     # fresh build-windows upload.
@@ -542,7 +544,7 @@ def test_the_signing_gate_also_requires_the_prod_environment() -> None:
 
 
 def test_the_pairing_guard_runs_before_the_upload_and_fails_hard() -> None:
-    """An orphaned installer must never be uploaded (#4301).
+    """An orphaned installer must never be uploaded.
 
     The guard exists so an .exe with no .blockmap beside it fails the build
     BEFORE the artifact is produced: the publish lane then takes its

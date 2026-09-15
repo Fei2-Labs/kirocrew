@@ -107,10 +107,19 @@ class HeadingAwareChunker:
         return chunks
 
     def chunk_code(self, text: str, language: str | None = None) -> list[dict]:
-        """Split code by function/class boundaries."""
+        """Split code by function/class boundaries.
+
+        The keyword set is language-generic, not per-``language``: one regex serves
+        every extension in ``ingestion.CODE_EXTS``, so a keyword added for one
+        language also becomes a boundary for the others that spell it the same way
+        (``interface`` in Kotlin/C# is equally a boundary in ``.ts``/``.java``).
+        Anything the regex misses is not dropped -- the block merely falls into the
+        preceding block and is split on word count.
+        """
         lines = text.split("\n")
         boundaries = re.compile(
-            r"^\s*(?:def |class |function |fn |func |pub fn |public |private |protected )"
+            r"^\s*(?:def |class |function |fn |fun |func |pub fn |object |interface |"
+            r"internal |public |private |protected )"
         )
         blocks: list[tuple[int, list[str]]] = []
         current_start = 1
@@ -187,6 +196,19 @@ class HeadingAwareChunker:
         current_title: str | None = None
         current_body = ""
         current_start = 1
+        current_end = 1
+
+        def _section_end_line(line_start: int, body: str) -> int:
+            """Last source line the section body's own text occupies.
+
+            A section body is a slice of the source running up to the next
+            heading, so it carries the newline separating it from that heading
+            and any whitespace-only lines sitting before it. The emitted content
+            is stripped, so none of that trailing whitespace is a content line:
+            trimming all of it before counting keeps the reported end on the
+            section's last line of real text.
+            """
+            return line_start + body.rstrip().count("\n")
 
         def _flush() -> None:
             """Emit the accumulated section, sub-splitting it if oversized."""
@@ -205,13 +227,17 @@ class HeadingAwareChunker:
                     offset += sub.count("\n") + 1
                     idx += 1
             else:
-                stripped = current_body.strip()
+                # line_end tracks the last SOURCE line of the merged sections,
+                # not the newline count of the reconstructed body: merging joins
+                # bodies with a synthetic "\n" that the source never had, so
+                # counting newlines in current_body would inflate the end by one
+                # line per merged section and cite past the section's real text.
                 results.append({
-                    "content": stripped,
+                    "content": current_body.strip(),
                     "section_title": current_title,
                     "chunk_index": idx,
                     "line_start": current_start,
-                    "line_end": current_start + stripped.count("\n"),
+                    "line_end": current_end,
                 })
                 idx += 1
 
@@ -220,8 +246,10 @@ class HeadingAwareChunker:
                 current_title = title
                 current_body = body
                 current_start = line_start
+                current_end = _section_end_line(line_start, body)
             elif _word_count(current_body + body) <= self.target_size:
                 current_body += "\n" + body
+                current_end = _section_end_line(line_start, body)
                 if current_title is None and title is not None:
                     current_title = title
             else:
@@ -229,6 +257,7 @@ class HeadingAwareChunker:
                 current_title = title
                 current_body = body
                 current_start = line_start
+                current_end = _section_end_line(line_start, body)
 
         if current_body.strip():
             _flush()

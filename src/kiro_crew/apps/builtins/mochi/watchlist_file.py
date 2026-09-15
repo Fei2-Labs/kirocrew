@@ -8,8 +8,8 @@ This is a MECHANICAL port. The six primitives the migration plan calls out
 (due-time recomputation after every check, priority dispatch, the timestamp
 lock, fail-degradation with cooldown, at-least-once delivery, lifecycle and
 archiving) live partly here and partly in ``watchlistService``; nothing about
-them is redesigned in passing. Upgrading this into a core scheduler is
-KiroCrew issue #721's business, with THIS file as the baseline.
+them is redesigned in passing. Upgrading this into a core scheduler is separate
+work, with THIS file as the baseline.
 
 PORTING NOTES
 -------------
@@ -259,10 +259,18 @@ def write_atomic(file_path: str, data: WatchList) -> None:
 def _backup_corrupted(file_path: str, now_ms: int) -> None:
     bak_path = f"{file_path}.bak.{now_ms}"
     try:
-        os.rename(file_path, bak_path)
+        # os.replace, not os.rename: on Windows rename REFUSES an existing
+        # destination, and two corruptions inside one millisecond share a
+        # timestamp suffix. Because the OSError below is swallowed, that failure
+        # would silently leave the corrupt file in place -- the one outcome this
+        # function exists to prevent. POSIX rename already overwrote.
+        os.replace(file_path, bak_path)
         logger.warning("[watchlist_file] Backed up corrupted file to %s", bak_path)
     except OSError:
-        pass  # file may not exist
+        # File may not exist. On Windows this also catches a sharing violation
+        # while the MCP-server process holds the corrupt file open; the caller
+        # then rebuilds from defaults, which is the same outcome as no backup.
+        pass
 
 
 # ── Item creation ──────────────────────────────────────────────────────────
@@ -345,16 +353,16 @@ def _reject_malformed_ops(params: dict[str, Any]) -> None:
 
     Nothing upstream type-checks these. The HTTP route forwards a decoded JSON
     body and the MCP tool forwards agent-authored arguments; both only assert
-    that at least one operation KEY is present. A wrong TYPE therefore used to
-    reach the per-item code, where it read as a server fault rather than a bad
+    that at least one operation KEY is present. Without this check a wrong TYPE
+    reaches the per-item code, where it reads as a server fault rather than a bad
     request:
 
-    - ``{"add": "x"}`` sliced the STRING, then called ``create_watch_item`` on
+    - ``{"add": "x"}`` slices the STRING, then calls ``create_watch_item`` on
       each character -> ``AttributeError`` -> HTTP 500.
     - ``{"add": [{"checkIntervalMins": "abc"}]}`` -> ``TypeError`` in
       ``_clamp_interval`` -> HTTP 500.
-    - ``{"remove": "abc"}`` built a set of CHARACTERS and deleted every item
-      whose id was one of them: silent data loss with no error at all.
+    - ``{"remove": "abc"}`` builds a set of CHARACTERS and deletes every item
+      whose id is one of them: silent data loss with no error at all.
 
     ``ValueError`` is what both callers already treat as the client's mistake
     (the route maps it to 400), so validating here — rather than in the route —

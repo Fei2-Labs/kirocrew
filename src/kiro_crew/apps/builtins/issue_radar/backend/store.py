@@ -47,14 +47,21 @@ def config_path(root: Path | None = None) -> Path:
 
 
 def read_config(root: Path | None = None) -> dict[str, Any]:
-    """Read config.json. Returns {"repos": []} if it doesn't exist yet."""
+    """Read config.json, keeping malformed repo rows out of every caller."""
     path = config_path(root)
     if not path.is_file():
         return {"repos": []}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {"repos": []}
+    if not isinstance(data, dict):
+        return {"repos": []}
+    repos = data.get("repos", [])
+    data["repos"] = (
+        [row for row in repos if isinstance(row, dict)] if isinstance(repos, list) else []
+    )
+    return data
 
 
 def write_config(config: dict[str, Any], root: Path | None = None) -> None:
@@ -71,7 +78,8 @@ def _config_lock(root: Path | None = None):
     that race, so every config RMW below holds this exclusive lock across the
     whole read→mutate→atomic-write."""
     lock_path = data_dir(root) / "config.json.lock"
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             yield
 
@@ -177,7 +185,9 @@ def issues_cache_lock(owner: str, repo: str, root: Path | None = None, state: st
     """
     path = issues_cache_path(owner, repo, root, state)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix(".json.lock"), "w") as fd:
+    lock_path = path.with_suffix(".json.lock")
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             yield
 
@@ -196,7 +206,8 @@ def issue_write_lock(owner: str, repo: str, number: int, root: Path | None = Non
     the network call, which is the point: ordering the writes is what matters."""
     path = repo_data_dir(owner, repo, root) / f"issue-{int(number)}.write.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as fd:
+    path.touch(exist_ok=True)
+    with open(path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             yield
 
@@ -368,7 +379,9 @@ def labels_cache_lock(owner: str, repo: str, root: Path | None = None):
     could be dropped and stay invisible until a manual refresh."""
     path = labels_cache_path(owner, repo, root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix(".json.lock"), "w") as fd:
+    lock_path = path.with_suffix(".json.lock")
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             yield
 
@@ -1347,7 +1360,9 @@ def _tagging_cache_lock(owner: str, repo: str, root: Path | None = None):
     with its own stale copy. Same reasoning as :func:`_config_lock`."""
     path = tagging_cache_path(owner, repo, root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix(".json.lock"), "w") as fd:
+    lock_path = path.with_suffix(".json.lock")
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             yield
 
@@ -1526,9 +1541,9 @@ DEPS_CACHE_SCHEMA = 1
 # This constant has TWO consumers with DIFFERENT needs, which is why it stays at
 # ten minutes even though the /deps route alone would be happy with hours:
 #
-#   * the /deps route, which since serve-stale-revalidate-behind no longer blocks
-#     a request on an expired cache (it returns the stale graph and refreshes in
-#     the background), so for the route this TTL governs how often a BACKGROUND
+#   * the /deps route, which does not block a request on an expired cache (it
+#     serves the stale graph and revalidates behind, refreshing in the
+#     background), so for the route this TTL governs how often a BACKGROUND
 #     rebuild fires and a long value would be harmless;
 #   * crew_runtime._read_or_refresh_deps, the sweep that feeds SIG_DEP_UNBLOCKED.
 #     For the sweep this TTL IS the freshness horizon on which a crew waiting for
@@ -1559,9 +1574,9 @@ def _deps_cache_lock(owner: str, repo: str, root: Path | None = None):
     """Serialize writers of ONE repo's deps cache across threads AND processes.
 
     Two independent producers rebuild this graph — the ``/deps`` route and the
-    crew sweep's ``_read_or_refresh_deps`` — and they run in DIFFERENT processes
-    (gateway request worker vs. sweep), so client-side serialization such as the
-    route's per-repo aiohttp mutex cannot order them. ``atomic_write`` prevents a
+    crew sweep's ``_read_or_refresh_deps``. The sweep's write runs on a worker
+    thread (``asyncio.to_thread``) and never takes the route's per-repo asyncio
+    mutex, so that mutex cannot order the two. ``atomic_write`` prevents a
     torn file but not a lost update: the compare-and-set in
     :func:`write_deps_cache` must read the stored stamp and write under one lock,
     or two writers could both read the pre-existing stamp, both decide they are
@@ -1570,7 +1585,9 @@ def _deps_cache_lock(owner: str, repo: str, root: Path | None = None):
     """
     path = deps_cache_path(owner, repo, root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix(".json.lock"), "w") as fd:
+    lock_path = path.with_suffix(".json.lock")
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             yield
 
@@ -1728,20 +1745,19 @@ def _coerce_stamp(value: Any) -> float | None:
 
 def write_deps_cache(
     owner: str, repo: str, edges: list[dict], nodes: dict[str, dict],
-    *, root: Path | None = None, fetched_at: float | None = None,
+    *, root: Path | None = None, fetched_at: float,
 ) -> None:
     """Store the dependency graph for a repo, stamping the current schema and the
     fetch time. Edges/nodes are normalized on the way in (native-wins dedup,
     self-edges dropped) so a caller cannot persist a malformed graph.
 
     ``fetched_at`` is when the graph was READ from the forge — callers capture
-    ``time.time()`` immediately before their ``fetch_dependency_edges`` call and
-    pass it here (same convention, and the same default-to-now fallback, as
-    ``_write_labels_cache_unlocked``). Stamping at write time instead re-dates
-    the data: a slow rebuild that started earlier but finishes later would land
-    its older graph on top of a newer one and mark it fresh, deferring the
-    refetch a full ``DEPS_CACHE_TTL_SEC`` and blinding the sweep's
-    unblock-transition signal (#5638).
+    ``time.time()`` before the work that produces their graph and pass it here
+    (the convention ``_write_labels_cache_unlocked`` uses). It is required, not
+    defaulted: stamping at write time re-dates the data — a slow rebuild that
+    started earlier but finishes later would land its older graph on top of a
+    newer one and mark it fresh, deferring the refetch a full
+    ``DEPS_CACHE_TTL_SEC`` and blinding the sweep's unblock-transition signal.
 
     The write is a compare-and-set under :func:`_deps_cache_lock`: it is SKIPPED
     (silently — a skipped write is a normal outcome, not an error) when the
@@ -1767,11 +1783,15 @@ def write_deps_cache(
     instead: a beyond-slack stored stamp reads as 0.0 (maximally stale, so
     the TTL refresh fires and its current-epoch write self-heals the stamp
     through the fail-open branch above), and sub-slack skew is clamped to
-    "now" so the age never reads negative. The mirror quadrant — a
-    future-stamped incoming write against a current-epoch stored stamp — is
-    ambiguous: the stored write may have run after the retreat (newer in
-    real time) or may be a genuinely old cache whose expiry triggered the
-    incoming rebuild, and the stamps cannot distinguish the two. The write
+    "now" so the age never reads negative. The mirror quadrant — an incoming
+    write whose stamp is ahead of the wall clock AT ALL against a current-epoch
+    stored stamp — is ambiguous: the stored write may have run after the
+    retreat (newer in real time) or may be a genuinely old cache whose expiry
+    triggered the incoming rebuild, and the stamps cannot distinguish the two.
+    The slack is a tolerance for a STORED stamp, not for an incoming one:
+    applying it to the incoming side classified a retreat SMALLER than the
+    slack as current-epoch, so the raw comparison let the older pre-retreat
+    graph win and read fresh for a whole TTL. The write
     is therefore PERSISTED WITH A MAXIMALLY STALE STAMP (0.0): no completed
     refresh is ever discarded, and the stale stamp makes the very next TTL
     check refetch with a current-epoch stamp, bounding the harm in either
@@ -1781,7 +1801,7 @@ def write_deps_cache(
     residual harm in any retreat race is bounded by one TTL.
     """
     norm_edges, norm_nodes = _normalize_deps(edges, nodes)
-    stamp = time.time() if fetched_at is None else float(fetched_at)
+    stamp = float(fetched_at)
     with _deps_cache_lock(owner, repo, root):
         now = time.time()
         existing = _read_deps_fetched_at_raw(owner, repo, root)
@@ -1792,7 +1812,17 @@ def write_deps_cache(
             # newer pre-retreat one (discarded as unordered), resurrecting the
             # very defect this CAS exists to stop.
             stored_is_future = existing > now + _DEPS_STAMP_FUTURE_SLACK_SEC
-            incoming_is_current_epoch = stamp <= now + _DEPS_STAMP_FUTURE_SLACK_SEC
+            # The slack is a tolerance for the STORED stamp ONLY. Extending it to
+            # the incoming side classified a stamp up to the slack ahead of the
+            # clock as current-epoch, which broke BOTH branches below: it let a
+            # sub-slack retreat skip the ambiguous branch, and — worse — it let
+            # an OLDER pre-retreat write pass the fail-open branch against a
+            # NEWER pre-retreat one (retreat beyond the slack, the two captures
+            # less than the slack apart, so the older stamp lands under
+            # ``now + slack`` while the newer one lands above it). ``stamp`` is
+            # captured before ``now`` in this very function, so an honest write
+            # always satisfies ``stamp <= now`` and needs no tolerance here.
+            incoming_is_current_epoch = stamp <= now
             if stored_is_future and incoming_is_current_epoch:
                 # The stored stamp predates a clock retreat; the incoming one is
                 # from the current epoch, so its rebuild ran AFTER the retreat —
@@ -1806,17 +1836,19 @@ def write_deps_cache(
                 )
             elif not stored_is_future and not incoming_is_current_epoch:
                 # Last quadrant of the epoch matrix, and the one the stamps
-                # genuinely cannot decide: the INCOMING stamp is pre-retreat
-                # future while the stored one is current-epoch. Two real-time
-                # orders produce exactly this signature. (a) The stored write
-                # ran AFTER the retreat — it is newer, and landing the older
-                # pre-retreat graph on top of it re-dated fresh is #5638
-                # inside the retreat window. (b) The stored cache is genuinely
-                # OLD — its expiry is what triggered this very rebuild, the
-                # rebuild started pre-retreat and finished after it, and the
-                # retreat has shrunk the old cache's apparent age back under
-                # the TTL; rejecting here discards a completed refresh and
-                # serves the stale graph until the age re-passes the TTL.
+                # genuinely cannot decide: the INCOMING stamp is ahead of the
+                # wall clock while the stored one is current-epoch.
+                # Two real-time orders produce exactly this signature. (a) The
+                # stored write ran AFTER the retreat — it is newer, and landing
+                # the older pre-retreat graph on top of it re-dated fresh is
+                # the lost-update defect inside the retreat window. (b) The
+                # stored cache is
+                # genuinely OLD — its expiry is what triggered this very
+                # rebuild, the rebuild started pre-retreat and finished after
+                # it, and the retreat has shrunk the old cache's apparent age
+                # back under the TTL; rejecting here discards a completed
+                # refresh and serves the stale graph until the age re-passes
+                # the TTL.
                 # Neither outright accept (unbounded harm in (a)) nor reject
                 # (retreat-magnitude harm in (b)) is safe, so do neither:
                 # persist the incoming graph with a MAXIMALLY STALE stamp.
@@ -1825,8 +1857,8 @@ def write_deps_cache(
                 # lands by the normal comparison — bounding the harm in both
                 # cases to a single freshness-check interval.
                 logger.debug(
-                    "issue-radar: deps-cache write for %s/%s carries a pre-retreat future "
-                    "stamp (%s) against a current-epoch stored stamp (%s) — persisting the "
+                    "issue-radar: deps-cache write for %s/%s carries a stamp ahead of the wall "
+                    "clock (%s) against a current-epoch stored stamp (%s) — persisting the "
                     "graph maximally stale so the next TTL check self-heals",
                     owner, repo, stamp, existing,
                 )
@@ -1853,8 +1885,8 @@ def write_deps_cache(
                     # compare-and-set's ordering token, and clamping a
                     # pre-retreat stamp to "now" at persistence would erase its
                     # epoch — a slower pre-retreat rebuild would then compare
-                    # greater than the clamped newer write and overwrite it,
-                    # resurrecting #5638 inside the retreat window. One
+                    # greater than the clamped newer write and overwrite it —
+                    # the lost update inside the retreat window. One
                     # exception: the ambiguous quadrant above rewrites the
                     # stamp to 0.0 (maximally stale) — the opposite direction
                     # from a clamp, which no straggler can compare greater
@@ -1990,7 +2022,7 @@ def apply_state_change_to_caches(
     *, root: Path | None = None,
 ) -> None:
     """Patch an issue's state in the detail cache and drop it from the list
-    cache it no longer belongs to (the open list on close, the closed list on
+    cache it does not belong in (the open list on close, the closed list on
     reopen). The issue reappears in the correct list on the next refresh."""
     dpath = issue_detail_cache_path(owner, repo, number, root)
     if dpath.is_file():
@@ -2260,7 +2292,8 @@ def write_investigation(
     now = _now_iso()
     lock_path = investigation_path(owner, repo, number, root, kind=kind).with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             existing = read_investigation(owner, repo, number, root, kind=kind) or {}
             # Read the findings' owning session from the PRE-patch record: the
@@ -2382,7 +2415,9 @@ def _pulls_cache_lock(owner: str, repo: str, root: Path | None, state: str):
     """
     path = pulls_cache_path(owner, repo, root, state)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix(".json.lock"), "w") as fd:
+    lock_path = path.with_suffix(".json.lock")
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             yield
 

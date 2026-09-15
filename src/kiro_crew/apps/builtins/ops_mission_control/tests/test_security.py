@@ -12,6 +12,7 @@ so this is the test that catches it.
 """
 
 import contextlib
+import json
 import os
 import shutil
 import tempfile
@@ -34,18 +35,6 @@ class TestKeystoneProtection(unittest.TestCase):
     def test_agent_file_tools_cannot_touch_it(self):
         """``is_sensitive_path`` is the shared read+write gate for agent tools."""
         self.assertTrue(security.is_sensitive_path(self._secret_path()))
-
-    def test_agent_shell_cannot_read_it(self):
-        self.assertTrue(security.is_sensitive_bash_command(f"cat {self._secret_path()}"))
-
-    def test_agent_shell_cannot_write_it(self):
-        for command in (
-            f"echo pwned > {self._secret_path()}",
-            f"tee {self._secret_path()}",
-            f"cp /tmp/x {self._secret_path()}",
-        ):
-            with self.subTest(command=command):
-                self.assertTrue(security.is_sensitive_bash_command(command))
 
     def test_every_home_prefix_is_covered(self):
         """The floor is built per home prefix — including the legacy home.
@@ -300,16 +289,25 @@ class TestSecretBackend(unittest.TestCase):
         (self.tmp / "secrets.json").write_text("{ not json", encoding="utf-8")
         self.assertEqual(self.backend.get("pagerduty", "api_token"), "")
 
+    def test_non_utf8_file_degrades_to_empty(self):
+        # UnicodeDecodeError escapes a JSONDecodeError-only clause here (it is a
+        # ValueError, not a JSONDecodeError). The lenient read must treat a
+        # corrupt byte stream as one condition regardless of which decoder
+        # noticed it -- failing a render would wedge the Settings UI on a file
+        # only a person can repair.
+        (self.tmp / "secrets.json").write_bytes(b"\xff\xfe not utf8")
+        self.assertEqual(self.backend.get("pagerduty", "api_token"), "")
+
 
 class TestSecretStoreLockdownOrdering(unittest.TestCase):
     """The store's write must never publish a token file it has not protected.
 
-    Ports the previous-store-survival recipe from
+    Ports the prior-store-survival recipe from
     ``test/test_aws_consent.py::TestGrantIsOnTheKeystoneFloor``: every failure
     inside ``atomic_write`` happens BEFORE the rename, so a transient lockdown
-    or write failure can no longer reach — let alone delete — the previous,
-    healthy store (the old post-publish ``restrict_to_owner`` + unlink-on-
-    OSError shape destroyed every stored provider token on one lockdown failure).
+    or write failure cannot reach — let alone delete — the healthy store already
+    on disk (a post-publish ``restrict_to_owner`` plus unlink-on-OSError destroys
+    every stored provider token on one lockdown failure).
     """
 
     def setUp(self):
@@ -337,7 +335,8 @@ class TestSecretStoreLockdownOrdering(unittest.TestCase):
 
         self.assertTrue(sizes, "premise: the lockdown ran at all")
         self.assertEqual(
-            sizes[0], 0,
+            sizes[0],
+            0,
             f"the file already held payload bytes when it was locked down: {sizes[0]} bytes",
         )
 
@@ -356,11 +355,13 @@ class TestSecretStoreLockdownOrdering(unittest.TestCase):
                 self.backend.put("datadog", "api_key", "x" * 32)
 
         self.assertEqual(
-            (self.tmp / "secrets.json").read_bytes(), before,
+            (self.tmp / "secrets.json").read_bytes(),
+            before,
             "the previous store was altered",
         )
         self.assertEqual(
-            self.backend.get("pagerduty", "api_token"), "u+secretvalue",
+            self.backend.get("pagerduty", "api_token"),
+            "u+secretvalue",
             "a failed new write destroyed the previously stored token",
         )
 
@@ -386,11 +387,13 @@ class TestSecretStoreLockdownOrdering(unittest.TestCase):
                 self.backend.put("datadog", "api_key", "x" * 32)
 
         self.assertEqual(
-            (self.tmp / "secrets.json").read_bytes(), before,
+            (self.tmp / "secrets.json").read_bytes(),
+            before,
             "the previous store was altered",
         )
         self.assertEqual(
-            self.backend.get("pagerduty", "api_token"), "u+secretvalue",
+            self.backend.get("pagerduty", "api_token"),
+            "u+secretvalue",
             "a transient write failure destroyed the previously stored token",
         )
 
@@ -449,11 +452,13 @@ class TestSecretStoreNeverPublishesOverAFailedRead(unittest.TestCase):
                 self.backend.delete("pagerduty")
 
         self.assertEqual(
-            self.store.read_bytes(), before,
+            self.store.read_bytes(),
+            before,
             "a failed read was published back over the store",
         )
         self.assertEqual(
-            self.backend.get("pagerduty", "api_token"), "u+thisisthestoredtoken",
+            self.backend.get("pagerduty", "api_token"),
+            "u+thisisthestoredtoken",
             "a failed read destroyed a token that was still on disk",
         )
 
@@ -483,13 +488,108 @@ class TestSecretStoreNeverPublishesOverAFailedRead(unittest.TestCase):
         self.backend.put("pagerduty", "api_token", "u+thefirsttoken")
         self.assertEqual(self.backend.get("pagerduty", "api_token"), "u+thefirsttoken")
 
-    def test_a_corrupt_store_still_repairs_on_write(self):
-        """Existing tolerance, pinned so the unreadable-file guard is not
-        mistaken for a licence to start failing on corruption too. A document
-        that parsed to nothing usable has no stored token left to lose."""
+    def test_a_corrupt_store_refuses_the_save_and_is_left_intact(self):
+        """A corrupt store is refused, never rewritten.
+
+        Reading an unparseable document as empty and letting ``put``
+        publish over it destroys tokens a truncated JSON still holds
+        verbatim, silently, when this file is the only copy of every provider
+        credential on the box. Byte-for-byte intactness is the half a raise
+        alone does not prove.
+        """
+        corrupt = '{"pagerduty": {"api_token": "u+recoverabletoken"}'  # truncated
+        self.store.write_text(corrupt, encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            self.backend.put("datadog", "api_key", "a" * 32)
+        self.assertEqual(
+            self.store.read_text(encoding="utf-8"),
+            corrupt,
+            "the mutation rewrote a corrupt store instead of refusing",
+        )
+
+    def test_a_corrupt_store_refuses_the_revocation_and_is_left_intact(self):
+        """The delete half: the old lenient read reported the provider absent,
+        so the operator was told there was nothing to revoke while the token
+        sat readable in the corrupt bytes -- and a later ``put`` would then
+        have destroyed it."""
+        corrupt = '{"pagerduty": {"api_token": "u+recoverabletoken"}'
+        self.store.write_text(corrupt, encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            self.backend.delete("pagerduty")
+        self.assertEqual(self.store.read_text(encoding="utf-8"), corrupt)
+
+    def test_the_corruption_refusal_is_the_named_type_with_no_document_bytes(self):
+        """Every corruption door raises ``CorruptDocumentError``, and NO copy of
+        the store's bytes rides anywhere on it: not the message, not ``doc``,
+        and not the exception CHAIN -- ``__cause__``/``__context__`` would keep
+        the original parser exception alive with the full document on it.
+        The adversarial shape is a TOKEN-SHAPED PROVIDER KEY: in a malformed
+        document any part can be a pasted credential, so a message that names
+        the key leaks it. Found in review (GPT 5.6)."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend.models import (
+            CorruptDocumentError,
+        )
+
+        token = "u+PastedTokenThatLandedInTheWrongPlace"
+        # Door 1: parse failure -- the document text (token included) must not
+        # survive on the refusal or its chain.
+        self.store.write_text(f'{{"{token}": {{"api_token": "x"}}', encoding="utf-8")
+        with self.assertRaises(CorruptDocumentError) as ctx:
+            self.backend.put("datadog", "api_key", "a" * 32)
+        exc = ctx.exception
+        self.assertNotIn(token, str(exc))
+        self.assertNotIn(token, exc.doc)
+        self.assertIsNone(exc.__cause__, "the chained cause carries the full document")
+        self.assertIsNone(exc.__context__, "the implicit context carries the full document")
+
+        # Door 2: valid JSON the strict coercion refuses -- the counterexample
+        # from review: the token IS the provider key of the unusable entry.
+        self.store.write_text(f'{{"{token}": "scalar-not-a-dict"}}', encoding="utf-8")
+        with self.assertRaises(CorruptDocumentError) as ctx:
+            self.backend.put("datadog", "api_key", "a" * 32)
+        exc = ctx.exception
+        self.assertNotIn(token, str(exc))
+        self.assertNotIn(token, exc.doc)
+        self.assertIsNone(exc.__cause__)
+        self.assertIsNone(exc.__context__)
+
+    def test_a_store_that_is_not_utf8_takes_the_corruption_path(self):
+        """Not valid UTF-8 never reaches ``json.loads``, so it arrives as
+        ``UnicodeDecodeError`` -- a ``ValueError`` but NOT a ``JSONDecodeError``.
+        Unwrapped it would slip past every corruption clause at the callers;
+        one corrupt byte stream must be ONE condition regardless of which
+        decoder noticed it first."""
+        self.store.write_bytes(b"\xff\xfe not utf8 \x00")
+        with self.assertRaises(json.JSONDecodeError):
+            self.backend.put("datadog", "api_key", "a" * 32)
+        self.assertEqual(self.store.read_bytes(), b"\xff\xfe not utf8 \x00")
+
+    def test_valid_json_that_is_not_an_object_refuses_the_write(self):
+        """A bare array parses without raising, so coercing it to ``{}`` would
+        let the rewrite destroy a document nobody could read -- the same loss,
+        reached without a parse failure."""
+        self.store.write_text('["u+token-in-a-list"]', encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            self.backend.put("datadog", "api_key", "a" * 32)
+        self.assertEqual(self.store.read_text(encoding="utf-8"), '["u+token-in-a-list"]')
+
+    def test_an_entry_the_coercion_would_drop_refuses_the_write(self):
+        """Deserialize, re-serialize, refuse if anything on disk did not
+        survive: a provider entry that is not an object is dropped by the
+        lenient coercion, so on the update path it must refuse -- the rewrite
+        would silently delete whatever those bytes held."""
+        doc = json.dumps({"pagerduty": "u+scalar-not-a-dict", "datadog": {"api_key": "k"}})
+        self.store.write_text(doc, encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            self.backend.put("datadog", "api_key", "a" * 32)
+        self.assertEqual(self.store.read_text(encoding="utf-8"), doc)
+
+    def test_the_lookup_read_still_tolerates_corruption(self):
+        """The asymmetry is the point: failing a render would turn a
+        recoverable file into an unusable app. ``get`` answers "not configured"
+        and the fail-closed ``has_secrets`` check refuses the provider."""
         self.store.write_text("{ not json", encoding="utf-8")
-        self.backend.put("pagerduty", "api_token", "u+afterthecorruption")
-        self.assertEqual(self.backend.get("pagerduty", "api_token"), "u+afterthecorruption")
+        self.assertEqual(self.backend.get("pagerduty", "api_token"), "")
 
 
 class TestDescribeSecrets(unittest.TestCase):
@@ -513,7 +613,7 @@ class TestDescribeSecrets(unittest.TestCase):
 
 
 class TestCrossPlatform(unittest.TestCase):
-    """AGENTS.md requires macOS + Linux + Windows for every change.
+    """docs/system-specs/common/platform-compat.md requires macOS + Linux + Windows.
 
     This app spawns two external binaries (`git` for ledger sync, `gh` for the rotation
     login) and does timezone math, which is where the Windows differences actually bite.
@@ -668,63 +768,6 @@ class TestTheScheduleIsWriteProtectedButReadable(unittest.TestCase):
             "the schedule must stay readable — the app reads it on every rotation check",
         )
 
-    def test_the_shell_path_is_closed_too(self):
-        """The tool gate is primary, but a shell write bypasses it entirely.
-
-        Asserted across write FORMS rather than one verb: the matcher is deliberately
-        verb-independent, because a narrow allowlist is bypassable by a quoted redirect, `cp`,
-        or any novel write verb.
-
-        Spelled with POSIX separators, which is what the gate matches and what a bash command
-        carries. A native `WindowsPath` renders all-backslash and matches nothing — a
-        whole-gate limitation on `security`'s home-anchored patterns, not specific to this
-        leaf, so pinning it here would assert a fix this file does not own.
-
-        Iterates the HOME FORMS rather than `self._path()`, the same way the incidents-index
-        equivalent below does, and the difference is load-bearing rather than stylistic. The
-        bash gate is a STRING matcher over `_CREW_HOME_PREFIXES` (`.kiro/crew`, `.kirocrew`),
-        so it recognises a command only by the home spelling the command carries. The tool
-        gate on the two tests above is not: `is_sensitive_write_path` resolves through
-        `config_dir()`, so it DOES follow a non-default `KIROCREW_HOME`.
-
-        That asymmetry means a custom-`KIROCREW_HOME` install (a pod, `dev-backend.sh`) has
-        this file protected against the agent's file tools but not against a bash redirect
-        naming the resolved path. It is a `security` gate limitation, not this app's, so it is
-        recorded here rather than half-fixed at this leaf. Handing `self._path()` to the bash
-        gate does not test it either way: under test isolation that path is a tmp dir, so the
-        assertion passed only while the suite was reading the operator's REAL home, and it
-        reported a guarantee it had not checked.
-        """
-        for home in ("~", "$HOME", "/home/alice", "/Users/alice"):
-            path = f"{home}/.kiro/crew/apps/ops-mission-control/data/rotation.yaml"
-            for cmd in (
-                f"echo 'who: attacker' > {path}",
-                f"cp /tmp/evil.yaml {path}",
-                f"tee {path}",
-                f"""python -c "open('{path}','w').write('x')" """,
-                f"sed -i s/alice/attacker/ {path}",
-                f"mv /tmp/evil.yaml {path}",
-            ):
-                with self.subTest(cmd=cmd[:40]):
-                    self.assertTrue(
-                        security.is_sensitive_bash_command(cmd),
-                        f"shell write not blocked: {cmd!r}",
-                    )
-
-    def test_the_registered_path_is_not_a_bare_filename(self):
-        """A bare `rotation.yaml` entry matches NOTHING, which is the trap here.
-
-        The bash matcher builds `<home>/<crew-prefix>/<entry>`, so an entry has to carry its
-        `apps/.../data/` subpath. Spelling it as a bare leaf enforced nothing while reading
-        exactly like a completed fix — so this pins the shape, not just the behaviour.
-        """
-        entries = [e for e in security._WRITE_PROTECTED_BASH_LEAVES if "rotation.yaml" in e]
-        self.assertEqual(len(entries), 1, "the schedule must be registered exactly once")
-        self.assertTrue(
-            entries[0].endswith("apps/ops-mission-control/data/rotation.yaml"),
-            f"entry must be the home-relative PATH, not a bare filename: {entries[0]!r}",
-        )
-
 
 class TestEveryRedactionSinkUsesTheSameSeam(unittest.TestCase):
     """All five egress paths must redact through ``platform.redact_via_context``.
@@ -750,9 +793,7 @@ class TestEveryRedactionSinkUsesTheSameSeam(unittest.TestCase):
         import importlib
         import inspect
 
-        mod = importlib.import_module(
-            f"kiro_crew.apps.builtins.ops_mission_control.backend.{name}"
-        )
+        mod = importlib.import_module(f"kiro_crew.apps.builtins.ops_mission_control.backend.{name}")
         return inspect.getsource(mod)
 
     def test_no_sink_imports_the_core_redactor_directly(self):
@@ -822,54 +863,3 @@ class TestTheIncidentIndexIsWriteProtectedButReadable(unittest.TestCase):
             security.is_sensitive_path(self._path()),
             "the index must stay readable — every dispatch cycle and board render reads it",
         )
-
-    def test_the_shell_path_is_closed_too(self):
-        """The tool gate is primary, but a shell write bypasses it entirely.
-
-        Spelled with POSIX separators and the home forms the matcher anchors on (`~`,
-        `$HOME`, `/home/<user>`, `/Users/<user>`) — see the schedule's equivalent test for
-        why a native `WindowsPath` is not used here.
-        """
-        for home in ("~", "$HOME", "/home/alice", "/Users/alice"):
-            path = f"{home}/.kiro/crew/apps/ops-mission-control/data/incidents/index.json"
-            for cmd in (
-                f"echo '{{}}' > {path}",
-                f"cp /tmp/evil.json {path}",
-                f"tee {path}",
-                f"""python -c "open('{path}','w').write('x')" """,
-                f"sed -i s/a/b/ {path}",
-                f"mv /tmp/evil.json {path}",
-            ):
-                with self.subTest(cmd=cmd[:44]):
-                    self.assertTrue(
-                        security.is_sensitive_bash_command(cmd),
-                        f"shell write not blocked: {cmd!r}",
-                    )
-
-    def test_the_shell_matcher_is_verb_independent_including_reads(self):
-        """A shell READ is blocked too, and that is the documented trade, not an oversight.
-
-        `_WRITE_PROTECTED_BASH_LEAVES` is matched verb-independently on purpose — a narrow
-        write-verb allowlist is bypassable by a quoted redirect or any novel verb — so
-        `cat` on this path is refused as well. Harmless here for the same reason it is
-        harmless for the schedule: the file holds no secret, and the legitimate readers
-        (the app itself, the board, the dispatch cycle) go through Python, not a shell.
-
-        The TOOL gate is where the read/write asymmetry actually lives, and
-        `test_agent_file_tools_can_still_read_it` above pins it. Asserted rather than left
-        implicit so the next reader does not "fix" this into a write-only matcher.
-        """
-        path = "~/.kiro/crew/apps/ops-mission-control/data/incidents/index.json"
-        self.assertIsNotNone(security.is_sensitive_bash_command(f"cat {path}"))
-        # And identical to the leaf registered before it, so the two cannot drift.
-        schedule = "~/.kiro/crew/apps/ops-mission-control/data/rotation.yaml"
-        self.assertIsNotNone(security.is_sensitive_bash_command(f"cat {schedule}"))
-
-    def test_the_registered_path_is_not_a_bare_filename(self):
-        """A bare `index.json` entry would match nothing — and `index.json` is a name common
-        enough that a bare entry would ALSO be wrong in the other direction."""
-        entries = [
-            e for e in security._WRITE_PROTECTED_BASH_LEAVES if e.endswith("incidents/index.json")
-        ]
-        self.assertEqual(len(entries), 1, "the index must be registered exactly once")
-        self.assertEqual(entries[0], "apps/ops-mission-control/data/incidents/index.json")

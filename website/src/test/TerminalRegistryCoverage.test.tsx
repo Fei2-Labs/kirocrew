@@ -25,6 +25,8 @@ import {
   useTerminalEnabled,
   useTerminalTitle,
   getTerminalCwd,
+  getTerminalShell,
+  getTerminalFenceShells,
   registerTerminalWs,
   unregisterTerminalWs,
   getTerminalWs,
@@ -182,6 +184,68 @@ describe('terminalRegistry', () => {
       openSocket(id)
       unregisterTerminalWs(id)
       expect(getTerminalWs(id)).toBeNull()
+    })
+  })
+
+  describe('getTerminalShell', () => {
+    it('records the shell the backend reports in its ready frame', () => {
+      const id = session('shell-report')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      expect(getTerminalShell(id)).toBeUndefined()
+      act(() => { ws.simulateJson({ type: 'ready', shell: '/usr/bin/fish' }) })
+      expect(getTerminalShell(id)).toBe('/usr/bin/fish')
+    })
+
+    it('stays unknown when the ready frame reports no shell', () => {
+      const id = session('shell-absent')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      act(() => { ws.simulateJson({ type: 'ready' }) })
+      expect(getTerminalShell(id)).toBeUndefined()
+    })
+
+    it('has the shell recorded before ready listeners run', () => {
+      const id = session('shell-order')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      // Run-in-terminal reads the shell from inside its ready callback, so a
+      // shell recorded after the drain would arrive too late to be used.
+      let seenFromListener: string | undefined = 'listener did not run'
+      onTerminalReady(id, () => { seenFromListener = getTerminalShell(id) })
+      act(() => { ws.simulateJson({ type: 'ready', shell: '/usr/bin/zsh' }) })
+      expect(seenFromListener).toBe('/usr/bin/zsh')
+    })
+
+    it('records the fence-shell paths the backend resolved', () => {
+      const id = session('fence-shells')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      expect(getTerminalFenceShells(id)).toEqual({})
+      act(() => {
+        ws.simulateJson({
+          type: 'ready',
+          shell: '/usr/bin/bash',
+          fence_shells: { bash: '/usr/bin/bash', fish: '/usr/bin/fish' },
+        })
+      })
+      expect(getTerminalFenceShells(id)).toEqual({
+        bash: '/usr/bin/bash',
+        fish: '/usr/bin/fish',
+      })
+    })
+
+    it('reports no fence shells when the ready frame carries none', () => {
+      const id = session('fence-shells-absent')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      act(() => { ws.simulateJson({ type: 'ready', shell: '/usr/bin/bash' }) })
+      expect(getTerminalFenceShells(id)).toEqual({})
     })
   })
 
@@ -489,6 +553,84 @@ describe('terminalRegistry', () => {
         vi.advanceTimersByTime(60_000)
       }
       expect(WS_INSTANCES).toHaveLength(10)
+    })
+  })
+
+  describe('displacement by a newer window', () => {
+    // The server closes a displaced socket on purpose after one
+    // `{type:'error', code:'displaced'}` frame. Redialing would take the PTY
+    // straight back from the window that just claimed it, so the session parks.
+    it('parks as disconnected without a redial when the server reports displacement', () => {
+      const id = session('displaced-park')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const { result } = renderHook(() => useTerminalConnStatus(id))
+      const ws = WS_INSTANCES[0]
+      act(() => { ws.simulateOpen(); ws.simulateJson({ type: 'ready' }) })
+      expect(result.current).toBe('connected')
+
+      act(() => {
+        ws.simulateJson({ type: 'error', code: 'displaced', message: 'Another connection owns this terminal session' })
+        ws.simulateClose()
+      })
+      expect(result.current).toBe('disconnected')
+      act(() => { vi.advanceTimersByTime(120_000) })
+      expect(WS_INSTANCES).toHaveLength(1)
+      expect(getTerminalWs(id)).toBeNull()
+    })
+
+    it('ignores online and visibility revives while displaced', () => {
+      const id = session('displaced-revive')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+      ws.simulateOpen()
+      ws.simulateJson({ type: 'error', code: 'displaced' })
+      ws.simulateClose()
+
+      window.dispatchEvent(new Event('online'))
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+      document.dispatchEvent(new Event('visibilitychange'))
+      vi.advanceTimersByTime(60_000)
+      expect(WS_INSTANCES).toHaveLength(1)
+    })
+
+    it('lets a manual Reconnect take the terminal back and clears the parked state', () => {
+      const id = session('displaced-manual')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const { result } = renderHook(() => useTerminalConnStatus(id))
+      const ws = WS_INSTANCES[0]
+      act(() => {
+        ws.simulateOpen()
+        ws.simulateJson({ type: 'error', code: 'displaced' })
+        ws.simulateClose()
+      })
+      expect(result.current).toBe('disconnected')
+
+      act(() => { retryTerminalConnection(id) })
+      expect(WS_INSTANCES).toHaveLength(2)
+      act(() => { WS_INSTANCES[1].simulateOpen() })
+      expect(result.current).toBe('connected')
+
+      // An ordinary drop afterwards redials normally again: the parked state
+      // did not outlive the manual retry.
+      act(() => { WS_INSTANCES[1].simulateClose() })
+      expect(result.current).toBe('reconnecting')
+      act(() => { vi.advanceTimersByTime(1000) })
+      expect(WS_INSTANCES).toHaveLength(3)
+    })
+
+    it('treats an error frame without the displaced code as an ordinary drop', () => {
+      const id = session('displaced-other-error')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+      ws.simulateOpen()
+      ws.simulateJson({ type: 'error', message: 'Terminal reconnect failed' })
+      ws.simulateClose()
+      vi.advanceTimersByTime(1000)
+      expect(WS_INSTANCES).toHaveLength(2)
     })
   })
 

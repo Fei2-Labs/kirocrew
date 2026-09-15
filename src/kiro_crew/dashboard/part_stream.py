@@ -2,31 +2,31 @@
 
 Three handlers write an uploaded part to a temp file: composer uploads
 (``handlers/files.py``), state import (``handlers/portability.py``) and knowledge
-ingest (``handlers/knowledge.py``). Each had grown its own copy, and the copy in
-``files.py`` took **seven** blocking review findings in seven rounds before the
-shape below settled. Every one of them was a variation on the same thing: a
-coroutine owning a file it can be cancelled away from.
+ingest (``handlers/knowledge.py``). They share this one implementation because
+every way of getting it wrong is a variation on the same thing: a coroutine
+owning a file it can be cancelled away from.
 
-The ledger, because the invariant is only legible next to what it prevents:
+The failure modes, because the invariant is only legible next to what it
+prevents:
 
-1. ``os.write`` short count ignored -- a truncated file that looks complete.
+1. An ignored ``os.write`` short count -- a truncated file that looks complete.
 2. ``CancelledError`` derives from ``BaseException``, so ``except Exception``
-   let a gateway shutdown past every cleanup.
-3. Cancellation raced ``to_thread(open)`` -- the worker created the file *after*
-   cleanup had run.
-4. A fix for (3) registered its callback before the shielded await, so the
-   descriptor was closed before the coroutine resumed: ``EBADF`` on every upload.
-5. Cleanup ran ``close``/``unlink`` on the serving loop; and a double close by
-   descriptor *number* could hit a number the kernel had reassigned.
-6. Cleanup keyed on ``task.result()`` could not run for a directly cancelled
-   open task -- the one case that needed it.
-7. Cleanup keyed on the path instead raced the worker the other way: the
-   callback fired on cancellation and unlinked *before* the worker created.
+   lets a gateway shutdown past every cleanup.
+3. Cancellation racing ``to_thread(open)`` -- the worker creates the file
+   *after* cleanup has run.
+4. A cleanup callback registered before the shielded await, so the descriptor
+   is closed before the coroutine resumes: ``EBADF`` on every upload.
+5. ``close``/``unlink`` running on the serving loop; and a double close by
+   descriptor *number* hitting a number the kernel has reassigned.
+6. Cleanup keyed on ``task.result()`` cannot run for a directly cancelled open
+   task -- the one case that needs it.
+7. Cleanup keyed on the path instead races the worker the other way: the
+   callback fires on cancellation and unlinks *before* the worker creates.
 
 **The invariant.** A cancellable owner cannot both offload its cleanup and
 guarantee it: offloading needs an await or a callback, and each introduces an
 ordering the owner does not control -- which is precisely how (3), (6) and (7)
-happened, in both directions. So ownership lives in a **synchronous context
+arise, in both directions. So ownership lives in a **synchronous context
 manager**: ``__enter__`` creates, ``__exit__`` discards unless the body
 committed. ``with`` guarantees ``__exit__`` on every exit including
 ``CancelledError``, and because no ``await`` sits between the create and the
@@ -37,9 +37,8 @@ The deliberate cost, stated plainly rather than hidden: ``__enter__``'s single
 ``os.open`` and ``__exit__``'s single ``close``+``unlink`` run on the event loop.
 That is bounded work on one freshly-named local path -- microseconds -- and it
 buys an ordering guarantee that no off-loop arrangement provides. The *bulk*
-cleanup that finding (5) was actually about (a request unlinking up to 20
-published paths, a 512 MB video among them) still runs in a worker, at the
-caller's level. Writes, the commit, and the sniff all run in workers too: only
+cleanup of (5) -- a request unlinking up to 20 published paths, a 512 MB video
+among them -- still runs in a worker, at the caller's level. Writes, the commit, and the sniff all run in workers too: only
 the create/discard of one temp is on the loop, and only because correctness
 requires it.
 
@@ -122,9 +121,7 @@ class _TempSink:
         # an upload may carry anything and the directory is shared. O_BINARY is
         # 0 off Windows and load-bearing on it: without it the CRT translates
         # newlines, so any payload containing 0x0A commits bytes that differ
-        # from what was uploaded -- a silently corrupted video or archive. This
-        # flag was on the pre-extraction opener and got dropped in the move;
-        # `test_open_flags_include_o_binary` now pins it.
+        # from what was uploaded -- a silently corrupted video or archive.
         fd = os.open(
             str(self.tmp),
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),

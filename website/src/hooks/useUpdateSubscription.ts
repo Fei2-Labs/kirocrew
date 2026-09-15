@@ -3,6 +3,8 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useAppDispatch } from '../store'
 import { setDesktopUpdateAvailable } from '../store/dashboardSlice'
 
+export type UpdateState = globalThis.UpdateState
+
 /**
  * The update lifecycle payload pushed by the Electron main process.
  *
@@ -11,50 +13,6 @@ import { setDesktopUpdateAvailable } from '../store/dashboardSlice'
  * absent at another — a missing optional field here reads as "never sent" at
  * the consumer that nobody remembered to edit.
  */
-export type UpdateState = {
-  state: 'checking' | 'found' | 'available' | 'downloading' | 'downloaded' | 'installing' | 'not-available' | 'error'
-  version?: string
-  notes?: string
-  pubDate?: string
-  channel?: string
-  message?: string
-  /** Which stage failed. Absent on builds older than the phase-aware emit. */
-  phase?: 'check' | 'download' | 'install'
-  /** Stable failure class; the user-facing copy is chosen from this, not from `message`. */
-  code?: string
-  httpStatus?: number
-  /** Download progress, 0-100. Absent until the first progress event arrives. */
-  percent?: number
-  bytesPerSecond?: number
-  /** Platform handoff the ready/installing UI should explain. */
-  installHandoff?: 'windows-installer' | 'automatic-relaunch'
-  /**
-   * What the FOLLOWED channel's feed reported and whether these bytes are ahead
-   * of it, carried on every lifecycle payload so a renderer that mounted before
-   * the latest check does not keep rendering `getInfo()`'s older answer. `''` /
-   * `null` means no usable answer — never "ahead". See auto-update.js
-   * `laneSnapshot`.
-   */
-  laneVersion?: string
-  runningAheadOfLane?: boolean | null
-  /**
-   * True when this payload was replayed from getInfo() on a fresh mount rather
-   * than pushed live. Restoration surfaces (the About card) render it like any
-   * other state; interruption surfaces (the UpdateModal) ignore it, so a
-   * dismissed modal is not resurrected by every renderer reload.
-   */
-  replayed?: boolean
-}
-
-type UpdateAPI = {
-  onState: (cb: (payload: UpdateState) => void) => (() => void)
-  /**
-   * Optional: the preload bridge exposes it, but an older bundle paired with a
-   * newer renderer may not — replay then degrades to the pre-replay behaviour.
-   */
-  getInfo?: () => Promise<{ lastState?: UpdateState | null } | undefined>
-}
-
 /**
  * Subscribes to the Electron main process's update lifecycle events and mirrors
  * each one into the shared ['update-state'] React Query cache.
@@ -86,7 +44,7 @@ export function useUpdateSubscription() {
   const queryClient = useQueryClient()
   const dispatch = useAppDispatch()
   useEffect(() => {
-    const api = (window as unknown as { updateAPI?: UpdateAPI }).updateAPI
+    const api = window.updateAPI
     if (!api?.onState) return
     const apply = (payload: UpdateState) => {
       queryClient.setQueryData(['update-state'], payload)

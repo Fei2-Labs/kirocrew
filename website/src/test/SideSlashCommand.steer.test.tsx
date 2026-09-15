@@ -22,16 +22,15 @@ import { ThemeProvider } from '../hooks/useTheme'
 import type { ChatSlot } from '../types'
 import type { RootState } from '../store'
 
-const { mockSideOpen, mockSideTurn, mockSteerChat, mockSendChat } = vi.hoisted(() => ({
+const { mockSideOpen, mockSideTurn, mockSendChat } = vi.hoisted(() => ({
   mockSideOpen: vi.fn().mockResolvedValue({ ok: true, open: true, messages: 0, last_run_id: '', created_at: '' }),
   mockSideTurn: vi.fn().mockResolvedValue({ ok: true, run_id: 'r1', messages: 1 }),
-  mockSteerChat: vi.fn().mockResolvedValue({ ok: true }),
-  mockSendChat: vi.fn().mockResolvedValue({ ok: true }),
+  mockSendChat: vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true, steered: true }) }),
 }))
 
 vi.mock('../api/client', () => ({
   api: new Proxy(
-    { sideOpen: mockSideOpen, sideTurn: mockSideTurn, steerChat: mockSteerChat, sendChat: mockSendChat },
+    { sideOpen: mockSideOpen, sideTurn: mockSideTurn, sendChat: mockSendChat },
     {
       get: (t, prop) => {
         if (prop in t) return (t as Record<string, unknown>)[prop as string]
@@ -165,11 +164,17 @@ describe('/side while a turn is running', () => {
     fireEvent.change(input, { target: { value: 'plain steer text' } })
     await armRunning(store)
     fireEvent.keyDown(input, { key: 'Enter' })
-    // The third argument is the client-minted send-correlation id the steer
-    // path stamps on its optimistic bubble (#6075) — pin its shape, not its
-    // random value.
-    await waitFor(() => expect(mockSteerChat).toHaveBeenCalledWith('plain steer text', SLOT, expect.stringMatching(/^s-/)))
-    expect(mockSendChat).not.toHaveBeenCalled()
+    // The steer is the same `/api/chat` POST as a send, flagged `steer`
+    // (6th argument), through the chat-core transport; `meta.sendId` is the
+    // client-minted correlation id the steer path stamps on its optimistic
+    // bubble (#6075) — pin its shape, not its random value. There is no
+    // bespoke steer helper; the flag is the whole difference.
+    await waitFor(() => expect(mockSendChat).toHaveBeenCalled())
+    const call = mockSendChat.mock.calls[0]
+    expect(call[0]).toBe('plain steer text')
+    expect(call[1]).toBe(SLOT)
+    expect((call[4] as { sendId?: string }).sendId).toMatch(/^s-/)
+    expect(call[5]).toBe(true)
   })
 
   it('/side opens the side chat instead of being steered into the turn', async () => {
@@ -184,7 +189,6 @@ describe('/side while a turn is running', () => {
     await waitFor(() => expect((input as HTMLTextAreaElement).value).toBe('/side '))
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => expect(mockSideOpen).toHaveBeenCalledWith(SLOT))
-    expect(mockSteerChat).not.toHaveBeenCalled()
     expect(mockSendChat).not.toHaveBeenCalled()
     expect(store.getState().chat.activityTab).toBe('side')
   })
@@ -196,7 +200,18 @@ describe('/side while a turn is running', () => {
     await armRunning(store)
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => expect(mockSideTurn).toHaveBeenCalledWith(SLOT, 'what is this error about'))
-    expect(mockSteerChat).not.toHaveBeenCalled()
+  })
+
+  it('/btw <message> rides the same interception — side turn, not steer', async () => {
+    // The alias must stay in lockstep with /side in isInterceptedSlashCommand,
+    // or a running turn would swallow "/btw ..." as steer text.
+    const store = renderRunningChatPage()
+    const input = await screen.findByLabelText('Message input')
+    fireEvent.change(input, { target: { value: '/btw what is this error about' } })
+    await armRunning(store)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(mockSideTurn).toHaveBeenCalledWith(SLOT, 'what is this error about'))
+    expect(mockSendChat).not.toHaveBeenCalled()
   })
 
   it('restores the composer text when the side turn is rejected', async () => {
@@ -208,7 +223,6 @@ describe('/side while a turn is running', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
     // Cleared optimistically, then restored once the rejection lands.
     await waitFor(() => expect((input as HTMLTextAreaElement).value).toBe('/side my precious question'))
-    expect(mockSteerChat).not.toHaveBeenCalled()
   })
 
   it('merges the rejected question below text typed while the rejection was in flight', async () => {

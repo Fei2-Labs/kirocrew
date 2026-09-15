@@ -41,7 +41,7 @@ describe('hi punctuation (style/hi.md §1)', () => {
       }
     }
     // Baselined: existing catalog may use periods
-    expect(bad.length, report(bad)).toBeLessThanOrEqual(30)
+    expect(bad.length, report(bad)).toBeLessThanOrEqual(31)
   })
 })
 

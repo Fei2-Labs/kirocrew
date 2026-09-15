@@ -286,7 +286,7 @@ class TestEffectiveDenied:
         cfg = HooksConfig(denied_commands_disabled_ids=["local-destructive-rm-rf-root"])
         mgr = HookManager(cfg)
         result = mgr.on_tool_call("rm -rf /tmp/foo", command="rm -rf /tmp/foo", is_shell=True)
-        # No longer denied — the built-in rule was individually opted out.
+        # Not denied — the built-in rule was individually opted out.
         assert result.action != TOOL_DENY
 
     def test_disable_all_falls_through(self):
@@ -473,7 +473,7 @@ class TestResolveDeniedNotes:
         # collapses whitespace precisely because "newlines would forge extra lines
         # in the refusal", but the config-file path (from_dict ->
         # resolve_denied_notes) applies only .strip() -- so a note hand-written
-        # into the keystone denied_commands.json used to reach the refusal with its
+        # into the keystone denied_commands.json would reach the refusal with its
         # newlines intact, and RecoveryCard's per-line POLICY_RE read the forged
         # line as a second pattern. Reach is operator-only (the keystone is not
         # agent-writable), but pasting a refusal you just saw into a note is a
@@ -1050,15 +1050,42 @@ class TestSearchTargetSynthesizedTier:
                     f"explicit way into the synthesized tier rather than being excluded"
                 )
 
-    def test_the_deny_exception_map_is_still_empty(self):
+    def test_no_deny_exception_can_exonerate_a_synthesized_target(self):
         # This tier deliberately omits the `_DENY_EXCEPTIONS` carve-out that `is_denied`
-        # carries, because the map ships empty and replicating it would be dead symmetry.
-        # The omission is only safe while that holds: an entry appearing here means a
-        # scoped exception exists that a synthesized target would silently not honour, so
-        # this reddens and the tier gets revisited deliberately.
-        from kiro_crew.security import _DENY_EXCEPTIONS
+        # carries. Requiring the map stay EMPTY once guarded the omission, but the
+        # search-verb carve-out ends that. The property that omission actually needs
+        # is narrower: no exception may apply to a synthesized target, or the same text
+        # would be exonerated in `is_denied` while this tier still denied it.
+        #
+        # Stated behaviourally rather than by pinning the map's size, and in the same
+        # ratchet spirit as the test above: an exception authored against the grammar
+        # reddens this, which is the signal to revisit the tier deliberately rather than
+        # to relax the assertion.
+        import fnmatch
 
-        assert not _DENY_EXCEPTIONS
+        from kiro_crew.security import _DENY_EXCEPTIONS, _deny_pattern_matches
+
+        targets = (
+            "file-search path=/srv/mkfs-tests max_depth=3",
+            "file-search path=/home/alice",
+            # A search ROOT whose own path ends in a search-verb name: the shape most
+            # likely to collide with a verb-anchored exception glob.
+            "file-search path=/usr/bin/grep max_depth=1",
+            "file-search",
+        )
+        for pattern, globs in _DENY_EXCEPTIONS.items():
+            for target in targets:
+                lowered = target.lower()
+                # An exception is only ever consulted for a target its own deny pattern
+                # matched, so a pattern that cannot match this target cannot diverge.
+                if not _deny_pattern_matches(pattern, lowered, True):
+                    continue
+                for glob in globs:
+                    assert not fnmatch.fnmatch(lowered, glob.lower()), (
+                        f"exception {glob!r} would exonerate synthesized target "
+                        f"{target!r} from {pattern!r}, which this tier still denies -- "
+                        f"the two tiers would diverge; give the tier an explicit way in"
+                    )
 
     def test_a_command_rule_takes_no_part_in_a_synthesized_target(self):
         from kiro_crew.security import is_denied_synthesized_target

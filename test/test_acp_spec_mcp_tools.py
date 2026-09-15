@@ -359,7 +359,7 @@ class TestSessionCallbackEnv:
         )
         client = _client(ACP_BACKEND_PI, tmp_path)
         client._session_key = "dashboard:slot-9"
-        servers = await client._session_mcp_servers()
+        servers = await client._gated_session_mcp_servers()
         core = next(entry for entry in servers if entry["name"] == "kirocrew-core")
         env = {pair["name"]: pair["value"] for pair in core["env"]}
         assert env["KIROCREW_SESSION_KEY"] == "dashboard:slot-9"
@@ -378,7 +378,7 @@ class TestSessionCallbackEnv:
         from unittest.mock import patch
 
         with patch.object(client, "_pooled_mcp_servers", return_value=pooled):
-            assert await client._session_mcp_servers() == pooled
+            assert await client._gated_session_mcp_servers() == pooled
 
 
 class TestDirectiveRoundTrip:

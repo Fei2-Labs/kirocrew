@@ -281,8 +281,8 @@ def _load_kirocrew_config_strict() -> dict | None:
     is malformed or unreadable.  The batch-add path must refuse to write
     in the None case: the lenient ``_load_json_or_empty`` coerces a broken
     file to ``{}``, and the subsequent atomic write would then silently
-    replace EVERY previously configured server with just the new batch
-    while reporting success.
+    replace EVERY configured server with just the new batch while reporting
+    success.
     """
     try:
         text = _mcp._kirocrew_mcp_json().read_text(encoding="utf-8")
@@ -353,7 +353,7 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
     async with _get_mcp_lock():
         # Load once, strictly: a malformed existing file must fail the
         # request, never be coerced to {} and overwritten (that would
-        # destroy every previously configured server "successfully").
+        # destroy every configured server "successfully").
         data = _load_kirocrew_config_strict()
         if data is None:
             sel().log_api_access(

@@ -196,11 +196,11 @@ class TestSecretsAreWriteOnly(unittest.IsolatedAsyncioTestCase):
 
 
 class TestIncidentsPayloadIsBounded(unittest.IsolatedAsyncioTestCase):
-    """`/incidents` used to serialize the ENTIRE index on every dashboard poll.
+    """`/incidents` must not serialize the ENTIRE index on every dashboard poll.
 
-    Fine at three incidents. Once a flapping alarm has minted hundreds — which became
-    possible when resolved alarms were made re-claimable — it is an ever-growing payload
-    on a polled endpoint.
+    Fine at three incidents. Once a flapping alarm has minted hundreds — which a
+    re-claimable resolved alarm allows — it is an ever-growing payload on a polled
+    endpoint.
     """
 
     def setUp(self):
@@ -883,12 +883,12 @@ class TestStateReportsTheNotificationChannel(unittest.IsolatedAsyncioTestCase):
 
 
 class TestAnActionSchedulesItsOwnVerification(unittest.IsolatedAsyncioTestCase):
-    """A 2xx from a provider is no longer the end of the story.
+    """A 2xx from a provider is not the end of the story.
 
-    `_handle_action` used to await `sink.execute`, audit, and return — so the response's
-    `ok` meant only "transmitted". Checkmk documents exactly that gap for its Livestatus
-    command dispatch; Nagios's command pipe returns nothing at all. The route now records
-    what was done and when to look again, and says which of the two it is doing.
+    Awaiting `sink.execute`, auditing and returning would make the response's `ok` mean
+    only "transmitted". Checkmk documents exactly that gap for its Livestatus command
+    dispatch; Nagios's command pipe returns nothing at all. The route records what was
+    done and when to look again, and says which of the two it is doing.
     """
 
     def setUp(self):
@@ -1471,12 +1471,11 @@ class TestHygieneIsPrimaryOnly(unittest.IsolatedAsyncioTestCase):
 
 
 class TestProposeLoop(unittest.IsolatedAsyncioTestCase):
-    """`propose` mode used to be behaviourally identical to `observe`.
+    """`propose` mode must not be behaviourally identical to `observe`.
 
-    `authorize_action` refuses anything below `act`, `proposed_action` was declared and
-    never assigned, and there was no store, no approve endpoint and no timeout. So the
-    mode most operators will live in — "tell me what you would do" — was prose in a chat
-    transcript with nothing to approve.
+    `authorize_action` refuses anything below `act`, so without a stored draft, an
+    approve endpoint and a timeout, the mode most operators live in — "tell me what you
+    would do" — is prose in a chat transcript with nothing to approve.
 
     The load-bearing property is that **the drafted text is the contract**: an approval
     binds to the exact terms shown, and executes those, not whatever the request supplies.
@@ -1936,7 +1935,7 @@ class TestBlockedStateReadsThePublicSlotContract(unittest.IsolatedAsyncioTestCas
     ``_ChatSlot.to_dict()`` is the owner's public serializer and already derives the same
     fact. These tests pin BOTH that we ask it, and that our answer agrees with the core's
     across the states that matter -- against the real class, not a stand-in, because a mock
-    would happily agree with a contract that no longer exists.
+    would happily agree with a contract that does not exist.
     """
 
     def test_no_private_slot_attribute_is_read(self):
@@ -2316,7 +2315,7 @@ class TestOutboundNotesAreRedacted(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(token, seen[0].get("note", ""), "a token must never leave in a note")
 
     def test_redaction_happens_before_the_length_clip(self):
-        """Clipping first could sever a token so the pattern no longer matches."""
+        """Clipping first could sever a token so the pattern does not match."""
         import inspect
 
         source = inspect.getsource(routes._handle_action)
@@ -3051,12 +3050,12 @@ class TestTheSlotKeyIsDerivedNotTrusted(unittest.TestCase):
 
 
 class TestManualClaimRequiresAFiringSignal(unittest.IsolatedAsyncioTestCase):
-    """`POST /incident/claim` must refuse a signal that is no longer firing.
+    """`POST /incident/claim` must refuse a signal that is not firing.
 
-    `poll_all` returns EVERY state — firing, ok and suppressed — and this handler matched on
-    id alone. The local was even named `firing`, which is what hid it: a signal that recovered
-    between the board's poll and this one came back as `ok`, matched, and minted an incident
-    for a fault that had already cleared. The two other `poll_all` consumers
+    `poll_all` returns EVERY state — firing, ok and suppressed — so matching on id alone is
+    wrong, and a local named `firing` is what hides it: a signal that recovered between the
+    board's poll and this one comes back as `ok`, matches, and mints an incident for a
+    fault that has already cleared. The two other `poll_all` consumers
     (`dispatch.run_cycle`, `GET /signals`) both filter explicitly. Found in review.
     """
 
@@ -3382,6 +3381,62 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         self.assertEqual(body["code"], "secret_store_unwritable")
         self.assertNotIn("removed", body, "the refusal must not claim a removal verdict")
 
+    async def test_a_corrupt_secret_store_is_a_coded_500_on_save(self):
+        """Corruption is not retryable, so it must not be advertised as a 503.
+
+        The store's update reader refuses a corrupt document rather than
+        replacing it, so a handler catching only ``OSError`` would surface the
+        refusal protecting the operator's only copy of every provider token
+        as aiohttp's bare uncoded 500.
+        """
+        token = "u+ThisIsTheActualTokenValue"
+        corrupt = json.JSONDecodeError("Expecting value", "{ not json", 2)
+
+        def _corrupt(*_a, **_kw):
+            raise corrupt
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(routes, "put_secret", _corrupt):
+                client = await self._client(app)
+                resp = await client.put(
+                    "/api/apps/ops-mission-control/providers/pagerduty/secret",
+                    json={"field": "api_token", "value": token},
+                )
+                self.assertEqual(resp.status, 500)
+                body = await resp.json()
+
+        self.assertEqual(body["code"], "secret_store_corrupt")
+        self.assertIs(body["ok"], False)
+        # A refusal must not echo the credential it failed to store, nor the
+        # document bytes the decode error may carry.
+        self.assertNotIn(token, json.dumps(body))
+        self.assertNotIn("{ not json", json.dumps(body))
+
+    async def test_a_corrupt_secret_store_is_a_coded_500_on_revocation(self):
+        """The revocation half: the old lenient read answered "nothing to
+        revoke" over a store whose token was still on disk; the corrupt refusal
+        must leave the operator correctly believing the token is still live."""
+        corrupt = json.JSONDecodeError("Expecting value", "{ not json", 2)
+
+        def _corrupt(*_a, **_kw):
+            raise corrupt
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(routes, "delete_secret", _corrupt):
+                client = await self._client(app)
+                resp = await client.delete(
+                    "/api/apps/ops-mission-control/providers/pagerduty/secret"
+                )
+                self.assertEqual(resp.status, 500)
+                body = await resp.json()
+
+        self.assertEqual(body["code"], "secret_store_corrupt")
+        self.assertNotIn("removed", body, "the refusal must not claim a removal verdict")
+
     async def test_a_refused_ceiling_write_is_a_coded_503(self):
         """The ceiling is the one value where a silent partial apply is a security state."""
         from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
@@ -3446,6 +3501,120 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
                 body = await resp.json()
 
         self.assertEqual(body["code"], "app_config_corrupt")
+
+    async def test_a_refused_ledger_post_is_a_coded_503_not_a_500(self):
+        """POST /ledger appends-or-rewrites under the ledger lock, so it can refuse.
+
+        The ledger trio (POST, DELETE, hygiene) was the last set of mutating routes in
+        this file still answering aiohttp's bare plain-text 500 on a refused write —
+        every sibling store write already reports ``{ok, error, code}``.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import ledger
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(ledger, "upsert", self._refuse):
+                client = await self._client(app)
+                resp = await client.post(
+                    "/api/apps/ops-mission-control/ledger",
+                    json={"pattern": "disk full on host", "fix": "clear the spool"},
+                )
+                self.assertEqual(resp.status, 503)
+                body = await resp.json()
+
+        self.assertEqual(body["code"], "ledger_store_unwritable")
+        self.assertIs(body["ok"], False)
+
+    async def test_a_refused_ledger_delete_never_reports_success(self):
+        """Same property as the secret-revocation route: anything 2xx here is the bug.
+
+        A refused rewrite means the entry the operator just deleted is still on disk,
+        and the previous escape (bare 500) left them unable to tell that from a crash
+        after the write. The coded 503 says plainly: still there, retry.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import ledger
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(ledger, "remove", self._refuse):
+                client = await self._client(app)
+                resp = await client.delete(
+                    "/api/apps/ops-mission-control/ledger?id=abc123",
+                )
+                self.assertEqual(resp.status, 503, "a refused removal answered as success")
+                body = await resp.json()
+
+        self.assertEqual(body["code"], "ledger_store_unwritable")
+        self.assertNotIn("removed", body, "the refusal must not claim a removal verdict")
+
+    async def test_a_failed_underlying_read_on_delete_is_a_503_not_a_404(self):
+        """The read half of the same fault, driven from below the handler.
+
+        ``remove`` starts from a read of the file it rewrites. When that READ was the
+        thing that failed, the lenient read collapsed it to ``[]`` and the route
+        answered a coded 404 — "no such entry" — about an entry still on disk, with no
+        failure audit. Found in review (GPT 5.6). With the mutation path on the strict
+        read, the same fault now surfaces as the identical retryable 503 the write
+        half answers, and the entry is not mis-reported as absent.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import ledger
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(ledger, "read_entries_for_update", self._refuse):
+                client = await self._client(app)
+                resp = await client.delete(
+                    "/api/apps/ops-mission-control/ledger?id=abc123",
+                )
+                self.assertNotEqual(resp.status, 404, "a failed read was reported as absence")
+                self.assertEqual(resp.status, 503)
+                body = await resp.json()
+
+        self.assertEqual(body["code"], "ledger_store_unwritable")
+
+    async def test_a_refused_hygiene_rewrite_is_a_coded_503_and_audited(self):
+        """``hygiene`` rewrites the whole ledger; a refused rewrite must not push.
+
+        Also pins that the refusal is AUDITED as a failure: the success path writes a
+        ``ledger_hygiene`` audit line, and a refusal that skipped the audit would make
+        the maintenance pass look like it never ran rather than like it failed.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import ledger, ledger_sync
+
+        directions: list[str] = []
+
+        async def _sync(*, direction="pull"):
+            directions.append(direction)
+            return ""
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(routes.rotation, "is_primary", return_value=True):
+                with mock.patch.object(ledger_sync, "sync_safely", _sync):
+                    with mock.patch.object(ledger, "hygiene", self._refuse):
+                        with mock.patch.object(routes, "_audit") as audited:
+                            client = await self._client(app)
+                            resp = await client.post(
+                                "/api/apps/ops-mission-control/ledger/hygiene"
+                            )
+                            self.assertEqual(resp.status, 503)
+                            body = await resp.json()
+
+        self.assertEqual(body["code"], "ledger_store_unwritable")
+        self.assertIs(body["ok"], False)
+        self.assertNotIn(
+            "push", directions, "a ledger the dedupe never committed to must not be pushed"
+        )
+        failures = [
+            c
+            for c in audited.call_args_list
+            if c.args[0] == "ledger_hygiene" and c.args[2] == "failure"
+        ]
+        self.assertEqual(len(failures), 1, "the refusal must be audited as a failure")
 
     async def test_a_claim_survives_a_failed_ledger_annotation(self):
         """The claim is committed before the annotation runs, so it must not be un-reported.

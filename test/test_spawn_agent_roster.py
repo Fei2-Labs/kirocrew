@@ -1,4 +1,4 @@
-"""The valid-agent roster must reach the CALLER, not only the gateway log (#4842).
+"""The valid-agent roster must reach the CALLER, not only the gateway log.
 
 Three seams, one failure: a caller that named a non-existent agent got a bare
 ``agent 'x' not found``, could not self-correct, and burned a whole wave retrying
@@ -121,7 +121,7 @@ class TestPredicateReadsTheWireCode:
     def test_a_gateway_without_the_code_fails_soft(self) -> None:
         """A client newer than the gateway sees no ``code`` and loses only the
         short-circuit: every member is dispatched and refused individually, which is
-        the pre-#4842 behavior -- never a refusal of a name the gateway would take."""
+        the soft-fail behavior -- never a refusal of a name the gateway would take."""
         assert not spawn_tools._is_unknown_agent_refusal(
             {"error": "agent 'explore' not found; available: scout", "counted": True}, "explore"
         )
@@ -244,7 +244,7 @@ class TestSpawnListUsesTheSameFilter:
         cannot see a re-duplication (both spellings behave alike), so this is a
         source ratchet: the pair is spelled once, where the constant lives.
 
-        The spawn tools no longer name the set at all -- they inherit it as
+        The spawn tools do not name the set at all -- they inherit it as
         ``visible_agent_names``' default -- so the ratchet also pins that default,
         which is what makes the omission safe rather than accidental.
         """
@@ -252,14 +252,23 @@ class TestSpawnListUsesTheSameFilter:
         import pathlib
 
         assert sa.UNADVERTISED_AGENTS == frozenset(
-            {"kirocrew", "kirocrew-conductor", "kirocrew-pipeline-conductor"}
+            {
+                "kirocrew",
+                "kirocrew-conductor",
+                "kirocrew-pipeline-conductor",
+                "kirocrew-security-conductor",
+            }
         )
         default = inspect.signature(sa.visible_agent_names).parameters["exclude"].default
         assert default is sa.UNADVERTISED_AGENTS
         for module in (sa, spawn_tools):
             src = pathlib.Path(module.__file__).read_text(encoding="utf-8")
             expected = 1 if module is sa else 0
-            for reserved in ("kirocrew-conductor", "kirocrew-pipeline-conductor"):
+            for reserved in (
+                "kirocrew-conductor",
+                "kirocrew-pipeline-conductor",
+                "kirocrew-security-conductor",
+            ):
                 assert src.count(reserved) == expected, (
                     f"{module.__name__} respells the reserved set; call "
                     "subagent.visible_agent_names instead"

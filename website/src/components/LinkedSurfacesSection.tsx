@@ -1,3 +1,4 @@
+import { Fragment, useId, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { ApiError, api } from '../api/client'
@@ -9,6 +10,7 @@ import type { ConfiguredChannelTarget, SessionLink } from '../types'
 import { channelBrandLabel } from '../utils/channelOrigin'
 import { parseErrorCode } from '../utils/errorReport'
 import { ChannelBrandIcon } from './ChannelBrandIcon'
+import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
 import { ContextMenuItem } from './ui/context-menu'
 import { DropdownMenuItem } from './ui/dropdown-menu'
 
@@ -52,6 +54,8 @@ export default function LinkedSurfacesSection({ slotKey, variant }: {
   variant: 'dropdown' | 'context'
 }) {
   const Item = variant === 'context' ? ContextMenuItem : DropdownMenuItem
+  const targetsErrorId = useId()
+  const rowErrorIdPrefix = useId()
   const dispatch = useAppDispatch()
   const slot = useAppSelector(s => s.dashboard.slots.find(x => x.key === slotKey))
   // No synthesized Slack row. The wire emits a Slack row on exactly the condition
@@ -60,17 +64,39 @@ export default function LinkedSurfacesSection({ slotKey, variant }: {
   // thread as connected. Trusting the wire is what keeps the two from disagreeing.
   const links: SessionLink[] = slot?.links ?? []
 
-  const { data: targets } = useQuery({
+  const { data: targets, error: targetsError } = useQuery({
     queryKey: ['channel-targets'],
     queryFn: () => api.channelTargets().then(result => (
       Array.isArray(result) ? result as ConfiguredChannelTarget[] : []
     )),
     refetchInterval: 30_000,
   })
+  const targetsErrorMessage = targetsError
+    ? i18nT('components.linkedSurfacesSection.targets_load_failed')
+    : null
+  const rowErrorId = (channel: string) => (
+    `${rowErrorIdPrefix}-${encodeURIComponent(channel)}`
+  )
 
   const notify = (kind: 'success' | 'error', title: string) => {
     dispatch(addNotification({ ts: String(Date.now()), title, body: '', kind }))
   }
+  // The bell-feed notification is kept as the durable record, but it was the
+  // ONLY report of a write that did not persist — a toast-only failure is the
+  // pattern `errors-use-error-notice` names as a violation. The failure is also
+  // rendered in place, under the row it belongs to, and cleared when that row
+  // is clicked again.
+  const [rowErrors, setRowErrors] = useState<Record<string, string>>({})
+  const failRow = (channel: string, title: string) => {
+    notify('error', title)
+    setRowErrors(prev => ({ ...prev, [channel]: title }))
+  }
+  const clearRow = (channel: string) => setRowErrors(prev => {
+    if (!(channel in prev)) return prev
+    const next = { ...prev }
+    delete next[channel]
+    return next
+  })
   const failure = (e: unknown) => (
     e instanceof Error && e.message
       ? e.message
@@ -98,7 +124,7 @@ export default function LinkedSurfacesSection({ slotKey, variant }: {
     onSuccess: (_r, paused) => dispatch(patchSlotLink({
       key: slotKey, channel: 'slack', patch: { paused },
     })),
-    onError: (e, paused) => notify('error', i18nT(
+    onError: (e, paused) => failRow('slack', i18nT(
       paused
         ? 'components.linkedSurfacesSection.disconnect_failed'
         : 'components.linkedSurfacesSection.connect_failed',
@@ -115,7 +141,7 @@ export default function LinkedSurfacesSection({ slotKey, variant }: {
     onSuccess: (_r, { channel, paused, origin }) => dispatch(patchSlotLink({
       key: slotKey, channel, origin, patch: { paused },
     })),
-    onError: (e, { channel, paused }) => notify('error', i18nT(
+    onError: (e, { channel, paused }) => failRow(channel, i18nT(
       paused
         ? 'components.linkedSurfacesSection.disconnect_failed'
         : 'components.linkedSurfacesSection.connect_failed',
@@ -137,7 +163,7 @@ export default function LinkedSurfacesSection({ slotKey, variant }: {
       }))
       dispatch(patchSlotLink({ key: slotKey, channel: 'slack', patch: { paused: false } }))
     },
-    onError: (e) => notify('error', i18nT('components.linkedSurfacesSection.connect_failed', {
+    onError: (e) => failRow('slack', i18nT('components.linkedSurfacesSection.connect_failed', {
       label: labelFor('slack', 'Slack'), reason: failure(e),
     })),
   })
@@ -160,7 +186,7 @@ export default function LinkedSurfacesSection({ slotKey, variant }: {
       const occupied = e instanceof ApiError
         && e.status === 409
         && parseErrorCode(e.body) === 'conversation_occupied'
-      notify('error', occupied
+      failRow(target.channel_type, occupied
         ? i18nT('components.linkedSurfacesSection.held_elsewhere', { label: target.label })
         : i18nT('components.linkedSurfacesSection.connect_failed', {
           label: target.label, reason: failure(e),
@@ -222,6 +248,7 @@ export default function LinkedSurfacesSection({ slotKey, variant }: {
         // `isPending` froze every sibling while one row was mid-flight, which
         // contradicts rows the design makes independently mutable.
         if (pendingChannel === channel) return
+        clearRow(channel)
         if (channel === 'slack') {
           setSlackDelivery.mutate(connected)
           return
@@ -259,6 +286,7 @@ export default function LinkedSurfacesSection({ slotKey, variant }: {
         : target.unavailable_reason || i18nT('components.linkedSurfacesSection.unavailable'),
       toggle: () => {
         if (pendingChannel === target.channel_type) return
+        clearRow(target.channel_type)
         if (target.channel_type === 'slack') connectSlack.mutate(target.target_id)
         else connectMirror.mutate(target)
       },
@@ -267,9 +295,30 @@ export default function LinkedSurfacesSection({ slotKey, variant }: {
 
   return (
     <>
+      {/* A failed target load must not look like an empty target list: the
+          alert says the read failed. It stays passive inside the menu; its
+          sibling item is the keyboard-reachable hand-off. */}
+      {targetsErrorMessage && (
+        <>
+          <div className="px-2 py-1.5 max-w-[280px]">
+            <ErrorNotice
+              id={targetsErrorId}
+              variant="inline"
+              className="whitespace-normal"
+              message={targetsErrorMessage}
+              testId="linked-surfaces-targets-error"
+            />
+          </div>
+          <ErrorNoticeMenuItem
+            Item={Item}
+            message={targetsErrorMessage}
+            describedBy={targetsErrorId}
+          />
+        </>
+      )}
       {rows.map(row => (
+        <Fragment key={row.key}>
         <Item
-          key={row.key}
           aria-disabled={row.disabledReason ? true : undefined}
           aria-busy={row.pending ? true : undefined}
           className={row.disabledReason ? 'opacity-60' : undefined}
@@ -314,6 +363,28 @@ export default function LinkedSurfacesSection({ slotKey, variant }: {
             ) : null}
           </span>
         </Item>
+        {/* In place, under the row that failed. The alert stays passive inside
+            Radix; the sibling item carries the keyboard-reachable hand-off. */}
+        {rowErrors[row.channel] && (
+          <>
+            <div className="px-2 pb-1.5 max-w-[280px]">
+              <ErrorNotice
+                id={rowErrorId(row.channel)}
+                variant="inline"
+                className="whitespace-normal text-[11px]"
+                message={rowErrors[row.channel]}
+                onDismiss={() => clearRow(row.channel)}
+                testId={`linked-surfaces-error-${row.channel}`}
+              />
+            </div>
+            <ErrorNoticeMenuItem
+              Item={Item}
+              message={rowErrors[row.channel]}
+              describedBy={rowErrorId(row.channel)}
+            />
+          </>
+        )}
+        </Fragment>
       ))}
     </>
   )

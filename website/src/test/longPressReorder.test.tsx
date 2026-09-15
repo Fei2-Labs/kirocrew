@@ -55,6 +55,27 @@ describe('useLongPressReorder', () => {
     expect(start).toHaveBeenCalledTimes(2)
   })
 
+  // A middle- or right-button press must not arm a drag: there is no middle-
+  // or right-drag gesture, so a non-primary press has nothing to reorder. This
+  // was also a suspect for the side-panel middle-click-to-close report, but a
+  // real-browser test ruled it out (with the guard removed, a middle-click
+  // still closed the tab), so this test pins correctness, not that symptom.
+  // Only the primary button reorders.
+  it('does not arm a drag for a non-primary mouse button', () => {
+    const { chip, start } = mount()
+    fireEvent.pointerDown(chip, { pointerType: 'mouse', button: 1, clientX: 10, clientY: 10 })
+    expect(start).not.toHaveBeenCalled()
+    expect(captured!.dragging).toBe(false)
+
+    fireEvent.pointerDown(chip, { pointerType: 'mouse', button: 2, clientX: 10, clientY: 10 })
+    expect(start).not.toHaveBeenCalled()
+
+    // The primary button on the same element still reorders.
+    fireEvent.pointerDown(chip, { pointerType: 'mouse', button: 0, clientX: 10, clientY: 10 })
+    expect(start).toHaveBeenCalledTimes(1)
+    expect(captured!.dragging).toBe(true)
+  })
+
   it('arms a touch drag only after a stationary hold', () => {
     vi.useFakeTimers()
     const { chip, start } = mount()

@@ -37,6 +37,7 @@ from croniter import croniter  # type: ignore[import-untyped]
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.config.loader import ConfigReadError, update_config_locked
 from kiro_crew.config.paths import config_dir
 from kiro_crew.embeddings import make_sync_embed_fn
 from kiro_crew.frontmatter import ONBOARDING_IMPORT, parse_block_scalar_header, split_frontmatter
@@ -47,8 +48,7 @@ from kiro_crew.platform.context import current_context, safe_context_call
 from kiro_crew.security import (
     contains_injection,
     is_sensitive_path,
-    redact_credentials,
-    redact_exfiltration_urls,
+    redact_with_findings,
 )
 from kiro_crew.vector_memory import VectorMemoryStore
 
@@ -892,10 +892,8 @@ def _read_text(
 
 def _sanitize_text(text: str, scan: _Scan) -> str:
     bounded = text[:_MAX_TEXT_CHARS]
-    cleaned, warnings = redact_credentials(bounded)
-    scan.secret_count += len(warnings)
-    cleaned, url_warnings = redact_exfiltration_urls(cleaned)
-    scan.secret_count += len(url_warnings)
+    cleaned, credential_warnings, url_warnings = redact_with_findings(bounded)
+    scan.secret_count += len(credential_warnings) + len(url_warnings)
     return cleaned.strip()
 
 
@@ -1337,8 +1335,7 @@ def _skill_package(
         except UnicodeDecodeError:
             scan.diagnostic("skills", "binary_skill_asset_excluded", unsupported=True)
             return None
-        screened, credential_warnings = redact_credentials(text)
-        screened, url_warnings = redact_exfiltration_urls(screened)
+        screened, credential_warnings, url_warnings = redact_with_findings(text)
         scan.secret_count += len(credential_warnings) + len(url_warnings)
         if credential_warnings or url_warnings or screened != text:
             scan.diagnostic("skills", "credential_bearing_skill")
@@ -2076,11 +2073,16 @@ def _column0_activation_declared(text: str) -> bool:
             return True
         if key != "always":
             continue
-        # Strip whitespace AFTER removing the quotes as well as before. The loader
-        # unquotes with ``str.strip("\"'")`` and its consumers then compare
-        # ``.strip().lower() == "true"``, so ``always: " true "`` activates a skill --
-        # while stripping only on the outside leaves ``" true "`` -> `` true ``, which
-        # matches no truthy word here and let that spelling through the screen.
+        # Strip whitespace AFTER removing the quotes as well as before: the
+        # loader's consumers compare ``.strip().lower() == "true"``, so
+        # ``always: " true "`` activates a skill -- while stripping only on the
+        # outside leaves ``" true "`` -> `` true ``, which matches no truthy
+        # word here and let that spelling through the screen. This run-strip is
+        # deliberately WIDER than the loader's unquote (one matched wrapping
+        # level; see ``frontmatter.FrontmatterDialect.strip_quotes``): every
+        # spelling the loader reads as truthy is run-strip truthy too, so the
+        # divergence only ever detects MORE spellings as activating -- the
+        # fail-closed direction this gate must err on.
         value = raw.strip().strip("\"'").strip().casefold()
         if value in {"1", "true", "yes"} or parse_block_scalar_header(value) is not None:
             return True
@@ -3887,9 +3889,8 @@ def _source_summary(scan: _Scan, *, display_name: str) -> dict[str, Any]:
         "id": scan.source_id,
         # `display_name` is REQUIRED, and deliberately: the caller already holds
         # the resolved registry, so a fallback that looked the name up again would
-        # be a SECOND read of a snapshot that may have changed — the exact
-        # split-read defect three earlier review rounds were about. The plan is
-        # the authority; this function is handed the answer.
+        # be a SECOND read of a snapshot that may have changed — a split-read.
+        # The plan is the authority; this function is handed the answer.
         "name": display_name,
         "root": str(scan.root),
         "user_home": str(scan.user_home),
@@ -4219,9 +4220,16 @@ def _preserve_replaced_json(payload: Any, destination: Path) -> str:
 def _lessons_overlap(incoming: str, existing: str) -> bool:
     """Whether two lesson rules are close enough to treat as the same lesson.
 
-    Mirrors ``VectorMemoryStore.write_lesson``'s own dedupe (substring, then
-    >50% significant-word overlap) so import RECOGNIZES the same collisions --
-    but reports them instead of replacing, which is what that writer would do.
+    Tracks ``VectorMemoryStore.write_lesson``'s own dedupe (substring, then
+    significant-word overlap) so import RECOGNIZES the same collisions -- but
+    reports them instead of replacing, which is what that writer would do.
+
+    The overlap divisor is deliberately the SMALLER word set here, which is
+    stricter than the writer's (that one divides by the larger set, because a
+    false positive there DELETES the stored lesson). Import is merge-only, so a
+    false positive costs at most a skipped foreign directive that the user can
+    still teach by hand -- the conservative direction for a boundary that
+    ingests another agent's instructions.
     """
 
     left = incoming.lower().strip()
@@ -4395,51 +4403,72 @@ def _write_workspace(
         return _WriteOutcome("rejected")
 
     path = data_home / "config.json"
-    data = _load_json_dict(path, fail_closed=True)
-    workspaces = data.get("workspaces")
-    if workspaces is None:
-        workspaces = {}
-        data["workspaces"] = workspaces
-    if not isinstance(workspaces, dict):
-        return _WriteOutcome("conflict")
+    # ONE locked read-modify-write: a raw _load_json_dict + _write_json pair
+    # takes no advisory lock, so a concurrent locked writer (CLI, dashboard)
+    # landing between the read and the atomic write is silently reverted by this
+    # import's whole-document publish.
+    outcome: _WriteOutcome | None = None
 
-    canonical = str(workspace)
-    for existing in workspaces.values():
-        if isinstance(existing, dict):
-            existing_dir = existing.get("dir")
-        elif isinstance(existing, str):
-            existing_dir = existing
-        else:
-            existing_dir = None
-        if not isinstance(existing_dir, str):
-            continue
-        try:
-            if str(Path(existing_dir).expanduser().resolve()) == canonical:
-                return _WriteOutcome("existing")
-        except (OSError, RuntimeError):
-            continue
+    def _mutate(data: dict) -> dict | None:
+        nonlocal outcome
+        workspaces = data.get("workspaces")
+        if workspaces is None:
+            workspaces = {}
+            data["workspaces"] = workspaces
+        if not isinstance(workspaces, dict):
+            outcome = _WriteOutcome("conflict")
+            return None
 
-    base_name = _SAFE_NAME_RE.sub("-", workspace.name).strip("-._").lower()
-    base_name = base_name[:64] or f"imported-{item.source_id}"
-    if base_name not in workspaces:
-        workspaces[base_name] = {"dir": canonical}
-        _write_json(path, data)
-        return _WriteOutcome("imported")
+        canonical = str(workspace)
+        for existing in workspaces.values():
+            if isinstance(existing, dict):
+                existing_dir = existing.get("dir")
+            elif isinstance(existing, str):
+                existing_dir = existing
+            else:
+                existing_dir = None
+            if not isinstance(existing_dir, str):
+                continue
+            try:
+                if str(Path(existing_dir).expanduser().resolve()) == canonical:
+                    outcome = _WriteOutcome("existing")
+                    return None
+            except (OSError, RuntimeError):
+                continue
 
-    # The name is taken by a DIFFERENT directory. Deriving a suffixed name is a
-    # rename, so it now requires the user to have asked for one; a plain skip
-    # reports the collision instead of quietly inventing a name.
-    if strategy != STRATEGY_RENAME:
-        return _WriteOutcome("conflict")
-    for candidate in (
-        f"{base_name}-{item.source_id}"[:64],
-        f"{base_name[:55]}-{item.fingerprint[:8]}",
-    ):
-        if candidate not in workspaces:
-            workspaces[candidate] = {"dir": canonical}
-            _write_json(path, data)
-            return _WriteOutcome("imported", renamed_to=candidate)
-    return _WriteOutcome("conflict")
+        base_name = _SAFE_NAME_RE.sub("-", workspace.name).strip("-._").lower()
+        base_name = base_name[:64] or f"imported-{item.source_id}"
+        if base_name not in workspaces:
+            workspaces[base_name] = {"dir": canonical}
+            outcome = _WriteOutcome("imported")
+            return data
+
+        # The name is taken by a DIFFERENT directory. Deriving a suffixed name
+        # is a rename, so it now requires the user to have asked for one; a
+        # plain skip reports the collision instead of quietly inventing a name.
+        if strategy != STRATEGY_RENAME:
+            outcome = _WriteOutcome("conflict")
+            return None
+        for candidate in (
+            f"{base_name}-{item.source_id}"[:64],
+            f"{base_name[:55]}-{item.fingerprint[:8]}",
+        ):
+            if candidate not in workspaces:
+                workspaces[candidate] = {"dir": canonical}
+                outcome = _WriteOutcome("imported", renamed_to=candidate)
+                return data
+        outcome = _WriteOutcome("conflict")
+        return None
+
+    # stamp_meta=False: this import is merge-only and must not alter any byte
+    # it did not add; a ConfigReadError keeps the old fail_closed contract
+    # (ValueError), which the apply loop maps to a rejected outcome.
+    try:
+        update_config_locked(path, mutate=_mutate, stamp_meta=False)
+    except ConfigReadError as exc:
+        raise ValueError("invalid destination JSON") from exc
+    assert outcome is not None  # every _mutate path sets it
+    return outcome
 
 
 @contextmanager
@@ -4838,12 +4867,20 @@ def _write_schedule(item: _Item, cron_service: Any) -> _WriteOutcome:
 
 def _write_settings(item: _Item, data_home: Path) -> _WriteOutcome:
     path = data_home / "config.json"
-    data = _load_json_dict(path, fail_closed=True)
-    changed = _merge_missing(data, item.payload)
-    if not changed:
-        return _WriteOutcome("existing")
-    _write_json(path, data)
-    return _WriteOutcome("imported")
+    # ONE locked read-modify-write -- see the workspace importer above for why a
+    # raw read+write pair loses concurrent updates.
+    changed = False
+
+    def _mutate(data: dict) -> dict | None:
+        nonlocal changed
+        changed = _merge_missing(data, item.payload)
+        return data if changed else None
+
+    try:
+        update_config_locked(path, mutate=_mutate, stamp_meta=False)
+    except ConfigReadError as exc:
+        raise ValueError("invalid destination JSON") from exc
+    return _WriteOutcome("imported" if changed else "existing")
 
 
 def apply_import(

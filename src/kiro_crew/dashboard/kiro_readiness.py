@@ -152,8 +152,8 @@ def _warn_refused_once(path: str) -> None:
     reason. Every post-spawn failure branch in ``api_models`` logs a WARNING, so a
     reader who greps the log for that endpoint and finds nothing concludes it is
     healthy. A silent refusal here therefore inverts the diagnosis rather than merely
-    withholding it, which is the misdiagnosis reported in issue #4577. An absent line
-    gets read as evidence; it is not. So the refusal must be visible.
+    withholding it. An absent line gets read as evidence; it is not. So the refusal
+    must be visible.
 
     It must ALSO not be visible 570 times an hour. A signed-out gateway with an open
     dashboard polls ``/api/models`` every 8s and ``/api/sessions/usage`` every 30s,
@@ -248,7 +248,7 @@ async def reject_if_kiro_unverified(request: web.Request) -> web.Response | None
     browser-opening spawn), and only these paths pay for the re-probe.
 
     **Backend scope.** The probe asks whether ``kiro-cli`` is installed and
-    signed in. It governs every backend in ``ACP_BACKENDS_KIRO_IDENTITY_STORE``:
+    signed in. It governs every backend in ``host_auth.backends_retired_by_host_logout()``:
     KAS is reached through the authenticated Kiro relay and therefore becomes
     unusable after the same external logout as the Kiro backend. Other adapters
     own different identity stores, and ``kiro-cli`` may not exist on their
@@ -257,7 +257,7 @@ async def reject_if_kiro_unverified(request: web.Request) -> web.Response | None
     Checked BEFORE ``kiro_verified_ready`` on purpose: the point is to skip the
     probe, not to run it and ignore the answer. The probe spawns a subprocess.
     """
-    from kiro_crew.acp.types import ACP_BACKENDS_KIRO_IDENTITY_STORE
+    from kiro_crew.agent_sdk.host_auth import backends_retired_by_host_logout
 
     live_backend = _request_live_acp_backend(request)
     effective_backend = (
@@ -265,7 +265,7 @@ async def reject_if_kiro_unverified(request: web.Request) -> web.Response | None
         if live_backend is not None
         else await asyncio.to_thread(_configured_acp_backend)
     )
-    if effective_backend in ACP_BACKENDS_KIRO_IDENTITY_STORE:
+    if effective_backend in backends_retired_by_host_logout():
         if await kiro_verified_ready(_service(request)):
             _clear_refusal_warning()
             return None

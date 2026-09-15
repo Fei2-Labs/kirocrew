@@ -585,6 +585,30 @@ class TestProjectConfigIsContained:
         store.write_project_config(project, {"main_file": "x.tex"})
         assert secret.read_text(encoding="utf-8") == original
 
+    def test_a_junctioned_config_is_refused(self, project: Path, tmp_path: Path) -> None:
+        """The two tests above skip on Windows, where os.symlink needs
+        SeCreateSymbolicLinkPrivilege -- so the one link type an unprivileged
+        Windows user CAN create had no coverage here at all.
+
+        The link points INSIDE the project on purpose: `safe_child` answers "does
+        this resolve inside the project", and an in-project link satisfies it, so
+        an out-of-project link is refused by containment whether or not the link
+        guard fires and cannot tell the two builds apart. Asserted on
+        `_config_path` rather than `read_project_config`, because reading a
+        directory fails anyway and the outcome would look right while the guard
+        was never consulted.
+
+        A junction is directory-only, so it cannot stand in for the
+        `.papyrus.json -> paper.tex` overwrite the symlink tests cover; what it
+        does is slip past a refusal this module documents as link-type-agnostic.
+        """
+        inside = project / "chapters"
+        inside.mkdir(exist_ok=True)
+        (project / store.PROJECT_CONFIG_FILENAME).unlink(missing_ok=True)
+        make_dir_link(project / store.PROJECT_CONFIG_FILENAME, inside)
+
+        assert store._config_path(project) is None
+
     @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
     def test_an_in_project_config_symlink_cannot_overwrite_the_manuscript(
         self, project: Path
@@ -714,11 +738,11 @@ class TestGitMachineryIsNotDocumentContent:
 class TestASymlinkedProjectEntryIsRefused:
     """`projects/<name>` must be a real directory under `projects_dir`, never a link.
 
-    The containment check used to accept `resolved == projects_dir` (the `resolved
-    != base_resolved` disjunct), and `projects/pwn -> .` satisfied exactly that.
-    The blast radius was total: every OTHER paper became a "child" of the fake
-    project, so `safe_child` resolved `other-paper/main.tex` as an in-project path
-    (cross-project read AND write), and `DELETE /project?name=pwn` ran `rmtree` on
+    A containment check that accepts `resolved == projects_dir` (the `resolved
+    != base_resolved` disjunct) is satisfied by `projects/pwn -> .`, and the blast
+    radius is total: every OTHER paper becomes a "child" of the fake project, so
+    `safe_child` resolves `other-paper/main.tex` as an in-project path
+    (cross-project read AND write), and `DELETE /project?name=pwn` runs `rmtree` on
     the projects ROOT — destroying every paper the user had.
     """
 

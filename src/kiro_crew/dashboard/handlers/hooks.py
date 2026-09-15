@@ -51,16 +51,16 @@ def _get_hook_store(state: DashboardState):
 def _store_failure_guard(handler):
     """Map a webhook/script-hook store failure to 503 instead of a 500.
 
-    Every store this module touches can now REFUSE rather than silently report an
+    Every store this module touches can REFUSE rather than silently report an
     empty file: reads raise ``WebhookStoreUnreadable`` when the file exists but
     cannot be parsed, and the shared ``hooks.json`` write refuses rather than
     erasing the webhook contexts stored alongside the script hooks. Writes can also
     fail outright on a full or read-only disk (``OSError``).
 
-    Those refusals were being caught one handler at a time, a round of review each.
-    Applying one wrapper to every store-touching handler closes the class: a
-    handler that already returns a more specific 503 still does (its own guard runs
-    first), and anything that would otherwise escape as an unhandled 500 — which
+    One wrapper on every store-touching handler closes the class rather than
+    catching those refusals a handler at a time: a handler that already returns a
+    more specific 503 still does (its own guard runs first), and anything that
+    would otherwise escape as an unhandled 500 — which
     reads to the operator as a gateway fault rather than "your store needs
     repair" — becomes the shared, machine-readable response.
     """
@@ -105,11 +105,11 @@ async def api_kiro_hooks(request: web.Request) -> web.Response:
     # ``kirocrew.json`` lives in the user-writable, tool-shared agents dir, so
     # the read goes through the hardened agents-dir reader (size cap, symlink
     # and sensitive-target screens, explicit UTF-8, non-object rejection).
-    # ``None`` covers every case the old ``except (OSError, JSONDecodeError)``
-    # caught — plus the ones it missed, e.g. non-UTF-8 bytes, which previously
-    # escaped as an unhandled 500 — and degrades the same way: no user hooks.
+    # ``None`` covers every unreadable case, including the ones an
+    # ``except (OSError, JSONDecodeError)`` misses (e.g. non-UTF-8 bytes, which
+    # would escape as an unhandled 500), and degrades one way: no user hooks.
     # Off-loop: the reader stats + reads up to the size cap, and this handler
-    # runs on the gateway event loop (review-adopted, no-blocking-call rule).
+    # runs on the gateway event loop (no-blocking-call rule).
     # The labels are passed explicitly: they name the SEL denial event's
     # operation and interface channel, and without them a refusal here is
     # recorded under the reader's ``list_agents`` defaults -- attributing a
@@ -211,7 +211,7 @@ async def api_hooks_create(request: web.Request) -> web.Response:
     except _StoreUnavailable:
         return _store_unavailable_response()
     except ValueError as exc:
-        # store.create now enforces the same invariants as store.update via the
+        # store.create enforces the same invariants as store.update via the
         # shared validator, so it can raise ValueError. The HOOK_CREATE_SCHEMA
         # check above normally rejects bad input first, but catch it here too so
         # any schema/validator drift surfaces as a 400 (like the update handler)
@@ -615,7 +615,7 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
     try:
         switch_on = await asyncio.to_thread(webhooks.token_store().is_switch_on)
     except webhooks.WebhookStoreUnreadable:
-        # The store exists but cannot be parsed. Reads now fail closed rather
+        # The store exists but cannot be parsed. Reads fail closed rather
         # than reporting an empty store, so answer with the same 503 shape an
         # operator-disabled endpoint uses instead of letting the exception
         # become an unhandled 500. Deliberately not recorded to the run store:
@@ -1042,17 +1042,39 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
     return web.json_response({"status": "accepted", "sessionKey": session_key})
 
 
+# The permission-request event kind, spelled locally: the agent-sdk-boundary
+# gate forbids ADDING an ACP/providers import edge in application code, and
+# kiro_crew.agent_sdk does not re-export the event vocabulary yet, so naming
+# the wire constant here would grow exactly the edge the gate ratchets down.
+# The spelling is pinned against the source of truth by the regression tests,
+# which compare it to the real event object's kind.
+_EVENT_PERMISSION_REQUEST_KIND = "permission_request"
+
+
 async def _run_hook_inner(
     state: DashboardState, session_key: str, message: str, agent: str | None
 ) -> str:
     """Inner agent turn — called within timeout wrapper."""
+    from kiro_crew import name_grant
+    from kiro_crew.context import _neutralize_structural_markers, session_store_for_turn
+    from kiro_crew.hooks import (  # noqa: F811  # circular import
+        TOOL_AUTO_APPROVE,
+        TOOL_DENY,
+        identity_grant_covers_child,
+    )
     from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK  # noqa: F811
 
+    memory_store = await session_store_for_turn(state.context_builder, session_key)
     client, is_new, resumed = await state.sessions.get_or_create(session_key, agent=agent)
     from kiro_crew.providers.acp import provider_label
 
     runtime_provider = provider_label(client)
     full_message = message
+    # The ContextBuilder prompt is the only text on this path that legitimately
+    # MINTS structural boundary markers, so it is the one text the scrub below
+    # must leave byte-exact. Identity, not equality: a prompt rebuilt by any
+    # future step is a different object and is treated as untrusted.
+    trusted_prompt: str | None = None
     if is_new and state.context_builder:
         # Off-loop: build_message embeds the episodic query (blocking urllib).
         full_message, _ = await run_in_embed_pool(
@@ -1062,8 +1084,21 @@ async def _run_hook_inner(
             session_key,
             agent=agent,
             resumed=resumed,
-            provider_type=runtime_provider,
+            provider_type=KiroCrewConfig.load().agent.provider,
+            memory_store=memory_store,
         )
+        trusted_prompt = full_message
+    if full_message is not trusted_prompt:
+        # ``message`` is supplied by an external caller of /api/hooks/agent, and
+        # ContextBuilder.build_message is the only code that neutralizes forgeable
+        # boundary markers in it. It runs on the new-session branch alone, so a
+        # reused session would hand a forged ``[END OF SESSION CONTEXT]`` /
+        # ``[CURRENT USER REQUEST ...]`` pair to the model verbatim. The scrub sits
+        # at the last statement before the stream, and covers everything the
+        # builder did not produce, so a branch added above cannot route around it.
+        # Off-loop like the dashboard's sibling seam: the restored-context prefix
+        # ``_run_hook_agent`` prepends is not bounded by _HOOK_MESSAGE_MAX_LEN.
+        full_message = await asyncio.to_thread(_neutralize_structural_markers, full_message)
     result_text = ""
     _complete_event: object | None = None
     # Wall clock for the webhook agent turn: acp leaves TurnUsage.duration_ms
@@ -1073,6 +1108,139 @@ async def _run_hook_inner(
     async for event in client.stream(full_message):
         if event.kind == EVENT_TEXT_CHUNK:
             result_text += event.text
+        elif event.kind == _EVENT_PERMISSION_REQUEST_KIND:
+            # Webhook turns are headless and their payload is untrusted
+            # external input, so the default is DENY. An unanswered request
+            # stalls the provider until the _run_hook_agent timeout fires and
+            # the watchdog reports the turn as cancelled by the user. Route
+            # the request through the same hook gate every other headless
+            # runner uses (task_planner, llm_helpers, subagent_manager) and
+            # approve ONLY on the gate's affirmative TOOL_AUTO_APPROVE:
+            # TOOL_ALLOW means "ask the user" on interactive surfaces, and
+            # with no approver here it fails closed.
+            decision = None
+            deny_error = "no_hook_store"
+            hooks_gate = getattr(state.context_builder, "hooks", None)
+            if hooks_gate is not None:
+                try:
+                    decision = hooks_gate.on_tool_call(
+                        event.title,
+                        session_key=session_key,
+                        agent=agent or "",
+                        tool_kind=event.tool_kind,
+                        raw_params=event.raw_tool_params,
+                        diff_path=event.diff_path,
+                        command=event.shell_command,
+                        is_shell=event.is_shell,
+                        mcp_server_name=event.mcp_server_name,
+                        mcp_tool_name=event.tool_name,
+                        mcp_identity_trusted=event.mcp_identity_trusted,
+                    )
+                except Exception:
+                    # A raising gate must not leave the request unanswered --
+                    # an unanswered request is the exact stall this branch
+                    # exists to fix. No verdict is no positive authorization.
+                    logger.exception("webhook hook gate failed for %s", session_key)
+                    decision = None
+                    deny_error = "gate_error"
+                else:
+                    deny_error = (
+                        "hook_deny" if decision.action == TOOL_DENY else "no_interactive_approver"
+                    )
+            approve = False
+            if decision is not None and decision.action == TOOL_AUTO_APPROVE:
+                approve = True
+                if event.child_low_fidelity and not identity_grant_covers_child(decision, event):
+                    # A backend-child request whose security context is
+                    # unverified: every hook auto-approve except the
+                    # identity-keyed grant read the forgeable, agent-authored
+                    # title, so the dashboard runner and the subagent manager
+                    # both downgrade it. Headless there is no approval card to
+                    # downgrade to, so the downgrade is deny.
+                    approve = False
+                    deny_error = "child_low_fidelity"
+            if approve:
+                # An auto-approve tier is a statement about a PROGRAM name,
+                # and the shell re-resolves that name through a PATH that can
+                # lead with agent-writable directories. Verify it
+                # unconditionally, as every name-grant surface does at the
+                # point of honour; with no approver to downgrade to, a
+                # withheld grant denies (same as llm_helpers headless).
+                _ng_refusal = await name_grant.refusal_for_event(event)
+                if _ng_refusal is not None:
+                    logger.warning(
+                        "declining a webhook hook auto-approve: %s",
+                        _ng_refusal.log_text,
+                    )
+                    name_grant.log_decline(
+                        source="webhook",
+                        session_key=session_key,
+                        agent=agent or "kirocrew",
+                        event=event,
+                        refusal=_ng_refusal,
+                        tier="hook_auto_approve",
+                        sel_factory=_sel,
+                    )
+                    approve = False
+                    deny_error = "name_grant_headless_reject"
+            if approve:
+                # Audit-or-deny: this surface runs unattended, so an
+                # auto-approve that cannot be audited must not run.
+                # critical=True writes synchronously and re-raises on a
+                # filesystem failure; audit BEFORE the wire call so a
+                # transport failure cannot skip the audit either (the stated
+                # invariant in llm_helpers / backend-security-controls).
+                try:
+                    # critical=True writes synchronously (open/write/flush)
+                    # and this is the branch's common path: off-loop it so an
+                    # SEL disk stall cannot pause every gateway task.
+                    await asyncio.to_thread(
+                        functools.partial(
+                            _sel().log_tool_invocation,
+                            session_key=session_key,
+                            agent=agent or "kirocrew",
+                            tool_name=event.title or "unknown",
+                            tool_kind=event.tool_kind,
+                            outcome="auto_approved",
+                            source="webhook",
+                            request_id=str(event.request_id),
+                            critical=True,
+                        )
+                    )
+                except Exception:
+                    logger.exception("webhook auto-approve audit failed; denying %s", session_key)
+                    # The decision itself must not vanish from SEL: hand the
+                    # denial to the ordinary (batched) writer best-effort,
+                    # naming the audit failure as the reason.
+                    try:
+                        _sel().log_tool_invocation(
+                            session_key=session_key,
+                            agent=agent or "kirocrew",
+                            tool_name=event.title or "unknown",
+                            tool_kind=event.tool_kind,
+                            outcome="denied",
+                            source="webhook",
+                            request_id=str(event.request_id),
+                            error="audit_write_failed",
+                        )
+                    except Exception:
+                        logger.debug("denial record after audit failure also failed", exc_info=True)
+                    await client.reject_tool(event.request_id)
+                else:
+                    await client.approve_tool(event.request_id)
+            else:
+                # Audit the denial BEFORE rejecting, for the same reason.
+                _sel().log_tool_invocation(
+                    session_key=session_key,
+                    agent=agent or "kirocrew",
+                    tool_name=event.title or "unknown",
+                    tool_kind=event.tool_kind,
+                    outcome="denied",
+                    source="webhook",
+                    request_id=str(event.request_id),
+                    error=deny_error,
+                )
+                await client.reject_tool(event.request_id)
         elif event.kind == EVENT_COMPLETE:
             _complete_event = event
             break
@@ -1324,8 +1492,8 @@ def _public_runs(runs: list[dict]) -> list[dict]:
     rendered on the dashboard, turning the run list into a disclosure surface.
 
     The record-time pass over ``name`` is not sufficient on its own: it runs only
-    the exfil-URL pass, covers just that one field, and cannot retroactively
-    clean rows written before this existed. Redacting on egress applies both
+    the exfil-URL pass, covers just that one field, and cannot clean a row
+    already on disk. Redacting on egress applies both
     passes to every field, on every read, which is the same discipline
     ``_list_hook_contexts`` already follows for the context list.
     """

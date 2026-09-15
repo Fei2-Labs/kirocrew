@@ -34,6 +34,7 @@ from kiro_crew.acp.client import (
     parse_slash_command,
 )
 from kiro_crew.acp.liveness import (
+    EVIDENCE_SAMPLING,
     VERDICT_DEAD,
     VERDICT_UNKNOWN,
     VERDICT_WORKING,
@@ -47,6 +48,7 @@ from kiro_crew.acp.types import (
     JSONRPC_METHOD_NOT_FOUND,
     AcpPromptStats,
 )
+from kiro_crew.agent_sdk import host_auth
 
 # Windows lacks os.killpg and POSIX process-tree APIs (ps, /proc).
 # Tests that exercise these paths are skipped on Windows.
@@ -352,10 +354,9 @@ class TestAcpClientToolHooks:
     async def test_pre_fire_redacts_credential_in_tool_input(self, monkeypatch):
         """Pre-fire MUST redact tool_input before handing it to the hook engine.
 
-        Regression for review-bot security-controls: tool_event.tool_input
-        is LLM-generated and was passed to user hook scripts RAW. It must be
-        redacted (credentials + exfil URLs) first, mirroring the Post path. A JSON
-        string is used because fire_tool_hooks json.loads the input; the marker
+        tool_event.tool_input is LLM-generated. It must be redacted (credentials +
+        exfil URLs) before reaching user hook scripts, mirroring the Post path. A
+        JSON string is used because fire_tool_hooks json.loads the input; the marker
         keeps it valid JSON so the parsed value reaching store.fire is redacted.
         """
         store = self._Store()
@@ -375,11 +376,11 @@ class TestAcpClientToolHooks:
     async def test_pre_fire_redacts_credential_in_dict_tool_input(self, monkeypatch):
         """A DICT tool_input containing a credential MUST also be redacted.
 
-        Regression for review-bot security-controls: the isinstance(str)
-        guard bypassed redaction for dict/list inputs, so LLM-generated dict inputs
-        reached user hook scripts RAW. Non-str inputs are now serialized to JSON,
-        redacted, and passed as a redacted JSON string (fire_tool_hooks json.loads
-        it, yielding a redacted parsed value at store.fire).
+        An isinstance(str) guard would bypass redaction for dict/list inputs, so
+        LLM-generated dict inputs could reach user hook scripts RAW. Non-str inputs
+        are serialized to JSON, redacted, and passed as a redacted JSON string
+        (fire_tool_hooks json.loads it, yielding a redacted parsed value at
+        store.fire).
         """
         store = self._Store()
         monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)
@@ -398,10 +399,9 @@ class TestAcpClientToolHooks:
     async def test_pre_fire_uses_unknown_tool_name_when_title_none(self, monkeypatch):
         """A title-less tool_call MUST fire with tool_name 'unknown' (Post parity).
 
-        Regression for the Pre path passed tool_event.title (which may
-        be None) while the Post path recovers a name and falls back — the Pre path
-        now applies the same 'unknown' fallback so a hook matcher sees a consistent
-        name across Pre and Post.
+        tool_event.title may be None. The Pre path applies the same 'unknown'
+        fallback the Post path uses, so a hook matcher sees a consistent name
+        across Pre and Post.
         """
         store = self._Store()
         monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)
@@ -417,9 +417,8 @@ class TestAcpClientToolHooks:
         """A tool_result whose tool_call_id is absent from _observed_tool_calls
         MUST fire Post with tool_name 'unknown' (Pre parity), not '' (empty string).
 
-        Regression for the Post path previously used a ("", "")
-        default tuple, so a missing/unrecorded tool_call resolved to an empty
-        tool_name — inconsistent with the Pre path's 'unknown' fallback.
+        A ("", "") default tuple would resolve a missing/unrecorded tool_call to an
+        empty tool_name, inconsistent with the Pre path's 'unknown' fallback.
         """
         store = self._Store()
         monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)
@@ -469,12 +468,11 @@ class TestAcpClientToolHooks:
     async def test_read_prompt_response_update_fires_hooks(self, monkeypatch):
         """send_message -> _read_prompt_response (worker-pool path) fires hooks.
 
-        Regression for worker-pool subagents (knowledge/llm_pool)
-        drive tools through send_message -> _read_prompt_response, not the stream
-        _dispatch_events. Its update branch must fire Pre+Post hooks so those
-        clients reach hook parity — the live gateway test caught an llm_pool
-        worker's auto-approved @builder-mcp/ReadInternalWebsites call firing NO
-        hook because this path was uninstrumented.
+        Worker-pool subagents (knowledge/llm_pool) drive tools through
+        send_message -> _read_prompt_response, not the stream _dispatch_events. Its
+        update branch must fire Pre+Post hooks so those clients reach hook parity:
+        otherwise an llm_pool worker's auto-approved @builder-mcp/ReadInternalWebsites
+        call fires NO hook.
         """
         store = self._Store()
         monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)
@@ -901,10 +899,10 @@ class TestAcpClientSessionKey:
 class TestSpawnStderrDrainCleanup:
     """_spawn's background stderr-drain task must not outlive a mocked spawn.
 
-    Guards the leak in issue #2485: _spawn starts _drain_stderr over
-    self._process.stderr, a mock process has a truthy stderr, and a spawn test
-    that never stops the client leaves the task alive. Its exception is later
-    reported against an unrelated test on the same worker.
+    _spawn starts _drain_stderr over self._process.stderr, a mock process has a
+    truthy stderr, and a spawn test that never stops the client leaves the task
+    alive. Its exception is later reported against an unrelated test on the same
+    worker.
     """
 
     @pytest.mark.asyncio
@@ -999,7 +997,7 @@ async def test_bound_client_session_cwd_is_read_off_the_descriptor(tmp_path, mon
 async def test_bound_client_session_cwd_fails_rather_than_handing_over_the_spelling(
     tmp_path, monkeypatch
 ):
-    """A workspace that no longer names the bound identity is not a fallback."""
+    """A workspace that does not name the bound identity is not a fallback."""
     client = AcpClient(work_dir=tmp_path)
     client._bound_workspace_fd = 82
     client._spawn_work_dir = str(tmp_path)
@@ -1193,17 +1191,17 @@ class TestAcpClientBackendSelection:
     ):
         """The reported directories must come from the search's own environment.
 
-        The diagnostic used to recompute ``known_kiro_cli_dirs`` from a FRESH
-        read of ``os.environ`` after resolution had already failed. A PATH change
+        Recomputing ``known_kiro_cli_dirs`` from a FRESH read of ``os.environ``
+        after resolution has already failed is what breaks it: a PATH change
         landing in that window -- a concurrent installer, a self-update, anything
         editing the gateway's environment -- makes the message name directories
         that were never searched and omit ones that were, which is the opposite
         of what a "not found (searched ...)" line is for.
 
-        #5048 gave the Claude adapter this guarantee by caching the search path
+        The Claude adapter holds the same guarantee by caching the search path
         with the resolution result (see
         ``test_spawn_claude_missing_bin_reports_the_cached_search_path``); this
-        pins the same property for the Kiro sibling it left recomputing.
+        pins it for the Kiro sibling.
         """
         from kiro_crew.acp import client as client_mod
 
@@ -1750,7 +1748,7 @@ class TestMiseWhich:
 
 
 class TestAcpClientStaleTurn:
-    """Regression for the stale-turn false-positive on the thinking path.
+    """The stale-turn check does not fire falsely on the thinking path.
 
     The staleness check in ``_prompt_loop`` must fold in ``_last_activity``
     (refreshed by the stderr drain when the agent streams ``thinking_tokens``)
@@ -2422,6 +2420,171 @@ class TestAcpClientStaleTurnOracleGate:
         assert tracked._log_traceback is False
 
 
+class TestStaleTurnOpenToolCall:
+    """An OPEN tool call defers the stale-turn cutoff.
+
+    Only kiro-cli streams ``tool_call_update`` progress frames while a tool
+    runs; a third-party backend that runs a tool to completion and only then
+    reports the result is silent for the whole tool. Text streamed before the
+    dispatch leaves ``_stale_eligible`` set, and off Linux the liveness oracle
+    can only answer UNKNOWN, so the cutoff declared that turn complete and tore
+    it down MID-TOOL. An open tool call is positive evidence the turn is alive:
+    the silence is handed to the tool-stall watchdog, which owns a much longer
+    budget and RECOVERS the slot instead of reporting a truncated turn as done.
+    """
+
+    def _silent_client(self, tmp_path, *, tool_dispatched: bool):
+        client = AcpClient(work_dir=tmp_path)
+        client._read_message = AsyncMock(return_value=None)
+        client._is_process_alive = MagicMock(return_value=True)
+        client._stale_eligible = True
+        client._tool_dispatched = tool_dispatched
+        client._last_activity = time.monotonic()
+        # The verdict every /proc-less host returns — the reporter's own log line.
+        client._consult_liveness_model_wait = AsyncMock(
+            return_value=(VERDICT_UNKNOWN, "no readable counters")
+        )
+        return client
+
+    @pytest.mark.asyncio
+    async def test_open_tool_call_defers_the_cutoff(self, tmp_path, caplog, monkeypatch):
+        monkeypatch.setattr(acp_client, "_TOOL_STALL_TIMEOUT", 30.0)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+        client = self._silent_client(tmp_path, tool_dispatched=True)
+
+        t0 = time.monotonic()
+        with patch("kiro_crew.acp.client._STALE_TURN_TIMEOUT", 0.05):
+            with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+                actions = []
+                async for action, _msg in client._prompt_loop(req_id=85, timeout=0.4):
+                    actions.append(action)
+        elapsed = time.monotonic() - t0
+
+        assert actions == []
+        assert "Stale turn detected" not in caplog.text
+        assert elapsed >= 0.3, f"loop exited at {elapsed:.2f}s — the cutoff reaped an open tool"
+
+    @pytest.mark.asyncio
+    async def test_a_resolved_tool_re_arms_the_cutoff(self, tmp_path, caplog, monkeypatch):
+        """Deferral is not a disarm: once the tool resolves, the cutoff fires."""
+        monkeypatch.setattr(acp_client, "_TOOL_STALL_TIMEOUT", 30.0)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+        client = self._silent_client(tmp_path, tool_dispatched=True)
+
+        async def _resolve_then_stay_silent(*_args, **_kwargs):
+            await asyncio.sleep(0.02)
+            # What _dispatch_events does when the tool's result frame arrives.
+            client._tool_dispatched = False
+            return None
+
+        client._read_message = AsyncMock(side_effect=_resolve_then_stay_silent)
+
+        with patch("kiro_crew.acp.client._STALE_TURN_TIMEOUT", 0.05):
+            with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+                actions = []
+                async for action, _msg in client._prompt_loop(req_id=86, timeout=5.0):
+                    actions.append(action)
+
+        assert actions == []
+        assert "Stale turn detected" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_stalled_open_tool_is_still_killed(self, tmp_path, monkeypatch):
+        """The deferral must not swallow the tool-stall watchdog.
+
+        Past ITS budget the wedged child is killed and AcpProcessDied raised, so
+        the slot cold-starts on the next prompt — the recovery the bare stale
+        ``return`` never performed.
+        """
+        monkeypatch.setattr(acp_client, "_TOOL_STALL_TIMEOUT", 0.1)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+        client = self._silent_client(tmp_path, tool_dispatched=True)
+        client._kill_process = AsyncMock()
+
+        with patch("kiro_crew.acp.client._STALE_TURN_TIMEOUT", 0.05):
+            with pytest.raises(AcpProcessDied, match="tool stalled"):
+                async for _action, _msg in client._prompt_loop(req_id=87, timeout=5.0):
+                    pass
+
+        client._kill_process.assert_awaited_once()
+
+
+class TestStaleTurnProbeAccounting:
+    """The stale cutoff must measure BACKEND silence, not our own probe.
+
+    Two ways the gate can end a live turn on no evidence at all:
+
+    * the idle clock was read AFTER awaiting the liveness consult, so a cold
+      walk's latency (executor warm-up plus the subtree read) was charged to the
+      backend's silence budget;
+    * the oracle's baseline-priming answer (``EVIDENCE_SAMPLING``) counted as a
+      negative verdict, although it is structurally incapable of reading WORKING
+      -- it means "ask me again", not "idle".
+
+    Together they reaped a turn on its FIRST silent read, which is the
+    truncation the per-silent-read consulting exists to avoid.
+    """
+
+    def _silent_client(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path)
+        client._read_message = AsyncMock(return_value=None)
+        client._is_process_alive = MagicMock(return_value=True)
+        client._stale_eligible = True
+        client._last_activity = time.monotonic()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_priming_verdict_defers_then_real_evidence_reaps(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+        client = self._silent_client(tmp_path)
+        client._consult_liveness_model_wait = AsyncMock(
+            side_effect=[
+                (VERDICT_UNKNOWN, EVIDENCE_SAMPLING),  # no baseline yet
+                (VERDICT_UNKNOWN, "flat counters"),  # a real answer
+            ]
+        )
+
+        # Cutoff 0 so every silent read is past it: the only thing that can keep
+        # the turn alive on the first read is the priming deferral.
+        with patch("kiro_crew.acp.client._STALE_TURN_TIMEOUT", 0.0):
+            with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+                async for _action, _msg in client._prompt_loop(req_id=88, timeout=5.0):
+                    pass
+
+        assert "Stale turn detected" in caplog.text  # recovery still fires
+        assert (
+            client._consult_liveness_model_wait.await_count == 2
+        ), "the turn was ended on the priming answer instead of on real evidence"
+
+    @pytest.mark.asyncio
+    async def test_consult_latency_is_not_charged_to_the_silence_budget(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """A consult slower than the cutoff must not itself end the turn."""
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.01)
+        client = self._silent_client(tmp_path)
+        consults = {"n": 0}
+
+        async def _slow_consult():
+            consults["n"] += 1
+            await asyncio.sleep(0.15)  # 3x the cutoff patched below
+            return VERDICT_UNKNOWN, "flat counters"
+
+        client._consult_liveness_model_wait = _slow_consult
+
+        with patch("kiro_crew.acp.client._STALE_TURN_TIMEOUT", 0.05):
+            with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+                async for _action, _msg in client._prompt_loop(req_id=89, timeout=5.0):
+                    pass
+
+        assert "Stale turn detected" in caplog.text
+        assert (
+            consults["n"] >= 2
+        ), "the first consult's own 0.15s runtime was counted as backend silence"
+
+
 class TestAcpClientReadMessage:
     @pytest.mark.asyncio
     async def test_read_valid_json(self, tmp_path):
@@ -2487,8 +2650,8 @@ class TestAcpClientReadMessage:
     async def test_read_buffer_overrun_drops_frame_and_keeps_reading(self, tmp_path):
         """A line exceeding the stdout buffer costs that ONE frame, not the turn.
 
-        The stream is NOT corrupted afterwards, contrary to what this call site
-        used to assume: readline() removes the oversize line through its
+        The stream is NOT corrupted afterwards: readline() removes the oversize
+        line through its
         terminating newline (or clears the buffer when the newline has not
         arrived yet) and resumes the transport before raising ValueError. So the
         overrun joins the blank-line and non-JSON paths in returning None, and
@@ -3803,6 +3966,35 @@ class TestEnsureReadyRetryOnAcpError:
         assert call_count == 2
         assert client._session_id == "sess-ok"
         client._kill_process.assert_called_once_with(force=True)
+
+    @pytest.mark.asyncio
+    async def test_retries_spawn_os_error_after_backoff(self, monkeypatch):
+        client = AcpClient()
+        client._work_dir_ready = True
+        spawn_count = 0
+
+        async def fake_spawn():
+            nonlocal spawn_count
+            spawn_count += 1
+            if spawn_count == 1:
+                raise FileNotFoundError("adapter replaced in place")
+            client._process = MagicMock(returncode=None, pid=101)
+
+        async def fake_init():
+            client._session_id = "sess-ok"
+
+        sleep = AsyncMock()
+        client._spawn = fake_spawn
+        client._initialize_session = fake_init
+        client._cleanup_failed_live_spawn = AsyncMock()
+        client._snapshot_process_tree = AsyncMock()
+        monkeypatch.setattr(acp_client.asyncio, "sleep", sleep)
+
+        await client.ensure_ready()
+
+        assert spawn_count == 2
+        sleep.assert_awaited_once_with(acp_client._ACP_RESPAWN_BACKOFF_S)
+        client._cleanup_failed_live_spawn.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_cancel_during_retry_kill_releases_bound_workspace(self, tmp_path, monkeypatch):
@@ -5879,8 +6071,8 @@ class TestBuildPermissionEvent:
     def test_tool_kind_carried_from_toolcall(self):
         # The ACP toolCall carries kind="execute" for Bash; carrying it onto the
         # event lets downstream validation apply the execute-tool exemptions
-        # (e.g. the display-name length cap). Regression for the empty-kind bug
-        # where long bash commands aborted as "User refused permission".
+        # (e.g. the display-name length cap). Without the carried kind a long
+        # bash command aborts as "User refused permission".
         client = AcpClient()
         from kiro_crew.acp.types import JsonRpcMessage
 
@@ -5907,7 +6099,7 @@ class TestBuildPermissionEvent:
         event = client._build_permission_event(msg)
         assert event.tool_kind == ""
 
-    def test_empty_options_stay_empty_and_pending(self):
+    def test_default_options_when_empty(self):
         client = AcpClient()
         from kiro_crew.acp.types import JsonRpcMessage
 
@@ -5917,15 +6109,15 @@ class TestBuildPermissionEvent:
             params={"toolCall": {"title": "rm"}, "options": []},
         )
         event = client._build_permission_event(msg)
-        assert event.options == []
-        assert client._permission_options[10] == {}
+        assert len(event.options) == 2
+        assert event.options[0]["id"] == "allow_once"
 
     @pytest.mark.parametrize("bad_options", [None, "allow", 42, {"id": "allow_once"}])
-    def test_non_list_options_degrade_to_empty_pending_request(self, bad_options):
+    def test_non_list_options_degrade_to_defaults(self, bad_options):
         """The permission payload comes straight from the agent process; a
         non-list options value made the for-loop raise TypeError (or iterate
         dict keys), tearing down the prompt-turn event generator instead of
-        degrading to a cancellable request with no selectable options."""
+        degrading to the default allow options."""
         client = AcpClient()
         from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, JsonRpcMessage
 
@@ -5936,8 +6128,8 @@ class TestBuildPermissionEvent:
         )
         event = client._build_permission_event(msg)  # must not raise
         assert event.kind == EVENT_PERMISSION_REQUEST
-        assert event.options == []
-        assert client._permission_options[12] == {}
+        assert len(event.options) == 2
+        assert event.options[0]["id"] == "allow_once"
 
     @pytest.mark.parametrize("bad_toolcall", [None, "shell", ["x"], 7])
     def test_non_dict_toolcall_degrades_to_unknown(self, bad_toolcall):
@@ -5975,7 +6167,7 @@ class TestBuildPermissionEvent:
             },
         )
         event = client._build_permission_event(msg)  # must not raise
-        assert event.options == [{"id": "allow_once", "label": "Allow once", "kind": "allow_once"}]
+        assert event.options == [{"id": "allow_once", "label": "Allow once"}]
 
     def test_cached_tool_input_used(self):
         client = AcpClient()
@@ -6065,10 +6257,7 @@ class TestBuildPermissionEvent:
             },
         )
         client._build_permission_event(msg)
-        assert client._permission_options[20] == {
-            "allow_once": "allow",
-            "allow_always": "allow_always",
-        }
+        assert client._permission_options[20] == {"once": "allow", "always": "allow_always"}
 
     def test_legacy_kiro_shape_records_optionids(self):
         """Legacy kiro shape (id/label, no kind) is classified by literal id."""
@@ -6088,8 +6277,8 @@ class TestBuildPermissionEvent:
         )
         client._build_permission_event(msg)
         assert client._permission_options[21] == {
-            "allow_once": "allow_once",
-            "allow_always": "allow_always",
+            "once": "allow_once",
+            "always": "allow_always",
         }
 
     def test_reject_option_recorded_even_without_allow(self):
@@ -6111,10 +6300,10 @@ class TestBuildPermissionEvent:
             },
         )
         client._build_permission_event(msg)
-        assert client._permission_options[22].get("reject_once") == "reject_once"
+        assert client._permission_options[22].get("reject") == "reject_once"
 
     def test_plain_reject_id_without_kind_recorded(self):
-        """#7681: a deny-naming id with NO kind (plain "reject"/"deny") must be
+        """A deny-naming id with NO kind (plain "reject"/"deny") must be
         classified as a per-tool reject. Missing it sent reject_tool down the
         ``cancelled`` fallback, which the backend treats as cancelling the
         TURN — every later tool call was auto-denied without prompting."""
@@ -6134,34 +6323,21 @@ class TestBuildPermissionEvent:
                 },
             )
             client._build_permission_event(msg)
-            assert client._permission_options[req_id].get("reject_once") == opt_id, opt_id
+            assert client._permission_options[req_id].get("reject") == opt_id, opt_id
 
     def test_every_deny_vocabulary_value_round_trips(self):
         """Every id in the shared deny table and every deny behavior must be
-        classified by BOTH sites — the event builder (recorded reject option) and
-        the auto-answer path (reject_option_id). Driven by the table itself so a
-        vocabulary addition cannot ship untested.
-
-        The two sites do NOT agree on the persistent ids, and that asymmetry is the
-        point: ``_LEGACY_OPTION_KIND`` maps ``deny_always``/``reject_always`` onto
-        ``reject_always``, and ``reject_option_id`` refuses to select those, because
-        an automatic answer must never make a deny the operator did not choose
-        STICK for the rest of the session. The builder still records them, under the
-        ``reject_always`` key, so nothing is silently dropped. Partitioned by the
-        table rather than listed, so a new persistent id lands on the right side.
-        """
+        recognized by BOTH classification sites — the event builder (recorded
+        reject option) and the auto-answer path (reject_option_id). Driven by
+        the table itself so a vocabulary addition cannot ship untested."""
         from kiro_crew.acp._dispatch import (
             _DENY_BEHAVIORS,
             _DENY_OPTION_IDS,
-            _LEGACY_OPTION_KIND,
             reject_option_id,
         )
         from kiro_crew.acp.types import JsonRpcMessage
 
         assert _DENY_OPTION_IDS, "derived deny-id table must not be empty"
-        persistent = {i for i in _DENY_OPTION_IDS if _LEGACY_OPTION_KIND.get(i) == "reject_always"}
-        assert persistent, "the persistent-deny half of the table must not be empty"
-        assert persistent < set(_DENY_OPTION_IDS), "some deny id must still be one-shot"
         client = AcpClient()
         req_id = 9000
         for opt_id in sorted(_DENY_OPTION_IDS):
@@ -6172,17 +6348,14 @@ class TestBuildPermissionEvent:
                     {"optionId": opt_id, "name": "Deny"},
                 ],
             }
-            sticky = opt_id in persistent
-            # Site 1: the auto-answer path picks a one-shot deny id, and REFUSES a
-            # persistent one rather than answering with it.
-            assert reject_option_id(params) == (None if sticky else opt_id), opt_id
-            # Site 2: the event builder records it either way, keyed by its scope.
+            # Site 1: auto-answer path picks the deny id.
+            assert reject_option_id(params) == opt_id, opt_id
+            # Site 2: event builder records it as the reject option.
             req_id += 1
             client._build_permission_event(
                 JsonRpcMessage(id=req_id, method="session/requestPermission", params=params)
             )
-            key = "reject_always" if sticky else "reject_once"
-            assert client._permission_options[req_id].get(key) == opt_id, opt_id
+            assert client._permission_options[req_id].get("reject") == opt_id, opt_id
         for behavior in sorted(_DENY_BEHAVIORS):
             params = {
                 "toolCall": {"title": "shell"},
@@ -6196,7 +6369,7 @@ class TestBuildPermissionEvent:
             client._build_permission_event(
                 JsonRpcMessage(id=req_id, method="session/requestPermission", params=params)
             )
-            assert client._permission_options[req_id].get("reject_once") == "custom-no", behavior
+            assert client._permission_options[req_id].get("reject") == "custom-no", behavior
 
     def test_contradictory_kind_wins_over_deny_metadata(self):
         """A valid spec `kind` classifies the option ALONE: an option carrying
@@ -6229,7 +6402,7 @@ class TestBuildPermissionEvent:
         assert reject_option_id(params) == "no"
 
     def test_deny_behavior_without_kind_recorded(self):
-        """#7681: an option that speaks ``behavior: "deny"`` instead of
+        """An option that speaks ``behavior: "deny"`` instead of
         ``kind`` is a per-tool reject whatever its id is called. An allow
         behavior must never be classified as a reject."""
         client = AcpClient()
@@ -6247,13 +6420,13 @@ class TestBuildPermissionEvent:
             },
         )
         client._build_permission_event(msg)
-        assert client._permission_options[27].get("reject_once") == "no"
+        assert client._permission_options[27].get("reject") == "no"
         # The allow-behavior option was NOT misread as a reject.
-        assert client._permission_options[27].get("reject_once") != "yes"
+        assert client._permission_options[27].get("reject") != "yes"
 
     @pytest.mark.asyncio
     async def test_reject_with_advertised_deny_never_answers_cancelled(self):
-        """#7681 end-to-end pin: when ANY deny-shaped option was advertised,
+        """End-to-end pin: when ANY deny-shaped option was advertised,
         reject_tool answers a per-tool ``selected`` reject — never the
         turn-cancelling ``cancelled`` outcome."""
         client = AcpClient()
@@ -6296,64 +6469,7 @@ class TestBuildPermissionEvent:
             },
         )
         client._build_permission_event(msg)
-        assert client._permission_options[23] == {}
-
-    def test_v2_command_and_raw_input_match_shared_builder(self):
-        """The client path must accept the same ACP v2 command / rawInput
-        shapes as AcpSessionHandle: both go through build_permission_event.
-        The local builder ignored subject.type==\"command\", skipped rawInput
-        on fallback, and never set raw_params_trusted / shell_classified."""
-        from kiro_crew.acp._dispatch import build_permission_event
-        from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, JsonRpcMessage
-
-        client = AcpClient()
-        command_msg = JsonRpcMessage(
-            id=30,
-            method="session/requestPermission",
-            params={
-                "title": "Run ls",
-                "subject": {
-                    "type": "command",
-                    "command": "ls -la",
-                    "cwd": "/tmp",
-                    "toolCallId": "tc-cmd",
-                },
-                "options": [
-                    {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
-                ],
-            },
-        )
-        raw_input_msg = JsonRpcMessage(
-            id=31,
-            method="session/requestPermission",
-            params={
-                "toolCall": {
-                    "title": "write",
-                    "toolCallId": "tc-ri",
-                    "rawInput": {"path": "/tmp/x", "contents": "hi"},
-                },
-                "options": [{"id": "allow_once", "label": "Allow"}],
-            },
-        )
-
-        client_cmd = client._build_permission_event(command_msg)
-        shared_cmd, _ = build_permission_event(command_msg)
-        assert client_cmd.kind == EVENT_PERMISSION_REQUEST
-        assert client_cmd.is_shell is True
-        assert client_cmd.raw_params_trusted is True
-        assert client_cmd.shell_classified is True
-        assert client_cmd.raw_tool_params == {"command": "ls -la", "cwd": "/tmp"}
-        assert client_cmd.raw_tool_params == shared_cmd.raw_tool_params
-        assert client_cmd.is_shell == shared_cmd.is_shell
-        assert client_cmd.raw_params_trusted == shared_cmd.raw_params_trusted
-        assert client_cmd.shell_classified == shared_cmd.shell_classified
-
-        client_ri = client._build_permission_event(raw_input_msg)
-        shared_ri, _ = build_permission_event(raw_input_msg)
-        assert "/tmp/x" in client_ri.tool_input
-        assert client_ri.raw_tool_params == {"path": "/tmp/x", "contents": "hi"}
-        assert client_ri.raw_tool_params == shared_ri.raw_tool_params
-        assert client_ri.tool_input == shared_ri.tool_input
+        assert 23 not in client._permission_options
 
 
 class TestApproveTool:
@@ -6364,12 +6480,12 @@ class TestApproveTool:
         from kiro_crew.acp.types import OUTCOME_SELECTED
 
         client = AcpClient(work_dir=tmp_path)
-        client._permission_options[42] = {"allow_once": "allow", "allow_always": "allow_always"}
+        client._permission_options[42] = {"once": "allow", "always": "allow_always"}
         client._send_response = AsyncMock()
         await client.approve_tool(42, always=True)
         client._send_response.assert_awaited_once_with(
             42,
-            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "allow"}},
+            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "allow_always"}},
         )
         assert 42 not in client._permission_options
 
@@ -6378,7 +6494,7 @@ class TestApproveTool:
         from kiro_crew.acp.types import OUTCOME_SELECTED
 
         client = AcpClient(work_dir=tmp_path)
-        client._permission_options[43] = {"allow_once": "allow", "allow_always": "allow_always"}
+        client._permission_options[43] = {"once": "allow", "always": "allow_always"}
         client._send_response = AsyncMock()
         await client.approve_tool(43)
         client._send_response.assert_awaited_once_with(
@@ -6387,49 +6503,69 @@ class TestApproveTool:
         )
 
     @pytest.mark.asyncio
-    async def test_no_recorded_option_cancels(self, tmp_path):
-        from kiro_crew.acp.types import OUTCOME_CANCELLED
+    async def test_no_recorded_falls_back_to_literal(self, tmp_path):
+        from kiro_crew.acp.types import (
+            OPTION_ALLOW_ALWAYS,
+            OPTION_ALLOW_ONCE,
+            OUTCOME_SELECTED,
+        )
 
         client = AcpClient(work_dir=tmp_path)
         client._send_response = AsyncMock()
         await client.approve_tool(44)
         client._send_response.assert_awaited_with(
             44,
-            {"outcome": {"outcome": OUTCOME_CANCELLED}},
+            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ONCE}},
         )
         await client.approve_tool(45, always=True)
         client._send_response.assert_awaited_with(
             45,
-            {"outcome": {"outcome": OUTCOME_CANCELLED}},
+            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ALWAYS}},
         )
 
     @pytest.mark.asyncio
-    async def test_unadvertised_explicit_option_cancels_and_consumes(self, tmp_path):
-        from kiro_crew.acp.types import OUTCOME_CANCELLED
+    async def test_explicit_option_id_skips_recorded_pop(self, tmp_path):
+        """Explicit option_id bypasses the recorded entry — defensive retries
+        with a recorded entry left intact still send the explicit id."""
+        from kiro_crew.acp.types import OUTCOME_SELECTED
 
         client = AcpClient(work_dir=tmp_path)
-        client._permission_options[46] = {"allow_once": "allow"}
+        client._permission_options[46] = {"once": "allow", "always": "allow_always"}
         client._send_response = AsyncMock()
         await client.approve_tool(46, option_id="custom_id")
         client._send_response.assert_awaited_with(
             46,
-            {"outcome": {"outcome": OUTCOME_CANCELLED}},
+            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "custom_id"}},
         )
-        assert 46 not in client._permission_options
+        assert client._permission_options[46] == {"once": "allow", "always": "allow_always"}
 
     @pytest.mark.asyncio
-    async def test_reject_only_request_cannot_be_approved(self, tmp_path):
-        from kiro_crew.acp.types import OUTCOME_CANCELLED
+    async def test_reject_only_recorded_falls_back_to_literal_on_approve(self, tmp_path):
+        """A request that advertised only a reject option records {"reject": ...}
+        with no "once"/"always" keys. Approving it must fall back to the canonical
+        allow id rather than KeyError-ing on the missing key."""
+        from kiro_crew.acp.types import (
+            OPTION_ALLOW_ALWAYS,
+            OPTION_ALLOW_ONCE,
+            OUTCOME_SELECTED,
+        )
 
         client = AcpClient(work_dir=tmp_path)
-        client._permission_options[47] = {"reject_once": "reject_once"}
+        client._permission_options[47] = {"reject": "reject_once"}
         client._send_response = AsyncMock()
         await client.approve_tool(47)
         client._send_response.assert_awaited_with(
             47,
-            {"outcome": {"outcome": OUTCOME_CANCELLED}},
+            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ONCE}},
         )
         assert 47 not in client._permission_options
+
+        client._permission_options[48] = {"reject": "reject_once"}
+        await client.approve_tool(48, always=True)
+        client._send_response.assert_awaited_with(
+            48,
+            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ALWAYS}},
+        )
 
 
 class TestRejectTool:
@@ -6443,9 +6579,8 @@ class TestRejectTool:
         from kiro_crew.acp.types import OUTCOME_SELECTED
 
         client = AcpClient(work_dir=tmp_path)
-        # claude-agent-acp advertises optionId "reject" with kind "reject_once";
-        # the map is keyed by KIND, so the id and the key differ here on purpose.
-        client._permission_options[60] = {"allow_once": "allow", "reject_once": "reject"}
+        # claude-agent-acp advertises optionId "reject" with kind "reject_once"
+        client._permission_options[60] = {"once": "allow", "reject": "reject"}
         client._send_response = AsyncMock()
         await client.reject_tool(60)
         client._send_response.assert_awaited_once_with(
@@ -6461,10 +6596,7 @@ class TestRejectTool:
         from kiro_crew.acp.types import OUTCOME_CANCELLED
 
         client = AcpClient(work_dir=tmp_path)
-        client._permission_options[61] = {
-            "allow_once": "allow_once",
-            "allow_always": "allow_always",
-        }
+        client._permission_options[61] = {"once": "allow_once", "always": "allow_always"}
         client._send_response = AsyncMock()
         await client.reject_tool(61)
         client._send_response.assert_awaited_once_with(
@@ -7428,6 +7560,93 @@ class TestExtractToolCallUpdate:
         assert event is not None
         assert "ls output here" in event.tool_output
 
+    def test_flat_raw_output_is_not_read_as_no_output(self):
+        """A captured KAS completion whose only carrier is a flat ``rawOutput``.
+
+        Mirrors ``_dispatch._build_tool_result_event``'s third path. Returning
+        None here also leaves the stall watchdog armed and PostToolUse unfired,
+        so the dropped event costs more than the transcript text.
+        """
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-kas",
+                "status": "completed",
+                "rawOutput": {"kind": "notEnabled", "retracted": False},
+            }
+        )
+        event = client._extract_tool_call_update(msg)
+        assert event is not None
+        assert event.tool_call_id == "tc-kas"
+        assert event.tool_final is True
+        assert "notEnabled" in event.tool_output
+
+    def test_flat_raw_output_loses_to_a_content_block(self):
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-kas2",
+                "status": "completed",
+                "content": [{"content": {"type": "text", "text": "real output"}}],
+                "rawOutput": {"output": "real output", "exitCode": 0},
+            }
+        )
+        event = client._extract_tool_call_update(msg)
+        assert event is not None
+        assert event.tool_output == "real output"
+        assert "exitCode" not in event.tool_output
+
+    def test_empty_items_envelope_still_returns_none(self):
+        """The gate is the ABSENCE of ``items``, so kiro-cli's space is unchanged."""
+        client = self._client()
+        for shape in ({"items": []}, {"items": [{"Text": ""}]}, {}):
+            msg = self._make_msg(
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-empty",
+                    "status": "completed",
+                    "rawOutput": shape,
+                }
+            )
+            assert client._extract_tool_call_update(msg) is None, shape
+
+    def test_credential_straddling_the_bound_is_still_redacted(self):
+        """The 8000-char bound must be applied AFTER redaction, not before.
+
+        A cut taken first splits a connection URI into fragments the credential
+        prefilter (``://user:pass@``) does not match: the head slice keeps
+        ``://admin:<password>`` and drops the ``@``, so the password would reach
+        the dashboard in clear text. The padding here puts the ``@`` exactly on
+        byte 8000 of the serialised output, which is the worst case.
+        """
+        import json as _json
+
+        secret = "sUp3rS3cr3tPassw0rd"
+        uri = f"postgres://admin:{secret}@db.internal:5432/prod"
+        pad = 7900
+        while True:
+            raw = {"pad": "A" * pad, "conn": uri}
+            if _json.dumps(raw, default=str).index("@") >= 8000:
+                break
+            pad += 1
+        assert _json.dumps(raw, default=str).index("@") == 8000
+
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-cred",
+                "status": "completed",
+                "rawOutput": raw,
+            }
+        )
+        event = client._extract_tool_call_update(msg)
+        assert event is not None
+        assert secret not in event.tool_output
+        assert len(event.tool_output) <= 8000
+
     def test_raw_output_json_fallback(self):
         client = self._client()
         msg = self._make_msg(
@@ -7591,6 +7810,328 @@ class TestExtractToolCallUpdate:
         msg = JsonRpcMessage(params=None)
         assert client._extract_tool_call_update(msg) is None
 
+    def test_bare_text_block_in_content_is_accepted(self):
+        # ACP wraps the ContentBlock: {"type": "content", "content": {...}}.
+        # Real backends also send the ContentBlock BARE, which is unambiguous —
+        # dropping it left the dashboard with nothing and it fell through to
+        # "No input or output captured for this tool call."
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-bare",
+                "content": [{"type": "text", "text": "bare block output"}],
+            }
+        )
+        event = client._extract_tool_call_update(msg)
+        assert event is not None
+        assert "bare block output" in event.tool_output
+
+    def test_unrenderable_content_entries_are_logged_with_shape(self, caplog):
+        # An unknown entry shape must not vanish with no diagnostic anywhere, or
+        # the backend author has no way to see the mismatch. One warning naming
+        # the shape — TYPE and KEY names only, never a value: this lands in the
+        # log ring /api/logs serves and a tool result can carry a credential.
+        import logging
+
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-unknown",
+                "content": [{"type": "resource_link", "uri": "file:///etc/secret.txt"}],
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.acp.client"):
+            assert client._extract_tool_call_update(msg) is None
+        hits = [r.getMessage() for r in caplog.records if "could be rendered" in r.getMessage()]
+        assert len(hits) == 1
+        assert "resource_link" in hits[0]
+        assert "secret.txt" not in hits[0]
+
+    def test_content_free_frame_is_not_warned_about(self, caplog):
+        # claude-agent-acp emits an initial tool_call with neither rawInput nor
+        # content and refines it later; warning on that would fire on every
+        # tool call of a healthy backend.
+        import logging
+
+        client = self._client()
+        msg = self._make_msg({"sessionUpdate": "tool_call_update", "toolCallId": "tc-quiet"})
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.acp.client"):
+            assert client._extract_tool_call_update(msg) is None
+        assert [r for r in caplog.records if "could be rendered" in r.getMessage()] == []
+
+
+# ── non-canonical tool-call content shapes on the dispatch path ──
+
+
+class TestDispatchToolResultContentShapes:
+    """`_build_tool_result_event` walks the same `content` array as
+    `AcpClient._extract_tool_call_update`, so it must be equally lenient —
+    a backend's shape is not a function of which of the two loops read it."""
+
+    def test_bare_text_block_in_content_is_accepted(self):
+        from kiro_crew.acp._dispatch import _build_tool_result_event
+
+        event = _build_tool_result_event(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-bare-dispatch",
+                "content": [{"type": "text", "text": "bare on the dispatch path"}],
+            }
+        )
+        assert event is not None
+        assert "bare on the dispatch path" in event.tool_output
+
+    def test_unrenderable_content_entries_are_logged_with_shape(self, caplog):
+        import logging
+
+        from kiro_crew.acp._dispatch import _build_tool_result_event
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.acp._dispatch"):
+            assert (
+                _build_tool_result_event(
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tc-unknown-dispatch",
+                        "content": [{"kind": "text", "value": "wrong key names"}],
+                    }
+                )
+                is None
+            )
+        hits = [r.getMessage() for r in caplog.records if "could be rendered" in r.getMessage()]
+        assert len(hits) == 1
+        assert "kind" in hits[0]
+        assert "wrong key names" not in hits[0]
+
+    def test_shape_diagnostics_and_tool_id_are_redacted(self, caplog):
+        """The warning lands in the ``/api/logs`` ring, which outlives the
+        transcript's own redaction. ``type`` and the tool id are frame-supplied
+        VALUES, not just key names, so a hostile or careless backend can put a
+        credential in either -- both must be scrubbed before they are logged."""
+        import logging
+
+        from kiro_crew.acp._dispatch import _build_tool_result_event
+
+        # Split so this file holds no literal-looking key; matches
+        # (?:AKIA|ASIA)[A-Z0-9]{16}, the same shape as
+        # test_core_path_redact_before_bound.
+        token = "AKIA" + "SHAPELEAK0123456"
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.acp._dispatch"):
+            assert (
+                _build_tool_result_event(
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": f"tc-{token}",
+                        "content": [{"type": token, "text": "unrecognised entry type"}],
+                    }
+                )
+                is None
+            )
+        hits = [r.getMessage() for r in caplog.records if "could be rendered" in r.getMessage()]
+        assert len(hits) == 1
+        assert token not in hits[0]
+        assert "[REDACTED" in hits[0]
+
+    def test_a_newline_bearing_tool_id_cannot_forge_a_log_line(self, caplog):
+        """The id is frame-supplied, so a newline in it would let a backend append
+        its own lines to the gateway log the dashboard renders. ``%r`` keeps the
+        whole id on one line with the newline escaped."""
+        import logging
+
+        from kiro_crew.acp._dispatch import _build_tool_result_event
+
+        forged = "tc-1\nWARNING kiro_crew: drive deleted by owner"
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.acp._dispatch"):
+            assert (
+                _build_tool_result_event(
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": forged,
+                        "content": [{"kind": "no-renderable-entry"}],
+                    }
+                )
+                is None
+            )
+        hits = [r.getMessage() for r in caplog.records if "could be rendered" in r.getMessage()]
+        assert len(hits) == 1
+        # The escaped form is present and the raw newline is not, so the forged
+        # text cannot start a line of its own.
+        assert "\\n" in hits[0]
+        assert "drive deleted by owner" not in hits[0].splitlines()[1:]
+        assert "\n" not in hits[0]
+
+    def test_every_documented_known_content_type_is_renderable_or_silent(self):
+        """The constant's docstring names four entry types as understood. If one is
+        dropped from the frozenset a real backend's frame starts warning, so pin
+        the documented set rather than trusting the comment above it."""
+        from kiro_crew.acp._dispatch import _KNOWN_TOOL_CONTENT_TYPES, unrenderable_content_shapes
+
+        assert _KNOWN_TOOL_CONTENT_TYPES == frozenset({"content", "diff", "terminal", "text"})
+        for known in sorted(_KNOWN_TOOL_CONTENT_TYPES):
+            assert unrenderable_content_shapes([{"type": known}]) == "", known
+        assert unrenderable_content_shapes([{"type": "not-a-known-type"}]) != ""
+
+    def test_a_numeric_tool_id_does_not_crash_the_turn(self, caplog):
+        """``toolCallId`` is whatever JSON the backend sent, so it need not be a
+        string. Passing an int straight into the redactor's regexes raises
+        ``TypeError`` -- and this is a diagnostic warning, which must never be able
+        to abort the turn it is reporting on."""
+        import logging
+
+        from kiro_crew.acp._dispatch import _build_tool_result_event, redacted_tool_id
+
+        assert redacted_tool_id(1234) == "1234"
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.acp._dispatch"):
+            assert (
+                _build_tool_result_event(
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": 1234,
+                        "content": [{"kind": "unrecognised"}],
+                    }
+                )
+                is None
+            )
+        assert [r for r in caplog.records if "could be rendered" in r.getMessage()]
+
+    def test_both_diagnostics_are_bounded(self):
+        """Both strings are unbounded backend input feeding a RETAINED log-ring
+        entry, so a frame that pads them cannot be held in memory in full. Bounds
+        are applied AFTER redaction, never before -- a cut taken first can split a
+        credential into fragments no pattern matches."""
+        from kiro_crew.acp._dispatch import redacted_tool_id, unrenderable_content_shapes
+
+        assert len(redacted_tool_id("t" * 100_000)) == 200
+        padded = [{"type": f"x{i}", "pad": "y" * 200} for i in range(2000)]
+        assert len(unrenderable_content_shapes(padded)) == 4000
+
+    def test_collection_stops_early_rather_than_building_the_whole_join(self):
+        """The final ``[:4000]`` alone still VISITS every entry and allocates the
+        full join before cutting, so a near-limit frame could OOM the gateway on the
+        way to a bounded string.
+
+        Asserted by counting entry visits, not by inspecting the output: a
+        length/content assertion passes either way, because the tail is cut off
+        regardless of whether the loop broke early. Counting is what discriminates.
+        """
+        from kiro_crew.acp._dispatch import unrenderable_content_shapes
+
+        visits = 0
+
+        class _CountingEntry(dict):
+            def get(self, *args, **kwargs):  # type: ignore[override]
+                nonlocal visits
+                visits += 1
+                return super().get(*args, **kwargs)
+
+        blocks = [_CountingEntry({"type": f"unknown-{i:06d}"}) for i in range(50_000)]
+        out = unrenderable_content_shapes(blocks)
+        assert len(out) <= 4000
+        assert "unknown-000000" in out
+        # ~4000 chars of shapes at ~40 chars each is a couple of hundred entries;
+        # anything near 50_000 means the loop consumed the whole frame.
+        assert visits < 1000, f"visited {visits} entries — the budget did not stop collection"
+
+    def test_an_object_valued_type_never_renders_its_nested_values(self):
+        """``type`` is frame-supplied and need not be a string. ``repr()`` of a dict
+        prints its nested VALUES, so a credential parked one level down would reach
+        the log ring through the very diagnostic that promises names only. A
+        non-string type renders by CLASS instead."""
+        from kiro_crew.acp._dispatch import unrenderable_content_shapes
+
+        token = "AKIA" + "NESTEDLEAK012345"
+        out = unrenderable_content_shapes([{"type": {"secret": token}, "other": 1}])
+        assert token not in out
+        assert "secret" not in out
+        assert "type=<dict>" in out
+        # Key NAMES are still reported -- that is the diagnostic's whole purpose.
+        assert "other" in out
+
+    def test_a_key_flood_is_truncated_structurally_not_mid_name(self):
+        """Per-entry key rendering is capped by DROPPING whole names, never by
+        cutting through one: a cut ahead of redaction could leave half a credential
+        that no pattern matches."""
+        from kiro_crew.acp._dispatch import unrenderable_content_shapes
+
+        entry = {"type": "unknown"} | {f"k{i:04d}": 1 for i in range(500)}
+        out = unrenderable_content_shapes([entry])
+        assert "more" in out
+        assert "k0499" not in out
+
+    def test_shapes_are_joined_with_one_separator(self):
+        """Two unrecognised entries render as two shapes in one string.
+
+        Deliberately does NOT claim to prove the redact-then-join ORDERING: a
+        separator count passes for a per-shape implementation too, so an assertion
+        of that shape discriminates nothing. The ordering is enforced by the
+        function returning a single joined string, not by a test.
+        """
+        from kiro_crew.acp._dispatch import unrenderable_content_shapes
+
+        joined = unrenderable_content_shapes([{"type": "one"}, {"type": "two"}])
+        assert "type='one'" in joined and "type='two'" in joined
+
+    def test_a_wrapped_entry_with_a_malformed_inner_block_is_reported(self):
+        """A known outer ``type`` is not evidence the entry renders.
+
+        ``{"type": "content", "content": {"kind": "text", ...}}`` -- ``kind`` where
+        the reader wants ``type`` -- renders nothing, and checked only at the outer
+        level it said nothing either: the same undiagnosable blank the shape
+        diagnostic exists to eliminate, one level down.
+        """
+        from kiro_crew.acp._dispatch import unrenderable_content_shapes
+
+        out = unrenderable_content_shapes(
+            [{"type": "content", "content": {"kind": "text", "text": "AKIAIOSFODNN7SECRET"}}]
+        )
+        assert out, "a wrapped entry with an unreadable inner block must be reported"
+        assert "inner_type=<NoneType>" in out
+        assert "'kind'" in out and "'text'" in out
+        # Key NAMES only at the inner level too -- this lands in the log ring.
+        assert "AKIAIOSFODNN7SECRET" not in out
+
+    def test_a_wrapped_inner_block_carrying_no_text_stays_silent(self):
+        """The negative control for the inner check, and the reason it is an
+        allowlist rather than "anything but text".
+
+        An image, audio or resource block renders no text and is NOT a defect, so
+        reporting it would fire this warning on a healthy backend -- the exact
+        false positive `test_content_free_frame_is_not_warned_about` guards at the
+        frame level.
+        """
+        from kiro_crew.acp._dispatch import unrenderable_content_shapes
+
+        for kind in ("text", "image", "audio", "resource", "resource_link"):
+            entry = {"type": "content", "content": {"type": kind}}
+            assert unrenderable_content_shapes([entry]) == "", f"{kind} must stay silent"
+
+    def test_a_wrapper_with_no_inner_block_stays_silent_but_an_explicit_null_does_not(self):
+        """The line the inner check draws, pinned in both directions.
+
+        A ``content`` key that is ABSENT asserts no block, so it stays silent --
+        that is the bare wrapper `_KNOWN_TOOL_CONTENT_TYPES` documents as
+        understood, and it is why the check cannot be a plain ``.get("content")``,
+        which would collapse this case into the null one below.
+        """
+        from kiro_crew.acp._dispatch import unrenderable_content_shapes
+
+        assert unrenderable_content_shapes([{"type": "content"}]) == ""
+        assert unrenderable_content_shapes([{"type": "content", "content": None}]) != ""
+
+    def test_a_wrapped_non_dict_inner_renders_by_class_not_value(self):
+        """``{"type": "content", "content": "<secret>"}`` is unreadable too, and the
+        inner is not a dict, so there are no key names -- only its CLASS may be
+        named, never the string itself."""
+        from kiro_crew.acp._dispatch import unrenderable_content_shapes
+
+        out = unrenderable_content_shapes([{"type": "content", "content": "AKIAIOSFODNN7SECRET"}])
+        assert "inner=<str>" in out
+        assert "AKIAIOSFODNN7SECRET" not in out
+
 
 # ── _extract_tool_call_refinement tests ──
 
@@ -7653,7 +8194,7 @@ class TestExtractToolCallRefinement:
 
     def test_prefers_rawinput_description_over_title(self):
         # Bash tool emits both `command` and `description` — the description
-        # is the human-readable purpose ("List KiroCrew dashboard module
+        # is the human-readable purpose ("List Kiro Crew dashboard module
         # files"), and that's what we surface on the pill.
         client = self._client()
         msg = self._make_msg(
@@ -7921,7 +8462,7 @@ class TestCaptureAvailableModels:
 
     def test_current_model_id_not_overwritten_when_absent(self):
         """A later session/new (or session/load) without currentModelId (e.g.
-        a minimal/degenerate response) must not clobber a previously-resolved
+        a minimal/degenerate response) must not clobber an already-resolved
         model id — _track_metadata's window resolution should keep working."""
         c = self._client()
         c._capture_available_models(
@@ -7952,7 +8493,7 @@ class TestCaptureAvailableModels:
         assert c.available_models()[0]["modelId"] == "m1"
 
     def test_capture_matches_canonical_parser(self):
-        """Drift-pin (#6382): the client-side capture normalizes exactly like
+        """Drift-pin: the client-side capture normalizes exactly like
         ``parse_advertised_models`` — hard-coded expectation so a regression
         inside the canonical parser (name fallback, description default,
         value-as-id, non-dict skip) fails this pin too."""
@@ -7975,7 +8516,7 @@ class TestCaptureAvailableModels:
         ]
 
     def test_capture_delegates_to_canonical_parser(self, monkeypatch):
-        """Anti-re-fork pin (#6382): the list must be SOURCED from
+        """Anti-re-fork pin: the list must be SOURCED from
         ``parse_advertised_models`` AND called with the gated envelope
         ``{"models": models}`` — a restored inline walk, a whole-response
         re-resolution, or a wrong envelope all fail this pin.
@@ -8014,7 +8555,7 @@ class TestCaptureAvailableModels:
     def test_empty_models_object_ignores_top_level_available_models(self):
         """An EMPTY (falsy) ``models`` object must not let the parser's
         dict-or-list fallback source the list from a top-level
-        ``availableModels`` key the dict gate never saw (#6382)."""
+        ``availableModels`` key the dict gate never saw."""
         c = self._client()
         c._capture_available_models({"models": {}, "availableModels": [{"modelId": "x"}]})
         assert c.available_models() == []
@@ -8528,7 +9069,7 @@ class TestFormatAcpError:
         assert "AKIAIOSFODNN7EXAMPLE" not in warnings[0].getMessage()
 
     def test_internal_server_error_rewrite(self):
-        """The real transient 5xx repro (live 2026-06-14) must
+        """A transient 5xx from the backend must
 
         classify as a momentary backend error rather than dumping the raw
         -32603 JSON-RPC dict at the user.
@@ -8690,19 +9231,50 @@ class TestFormatAcpError:
 
     def test_session_expired_rewrite(self):
         """An expired session gets actionable sign-in guidance rather than the
-        misleading transient-5xx retry advice."""
+        misleading transient-5xx retry advice.
+
+        The sign-in half is the failing harness's own declared remedy, so this
+        asserts it is rendered verbatim rather than pinning the wording here: a
+        second copy of that wording is what let the message name `kiro-cli login`
+        to an operator on a harness that signs in some other way.
+        """
         err = {
             "code": -32603,
             "message": "Internal error",
             "data": "DispatchFailure: session expired",
         }
         out = _format_acp_error(err)
-        assert "session has expired" in out.lower() or "session expired" in out.lower()
+        # The signed-out MESSAGE, not the remedy. This arm reaches the text on real
+        # evidence (a 401/403, or prose saying the session expired), so it may assert
+        # the state; the remedy is the register for a caveat rendered having measured
+        # nothing, and it deliberately makes no state claim.
+        assert host_auth.signed_out_message("") in out
         assert "kiro-cli login" in out.lower()
         assert "retry" in out.lower() and "will not help" in out.lower()
         # Must NOT show the misleading 5xx message.
         assert "transient error" not in out.lower()
         assert "retry in a moment" not in out.lower()
+
+    def test_session_expired_names_the_failing_harness(self):
+        """A harness that signs in elsewhere gets ITS message, not kiro-cli's.
+
+        The regression this guards: the arm hardcoded `kiro-cli login`, so an
+        expiry on a harness with its own credential file told the operator to run
+        a command that could not fix it. The retry verdict is this arm's own
+        finding about the error, so it must survive on every backend.
+
+        Reads ``signed_out_message`` and not ``sign_in_remedy``, and the
+        difference is the point: this arm HAS evidence -- a 401, or prose saying
+        the session expired -- so it may assert the state. The remedy is the
+        register for the places that render a standing line having measured
+        nothing, and using it here would drop the diagnosis.
+        """
+        err = {"code": -32603, "message": "Internal error", "data": "HTTP 401"}
+        for backend in ("claude", "codex"):
+            out = _format_acp_error(err, backend=backend)
+            assert host_auth.signed_out_message(backend) in out
+            assert "kiro-cli login" not in out.lower(), backend
+            assert "will not help" in out.lower(), backend
 
     def test_session_expired_by_http_status(self):
         """A bare 401/403 is the shape an expired session actually arrives in:
@@ -8716,7 +9288,7 @@ class TestFormatAcpError:
 
     def test_session_expired_401_with_transport_error(self):
         """The reported failure mode: an aborted request leaves a transport
-        error alongside the 401, and the 5xx family used to win and tell the
+        error alongside the 401, and the 5xx family must not win and tell the
         user to retry."""
         err = {
             "code": -32603,
@@ -8824,8 +9396,10 @@ class TestFormatAcpError:
         kas_out = _format_acp_error(err, backend=ACP_BACKEND_KAS)
         assert "kiro-cli login" in kas_out.lower()
 
+        # Codex's sentence is its harness declaration's own (``agent_sdk.host_auth``),
+        # which names Codex's sign-in without asserting a state it cannot check.
         codex_out = _format_acp_error(err, backend=ACP_BACKEND_CODEX)
-        assert "codex login" in codex_out.lower()
+        assert "codex" in codex_out.lower()
         assert "kiro-cli login" not in codex_out.lower()
 
         claude_out = _format_acp_error(err, backend=ACP_BACKEND_CLAUDE)
@@ -8846,7 +9420,7 @@ class TestFormatAcpError:
         err = {"code": -32603, "message": "Internal error", "data": "login required"}
         with pytest.raises(AcpError) as ei:
             _raise_acp_error(err, backend=ACP_BACKEND_CODEX)
-        assert "codex login" in str(ei.value).lower()
+        assert "codex" in str(ei.value).lower()
         assert "kiro-cli login" not in str(ei.value).lower()
 
 
@@ -8882,7 +9456,7 @@ class TestIsTransientRawError:
         from kiro_crew.acp.client import _is_transient_raw_error
 
         # 5xx signal carried in `message` (not `data`) must still be caught:
-        # the classifier scans the combined haystack, so this no longer fails
+        # the classifier scans the combined haystack, so this does not fail
         # fast the way a data-only scan would (SHOULD-FIX). Auth is
         # still checked first, so an auth error with a stray 50x stays terminal.
         assert _is_transient_raw_error({"message": "InternalServerError", "data": ""}) is True
@@ -8956,7 +9530,7 @@ class TestIsTransientRawError:
     def test_session_expired_is_not_transient(self):
         """Regression test: kiro-cli session expiry must be terminal.
 
-        These error shapes previously fell through to the 5xx branch (when they
+        These error shapes can fall through to the 5xx branch (when they
         also carried DispatchFailure/ConnectionResetError), telling the user to
         retry when re-authentication was required.
         """
@@ -9033,6 +9607,88 @@ class TestIsTransientRawError:
             )
             is False
         )
+
+    def test_prose_spelled_dispatch_failure_is_transient(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        # The AWS Rust SDK spells ONE connector fault two ways: the Debug repr
+        # is CamelCase (DispatchFailure) and the Display impl is prose
+        # ("dispatch failure"). kiro-cli surfaces whichever the failing layer
+        # produced. While the pattern was CamelCase-only and case-SENSITIVE the
+        # prose form read as an unknown shape and was classified TERMINAL, so
+        # every affected turn surfaced a bare error on the FIRST attempt and no
+        # retry ladder ever ran.
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": (
+                "Encountered an error in the response stream: "
+                "An unknown error occurred: dispatch failure"
+            ),
+        }
+        assert _is_transient_raw_error(err) is True
+        # The CamelCase spelling keeps classifying identically.
+        assert _is_transient_raw_error({"data": "DispatchFailure ConnectionReset"}) is True
+        # Same two-spelling split for the sibling connector fault.
+        assert _is_transient_raw_error({"data": "connection reset by peer"}) is True
+
+    def test_bare_internal_error_stays_terminal(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        # -32603's canonical message is literally "Internal error". The
+        # separator tolerance loosens only the gaps BETWEEN words, never the
+        # tokens, so this still matches nothing (no "server", no "failure") and
+        # keeps falling through to the unknown-shape branch instead of being
+        # mis-told to retry a condition that will never succeed.
+        assert (
+            _is_transient_raw_error(
+                {"code": -32603, "message": "Internal error", "data": "Input is too long"}
+            )
+            is False
+        )
+
+    def test_terminal_branches_outrank_a_co_occurring_dispatch_failure(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        # Every terminal branch is checked BEFORE the 5xx family, so widening
+        # the 5xx pattern must not let a connector token rescue an error that
+        # can only be reproduced by retrying it.
+        for data in (
+            "You've reached your monthly usage limit. dispatch failure",
+            "dispatch failure: session expired",
+            "AccessDeniedException dispatch failure",
+            "Improperly formed request dispatch failure",
+        ):
+            assert _is_transient_raw_error({"data": data, "message": ""}) is False
+
+    def test_prose_dispatch_failure_reaches_the_retry_decider(self):
+        import pytest
+
+        from kiro_crew.acp.client import AcpError, _raise_acp_error
+        from kiro_crew.llm_helpers import acp_error_is_transient
+
+        # The classifier and the retry decider are two different layers, and
+        # the gap between them is what broke: acp_error_is_transient prefers the
+        # structured AcpError.transient flag and consults its string markers
+        # ONLY when no flag is present. _TRANSIENT_MARKERS already listed the
+        # prose spellings, so a transient=False flag made that list unreachable
+        # dead code on this path. Assert the end-to-end verdict, not just the
+        # classifier, or the next regex edit silently reintroduces this.
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": (
+                "Encountered an error in the response stream: "
+                "An unknown error occurred: dispatch failure"
+            ),
+        }
+        with pytest.raises(AcpError) as ei:
+            _raise_acp_error(err)
+        exc = ei.value
+        assert exc.transient is True
+        assert acp_error_is_transient(exc) is True
+        # The raw provider text is replaced by the actionable 5xx wording.
+        assert "transient error (HTTP 5xx)" in str(exc)
 
     def test_raise_acp_error_carries_transient_flag_and_formatted_message(self):
         import pytest
@@ -9235,8 +9891,12 @@ class TestResolveKiroBinEnvOverride:
         fake.write_bytes(b"#!/bin/sh\n# original\n")
         fake.chmod(0o755)
         mock_exec = AsyncMock()
+        mock_exec.return_value.pid = 12345
         with (
             patch.dict("os.environ", {"KIROCREW_KIRO_BIN": str(fake)}),
+            patch("kiro_crew.session._track_pid"),
+            patch("kiro_crew.session._track_session_pid"),
+            patch.object(client_module, "_get_child_pids", return_value=[]),
             # This test asserts WHICH bytes get launched, not that the spawn is
             # sandboxed (covered by test_sandbox_*.py). A CI runner with
             # kernel.apparmor_restrict_unprivileged_userns=1 genuinely cannot
@@ -9532,6 +10192,78 @@ class TestDispatchSubagentEvents:
         assert len(txt) == 1 and txt[0].sub_session_id == "s1"
 
     @pytest.mark.asyncio
+    async def test_dispatch_ignores_activity_naming_this_session(self):
+        """A frame naming THIS session is the parent's own stream, not a child's.
+
+        kiro-cli carries the parent turn's own ``tool_call_chunk`` on
+        ``_kiro.dev/session/update`` with ``params.sessionId`` set to the
+        parent's session, the same method a child's update arrives on, so the
+        sessionId is the only separator. Recorded live in
+        ``test/fixtures/acp_frames/kiro/session.jsonl``. Both carriers are
+        checked so one guard cannot cover half the shape.
+        """
+        from kiro_crew.acp.types import EVENT_SUBAGENT_ACTIVITY, JsonRpcMessage
+
+        client = AcpClient()
+        client._session_id = "own-1"
+
+        frames = [
+            (
+                "subagent_activity",
+                JsonRpcMessage(
+                    params={
+                        "sessionId": "own-1",
+                        "update": {
+                            "sessionUpdate": "tool_call_chunk",
+                            "toolCallId": "tc-own",
+                            "title": "shell",
+                        },
+                    }
+                ),
+            ),
+            (
+                "subagent_activity",
+                JsonRpcMessage(
+                    params={
+                        "sessionId": "own-1",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "text": "the parent's own streamed text",
+                        },
+                    }
+                ),
+            ),
+            (
+                "subagent_activity",
+                JsonRpcMessage(
+                    params={
+                        "sessionId": "child-1",
+                        "update": {
+                            "sessionUpdate": "tool_call_chunk",
+                            "toolCallId": "tc-child",
+                            "title": "read",
+                        },
+                    }
+                ),
+            ),
+            ("complete", JsonRpcMessage(result={"stopReason": "end_turn"})),
+        ]
+
+        async def _fake_loop(req_id, timeout):
+            for f in frames:
+                yield f
+
+        client._prompt_loop = _fake_loop  # type: ignore[assignment]
+
+        events = []
+        async for ev in client._dispatch_events(req_id=1, timeout=1.0):
+            events.append(ev)
+
+        acts = [e for e in events if e.kind == EVENT_SUBAGENT_ACTIVITY]
+        assert [a.sub_session_id for a in acts] == ["child-1"]
+        assert acts[0].tool_call_id == "tc-child"
+
+    @pytest.mark.asyncio
     async def test_dispatch_redacts_and_extracts_subagent_output(self):
         """Sub-agent titles/text are LLM-influenced, so credentials + exfil URLs
         must be scrubbed before they surface as EVENT_SUBAGENT_ACTIVITY. Also
@@ -9731,7 +10463,7 @@ class TestTrackMetadataCredits:
 
 class TestTrackMetadataWindowResolution:
     """_track_metadata derives context_window_tokens from the resolved model
-    when no usage_update has set it (kiro-cli 2.10+ no longer sends one)."""
+    when no usage_update has set it (kiro-cli 2.10+ does not send one)."""
 
     @staticmethod
     def _metadata_msg(pct):
@@ -10473,9 +11205,9 @@ class TestAcpClientIsShellSignal:
     """The canonical is_shell flow: the ACP shell kind ("execute") must be
     captured at the tool_call boundary and inherited by the later
     permission_request event (which carries no reliable kind), so the dashboard
-    exempts long shell command titles from the 256-char cap. Regression for the
-    empty-kind permission path (long shell commands rejected as
-    "Tool name exceeds max length 256").
+    exempts long shell command titles from the 256-char cap. Without the
+    inherited kind the permission path rejects long shell commands as
+    "Tool name exceeds max length 256".
     """
 
     def _tool_call_msg(self, kind, tool_call_id="tc-1", command="echo hi"):
@@ -10734,7 +11466,7 @@ class TestAcpClientIsShellSignal:
     def test_refinement_kindless_does_not_clobber_cached_shell(self, tmp_path):
         """A refinement update that omits `kind` must NOT overwrite the
         is_shell=True cached by the initial tool_call notification (kind is
-        optional on updates). Regression for the no-clobber invariant."""
+        optional on updates). This pins the no-clobber invariant."""
         from kiro_crew.acp.client import AcpClient
 
         client = AcpClient(work_dir=tmp_path)
@@ -10777,7 +11509,7 @@ class TestAcpClientIsShellSignal:
         """The permission event must read the cached signal with .get(), not
         .pop(): a later tool_call_update refinement for the same toolCallId
         reads the same cache, so popping would make it wrongly see is_shell=
-        False. Regression for the review-bot .pop()-consumes-the-entry bug."""
+        False. The read must use .get(), not a .pop() that consumes the entry."""
         from kiro_crew.acp.client import AcpClient
 
         client = AcpClient(work_dir=tmp_path)
@@ -10904,6 +11636,7 @@ class TestSpawnEnvScrub:
             assert key not in env, f"{key} leaked into ACP child env"
         assert env.get("KIROCREW_UNRELATED_KEEPME") == "keep-this-value"
         assert env.get("AWS_ACCESS_KEY_ID") == "FAKE-akid"
+        assert env.get("KIROCREW_RUNTIME_PYTHON") == sys.executable
 
     @pytest.mark.asyncio
     async def test_client_spawn_pins_callbacks_to_parent_bound_port(self, monkeypatch):
@@ -10949,7 +11682,7 @@ class TestSpawnEnvScrub:
 class TestSetModelRebasesContextStats:
     """A mid-session set_model must re-anchor the context-meter stats.
 
-    Regression for the stale context meter: set_model used to leave
+    Without the re-anchor set_model leaves
     last_prompt_stats untouched, so the old model's window (and its
     authoritative context_tokens_from_usage flag) survived the switch. When
     the new model streams only contextUsagePercentage metadata (kiro 2.10+),
@@ -10988,8 +11721,36 @@ class TestSetModelRebasesContextStats:
         assert stats.context_window_tokens == 272_000
         assert stats.context_used_tokens == 100_000  # transcript unchanged
         assert stats.context_pct == round(100_000 / 272_000 * 100, 1)
-        # The old model's usage_update no longer describes the session.
+        # The old model's usage_update does not describe the session.
         assert stats.context_tokens_from_usage is False
+
+    @pytest.mark.asyncio
+    async def test_rebases_to_the_substituted_models_window(self, tmp_path, monkeypatch):
+        """The meter describes what is serving, not what was asked for.
+
+        A config-option advisory can substitute the model a switch actually
+        got. Keying the rebase on the requested id showed that model's window
+        against the substitute's token counts, so the percentage was wrong for
+        exactly the sessions that were silently moved.
+        """
+        import kiro_crew.acp.client as c
+
+        windows = {"gpt-5.6-sol": 272_000, "substitute-model": 128_000}
+        monkeypatch.setattr(c.model_registry, "has_known_window", lambda mid: mid in windows)
+        monkeypatch.setattr(c.model_registry, "model_window", lambda mid, **kw: windows[mid])
+        client = self._client(tmp_path)
+        client._track_usage_update(self._usage_msg(100_000, 1_000_000))
+
+        async def _substitute(method, params):
+            client._last_substitution_model = "substitute-model"
+            return 1
+
+        client._send_request = _substitute
+
+        await client.set_model("gpt-5.6-sol")
+
+        assert client._resolved_model_id == "substitute-model"
+        assert client.last_prompt_stats.context_window_tokens == 128_000
 
     @pytest.mark.asyncio
     async def test_post_switch_metadata_backfills_new_window(self, tmp_path, monkeypatch):
@@ -11053,7 +11814,7 @@ class TestSetModelRebasesContextStats:
 class TestCompactionResetsContextStats:
     """A completed compaction must drop the stale context-usage counts.
 
-    Regression for the frozen context meter after /compact: the pre-compaction
+    Without the drop, the pre-compaction
     counts carried an authoritative ``context_tokens_from_usage=True`` flag, so
     ``_track_metadata`` refused to apply any fresh percentage and every
     ``context_usage`` broadcast re-sent the old numbers — the dashboard bar
@@ -11239,7 +12000,7 @@ class TestCompactionResetsContextStats:
 class TestModelEntitlementPreflight:
     """An unusable model is stopped BEFORE the wire, not explained afterwards.
 
-    PR #1550 made a post-hoc rejection readable and terminal. These cover the
+    A post-hoc rejection is readable and terminal. These cover the
     turn never failing in the first place: the advertised set is known at
     session/new, so a model the account cannot run has no business being sent.
     """
@@ -11296,18 +12057,71 @@ class TestModelEntitlementPreflight:
         # Not left holding the id we declined -- the warm-pool re-apply path
         # reads this and would re-offer it on every claim.
         assert client._model == DEFAULT_MODEL
+        assert client._resolved_model_id == "claude-sonnet-4.6"
+
+    @pytest.mark.asyncio
+    async def test_startup_auto_keeps_the_backend_default(self):
+        from kiro_crew.acp.client import DEFAULT_MODEL
+
+        client = self._client(["gpt-5.6-terra"], DEFAULT_MODEL)
+        client._resolved_model_id = "gpt-5.6-terra"
+        sent = []
+        client._send_request = _record(sent)
+
+        await client._apply_startup_model()
+
+        assert sent == []
+        assert client._resolved_model_id == "gpt-5.6-terra"
 
     @pytest.mark.asyncio
     async def test_startup_still_applies_a_usable_model(self):
-        client = self._client(["claude-sonnet-4.6", "claude-opus-4.8"], "claude-opus-4.8")
+        client = self._client(["gpt-5.6-terra", "gpt-6-astra"], "gpt-6-astra")
+        client._resolved_model_id = "gpt-5.6-terra"
         sent = []
         client._send_request = _record(sent)
 
         await client._apply_startup_model()
 
         assert len(sent) == 1
-        assert sent[0][1]["modelId"] == "claude-opus-4.8"
-        assert client._model == "claude-opus-4.8"
+        assert sent[0][1]["modelId"] == "gpt-6-astra"
+        assert client._model == "gpt-6-astra"
+        assert client._resolved_model_id == "gpt-6-astra"
+
+    @pytest.mark.asyncio
+    async def test_startup_resolves_namespaced_pin_to_advertised_spelling(self):
+        """A stale `<namespace>::` qualifier on a fully served model.
+
+        The pin was stored when a catalog advertised the qualified spelling;
+        this session advertises the bare id. The wire must send the ADVERTISED
+        spelling — running the model the pin names — rather than withholding
+        and silently dropping to the backend default.
+        """
+        client = self._client(["z-ai/glm-5.3-flash"], "openrouter::z-ai/glm-5.3-flash")
+        sent = []
+        client._send_request = _record(sent)
+
+        await client._apply_startup_model()
+
+        assert len(sent) == 1
+        assert sent[0][1]["modelId"] == "z-ai/glm-5.3-flash"
+        # _model records what the session actually runs (the warm-pool re-apply
+        # path reads it), so it must hold the resolved spelling, not the
+        # qualified pin.
+        assert client._model == "z-ai/glm-5.3-flash"
+
+    @pytest.mark.asyncio
+    async def test_startup_still_withholds_namespaced_pin_absent_when_peeled(self):
+        """The resolve is not a rubber stamp: absent under BOTH spellings withholds."""
+        from kiro_crew.acp.client import DEFAULT_MODEL
+
+        client = self._client(["z-ai/glm-5.3-flash"], "openrouter::no-such-model")
+        sent = []
+        client._send_request = _record(sent)
+
+        await client._apply_startup_model()
+
+        assert sent == []
+        assert client._model == DEFAULT_MODEL
 
     @pytest.mark.asyncio
     async def test_kiro_startup_process_death_stays_fail_loud(self):
@@ -11350,6 +12164,101 @@ class TestModelEntitlementPreflight:
         await client._apply_startup_model()
 
         assert applied == [("model", "global.anthropic.claude-opus-4-8[1m]")]
+        assert client._resolved_model_id == "global.anthropic.claude-opus-4-8[1m]"
+
+    @pytest.mark.asyncio
+    async def test_startup_attributes_config_option_substitution_to_served_model(self):
+        client = self._client(
+            ["claude-opus-4-8[1m]"],
+            "global.anthropic.claude-opus-4-8[1m]",
+            is_claude=True,
+        )
+        sent = []
+
+        async def _send_request(method, params):
+            sent.append((method, params))
+            return 1
+
+        async def _wait_for_response(req_id, timeout=0.0):
+            client._last_substitution_model = "global.anthropic.claude-sonnet-4-6[1m]"
+            return {}
+
+        client._send_request = _send_request
+        client._wait_for_response = _wait_for_response
+
+        await client._apply_startup_model()
+
+        assert sent == [
+            (
+                "session/set_config_option",
+                {
+                    "sessionId": "sess-1",
+                    "configId": "model",
+                    "value": "global.anthropic.claude-opus-4-8[1m]",
+                },
+            )
+        ]
+        assert client._resolved_model_id == "global.anthropic.claude-sonnet-4-6[1m]"
+
+    @pytest.mark.asyncio
+    async def test_startup_override_does_not_inherit_a_stale_substitution(self):
+        """An advisory belongs to the request that emitted it.
+
+        A substitution recorded by an earlier switch survives a process reset
+        or resume. Reading it after the startup override, without clearing it
+        first, attributes the session to a model this dispatch never got.
+        """
+        client = self._client(
+            ["claude-opus-4-8[1m]"],
+            "global.anthropic.claude-opus-4-8[1m]",
+            is_claude=True,
+        )
+        client._last_substitution_model = "global.anthropic.claude-sonnet-4-6[1m]"
+
+        async def _send_request(method, params):
+            return 1
+
+        async def _wait_for_response(req_id, timeout=0.0):
+            return {}  # this dispatch carries no advisory of its own
+
+        client._send_request = _send_request
+        client._wait_for_response = _wait_for_response
+
+        await client._apply_startup_model()
+
+        assert client._resolved_model_id == "global.anthropic.claude-opus-4-8[1m]"
+        assert client._last_substitution_model is None
+
+    @pytest.mark.asyncio
+    async def test_clean_explicit_switch_does_not_reuse_startup_substitution(self):
+        client = self._client(
+            ["claude-opus-4-8[1m]"],
+            "global.anthropic.claude-opus-4-8[1m]",
+            is_claude=True,
+        )
+        waits = 0
+
+        async def _send_request(method, params):
+            return 1
+
+        async def _wait_for_response(req_id, timeout=0.0):
+            nonlocal waits
+            waits += 1
+            if waits == 1:
+                client._last_substitution_model = "global.anthropic.claude-sonnet-4-6[1m]"
+            return {}
+
+        client._send_request = _send_request
+        client._wait_for_response = _wait_for_response
+
+        await client._apply_startup_model()
+        assert client._resolved_model_id == "global.anthropic.claude-sonnet-4-6[1m]"
+
+        await client.set_model("global.anthropic.claude-opus-4-8[1m]")
+
+        assert client._model == "global.anthropic.claude-opus-4-8[1m]"
+        assert client._resolved_model_id == "global.anthropic.claude-opus-4-8[1m]"
+        assert client._last_substitution_model is None
 
     @pytest.mark.asyncio
     async def test_explicit_switch_is_refused_not_downgraded(self):
@@ -11394,6 +12303,41 @@ class TestModelEntitlementPreflight:
         assert len(sent) == 1
         assert client._model == "claude-opus-4.8"
 
+    @pytest.mark.asyncio
+    async def test_explicit_switch_attributes_config_option_substitution_to_served_model(self):
+        client = self._client(
+            ["claude-opus-4-8[1m]"],
+            "global.anthropic.claude-opus-4-8[1m]",
+            is_claude=True,
+        )
+        sent = []
+
+        async def _send_request(method, params):
+            sent.append((method, params))
+            return 1
+
+        async def _wait_for_response(req_id, timeout=0.0):
+            client._last_substitution_model = "global.anthropic.claude-sonnet-4-6[1m]"
+            return {}
+
+        client._send_request = _send_request
+        client._wait_for_response = _wait_for_response
+
+        await client.set_model("global.anthropic.claude-opus-4-8[1m]")
+
+        assert sent == [
+            (
+                "session/set_config_option",
+                {
+                    "sessionId": "sess-1",
+                    "configId": "model",
+                    "value": "global.anthropic.claude-opus-4-8[1m]",
+                },
+            )
+        ]
+        assert client._model == "global.anthropic.claude-opus-4-8[1m]"
+        assert client._resolved_model_id == "global.anthropic.claude-sonnet-4-6[1m]"
+
 
 def _record(sink):
     """An async _send_request stub that records calls and returns a request id."""
@@ -11405,10 +12349,182 @@ def _record(sink):
     return _send_request
 
 
-class TestMiseNodeInstallsDir:
-    """ACP node resolution must honour mise's real data root (#1605).
+class TestColdCacheModelFallback:
+    """The cold-cache push twin of TestModelEntitlementPreflight.
 
-    ``_mise_node_installs_dir`` used to hardcode ``~/.local/share/mise``,
+    ``resolve_wire_model_id`` folds onto the advertised spelling only when the
+    advertised cache is warm. On the first-ever session that cache is empty,
+    so a prefixed ``[1m]`` id reached the wire verbatim and the adapter
+    rejected it — resetting the session and dropping the user onto the default
+    with no explanation (the ``Invalid value for config option model:
+    global.anthropic.claude-sonnet-4-6[1m]`` report). The push helper derives
+    fallback spellings from the id itself and lets the adapter judge each.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cold_advertised_cache(self, monkeypatch):
+        """Pin the cache these tests are ABOUT to the state their name claims.
+
+        ``_apply_startup_model`` folds the id onto the advertised spelling through
+        ``model_registry.resolve_wire_model_id`` before it pushes anything, and
+        the advertised set is a module global another test on the same xdist
+        worker may have warmed (``claude-sonnet-4-6`` advertised). Warm, the fold
+        collapses ``global.anthropic.claude-sonnet-4-6[1m]`` to the served
+        spelling and the adapter sees ONE push instead of the three fallbacks --
+        a 1-in-5 failure in full runs. Cold is the premise, so pin it.
+        """
+        from kiro_crew import model_registry
+
+        monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {})
+
+    @staticmethod
+    def _claude_client(model):
+        from kiro_crew.acp.client import ACP_BACKEND_CLAUDE, AcpClient
+
+        client = AcpClient()
+        client._session_id = "sess-1"
+        client._model = model
+        client._resolved_model_id = model
+        client._acp_backend = ACP_BACKEND_CLAUDE
+        return client
+
+    @staticmethod
+    def _rejecting_set_config_option(applied, accepted):
+        from kiro_crew.acp.client import AcpError
+
+        async def _set_config_option(config_id, value):
+            applied.append((config_id, value))
+            if value not in accepted:
+                raise AcpError(f"Invalid value for config option model: {value}")
+
+        return _set_config_option
+
+    @pytest.mark.asyncio
+    async def test_startup_falls_back_to_bare_spelling(self):
+        """The reported failure: prefixed [1m] id refused, bare spelling served."""
+        from kiro_crew.acp.client import DEFAULT_MODEL
+
+        client = self._claude_client("global.anthropic.claude-sonnet-4-6[1m]")
+        applied = []
+        client.set_config_option = self._rejecting_set_config_option(
+            applied, {"claude-sonnet-4-6[1m]"}
+        )
+
+        await client._apply_startup_model()
+
+        assert applied == [
+            ("model", "global.anthropic.claude-sonnet-4-6[1m]"),
+            ("model", "claude-sonnet-4-6[1m]"),
+        ]
+        # Records the spelling that actually went on the wire, not the refused
+        # one (the warm-pool re-apply path reads this field).
+        assert client._model == "claude-sonnet-4-6[1m]"
+        assert client._model != DEFAULT_MODEL
+
+    @pytest.mark.asyncio
+    async def test_startup_prefers_verbatim_when_accepted(self):
+        """A warm cache folds before the wire: the original id is accepted as-is."""
+        client = self._claude_client("claude-sonnet-4-6[1m]")
+        applied = []
+        client.set_config_option = self._rejecting_set_config_option(
+            applied, {"claude-sonnet-4-6[1m]"}
+        )
+
+        await client._apply_startup_model()
+
+        assert applied == [("model", "claude-sonnet-4-6[1m]")]
+        assert client._model == "claude-sonnet-4-6[1m]"
+
+    @pytest.mark.asyncio
+    async def test_startup_all_refused_stays_on_default(self):
+        """Every spelling refused = the withhold contract, not a crash."""
+        from kiro_crew.acp.client import DEFAULT_MODEL
+
+        client = self._claude_client("global.anthropic.claude-sonnet-4-6[1m]")
+        applied = []
+        client.set_config_option = self._rejecting_set_config_option(applied, set())
+
+        await client._apply_startup_model()
+
+        assert len(applied) == 3  # verbatim, prefix-stripped, fully bare
+        assert client._model == DEFAULT_MODEL
+
+    @pytest.mark.asyncio
+    async def test_explicit_switch_refused_raises_unavailable(self):
+        """set_model is an explicit pick: refusal is typed, never a silent lie."""
+        from kiro_crew.acp.client import AcpModelUnavailable
+
+        client = self._claude_client("claude-sonnet-4-6[1m]")
+        client.set_config_option = self._rejecting_set_config_option([], set())
+
+        with pytest.raises(AcpModelUnavailable):
+            await client.set_model("global.anthropic.claude-sonnet-4-6[1m]")
+
+    @pytest.mark.asyncio
+    async def test_explicit_switch_sends_accepted_fallback(self):
+        """An explicit pick that SOME spelling serves still lands on the model."""
+        client = self._claude_client("global.anthropic.claude-sonnet-4-6[1m]")
+        applied = []
+        client.set_config_option = self._rejecting_set_config_option(
+            applied, {"claude-sonnet-4-6[1m]"}
+        )
+
+        await client.set_model("global.anthropic.claude-sonnet-4-6[1m]")
+
+        assert applied[-1] == ("model", "claude-sonnet-4-6[1m]")
+        assert client._model == "claude-sonnet-4-6[1m]"
+        assert client._resolved_model_id == "claude-sonnet-4-6[1m]"
+
+    @pytest.mark.asyncio
+    async def test_unknown_config_option_skips_push(self):
+        """No 'model' option at all (other adapter build): no spelling retry."""
+        from kiro_crew.acp.client import DEFAULT_MODEL, AcpError
+
+        client = self._claude_client("global.anthropic.claude-sonnet-4-6[1m]")
+        applied = []
+
+        async def _unknown(config_id, value):
+            applied.append((config_id, value))
+            raise AcpError("Unknown config option: model")
+
+        client.set_config_option = _unknown
+
+        await client._apply_startup_model()
+
+        assert applied == [("model", "global.anthropic.claude-sonnet-4-6[1m]")]
+        assert client._model == DEFAULT_MODEL
+
+    @pytest.mark.asyncio
+    async def test_transport_error_propagates(self):
+        """A non-value-rejection failure is not ours to swallow."""
+        from kiro_crew.acp.client import AcpError
+
+        client = self._claude_client("claude-sonnet-4-6[1m]")
+
+        async def _transport(config_id, value):
+            raise AcpError("transport closed")
+
+        client.set_config_option = _transport
+
+        with pytest.raises(AcpError, match="transport closed"):
+            await client._apply_startup_model()
+
+    def test_candidate_order_is_derived_from_the_id(self):
+        from kiro_crew.acp.client import AcpClient
+
+        assert AcpClient._model_config_candidates("global.anthropic.claude-sonnet-4-6[1m]") == [
+            "global.anthropic.claude-sonnet-4-6[1m]",
+            "claude-sonnet-4-6[1m]",
+            "claude-sonnet-4-6",
+        ]
+        # No prefix / no window marker: single candidate, nothing derived.
+        assert AcpClient._model_config_candidates("claude-sonnet-4-6") == ["claude-sonnet-4-6"]
+
+
+class TestMiseNodeInstallsDir:
+    """ACP node resolution must honour mise's real data root.
+
+    ``_mise_node_installs_dir`` must not hardcode ``~/.local/share/mise``,
     silently missing installs whenever ``MISE_DATA_DIR`` or ``XDG_DATA_HOME``
     relocated the data dir — while ``env.mise_data_dir`` already resolved the
     same root correctly for the build toolchain. These pin the consolidated
@@ -11480,7 +12596,7 @@ class TestCompactionFailureTurnBudget:
     compacting for: no session/prompt response and no end_turn ever arrive, so
     the read loop drained in silence to the caller's full prompt ceiling
     (hours) while the slot stayed occupied — the user waited it out or pressed
-    Stop (issue #3583). The budget bounds that wait and the turn ends with
+    Stop. The budget bounds that wait and the turn ends with
     STOP_REASON_COMPACTION_FAILED. No retry is attempted: compaction stays
     kiro-cli's, this only makes its failure fail cleanly.
     """

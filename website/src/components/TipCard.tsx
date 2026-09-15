@@ -2,26 +2,18 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowRight, ExternalLink, Lightbulb, Settings, X } from 'lucide-react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { Link, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
 import MarkdownRenderer from './MarkdownRenderer'
 
 import { i18nT } from '../i18n/t'
-// The Feature Tips toggle lives in Settings → Chat.
-export const TIPS_SETTINGS_PATH = '/settings/chat'
+import { SettingsLink } from './SettingsLink'
 
-// Tip docs live in the repo at src/kiro_crew/docs/ (same base the Security and
-// Discord settings panels link to).
-const DOCS_BASE = 'https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/docs'
-// Tips can be LLM-generated: only link a doc value shaped like a plain
-// markdown filename so an invented value can't produce a weird URL.
-const DOC_FILENAME_RE = /^[a-z0-9][a-z0-9._-]*\.md$/i
-
-export function tipDocHref(doc: string | undefined): string | null {
-  if (!doc || !DOC_FILENAME_RE.test(doc)) return null
-  return `${DOCS_BASE}/${doc}`
-}
+// The resolver lives in `utils/docsLink`: a pure function must not live behind a
+// component module, or importing it drags this file's router and markdown
+// dependencies along with it.
+import { tipDocHref } from '../utils/docsLink'
 
 // Optional one-click action button on a tip. A single 'route' kind for now:
 // navigate to an internal dashboard path (an exact settings tab/control via
@@ -189,15 +181,17 @@ export function TipCard({ tip, onDismiss }: TipCardProps) {
             >
               {i18nT('components.tipCard.turn_off_tips')}
             </button>
-            <Link
-              to={TIPS_SETTINGS_PATH}
+            {/* The Feature Tips toggle lives in Settings → Chat. No `highlight`
+                yet: that toggle has no setting anchor to flash. */}
+            <SettingsLink
+              tab="chat"
               className="inline-flex items-center rounded p-0.5 transition-colors hover:bg-[var(--bg-hover)]"
               style={{ color: 'var(--muted)' }}
               aria-label={i18nT('components.tipCard.tip_settings')}
               title={i18nT('components.tipCard.tip_settings')}
             >
               <Settings size={12} aria-hidden="true" />
-            </Link>
+            </SettingsLink>
           </div>
         </div>
       </div>

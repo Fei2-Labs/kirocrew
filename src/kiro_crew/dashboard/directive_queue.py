@@ -7,7 +7,7 @@ comes from the provider's out-of-band ``_meta.kiro`` channel, which is a
 kiro-cli engine feature: an ACP backend that does not emit it leaves the gate
 with no trusted source, and a gate with no trusted source correctly refuses
 every directive. The whole control plane (loops, project changes, cards) then
-fails closed on that backend — silently, until #6970 added the diagnostic.
+fails closed on that backend, which the gate reports as a diagnostic.
 
 This module is the second delivery path, and it carries the payload OUT OF BAND
 rather than through the model's tool result. The MCP tool, having validated its
@@ -15,32 +15,49 @@ arguments, POSTs them to the gateway over Kiro Crew's own internal API declaring
 its ``X-Session-Key``; the gateway parks the record here; the turn's consumer
 claims it. The marker is still emitted (the kiro-cli path is unchanged and
 remains authoritative there), but on a backend without ``_meta.kiro`` the marker
-is reduced to a HINT that a record may be waiting — its CONTENT is never read.
+is DISPLAY ONLY: neither its presence nor its content takes part in the claim.
+
+How the consumer names the record: by the tool CALL's input, not the result
+------------------------------------------------------------------------------
+The record is keyed by :func:`session_directive.call_input_digest` of the raw
+arguments the tool was called with. The tool computes it from the ``arguments``
+of the ``tools/call`` it served; the consumer computes it from the ``rawInput``
+of the ACP ``tool_call`` frame it saw the model make. Neither reading passes
+through the tool RESULT, which is the one thing every backend reshapes at will:
+KAS re-serialises the envelope, copies the text into two fields, swaps one for
+an offload reference above a threshold, and caps every string with the
+tail-anchored marker falling off the end. Reading the selector out of that body
+would make each of those shapes one more repair branch in the shared ACP parser.
+None of them touch ``rawInput``.
 
 Why this is not weaker than the marker gate it backs up
 ------------------------------------------------------
 TWO channels must agree, and neither is trusted alone. That is the whole design:
 
-* The RECORD carries the payload and is unforgeable in CONTENT — it is what the
-  tool validated, delivered out of band, never lifted from model-visible text.
+* The RECORD carries the payload and is unforgeable in CONTENT — the gateway
+  DERIVES it by re-running the directive tool on the raw call arguments the stub
+  reported (``mcp_core.derive_directive``), so a caller cannot pair a payload of
+  its choosing with the key of some other call; it can only park what that call
+  itself would produce. Never lifted from model-visible text.
   Its weak point is its TARGET: the session is named by an ``X-Session-Key``
   header, and the header is only kernel-attested on an AF_UNIX peer whose /proc
   ancestry resolves. Over TCP loopback (Windows has no AF_UNIX at all), or from a
   pooled backend whose ancestry does not resolve, a same-uid caller holding the
   internal secret could name somebody else's session.
-* The MARKER is bound to the right session by construction — it arrives inside
-  the tool result of a call made in THAT turn, on that session's own event
-  stream. Its weak point is CONTENT: it is model-visible text, so a model can
-  type one.
+* The CALL INPUT is bound to the right session by construction — it arrives in
+  the ``tool_call`` frame of a call made in THAT turn, on that session's own
+  event stream. Its weak point is CONTENT: it is model-authored, so a model can
+  type any arguments it likes.
 * So a directive applies only where BOTH hold: :func:`claim` requires a parked
-  record whose ``(kind, args)`` equal the ones the frame's marker names, parked
-  during the CLAIMING turn. A record aimed at another session waits for a marker
-  that session's model never emits; a forged marker looks up a record that no
-  tool ever validated. The applied payload is always the RECORD's, so the marker
-  never contributes a value — only the choice of which record to look up.
+  record whose input digest equals the one the frame's call carried, parked
+  during the CLAIMING turn. A record aimed at another session waits for a call
+  that session's model never makes; a call with arguments no tool ever validated
+  looks up a record that was never parked. The applied payload is always the
+  RECORD's, so the call input never contributes a value — only the choice of
+  which record to look up. Exactly the shape the marker selector had.
 
-A model can still drive its OWN session by publishing and marking honestly, which
-is exactly what calling the tool does. No privilege is gained.
+A model can still drive its OWN session by calling the tool honestly, which is
+exactly what calling the tool is. No privilege is gained.
 
 Deliberately NOT persisted. A directive is turn-scoped: the turn that requested
 it is what gives it meaning. Surviving a gateway restart would let a loop arm, or
@@ -59,14 +76,13 @@ backstop for a burst inside one expiry window.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
 import uuid
 from typing import Any
 
-from kiro_crew.session_directive import DIRECTIVE_TOOLS, content_free_digest
+from kiro_crew.session_directive import DIRECTIVE_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -96,23 +112,32 @@ _lock = threading.Lock()
 _pending: dict[str, list[dict[str, Any]]] = {}
 
 
-def publish(session_key: str, kind: str, args: dict[str, Any]) -> str:
+def publish(session_key: str, kind: str, args: dict[str, Any], input_digest: str) -> str:
     """Park a validated directive for *session_key*; return its record id.
 
-    Raises :class:`ValueError` for an unknown *kind* or an empty *session_key* —
-    the caller is the gateway handler, and an unrecognized kind means the request
-    did not come from one of Kiro Crew's own directive tools.
+    *input_digest* is :func:`session_directive.call_input_digest` of the raw
+    arguments the tool was CALLED with (before validation added defaults), and
+    it is the only key :func:`claim` matches on. Required, not optional: a
+    record with no digest could never be claimed, so accepting one would park a
+    directive the model was told was requested and that nothing can apply.
+
+    Raises :class:`ValueError` for an unknown *kind*, an empty *session_key* or
+    an empty *input_digest* — the caller is the gateway handler, and a request
+    missing any of them did not come from one of Kiro Crew's own directive tools.
     """
     if kind not in DIRECTIVE_TOOLS:
         raise ValueError(f"unknown directive kind: {kind!r}")
     if not session_key:
         raise ValueError("session_key required")
+    if not input_digest or not isinstance(input_digest, str):
+        raise ValueError("input_digest required")
     rec_id = uuid.uuid4().hex
     now = time.monotonic()
     record: dict[str, Any] = {
         "id": rec_id,
         "kind": kind,
         "args": dict(args or {}),
+        "input_digest": input_digest,
         "at": now,
     }
     with _lock:
@@ -178,55 +203,44 @@ def _sweep_locked(now: float) -> None:
         )
 
 
-def _canonical(args: dict[str, Any] | None) -> str:
-    """Order-independent comparable form of a directive's ``args``.
-
-    The two channels serialize independently — the marker through
-    ``session_directive.encode``, the record through the internal API's JSON body
-    — so the dicts are equal in value but not necessarily in key order. Sorting
-    keys makes the comparison about the payload rather than about how either side
-    happened to emit it, and ``default=str`` mirrors ``encode`` so a value only
-    one side could serialize compares equal instead of raising.
-    """
-    return json.dumps(args or {}, sort_keys=True, separators=(",", ":"), default=str)
-
-
 def claim(
     session_key: str,
-    kind: str,
-    args: dict[str, Any] | None,
+    input_digest: str,
     *,
     not_before: float | None = None,
 ) -> dict[str, Any] | None:
-    """Remove and return the ONE record for *session_key* matching *kind*/*args*.
+    """Remove and return the ONE record for *session_key* parked under *input_digest*.
 
     CORRELATED by construction, which is what makes the out-of-band path safe to
-    act on (see the module docstring): the caller passes the ``(kind, args)`` its
-    frame's marker named, and only a record parked with that same payload is
-    returned. An uncorrelated drain would apply whatever happened to be queued —
-    including a record another session's caller parked here, or one left by a turn
-    that was cancelled before it could consume it.
+    act on (see the module docstring): the caller passes the digest of the raw
+    arguments it saw the model make the tool call with, and only a record the tool
+    parked under that same digest is returned. An uncorrelated drain would apply
+    whatever happened to be queued — including a record another session's caller
+    parked here, or one left by a turn that was cancelled before it could consume
+    it.
 
     *not_before* bounds the record to the claiming TURN (pass the turn's start
     from ``time.monotonic()``). A directive belongs to the turn that asked for it:
     without this bound, a record whose turn was abandoned stays claimable by any
-    later frame naming the same payload, so a cancelled intent could land minutes
+    later frame carrying the same input, so a cancelled intent could land minutes
     later.
 
     Single-consume: the match is removed under the lock, so two consumers racing
-    the same session cannot both apply it. Returns ``None`` when nothing matches.
+    the same session cannot both apply it. FIFO among equals: the model calling
+    the same tool twice with identical arguments parks two records under one
+    digest, and each frame consumes its OWN — the queue is oldest-first, so the
+    first match pairs frame N with record N while the rest stay for the sibling
+    frames. Returns ``None`` when nothing matches.
     """
-    if not session_key or kind not in DIRECTIVE_TOOLS:
+    if not session_key or not input_digest:
         logger.warning(
-            "session-directive CLAIM REFUSED before lookup: session_key=%r kind=%r "
-            "(empty session key, or kind is not a known directive tool). Nothing "
-            "was claimed.",
+            "session-directive CLAIM REFUSED before lookup: session_key=%r "
+            "input_digest=%s (empty session key or empty digest). Nothing was claimed.",
             session_key,
-            kind,
+            (input_digest or "")[:12] or "empty",
         )
         return None
     now = time.monotonic()
-    want = _canonical(args)
     with _lock:
         queue = _pending.get(session_key)
         if not queue:
@@ -249,17 +263,10 @@ def claim(
                     MAX_AGE_SECS,
                 )
                 continue
-            # FIFO among equals: a repeated identical directive in one turn (the
-            # model calling monitor_start twice with the same message) parks two
-            # equal records, and each frame must consume its OWN. The queue is
-            # oldest-first, so taking the first match pairs frame N with record N
-            # while `keep` retains the rest for the sibling frames.
-            _rec_kind = record.get("kind")
-            _rec_args = _canonical(record.get("args"))
+            _rec_digest = str(record.get("input_digest") or "")
             if (
                 hit is None
-                and _rec_kind == kind
-                and _rec_args == want
+                and _rec_digest == input_digest
                 and (not_before is None or at >= not_before)
             ):
                 hit = record
@@ -267,25 +274,15 @@ def claim(
             if hit is None:
                 # Name the ONE reason this candidate was passed over. Ordered so
                 # the first true predicate is the decisive one, because a record
-                # failing on kind is a different bug from one failing only on the
-                # turn bound -- and the old silent None could not tell them apart.
-                if _rec_kind != kind:
-                    misses.append("kind-differs(parked=%r wanted=%r)" % (_rec_kind, kind))
-                elif _rec_args != want:
-                    # Digests, not the args themselves: the parked record carries
-                    # the payload the tool validated and `want` came off
-                    # model-visible marker text, so printing either publishes
-                    # directive content to the dashboard log. A digest still
-                    # answers the question this line exists for -- are these two
-                    # the same payload -- and pairs with the other side's log.
+                # failing on digest is a different bug from one failing only on
+                # the turn bound -- and a silent None could not tell them apart.
+                # Digest prefixes only: the digest is a one-way handle over the
+                # call input and reveals nothing, but a full 64-char pair makes
+                # the line unreadable.
+                if _rec_digest != input_digest:
                     misses.append(
-                        "args-differ(parked_sha=%s/%dB wanted_sha=%s/%dB)"
-                        % (
-                            content_free_digest(_rec_args),
-                            len(_rec_args),
-                            content_free_digest(want),
-                            len(want),
-                        )
+                        "input-differs(kind=%r parked=%s wanted=%s)"
+                        % (record.get("kind"), _rec_digest[:12] or "empty", input_digest[:12])
                     )
                 elif not_before is not None and at < not_before:
                     misses.append(
@@ -293,16 +290,18 @@ def claim(
                         % (at, not_before, not_before - at)
                     )
                 else:
-                    misses.append("already-matched-a-sibling-frame(kind=%r)" % (_rec_kind,))
+                    misses.append(
+                        "already-matched-a-sibling-frame(kind=%r)" % (record.get("kind"),)
+                    )
             keep.append(record)
         if hit is None:
             if misses:
                 logger.warning(
-                    "session-directive CLAIM MISS for session_key=%r kind=%r: %d "
+                    "session-directive CLAIM MISS for session_key=%r input_digest=%s: %d "
                     "parked record(s) were examined and none matched -> %s. The "
                     "record stays parked; the directive is NOT applied.",
                     session_key,
-                    kind,
+                    input_digest[:12],
                     len(misses),
                     "; ".join(misses),
                 )

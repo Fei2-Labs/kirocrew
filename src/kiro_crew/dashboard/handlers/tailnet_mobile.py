@@ -30,7 +30,7 @@ The payload is a URL with a session token in its query string. It is not logged,
 not stored, and not returned by the status endpoint — only by an explicit POST.
 Behind ``tailscale serve`` every request reaches the gateway from ``127.0.0.1``,
 so per-device session pinning cannot distinguish the phone from anything else on
-the tailnet (issue #1762): the token is the only real credential, which is why
+the tailnet: the token is the only real credential, which is why
 the default TTL here is an hour rather than the 20-hour ceiling the CLI uses.
 
 **Publishing is the consent for staying awake.** A phone loses the dashboard the
@@ -73,7 +73,7 @@ TAILSCALE_DOWNLOAD_URL = "https://tailscale.com/download"
 
 #: Default lifetime of the session a scanned QR opens. Deliberately far below the
 #: 20-hour ceiling: behind ``tailscale serve`` the session cannot be pinned to the
-#: scanning device (#1762), so this token is the only thing standing between the
+#: scanning device, so this token is the only thing standing between the
 #: tailnet and the dashboard. An hour is enough for a phone session and short
 #: enough that a leaked link stops mattering quickly.
 DEFAULT_QR_TTL_SECS = 3600
@@ -106,6 +106,7 @@ def _derive_step(
     trusted: bool,
     startup_host: str,
     published: bool | None,
+    port_free: bool | None,
 ) -> Step:
     """The one next action, derived HERE and nowhere else.
 
@@ -133,7 +134,12 @@ def _derive_step(
     6. ``occupied`` — serve holds this port/mount for something that is not this
        dashboard, or its state could not be determined. Publishing would REPLACE
        it, so this refuses and the card renders the manual command
-       (``kirocrew tailnet up``) for the operator to run deliberately.
+       (``kirocrew tailnet up``) for the operator to run deliberately. Decided
+       on ``port_free``, not on ``published`` alone: a stranger's handler at the
+       mount reads ``published=False`` exactly as a free port does, and offering
+       the publish button for it walked the operator into ``publish()``'s own
+       refusal one click later. Serve config that sits entirely on OTHER ports
+       is neither — it is invisible to this write and derives ``publish``.
     7. ``publish`` — everything is in place; one action left.
     8. ``ready`` — published and trusted.
     """
@@ -169,10 +175,12 @@ def _derive_step(
         return "restart_gateway"
     if published is True:
         return "ready"
-    # ``published is None`` is "could not tell", which is NOT "free". Publishing
-    # over an unknown mount is the destructive direction, so an undetermined
-    # state lands with the occupied case — same refusal, same manual escape.
-    return "publish" if published is False else "occupied"
+    # Only a provably free port earns the publish button; ``None`` ("could not
+    # tell") and ``False`` (something else holds the mount) are both the
+    # destructive direction and land with the occupied case — same refusal,
+    # same manual escape. This mirrors ``publish()``'s own guard, so the card
+    # never offers an action the write side will refuse.
+    return "publish" if (published is False and port_free is True) else "occupied"
 
 
 def _dashboard_port(request: web.Request) -> int:
@@ -311,20 +319,18 @@ class _LiveState(NamedTuple):
 async def _live_state(request: web.Request, port: int) -> _LiveState:
     """Probe the machine and derive the single next step, for EVERY caller.
 
-    Extracted so the status read and the QR mint cannot disagree about what this
-    machine may currently do. They previously disagreed in the direction that
-    matters: the card refused to offer a QR unless the derived step was ``ready``,
-    while the mint endpoint re-checked two of ``_derive_step``'s seven
-    preconditions by hand (a name exists; serve reports published) and silently
-    admitted the other five. Every precondition the mint did not re-implement was
-    a way to obtain a credential the card would never have offered — which is why
-    this endpoint accumulated four separate blocking review findings, one per
-    missed precondition, rather than one.
+    Shared so the status read and the QR mint cannot disagree about what this
+    machine may currently do. A disagreement runs in the direction that matters:
+    the card refuses to offer a QR unless the derived step is ``ready``, so a mint
+    endpoint re-checking only two of ``_derive_step``'s seven preconditions by
+    hand (a name exists; serve reports published) silently admits the other five.
+    Every precondition the mint does not re-implement is a way to obtain a
+    credential the card would never have offered.
 
     ``_derive_step`` is documented as deriving the next action "HERE and nowhere
-    else", so the fix is to honour that rather than to add a fifth hand-rolled
-    check. Reading one function's answer is also the only version of this that
-    stays correct when a step is added later.
+    else", and this honours that rather than adding a hand-rolled check. Reading
+    one function's answer is also the only version of this that stays correct when
+    a step is added later.
     """
     try:
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
@@ -347,6 +353,7 @@ async def _live_state(request: web.Request, port: int) -> _LiveState:
         name="", installed=False, reachable=False, logged_in=False, detail=""
     )
     published: bool | None = None
+    port_free: bool | None = None
     serve_detail = ""
     if not pinned:
         # Both are subprocess round trips; neither may run on the event loop.
@@ -354,6 +361,7 @@ async def _live_state(request: web.Request, port: int) -> _LiveState:
         if probe.name and port:
             state = await asyncio.to_thread(tailnet_serve.serve_state, port)
             published = state.published
+            port_free = state.port_free
             serve_detail = state.detail
 
     startup_host = tailnet.running_tailnet_origin(request.app)[0]
@@ -363,6 +371,7 @@ async def _live_state(request: web.Request, port: int) -> _LiveState:
         trusted=trusted,
         startup_host=startup_host,
         published=published,
+        port_free=port_free,
     )
     return _LiveState(
         step=step,
@@ -976,7 +985,7 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     #
     # GATED on daemon-verified tailnet identity, and the gate is what makes this
     # offerable at all rather than merely convenient. Behind ``tailscale serve``
-    # every request reaches the gateway from 127.0.0.1 (#1762), so with identity
+    # every request reaches the gateway from 127.0.0.1, so with identity
     # trust off the pin is ``ip:127.0.0.1`` for every tailnet client and the
     # cookie is a bearer credential any of them could replay. A session that ends
     # at the next restart bounds that exposure; one that outlives the process does

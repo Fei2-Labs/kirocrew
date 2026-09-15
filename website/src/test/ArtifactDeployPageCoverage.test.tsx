@@ -52,8 +52,17 @@ const SITE: Json = {
 
 function installFetch(cfg: FetchCfg = {}): Call[] {
   const calls: Call[] = []
+  // `text()` and `headers` are what the shared `toApiError` factory reads on a
+  // non-2xx reply. An empty-object body stands in for "no body" here, so the
+  // factory's `HTTP <status>` fallback is what the notice shows for it.
   const reply = (status: number, data: Json) =>
-    ({ ok: status < 400, status, json: async () => data }) as unknown as Response
+    ({
+      ok: status < 400,
+      status,
+      json: async () => data,
+      text: async () => (Object.keys(data).length ? JSON.stringify(data) : ''),
+      headers: { get: () => null },
+    }) as unknown as Response
   const fn = vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url)
     const method = (init?.method ?? 'GET').toUpperCase()
@@ -185,6 +194,30 @@ describe('ArtifactDeployPage — navigation, disclosure, and copy affordances', 
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining('aws configure sso'))
   })
 
+  it('shows a check confirmation once a setup-command copy actually lands', async () => {
+    installFetch()
+    installClipboard()
+    renderPage()
+    const copyButtons = await screen.findAllByRole('button', { name: 'Copy' })
+    fireEvent.click(copyButtons[0])
+    await waitFor(() => expect(copyButtons[0].querySelector('.lucide-check')).not.toBeNull())
+  })
+
+  it('renders no check confirmation when a setup-command copy fails outright', async () => {
+    installFetch()
+    // Both clipboard layers fail: writeText rejects, and execCommand (jsdom has
+    // no real implementation) returns false via the shared helper's fallback.
+    Object.defineProperty(window.navigator, 'clipboard', {
+      value: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
+      configurable: true,
+    })
+    renderPage()
+    const copyButtons = await screen.findAllByRole('button', { name: 'Copy' })
+    fireEvent.click(copyButtons[0])
+    await waitFor(() => expect(copyButtons[0]).toBeInTheDocument())
+    expect(copyButtons[0].querySelector('.lucide-check')).toBeNull()
+  })
+
   it('states the empty case for both the registry and the deployment list', async () => {
     installFetch({ profiles: [], defaultProfile: '' })
     renderPage()
@@ -220,14 +253,17 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
   it('surfaces the backend reason a registration was refused', async () => {    installFetch({ available: ['other-sso'], write: { status: 400, body: { error: 'profile not found in ~/.aws/config' } } })
     renderPage()
     fireEvent.click(await screen.findByRole('button', { name: /other-sso/ }))
-    expect(await screen.findByText('Error: profile not found in ~/.aws/config')).toBeInTheDocument()
+    // The backend reason is the ErrorNotice message verbatim (no "Error:" lead),
+    // so the journal message-match keeps working.
+    const notice = await screen.findByRole('alert')
+    expect(notice.textContent).toContain('profile not found in ')
   })
 
   it('falls back to a generic reason when the refusal carries no error field', async () => {
     installFetch({ available: ['other-sso'], write: { status: 500, body: {} } })
     renderPage()
     fireEvent.click(await screen.findByRole('button', { name: /other-sso/ }))
-    expect(await screen.findByText('Error: add failed')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('HTTP 500')
   })
 
   it('creates and registers a profile from the form, then closes and clears it', async () => {
@@ -287,7 +323,7 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
     renderPage()
     await profilesLoaded()
     fireEvent.click(screen.getByLabelText('Make ship-sandbox the default profile'))
-    expect(await screen.findByText('Error: update failed')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('HTTP 409')
   })
 
   // The removal guard is the in-app dialog, never window.confirm — the native
@@ -325,7 +361,7 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
     fireEvent.click(screen.getByLabelText('Remove ship-sandbox from registry'))
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: 'Remove profile' }))
-    expect(await screen.findByText('Error: remove failed')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('HTTP 500')
   })
 
   it('shows the account behind a verified profile', async () => {
@@ -334,7 +370,7 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
     await profilesLoaded()
     fireEvent.click(screen.getAllByRole('button', { name: /Verify/ })[0])
     // Built from the mock rather than inlined: the literal "account <12
-    // digits>" string is the shape scripts/scrub-lint.sh rejects.
+    // digits>" string is the shape the internal-content scan rejects.
     const account = (PROFILES[0] as { account: string }).account
     expect(
       await screen.findByText(new RegExp(`access reachable \\(account ${account}\\)`)),
@@ -373,8 +409,25 @@ describe('ArtifactDeployPage — IAM policy loader', () => {
     expect(await screen.findByText('STATIC-POLICY-JSON')).toBeInTheDocument()
     expect(calls.some((c) => c.url.includes('/iam-policy?tier=static'))).toBe(true)
     expect(screen.queryByRole('button', { name: /Copy boundary policy/ })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: /Copy policy/ }))
+    const copyPolicyBtn = screen.getByRole('button', { name: /Copy policy/ })
+    fireEvent.click(copyPolicyBtn)
     expect(writeText).toHaveBeenCalledWith('STATIC-POLICY-JSON')
+    await waitFor(() => expect(copyPolicyBtn.querySelector('.lucide-check')).not.toBeNull())
+  })
+
+  it('renders no confirmation when copying the IAM policy fails', async () => {
+    installFetch()
+    Object.defineProperty(window.navigator, 'clipboard', {
+      value: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
+      configurable: true,
+    })
+    renderPage()
+    await profilesLoaded()
+    fireEvent.click(screen.getByRole('button', { name: 'Get IAM policy' }))
+    const copyPolicyBtn = await screen.findByRole('button', { name: /Copy policy/ })
+    fireEvent.click(copyPolicyBtn)
+    await waitFor(() => expect(copyPolicyBtn).toBeInTheDocument())
+    expect(copyPolicyBtn.querySelector('.lucide-check')).toBeNull()
   })
 
   it('loads the fullstack tier with its permissions-boundary policy and note', async () => {
@@ -471,7 +524,7 @@ describe('ArtifactDeployPage — recall and destroy two-call guard', () => {
     fireEvent.click(screen.getByRole('button', { name: /Recall/ }))
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: 'Recall site' }))
-    expect(await screen.findByText('Error: bucket changed since preview')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('bucket changed since preview')
   })
 
   it('names the bucket and the distribution in the destroy dialog and binds both', async () => {
@@ -510,7 +563,7 @@ describe('ArtifactDeployPage — recall and destroy two-call guard', () => {
     fireEvent.click(screen.getByRole('button', { name: /Destroy/ }))
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: 'Destroy site' }))
-    expect(await screen.findByText('Error: site was recreated since preview')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('site was recreated since preview')
   })
 
   it('fails the destroy closed when the preview cannot resolve the resources', async () => {

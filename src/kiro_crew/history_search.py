@@ -9,15 +9,19 @@ lock, and path.
 
 from __future__ import annotations
 
+import itertools
 import json
+import logging
 import math
+import os
 import re
 import time as _time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, NamedTuple
 
 from kiro_crew._sqlite_compat import is_cjk_char, script_runs
+from kiro_crew.history_index import INDEX_FILENAME, SessionSearchIndex
 from kiro_crew.jsonl_util import bounded_records
 
 if TYPE_CHECKING:
@@ -67,6 +71,17 @@ _FORGE_REF_WEIGHT = 4.0
 # expensive part of a search. A fourth forge-shaped token degrades to a plain
 # needle.
 _SEARCH_MAX_FORGE_REFS = 3
+# ALTERNATIVE spellings ONE resolver answer may contribute for a single token.
+# The collector returns the FIRST plugin to recognize the token, for every token
+# shape, so exactly one provider's answer ever arrives here — this bounds that
+# one answer, not a fan-in across providers. The unit of cost is the same as
+# above: one ``str.count`` per spelling per scanned session per field, so an
+# unbounded contribution would let a plugin multiply every search by a number
+# nothing in core chose. Sized to the sibling per-plugin ceiling
+# (_MAX_PLUGIN_PATH_MARKERS, also 8), which bounds the same kind of thing: what
+# one plugin may hand core for one lookup. Lives here rather than beside the
+# collector because the cost it bounds is this module's.
+_MAX_SEARCH_REF_SPELLINGS = 8
 
 
 def _is_cjk_char(ch: str) -> bool:
@@ -438,6 +453,129 @@ def _parse_forge_ref(token: str, lead: tuple[str, ...]) -> _ForgeRef | None:
     return None
 
 
+#: The resolver that recognizes a query token as some REGISTERED source
+#: provider's item and answers with that item's spellings. The built-in forge
+#: shapes above are tried first, so it can only ever claim a token no built-in
+#: recognized.
+#:
+#: ONE slot, not a list: the only production registrant is
+#: ``register_source_provider``, and the per-plugin fan-out already lives inside
+#: the collector it publishes. A list would have bought ordered consultation
+#: nothing in-tree can exercise.
+#:
+#: Deliberately a plain module-level callable: this module imports nothing but
+#: the standard library, and the provider registry it serves lives in
+#: ``kiro_crew.dashboard.handlers.source_providers`` — a 7k-line module that
+#: imports aiohttp at module scope. Reaching UP to ask it would put the whole
+#: dashboard HTTP stack on every search, including the CLI and the Discord
+#: title-only gate, neither of which runs a web server. The dashboard therefore
+#: PUSHES its collector down here at registration time instead.
+_search_ref_resolver: Callable[[str], tuple[str, Sequence[str]] | None] | None = None
+
+logger = logging.getLogger(__name__)
+
+
+def register_search_ref_resolver(
+    resolve: Callable[[str], tuple[str, Sequence[str]] | None],
+) -> None:
+    """Install the token -> ``(canonical, alts)`` resolver. Idempotent.
+
+    Called at provider registration time, from the side that owns the provider
+    registry. Re-registration is the expected case, not an error — the registry
+    publishes the same collector on every provider registration — and the slot
+    simply holds the latest.
+
+    A resolver must be PURE and allocation-cheap: it is consulted for every term
+    of every query, and both :func:`snippet_needles` and
+    :meth:`ConversationLog.search_sessions` re-parse, so a search costs at least
+    two passes over the tokens. Any I/O, config read or lock in a resolver
+    becomes per-keystroke latency in the dashboard's search box. Nothing enforces
+    that beyond this contract.
+    """
+    global _search_ref_resolver
+    _search_ref_resolver = resolve
+
+
+def reset_search_ref_resolver_for_tests() -> None:
+    """Drop the resolver. Test-only: the slot is module state."""
+    global _search_ref_resolver
+    _search_ref_resolver = None
+
+
+def _provider_search_ref(token: str) -> tuple[str, tuple[str, ...]] | None:
+    """Ask the registered resolver to recognize *token*.
+
+    Returns ``(canonical, alts)`` NORMALIZED — casefolded, de-duplicated, empties
+    dropped, alts capped at :data:`_MAX_SEARCH_REF_SPELLINGS` — or ``None``.
+
+    This is the ONLY normalizer. The dashboard collector hands the first answer
+    through without judging it, so casefolding, the shape checks, the cap and the
+    dedup all happen once, here, where the cost they bound is paid. It matters
+    because the failure is SILENT — :func:`parse_search_query` casefolds its input
+    and :func:`count_needle` requires already-folded needles, so a spelling that
+    arrives with a capital letter produces a needle that matches nothing, with no
+    error and no log; it just returns zero results.
+
+    Every way a resolver can fail is contained, because a plugin defect must not
+    make the search box stop working: raising when CALLED, returning a malformed
+    answer, and raising while its ``alts`` are READ — the hook promises a
+    ``Sequence``, which cannot do that, but a resolver ignoring the contract can,
+    so the read sits inside a ``try`` and the answer is dropped whole. Every case
+    logs — a traceback where an exception was raised, the offending value where a
+    shape was merely wrong. None of them is silent: silence is the defect above.
+    """
+    resolve = _search_ref_resolver
+    if resolve is None:
+        return None
+    try:
+        found = resolve(token)
+    except Exception:
+        logger.debug("search ref resolver %r failed on %r", resolve, token, exc_info=True)
+        return None
+    if found is None:
+        return None
+    try:
+        canonical, alts = found
+    except Exception:
+        # `Exception`, not just TypeError/ValueError: the ANSWER may itself be lazy,
+        # so unpacking it runs plugin code that can raise anything at all.
+        logger.debug("search ref resolver %r returned a malformed answer", resolve, exc_info=True)
+        return None
+    if not isinstance(canonical, str) or not canonical.strip():
+        logger.debug("search ref resolver %r returned an invalid canonical %r", resolve, canonical)
+        return None
+    if isinstance(alts, str) or not isinstance(alts, Iterable):
+        logger.debug("search ref resolver %r returned invalid alts %r", resolve, alts)
+        return None
+    folded = canonical.casefold()
+    try:
+        # islice, not tuple(alts): a resolver ignoring the `Sequence` contract can
+        # hand back an endless iterable, and materializing it would hang the parse.
+        candidates = tuple(itertools.islice(alts, _MAX_SEARCH_REF_SPELLINGS))
+    except Exception:
+        # A `Sequence` cannot raise here; a resolver ignoring the contract can,
+        # and its answer is dropped whole rather than read half-way.
+        logger.debug(
+            "search ref resolver %r raised while its alts were read", resolve, exc_info=True
+        )
+        return None
+    spellings: dict[str, None] = {}
+    for alt in candidates:
+        if isinstance(alt, str) and alt.strip():
+            spellings[alt.casefold()] = None
+        else:
+            logger.debug("search ref resolver %r returned an invalid alt %r", resolve, alt)
+    spellings.pop(folded, None)
+    # Containment: at least one spelling must actually carry the token the user
+    # typed, or the answer describes some other item and would gate (or rank) a
+    # query on text it never named.
+    typed = token.casefold()
+    if typed not in folded and not any(typed in spelling for spelling in spellings):
+        logger.debug("search ref resolver %r answered %r without the typed token", resolve, folded)
+        return None
+    return (folded, tuple(spellings))
+
+
 def parse_search_query(query: str) -> tuple[list[SearchNeedle], str, bool]:
     """Return ``(needles, phrase, adjacency_floor)`` for a search *query*, casefolded.
 
@@ -529,6 +667,42 @@ def parse_search_query(query: str) -> tuple[list[SearchNeedle], str, bool]:
     for index, part in enumerate(parts):
         lead = _forge_lead_in(parts, index)
         ref = _parse_forge_ref(part, lead)
+        if ref is None and not part.isdigit():
+            # Built-ins always win: only a token no forge shape recognized is
+            # offered to a registered provider. The extra `isdigit` guard is what
+            # keeps a provider from turning a BARE NUMBER into a gate — the same
+            # rule _parse_forge_ref applies to itself, and for the same reason.
+            # Gating "987654321" on a provider spelling would demand that
+            # spelling of every result, silently narrowing ordinary numeric
+            # content search. So a bare number is never offered to a provider at
+            # all, and the built-in ranking hint below carries built-in
+            # spellings only.
+            #
+            # A provider contributes SPELLINGS ONLY, never lead-in vocabulary:
+            # _forge_type_suffix's words are popped from the gate, and the common
+            # English words a provider would want ("review", "cr") are far more
+            # frequent in transcripts than "pr"/"mr", so admitting them would
+            # trade a real search term for every session mentioning that number.
+            # A prefixed token carries its own type and needs no lead-in.
+            provider_ref = _provider_search_ref(part)
+            if provider_ref is not None:
+                canonical, alts = provider_ref
+                if canonical in required:
+                    # Already gated by an earlier spelling of the same item; the
+                    # needle carries the whole set, so there is nothing to merge.
+                    continue
+                if canonical in charged or forge_budget:
+                    if canonical not in charged:
+                        charged.add(canonical)
+                        forge_budget -= 1
+                    required.setdefault(canonical, SearchNeedle(canonical, 1.0, True, alts, True))
+                    # Continue like the built-in path does: the literal token must
+                    # not ALSO survive into the gate through _script_runs, or a
+                    # provider query would carry two required needles.
+                    continue
+                # Budget exhausted and this item has no slot — fall through and
+                # degrade to a plain literal needle, exactly as an over-budget
+                # forge token does.
         if ref is not None:
             canonical, alts = _forge_spellings(ref)
             if canonical in required:
@@ -598,10 +772,29 @@ def parse_search_query(query: str) -> tuple[list[SearchNeedle], str, bool]:
                 bigram = run[i : i + 2]
                 extras.setdefault(bigram, SearchNeedle(bigram, 1.0, False, adjacency=True))
     # A spelling that is already REQUIRED must not also score as a ranking hint:
-    # a query naming the same item twice ("#4411 4411") would count its hits
-    # twice over.
+    # a query naming the same item twice — the bare number and then its GitHub
+    # sigil form — would count its hits twice over. The by-key sweep catches the
+    # SAME-FAMILY repeat, where the hint's own key is the required spelling.
     for text in [t for t in ranking if t in required]:
         del ranking[text]
+    # A CROSS-FAMILY repeat ("4411 !4411") slips past that sweep: the sigil
+    # gates the GitLab spelling while the bare number's hint stays keyed on the
+    # GitHub form, so the required spelling survives inside the hint's ALTS and
+    # one mention would be scored by the required needle AND the hint. Required
+    # needles carry alts of their own (count_needle scores every spelling), so
+    # the purge covers those too, not only the keys. A hint whose every
+    # spelling is already required contributes nothing and is dropped whole —
+    # built-in spellings alone cannot get there (the hint's canonical form is
+    # only ever a required KEY, which the by-key sweep already handled), but a
+    # provider's alts can blanket the rest. A hint that keeps any spelling
+    # still ranks on what survives.
+    required_spellings = {s for n in required.values() for s in (n.text, *n.alts)}
+    for key, needle in list(ranking.items()):
+        spellings = tuple(s for s in (needle.text, *needle.alts) if s not in required_spellings)
+        if not spellings:
+            del ranking[key]
+        elif spellings != (needle.text, *needle.alts):
+            ranking[key] = needle._replace(text=spellings[0], alts=spellings[1:])
     needles = list(required.values())[:SEARCH_MAX_TOKENS]
     needles.extend(list(extras.values())[:_SEARCH_MAX_SCORING_EXTRAS])
     needles.extend(ranking.values())
@@ -701,7 +894,7 @@ def _facade_search_scan_window() -> int:
     """Read the facade's live scan limit without creating an import cycle.
 
     The import happens only when a search runs.  Keeping this as a getter is
-    intentional: tests and callers historically patch
+    intentional: tests and callers patch
     ``kiro_crew.history._SEARCH_SCAN_WINDOW`` after construction.
     """
     from kiro_crew import history as history_facade
@@ -709,11 +902,46 @@ def _facade_search_scan_window() -> int:
     return history_facade._SEARCH_SCAN_WINDOW
 
 
+def _history_lock_timeout() -> type[BaseException]:
+    """The facade's lock-timeout class, looked up late to avoid an import cycle.
+
+    ``history`` imports this module to build its catalog projection, so the class
+    cannot be imported at module scope. Same reason as
+    :func:`_facade_search_scan_window` above.
+    """
+    from kiro_crew import history as history_facade
+
+    return history_facade.HistoryLockTimeout
+
+
 class SessionCatalogProjection:
     """List, aggregate, search, and snippet-project conversation sessions."""
 
     def __init__(self, log: "ConversationLog") -> None:
         self._log = log
+        self._index: "SessionSearchIndex | None" = None
+
+    @property
+    def search_index(self) -> "SessionSearchIndex":
+        """The candidate index, opened on first search rather than on construction.
+
+        Lazy because a ``ConversationLog`` is built for many reasons that never
+        search — every test fixture, every append-only writer — and opening a
+        SQLite file per instance would cost handles nothing asks for. Owned here
+        rather than on the log because the index exists only to serve this
+        projection; the delete path reaches it through the log's catalog
+        projection.
+
+        Kept in a ``.index`` subdirectory OF the session directory, so a pod, a
+        temporary home, or a test's ``tmp_path`` indexes its own sessions instead
+        of sharing one file with whatever else lives beside it. A subdirectory
+        rather than a sibling of the transcripts because the index is derived
+        data: anything walking the session directory should be able to ignore it
+        by name, and losing it costs one backfill.
+        """
+        if self._index is None:
+            self._index = SessionSearchIndex(self._log._dir / ".index" / INDEX_FILENAME)
+        return self._index
 
     @staticmethod
     def _canonical_key(key: str) -> str:
@@ -958,8 +1186,17 @@ class SessionCatalogProjection:
         scored: list[tuple[float, int, dict, bool]] = []
         window = self._log.list_sessions()[: _facade_search_scan_window()]
         self._log._prune_search_memos({m["key"] for m in window})
+        allowed, rowids = self._index_shortlist(window, needles)
         for rank, meta in enumerate(window):
-            doc_chars, folded = self._log._folded_content(meta["key"])
+            key = meta["key"]
+            if allowed is not None and key not in allowed:
+                # The index vouches for this session's current text and proved it
+                # cannot satisfy the gate, so it is skipped without the read and
+                # per-line parse that dominate a scan. This is the speedup; every
+                # line below is the unchanged exact evaluation, run on far fewer
+                # sessions.
+                continue
+            doc_chars, folded = self._folded_for(key, rowids)
             title_folded = (meta.get("title") or "").casefold()
             content_hits = 0.0
             title_hits = 0.0
@@ -1021,6 +1258,189 @@ class SessionCatalogProjection:
             snippet = self._log._content_snippet(meta["key"], query) if needs_snippet else ""
             out.append({**meta, "snippet": snippet} if snippet else meta)
         return out
+
+    def index_session(self, key: str) -> bool:
+        """Index *key*'s current text, returning ``True`` when a row was written.
+
+        Runs under the session's own ``_locked(key)`` for the whole stat → read →
+        write, which is what orders it against deletion. Without the lock a delete
+        landing between the read and the write re-inserts the text of a session
+        that was just deleted: the transcript is gone, the row is gone, and then
+        this writes the copy back — reachable, and it survives until some later
+        backfill pass happens to evict it.
+
+        The lock is not new cost. ``_build_folded`` — the scan path this replaces —
+        already took it once per session PER QUERY, so moving the read behind the
+        same lock in a background pass strictly reduces how long it is held.
+
+        The stat is taken inside the lock and before the read, so the row records
+        the revision its text actually came from.
+        """
+        index = self.search_index
+        if not index.available:
+            return False
+        try:
+            with self._log._locked(key):
+                try:
+                    st = self._log._path(key).stat()
+                except OSError:
+                    # The file is gone; make sure no row keeps claiming it.
+                    index.drop([key])
+                    return False
+                try:
+                    texts = list(self._log._iter_message_texts(key))
+                except OSError:
+                    return False
+                index.sync(
+                    key,
+                    mtime_ns=st.st_mtime_ns,
+                    size=st.st_size,
+                    dev=st.st_dev,
+                    ino=st.st_ino,
+                    texts=texts,
+                )
+        except _history_lock_timeout():
+            # A writer holds this session; the next pass picks it up. Reporting
+            # False keeps the backfill's "remaining" count honest.
+            return False
+        return True
+
+    def backfill_index(self, *, budget_secs: float = 5.0) -> dict[str, int]:
+        """Index window sessions no row vouches for, within *budget_secs*.
+
+        Returns counts so a caller can decide whether to run again soon. The
+        budget is wall-clock and checked between sessions, so one very large
+        session can overrun it — bounding that would mean abandoning a session
+        half-indexed, and a row that describes half a file is exactly the kind of
+        lie this design refuses to store.
+
+        Rows for sessions that have left the search window are dropped in the
+        same pass. They are unreachable by search (the window is the only thing
+        scored) so keeping them would grow the index without bound while
+        answering nothing.
+        """
+        index = self.search_index
+        if not index.available:
+            return {"indexed": 0, "dropped": 0, "remaining": 0}
+        window = self._log.list_sessions()[: _facade_search_scan_window()]
+        window_keys = {meta["key"] for meta in window}
+        stats: dict[str, os.stat_result] = {}
+        for meta in window:
+            try:
+                stats[meta["key"]] = self._log._path(meta["key"]).stat()
+            except OSError:
+                continue
+        fresh = index.fresh_keys(stats)
+        pending = [meta["key"] for meta in window if meta["key"] not in fresh]
+        departed = index.indexed_keys() - window_keys
+        index.drop(departed)
+        deadline = _time.monotonic() + budget_secs
+        indexed = 0
+        for key in pending:
+            if _time.monotonic() > deadline:
+                break
+            if self.index_session(key):
+                indexed += 1
+        return {
+            "indexed": indexed,
+            "dropped": len(departed),
+            "remaining": len(pending) - indexed,
+        }
+
+    def _index_shortlist(
+        self, window: list[dict], needles: list[SearchNeedle]
+    ) -> tuple[set[str] | None, dict[str, int]]:
+        """Narrow *window* to the sessions that could satisfy the gate.
+
+        Returns ``(allowed, rowids)``. ``allowed`` is ``None`` when the index
+        cannot narrow this query — no needle was long enough to look up, or the
+        index is unavailable — in which case the caller scores every session
+        exactly as it always did. ``rowids`` addresses the folded text of the
+        sessions the index vouches for.
+
+        Three unions make ``allowed`` a provable SUPERSET of the true hit set,
+        and all three are load-bearing:
+
+        * per NEEDLE, not per query, because the gate is satisfied field-wise —
+          one needle may be found in the title while another is found in the
+          content, so intersecting pre-combined content answers would drop that
+          session;
+        * a needle found in a session's TITLE is satisfied there, and titles are
+          not indexed (they are already in memory from ``list_sessions``);
+        * a session the index does not vouch for — never indexed, or its file has
+          moved on — stays in play unconditionally, because no row describes its
+          current text.
+        """
+        index = self.search_index
+        if not index.available:
+            return (None, {})
+        stats: dict[str, os.stat_result] = {}
+        for meta in window:
+            try:
+                stats[meta["key"]] = self._log._path(meta["key"]).stat()
+            except OSError:
+                continue
+        # One snapshot for both answers: read separately, a row dropped by the
+        # backfill between them leaves its session vouched-for AND out of every
+        # candidate set, which silently loses a hit the scan path would return.
+        rowids, per_needle = index.shortlist(stats, needles)
+        # Then re-stamp. The stats above were taken BEFORE the snapshot, so on their
+        # own they can vouch for a row whose file has since grown -- not as a race,
+        # but as an ordering error: the vouch would rest on an observation older than
+        # the index read it certifies, and the session's superseded text would decide
+        # whether it matches. Re-stating after the snapshot makes a vouch mean "as of
+        # a moment no earlier than this read", which is the guarantee the scan path
+        # gives by stat'ing and then folding. A key that moved is dropped here and
+        # picked up by ``unvouched`` below, so it is scanned rather than skipped.
+        for key in list(rowids):
+            before = stats.get(key)
+            try:
+                after = self._log._path(key).stat()
+            except OSError:
+                del rowids[key]
+                continue
+            if (
+                before is None
+                or after.st_mtime_ns != before.st_mtime_ns
+                or after.st_size != before.st_size
+                or after.st_dev != before.st_dev
+                or after.st_ino != before.st_ino
+            ):
+                del rowids[key]
+        if per_needle is None:
+            return (None, rowids)
+        unvouched = {meta["key"] for meta in window} - set(rowids)
+        allowed: set[str] | None = None
+        for pos, content_keys in per_needle.items():
+            needle = needles[pos]
+            in_title = {
+                meta["key"]
+                for meta in window
+                if count_needle(needle, (meta.get("title") or "").casefold())
+            }
+            satisfied = content_keys | in_title | unvouched
+            allowed = satisfied if allowed is None else (allowed & satisfied)
+        return (allowed, rowids)
+
+    def _folded_for(self, key: str, rowids: dict[str, int]) -> tuple[int, str]:
+        """Folded text for *key*, from the index when it vouches for the file.
+
+        One index read replaces a whole-file read plus a ``json.loads`` per line —
+        the ~85% of a scan that measured as pure overhead, since the bytes parsed
+        are dominated by the ``meta`` blob that carries no searchable text. It
+        also keeps the in-memory fold memo and its byte budget out of the picture
+        for indexed sessions, so a warm query stops growing RSS with the corpus.
+
+        Falls back to :meth:`_folded_content` — the original path, memo and all —
+        whenever the row is missing, unreadable, or belongs to a different
+        session, so a degraded or recycled index costs speed and never results.
+        """
+        rowid = rowids.get(key)
+        if rowid is not None:
+            doc = self.search_index.document(rowid, key)
+            if doc is not None:
+                return doc
+        return self._log._folded_content(key)
 
     def _folded_content(self, key: str) -> tuple[int, str]:
         """Return ``(doc_chars, casefolded_content)`` for *key*, memoized by
@@ -1261,6 +1681,24 @@ class SessionCatalogProjection:
                 # Let the fallback read raise the OSError the caller handles,
                 # rather than deciding here what a vanished file means.
                 pass
+        # The index holds the same texts the memo would have, for every session
+        # it vouches for — and unlike the memo it is not rationed by a byte
+        # budget, so it answers for the whole window rather than the first ~80
+        # sessions. This is where the last of the per-query file reads goes:
+        # snippets are built for the returned rows only, and taking one from the
+        # file costs a whole-transcript read and parse: 858 ms of a 947 ms query
+        # once matching itself is indexed. Freshness is re-checked
+        # inside ``raw_texts`` against this stat, so a file that moved on since
+        # the scoring pass falls through to the read below.
+        if self._index is not None and self._index.available:
+            try:
+                st = self._log._path(key).stat()
+            except OSError:
+                st = None
+            if st is not None:
+                texts = self._index.raw_texts(key, st)
+                if texts is not None:
+                    return iter(texts)
         return self._log._iter_message_texts(key)
 
     def _content_snippet(self, key: str, query: str) -> str:

@@ -15,14 +15,19 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from kiro_crew import name_grant
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.config import live
 from kiro_crew.config.paths import config_dir
+from kiro_crew.llm_helpers import is_prompt_busy
+from kiro_crew.trust_patterns import extract_bash_command
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +68,16 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     "session_read_message",
     "session_create",
     "session_close",
+    # The four work-ledger tools, blocked for the same containment reason and not
+    # for a new one: a channel agent has no dispatch relationship, so it is
+    # neither a conductor nor a bound worker and has no business holding one.
+    # Reading a brief would pull a private dispatch's acceptance bar into a
+    # channel other humans can see, and a report or a record would write into a
+    # conductor's own decision record from outside it.
+    "work_brief",
+    "work_report",
+    "work_ledger_read",
+    "work_ledger_record",
 )
 
 # Boundary-aware matcher: the tool name must stand alone in the rendered
@@ -77,11 +92,119 @@ _BLOCKED_TOOL_RE = re.compile(
     + r")(?![\w.\-/])"
 )
 _MCP_SEPARATOR_RE = re.compile(r"_{2,}")
+# A THIRD qualified spelling: opencode joins server and tool with a SINGLE
+# underscore ("kirocrew-core_send_message", measured on 1.18.30), which the run
+# of 2+ above leaves untouched — and a lone "_" before the tool name is a word
+# character, so the boundary lookbehind then refuses the match and the whole
+# containment list read as absent on that harness. Keyed on Crew's OWN
+# server-name shape rather than on "one underscore", because a bare single
+# underscore also unblocks "do_send_message" and every other identifier that
+# merely ends in a blocked name. Applied AFTER the run normalization, so
+# "mcp__kirocrew-core__send_message" is already spaced out and does not come
+# back here as "mcp _send_message" with the boundary re-broken. Recognising one
+# name too many can only ever BLOCK more, which is the safe direction for a
+# containment list — unlike the grant in ``session_directive``, which is why
+# that one matches the server name exactly.
+# Left boundary is the same class ``_BLOCKED_TOOL_RE`` uses, NOT ``\b``: ``\b``
+# treats ``/`` and ``.`` as boundaries, so a rendered PATH
+# ("cat /tmp/kirocrew-core_send_message") normalized to " send_message" and
+# over-blocked -- the same filename-versus-tool confusion the negative cases
+# in ``test_channel_blocked_tools.py`` exist to catch.
+_CREW_MCP_SERVER_PREFIX_RE = re.compile(r"(?<![\w.\-/])kirocrew-[A-Za-z0-9-]+_")
+
+
+def _shell_base_binary(cmd: str) -> str | None:
+    """The single binary a SIMPLE shell command invokes, else None.
+
+    Shell-aware (shlex) tokenization, fail-closed on everything that is not
+    one plain invocation: parse failures, empty commands, shell operators or
+    substitution anywhere (``|``, ``&``, ``;``, newline, backtick, ``$(``,
+    redirects), and env-assignment or quoted/space-bearing first tokens. A
+    base-command trust grant keyed on anything richer than one unambiguous
+    binary name has already been shown to widen scope (naive first-token
+    slicing turned ``"./my tool" --safe`` into a ``"./my`` prefix grant, and
+    env prefixes into match-anything grants), so anything ambiguous simply
+    has no base.
+    """
+    if not cmd or _CHANNEL_SHELL_OPERATOR_RE.search(cmd):
+        return None
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    base = tokens[0]
+    # An env-assignment first token means the binary is the SECOND token —
+    # refuse rather than guess (the grant would silently cover any command
+    # run under that prefix).
+    if not base or "=" in base:
+        return None
+    # A base containing whitespace can only come from quoting; a quoted
+    # executable path is matched by the exact-command tier, not by base.
+    if any(c.isspace() for c in base):
+        return None
+    # POSITIVE shape check: the base must look like a plain binary name or
+    # path. Enumerating bad metacharacters one by one (``!``, ``(``, …) is a
+    # losing game — the shell always has one more; anything outside this
+    # conservative charset is refused instead.
+    if not _CHANNEL_BASE_BINARY_RE.fullmatch(base):
+        return None
+    # Shell reserved words pass the charset but are interpreted by the shell,
+    # not executed as a binary — ``time rm ...`` must not yield a ``time``
+    # grant that covers ``time <anything>``.
+    if base in _CHANNEL_SHELL_RESERVED_WORDS:
+        return None
+    return base
+
+
+# Anything that makes a command more than ONE plain invocation. Deliberately
+# broader than the enforcement splitter's operator set: over-matching here
+# fails toward "no per-command grant available", never toward a wider grant.
+# Parentheses and braces cover subshell / brace grouping — "(rm /tmp/a)" must
+# not yield "(rm" as a trusted binary.
+_CHANNEL_SHELL_OPERATOR_RE = re.compile(r"[|&;`\n\r<>(){}]|\$\(")
+
+# What a trusted base binary is ALLOWED to look like: alphanumerics plus the
+# few characters real binary names and paths use. Everything else — negation
+# ``!``, test ``[``, arithmetic ``((`` — simply has no derivable base.
+_CHANNEL_BASE_BINARY_RE = re.compile(r"[A-Za-z0-9._/+-]+")
+
+# Words the shell interprets instead of executing. A grant keyed on one would
+# cover whatever command the shell runs under it.
+_CHANNEL_SHELL_RESERVED_WORDS = frozenset(
+    "! case coproc do done elif else esac fi for function if in select "
+    "then time until while".split()
+)
+
+
+def _match_trusted_channel_command(cmd: str, agent: "ChannelAgent") -> str | None:
+    """Match a pending shell command against the agent's trust grants.
+
+    Two literal forms only, both case-sensitive (on POSIX ``./Deploy.sh`` and
+    ``./deploy.sh`` are different executables):
+
+    - exact: the whole command text equals a granted command, OR
+    - base: the command is a SIMPLE invocation (see ``_shell_base_binary``)
+      whose binary equals a granted base.
+
+    Compound commands never match a base grant and only match an exact grant
+    granted for that identical compound; there is no pattern language and no
+    per-segment matching, so a grant can never cover text the user did not
+    read. Returns an audit label or None.
+    """
+    if cmd in agent._trusted_commands:
+        return f"command:{cmd}"
+    base = _shell_base_binary(cmd)
+    if base is not None and base in agent._trusted_bases:
+        return f"base:{base}"
+    return None
 
 
 def _blocked_tool_named(rendered: str) -> bool:
     """True when a blocked messaging tool is named (as a tool) in *rendered*."""
-    return bool(_BLOCKED_TOOL_RE.search(_MCP_SEPARATOR_RE.sub(" ", rendered)))
+    normalized = _CREW_MCP_SERVER_PREFIX_RE.sub(" ", _MCP_SEPARATOR_RE.sub(" ", rendered))
+    return bool(_BLOCKED_TOOL_RE.search(normalized))
 
 
 class ListenMode(Enum):
@@ -145,6 +268,24 @@ class ChannelAgent:
     listen_mode: ListenMode = ListenMode.MENTION
     inbox: asyncio.Queue[ChannelMessage] = field(default_factory=asyncio.Queue)
     _approval_future: asyncio.Future | None = field(default=None, repr=False)
+    # Per-command trust grants (trust_command / trust_base tiers) — runtime
+    # only, like the chat slot's session-scoped grants: agents are relaunched
+    # with fresh sessions on gateway restart, so grants deliberately do not
+    # persist. Grants are OPAQUE LITERALS, never patterns: ``_trusted_commands``
+    # holds exact full command texts (matched by string equality) and
+    # ``_trusted_bases`` holds single binary names (matched by shlex-token
+    # equality). No pattern language exists here by design — every derived
+    # sub-pattern scheme reviewed on this surface (segment globs, base globs
+    # from naive tokenization) leaked scope the user never consented to.
+    _trusted_commands: set[str] = field(default_factory=set, repr=False)
+    _trusted_bases: set[str] = field(default_factory=set, repr=False)
+    # Canonical shell command of the approval currently awaiting a decision,
+    # extracted server-side from the provider event's ``tool_input`` when the
+    # provider classified the tool as shell ("" otherwise). The approve
+    # endpoint binds trust_command / trust_base grants to THIS value — display
+    # titles and request-body patterns are LLM-influenced and never scope a
+    # grant. Set while ``_approval_future`` is pending, cleared with it.
+    _pending_approval_command: str = field(default="", repr=False)
     _task: asyncio.Task | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -480,12 +621,29 @@ class ChannelManager:
         self._broadcast_fn = broadcast_fn
         self._max_channels = max_channels
         self._max_agents = max_agents
+        # The two caps follow config live; the binder holds this object weakly.
+        self._config_subs = (
+            live.bind("agent.max_channels", self.set_max_channels),
+            live.bind("agent.max_channel_agents", self.set_max_agents),
+        )
         # Resolve the channels dir lazily in __init__ (not as a class attr) so
         # merely importing this module never triggers config_dir() and its
         # one-time data-home migration as an import side effect — that must fire
         # only at the single chosen point (ensure_data_home() in the CLI prologue).
         self._CHANNELS_DIR = channels_dir or str(config_dir() / "channels")
         self._load_all()
+
+    def set_max_channels(self, value: int) -> None:
+        """Adopt a new ``agent.max_channels`` cap for channels created from now on.
+
+        Existing channels above a lowered cap stay open; the cap gates creation
+        only, exactly as the constructor value did.
+        """
+        self._max_channels = max(1, int(value))
+
+    def set_max_agents(self, value: int) -> None:
+        """Adopt a new ``agent.max_channel_agents`` cap for members added from now on."""
+        self._max_agents = max(1, int(value))
 
     def _save_channel(self, channel: Channel) -> None:
         """Persist channel state to disk.
@@ -665,7 +823,34 @@ async def run_channel_agent(
             )
             orch_toplevel = agent.is_orchestrator and (is_toplevel_human or is_agent_report_back)
             tid = None if orch_toplevel else (msg.thread_id or msg.id)
-            await _stream_task(agent, channel, client, prompt, thread_id=tid, is_yolo=is_yolo)
+            busy = await _stream_task(
+                agent, channel, client, prompt, thread_id=tid, is_yolo=is_yolo
+            )
+            if busy:
+                # This loop owns the SessionManager, so it is the only place that
+                # can clear a wedge: replace the session and replay the message
+                # once on a cold one, then rebind the now-dead client.
+                replacement = await _recover_busy_agent(
+                    agent, channel, sessions, prompt, thread_id=tid, is_yolo=is_yolo
+                )
+                if replacement is None:
+                    # Report the dead end EXACTLY ONCE and stop consuming the
+                    # inbox. Re-running the reset on every later message would
+                    # spam the channel — strictly worse than the wedge itself.
+                    # ``api_channel_wake_agent`` is the restart affordance, and
+                    # it cold-starts because _recover_busy_agent tore the
+                    # abandoned replacement out of the session registry.
+                    await channel.post(
+                        agent.id,
+                        "❌ This agent's session is stuck and could not be recovered. "
+                        "Clear its context or wake it to try again.",
+                        from_role=agent.role,
+                        msg_type="system",
+                        thread_id=tid,
+                    )
+                    agent.state = "failed"
+                    break
+                client = replacement
 
             agent.state = "listening"
             channel._broadcast(
@@ -691,6 +876,93 @@ async def run_channel_agent(
         logger.info("Channel agent %s (%s) finished: %s", agent.id, agent.role, agent.state)
 
 
+async def _reset_busy_session(sessions: Any, agent: ChannelAgent) -> Any | None:
+    """Replace *agent*'s wedged session and return a lease on a cold one.
+
+    ``SessionManager.reset`` pops the registry entry and never awaits its
+    semaphore, so resetting while ``run_channel_agent`` still holds the permit
+    cannot deadlock; ``get_or_create`` then builds a fresh entry with a free
+    semaphore, and the single ``release(key)`` in that loop's ``finally``
+    resolves the key at call time, so it balances against the replacement. The
+    orphaned permit dies with the discarded session.
+
+    ``expect_session`` makes the swap a compare-and-swap: a concurrent
+    ``clear-context`` reset (``api_channel_clear_context``) may already have
+    replaced or removed the occupant, and neither outcome may be torn down
+    here. A guarded reset that declines is not a failure — it leaves the key
+    cold, which is exactly what the re-acquire below needs. Returns ``None``
+    only when the replacement lease cannot be obtained.
+    """
+    try:
+        await sessions.reset(
+            agent.session_key,
+            expect_session=sessions._sessions.get(agent.session_key),
+        )
+    except Exception:
+        logger.exception("Failed to reset wedged session %s", agent.session_key)
+        return None
+    try:
+        client, _is_new, _resumed = await sessions.get_or_create(
+            agent.session_key,
+            agent=agent.agent_name or None,
+            approval_policy=agent.approval_policy.value,
+        )
+    except Exception:
+        logger.exception("Failed to re-acquire session %s after reset", agent.session_key)
+        return None
+    return client
+
+
+async def _recover_busy_agent(
+    agent: ChannelAgent,
+    channel: Channel,
+    sessions: Any,  # SessionManager
+    message: str,
+    thread_id: str | None = None,
+    is_yolo: Any = None,  # callable returning bool
+) -> Any | None:
+    """Replace a prompt-busy session and replay *message* once on a cold one.
+
+    Returns the replacement client, or ``None`` when the agent cannot be used
+    again: the replacement lease was unobtainable, or the wedge survived it. In
+    that second case the replacement is torn back down here
+    rather than left behind — ``channel:``-keyed sessions are exempt from both
+    reapers (``session_cleanup._rss_threshold_check`` and ``_expire_idle`` skip
+    any key starting with ``session._CHANNEL_PREFIX``), so an abandoned one
+    leaks until the channel closes, and ``api_channel_wake_agent`` would
+    otherwise re-acquire that same wedged session straight out of the registry
+    and re-wedge instantly.
+    """
+    logger.warning(
+        "Channel agent %s (%s) session is prompt-busy — replacing it",
+        agent.id,
+        agent.role,
+    )
+    client = await _reset_busy_session(sessions, agent)
+    if client is None:
+        return None
+    still_busy = await _stream_task(
+        agent, channel, client, message, thread_id=thread_id, is_yolo=is_yolo
+    )
+    if not still_busy:
+        return client
+    logger.error(
+        "Channel agent %s (%s) still prompt-busy after a session reset",
+        agent.id,
+        agent.role,
+    )
+    try:
+        await sessions.reset(
+            agent.session_key,
+            expect_session=sessions._sessions.get(agent.session_key),
+        )
+    except Exception:
+        logger.exception(
+            "Failed to tear down the abandoned replacement session %s", agent.session_key
+        )
+    return None
+
+
 async def _stream_task(
     agent: ChannelAgent,
     channel: Channel,
@@ -698,8 +970,13 @@ async def _stream_task(
     message: str,
     thread_id: str | None = None,
     is_yolo: Any = None,  # callable returning bool
-) -> None:
-    """Stream an LLM task, posting output as channel messages."""
+) -> bool:
+    """Stream an LLM task, posting output as channel messages.
+
+    Returns True when the provider reported a prompt-busy wedge, which only the
+    caller can clear (it owns the ``SessionManager``); False on success and on
+    every other error, which a session reset cannot fix.
+    """
     from kiro_crew.providers.base import (
         EVENT_COMPLETE,
         EVENT_PERMISSION_REQUEST,
@@ -766,6 +1043,58 @@ async def _stream_task(
                     )
                     await client.approve_tool(event.request_id)
                     continue
+                # Per-command trust grants (trust_command / trust_base) — agent-
+                # scoped patterns granted via the approve endpoint. Security:
+                # grants are SHELL-ONLY and match against the ACTUAL command
+                # extracted from tool_input, never the LLM-authored display
+                # title; a tool the provider did not classify as shell is never
+                # matched even when its arguments carry a nested "command" key
+                # (e.g. cron_add), so a shell grant cannot leak onto MCP tools
+                # (deny-by-default). Mirrors the dashboard chat slot's
+                # trusted-pattern gate, hardened on the is_shell axis.
+                _is_shell = bool(getattr(event, "is_shell", False))
+                _cmd = (
+                    extract_bash_command(event.tool_input) if _is_shell and event.tool_input else ""
+                )
+                if (agent._trusted_commands or agent._trusted_bases) and _cmd:
+                    matched = _match_trusted_channel_command(_cmd, agent)
+                    if matched:
+                        # The grant names a PROGRAM; the shell resolves that
+                        # name again through a PATH that can lead with
+                        # agent-writable directories, and the file behind a
+                        # trusted `./deploy.sh` can have been replaced since
+                        # the human approved it. Same shared check as every
+                        # other name-based tier (hook auto-approve, chat
+                        # trusted patterns): a refusal does not reject — the
+                        # request falls through to the interactive card below,
+                        # where the human decides on this specific command.
+                        # Check the COMMAND THE GRANT MATCHED (_cmd, from
+                        # extract_bash_command) rather than re-deriving it
+                        # from the event: event.shell_command returns None
+                        # for raw non-JSON tool_input, and a None command
+                        # would make the check vouch for nothing while the
+                        # tier still auto-approves.
+                        _ng_refusal = await name_grant.refusal_for_command_off_loop(_cmd)
+                        if _ng_refusal is None:
+                            sel().log_tool_invocation(
+                                session_key=agent.session_key,
+                                agent=agent.agent_name,
+                                source="channel",
+                                tool_name=event.text or event.title or "",
+                                outcome="auto_approved_trusted_pattern",
+                                metadata={"pattern": matched},
+                            )
+                            await client.approve_tool(event.request_id)
+                            continue
+                        name_grant.log_decline(
+                            source="channel",
+                            session_key=agent.session_key,
+                            agent=agent.agent_name,
+                            event=event,
+                            refusal=_ng_refusal,
+                            tier="channel_trusted_pattern",
+                            sel_factory=sel,
+                        )
                 # Normal mode — interactive approval
                 # Redact over the FULL input, then bound: cutting first can
                 # split a credential at the boundary into fragments no
@@ -775,23 +1104,89 @@ async def _stream_task(
                 sanitized_input = await asyncio.to_thread(
                     redact_and_truncate, event.tool_input, 500
                 )
-                sanitized_name, _ = redact_credentials(event.text or "")
+                # The card's tool name. For a shell tool prefer the CANONICAL
+                # command (from ``tool_input``) over the display title: kiro's
+                # ``title`` for shell calls can be a model-authored prose
+                # description, and the trust tiers derive their consent-proof
+                # pattern from this name — a prose name would make the tiers
+                # mismatch the real command and fail with
+                # ``approval_superseded``. Non-shell tools keep the provider
+                # name (``text`` then ``title`` — the same fallback the
+                # blocked-tool check above uses; ACP permission events
+                # populate only ``title``).
+                # Use the same redactors on the command BYTES that would become
+                # authority. ``tool_input_redacted`` is transport provenance:
+                # re-running the scanners cannot reveal bytes an ACP transport
+                # already removed. Either signal makes the command display-only.
+                _safe_cmd, _cmd_credential_redacted = redact_credentials(_cmd)
+                _safe_cmd, _cmd_url_redacted = redact_exfiltration_urls(_safe_cmd)
+                _command_grantable = bool(_cmd) and not (
+                    bool(getattr(event, "tool_input_redacted", False))
+                    or _cmd_credential_redacted
+                    or _cmd_url_redacted
+                    or _safe_cmd != _cmd
+                    or "[REDACTED" in _cmd
+                )
+                if _cmd:
+                    # ``Running:`` is the channel UI's explicit proof that
+                    # command-scoped tiers are available. Keep an ungrantable
+                    # redacted command visible, but do not give it that marker
+                    # or the card would offer decisions the server must refuse.
+                    #
+                    # The other marker names what is missing and promises
+                    # nothing about scope. It must not say "allow once": the
+                    # blanket channel grant needs no command scope, so ``Trust
+                    # all tools in this channel`` renders beside this label and
+                    # the endpoint records it. A card telling the reader it can
+                    # only be allowed once, while carrying a control that trusts
+                    # the whole channel, is worse than a card that says nothing.
+                    #
+                    # It also must not say the text is HIDDEN, because the text
+                    # is right there beside the marker: what the reader cannot
+                    # have is proof that those characters are the ones that run,
+                    # since two commands differing only in a credential redact
+                    # to the same string. "Exact text unverified" is the fact,
+                    # and it stays out of implementation vocabulary: channel
+                    # readers are not all engineers, so it names neither bytes
+                    # nor redaction.
+                    _card_name = (
+                        f"Running: {_safe_cmd}"
+                        if _command_grantable
+                        else f"Shell command (exact text unverified): {_safe_cmd}"
+                    )
+                else:
+                    _card_name = event.text or event.title or ""
+                sanitized_name, _ = redact_credentials(_card_name)
                 sanitized_name, _ = redact_exfiltration_urls(sanitized_name)
                 loop = asyncio.get_running_loop()
-                agent._approval_future = loop.create_future()
-                await channel.post(
-                    agent.id,
-                    f"⚠️ Approval needed: **{sanitized_name}**\n```\n{sanitized_input}\n```",
-                    from_role=agent.role,
-                    msg_type="approval",
-                    thread_id=thread_id,
-                )
+                # Bind-target for a per-command trust decision on THIS
+                # approval: the canonical shell command ("" for non-shell
+                # tools, which the tiers refuse — fail closed). A command the
+                # provider redacted is also refused: two commands differing
+                # only in their credentials redact to the SAME text, so a
+                # grant scoped to the redacted form would silently cover
+                # commands the user never consented to.
+                approval_future = loop.create_future()
+                agent._pending_approval_command = _cmd if _command_grantable else ""
+                agent._approval_future = approval_future
                 try:
-                    decision = await asyncio.wait_for(agent._approval_future, timeout=3600)
+                    # Posting and waiting are one ownership scope. If the post
+                    # itself fails, neither the Future nor its command authority
+                    # may leak onto the next approval handled by this agent.
+                    await channel.post(
+                        agent.id,
+                        f"⚠️ Approval needed: **{sanitized_name}**\n```\n{sanitized_input}\n```",
+                        from_role=agent.role,
+                        msg_type="approval",
+                        thread_id=thread_id,
+                    )
+                    decision = await asyncio.wait_for(approval_future, timeout=3600)
                 except asyncio.TimeoutError:
                     decision = "rejected"
                 finally:
-                    agent._approval_future = None
+                    if agent._approval_future is approval_future:
+                        agent._approval_future = None
+                        agent._pending_approval_command = ""
 
                 if decision not in ("approved", "rejected", "trust"):
                     decision = "rejected"
@@ -804,6 +1199,16 @@ async def _stream_task(
                     outcome=decision,
                 )
 
+                if decision in ("approved", "trust") and _is_shell and _cmd:
+                    # A human read this exact command and said yes: record the
+                    # identity of the file behind each program name (same
+                    # witness the chat slot pins), so a later per-command
+                    # grant is honoured only while the same file answers to
+                    # the name. Pin BEFORE releasing execution: approving
+                    # first would let a self-replacing script swap the file
+                    # and get the replacement pinned. Runs off-loop (stats +
+                    # digests files).
+                    await asyncio.to_thread(name_grant.pin_human_approval, _cmd)
                 if decision == "trust":
                     channel.trusted = True
                     await client.approve_tool(event.request_id)
@@ -814,7 +1219,14 @@ async def _stream_task(
 
             elif event.kind == EVENT_COMPLETE:
                 break
-    except Exception:
+    except Exception as exc:
+        if is_prompt_busy(exc):
+            # No card here: a card is a dead end. The backend still holds an
+            # in-flight prompt, so every later message on this session is
+            # rejected identically until the session is replaced — and only the
+            # caller can do that. Report the wedge upward instead.
+            logger.warning("Prompt busy for channel agent %s (%s): %s", agent.id, agent.role, exc)
+            return True
         logger.exception("LLM stream error for agent %s (%s)", agent.id, agent.role)
         await channel.post(
             agent.id,
@@ -823,11 +1235,11 @@ async def _stream_task(
             msg_type="system",
             thread_id=thread_id,
         )
-        return
+        return False
 
     full_text = "".join(chunks).strip()
     if not full_text:
-        return
+        return False
     # Sanitize LLM output before posting
     full_text, _ = redact_exfiltration_urls(full_text)
     full_text, _ = redact_credentials(full_text)
@@ -843,3 +1255,4 @@ async def _stream_task(
         thread_id=thread_id,
         mention=mention_ids or None,
     )
+    return False

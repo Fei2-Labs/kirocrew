@@ -49,7 +49,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kiro_crew import mcp_computer
+from kiro_crew import mcp_computer, mcp_core
 from kiro_crew.computer_use import backend as cu_backend
 from kiro_crew.computer_use import index as cu_index
 from kiro_crew.computer_use import policy as cu_policy
@@ -409,7 +409,7 @@ def test_oversized_text_is_rejected():
 
 
 def test_shim_uses_the_strict_session_resolver_not_the_lenient_one():
-    """``_resolve_session_key_strict`` only.
+    """Strict identity only, routed through the shared reflexive-tool gate.
 
     The lenient resolver walks ``/proc`` ancestors over ``session_pid_<pid>.txt``,
     which ``mcp_core`` itself documents as "agent-writable and therefore
@@ -417,6 +417,7 @@ def test_shim_uses_the_strict_session_resolver_not_the_lenient_one():
     over the module's source so a future edit cannot quietly swap the resolver.
     """
     src = inspect.getsource(mcp_computer)
+    assert "require_strict_session_key" in src
     assert "_resolve_session_key_strict" in src
     # The lenient name must not appear as a CALL. (It is a prefix of the strict
     # name, so compare call forms rather than substrings.)
@@ -428,9 +429,8 @@ def test_an_unresolved_session_key_PROCEEDS_with_an_empty_identity(
 ):
     """**An unresolved identity is NOT a refusal** — it proceeds, empty.
 
-    This inverts an earlier revision, deliberately. The shim used to refuse, on the
-    reasoning that an unproven key is indistinguishable from an unattended surface.
-    Two things killed that:
+    This inverts an earlier revision, deliberately. The shim does not refuse an unproven key, though it is indistinguishable from an
+    unattended surface. Two reasons:
 
     * the unattended-surface rule was removed by product decision, so there is no
       longer a surface class to protect;
@@ -446,7 +446,7 @@ def test_an_unresolved_session_key_PROCEEDS_with_an_empty_identity(
     """
     _enable(keystone)
     posted: list[Any] = []
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: "")
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: posted.append(a) or {"text": "ok"})
     result = mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
     assert not result.startswith(ERROR_PREFIX), result
@@ -481,7 +481,7 @@ def test_resolved_session_key_is_forwarded_in_body_and_header(
         seen.update({"session_key": session_key, "name": name, "args": args})
         return {"text": "App=…"}
 
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(mcp_computer, "_invoke", _invoke)
     assert mcp_computer._call_tool_inner(TOOL_LIST_APPS, {}) == "App=…"
     assert seen["session_key"] == _SESSION
@@ -497,7 +497,7 @@ def test_non_latin1_session_key_is_refused_with_an_actionable_message(
     surface as a raw ``UnicodeEncodeError`` instead of "rename the tab".
     """
     _enable(keystone)
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: "dashboard:tab—1")
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:tab—1")
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: {"text": "ok"})
     result = mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
     assert result.startswith(ERROR_PREFIX)
@@ -541,7 +541,7 @@ def test_transport_failure_is_reported_as_an_actionable_error(
 ):
     """An unreachable gateway must be diagnosable, not an opaque internal error."""
     _enable(keystone)
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(
         mcp_computer,
         "_invoke",
@@ -561,7 +561,7 @@ def test_gateway_refusal_text_is_relayed_verbatim(keystone: Path, monkeypatch: p
     """
     _enable(keystone)
     refusal = f"{ERROR_PREFIX}Blocked by governance policy: capability disabled"
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: {"text": refusal})
     assert mcp_computer._call_tool_inner(TOOL_CLICK, {}) == refusal
 
@@ -571,7 +571,7 @@ def test_empty_gateway_body_is_an_error_not_a_silent_success(
 ):
     """A body with neither text nor error must not read as success."""
     _enable(keystone)
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: {})
     result = mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
     assert result.startswith(ERROR_PREFIX)
@@ -1817,7 +1817,7 @@ class TestDragTool:
     ):
         """The one retained refusal applies to the new verb like every other one.
 
-        Retargeted from a terminal (no longer refused) onto KiroCrew's own window,
+        Retargeted from a terminal (not refused) onto Kiro Crew's own window,
         which stays refused because driving our own Settings UI would route around
         the keystone that holds the primary enable.
         """
@@ -1955,7 +1955,7 @@ class TestTheSkillContractMatchesTheRuntime:
         """The stale claim lived in TWO documents, and the second was easy to miss.
 
         `docs/.../computer-use.md` listed "indexless keyboard input — typing into
-        whatever the app has focused works again" under **What no longer refuses** —
+        whatever the app has focused works again" under the removed-refusals heading —
         written during the scope change and never implemented. A reader auditing the
         security posture from that document would have concluded a control was gone
         that is in fact still enforced, which is the more dangerous direction for a
@@ -2017,7 +2017,7 @@ class TestTheSkillContractMatchesTheRuntime:
         """Every non-failure message the model can see belongs in the skill's table.
 
         A suppressed capture on a truncated walk is ROUTINE (a browser or Electron app
-        exceeds the default node budget), and it used to be emitted with no text at
+        exceeds the default node budget), and without the note it is emitted with no text at
         all — the model asked for a screenshot, got none, and had no reason to stop
         retrying. The note is now in ``types``; asserting the skill quotes it keeps the
         two from drifting, since ``SKILL.md`` ships to every pip/DMG install and is
@@ -2051,7 +2051,7 @@ class TestUnresolvedSessionsAreNamespaced:
     namespaces precisely as far as the sessions are genuinely separate, and nothing is
     refused. The security posture is unchanged; only the cache key is.
 
-    #5322 is the POOLED half of the same aliasing. "One shim process per session" is
+    The POOLED half of the same aliasing: "One shim process per session" is
     the 1:1 topology's premise, and a pooled backend breaks it: one process serves N
     connections, so the pid separates nothing and every unnamed co-tenant collapsed
     back onto a single ``unresolved:<pid>`` key. The pid is now joined by the
@@ -2104,7 +2104,7 @@ class TestUnresolvedSessionsAreNamespaced:
         assert key == f"{mcp_computer.UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
 
     def test_two_unnamed_co_tenants_of_ONE_process_do_not_share_a_slot(self, monkeypatch):
-        """#5322, at the layer it lives in — one pid, two connections.
+        """The pooled aliasing at the layer it lives in — one pid, two connections.
 
         Both co-tenants run in the SAME shim process, so ``os.getpid()`` is pinned to
         one value here deliberately: that is the whole premise the pooled topology
@@ -2166,7 +2166,7 @@ class TestUnresolvedSessionsAreNamespaced:
         set_current_caller(None)
         set_current_tenant_nonce("cafebabe")
 
-        assert mcp_computer._resolve_session_key_strict() == ""
+        assert mcp_core._resolve_session_key_strict() == ""
         assert mcp_computer._unresolved_session_key().startswith(
             mcp_computer.UNRESOLVED_SESSION_PREFIX
         )
@@ -2181,7 +2181,7 @@ class TestUnresolvedSessionsAreNamespaced:
         set_current_caller(CallerContext(session_key="dashboard:main"))
         set_current_tenant_nonce("cafebabe")
         try:
-            assert mcp_computer._resolve_session_key_strict() == "dashboard:main"
+            assert mcp_core._resolve_session_key_strict() == "dashboard:main"
         finally:
             set_current_caller(None)
 
@@ -2219,7 +2219,7 @@ class TestUnresolvedSessionsAreNamespaced:
         attribution the strict resolver exists to provide."""
         _enable(keystone)
         posted: list[Any] = []
-        monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: "dashboard:main")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:main")
         monkeypatch.setattr(
             mcp_computer, "_invoke", lambda *a, **k: posted.append(a) or {"text": "ok"}
         )
@@ -2378,7 +2378,7 @@ class TestTheInvokeCallIsNeverProxied:
             for key in self.PROXY_ENV_KEYS:
                 monkeypatch.delenv(key, raising=False)
             monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{proxy_port}")
-            # Paired resolution (#4106): an attempt threads (base, socket_path).
+            # Paired resolution: an attempt threads (base, socket_path).
             # The empty socket keeps this case on TCP, which is what the proxy
             # question is about.
             monkeypatch.setattr(
@@ -2417,7 +2417,7 @@ class TestTheInvokeCallIsNeverProxied:
                 monkeypatch.delenv(key, raising=False)
             monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy_port}")
             monkeypatch.setenv("no_proxy", "localhost")
-            # Paired resolution (#4106): an attempt threads (base, socket_path).
+            # Paired resolution: an attempt threads (base, socket_path).
             # The empty socket keeps this case on TCP, which is what the proxy
             # question is about.
             monkeypatch.setattr(

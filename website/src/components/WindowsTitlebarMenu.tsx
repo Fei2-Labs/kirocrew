@@ -20,21 +20,7 @@ const formatWindowsAccelerator = (accelerator: string) => accelerator
   .replaceAll('CommandOrControl', 'Ctrl')
   .replaceAll('CmdOrCtrl', 'Ctrl')
 
-type ElectronMenuAPI = {
-  getAppMenuItems?: (id: string) => Promise<AppMenuItem[]>
-  executeAppMenuItem?: (id: string, index: number) => void
-}
-
-type AppMenuItem =
-  | { type: 'separator'; index: number }
-  | {
-      type: 'normal' | 'checkbox' | 'radio'
-      index: number
-      label: string
-      accelerator: string
-      enabled: boolean
-      checked: boolean
-    }
+type AppMenuItem = ElectronAppMenuItem
 
 /**
  * Zed-style Windows application menu. It rests as a compact hamburger, expands
@@ -106,7 +92,7 @@ export default function WindowsTitlebarMenu() {
   }, [collapseMenu, expanded])
 
   const openMenu = useCallback(async (id: string, target: HTMLElement) => {
-    const api = (window as Window & { electronAPI?: ElectronMenuAPI }).electronAPI
+    const api = window.electronAPI
     if (!api?.getAppMenuItems) return
     const rect = target.getBoundingClientRect()
     const titlebarBottom = target.closest('header')?.getBoundingClientRect().bottom
@@ -138,7 +124,7 @@ export default function WindowsTitlebarMenu() {
   }, [activeMenuId, collapseMenu, openMenu])
 
   const executeItem = useCallback((item: Exclude<AppMenuItem, { type: 'separator' }>) => {
-    const api = (window as Window & { electronAPI?: ElectronMenuAPI }).electronAPI
+    const api = window.electronAPI
     if (activeMenuId && item.enabled) api?.executeAppMenuItem?.(activeMenuId, item.index)
     collapseMenu(true)
   }, [activeMenuId, collapseMenu])

@@ -512,8 +512,13 @@ LAUNCH
   fi
 
   # Self-containment gate: the full import chain must resolve with no user-site.
+  # Bare `--version` is a pre-dispatch fast-path that skips `kiro_crew.cli`'s
+  # heavy imports, so it cannot prove the chain alone: the import probe below
+  # restores the gate's meaning.
   log "Verifying self-containment ($(basename "$out"))…"
   PYTHONNOUSERSITE=1 "$out/bin/python3.12" -m kiro_crew --version >/dev/null \
+    || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
+  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -c 'import kiro_crew.cli' \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
 
   # Prune to shrink the bundle.
@@ -530,6 +535,73 @@ LAUNCH
 
   # After pruning, so it validates what actually ships.
   stdlib_probe_gate "$out"
+
+  # Compile the WHOLE shipped tree as checked-hash pycs, then let the runtime
+  # forbid writing any.
+  #
+  # This is what keeps the signed .app's seal intact. codesign seals every file
+  # under Contents/, so bytecode written there after signing invalidates the
+  # signature and Gatekeeper refuses the app as "damaged" -- which is what
+  # managed Macs report, because their policy re-evaluates instead of reusing a
+  # cached accept verdict.
+  #
+  # Deliberately the whole tree, not the traced startup closure the Windows lane
+  # ships. The pipeline signs a COMPLETE bundle, so nothing on a user's machine
+  # has any business writing into it -- and a module left uncompiled is exactly
+  # what creates the reason to. Windows can afford the narrower closure because
+  # Authenticode seals no resource tree, so a later write there is harmless; on
+  # macOS an uncovered module is a latent signature break, so coverage has to be
+  # total rather than measured.
+  #
+  # The MODE is the other half. The prune above deletes the TIMESTAMP pycs pip
+  # left behind, and deleting them is not squeamishness -- a timestamp pyc
+  # records the mtime of the source it was built from, `ditto` restamps sources
+  # at extraction, so every shipped timestamp pyc is guaranteed to look stale on
+  # the user's machine and be rewritten in place. That rewrite IS the corruption.
+  # CHECKED_HASH validates against contents, so an extraction-restamped source
+  # still matches.
+  #
+  # `-q -f`: quiet, and force so nothing is skipped on a stale timestamp cache.
+  # A failure to compile one module must not fail the build -- compileall exits
+  # non-zero on a syntax error in any file it walks, including vendored samples
+  # that are not importable on this interpreter -- so the exit code is reported
+  # and tolerated while the coverage assertion below is what actually gates.
+  log "Precompiling the shipped tree as checked-hash pycs ($(basename "$out"))…"
+  env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
+    "$out/bin/python3.12" -s -m compileall -q -f \
+    --invalidation-mode checked-hash "$out/lib" \
+    || echo "    compileall reported errors (unimportable vendored samples are expected)"
+
+  # Coverage gate: the point of the exercise is that the runtime never needs to
+  # write, so a tree that shipped without caches would silently reintroduce the
+  # defect the moment PYTHONDONTWRITEBYTECODE is honoured.
+  "$out/bin/python3.12" -s - "$out/lib" <<'COVERAGE'
+import os, sys
+root = sys.argv[1]
+missing = []
+for dirpath, dirnames, filenames in os.walk(root):
+    if os.path.basename(dirpath) == "__pycache__":
+        continue
+    cache = os.path.join(dirpath, "__pycache__")
+    for name in filenames:
+        if not name.endswith(".py"):
+            continue
+        stem = name[:-3]
+        if not any(
+            f.startswith(stem + ".") and f.endswith(".pyc")
+            for f in (os.listdir(cache) if os.path.isdir(cache) else ())
+        ):
+            missing.append(os.path.join(dirpath, name))
+if missing:
+    print(f"    {len(missing)} module(s) shipped without a bytecode cache", file=sys.stderr)
+    for path in missing[:10]:
+        print(f"      {os.path.relpath(path, root)}", file=sys.stderr)
+    # A handful of unimportable vendored samples is tolerable; a wholesale miss
+    # means compileall did not run and every launch would want to write.
+    if len(missing) > 50:
+        print("ERROR: bytecode coverage is too low to forbid runtime writes", file=sys.stderr)
+        raise SystemExit(1)
+COVERAGE
 
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
 }
@@ -604,6 +676,8 @@ build_backend_windows() {
   log "Verifying self-containment ($(basename "$out"))…"
   PYTHONNOUSERSITE=1 "$out/python.exe" -s -m kiro_crew --version >/dev/null \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
+  PYTHONNOUSERSITE=1 "$out/python.exe" -s -c 'import kiro_crew.cli' \
+    || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
 
   log "Pruning bundle ($(basename "$out"))…"
   ( cd "$out"
@@ -623,10 +697,17 @@ build_backend_windows() {
   # After pruning, so it validates what actually ships.
   stdlib_probe_gate "$out"
 
-  # Trace the real gateway import after the final prune and ship checked-hash
-  # pycs for exactly that closure. Windows can consume these beside the source
-  # without invalidating an Authenticode signature, avoiding the first launch's
-  # thousand-file cache write while keeping unrelated modules out of the bundle.
+  # Trace the real gateway import after the final prune and ship hash-based
+  # (UNCHECKED) pycs for exactly that closure. Windows can consume these beside
+  # the source without invalidating an Authenticode signature, avoiding the first
+  # launch's thousand-file cache write while keeping unrelated modules out of the
+  # bundle. Unchecked, not checked, and the difference is load-bearing: a
+  # checked-hash pyc makes the loader read and hash each .py in ADDITION to the
+  # .pyc, which measured 43.55 MB and 1639 extra cold file opens per boot -- a
+  # median 12.5 s on a cold file cache. Both hash modes ignore mtime, which is
+  # the property this needs; only the re-read is dropped. The posix tree above
+  # stays checked-hash: it is a different mechanism (whole tree, codesigned) and
+  # does not show the symptom.
   log "Precompiling Windows gateway startup modules ($(basename "$out"))…"
   env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
     "$out/python.exe" -s "$ROOT/packaging/precompile_windows.py" \
@@ -742,9 +823,73 @@ else
   fi
 fi
 
+# A leftover staged marker from an earlier interrupted build is removed on
+# EVERY run, before any early exit: step 3b re-stages it when asked. This sits
+# ahead of the SKIP_ELECTRON return so a backend-only build cannot leave a
+# stale declaration behind for a hand-run electron-builder to pack.
+rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+
 if [ "${SKIP_ELECTRON:-0}" = "1" ]; then
   log "SKIP_ELECTRON=1 — backend(s) ready under $ELECTRON_DIR/backend-dist/"
   exit 0
+fi
+
+# --- 3b. Baked EXTERNALLY-MANAGED marker (optional) --------------------------
+# An edition whose installs are owned by an external package manager (a Toolbox,
+# a corporate installer) declares that at BUILD time by naming its marker here.
+# The file is copied to $ELECTRON_DIR/EXTERNALLY-MANAGED, which package.json's
+# `files` list packs INTO app.asar next to main.js -- so the running app reads
+# it as its own code, on every platform, with no ownership probe (see
+# readExternallyManaged in website/electron/auto-update.js). A marker dropped
+# beside the app after the build (`<resources>/EXTERNALLY-MANAGED`) is the
+# repackager affordance and stays gated on file provenance; that gate refuses
+# every user-owned install and can never pass on Windows, which is why an
+# edition bakes instead of dropping.
+#
+# The copy is validated as the JSON object the reader accepts -- string fields
+# only, under the reader's 8 KiB read cap -- and the build FAILS on anything
+# else: the reader treats a malformed marker as "managed, nothing to run", so a
+# typo here would silently ship an app that can neither self-update nor be
+# updated from its About panel. Unset, nothing is staged: the unconditional
+# cleanup above (ahead of the SKIP_ELECTRON exit) already removed any leftover
+# from a previous local build, so a stale declaration cannot ride along.
+if [ -n "${KIROCREW_MANAGED_INSTALL_MARKER:-}" ]; then
+  MARKER_SRC="$KIROCREW_MANAGED_INSTALL_MARKER"
+  test -f "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER does not name a file: $MARKER_SRC" >&2; exit 1; }
+  node -e '
+    const fs = require("fs");
+    const [src] = process.argv.slice(1);
+    const buf = fs.readFileSync(src);
+    if (buf.length > 8192) { console.error(`marker is ${buf.length} bytes; the reader caps at 8192`); process.exit(1); }
+    let parsed;
+    try { parsed = JSON.parse(buf.toString("utf8")); } catch (e) { console.error(`marker is not JSON: ${e.message}`); process.exit(1); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { console.error("marker must be a JSON object"); process.exit(1); }
+    const allowed = ["managedBy", "updateCommand", "checkCommand"];
+    // The reader TRIMS each field and slices it to a cap (auto-update.js:
+    // MANAGED_BY_MAX_CHARS / UPDATE_COMMAND_MAX_CHARS / CHECK_COMMAND_MAX_CHARS).
+    // Validate the value the reader will actually see: a whitespace-only
+    // command would trim to nothing and turn the marker bare, and an over-cap
+    // one would be truncated into a DIFFERENT command. Both are refused here.
+    const caps = { managedBy: 128, updateCommand: 512, checkCommand: 512 };
+    for (const k of Object.keys(parsed)) {
+      if (!allowed.includes(k)) { console.error(`marker has unknown field "${k}" (allowed: ${allowed.join(", ")})`); process.exit(1); }
+      if (typeof parsed[k] !== "string") { console.error(`marker field "${k}" must be a string`); process.exit(1); }
+      if (parsed[k].trim() !== parsed[k]) { console.error(`marker field "${k}" has leading/trailing whitespace the reader would trim`); process.exit(1); }
+      if (parsed[k].length > caps[k]) { console.error(`marker field "${k}" is ${parsed[k].length} chars; the reader caps at ${caps[k]} and would truncate the command`); process.exit(1); }
+    }
+    if (!parsed.updateCommand) { console.error("marker has no updateCommand: it would disable updates without offering any"); process.exit(1); }
+  ' "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER rejected: $MARKER_SRC" >&2; exit 1; }
+  # Staged for THIS build only: electron-builder packs it below, and the copy
+  # must not outlive the run -- a later build of a different edition from the
+  # same tree (or a hand-run electron-builder) would otherwise pack the previous
+  # edition's commands. The unconditional rm above covers the next
+  # build-desktop.sh run; this covers every other exit path. The trap is armed
+  # BEFORE the copy so there is no instant at which the file exists without
+  # its cleanup -- an interrupt between the two would leave a stale marker for
+  # a hand-run `npm run dist` to pack.
+  trap 'rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"' EXIT
+  cp "$MARKER_SRC" "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+  log "Baking EXTERNALLY-MANAGED marker into the app from $MARKER_SRC"
 fi
 
 # --- 4. Package the desktop app with electron-builder -----------------------

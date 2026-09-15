@@ -45,6 +45,9 @@ interface SlashCommand {
  */
 const COMMAND_DESC_KEY: Record<string, string> = {
   '/agent': 'components.slashCommandMenu.desc_agent',
+  // Alias of /side, so it shares the description key deliberately: the two
+  // rows must never drift apart, and the locale catalogs stay untouched.
+  '/btw': 'components.slashCommandMenu.desc_side',
   '/changelog': 'components.slashCommandMenu.desc_changelog',
   '/chat': 'components.slashCommandMenu.desc_chat',
   '/clear': 'components.slashCommandMenu.desc_clear',
@@ -97,14 +100,15 @@ function commandDescription(cmd: SlashCommand): string {
 // _SLASH_COMMANDS set MINUS _BLOCKED_SLASH_COMMANDS — so the same commands
 // appear whether they came from the live API or this fallback. Blocked
 // commands (/quit, /exit, /q, /chat, /paste, /reply, /editor, /tangent) are
-// terminal-only kiro-cli gestures the dashboard rejects, so suggesting them
-// anywhere is an inert affordance; the descriptions themselves come from
-// COMMAND_DESC_KEY either way. /kb is a frontend-only command (also merged
-// via FRONTEND_COMMANDS below).
+// terminal-only kiro-cli gestures the dashboard rejects, and /todos is one the
+// ACP harness does not implement, so suggesting any of them anywhere is an
+// inert affordance; the descriptions themselves come from COMMAND_DESC_KEY
+// either way. /kb is a frontend-only command (also merged via
+// FRONTEND_COMMANDS below).
 const FALLBACK_COMMAND_NAMES = [
   '/agent', '/changelog', '/clear', '/code', '/compact', '/context',
   '/experiment', '/help', '/hooks', '/issue', '/kb', '/logdump',
-  '/mcp', '/model', '/prompts', '/side', '/todos', '/tools', '/usage', '/workflow',
+  '/mcp', '/model', '/prompts', '/side', '/tools', '/usage', '/workflow',
 ] as const
 
 const FALLBACK_COMMANDS: SlashCommand[] = FALLBACK_COMMAND_NAMES.map(name => ({ name }))
@@ -128,9 +132,10 @@ interface Props {
  * the menu still offers them. Two different kinds live here, and the difference
  * matters when adding a row:
  *
- * - CLIENT-INTERCEPTED (`/kb`, `/onboarding`): the composer recognises the text
- *   and acts on it locally; the message is never sent. Those also need a branch
- *   in `interceptSlashCommand`.
+ * - CLIENT-INTERCEPTED (`/btw`, `/kb`, `/onboarding`): the composer recognises
+ *   the text and acts on it locally; the message is never sent. Those also need
+ *   a branch in `interceptSlashCommand` (`/btw` rides `/side`'s — it is a pure
+ *   alias, matched by the same SIDE_RE).
  * - QUICK PROMPT (`/plain`): a backend MACRO. The message IS sent, unchanged, and
  *   `ContextBuilder.build_message` swaps the token for the instruction it stands
  *   for (`src/kiro_crew/quick_prompts.py`). It must therefore stay OUT of
@@ -138,7 +143,7 @@ interface Props {
  *   expansion — and out of the kiro-cli passthrough set, which would forward it
  *   to a harness that has no such command.
  */
-const FRONTEND_COMMAND_NAMES = ['/kb', '/onboarding', '/plain'] as const
+const FRONTEND_COMMAND_NAMES = ['/btw', '/kb', '/onboarding', '/plain'] as const
 
 const FRONTEND_COMMANDS: SlashCommand[] = FRONTEND_COMMAND_NAMES.map(name => ({ name }))
 

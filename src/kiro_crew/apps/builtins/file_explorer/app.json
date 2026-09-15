@@ -20,6 +20,13 @@
     "Reachable paths are limited to your home directory, /tmp, and /opt — symlinks out are refused"
   ],
   "defaultEnabled": false,
+  "platform": {
+    "os": [
+      "macos",
+      "linux",
+      "windows"
+    ]
+  },
   "permissions": {
     "api": [
       "/apps/file-explorer/api"

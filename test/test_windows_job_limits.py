@@ -37,8 +37,7 @@ _WINDOWS_ONLY = pytest.mark.skipif(
 
 # The job member waits for a go-signal (so the job is applied before it forks),
 # then reports how many child spawns succeeded and the error that stopped it.
-_MEMBER_SRC = textwrap.dedent(
-    """
+_MEMBER_SRC = textwrap.dedent("""
     import subprocess, sys
     sys.stdin.readline()
     ok, err, kids = 0, "", []
@@ -56,8 +55,7 @@ _MEMBER_SRC = textwrap.dedent(
             k.wait(timeout=5)
         except Exception:
             pass
-    """
-)
+    """)
 
 _ERROR_NOT_ENOUGH_QUOTA = 1816
 
@@ -319,7 +317,7 @@ class TestFinishSuspendedSpawn:
         ceilinged: list[int] = []
         monkeypatch.setattr(acp_client.platform_compat, "IS_WINDOWS", True)
         # Someone else's child, and it is alive and unresumable — the exact shape
-        # that previously produced a kill.
+        # that must not produce a kill.
         monkeypatch.setattr(acp_client.platform_compat, "get_ppid", lambda pid: os.getpid() + 1)
         monkeypatch.setattr(
             acp_client, "apply_windows_resource_ceiling", lambda pid: bool(ceilinged.append(pid))

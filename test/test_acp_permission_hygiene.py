@@ -18,7 +18,6 @@ import pytest
 from kiro_crew.acp._dispatch import (
     permission_answerable_on_handle,
     permission_frame_session_id,
-    resolve_permission_allow_id,
 )
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
@@ -26,7 +25,6 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_PI,
     METHOD_REQUEST_PERMISSION,
-    OUTCOME_CANCELLED,
     OUTCOME_SELECTED,
     JsonRpcMessage,
 )
@@ -92,24 +90,6 @@ def _stub_sel(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sel_mod, "sel", lambda: _StubSel())
 
 
-def test_resolve_allow_id_prefers_once() -> None:
-    recorded = {"allow_once": "allow", "allow_always": "allow_always"}
-    assert resolve_permission_allow_id(recorded) == "allow"
-    assert resolve_permission_allow_id(recorded, always=True) == "allow"
-
-
-def test_resolve_allow_id_never_persists_always() -> None:
-    assert resolve_permission_allow_id({"allow_always": "allow_always"}) is None
-    assert resolve_permission_allow_id({"allow_always": "allow_always"}, always=True) is None
-
-
-def test_resolve_allow_id_unknown_option_fails_closed() -> None:
-    recorded = {"allow_once": "allow", "allow_always": "allow_always"}
-    assert resolve_permission_allow_id(recorded, option_id="allow_always") is None
-    assert resolve_permission_allow_id(recorded, option_id="not-advertised") is None
-    assert resolve_permission_allow_id(recorded, option_id="allow") == "allow"
-
-
 def test_permission_frame_session_id_rejects_missing_and_non_string() -> None:
     assert permission_frame_session_id(None) == ""
     assert permission_frame_session_id({}) == ""
@@ -140,38 +120,42 @@ def test_crew_mcp_forwarding_stays_unverified_on_pi() -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_always_true_sends_allow_once(tmp_path) -> None:
+async def test_client_always_true_sends_the_advertised_always_id(tmp_path) -> None:
     client = AcpClient(work_dir=tmp_path)
-    client._permission_options[1] = {"allow_once": "allow", "allow_always": "allow_always"}
+    client._permission_options[1] = {"once": "allow", "always": "allow_always"}
     client._send_response = AsyncMock()
     await client.approve_tool(1, always=True)
     client._send_response.assert_awaited_once_with(
         1,
-        {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "allow"}},
+        {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "allow_always"}},
     )
 
 
 @pytest.mark.asyncio
-async def test_client_allow_always_only_cancels(tmp_path) -> None:
+async def test_client_allow_always_only_still_approves(tmp_path) -> None:
+    """An adapter that advertises ONLY allow_always gets that id for a one-shot
+    approval rather than a ``cancelled`` outcome, which kiro-cli maps to
+    cancelling the whole turn. The dispatch recorder folds the single allow id
+    onto both keys, which is what this seeds."""
     client = AcpClient(work_dir=tmp_path)
-    client._permission_options[2] = {"allow_always": "allow_always"}
+    client._permission_options[2] = {"once": "allow_always", "always": "allow_always"}
     client._send_response = AsyncMock()
     await client.approve_tool(2)
     client._send_response.assert_awaited_once_with(
         2,
-        {"outcome": {"outcome": OUTCOME_CANCELLED}},
+        {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "allow_always"}},
     )
 
 
 @pytest.mark.asyncio
-async def test_handle_always_true_sends_allow_once() -> None:
+async def test_handle_always_true_sends_the_advertised_always_id() -> None:
     rt, _, proc = _make_runtime()
     q = _register(rt, "sA")
     handle = AcpSessionHandle("sA", q["sA"], rt)
-    handle._permission_options[3] = {"allow_once": "allow", "allow_always": "allow_always"}
+    handle._permission_options[3] = {"once": "allow", "always": "allow_always"}
     await handle.approve_tool(3, always=True)
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())
-    assert sent["result"]["outcome"]["optionId"] == "allow"
+    assert sent["result"]["outcome"]["optionId"] == "allow_always"
 
 
 @pytest.mark.asyncio

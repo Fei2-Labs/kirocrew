@@ -319,8 +319,8 @@ class TestFetchUsageBg:
         }
         whoami = AsyncMock(return_value={"email": "carol@amazon.com",
                                          "start_url": "https://amzn.awsapps.com/start"})
-        # SAMPLE_USAGE carries resets "2026-07-01" — a different cycle from the
-        # cached "2026-08-01".
+        # SAMPLE_USAGE carries a reset date from a different cycle than the
+        # cached reading.
         with patch.object(sessions_mod, "_resolve_kiro_bin_for_spawn", return_value="/bin/kiro"), \
              patch.object(sessions_mod, "_fetch_whoami", whoami), \
              patch("asyncio.create_subprocess_exec",
@@ -669,7 +669,7 @@ class TestFetchUsageBgApi:
 
 
 class TestApiKeyAuthFailFast:
-    """API-key accounts short-circuit the usage refresh entirely (#5728).
+    """API-key accounts short-circuit the usage refresh entirely.
 
     ``kiro-cli whoami`` reports ``accountType=ApiKey`` for API-key auth. Such
     accounts hold no SSO/OIDC bearer token, so ``fetch_usage_limits`` would burn
@@ -1165,7 +1165,7 @@ class TestTextScrapeIsOptIn:
             "kiro_crew.dashboard.handlers.sessions.wrap_argv",
             lambda argv, **k: (list(argv), None),
         )
-        # The API path yields no plan, which is exactly what used to fall through
+        # The API path yields no plan -- the case that must not fall through
         # to the billed scrape.
         monkeypatch.setattr(
             sessions_mod.kiro_usage_api, "fetch_usage_limits", lambda **k: None
@@ -1210,6 +1210,25 @@ class TestTextScrapeIsOptIn:
         assert "credits_plan" not in sessions_mod._usage_cache
 
     @pytest.mark.asyncio
+    async def test_disabled_marker_names_the_reason(self, monkeypatch):
+        # The opted-out scrape is a PERMANENT, user-addressable state, so
+        # the unavailable marker carries reason=scrape_disabled and the frontend
+        # renders an explanatory dash instead of hiding the pill silently.
+        monkeypatch.setattr(sessions_mod, "_text_scrape_enabled", lambda: False)
+        with patch("asyncio.create_subprocess_exec", self._spawn_mock(SAMPLE_USAGE.encode())):
+            await sessions_mod._fetch_usage_bg()
+        assert sessions_mod._usage_cache.get("available") is False
+        assert sessions_mod._usage_cache.get("reason") == "scrape_disabled"
+
+    @pytest.mark.asyncio
+    async def test_no_kiro_bin_marker_stays_reason_free(self):
+        # The definitive kiro-cli-absent verdict must keep hiding the pill: a
+        # non-Kiro provider has no credits to explain, so no reason rides it.
+        with patch.object(sessions_mod, "_resolve_kiro_bin_for_spawn", return_value=None):
+            await sessions_mod._fetch_usage_bg()
+        assert sessions_mod._usage_cache == {"available": False}
+
+    @pytest.mark.asyncio
     async def test_disabled_keeps_partial_api_fields(self, monkeypatch):
         # The API answered but carried no plan (e.g. plan name + reset date only).
         # Keep what it gave alongside the unavailable marker instead of discarding it.
@@ -1230,7 +1249,7 @@ class TestTextScrapeIsOptIn:
 
     @pytest.mark.asyncio
     async def test_disabled_preserves_a_prior_good_value_as_stale(self, monkeypatch):
-        # A previously-good reading for THIS SAME account is dimmed, not blanked —
+        # An earlier good reading for THIS SAME account is dimmed, not blanked —
         # and not replaced by the scrape's own (parseable) numbers, which the gate
         # must never fetch.
         monkeypatch.setattr(sessions_mod, "_text_scrape_enabled", lambda: False)

@@ -30,6 +30,7 @@ import os
 import platform
 import stat
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,12 +131,40 @@ def _sdk_path() -> str | None:
 #: Prefixes a compiler may live under. Anything outside these is refused even if
 #: ``xcrun`` names it, because the gateway executes what the compiler produces.
 _TRUSTED_TOOLCHAIN_PREFIXES = (
-    "/Applications/Xcode.app/",
-    "/Applications/Xcode-beta.app/",
     "/Library/Developer/",
     "/usr/bin/",
     "/usr/libexec/",
 )
+
+#: `/Applications` itself, for the Xcode bundle rule below.
+_APPLICATIONS_DIR = "/Applications/"
+
+
+def _xcode_bundle_prefix(real: str) -> str | None:
+    """The `/Applications/Xcode*.app` bundle *real* lives in, or None.
+
+    An Xcode bundle carries its VERSION in practice -- `Xcode_16.4.app`, with
+    `Xcode.app` a symlink to whichever is the default. That is the layout on every
+    GitHub macOS runner and on any machine holding more than one Xcode, so a
+    literal `/Applications/Xcode.app/` prefix matched nothing once `realpath`
+    resolved the link, and a genuine toolchain was refused.
+
+    Anchored to exactly ONE path component, so nothing deeper under
+    `/Applications` can widen it, and it grants no trust by itself: the caller
+    still walks from the compiler up to this bundle root requiring root ownership
+    with no group or other write at every level. `/Applications` is `775
+    root:admin`, so an admin-group user CAN create a bundle beside a real one --
+    and it is owned by that user, which is what the walk refuses.
+    """
+    if not real.startswith(_APPLICATIONS_DIR):
+        return None
+    head, _, rest = real[len(_APPLICATIONS_DIR) :].partition("/")
+    # `rest` must be non-empty for the same reason the literal prefixes carried a
+    # trailing slash: the bundle DIRECTORY is not itself a compiler or an SDK.
+    if not rest or not head.startswith("Xcode") or not head.endswith(".app"):
+        return None
+    return f"{_APPLICATIONS_DIR}{head}/"
+
 
 #: Wall-clock ceiling for one helper run. Generous relative to observed runtimes
 #: (sub-second per 10s of audio) because a first-ever run may block on asset install.
@@ -187,6 +216,8 @@ def _is_trusted_toolchain(path: str) -> bool:
     except OSError:
         return False
     prefix = next((p for p in _TRUSTED_TOOLCHAIN_PREFIXES if real.startswith(p)), None)
+    if prefix is None:
+        prefix = _xcode_bundle_prefix(real)
     if prefix is None:
         return False
     stop = prefix.rstrip("/")
@@ -397,7 +428,7 @@ async def _sandboxed_off_loop(argv: list[str]) -> tuple[list[str], dict[str, str
 
     Delegates to the shared :func:`sandbox.shielded_prepare_off_loop`, which
     owns the shield-and-recover pattern (worker-thread hop + settle-then-unlink
-    under cancellation, repeat-cancellation safe per #5841) for every async
+    under cancellation, repeat-cancellation safe) for every async
     caller of the chokepoint.  Preparation stays behind :func:`_sandboxed` so
     this module keeps owning its own ``mode="strict"`` + ``_build_env()``
     policy.  ``SandboxUnavailableError`` still propagates to the caller
@@ -531,22 +562,75 @@ def is_available() -> bool:
     return availability().ok
 
 
-async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
+class TranscriptionRefusedError(RuntimeError):
+    """Base for pre-conversion refusals ``transcribe()`` surfaces as errors."""
+
+
+class RecordingTooLongError(TranscriptionRefusedError):
+    """The input exceeds the transcription ceiling; refusing beats truncating."""
+
+
+class DurationUnverifiedError(TranscriptionRefusedError):
+    """The duration probe could not answer; refusing beats risking truncation.
+
+    A ``None`` probe is not proof the input is under the ceiling: a TRANSIENT
+    cause — a load spike that times the probe out but clears before the
+    remux — would let the ``-t``-bounded conversion succeed on the truncated
+    prefix of an over-cap recording (GPT review r27). Only a persistent cause
+    is covered by the aligned-budget argument, so ``None`` must refuse loudly
+    and retryably, exactly as the meetings import gate does (r14).
+    """
+
+
+async def _to_native_audio(
+    audio_path: str, probe_timeout_secs: int = DEFAULT_TIMEOUT_SECS
+) -> tuple[str, bool]:
     """Return a path ``AVAudioFile`` can open, plus whether it is a temp file.
 
     Transcodes to 16 kHz mono WAV with ffmpeg when the input container is not one
     the framework reads. Falls back to the original path when ffmpeg is missing, so
     the caller still gets the framework's own error rather than a silent refusal.
-    """
-    if Path(audio_path).suffix.lower() in _NATIVE_AUDIO_SUFFIXES:
-        return audio_path, False
 
+    Raises :class:`RecordingTooLongError` for an input the duration probe shows
+    is over the transcription ceiling, and :class:`DurationUnverifiedError`
+    when the probe cannot answer at all — both BEFORE the conversion, because
+    the remux below is ``-t``-bounded (a temp-disk guard) and converting only
+    the first hour of a longer-or-unknown recording would return a silently
+    truncated transcript, the exact data loss the meetings import gate refuses
+    (GPT reviews r26/r27). The no-ffmpeg degrade path is exempt: with no
+    decoder there is no remux and therefore no truncation to guard against.
+    """
     from kiro_crew.transcribe import (
+        _MAX_AUDIO_SECS,
         _close_ffmpeg_for_execution,
         _create_ffmpeg_subprocess,
+        _describe_ffmpeg_exit,
+        _dev_fd_number,
+        _forced_demuxer_args,
+        _input_suffix,
         _resolve_ffmpeg_for_execution,
+        audio_exceeds_secs,
         ensure_ffmpeg_in_path,
     )
+
+    # The native fast path hands *audio_path* to the Swift helper BY VALUE, and
+    # a descriptor path (``/dev/fd/N``) names a descriptor of THIS process —
+    # useless to the helper, whose own fd table does not hold N (GPT review
+    # r23: a native-suffix import would fail with a 502). The remux below is
+    # the materializing path: its FFmpeg child inherits the descriptor via the
+    # spawn seam and writes a NAMED temp file the helper can open.
+    if _dev_fd_number(audio_path) is None and _input_suffix(audio_path) in _NATIVE_AUDIO_SUFFIXES:
+        return audio_path, False
+
+    try:
+        # Same demuxer pin as every other FFmpeg input (transcribe r20/r21):
+        # resolved BEFORE the decoder handle so a refusal cannot leak it. The
+        # loud-failure convention below applies: the helper then reports the
+        # undecodable input rather than this remux sniffing its content.
+        demux_args = _forced_demuxer_args(audio_path)
+    except OSError:
+        logger.warning("apple_speech: cannot resolve a demuxer for %s", audio_path)
+        return audio_path, False
 
     await asyncio.to_thread(ensure_ffmpeg_in_path)
     # A bundled decoder is 49-88 MB and is SHA-256 authenticated on every
@@ -558,6 +642,34 @@ async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
             Path(audio_path).suffix or "<no suffix>",
         )
         return audio_path, False
+
+    # Duration gate, AFTER the decoder resolve on purpose: with no ffmpeg there
+    # is no remux and therefore no truncation to guard against (the degrade
+    # return above hands the original file over and the framework fails
+    # loudly), while WITH a decoder the ``-t``-bounded conversion below must
+    # never run on an input whose duration is over — or UNKNOWN. ``None``
+    # refuses too (GPT review r27): a transient probe cause (a load spike that
+    # clears before the remux) is not covered by the aligned-budget argument,
+    # and proceeding would transcribe a silently truncated prefix.
+    try:
+        exceeds = await audio_exceeds_secs(
+            audio_path, _MAX_AUDIO_SECS, timeout_secs=probe_timeout_secs
+        )
+    except BaseException:
+        await _close_ffmpeg_for_execution(ffmpeg, preserve_active_exception=True)
+        raise
+    if exceeds:
+        await _close_ffmpeg_for_execution(ffmpeg)
+        raise RecordingTooLongError(
+            f"recording exceeds the {_MAX_AUDIO_SECS // 60}-minute transcription "
+            "ceiling; trim it rather than transcribing a truncated prefix"
+        )
+    if exceeds is None:
+        await _close_ffmpeg_for_execution(ffmpeg)
+        raise DurationUnverifiedError(
+            "could not verify the recording's duration just now; retry, or trim "
+            f"it to under {_MAX_AUDIO_SECS // 60} minutes"
+        )
 
     # Both syscalls in ONE thread hop. `os.close` alone is trivial, but
     # `tempfile.mkstemp` is the heavier half — it creates a file — and leaving it
@@ -576,44 +688,83 @@ async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
     # still-running child can race the removal. Every cleanup step is
     # best-effort — the exception in flight is the one that must surface.
     try:
-        proc = await _create_ffmpeg_subprocess(
-            ffmpeg,
-            "-y",
-            "-i",
-            audio_path,
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            out,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
         try:
-            _, err = await proc.communicate()
+            proc = await _create_ffmpeg_subprocess(
+                ffmpeg,
+                "-y",
+                *demux_args,
+                "-i",
+                audio_path,
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                # Bounds the temp file as well as the conversion itself: a large
+                # low-bitrate input could otherwise expand into a multi-gigabyte
+                # WAV and exhaust the temp volume (GPT review r23). This is the
+                # ceiling ``batch_duration_cap_secs`` reports for the Apple lane,
+                # so the meetings import refuses over-cap recordings loudly
+                # BEFORE this truncation could ever bite.
+                "-t",
+                str(_MAX_AUDIO_SECS),
+                out,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, err = await proc.communicate()
+            except BaseException:
+                try:
+                    proc.kill()
+                except (OSError, ProcessLookupError):
+                    pass
+                else:
+                    try:
+                        await proc.communicate()
+                    except BaseException:
+                        # A repeat cancellation can land on this await; swallow it
+                        # so the unlink below still runs and the ORIGINAL exception
+                        # is the one that propagates.
+                        pass
+                raise
         except BaseException:
             try:
-                proc.kill()
-            except (OSError, ProcessLookupError):
+                os.unlink(out)
+            except OSError:
                 pass
-            else:
-                try:
-                    await proc.communicate()
-                except BaseException:
-                    # A repeat cancellation can land on this await; swallow it
-                    # so the unlink below still runs and the ORIGINAL exception
-                    # is the one that propagates.
-                    pass
             raise
-    except BaseException:
+    finally:
+        # The authenticated handle must outlive the spawn: every branch
+        # above has already reaped the child (``communicate`` on success,
+        # kill-and-reap on failure) or never spawned one, so the staged image
+        # can be released now — off the loop, unconditionally, instead of by
+        # ``__del__`` running the close synchronously on the gateway event
+        # loop. ``preserve_active_exception`` is set only while an exception is
+        # genuinely in flight, so a cleanup failure never masks the original
+        # error and a cancellation landing on the close await of a success
+        # path still propagates.
         try:
-            os.unlink(out)
-        except OSError:
-            pass
-        raise
+            await _close_ffmpeg_for_execution(
+                ffmpeg,
+                preserve_active_exception=sys.exc_info()[1] is not None,
+            )
+        except BaseException:
+            # This await is the only suspension point between the child
+            # exiting and the success return transferring ``out`` to the
+            # caller. A cancellation landing exactly here (it can only raise
+            # on the no-exception-in-flight path) would otherwise propagate
+            # with the invocation-owned temp still on disk. The failure
+            # branches already unlinked, so this second unlink is a tolerated
+            # no-op there.
+            try:
+                os.unlink(out)
+            except OSError:
+                pass
+            raise
     if proc.returncode != 0:
+        tail = err.decode(errors="replace").strip()[-300:] if err else ""
         logger.warning(
-            "apple_speech: ffmpeg transcode failed: %s", err.decode(errors="replace")[-300:]
+            "apple_speech: ffmpeg transcode %s", _describe_ffmpeg_exit(proc.returncode, tail)
         )
         try:
             os.unlink(out)
@@ -644,7 +795,13 @@ async def transcribe(
     if not helper:
         return None, {"error": "speech helper could not be built"}
 
-    native_path, is_temp = await _to_native_audio(audio_path)
+    try:
+        native_path, is_temp = await _to_native_audio(audio_path, probe_timeout_secs=timeout_secs)
+    except TranscriptionRefusedError as exc:
+        # Loud, user-actionable refusal — never a transcript that silently
+        # omits everything past the ceiling (GPT review r26/r27): over-cap
+        # AND duration-unverified inputs both stop here, before conversion.
+        return None, {"error": str(exc)}
     # When `is_temp` is true this invocation owns the transcode temp from here
     # on, so every exit — the sandbox rejection included — must route through
     # the cleanup `finally` below. An original input (`is_temp` false) is the

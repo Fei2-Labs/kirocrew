@@ -49,6 +49,7 @@ interface, the public edition is complete standalone.
 | `agent_catalog` | adapter | `DefaultAgentCatalogProvider` (`builtin_agents()` → `[]`) | edition agent-catalog rows |
 | `prompt_sources` | adapter | `DefaultPromptSourceProvider` (`prompt_source_roots()` → `[]`) | edition prompt/SOP roots |
 | `skill_discovery` | adapter | `DefaultSkillDiscoveryProvider` (`skill_providers()` → `[]`) | edition skill discovery providers for the multi-provider search |
+| `tips` | adapter | `DefaultTipsProvider` (`tips_pool()` → `None`) | the edition's feature-tip pool. The one **REPLACE-capable** seam: a supplied `TipsPool` takes over from the public curated file AND the docs-scan catalog instead of being unioned into them, because a public tip advertises a capability an edition build may not have or may not expose. An empty pool means "this build shows no tips" |
 | `denied_rules` | adapter | `DefaultDeniedRuleProvider` (`denied_rules()` → `[]`) | edition denied-command rules that are default-on but USER-DISABLEABLE (distinct from `security`, the un-weakenable overlay floor) |
 | `import_sources` | adapter | `DefaultImportSourceProvider` (`import_sources()` → `[]`) | edition onboarding-import sources |
 | `capability_manager` | adapter | `DefaultCapabilityManager` (`available()` → `False`) | operations-based external package manager: MCP servers, skills, agent packages, and client plugins |
@@ -62,7 +63,37 @@ interface, the public edition is complete standalone.
 | `dashboard` | adapter | `DefaultDashboardContributor` (no routes/services, no login handler) | secretary/taskkeeper routes + enterprise SSO PTY login |
 | `jail` | adapter | `DefaultJailProvider` (no-op, never jails) | enterprise process isolation |
 | `mobile_connect` | adapter | `DefaultMobileConnectProvider` (personal-install pair: `tailnet_qr` + `login_link` (id == kind by design)) | edition-specific phone-connection methods (descriptor-only `{id, kind}`; minting stays on each method's own endpoint; an empty list hides the dashboard entry; list + mint governed by `capabilities.mobile_connect`) |
+| `remote_provisioners` | adapter | `DefaultRemoteProvisionerProvider` (the single built-in `aws_ec2` lane, backed by `RealLaunchEngine`; id == kind by design) | edition-specific ways to CREATE a remote instance (a managed dev environment, a container task): descriptor-only `{id, kind, label, posix_only, step_labels}` plus a `LaunchEngine` per id; the core's durable launch job still drives every launch, so cancel, rollback and orphan reaping are inherited rather than reimplemented |
 | `feature_apps` | tuple | **RESERVED** — `()`; apps register via `apps_loader` (provenance record only) | — (slot inert) |
+
+> `remote_provisioners` note — the Set-up tab under Settings → Remote Instances
+> could only ever create an EC2 instance in the user's own AWS account, because
+> `handlers_cloud._engine()` constructed `RealLaunchEngine` directly (the
+> `state.cloud_launch_engine` hook next to it is a test seam, not a contract). A
+> deployment whose users have no AWS account of their own, or whose machines come
+> from a managed dev-environment service, had no way to offer a second lane
+> without shadowing the 1500-line panel. The seam follows `mobile_connect`
+> exactly: the backend contributes descriptors (`GET /api/cloud/provisioners`),
+> the frontend draws each `kind` through `registerRemoteProvisionerRenderer()`
+> (the `aws_ec2` kind is drawn by the core's own form and cannot be claimed), and
+> `POST /api/cloud/launch` resolves the requested `provider_id` against the same
+> seam before a job file exists. What the seam deliberately does NOT hand out is
+> the launch loop itself: an edition supplies the five-method `LaunchEngine` and
+> `cloud/launch_job.py::run_launch` drives it, so one-launch-at-a-time, cancel,
+> the two rollback paths and `reap_orphans` apply to every lane. The four step
+> KEYS are therefore fixed (rollback branches on them); a descriptor may only
+> relabel them. `size_key`, `profile` and `region` are the generic wires: for the
+> built-in they are the EC2 ladder, an AWS profile and an AWS region; another
+> provisioner reads them as its own shape, credential selector and placement,
+> which is why `LaunchJobStore.create()` validates `size_key` against
+> `sizes.py` for the built-in id only. The stop/start/delete lifecycle routes
+> (`/api/cloud/{tag}/...`) remain EC2-specific: a lane that needs them
+> contributes its own through `dashboard.contribute_routes`. No governance scope
+> is added here; the existing EC2 lane carries none today, and a
+> `capabilities.remote_provisioners` row mirroring `capabilities.mobile_connect`
+> is the natural follow-up once a second lane exists to narrow on.
+>
+> Contributor walkthrough: [adding-a-remote-provisioner.md](../../guides/adding-a-remote-provisioner.md).
 
 > `external_access` note — three surfaces the core offers unconditionally, none of
 > which had a composition point. Two are installable-content registries: skill
@@ -135,7 +166,11 @@ installs the context. `bootstrap_context`:
 2. If profile != standalone: `discover_companion_context` (fail-closed), then validate `contract_version` and the ADD-only security floor.
 3. `assert_governance_paths_protected`, `assert_policy_signature_satisfied`, and `assert_profiles_within_ceiling` validate the final context before `set_context`; these gates prevent an agent-writable trust root, an absent required signature, or a profile looser than its ceiling from becoming active.
 4. `ctx.providers.register_acp_backends()` once (Default no-op).
-5. `ctx.publish.register_publish_providers()` once (Default no-op → the `publish_provider` registry stays empty and publishing is unavailable).
+5. `ctx.publish.register_publish_providers()` once (Default registers the personal
+   cloud drive under its OWN key, `PERSONAL_DRIVE_PROVIDER`, so the destination is
+   listed and selectable but does NOT capture the unnamed default — a publish that
+   names no destination still resolves `DEFAULT_PROVIDER`, which stays unregistered,
+   and gets a 503; a companion edition registers its own destination instead).
 
 ## Profile resolution
 
@@ -170,9 +205,9 @@ once loaded.
 
 ## Level-1 governance ceiling and distribution
 
-`PlatformContext.governance` is the optional Level-1 `GovernanceCeiling` that enforcement chokepoints read through `current_context()`. `governance.load_security_policy` selects the first available source: an explicit local policy, a centrally distributed policy, a companion-bundled policy, then the data-home policy; no source leaves editable standalone defaults. The local source remains first so an operator can roll back a bad fleet-wide publication without waiting for the central control plane.
+`PlatformContext.governance` is the optional Level-1 `GovernanceCeiling` that enforcement chokepoints read through `current_context()`. `governance.load_security_policy` composes a **tier ladder**, highest first: the centrally distributed document, then exactly one of the local sources (an explicit `KIROCREW_SECURITY_POLICY` path, a companion-bundled policy, or the data-home policy). The central document is the authority; every tier below it may only **tighten** it, through the same per-scope AND the profile layer uses. There is no local rollback lever above the fleet: recovery from a bad publication is re-publishing a good document at the source (`governance.md` → "Loading + precedence"). No source leaves editable standalone defaults.
 
-`policy_distribution.resolve_distribution` accepts the central source from fleet environment settings or the `distribution` declaration of an already-selected lower-tier policy, with environment settings taking precedence individually. A declared distribution source cannot carry credentials; request headers remain host-local and `cache_only()` prevents child processes from receiving the means to contact the fleet control plane.
+`policy_distribution.resolve_distribution` takes the central source from the `distribution` declaration of the highest tier that made one, or from fleet environment settings when none did, with environment settings taking precedence individually. A declared distribution source cannot carry credentials; request headers remain host-local and `cache_only()` prevents child processes from receiving the means to contact the fleet control plane.
 
 `governance._parse_controls` rejects every unknown governed key, including an unrecognised `sandbox` child. Only documented non-governed sandbox flags are accepted in the reserved internal scope. This fails closed instead of recording a misspelled sandbox floor as a valid but unenforced policy control.
 
@@ -284,6 +319,17 @@ Policy shape (`admission_policy.json`):
 }
 ```
 
+**Strict gate-flag reading.** `require_signature` and
+`require_policy_signature` are read strictly by `_coerce_flag`: a real JSON
+boolean is honoured, an absent key leaves the gate off (the documented
+default), and any other present value — explicit `null`, the string
+`"false"`, `0`, `1` — is warned about and read as **on**, the fail-closed
+direction (#9641). `bool()` on the raw value used to read any non-empty
+string as ON but `null`/`""` as OFF, so a template rendering
+`"require_policy_signature": null` silently disabled the gate. Same
+strict-read shape as the `boot` gate flags in
+[governance](governance.md) (#9176).
+
 **This policy is also the trust root for the security ceiling.**
 `require_policy_signature` (default `false`) additionally demands a *verified*
 `identity.signature` on `security_policy.json`, keyed by that document's
@@ -325,7 +371,7 @@ added pre-launch landed under this same `1`, with no bump:
   contributor), and `jail` (process-isolation) extension points;
 - the `agent_identity` slot (`AgentIdentityProvider` — agent workload identity
   and token vending, distinct from operator-SSO `identity`);
-- wiring an *existing* but previously-unconsumed Protocol method into a call site
+- wiring an *existing* but unconsumed Protocol method into a call site
   (e.g. `ProviderRegistry.create_factory` going live, `AppsLoader` bundling
   feature apps) — no shape change, so no bump regardless;
 - adding `TunnelProvider.register_callbacks` / `status_snapshot` when the tunnel
@@ -348,11 +394,65 @@ dependencies = ["kirocrew"]
 The `kirocrew-enterprise` binary sets `KIROCREW_PROFILE=enterprise` and delegates to the
 core `main` — the explicit composition-root path that a security review reads.
 
+### Distribution build version
+
+A distribution that repackages one core release as several builds of its own
+(an enterprise bundle vending `0.6.0.10`, `0.6.0.11`, … of the same `0.6.0`)
+names the build it shipped in a `BUILD_VERSION` file placed **beside
+`kiro_crew/__init__.py`** at packaging time (declared as optional package data;
+absent in this repo and in the wheels it publishes). `kiro_crew/__init__`
+resolves it **at import**, replacing `__version__` for every reader — the About
+page's version chip (`version_display`), `/api/status`, `/api/health`,
+`kirocrew --version`, the diagnostics report, and the governance minimum-version
+floor (`update_required`), which a fleet writes in the distribution's build
+numbers. Two readers deliberately do not change: the anonymous usage beacon
+(`beacon.release` clamps to `major.minor.patch` for cardinality, so a stamped
+build sends the same value as its base), and the About page's changelog, where
+`changelog.running_release` folds the stamp back onto its three-segment release
+so the build marks the `0.6.0` row rather than opening an empty `0.6.0.12` row. Import time is the only point that works:
+`dashboard/handlers/updates.py`, `dashboard/ws.py`, `config/loader.py` and
+`cli_server.py` bind `from kiro_crew import __version__` copies that nothing
+later can reach, so this is deliberately not a `PlatformContext` field — a
+context is composed after those imports.
+
+A file in the package rather than an environment variable, on purpose: the
+version feeds an enterprise ceiling (the minimum-version floor) that the local
+operator must not be able to weaken, and an env var is theirs to set. The file
+sits in the same site-packages tree as the code and carries exactly its trust —
+whoever can write it can write `__init__.py` — so it adds no bypass the bytes did
+not already have, and it is the same model the release lanes use when they
+rewrite the version literal for a nightly or insider build. Being in the bytes,
+it is also what a shadow-venv probe or any fresh interpreter naturally reports.
+
+Fail-closed on shape: only the core base itself, or the base followed by exactly
+one `.N` ASCII-numeric segment over a bare numeric base, is honoured (the read is
+capped, and an oversized, undecodable or unreadable file falls back to the base).
+A different base, a prerelease stamp, a non-numeric or second segment, or a
+suffix over an `rc` / nightly base is a build this core is not; it is ignored
+with one warning and the base stays, so a process can never claim bytes it does
+not run. The contract is the file — its name and that shape — not a Python API;
+the helpers in `kiro_crew/__init__` are private. The accepted shape parses as a
+PEP 440 release wherever the version is compared (`_is_newer` orders `0.6.0.12`
+above `0.6.0` and below `0.6.1`; `release_channel.channel` still reads
+`stable`), and `base_version` — the stable-channel display fold — preserves the
+stamped string, which is what lets the chip show it.
+
+Update lane. A distribution owns its own update path, normally the command
+provider selected by `check_command` / `apply_command` update pins, which never
+consults the public release feed. Should a stamped build reach the feed check,
+`channel_move_pending` compares by **release** (`changelog.release_of_build`
+folds `0.6.0.12` to `0.6.0`), so a stamped build on the lane that shipped its
+release is on that lane, not permanently "ahead" of it; the `update_available`
+verdict needs no fold (`0.6.0` is not newer than `0.6.0.12`). The wheel's
+dist-info metadata is not touched by the stamp — `pip` and `importlib.metadata`
+still report the base — so a downstream that builds its own wheel and needs
+those to differ must bump its own project version as well.
+
 ## Consumption-site wiring
 
-Core consumption sites read the context rather than the module global they
-previously used. Standalone behavior is preserved because each Default adapter
-delegates to that same global. Wired sites:
+Core consumption sites read the context rather than a module global. Standalone
+behavior is unchanged because each Default adapter delegates to that same global.
+Wired sites:
 
 - `cli.py:main` / `slack/gateway.py:run_gateway` — `boot_platform(cfg)` once at
   startup (gateway raises fail-closed; cli is defensive — standalone never raises).
@@ -779,9 +879,9 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   separator — a split silently misattributes any package whose own name contains
   that separator, which makes the package permanently "drifted" so every
   `sync_plugins` reinstalls a plugin that already exists.
-- `CapabilityManager` (operations-based external package/capability manager) —
-  **replaces the former `external_capability_bin()` binary-name seam.** Rather
-  than naming a binary whose exact CLI grammar the core then hardcodes, the
+- `CapabilityManager` (operations-based external package/capability manager).
+  The seam names OPERATIONS, not a binary whose exact CLI grammar the core would
+  hardcode: the
   edition implements OPERATIONS and OWNS its own invocation grammar, output
   parsing, and error translation; the core (`/api/capability/*` handlers +
   `mcp.py` uninstall) calls an operation and only serializes the result / applies
@@ -888,12 +988,24 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   > through read and does NOT auto-reconcile — the sweep + idempotent re-apply are
   > the recovery path.
 
-  `async registry() -> List[Dict]` (the manager parses its own registry output
-  into entries; the core passes them through as `{"servers": [...]}`). The public
+  `async registry(query: str | None = None) -> List[Dict]` (the manager parses its
+  own registry output into entries; the core passes them through as
+  `{"servers": [...]}`). The public
   `DefaultCapabilityManager.available()` is `False` → the handlers return HTTP 503;
   a companion implements registry-backed management. This is the operations-based
   Protocol the prior binary-name seam's contract note anticipated — chosen now,
   pre-launch, so no external CLI grammar fossilizes in the core.
+
+  > `query` is an optional free-text filter HINT, sent only by MCP discovery
+  > search (`mcp_providers/capability.py`); the browse endpoint
+  > `GET /api/capability/mcp/registry` omits it and gets the full listing. The
+  > provider consumes at most `_LIST_LIMIT_GUARD` (500) rows, so a manager whose
+  > registry is larger MUST filter server-side or every row past that cap is
+  > unsearchable. Ignoring the hint stays correct — the provider filters again —
+  > it only costs reach. The hint is feature-detected on the signature
+  > (`mcp_utils.registry_accepts_query`) and forwarded by
+  > `BoundedCapabilityManager`, so an edition still on the zero-arg signature
+  > keeps working.
 
   **Second consumer — App Kit dependency resolution.** `apps/dependencies.py`
   resolves an app manifest's `dependencies.capabilities.{mcp,skills}` through
@@ -992,25 +1104,22 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   fork. v1 addition; `Default` returns `[]`.
 
 **`McpToolingProvider` is intentionally scoped to MCP tooling only** —
-`extra_mcp_servers()`, `extra_skills()`, and `extra_mcp_scopes()`. The former
-grab-bag members were split into dedicated Protocols this session
+`extra_mcp_servers()`, `extra_skills()`, and `extra_mcp_scopes()`. Agent
+catalogs, prompt sources and capability management each own a dedicated Protocol
 (`AgentCatalogProvider`, `PromptSourceProvider`, `CapabilityManager`) so the CPP
-layer keeps its "one adapter per concern" shape; every future edition hook lands
-on its own interface rather than accreting onto the nearest existing one.
+layer keeps its "one adapter per concern" shape; every edition hook lands on its
+own interface rather than accreting onto the nearest existing one.
 
-**Agent-discovery module rename (this session).** `aim_agents.py` →
-`agent_discovery.py`; the `AimAgent` dataclass → `AgentInfo`. The agent `source`
-classification was generalized: the old `KiroCrewAICapabilities`-specific
-hardcode was removed, so a package-installed agent is now classified
-`source="package"` (alongside `"kirocrew"` for `kirocrew.json`/`kirocrew-lite.json`
-and `"builtin"` for the rest) rather than the former `"aim"` literal. Importers
-(`subagent`, `mcp_core`, `conductor_skill`, dashboard agents) were updated to the
-new module/class names.
-- **`register_browser_auth_provider(provider)` — removed with the playwright-cli
-  migration.** The module that carried this seam is gone, so there is no
-  browser-auth provider hook to register at all: browsing runs through the
-  external `playwright-cli` binary (`kiro_crew/browser_cli/`), and a logged-in
-  session reaches that binary through the CLI's own surfaces (`state-save` /
+**Agent discovery.** `agent_discovery.py` owns it, and `AgentInfo` is the record
+it yields. The `source` classification is generic — no product-specific hardcode:
+`"kirocrew"` for `kirocrew.json` / `kirocrew-lite.json`, `"package"` for a
+package-installed agent, `"builtin"` for the rest. It has many consumers —
+`agent`, `session`, `context`, `subagent`, `mcp_core`, `cron_script`,
+`slack/handler` and several dashboard modules among them — so treat any list here as
+representative rather than exhaustive.
+- **There is no browser-auth provider hook.** Browsing runs through the external
+  `playwright-cli` binary (`kiro_crew/browser_cli/`), and a logged-in session
+  reaches that binary through the CLI's own surfaces (`state-save` /
   `state-load`, `attach --extension`) rather than through an in-process
   provider.
 - `hooks.register_internal_read_path(read_id, rel_path)` — guarded seam adding a
@@ -1018,10 +1127,9 @@ new module/class names.
   non-sensitive/repoint).
 - `security._SENSITIVE_HOME_DIRS` gains `.midway` (live SSO bearer cookie;
   inert on a host without `~/.midway`).
-- `config.dashboard.mwinit_flags` (str) + `_EDITABLE_CONFIG` PATCH entry.
 - `config.knowledge.doc_ingest_hosts` (list) — SSRF-safe allowlist for the
   server-side fetch path only; empty = deny-by-default. The agent-driven
-  `auto_add_documents` path (renamed from `auto_ingest_doc_links`) is NOT gated
+  `auto_add_documents` path is NOT gated
   on it: the agent hands over text it already fetched, Kiro Crew fetches nothing.
 - `KiroCrewConfig._extra_sections` (private) — unknown top-level config.json
   sections captured at `load()`, re-emitted by `to_dict()`, so an edition

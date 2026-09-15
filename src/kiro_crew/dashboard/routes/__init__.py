@@ -1,8 +1,7 @@
 """The dashboard's HTTP route table, split into ordered slices.
 
-``start_dashboard`` used to carry all 447 registrations inline. They live here
-instead, one module per section of the original table, each exposing
-``register(app)``.
+Every registration lives here rather than inline in ``start_dashboard``: one
+module per section of the table, each exposing ``register(app)``.
 
 **The order of ``_REGISTRARS`` is load-bearing and must not be sorted.** aiohttp
 resolves a request against its routes in REGISTRATION order, and this table
@@ -10,10 +9,10 @@ depends on that in several places -- a literal path is deliberately registered
 before a pattern that would otherwise swallow it (``/api/skills/-/tree`` before
 ``/api/skills/{name:.+}``, ``/api/chat/slots/cleanup`` before
 ``/api/chat/slots/{slot}``, ``/api/steering/search`` before
-``/api/steering/{key}``, and others called out in the slice comments). Splitting
-the table into contiguous slices and calling them in the original sequence keeps
-global ordering identical by construction; reordering this tuple, or the lines
-inside any slice, can silently shadow a route.
+``/api/steering/{key}``, and others called out in the slice comments). The slices
+are contiguous and called in sequence, so global ordering holds by construction;
+reordering this tuple, or the lines inside any slice, can silently shadow a
+route.
 
 ``test_dashboard_route_table.py`` pins the resulting (method, path, handler)
 sequence, so a reordering shows up as a failing test rather than as a 404 or a

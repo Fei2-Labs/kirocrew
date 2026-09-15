@@ -148,7 +148,7 @@ export default function SegmentedControl<T extends string = string>({ segments, 
 
   return (
     <>
-      <div ref={containerRef} className="inline-flex rounded-lg bg-bg-elevated border border-border p-0.5 gap-0.5">
+      <div ref={containerRef} role="group" className="inline-flex rounded-lg bg-bg-elevated border border-border p-0.5 gap-0.5">
         {segments.map(s => {
           const isActive = s.key === value
           const isDisabled = s.disabled === true
@@ -158,10 +158,27 @@ export default function SegmentedControl<T extends string = string>({ segments, 
           // tooltip never appears on touch, which is the form factor compact
           // exists for.
           const labelShown = !iconOnly && (mode === 'full' || isActive)
+          // #9684: the active-pill indicator (below) is `absolute inset-0`, so
+          // its CSS box always equals the button's live box. The label reveal
+          // animates its own `width` from 0 to auto, growing the button box
+          // every frame of the transition. Two things used to make the pill
+          // mis-size during that reveal, and BOTH had to change (measured: each
+          // alone leaves ~6px of overshoot, together 0):
+          //   1. the button carried `layout`, so framer re-measured and
+          //      re-projected the whole button box every frame -- the pill,
+          //      pinned to it, was dragged onto the intermediate box. Dropped
+          //      here; the button still grows smoothly because the label's
+          //      width is itself a spring, and the pill's travel BETWEEN
+          //      segments is the indicator's own `layoutId`, not the button's.
+          //   2. the indicator animated its SIZE via the shared-layout spring,
+          //      so on selection it sprang from the old box to a NEW box read
+          //      while the label was still at width 0. `layout="position"` below
+          //      keeps the cross-segment position spring but takes the size from
+          //      CSS `inset-0`, so the pill matches the button box on every
+          //      frame, settled or mid-reveal.
           return (
             <motion.button
               key={s.key}
-              layout
               aria-label={labelShown ? undefined : s.label}
               aria-disabled={isDisabled || undefined}
               onClick={() => {
@@ -181,6 +198,7 @@ export default function SegmentedControl<T extends string = string>({ segments, 
             >
               {isActive && !isDisabled && (
                 <motion.div
+                  layout="position"
                   layoutId={`${layoutId}-indicator`}
                   className="absolute inset-0 bg-card rounded-md shadow-sm border border-border"
                   transition={reduceMotion

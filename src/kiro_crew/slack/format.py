@@ -47,7 +47,7 @@ def extract_options(text: str) -> tuple[str, list[str]]:
     m = _OPTIONS_RE.search(text)
     if not m:
         return text, []
-    choices = [c.strip() for c in m.group(1).split("|") if c.strip()]
+    choices = [c.strip() for c in m.group("labels").split("|") if c.strip()]
     cleaned = text[: m.start()].rstrip()
     return cleaned, choices
 

@@ -22,7 +22,7 @@ from kiro_crew.session import _MAX_CONCURRENT_COLD_STARTS as _MAX_COLD_STARTS_FO
 
 @pytest.fixture(autouse=True)
 def _private_sel_root_per_test(sel_private_root):
-    """Every test in this module gets its OWN SEL root (issue #7029).
+    """Every test in this module gets its OWN SEL root.
 
     ``identity_fingerprint`` is audit-or-deny: it returns "absent" unless a
     CRITICAL SEL event lands first. On the event-loop thread the chain-lock
@@ -618,9 +618,9 @@ class _FakeProvider:
 
     @property
     def uses_kiro_identity_store(self) -> bool:
-        from kiro_crew.acp.types import ACP_BACKENDS_KIRO_IDENTITY_STORE
+        from kiro_crew.acp.types import backends_retired_by_host_logout
 
-        return self.backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        return self.backend in backends_retired_by_host_logout()
 
     def is_process_alive(self) -> bool:
         return True
@@ -645,9 +645,9 @@ class _FakeRuntime:
 
     @property
     def uses_kiro_identity_store(self) -> bool:
-        from kiro_crew.acp.types import ACP_BACKENDS_KIRO_IDENTITY_STORE
+        from kiro_crew.acp.types import backends_retired_by_host_logout
 
-        return self._acp_backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        return self._acp_backend in backends_retired_by_host_logout()
 
     def has_active_sessions(self) -> bool:
         return self._active

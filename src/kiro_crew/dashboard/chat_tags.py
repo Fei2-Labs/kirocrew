@@ -24,7 +24,7 @@ from aiohttp import web
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.state import DashboardState, mint_tags_revision
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -114,7 +114,7 @@ def validate_folder_tag_ids(raw: Any, state: DashboardState) -> list[str]:
 
 
 def _tags_write_lock(state: Any) -> LoopBoundLock:
-    """Return (lazily create) the per-state lock for tag writes (loop-bound, #4800)."""
+    """Return (lazily create) the per-state lock for tag writes (loop-bound)."""
     lock = _TAGS_WRITE_LOCKS.get(state)
     if lock is None:
         lock = LoopBoundLock()
@@ -177,6 +177,16 @@ def _valid_color(value: str) -> str:
 
 def _tag_by_id(state: DashboardState, tag_id: str) -> dict | None:
     return next((t for t in state._tags if t.get("id") == tag_id), None)
+
+
+def _bump_slot_tags_revision(slot: Any) -> str:
+    """Rotate a slot's tag revision while preserving duck-typed callers."""
+    bump_revision = getattr(slot, "bump_tags_revision", None)
+    if callable(bump_revision):
+        return str(bump_revision())
+    revision = mint_tags_revision()
+    slot.tags_revision = revision
+    return revision
 
 
 def create_tag_definition(
@@ -415,6 +425,7 @@ async def api_chat_tag_delete(request: web.Request) -> web.Response:
                 # between this capture and the strip below.
                 authorized_history_key = slot_history_key(slot)
                 slot.tags = [t for t in slot.tags if t != tid]
+                _bump_slot_tags_revision(slot)
                 try:
                     applied = await save_slot_off_loop(
                         state,
@@ -533,6 +544,19 @@ async def api_chat_slot_tags(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "tags must be an array", "code": "tags_not_array"}, status=400
         )
+    # Optional compare-and-swap precondition: the revision the caller composed
+    # its list onto. A client's list is a one-click delta applied to the last
+    # snapshot it ACCEPTED; if another client committed since, that snapshot is
+    # stale and replacing the slot's list wholesale would silently drop the
+    # other client's tag. Absent (legacy or scripted callers) the write is
+    # unconditional, as before.
+    raw_base = body.get("base_tags_revision")
+    if raw_base is not None and not isinstance(raw_base, str):
+        return web.json_response(
+            {"error": "base_tags_revision must be a string", "code": "base_not_string"},
+            status=400,
+        )
+    base_tags_revision: str | None = raw_base or None
 
     async with _tags_write_lock(state):
         valid_ids = {t.get("id") for t in state._tags}
@@ -558,8 +582,33 @@ async def api_chat_slot_tags(request: web.Request) -> web.Response:
                 {"error": "session was deleted or rebound", "code": "session_gone"},
                 status=409,
             )
+        if base_tags_revision is not None and base_tags_revision != slot.tags_revision:
+            # Decided under the same lock every writer holds, so the revision
+            # compared here is the one the slot will still hold if we proceed.
+            # Nothing is written; the caller rebases its delta onto the list
+            # and revision returned and retries.
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.slot_tags",
+                outcome="denied",
+                source="dashboard",
+                resources=name,
+                error="stale base revision",
+            )
+            return web.json_response(
+                {
+                    "error": "tags changed since the list was composed",
+                    "code": "stale_base",
+                    "base_tags_revision": base_tags_revision,
+                    "tags_revision": slot.tags_revision,
+                    "tags": slot.tags,
+                },
+                status=409,
+            )
         prior_tags = slot.tags
+        prior_tags_revision = slot.tags_revision
         slot.tags = new_tags
+        written_tags_revision = _bump_slot_tags_revision(slot)
         if not await save_slot_off_loop(
             state, slot, force=True, expected_history_key=authorized_history_key
         ):
@@ -569,13 +618,21 @@ async def api_chat_slot_tags(request: web.Request) -> web.Response:
             # a concurrent writer may have committed a newer value that an
             # unconditional restore would erase (the same guard
             # _restore_unfiled applies to its rollback).
-            if slot.tags == new_tags:
+            if slot.tags == new_tags and slot.tags_revision == written_tags_revision:
                 slot.tags = prior_tags
+                # Do NOT reuse prior_tags_revision: a client that adopted the
+                # leaked provisional revision from a concurrent broadcast
+                # already classifies the prior one as a known predecessor and
+                # would ignore a frame carrying it, keeping the rejected tags.
+                # A fresh revision is an authoritative change every client
+                # must adopt; broadcast it so they reconverge now.
+                _bump_slot_tags_revision(slot)
             # The UNPINNED periodic flush may have persisted the provisional
             # value to the slot's current transcript while this save awaited
             # (review-caught): mark dirty so the next flush reconverges the
             # durable record to the rolled-back live state.
             slot._dirty = True
+            state.push_slots_update()
             sel().log_api_access(
                 caller="dashboard",
                 operation="chat.slot_tags",
@@ -584,8 +641,24 @@ async def api_chat_slot_tags(request: web.Request) -> web.Response:
                 resources=name,
                 error="session was deleted or rebound",
             )
+            # The provisional revision sat on the live slot while the save
+            # awaited, so a concurrent slots broadcast may already have shown
+            # it to clients. Name it in the rejection so a client can classify
+            # that leaked frame as stale rather than as a newer writer's commit
+            # (and so not reapply the rejected tags on its next toggle).
             return web.json_response(
-                {"error": "session was deleted or rebound", "code": "session_gone"},
+                {
+                    "error": "session was deleted or rebound",
+                    "code": "session_gone",
+                    "rejected_tags_revision": written_tags_revision,
+                    "tags_revision": slot.tags_revision,
+                    # The list the slot actually holds after rollback (a
+                    # concurrent writer's commit if one landed mid-write). The
+                    # client seeds its accepted snapshot from this so a rapid
+                    # retry composes onto the server's state, not onto the
+                    # pre-write baseline it captured before that writer landed.
+                    "tags": slot.tags,
+                },
                 status=409,
             )
 
@@ -597,7 +670,14 @@ async def api_chat_slot_tags(request: web.Request) -> web.Response:
         source="dashboard",
         resources=name,
     )
-    return web.json_response({"ok": True, "tags": slot.tags})
+    return web.json_response(
+        {
+            "ok": True,
+            "tags": slot.tags,
+            "tags_revision": slot.tags_revision,
+            "prior_tags_revision": prior_tags_revision,
+        }
+    )
 
 
 # ── Sidebar columns (Trello-style filtered lanes) ──────────────────────────
@@ -981,6 +1061,7 @@ async def api_chat_slot_drop(request: web.Request) -> web.Response:
         prior_tags = slot.tags
         written_tags = kept + [target_id]
         slot.tags = written_tags
+        written_tags_revision = _bump_slot_tags_revision(slot)
         if not await save_slot_off_loop(
             state, slot, force=True, expected_history_key=authorized_history_key
         ):
@@ -990,12 +1071,18 @@ async def api_chat_slot_drop(request: web.Request) -> web.Response:
             # newer commit is not erased — and report the drop as rejected,
             # matching this endpoint's rejection shape (the card stays where
             # it was).
-            if slot.tags == written_tags:
+            if slot.tags == written_tags and slot.tags_revision == written_tags_revision:
                 slot.tags = prior_tags
+                # Fresh revision, not prior_tags_revision (see api_chat_slot_tags):
+                # a client that adopted the leaked provisional revision treats
+                # the prior one as a known predecessor and would keep the
+                # rejected tags.
+                _bump_slot_tags_revision(slot)
             # The UNPINNED periodic flush may have persisted the provisional
             # value while this save awaited (review-caught): mark dirty so the
             # next flush reconverges the durable record to the live state.
             slot._dirty = True
+            state.push_slots_update()
             return _rejected("session was deleted or rebound")
     state.push_slots_update()
     sel().log_api_access(

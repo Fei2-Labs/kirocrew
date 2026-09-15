@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -175,6 +176,49 @@ class TestYoloCommand:
         slack.actions.clear()
         await _slash("!yolo", slack, sessions)
         assert "ON" in _texts(slack)
+
+    @pytest.mark.asyncio
+    async def test_off_revokes_while_policy_masks_the_grant(
+        self, slack, sessions, owner, monkeypatch
+    ):
+        """An explicit off must not be gated on the POLICY-FILTERED liveness.
+
+        ``!yolo`` computes ``yolo_active = is_yolo_mode()``, which policy can veto. A
+        grant that policy masks but that still EXISTS therefore reads False, so the
+        off branch reported "already off" and never called ``disable_yolo()`` --
+        leaving a grant standing that the operator had explicitly revoked.
+        ``disable_yolo`` itself was corrected to read ``has_grant``; this covers its
+        CALLER, which was still gating it out.
+
+        A deny normally destroys the grant at ceiling-install time, so the mask is the
+        fail-closed floor for a teardown that did not complete -- which is exactly the
+        state where an explicit off has work to do.
+
+        Driven through ``_slash`` on purpose: an earlier attempt re-implemented the
+        gate inside the test and therefore exercised no handler code, passing even
+        with the fix reverted.
+        """
+        from kiro_crew import safety_override as so
+
+        await _slash("!yolo on", slack, sessions)
+        assert h.is_yolo_mode() is True
+        slack.actions.clear()
+
+        # Push a DENY without going through a ceiling install, so the grant survives
+        # and only the policy mask is in force -- which is the state that misled the
+        # branch under test.
+        monkeypatch.setattr(so, "_yolo_policy_permitted", False)
+        monkeypatch.setattr(so, "_yolo_policy_resolved", True)
+        assert h.is_yolo_mode() is False, "the filtered reading is what misled the branch"
+        assert so.safety_override().has_grant() is True, "the grant is still standing"
+
+        await _slash("!yolo off", slack, sessions)
+
+        assert "disabled" in _texts(slack), "the off must be reported as an off"
+        with so.safety_override()._lock:
+            assert (
+                so.safety_override()._active is False
+            ), "the grant must be torn down even while the verdict is unknown"
 
     @pytest.mark.asyncio
     async def test_off_when_active_and_when_already_off(self, slack, sessions, owner):
@@ -1067,35 +1111,121 @@ class TestAgentResolution:
 # thread-override hydration
 # ──────────────────────────────────────────────────────────────────────
 class TestThreadOverrideHydration:
-    def test_second_call_is_a_no_op(self):
-        log = MagicMock()
-        log.get_metadata.return_value = {}
-        h._hydrate_thread_overrides("t1", log)
-        h._hydrate_thread_overrides("t1", log)
-        log.get_metadata.assert_called_once()
+    @pytest.mark.asyncio
+    async def test_private_identity_reads_run_off_loop_and_live_maps_stay_on_loop(
+        self, monkeypatch
+    ):
+        from kiro_crew import memory_stores
+        from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+        from kiro_crew.config.sections import MemoryStoreConfig
 
-    def test_without_log_only_marks_hydrated(self):
-        h._hydrate_thread_overrides("t1", None)
+        loop_thread = threading.get_ident()
+
+        class LoopOwnedMap(dict):
+            def __setitem__(self, key, value):
+                assert threading.get_ident() == loop_thread
+                super().__setitem__(key, value)
+
+        monkeypatch.setattr(h, "_thread_agents", LoopOwnedMap())
+        monkeypatch.setattr(h, "_thread_projects", LoopOwnedMap())
+        cfg = KiroCrewConfig.load()
+        cfg.agents["reviewer"] = KiroCrewAgentConfig(
+            kiro_agent="kirocrew", memory_store="member-reviewer"
+        )
+        cfg.memory_stores["member-reviewer"] = MemoryStoreConfig(
+            owner_member="reviewer", memory_version=2
+        )
+        monkeypatch.setattr(KiroCrewConfig, "load", lambda: cfg)
+        original = memory_stores.require_member_memory_not_archived
+        archive_reads = []
+
+        def read_archive(store):
+            with pytest.raises(RuntimeError, match="no running event loop"):
+                asyncio.get_running_loop()
+            archive_reads.append(store)
+            return original(store)
+
+        monkeypatch.setattr(memory_stores, "require_member_memory_not_archived", read_archive)
+
+        def read_metadata(_key):
+            with pytest.raises(RuntimeError, match="no running event loop"):
+                asyncio.get_running_loop()
+            return {"agent": "reviewer", "memory_store": "member-reviewer", "project": "/srv/app"}
+
+        log = MagicMock(get_metadata=MagicMock(side_effect=read_metadata))
+        await h._hydrate_thread_overrides("t1", log)
+        await h._hydrate_thread_overrides("t1", log)
+        log.get_metadata.assert_called_once_with("t1")
+        assert archive_reads == ["member-reviewer"]
+        assert h._thread_agents["t1"] == "kirocrew"
+        assert h._thread_projects["t1"] == "/srv/app"
         assert "t1" in h._hydrated_sessions
 
-    def test_metadata_failure_is_swallowed(self):
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("clear", [False, True])
+    async def test_worker_result_cannot_overwrite_a_newer_live_selection(self, monkeypatch, clear):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        h._thread_agents["t1"] = "before-agent"
+        h._thread_projects["t1"] = "before-project"
+
+        def read(_key, _log):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5), "test did not release the metadata read"
+            return "saved-agent", "saved-project"
+
+        monkeypatch.setattr(h, "_read_thread_overrides", read)
+        task = asyncio.create_task(h._hydrate_thread_overrides("t1", MagicMock()))
+        try:
+            await asyncio.wait_for(started.wait(), 5)
+            assert "t1" not in h._hydrated_sessions
+            if clear:
+                h._thread_agents.pop("t1")
+                h._thread_projects.pop("t1")
+            else:
+                h._thread_agents["t1"] = "new-agent"
+                h._thread_projects["t1"] = "new-project"
+        finally:
+            release.set()
+            await asyncio.wait_for(task, 5)
+        assert h._thread_agents.get("t1") == (None if clear else "new-agent")
+        assert h._thread_projects.get("t1") == (None if clear else "new-project")
+
+    @pytest.mark.asyncio
+    async def test_second_call_is_a_no_op(self):
+        log = MagicMock()
+        log.get_metadata.return_value = {}
+        await h._hydrate_thread_overrides("t1", log)
+        await h._hydrate_thread_overrides("t1", log)
+        log.get_metadata.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_without_log_only_marks_hydrated(self):
+        await h._hydrate_thread_overrides("t1", None)
+        assert "t1" in h._hydrated_sessions
+
+    @pytest.mark.asyncio
+    async def test_metadata_failure_is_swallowed(self):
         log = MagicMock()
         log.get_metadata.side_effect = OSError("corrupt")
-        h._hydrate_thread_overrides("t1", log)
+        await h._hydrate_thread_overrides("t1", log)
         assert "t1" not in h._thread_agents
 
-    def test_agent_and_project_hydrated(self):
+    @pytest.mark.asyncio
+    async def test_agent_and_project_hydrated(self):
         log = MagicMock()
         log.get_metadata.return_value = {"agent": "demo", "project": "/srv/app"}
-        h._hydrate_thread_overrides("t1", log)
+        await h._hydrate_thread_overrides("t1", log)
         assert h._thread_agents["t1"] == "demo"
         assert h._thread_projects["t1"] == "/srv/app"
 
-    def test_sensitive_project_is_dropped(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_sensitive_project_is_dropped(self, monkeypatch):
         monkeypatch.setattr(h, "is_sensitive_path", lambda p: True)
         log = MagicMock()
         log.get_metadata.return_value = {"project": "/home/u/.aws"}
-        h._hydrate_thread_overrides("t1", log)
+        await h._hydrate_thread_overrides("t1", log)
         assert "t1" not in h._thread_projects
 
 
@@ -1498,8 +1628,13 @@ class TestRouteLinkedThread:
         state.get_linked_slot.return_value = slot
         monkeypatch.setattr(h, "_dashboard_state", state)
         assert await h.maybe_route_linked_thread("do it", "t1", "U1", "C1", slack, "t1") is True
-        # meta carries the admission-time containment snapshot (#5911).
-        slot.queue_append.assert_called_once_with("do it", meta=ANY, directive_user_origin=True)
+        # meta carries the admission-time containment snapshot.
+        slot.queue_append.assert_called_once_with(
+            "do it",
+            meta=ANY,
+            directive_user_origin=True,
+            directive_channel_origin=True,
+        )
         slot.append.assert_called_once()
         state.push_slots_update.assert_called_once()
 

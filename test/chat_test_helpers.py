@@ -71,7 +71,7 @@ def move_transcript_past(log: ConversationLog, key: str, sig: float) -> None:
     (~15.6 ms on Windows), leaving the second write with an mtime identical
     to the first -- a staged "transcript moved on" then has not moved on at
     all, and any staleness assertion keyed on the mtime signature becomes a
-    coin flip (#2981, same class as #2449). Pinning the mtime makes the test
+    coin flip. Pinning the mtime makes the test
     exercise the signature COMPARISON rather than the platform's clock
     resolution (testing-conventions.md § Determinism).
     """
@@ -89,7 +89,7 @@ async def drain_background_tasks(state) -> None:
     the Slack mock straight afterwards races it: it usually wins on an idle machine and
     loses under load. That flake surfaces as a plain count mismatch (``assert 0 == 2``)
     or as ``'NoneType' object has no attribute 'args'``, on a DIFFERENT test in the
-    class each run, and names neither the task nor the race (#4130).
+    class each run, and names neither the task nor the race.
 
     Awaiting the not-yet-done members is an exact wait on the real completion
     condition rather than a sleep. An empty set means the task already finished; a
@@ -139,15 +139,45 @@ def _make_ready_kiro_prerequisite() -> KiroPrerequisiteService:
     return _READY_KIRO_PREREQUISITE
 
 
+def stub_readonly_spec_publisher(monkeypatch) -> list[tuple[str, str | None]]:
+    """Stand in for the side turn's derived-spec publisher.
+
+    ``_run_side_turn`` derives ``<agent>--readonly`` from the live kiro agent
+    registry before it creates the side session; under a test home that
+    registry holds no base spec, so the real publisher would refuse every turn
+    (``base_spec_missing``). The stub answers with the derived name and a fixed
+    digest and records the base it was asked for. The real derivation and
+    publication are covered by ``test_side_readonly_spec.py``.
+    """
+    from kiro_crew.dashboard.side_readonly_spec import PublishedSpec
+
+    calls: list[tuple[str, str | None]] = []
+
+    def _fake_publish(base_name: str, project_dir: str | None = None) -> PublishedSpec:
+        calls.append((base_name, project_dir))
+        return PublishedSpec(name=f"{base_name}--readonly", digest="d" * 64)
+
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.side.publish_readonly_spec", _fake_publish)
+    return calls
+
+
 def _make_state(tmp_path, **kwargs):
     """Create a DashboardState with mocked services and real ConversationLog."""
     sessions = MagicMock(count=0)
+    sessions.get_provider = MagicMock(return_value=None)
+    sessions.resumable_sid = MagicMock(return_value=None)
     sessions.remove = AsyncMock()
     sessions.discard_conversation = AsyncMock()
     sessions.aflush = AsyncMock()
     sessions.recycle_background = AsyncMock()
     sessions.get_pid = MagicMock(return_value=None)
     sessions.provider_label_for = MagicMock(return_value="")
+    # No live provider by default, and a destroy that can be awaited: the side
+    # turn asks ``get_provider`` whether a session is retained and destroys a
+    # stale one. A bare MagicMock answers "yes" to the first and cannot be
+    # awaited for the second. Tests that want a live provider set it explicitly.
+    sessions.get_provider = MagicMock(return_value=None)
+    sessions.destroy = AsyncMock()
     # Real in-memory Slack-link store rather than bare MagicMocks. The unlink
     # path unpacks get_slack_link into (thread_ts, channel_id) and branches on
     # whether a link is PRESENT, and a MagicMock satisfies neither: it iterates
@@ -180,24 +210,50 @@ def _make_state(tmp_path, **kwargs):
     # drain's mirror-retarget comparison reads the link's identity fields, so a
     # bare tuple would make every mirror identical).
     _mirror_links: dict[str, ChannelLink] = {}
+    #: Keys whose binding accepts INBOUND messages, so ``find_mirror_sessions``
+    #: can answer the ``inbound_only`` question the resume paths ask.
+    _inbound_keys: set[str] = set()
 
-    def _set_mirror_link(key, channel_id, thread_ts):
+    def _set_mirror_link(key, channel_id=None, thread_ts=None, *, accepts_inbound=False, reason=""):
+        # Two shapes reach this double. Production is
+        # ``(key, ChannelLink, *, accepts_inbound, reason)``; the Slack-era callers
+        # in these tests pass ``(key, channel_id, thread_ts)``. Accepting both is
+        # what lets ONE double serve every mirror path — without the keyword-only
+        # arguments the channel-neutral link endpoint raises TypeError, which
+        # surfaces as a 500 and hides whatever the test was actually asserting.
+        if isinstance(channel_id, ChannelLink):
+            _mirror_links[key] = channel_id
+            if accepts_inbound:
+                _inbound_keys.add(key)
+            else:
+                _inbound_keys.discard(key)
+            return
         if channel_id or thread_ts:
             _mirror_links[key] = ChannelLink(
                 channel_type="slack", channel_id=channel_id, thread_id=thread_ts
             )
         else:
             _mirror_links.pop(key, None)
+            _inbound_keys.discard(key)
 
     def _get_mirror_link(key):
         return _mirror_links.get(key)
 
-    def _clear_mirror_link(key):
+    def _clear_mirror_link(key, *, reason=""):
+        _inbound_keys.discard(key)
         return _mirror_links.pop(key, None) is not None
+
+    def _find_mirror_sessions(link, *, inbound_only=False):
+        return [
+            key
+            for key, candidate in _mirror_links.items()
+            if candidate == link and (not inbound_only or key in _inbound_keys)
+        ]
 
     sessions.set_mirror_link = MagicMock(side_effect=_set_mirror_link)
     sessions.get_mirror_link = MagicMock(side_effect=_get_mirror_link)
     sessions.clear_mirror_link = MagicMock(side_effect=_clear_mirror_link)
+    sessions.find_mirror_sessions = MagicMock(side_effect=_find_mirror_sessions)
     state = DashboardState(
         sessions=sessions,
         crons=MagicMock(list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})),

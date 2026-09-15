@@ -343,6 +343,27 @@ class TestProjectsAdd:
         # Was also appended to _CFG
         assert len(server._CFG["projects"]) == 1
 
+    def test_register_valid_folder_persists_under_the_pinned_data_dir(
+        self, isolated_queue, tmp_path, monkeypatch
+    ):
+        """The registry write lands under the `DATA_DIR` this test pinned, not
+        under whatever real home was captured when the module was imported.
+        A `CONFIG_FILE` frozen from `DATA_DIR` at import ignores every later
+        repoint of `DATA_DIR`, so registering a project rewrites the operator's
+        real ~/.kiro/crew/apps/design-tweak/data/config.json -- this pins the
+        derive-at-access seam that keeps the write under the isolated dir."""
+        proj_dir = tmp_path / "webapp"
+        proj_dir.mkdir()
+        monkeypatch.setattr(server, '_detect_dev_servers', lambda root: [])
+        h, rec = _post("/projects", {"path": str(proj_dir)})
+        h._h_projects_add()
+        assert rec.code == 200
+        registry = server.request_state.config_file(server)
+        assert registry == server.DATA_DIR / "config.json"
+        assert registry.is_relative_to(isolated_queue.parent)
+        saved = json.loads(registry.read_text("utf-8"))
+        assert saved["projects"][0]["path"] == str(proj_dir.resolve())
+
     def test_refuses_sensitive_path_ssh(self, isolated_queue, monkeypatch):
         """_valid_root refuses paths containing .ssh; without this, the preview
         would serve private keys over HTTP."""
@@ -672,7 +693,7 @@ class TestDevServer:
 
         `proj` is resolved BEFORE `_stop_dev_proc`, which can take as long as a
         SIGKILL escalation. Mutating that pre-lock dict afterwards would persist a
-        registry the project is no longer part of, so the handler re-resolves
+        registry the project is not part of, so the handler re-resolves
         inside the lock and saves nothing when it is gone.
         """
         proj = {"id": "ds7", "path": "/tmp/stop7", "name": "stop7",
@@ -851,7 +872,7 @@ class TestPickFolder:
     def test_non_darwin_returns_501(self, isolated_queue, monkeypatch):
         """Off macOS the picker returns a structured error rather than trying to
         spawn osascript; failure means Linux/Windows users see a raw crash."""
-        monkeypatch.setattr(server._sys, 'platform', 'linux')
+        monkeypatch.setattr(server, 'IS_MACOS', False)
         h, rec = _post("/pick-folder")
         h._h_pick_folder()
         assert rec.code == 501
@@ -860,7 +881,7 @@ class TestPickFolder:
     def test_picker_unavailable(self, isolated_queue, monkeypatch):
         """If trusted_system_bin returns None (osascript not at expected path),
         the handler returns a structured error, not a crash."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         monkeypatch.setattr(server, 'trusted_system_bin', lambda name: None)
         # Release the lock if test isolation left it acquired
         if server._PICK_LOCK.locked():
@@ -873,7 +894,7 @@ class TestPickFolder:
     def test_picker_timeout(self, isolated_queue, monkeypatch):
         """A timed-out picker returns 408 rather than hanging; failure means the
         backend thread is blocked forever by a stuck dialog."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         monkeypatch.setattr(server, 'trusted_system_bin', lambda name: '/usr/bin/osascript')
 
         def _timeout_run(*args, **kwargs):
@@ -890,7 +911,7 @@ class TestPickFolder:
     def test_picker_canceled(self, isolated_queue, monkeypatch):
         """A user-cancelled dialog returns ok=False/canceled=True; failure means
         cancellation is reported as an error and the UI shows an alert."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         monkeypatch.setattr(server, 'trusted_system_bin', lambda name: '/usr/bin/osascript')
 
         result = subprocess.CompletedProcess(
@@ -907,7 +928,7 @@ class TestPickFolder:
     def test_picker_returns_path(self, isolated_queue, monkeypatch):
         """A successful pick returns the chosen path; failure means the folder
         registration flow is completely broken."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         monkeypatch.setattr(server, 'trusted_system_bin', lambda name: '/usr/bin/osascript')
 
         result = subprocess.CompletedProcess(
@@ -925,7 +946,7 @@ class TestPickFolder:
     def test_picker_concurrent_lock(self, isolated_queue, monkeypatch):
         """Only one picker can be open at a time; a second attempt returns 409;
         failure means two dialogs stack invisibly and the user is confused."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         # Acquire the lock to simulate a picker already running
         server._PICK_LOCK.acquire()
         try:
@@ -939,7 +960,7 @@ class TestPickFolder:
     def test_picker_oserror(self, isolated_queue, monkeypatch):
         """An OSError from subprocess is caught and reported; failure means the
         backend crashes on a permission-denied spawn."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         monkeypatch.setattr(server, 'trusted_system_bin', lambda name: '/usr/bin/osascript')
 
         def _raise_os_error(*args, **kwargs):
@@ -986,7 +1007,7 @@ class TestSetSource:
 
     def test_set_url_rejects_non_loopback(self, isolated_queue, monkeypatch):
         """A non-loopback URL is rejected (SSRF); failure means the proxy can
-        be used to reach internal services."""
+        reach internal services."""
         h, rec = _post("/source", {"value": "http://internal.corp:8080"})
         h._h_set_source()
         assert rec.code == 400

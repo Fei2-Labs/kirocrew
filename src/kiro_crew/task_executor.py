@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Callable
 
 from kiro_crew import git_coord, name_grant, platform_compat, shutdown_event
 from kiro_crew.acp.client import AcpProcessDied
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, fire_tool_hooks, get_global_hook_store
 from kiro_crew.llm_helpers import provider_last_turn_usage, stream_and_collect_json
@@ -220,7 +221,7 @@ async def execute_single_task(
                 logger.debug("Git commit failed for task %d", task.index, exc_info=True)
 
         task.status = TaskStatus.REVIEWING
-        review_ok = await self_review(run, task, sessions, agent, session_key)
+        review_ok = await self_review(run, task, sessions, agent, session_key, ctx=ctx)
         if not review_ok:
             if committed and run.branch_name:
                 try:
@@ -326,8 +327,12 @@ async def execute_task(
 
         _acquired = False
         try:
-            await check_context(session_key, sessions)
+            from kiro_crew.context import inherit_session_memory
 
+            memory_store = await inherit_session_memory(
+                ctx, f"{SESSION_PREFIX}:{run.task_id}:runtime", session_key
+            )
+            await check_context(session_key, sessions)
             client, is_new, _resumed = await sessions.open_task_session(
                 f"{SESSION_PREFIX}:{run.task_id}:runtime",
                 session_key,
@@ -346,7 +351,8 @@ async def execute_task(
                     session_key,
                     agent=agent or None,
                     project=str(work_dir) if work_dir else None,
-                    provider_type=_runtime_provider_label(client),
+                    provider_type=KiroCrewConfig.load().agent.provider,
+                    memory_store=memory_store,
                 )
             else:
                 full_prompt = task_prompt
@@ -384,10 +390,12 @@ async def execute_task(
                             agent=agent,
                             tool_kind=event.tool_kind,
                             raw_params=event.raw_tool_params,
+                            diff_path=event.diff_path,
                             command=event.shell_command,
                             is_shell=event.is_shell,
                             mcp_server_name=event.mcp_server_name,
                             mcp_tool_name=event.tool_name,
+                            mcp_identity_trusted=event.mcp_identity_trusted,
                             mcp_identity_ambiguous=event.mcp_identity_ambiguous,
                         )
                         if tool_result.action == TOOL_DENY:
@@ -842,8 +850,8 @@ async def check_context(session_key: str, sessions: "SessionManager") -> None:
     path gateway compaction uses — so the task runner inherits concurrent-
     trigger dedup, the failure/ineffective cooldown, turn-semaphore exclusion,
     the still-critical post-compaction reset, and skills-index reinjection,
-    instead of bypassing them all with a direct ``provider.compact()``
-    (#4686). A ``"busy"`` decline (a turn holds the semaphore) is final for
+    instead of bypassing them all with a direct ``provider.compact()``.
+    A ``"busy"`` decline (a turn holds the semaphore) is final for
     this check: never fall back to a direct compact — the next check retries
     once the turn drains.
     """
@@ -861,9 +869,14 @@ async def self_review(
     sessions: "SessionManager",
     agent: str,
     session_key: str = "",
+    *,
+    ctx: "ContextBuilder | None" = None,
 ) -> bool:
     """Review task using a separate session that reads the actual git diff."""
     review_key = f"{SESSION_PREFIX}:{run.task_id}:review"
+    from kiro_crew.context import inherit_session_memory
+
+    await inherit_session_memory(ctx, f"{SESSION_PREFIX}:{run.task_id}:runtime", review_key)
     try:
         diff = ""
         if run.branch_name:

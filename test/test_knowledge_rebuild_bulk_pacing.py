@@ -9,21 +9,30 @@ sweep's own coroutine (holding neither the DB connection nor the model). Both
 are keyed on attendance, not corpus size: the dashboard-triggered rebuild a
 human is watching runs unpaced at ``PRIORITY_NORMAL`` on the full interactive
 pool. Mirrors ``test_vector_memory_bulk_pacing.py`` for the knowledge corpus.
+
+The same attendance split applies to per-item ingestion: scheduled folder and
+single-file re-ingest use the bulk class, while direct/manual ingestion retains
+the normal default. Priority stays call-scoped so concurrent paths cannot race.
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from kiro_crew import embeddings as _embeddings
 from kiro_crew.embeddings import PRIORITY_BULK, PRIORITY_NORMAL
 from kiro_crew.knowledge import ingestion
+from kiro_crew.knowledge.chunker import HeadingAwareChunker
 from kiro_crew.knowledge.embedder import InProcessEmbedder
-from kiro_crew.knowledge.ingestion import rebuild_embeddings
+from kiro_crew.knowledge.folder_watcher import FolderWatcher
+from kiro_crew.knowledge.ingestion import IngestionPipeline, rebuild_embeddings
+from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.store import KnowledgeStore
+from kiro_crew.knowledge.watcher import KnowledgeWatcher
 
 # One sentinel delay for the whole file: every test that arms pacing stubs
 # ``bulk_pace_delay`` to return exactly this value, and the recorders below
@@ -96,6 +105,47 @@ def _stale_items(store, n):
     for i in range(n):
         store.add_item(f"stale row {i}", f"body {i}", "document")
     store.db.commit()
+
+
+@pytest.mark.asyncio
+class TestPerItemPriority:
+    @pytest.mark.parametrize(
+        ("priority", "expected"),
+        [(None, PRIORITY_NORMAL), (PRIORITY_BULK, PRIORITY_BULK)],
+    )
+    async def test_priority_reaches_the_shared_backend(
+        self, store, embedder, backend, tmp_path, priority, expected
+    ):
+        class _Extractor:
+            _pool = None
+
+            async def extract_batch(self, chunks):
+                return [
+                    {
+                        "category": "document",
+                        "summary": "summary",
+                        "entities": [],
+                        "relations": [],
+                    }
+                    for _chunk in chunks
+                ]
+
+        pipeline = IngestionPipeline(
+            store,
+            _Extractor(),
+            HeadingAwareChunker(),
+            FileReader(),
+            embedder=embedder,
+        )
+        document = tmp_path / "priority.md"
+        document.write_text("# Priority\n\nBody", encoding="utf-8")
+
+        if priority is None:
+            await pipeline.ingest_file(str(document))
+        else:
+            await pipeline.ingest_file(str(document), embed_priority=priority)
+
+        assert backend.priorities == [expected]
 
 
 @pytest.mark.asyncio
@@ -208,8 +258,6 @@ class TestCallerWiring:
     async def test_watcher_self_heal_sweep_is_paced_on_the_bulk_class(
         self, store, embedder, backend, sleeps, monkeypatch
     ):
-        from kiro_crew.knowledge.watcher import KnowledgeWatcher
-
         monkeypatch.setattr(ingestion, "bulk_pace_delay", lambda elapsed: _PACE)
         _stale_items(store, 2)
 
@@ -226,6 +274,70 @@ class TestCallerWiring:
 
         assert sleeps == [_PACE, _PACE]
         assert backend.priorities == [PRIORITY_BULK, PRIORITY_BULK]
+
+    async def test_scheduled_source_reingest_uses_the_bulk_class(self, store, tmp_path):
+        folder = tmp_path / "folder"
+        folder.mkdir()
+        doc = tmp_path / "changed.md"
+        doc.write_text("# changed", encoding="utf-8")
+        folder_id = await asyncio.to_thread(store.add_source, "folder", "local_folder", str(folder))
+        file_id = await asyncio.to_thread(
+            store.add_source,
+            "changed.md",
+            "local_file",
+            str(doc),
+            properties={"mtime": 0, "content_hash": "stale"},
+        )
+        pipeline = MagicMock()
+        pipeline.embedder = None
+        pipeline.ingest_file = AsyncMock(return_value="job")
+        watcher = KnowledgeWatcher(store, pipeline)
+        watcher._folder_watcher.scan_source = AsyncMock(return_value={})
+        watcher._maybe_reembed_stale = AsyncMock()
+        watcher._maybe_dedup_sweep = AsyncMock()
+
+        await watcher._scan()
+
+        folder_call = watcher._folder_watcher.scan_source.await_args
+        assert folder_call.args[0]["id"] == folder_id
+        assert folder_call.kwargs["embed_priority"] == PRIORITY_BULK
+        file_call = pipeline.ingest_file.await_args
+        assert file_call.kwargs["source_id"] == file_id
+        assert file_call.kwargs["embed_priority"] == PRIORITY_BULK
+
+    @pytest.mark.parametrize(
+        ("priority", "expected"),
+        [(None, PRIORITY_NORMAL), (PRIORITY_BULK, PRIORITY_BULK)],
+    )
+    async def test_folder_scan_forwards_per_call_priority(
+        self, store, tmp_path, priority, expected
+    ):
+        folder = tmp_path / "folder"
+        folder.mkdir()
+        (folder / "note.md").write_text("# note", encoding="utf-8")
+        source_id = await asyncio.to_thread(store.add_source, "folder", "local_folder", str(folder))
+        pipeline = MagicMock()
+        pipeline.embedder = None
+
+        async def _ingest(*_args, **kwargs):
+            await asyncio.to_thread(kwargs["on_committed"], [])
+            return "job"
+
+        pipeline.ingest_file = AsyncMock(side_effect=_ingest)
+        folder_watcher = FolderWatcher(store, pipeline)
+        source = {
+            "id": source_id,
+            "uri": str(folder),
+            "source_type": "local_folder",
+            "properties": "{}",
+        }
+
+        if priority is None:
+            await folder_watcher.scan_source(source)
+        else:
+            await folder_watcher.scan_source(source, embed_priority=priority)
+
+        assert pipeline.ingest_file.await_args.kwargs["embed_priority"] == expected
 
     async def test_dashboard_trigger_runs_unpaced_at_the_interactive_class(
         self, store, embedder, backend, sleeps, monkeypatch

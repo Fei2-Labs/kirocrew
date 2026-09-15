@@ -1,15 +1,17 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { Copy, Check, Smartphone, X, ArrowRight } from 'lucide-react'
 import { api } from '../api/client'
 import { Btn } from './ui'
+import { settingsPath } from './settingsPath'
 import { useAppSelector } from '../store'
 import { useDialogFocusTrap } from '../hooks/useDialogFocusTrap'
 import { copyToClipboard } from '../utils/clipboard'
-import { parseErrorCode } from '../utils/errorReport'
+import { findReport, parseErrorCode } from '../utils/errorReport'
 import ErrorBoundary from './ErrorBoundary'
+import ErrorNotice from './ErrorNotice'
 import { getMobileConnectRenderers } from './mobileConnectRenderers'
 
 /** Machine-readable code from a mint error's JSON body (same shape as the
@@ -19,6 +21,30 @@ const linkErrorCode = (error: unknown): string | undefined =>
   typeof error === 'object' && error !== null && 'body' in error
     ? parseErrorCode(typeof error.body === 'string' ? error.body : undefined)
     : undefined
+
+/**
+ * Handler error code → catalog key, for the SECOND consumer of
+ * `api.mobileLoginLink` (the Settings card is the first, and carries the same
+ * map). Both dialogs mint through one handler, so a code that retrying cannot
+ * clear has to name its action in both places or the defect only half moves.
+ *
+ * The two 403s reuse the Settings card's keys rather than duplicating the
+ * sentences into this namespace: the copy is identical, the strings are already
+ * translated in all thirteen catalogs, and a component reading a `pages.*` core
+ * key is the established shape here (`ApprovalModePicker`, `AddJobSplitButton`).
+ * The other two entries stay on this dialog's own keys, whose wording is
+ * dialog-specific.
+ *
+ * Every key is a plain string literal in an `as const` map, not a key assembled
+ * at the call site, so the static key scan can see them — see
+ * `src/i18n/dynamicKeys.test.ts`.
+ */
+const LINK_ERROR_KEYS = {
+  external_origin_unavailable: 'components.mobileConnect.could_not_create_a_link_check_that_an_external_add',
+  governance_denied: 'components.mobileConnect.phone_connection_is_disabled_by_policy_on_this_dep',
+  restricted_session: 'pages.settings.mobileLoginCard.restricted_sessions_cannot_create_a_sign_in_link',
+  caller_session_expired: 'pages.settings.mobileLoginCard.session_expired_sign_in_again_to_create_a_link',
+} as const
 
 /**
  * "Connect your phone" — the sidebar entry's centered dialog (mockup A1).
@@ -49,6 +75,22 @@ export default function MobileConnectModal({
   // The repo's modal keyboard contract: focus-in on mount, focus-restore on
   // close, Tab trapped inside the dialog, Escape dismisses.
   useDialogFocusTrap(dialogRef, onClose)
+  // Dismiss on any pointer-down OUTSIDE the dialog — the backdrop, the main
+  // content, AND the nav rail, which renders ABOVE the backdrop so a click on
+  // empty sidebar space never reaches the backdrop's own handler (the dead zone
+  // this closes). A nav row's own click still fires, so clicking a tab both
+  // dismisses and navigates. Attached from an effect (after mount) so the very
+  // click that opened the dialog — already dispatched before this runs — cannot
+  // immediately close it; capture phase so a child that stops propagation can't
+  // hide the outside click from us.
+  useEffect(() => {
+    const onPointerDown = (e: PointerEvent) => {
+      const dialog = dialogRef.current
+      if (dialog && !dialog.contains(e.target as Node)) onClose()
+    }
+    document.addEventListener('pointerdown', onPointerDown, true)
+    return () => document.removeEventListener('pointerdown', onPointerDown, true)
+  }, [onClose])
 
   const hasQr = kinds.includes('tailnet_qr')
   // Only renderers whose kind this deployment actually offers: the endpoint has
@@ -60,7 +102,6 @@ export default function MobileConnectModal({
     <div
       className="fixed inset-0 z-50 bg-bg/80 backdrop-blur-sm flex items-center justify-center animate-rise"
       role="presentation"
-      onClick={e => { if (e.target === e.currentTarget) onClose() }}
     >
       <div
         ref={dialogRef}
@@ -101,7 +142,7 @@ export default function MobileConnectModal({
         ))}
         {hasQr && <TailnetQrSection onClose={onClose} />}
         {kinds.includes('login_link') && (
-          <LoginLinkSection standalone={!hasQr && editionSections.length === 0} />
+          <LoginLinkSection standalone={!hasQr && editionSections.length === 0} onClose={onClose} />
         )}
       </div>
     </div>
@@ -142,7 +183,7 @@ function TailnetQrSection({ onClose }: { onClose: () => void }) {
   const sessionKey = activeSlot ? `dashboard:${activeSlot}` : undefined
   // Single probe on open (the card's gentle-poll contract): the modal is
   // short-lived, and minting re-validates server-side anyway.
-  const { data: status, isPending: probing, isError: probeFailed, refetch } = useQuery({
+  const { data: status, isPending: probing, isError: probeFailed, error: probeError, refetch } = useQuery({
     queryKey: ['mobile-connect-tailnet-probe'],
     queryFn: () => api.tailnetMobile(),
     staleTime: 30_000,
@@ -157,9 +198,23 @@ function TailnetQrSection({ onClose }: { onClose: () => void }) {
       {probing && (
         <p className="text-[11.5px] text-muted mb-2">{t('components.mobileConnect.checking_remote_access')}</p>
       )}
+      {/* askAgent on everywhere in this modal: it holds no draft (the link
+          input is read-only), and a remote-access probe, a QR mint or a
+          link mint that failed is gateway-side — what the agent can diagnose.
+          Every notice passes onHandoff={onClose}: this modal is a fixed
+          full-screen overlay, so without closing it the hand-off would land
+          on a chat the user cannot see. */}
       {probeFailed && (
         <div className="flex items-center justify-between gap-2 mb-2">
-          <p className="text-[11.5px] text-danger">{t('components.mobileConnect.could_not_check_remote_access')}</p>
+          <ErrorNotice
+            variant="inline"
+            className="text-[11.5px]"
+            message={t('components.mobileConnect.could_not_check_remote_access')}
+            askAgent
+            report={findReport(probeError?.message)}
+            onHandoff={onClose}
+            testId="mobile-connect-probe-error"
+          />
           <Btn onClick={() => refetch()}>{t('components.mobileConnect.try_again')}</Btn>
         </div>
       )}
@@ -189,22 +244,33 @@ function TailnetQrSection({ onClose }: { onClose: () => void }) {
             <CopyBtn value={mintQr.data.url} label={t('components.mobileConnect.copy_link')} onResult={ok => setQrCopyFailed(!ok)} />
           </div>
           {qrCopyFailed && (
-            <p className="text-[11.5px] text-danger w-full" role="alert">
-              {t('components.mobileConnect.copy_failed_select_the_link_and_copy_it_manually')}
-            </p>
+            <ErrorNotice
+              variant="inline"
+              className="text-[11.5px] w-full"
+              message={t('components.mobileConnect.copy_failed_select_the_link_and_copy_it_manually')}
+              askAgent
+              onHandoff={onClose}
+              testId="mobile-connect-qr-copy-error"
+            />
           )}
         </div>
       )}
       {mintQr.isError && (
-        <p className="text-[11.5px] text-danger mb-2" role="alert">
-          {linkErrorCode(mintQr.error) === 'governance_denied'
+        <ErrorNotice
+          variant="inline"
+          className="text-[11.5px] mb-2"
+          message={linkErrorCode(mintQr.error) === 'governance_denied'
             ? t('components.mobileConnect.phone_connection_is_disabled_by_policy_on_this_dep')
             : t('components.mobileConnect.could_not_generate_a_code_try_again')}
-        </p>
+          askAgent
+          report={findReport(mintQr.error?.message)}
+          onHandoff={onClose}
+          testId="mobile-connect-qr-error"
+        />
       )}
       {status && !ready && (
         <button
-          onClick={() => { onClose(); navigate('/settings/overview') }}
+          onClick={() => { onClose(); navigate(settingsPath({ tab: 'overview' })) }}
           className="w-full flex items-center justify-between gap-2 bg-bg-elevated border border-border rounded-lg px-3 py-2.5 mb-2 text-left cursor-pointer hover:bg-bg-hover transition-colors"
         >
           <span className="text-[12px] text-muted">
@@ -236,7 +302,7 @@ function TailnetQrSection({ onClose }: { onClose: () => void }) {
 /** One-time login link for the configured external origin. `standalone` means
  *  the QR section is absent (link-only editions / governance): no divider, and
  *  an intro that does not presuppose a camera alternative. */
-function LoginLinkSection({ standalone }: { standalone: boolean }) {
+function LoginLinkSection({ standalone, onClose }: { standalone: boolean; onClose: () => void }) {
   const { t } = useTranslation()
   // The active slot's key rides the request so the server's restricted-session
   // guard sees the REAL session, not the shared `dashboard:ui` default.
@@ -272,21 +338,38 @@ function LoginLinkSection({ standalone }: { standalone: boolean }) {
         </div>
       )}
       {linkCopyFailed && (
-        <p className="text-[11.5px] text-danger mt-2" role="alert">
-          {t('components.mobileConnect.copy_failed_select_the_link_and_copy_it_manually')}
-        </p>
+        <ErrorNotice
+          variant="inline"
+          className="text-[11.5px] mt-2"
+          message={t('components.mobileConnect.copy_failed_select_the_link_and_copy_it_manually')}
+          askAgent
+          onHandoff={onClose}
+          testId="mobile-connect-link-copy-error"
+        />
       )}
       {createLink.isError && (
-        <p className="text-[11.5px] text-danger mt-2" role="alert">
-          {/* Blame configuration ONLY when the server said so; a policy denial
-              is terminal (retrying cannot succeed); anything else gets a plain
-              retry line so the user does not hunt a config that is fine. */}
-          {linkErrorCode(createLink.error) === 'external_origin_unavailable'
-            ? t('components.mobileConnect.could_not_create_a_link_check_that_an_external_add')
-            : linkErrorCode(createLink.error) === 'governance_denied'
-              ? t('components.mobileConnect.phone_connection_is_disabled_by_policy_on_this_dep')
-              : t('components.mobileConnect.could_not_create_a_link_try_again')}
-        </p>
+        /* Blame configuration ONLY when the server said so; a policy denial
+           and both dead-end 403s are terminal (retrying cannot succeed);
+           anything else gets a plain retry line so the user does not hunt a
+           config that is fine.
+           Hand-off is on: the mint takes no user input, so the only thing this
+           dialog holds is a read-only generated link that re-minting replaces.
+           `report` is resolved from the RAW error message, not the copy below:
+           the journal keys on what `apiFailure` threw, so a lookup by the
+           translated sentence would miss and the hand-off would carry no
+           endpoint, status or backend `code`. */
+        <ErrorNotice
+          variant="inline"
+          askAgent
+          className="text-[11.5px] mt-2"
+          onHandoff={onClose}
+          testId="mobile-connect-link-error"
+          report={findReport(createLink.error?.message)}
+          message={t(
+            LINK_ERROR_KEYS[linkErrorCode(createLink.error) as keyof typeof LINK_ERROR_KEYS] ||
+              'components.mobileConnect.could_not_create_a_link_try_again',
+          )}
+        />
       )}
       {createLink.data && (
         <p className="text-[11.5px] text-muted mt-2">

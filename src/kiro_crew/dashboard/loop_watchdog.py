@@ -228,7 +228,7 @@ class LoopStallWatchdog:
                 self._arm_later(self._exit_after)
             except Exception:  # pragma: no cover - never let petting crash the loop
                 # Cancellation succeeded but no replacement timer exists.  The
-                # soft watchdog must now write the discoverable file as well as
+                # soft watchdog must write the discoverable file as well as
                 # stderr; leaving this true would silently lose both the hard
                 # exit and its crash artifact on the next stall.
                 self._later_active = False

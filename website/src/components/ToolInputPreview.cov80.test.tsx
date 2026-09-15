@@ -30,4 +30,21 @@ describe('ToolInputPreview', () => {
     render(<ToolInputPreview toolInput={'z'.repeat(10)} threshold={10} />)
     expect(screen.queryByRole('button')).not.toBeInTheDocument()
   })
+
+  it('exposes disclosure semantics linking the toggle to the <pre> it controls', () => {
+    render(<ToolInputPreview toolInput={'z'.repeat(30)} threshold={10} />)
+    const expand = screen.getByRole('button', { name: /show full command/i })
+    // Collapsed: aria-expanded=false and aria-controls points at the <pre> id.
+    expect(expand).toHaveAttribute('aria-expanded', 'false')
+    const controlled = expand.getAttribute('aria-controls')
+    expect(controlled).toBeTruthy()
+    expect(document.querySelector('pre')!.id).toBe(controlled)
+
+    fireEvent.click(expand)
+    const collapse = screen.getByRole('button', { name: /collapse/i })
+    // Expanded: aria-expanded=true, still controlling the same region id.
+    expect(collapse).toHaveAttribute('aria-expanded', 'true')
+    expect(collapse).toHaveAttribute('aria-controls', controlled!)
+    expect(document.querySelector('pre')!.id).toBe(controlled)
+  })
 })

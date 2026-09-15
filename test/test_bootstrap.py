@@ -118,7 +118,7 @@ def test_self_heal_refuses_outside_source_checkout(monkeypatch):
 
 
 def test_self_heal_runs_on_windows_through_the_dependency_only_path(monkeypatch, tmp_path):
-    """Windows heals now. It used to be the one platform that never did.
+    """Windows heals through the dependency-only path.
 
     The blanket skip was there because pip cannot replace the running
     ``kirocrew.exe`` — but a dependency install never touches that wrapper, and a
@@ -174,18 +174,28 @@ def test_retry_invalidates_import_caches(monkeypatch):
 
 
 def test_self_heal_runs_fixed_pip_argv(monkeypatch, tmp_path):
-    """Where pip CAN rewrite the script, the heal is still the full reinstall."""
+    """A full reinstall heals dependencies and satisfies its artifact contract."""
     from kiro_crew import dep_sync
 
-    monkeypatch.setattr(_bootstrap.sys, "platform", "linux")  # POSIX heal path
+    monkeypatch.setattr(_bootstrap.sys, "platform", "linux")
     monkeypatch.setattr(_bootstrap, "_source_checkout_root", lambda: tmp_path)
     _venv_maps(monkeypatch)
     monkeypatch.setattr(dep_sync, "locked_console_scripts", lambda target: [])
+    script = tmp_path / "venv" / "bin" / "kirocrew"
+    monkeypatch.setattr(dep_sync, "console_script_path", lambda target: script)
     seen: dict = {}
 
     def _fake_run(argv, **kwargs):
-        seen["argv"] = argv
-        seen["timeout"] = kwargs.get("timeout")
+        if argv[1:3] == ["-m", "pip"]:
+            seen["argv"] = argv
+            seen["timeout"] = kwargs.get("timeout")
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/bin/sh\n")
+            script.chmod(0o755)
+        # This build adds -B to every isolated (-I) spawn: the pycache prefix cannot
+        # reach such a child (test_build_desktop_launcher_symlink pins the policy).
+        elif argv[1:] == ["-I", "-B", "-X", "utf8", "-c", "import kiro_crew"]:
+            seen["import_checked"] = True
 
         class _P:
             returncode = 0
@@ -198,6 +208,7 @@ def test_self_heal_runs_fixed_pip_argv(monkeypatch, tmp_path):
     assert _bootstrap._self_heal("defusedxml") is True
     assert seen["argv"][1:] == ["-m", "pip", "install", "-e", str(tmp_path), "--quiet"]
     assert seen["timeout"] == _bootstrap._PIP_TIMEOUT_SECS
+    assert seen["import_checked"] is True
 
 
 def test_self_heal_reports_pip_failure(monkeypatch, tmp_path):

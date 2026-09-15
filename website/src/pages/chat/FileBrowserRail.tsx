@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { Files, Diff, Search, X, RefreshCw } from 'lucide-react'
 import { api } from '../../api/client'
+import ErrorNotice from '../../components/ErrorNotice'
 import { cn } from '../../lib/utils'
 import { useColumnResize } from '../../hooks/useColumnResize'
 import { PierreWorkspaceTree } from '../../pierre/tree'
@@ -17,6 +18,30 @@ const RAIL_W_KEY = 'mc-files-rail-w'
  *  changes — and the mode must survive that, while a fresh page load still
  *  defaults to All files. */
 let sessionChangedMode = false
+
+/** Filter text for the current page session, keyed by project directory.
+ *  Module-level like `sessionChangedMode` (and deliberately NOT localStorage:
+ *  a filter is session-scoped intent, and a stale filter surviving a page
+ *  reload would hide the tree with no visible reason): in-place tab
+ *  navigation remounts the rail and the typed filter must survive that. */
+const sessionQuery = new Map<string, string>()
+
+/** Cap on remembered project entries, mirroring the expansion memory's dir
+ *  cap: delete-then-set keeps insertion order least-recently-written-first,
+ *  so a long-lived tab drops the stalest project's filter, not the newest. */
+const MAX_SESSION_QUERY_DIRS = 20
+function rememberQuery(projectDir: string, value: string): void {
+  sessionQuery.delete(projectDir)
+  // An empty filter is indistinguishable from no entry: storing it would
+  // occupy an LRU slot (evicting some other project's live filter) for
+  // nothing, so clearing removes the entry outright.
+  if (value === '') return
+  sessionQuery.set(projectDir, value)
+  for (const k of sessionQuery.keys()) {
+    if (sessionQuery.size <= MAX_SESSION_QUERY_DIRS) break
+    sessionQuery.delete(k)
+  }
+}
 
 /** Whether the tree APIs answer for this directory. Shares the tree
  *  component's query key, so the probe costs no extra request. */
@@ -71,9 +96,22 @@ export default function FileBrowserRail({ projectDir, onFileOpen, onAddToContext
     sessionChangedMode = v
     _setChangedMode(v)
   }
-  const [query, setQuery] = useState('')
+  const [query, _setQuery] = useState(() => sessionQuery.get(projectDir) ?? '')
+  // Rehydrate on an in-place projectDir change (React's adjust-state-on-prop
+  // pattern, synchronous before paint): `useState` reads the map only on the
+  // first mount, and without this a new project would inherit — and then
+  // store under its own key — the previous project's filter.
+  const [queryDir, setQueryDir] = useState(projectDir)
+  if (queryDir !== projectDir) {
+    setQueryDir(projectDir)
+    _setQuery(sessionQuery.get(projectDir) ?? '')
+  }
+  const setQuery = (v: string) => {
+    rememberQuery(projectDir, v)
+    _setQuery(v)
+  }
 
-  const { data: status } = useQuery({
+  const { data: status, isError: statusError } = useQuery({
     queryKey: ['git-status', projectDir],
     queryFn: () => api.projectGitStatus(projectDir),
     enabled: !!projectDir,
@@ -187,14 +225,20 @@ export default function FileBrowserRail({ projectDir, onFileOpen, onAddToContext
             <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />
           </button>
         </div>
+        {/* A failed status read used to make the Changed count silently read 0.
+            Its own row under the header (the 40px header is full). File rail,
+            no draft → hand-off on. */}
+        {statusError && (
+          <div className="px-2 pt-1.5 shrink-0">
+            <ErrorNotice variant="inline" message={t('pages.chat.fileBrowserRail.git_status_failed')} askAgent />
+          </div>
+        )}
         <div className="flex-1 min-h-0 flex flex-col py-1.5 pl-1">
           <PierreWorkspaceTree
             mode={changedMode ? 'changed' : 'all'}
             projectDir={projectDir}
-            onFileOpen={(abs) => {
-              setQuery('')
-              onFileOpen(abs, changedMode)
-            }}
+            persistExpansion
+            onFileOpen={(abs) => onFileOpen(abs, changedMode)}
             onAddToContext={onAddToContext}
             searchQuery={query || null}
             selectedPath={selectedPath ?? null}

@@ -66,6 +66,18 @@ def _state_with_slot(tmp_path, name: str = NAME):
     return state
 
 
+def test_slot_owns_its_close_admission_fence(tmp_path) -> None:
+    slot = _state_with_slot(tmp_path).get_slot(NAME)
+    assert slot is not None
+    assert slot.is_closing is False
+
+    slot.begin_close()
+    assert slot.is_closing is True
+
+    slot.cancel_close()
+    assert slot.is_closing is False
+
+
 async def _service(tmp_path, monkeypatch, on_fire=None) -> AutoNudgeService:
     """A real AutoNudgeService registered as the process-wide instance.
 
@@ -125,25 +137,61 @@ async def test_nudge_expiring_during_the_persist_cannot_resurrect(tmp_path, monk
 async def test_loop_is_retired_before_the_persist_begins(tmp_path, monkeypatch) -> None:
     """Order, not end state: the retirement must precede the closure persist."""
     state = _state_with_slot(tmp_path)
+    slot = state._slots[NAME]
     svc = await _service(tmp_path, monkeypatch)
     await svc.add(NAME, "check the PR", idle_secs=15)
 
     order: list[str] = []
     svc.subscribe(lambda event, _lp: order.append(f"loop:{event}"))
+    original_retire = handlers._retire_slot_nudge_loop
+
+    async def _retire(slot_key: str):
+        assert slot.is_closing is True
+        return await original_retire(slot_key)
 
     async def _persist(*_a, **_kw) -> None:
         order.append("persist")
+        assert slot.is_closing is True
 
+    monkeypatch.setattr(handlers, "_retire_slot_nudge_loop", _retire)
     monkeypatch.setattr(handlers, "save_slot_off_loop", _persist)
     state.sessions.remove = AsyncMock(side_effect=lambda *_a: order.append("session_teardown"))
 
     resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
 
     assert resp.status == 200
-    assert order == ["loop:removed", "persist", "session_teardown"], (
-        "the loop must be gone before the closure is persisted, not after"
-    )
+    assert order == [
+        "loop:removed",
+        "persist",
+        "session_teardown",
+    ], "the loop must be gone before the closure is persisted, not after"
     svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_releases_the_live_slot_admission_fence(
+    tmp_path, monkeypatch
+) -> None:
+    state = _state_with_slot(tmp_path)
+    slot = state._slots[NAME]
+    entered = asyncio.Event()
+    parked = asyncio.Event()
+
+    async def _retire(_slot_key: str):
+        entered.set()
+        await parked.wait()
+
+    monkeypatch.setattr(handlers, "_retire_slot_nudge_loop", _retire)
+    close = asyncio.create_task(handlers.close_slot(state, slot, NAME))
+    await entered.wait()
+    assert slot.is_closing is True
+
+    close.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close
+
+    assert state.get_slot(NAME) is slot
+    assert slot.is_closing is False
 
 
 @pytest.mark.asyncio
@@ -162,9 +210,9 @@ async def test_close_with_no_armed_loop_is_unaffected(tmp_path, monkeypatch) -> 
     saved = state.conversation_log.read_messages(f"dashboard:{NAME}")
     assert [m["role"] for m in saved] == ["user", "assistant"]
     survivor = svc.get_by_slot("chat-2-9999")
-    assert survivor is not None and survivor.id == other.id, (
-        "closing one tab retired another tab's loop"
-    )
+    assert (
+        survivor is not None and survivor.id == other.id
+    ), "closing one tab retired another tab's loop"
     svc.stop()
 
 
@@ -185,17 +233,22 @@ async def test_close_with_no_nudge_service_still_closes(tmp_path, monkeypatch) -
 async def test_failed_persist_gives_the_session_its_clock_back(tmp_path, monkeypatch) -> None:
     """A close that cannot persist must not silently retire the babysit loop."""
     state = _state_with_slot(tmp_path)
+    slot = state._slots[NAME]
     svc = await _service(tmp_path, monkeypatch)
-    loop = await svc.add(
-        NAME, "check the PR", idle_secs=300, max_cycles=24, max_runtime_secs=3600
-    )
+    loop = await svc.add(NAME, "check the PR", idle_secs=300, max_cycles=24, max_runtime_secs=3600)
     loop.cycle_count = 3
     loop.created_ts = time.time() - 600
+    original_restore = handlers._restore_slot_nudge_loop
 
     async def _persist(*_a, **_kw) -> None:
         raise RuntimeError("disk wedged")
 
+    async def _restore(retired_loop, admission_check) -> None:
+        assert slot.is_closing is True, "monitor admission reopened before rollback completed"
+        await original_restore(retired_loop, admission_check)
+
     monkeypatch.setattr(handlers, "save_slot_off_loop", _persist)
+    monkeypatch.setattr(handlers, "_restore_slot_nudge_loop", _restore)
 
     resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
 
@@ -205,6 +258,7 @@ async def test_failed_persist_gives_the_session_its_clock_back(tmp_path, monkeyp
     assert replacement is not None, "the restored session was left with no clock"
     assert replacement.message == "check the PR"
     assert replacement.idle_secs == 300
+    assert state._slots[NAME].is_closing is False
     # Remaining budget, never a fresh one: 3 cycles and 600s are already spent.
     assert replacement.max_cycles == 21
     assert 2900 < replacement.max_runtime_secs <= 3000
@@ -325,9 +379,11 @@ async def test_an_app_that_cannot_be_told_aborts_the_close(tmp_path, monkeypatch
     operational, which is a state the user can see and retry.
     """
     state = _state_with_slot(tmp_path)
-    state._slots[NAME]._app = "issue-radar"
+    slot = state._slots[NAME]
+    slot._app = "issue-radar"
     svc = await _service(tmp_path, monkeypatch)
     await svc.add(NAME, "check the PR", idle_secs=300, max_cycles=24)
+    original_restore = handlers._restore_slot_nudge_loop
 
     saved: list[bool] = []
 
@@ -337,8 +393,13 @@ async def test_an_app_that_cannot_be_told_aborts_the_close(tmp_path, monkeypatch
     async def _hook_fails(_app: str, _slot_key: str) -> bool:
         return False
 
+    async def _restore(retired_loop, admission_check) -> None:
+        assert slot.is_closing is True, "monitor admission reopened before rollback completed"
+        await original_restore(retired_loop, admission_check)
+
     monkeypatch.setattr(handlers, "save_slot_off_loop", _persist)
     monkeypatch.setattr("kiro_crew.apps.teardown.notify_slot_closed", _hook_fails)
+    monkeypatch.setattr(handlers, "_restore_slot_nudge_loop", _restore)
 
     resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
 
@@ -436,9 +497,7 @@ async def test_app_close_waits_for_a_queued_direct_arm(tmp_path, monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_app_close_retires_the_latest_queued_arm_generation(
-    tmp_path, monkeypatch
-) -> None:
+async def test_app_close_retires_the_latest_queued_arm_generation(tmp_path, monkeypatch) -> None:
     state = _state_with_slot(tmp_path)
     state._slots[NAME]._app = "issue-radar"
     svc = await _service(tmp_path, monkeypatch)
@@ -505,9 +564,7 @@ async def test_issue_radar_arm_queued_behind_final_retirement_is_refused(
         return True
 
     monkeypatch.setattr("kiro_crew.apps.teardown.notify_slot_closed", _hook)
-    monkeypatch.setattr(
-        crew_runtime, "ensure_crew_session", AsyncMock(return_value=slot)
-    )
+    monkeypatch.setattr(crew_runtime, "ensure_crew_session", AsyncMock(return_value=slot))
     monkeypatch.setattr(
         crew_runtime,
         "compose_turn_prompt_async",
@@ -621,4 +678,82 @@ async def test_failed_persist_does_not_revive_a_paused_loop(tmp_path, monkeypatc
 
     assert resp.status == 500
     assert svc.get_by_slot(NAME) is None, "a paused loop was resumed by a failed close"
+    svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_persist_gives_the_session_its_banner_back(tmp_path, monkeypatch) -> None:
+    """The replacement must carry the configured banner, not a blank one.
+
+    ``add()`` defaults ``banner`` to ``""``, so omitting it here fails SILENTLY:
+    the restored loop keeps running, and only its transcript rows change —
+    reverting to the full multi-KB message on every cycle, which is the exact
+    harm the banner exists to remove. Nothing raises, nothing logs, and the
+    empty value is then PERSISTED, so a single failed close discards the setting
+    permanently.
+
+    The budget assertions are deliberately in this same test rather than only in
+    the sibling above. Threading one more field through this call must not
+    disturb the remaining-budget arithmetic that is the whole reason this
+    function reconstructs the loop by hand — so an over-broad "just replay the
+    loop object" fix, which would hand back a FRESH 24 cycles and 3600s, fails
+    here instead of passing.
+    """
+    state = _state_with_slot(tmp_path)
+    svc = await _service(tmp_path, monkeypatch)
+    loop = await svc.add(
+        NAME,
+        "check the PR",
+        idle_secs=300,
+        max_cycles=24,
+        max_runtime_secs=3600,
+        banner="watching CI",
+    )
+    loop.cycle_count = 3
+    loop.created_ts = time.time() - 600
+
+    async def _persist(*_a, **_kw) -> None:
+        raise RuntimeError("disk wedged")
+
+    monkeypatch.setattr(handlers, "save_slot_off_loop", _persist)
+
+    resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
+
+    assert resp.status == 500
+    replacement = svc.get_by_slot(NAME)
+    assert replacement is not None, "the restored session was left with no clock"
+    assert replacement.banner == "watching CI", "the restore discarded the configured banner"
+    # NEGATIVE CONTROL: the remaining budget is still subtracted, exactly as the
+    # sibling test pins. 3 cycles and 600s are already spent.
+    assert replacement.max_cycles == 21, "threading the banner regressed the cycle budget"
+    assert 2900 < replacement.max_runtime_secs <= 3000, "the runtime budget was reset"
+    svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_banner_loop_whose_cycles_are_spent_is_still_not_restored(
+    tmp_path, monkeypatch
+) -> None:
+    """NEGATIVE CONTROL: a banner must not buy a terminal loop another life.
+
+    The early returns for a spent cycle cap and a spent wall-clock budget are
+    what stop a failed close from granting unattended cycles the user never
+    authorized. Carrying one more field must not move that gate, so this asserts
+    the terminal loop is STILL dropped — a fix that restored unconditionally in
+    order to preserve the banner fails here.
+    """
+    state = _state_with_slot(tmp_path)
+    svc = await _service(tmp_path, monkeypatch)
+    loop = await svc.add(NAME, "check the PR", idle_secs=300, max_cycles=4, banner="watching CI")
+    loop.cycle_count = 4
+
+    async def _persist(*_a, **_kw) -> None:
+        raise RuntimeError("disk wedged")
+
+    monkeypatch.setattr(handlers, "save_slot_off_loop", _persist)
+
+    resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
+
+    assert resp.status == 500
+    assert svc.get_by_slot(NAME) is None, "a spent loop was revived to preserve its banner"
     svc.stop()

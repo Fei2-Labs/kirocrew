@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -12,12 +13,14 @@ import tempfile
 import uuid
 import zipfile
 from datetime import datetime
+from functools import partial
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from aiohttp import web
 
 from kiro_crew._sqlite_compat import fts5_segment_for_index, sqlite3
 from kiro_crew.artifacts import get_default_store
+from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, data_home
 from kiro_crew.dashboard import part_stream
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
@@ -45,14 +48,16 @@ from kiro_crew.knowledge.folder_watcher import (
     walk_filters,
 )
 from kiro_crew.knowledge.ingestion import (
+    ImportChunkBudgetError,
     IngestionPipeline,
     _redact,
+    handoff_gate_context,
     rebuild_embeddings,
     start_rebuild_job,
 )
 from kiro_crew.knowledge.llm_pool import DEFAULT_EXTRACTION_EFFORT, LLMPool
 from kiro_crew.knowledge.readers import FileReader
-from kiro_crew.knowledge.retrieval import HybridRetriever
+from kiro_crew.knowledge.retrieval import HybridRetriever, vector_leg
 from kiro_crew.knowledge.spend import source_spend
 from kiro_crew.knowledge.store import (
     AUTO_REGISTRATION_RETIRED_PROP,
@@ -77,6 +82,30 @@ def _sel_log(tool: str, **kwargs: object) -> None:
         tool_name=f"knowledge.{tool}", outcome=str(kwargs.pop("outcome", "completed")),
         resources=str(kwargs) if kwargs else "",
     )
+
+
+async def _audited_write(fn, *, event: str, fields=None):
+    """Run a store write and its audit line in ONE worker take.
+
+    A client disconnect cancels the handler at its ``await``, so an audit line
+    written after the worker returned is dropped for a mutation that already
+    committed. Emitting it inside the worker closes that window: the thread runs
+    to completion regardless of the coroutine's fate, and SEL writes are
+    lock-guarded, so writing from a worker is safe. ``delete_item`` and
+    ``import_bundle`` use the same shape inline.
+
+    *fn* is the whole call (bind arguments with ``functools.partial``) and
+    *fields* is the audit payload. A record naming something the write produced,
+    such as a new source id, does not fit that shape: those callers audit from
+    their own sync helper instead (``_create_source_audited``). Returns whatever
+    *fn* returned.
+    """
+    def _write_and_audit():
+        result = fn()
+        _sel_log(event, **(fields or {}))
+        return result
+
+    return await asyncio.to_thread(_write_and_audit)
 
 
 _BUNDLE_LIST_FIELDS = ("items", "entities", "relations", "sources", "source_locations", "mentions")
@@ -171,12 +200,22 @@ def _create_embedder(app):
 # ---------- Namespaces ----------
 
 
+def _namespace_rows(store) -> list:
+    """Namespace item counts, in one off-loop take.
+
+    Sync on purpose: this is a full GROUP BY over ``items``, which grows without
+    bound, and the Library polls it. The caller dispatches this to a worker
+    thread; ``store.db`` is thread-local, so the thread gets its own connection.
+    """
+    return store.db.execute(
+        "SELECT namespace, COUNT(*) as count FROM items WHERE status = 'active' GROUP BY namespace ORDER BY count DESC"
+    ).fetchall()
+
+
 async def list_namespaces(request: web.Request) -> web.Response:
     """GET /api/knowledge/namespaces -- all namespaces with item counts."""
     store = _store(request)
-    rows = store.db.execute(
-        "SELECT namespace, COUNT(*) as count FROM items WHERE status = 'active' GROUP BY namespace ORDER BY count DESC"
-    ).fetchall()
+    rows = await asyncio.to_thread(_namespace_rows, store)
     return web.json_response([{"name": r["namespace"] or "default", "count": r["count"]} for r in rows])
 
 
@@ -196,7 +235,7 @@ async def _start_watcher_async(app: web.Application) -> None:
     app["_knowledge_watcher_task"] = task
 
 
-async def _start_artifact_ingest_async(app: web.Application) -> None:
+async def _start_artifact_ingest_async(app: web.Application, cfg: KiroCrewConfig | None = None) -> None:
     """Wire artifact -> Knowledge Library sync when auto-ingest is enabled.
 
     Registers an in-process change-listener on the artifact store: every
@@ -209,8 +248,13 @@ async def _start_artifact_ingest_async(app: web.Application) -> None:
     window in which this was switched off is repaired rather than left permanent.
     Gated on ``knowledge.auto_ingest_artifacts`` (off by default). See
     ``kiro_crew.knowledge.artifact_ingest`` for the full design.
+
+    ``cfg`` is the already-loaded config when the live applier calls this with
+    the document the watcher just adopted; boot passes nothing and the load runs
+    off the loop, because ``KiroCrewConfig.load()`` is filesystem work.
     """
-    cfg = KiroCrewConfig.load()
+    if cfg is None:
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
     if not cfg.knowledge.auto_ingest_artifacts:
         return
     pipeline = app["knowledge_pipeline"]
@@ -226,6 +270,84 @@ async def _start_artifact_ingest_async(app: web.Application) -> None:
     # Hold a reference so the listener binding isn't garbage-collected.
     app["artifact_knowledge_sync"] = sync
     await sync.start()
+
+
+async def _stop_artifact_ingest(app: web.Application) -> None:
+    """Unregister the artifact->Library listener and drop the sync object.
+
+    Detaching the listener is what actually stops the ingest: with it gone, an
+    artifact write does not reach the pipeline. Existing Library items are
+    LEFT in place -- turning auto-ingest off asks for no new ingests, not for a
+    retroactive delete of documents already searchable -- and a later re-enable
+    repairs the gap through the reconcile pass in
+    :func:`_start_artifact_ingest_async`.
+    """
+    sync = app.pop("artifact_knowledge_sync", None)
+    if sync is None:
+        return
+    try:
+        get_default_store().set_change_listener(None)
+    except Exception:
+        logger.warning("artifact auto-ingest: listener detach failed", exc_info=True)
+
+
+async def _apply_knowledge_config(app: web.Application, change: object) -> None:
+    """Apply a live ``knowledge.*`` change to the running ingest stack.
+
+    Three independent effects, each guarded so one failure cannot block the
+    others:
+
+    * ``embed_timeout_secs`` / ``embed_content_budget`` -- rebuild the embedder
+      and swap it into both the app key and the pipeline. The embedder holds no
+      connection, so a swap is a plain object replacement; an embed already in
+      flight finishes against the old one.
+    * ``auto_ingest_artifacts`` -- register or unregister the artifact listener,
+      so the toggle takes effect on the next artifact write.
+    * ``auto_ingest_artifact_kinds`` -- replace the kinds set on the live sync
+      object, which is the only thing the change gates.
+    """
+    new = getattr(change, "new")
+    touched = getattr(change, "touched")
+    if touched("knowledge.embed_timeout_secs", "knowledge.embed_content_budget"):
+        try:
+            embedder = await asyncio.to_thread(_create_embedder, app)
+            app["knowledge_embedder"] = embedder
+            pipeline = app.get("knowledge_pipeline")
+            if pipeline is not None:
+                pipeline.embedder = embedder
+        except Exception:
+            logger.warning("knowledge embedder rebuild failed; keeping the old one", exc_info=True)
+    if touched("knowledge.auto_ingest_artifacts"):
+        try:
+            if new.knowledge.auto_ingest_artifacts:
+                if app.get("artifact_knowledge_sync") is None:
+                    await _start_artifact_ingest_async(app, new)
+            else:
+                await _stop_artifact_ingest(app)
+        except Exception:
+            logger.warning("knowledge artifact auto-ingest rewire failed", exc_info=True)
+    if touched("knowledge.auto_ingest_artifact_kinds"):
+        sync = app.get("artifact_knowledge_sync")
+        if sync is not None:
+            sync.kinds = set(new.knowledge.auto_ingest_artifact_kinds)
+
+
+async def _watch_knowledge_config(app: web.Application) -> None:
+    """Register the knowledge appliers once the loop is running.
+
+    An ``on_startup`` hook rather than a call from ``setup_knowledge_routes``,
+    because the applier needs a running loop to re-register the artifact listener
+    and the subscription must outlive the setup call. The Subscription is held on
+    ``app`` so the watcher's weak reference to the bound closure stays alive for
+    the app's lifetime.
+    """
+
+    async def _applier(change: object) -> None:
+        await _apply_knowledge_config(app, change)
+
+    app["_knowledge_config_sub"] = live.subscribe(
+        "knowledge", callback=_applier, name="knowledge-routes"
+    )
 
 
 # ---------- Items ----------
@@ -343,6 +465,29 @@ def _load_items_by_id(store, item_ids: list[str]) -> dict[str, dict]:
     return out
 
 
+def _items_page(store, where_clause: str, params: list,
+                limit: int, offset: int) -> tuple[int, list[dict]]:
+    """One page of the item listing, with its total, in one off-loop take.
+
+    Sync on purpose: the COUNT is a full scan over ``items``, which grows
+    without bound, and ``_attach_file_paths`` adds two more queries plus the row
+    serialization. The total and the page are separate reads on an autocommit
+    connection, so a concurrent insert can make the total disagree with the rows
+    by one page-worth; one take removes the suspensions between them, not the
+    disagreement. The caller dispatches this to a worker thread; ``store.db``
+    is thread-local, so the thread gets its own connection.
+    """
+    total = store.db.execute(
+        f"SELECT COUNT(*) FROM items i WHERE {where_clause}",  # noqa: S608
+        params).fetchone()[0]
+    rows = store.db.execute(
+        f"SELECT i.* FROM items i LEFT JOIN sources s ON i.source_id = s.id WHERE {where_clause} ORDER BY s.updated_at DESC, i.chunk_index ASC LIMIT ? OFFSET ?",  # noqa: S608, E501
+        [*params, limit, offset]).fetchall()
+    items = [store._serialize_item(r) for r in rows]
+    _attach_file_paths(store, items)
+    return total, items
+
+
 async def list_items(request: web.Request) -> web.Response:
     """GET /api/knowledge/items -- list/search with pagination."""
     store = _store(request)
@@ -362,13 +507,14 @@ async def list_items(request: web.Request) -> web.Response:
 
     if q:
         # Use hybrid search: FTS5 keyword + graph traversal + optional vector + RRF fusion.
-        # The availability probe and retriever.search (blocking query embed to
-        # Ollama) both do synchronous network I/O — run off-loop, mirroring
+        # The availability probe and retriever.search (its blocking query embed)
+        # both occupy the shared in-process model — run off-loop, mirroring
         # search_for_context below.
         embedder = request.app.get("knowledge_embedder")
-        embed_fn = embedder.embed if embedder and await embedder.is_available_async() else None
-        retriever = HybridRetriever(store, embedder=embed_fn)
-        # mc-embed bulkhead: the search's query embed blocks on Ollama.
+        available = bool(embedder) and await embedder.is_available_async()
+        embed_fn, embed_sig = vector_leg(embedder if available else None)
+        retriever = HybridRetriever(store, embedder=embed_fn, embed_sig=embed_sig)
+        # mc-embed bulkhead: the search's query embed blocks on the shared model.
         # The retriever ranks globally, so post-retrieval filtering can discard
         # an unbounded share of any fixed window: if enough higher-ranked hits
         # belong to other sources, a scoped search would report zero matches and
@@ -408,7 +554,7 @@ async def list_items(request: web.Request) -> web.Response:
         total = len(filtered)
         offset = (page - 1) * limit
         items = filtered[offset:offset + limit]
-        _attach_file_paths(store, items)
+        await asyncio.to_thread(_attach_file_paths, store, items)
         return web.json_response({"items": items, "total": total, "page": page, "limit": limit})
     else:
         where, params = ["1=1"], []  # type: list[str], list[object]
@@ -427,25 +573,26 @@ async def list_items(request: web.Request) -> web.Response:
             where.append("i.source_id = ?")
             params.append(source_id)
         where_clause = ' AND '.join(where)
-        total = store.db.execute(
-            f"SELECT COUNT(*) FROM items i WHERE {where_clause}",  # noqa: S608
-            params).fetchone()[0]
         offset = (page - 1) * limit
-        rows = store.db.execute(
-            f"SELECT i.* FROM items i LEFT JOIN sources s ON i.source_id = s.id WHERE {where_clause} ORDER BY s.updated_at DESC, i.chunk_index ASC LIMIT ? OFFSET ?",  # noqa: S608, E501
-            [*params, limit, offset]).fetchall()
-        items = [store._serialize_item(r) for r in rows]
-        _attach_file_paths(store, items)
+        total, items = await asyncio.to_thread(
+            _items_page, store, where_clause, params, limit, offset)
         return web.json_response({"items": items, "total": total, "page": page, "limit": limit})
 
 
-async def get_item(request: web.Request) -> web.Response:
-    """GET /api/knowledge/items/{id} -- single item with entities, relations, source_locations."""
-    store = _store(request)
-    item_id = request.match_info["id"]
+def _item_detail(store, item_id: str) -> dict | None:
+    """One item with its entities, relations and locations, in one off-loop take.
+
+    ``None`` when the item is absent, which is how the handler answers 404.
+
+    Sync on purpose: the queries fan out per mentioned entity -- one lookup each,
+    plus two name lookups per relation -- so a contended connection multiplies
+    its busy wait by the item's entity count. The caller dispatches this to a
+    worker thread; ``store.db`` is thread-local, so the thread gets its own
+    connection.
+    """
     item = store.get_item(item_id)
     if not item:
-        return web.json_response({"error": "not found"}, status=404)
+        return None
 
     mentions = store.db.execute("SELECT entity_id, context FROM mentions WHERE item_id = ?", (item_id,)).fetchall()
     entity_ids = [m["entity_id"] for m in mentions]
@@ -473,14 +620,23 @@ async def get_item(request: web.Request) -> web.Response:
     locations = [dict(r) for r in store.db.execute(
         "SELECT * FROM source_locations WHERE item_id = ?", (item_id,))]
 
-    return web.json_response({**item, "entities": entities, "relations": relations, "source_locations": locations})
+    return {**item, "entities": entities, "relations": relations, "source_locations": locations}
+
+
+async def get_item(request: web.Request) -> web.Response:
+    """GET /api/knowledge/items/{id} -- single item with entities, relations, source_locations."""
+    store = _store(request)
+    detail = await asyncio.to_thread(_item_detail, store, request.match_info["id"])
+    if detail is None:
+        return web.json_response({"error": "not found"}, status=404)
+    return web.json_response(detail)
 
 
 async def update_item(request: web.Request) -> web.Response:
     """PATCH /api/knowledge/items/{id} -- update fields."""
     store = _store(request)
     item_id = request.match_info["id"]
-    if not store.get_item(item_id):
+    if not await asyncio.to_thread(store.get_item, item_id):
         return web.json_response({"error": "not found"}, status=404)
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
@@ -490,8 +646,9 @@ async def update_item(request: web.Request) -> web.Response:
     fields = {k: v for k, v in body.items() if k in allowed}
     if not fields:
         return web.json_response({"error": "no valid fields"}, status=400)
-    store.update_item(item_id, **fields)
-    _sel_log("item.update", item_id=item_id, fields=list(fields))
+    await _audited_write(
+        partial(store.update_item, item_id, **fields),
+        event="item.update", fields={"item_id": item_id, "fields": list(fields)})
     return web.json_response({"ok": True})
 
 
@@ -499,29 +656,54 @@ async def delete_item(request: web.Request) -> web.Response:
     """DELETE /api/knowledge/items/{id}."""
     store = _store(request)
     item_id = request.match_info["id"]
-    item = store.get_item(item_id)
+    item = await asyncio.to_thread(store.get_item, item_id)
     if not item:
         return web.json_response({"error": "not found"}, status=404)
-    store.delete_item(item_id)
+
+    # BEGIN IMMEDIATE takes the write lock eagerly (busy_timeout 10s, so a
+    # concurrent writer can park this call for that long) and the commit is
+    # followed by _load_graph(), a full scan of entities and entity_relations
+    # that grows linearly with the library -- never on the event loop.
+    # The SEL record rides in the same worker as the commit: a client
+    # disconnect cancels this coroutine at the await, and a cancellation
+    # landing after the worker committed must not skip the audit line. The
+    # worker thread runs to completion regardless, and SEL writes are
+    # lock-guarded, so emitting from it is safe.
+    def _delete_and_audit() -> None:
+        store.delete_item(item_id)
+        _sel_log("item.delete", item_id=item_id)
+
+    await asyncio.to_thread(_delete_and_audit)
     # A now-empty source is reclaimed by the store's own orphan rule on the next
     # open, which checks the document-state tables, in-flight jobs and the location
-    # table first. Deleting the row here instead raised on the foreign keys those
-    # tables hold -- after the item delete had already committed -- and dropped a
-    # source that still held documents by location.
-    _sel_log("item.delete", item_id=item_id)
+    # table first. Deleting the row here instead raises on the foreign keys those
+    # tables hold -- after the item delete has already committed -- and drops a
+    # source that still holds documents by location.
     return web.json_response({"ok": True})
 
 
 async def get_item_content(request: web.Request) -> web.Response:
     """GET /api/knowledge/items/{id}/content -- plain text for clipboard."""
     store = _store(request)
-    item = store.get_item(request.match_info["id"])
+    item = await asyncio.to_thread(store.get_item, request.match_info["id"])
     if not item:
         return web.Response(text="not found", status=404)
     return web.Response(text=item["content"], content_type="text/plain")
 
 
 # ---------- Entities ----------
+
+
+def _entity_list_rows(store, where_clause: str, params: list) -> list:
+    """The entity listing, in one off-loop take.
+
+    Sync on purpose: an unanchored ``name LIKE '%q%'`` is a full scan over
+    ``entities``, which grows without bound. The caller dispatches this to a
+    worker thread; ``store.db`` is thread-local, so the thread gets its own
+    connection.
+    """
+    return store.db.execute(
+        f"SELECT * FROM entities WHERE {where_clause} ORDER BY name LIMIT ?", params).fetchall()  # noqa: S608
 
 
 async def list_entities(request: web.Request) -> web.Response:
@@ -542,8 +724,8 @@ async def list_entities(request: web.Request) -> web.Response:
         where.append("name LIKE ?")
         params.append(f"%{q}%")
     params.append(limit)
-    rows = store.db.execute(
-        f"SELECT * FROM entities WHERE {' AND '.join(where)} ORDER BY name LIMIT ?", params).fetchall()  # noqa: S608
+    rows = await asyncio.to_thread(
+        _entity_list_rows, store, ' AND '.join(where), params)
     return web.json_response([dict(r) for r in rows])
 
 
@@ -555,9 +737,20 @@ async def get_entity_graph(request: web.Request) -> web.Response:
         depth = min(5, max(1, int(request.query.get("depth", 2) or 2)))
     except ValueError:
         return web.json_response({"error": "invalid depth"}, status=400)
-    if not store.graph.has_node(entity_id):
+    # Materialise the graph off-loop before touching it. The store defers the
+    # load to its first reader, and every `.graph` read below runs on
+    # the event loop, where the loop-stall watchdog is armed -- so the scan has
+    # to happen on a worker thread, the same way this module already offloads
+    # the store's SQL.
+    await asyncio.to_thread(store.ensure_graph_loaded)
+    # get_entity_subgraph pins one graph reference internally and does the
+    # existence check against it, so the 404 decision and the walk read the SAME
+    # snapshot even if a worker-thread mutation swaps in a rebuilt graph; it
+    # returns None when the entity is absent.
+    result = store.get_entity_subgraph(entity_id, depth)
+    if result is None:
         return web.json_response({"error": "entity not found"}, status=404)
-    return web.json_response(store.get_entity_subgraph(entity_id, depth))
+    return web.json_response(result)
 
 
 async def get_entity_items(request: web.Request) -> web.Response:
@@ -595,20 +788,21 @@ def _entity_items_rows(store, name: str) -> list:
     ).fetchall()
 
 
-async def get_related_items(request: web.Request) -> web.Response:
-    """GET /api/knowledge/items/{id}/related -- items sharing entities with given item."""
-    store = _store(request)
-    item_id = request.match_info["id"]
-    try:
-        limit = min(20, max(1, int(request.query.get("limit", 8) or 8)))
-    except ValueError:
-        return web.json_response({"error": "invalid limit"}, status=400)
+def _related_items(store, item_id: str, limit: int) -> list[dict]:
+    """Items sharing entities with *item_id*, in one off-loop take.
 
+    Sync on purpose: the ranking is a GROUP BY over the ``items``/``mentions``
+    join, both of which grow without bound. One take keeps the two queries on
+    one connection with no suspension between them -- not in one transaction,
+    since the connection is autocommit, so a mention deleted between them just
+    drops out of the ranking. The caller dispatches this to a worker thread;
+    ``store.db`` is thread-local, so the thread gets its own connection.
+    """
     # Find entities mentioned in this item
     entity_ids = [r["entity_id"] for r in store.db.execute(
         "SELECT entity_id FROM mentions WHERE item_id = ?", (item_id,)).fetchall()]
     if not entity_ids:
-        return web.json_response([])
+        return []
 
     # Find other items that mention the same entities, ranked by overlap count
     placeholders = ",".join("?" * len(entity_ids))
@@ -619,7 +813,20 @@ async def get_related_items(request: web.Request) -> web.Response:
         f"GROUP BY i.id ORDER BY shared_entities DESC LIMIT ?",
         [*entity_ids, item_id, limit]
     ).fetchall()
-    return web.json_response([{**store._serialize_item(r), "shared_entities": r["shared_entities"]} for r in rows])
+    return [{**store._serialize_item(r), "shared_entities": r["shared_entities"]} for r in rows]
+
+
+async def get_related_items(request: web.Request) -> web.Response:
+    """GET /api/knowledge/items/{id}/related -- items sharing entities with given item."""
+    store = _store(request)
+    item_id = request.match_info["id"]
+    try:
+        limit = min(20, max(1, int(request.query.get("limit", 8) or 8)))
+    except ValueError:
+        return web.json_response({"error": "invalid limit"}, status=400)
+
+    items = await asyncio.to_thread(_related_items, store, item_id, limit)
+    return web.json_response(items)
 
 
 async def get_full_graph(request: web.Request) -> web.Response:
@@ -635,6 +842,18 @@ async def get_full_graph(request: web.Request) -> web.Response:
         limit = min(200, max(1, int(request.query.get("limit", 100) or 100)))
     except ValueError:
         return web.json_response({"error": "invalid limit"}, status=400)
+
+    # Materialise the graph off-loop before any `.graph` read below. The store
+    # defers the load to its first reader; this handler already offloads its SQL
+    # for the same reason, and an inline graph read would stall the event loop.
+    await asyncio.to_thread(store.ensure_graph_loaded)
+
+    # Pin one graph reference for every read below. ``_load_graph`` publishes a
+    # rebuilt graph by swapping ``store._graph``; re-reading
+    # ``store.graph`` at each step (degree ranking, then per-node attribute
+    # reads, then edges) could otherwise mix an old and a new graph and drop a
+    # node between steps. One capture means this response is a single snapshot.
+    graph = store.graph
 
     # Source filter: restrict to entities mentioned in items from specific sources
     source_id_param = request.query.get("source_id", "").strip()
@@ -666,18 +885,18 @@ async def get_full_graph(request: web.Request) -> web.Response:
             return web.json_response({"nodes": [], "edges": []})
         # Rank allowed entities by degree, take top N
         nodes_by_degree = sorted(
-            allowed_entities, key=lambda n: store.graph.degree(n) if store.graph.has_node(n) else 0, reverse=True
+            allowed_entities, key=lambda n: graph.degree(n) if graph.has_node(n) else 0, reverse=True
         )[:limit]
     else:
-        nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+        nodes_by_degree = sorted(graph.nodes, key=lambda n: graph.degree(n), reverse=True)[:limit]
 
     if not nodes_by_degree:
         return web.json_response({"nodes": [], "edges": []})
     node_set = set(nodes_by_degree)
-    nodes = [{"id": n, "name": store.graph.nodes[n].get("name"), "type": store.graph.nodes[n].get("entity_type")}
-             for n in node_set if store.graph.has_node(n)]
+    nodes = [{"id": n, "name": graph.nodes[n].get("name"), "type": graph.nodes[n].get("entity_type")}
+             for n in node_set if graph.has_node(n)]
     edges = [{"source": u, "target": v, "type": d.get("relation_type"), "weight": d.get("weight")}
-             for u, v, d in store.graph.edges(data=True) if u in node_set and v in node_set]
+             for u, v, d in graph.edges(data=True) if u in node_set and v in node_set]
     return web.json_response({"nodes": nodes, "edges": edges})
 
 
@@ -748,6 +967,179 @@ async def source_counts(request: web.Request) -> web.Response:
     return web.json_response({"counts": counts, "total": total_row[0]})
 
 
+def _source_row(store, source_id: str):
+    """One source row by id, in one off-loop take.
+
+    Sync on purpose: a primary-key read is cheap only when the connection is
+    free, and these handlers run while a sync holds the write lock -- the
+    connection's busy timeout is 10s, which on the loop is most of the
+    watchdog's budget. The caller dispatches this to a worker thread;
+    ``store.db`` is thread-local, so the thread gets its own connection.
+    """
+    return store.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+
+
+def _set_sync_status(store, source_id: str, status: str) -> None:
+    """Stamp a source's ``sync_status``, in one off-loop take.
+
+    The connection runs in autocommit mode (``isolation_level=None``), so the
+    ``commit()`` is a no-op kept for uniformity with the module's other writers
+    and to stay correct if that ever changes. What one take buys is that the
+    statements of ONE logical write cannot interleave with another caller's.
+    ``store.db`` is thread-local, so the worker gets its own connection.
+    """
+    store.db.execute("UPDATE sources SET sync_status = ? WHERE id = ?", (status, source_id))
+    store.db.commit()
+
+
+def _finalize_sync_status_write(
+    store, source_id: str, status: str, from_statuses: tuple[str, ...] = ("syncing",)  # type: ignore[no-untyped-def]
+) -> bool:
+    """CAS a terminal state over a row still mid-sync, in one off-loop take.
+
+    Compare-and-set for the reason ``_finalize_job`` documents: the terminal
+    paths race. A shutdown cancel can be delivered to the coroutine after the
+    success write's worker already committed 'synced', and a blind second
+    write would stamp 'error' over the state the work actually reached. Only
+    a row still in one of *from_statuses* is moved, so the loser's write
+    lands on nothing. The upload path passes ('syncing', 'pending') because a
+    cancel can land before its best-effort 'syncing' stamp, while the freshly
+    inserted row still reads the INSERT default 'pending'.
+    """
+    marks = ", ".join("?" for _ in from_statuses)
+    cur = store.db.execute(
+        f"UPDATE sources SET sync_status = ? WHERE id = ? AND sync_status IN ({marks})",
+        (status, source_id, *from_statuses))
+    store.db.commit()
+    return cur.rowcount > 0
+
+
+async def _finalize_sync_status(
+    store, source_id: str, status: str, from_statuses: tuple[str, ...] = ("syncing",)  # type: ignore[no-untyped-def]
+) -> None:
+    """Write a terminal ``sync_status`` from a finalizer, and never raise.
+
+    Runs inside an ``except BaseException`` arm, so an exception escaping here
+    would mask the original one -- a failed DB write is logged and dropped
+    instead. A re-cancel can interrupt the ``await`` before the worker returns;
+    a worker already RUNNING completes, so a write in flight still lands (only
+    a re-cancel that arrives before the executor picks the item up can drop
+    it). Suppressing the re-cancel keeps the caller's original exception
+    current for its bare ``raise`` (the same shape as
+    ``_rebuild_embeddings_job``'s finalize).
+    """
+    try:
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.to_thread(
+                _finalize_sync_status_write, store, source_id, status, from_statuses)
+    except Exception:
+        logger.exception(
+            "Could not finalize sync_status=%r for source %s", status, source_id)
+
+
+async def _write_status_cancel_safe(store, source_id: str, status: str) -> None:  # type: ignore[no-untyped-def]
+    """Write *status* so that a cancel cannot strand the row at 'syncing'.
+
+    An exception raised INSIDE an ``except`` arm is not caught by its sibling
+    arms, so a cancel delivered during a status write made from one (the
+    budget-deferral 'pending' writes) would otherwise propagate with the row
+    still 'syncing'. The worker also outlives the cancel, so it is drained
+    first; whatever it landed, the CAS finalize then moves only a row still
+    'syncing' -- a landed write leaves it nothing to do -- and the cancel is
+    re-raised.
+    """
+    write = asyncio.ensure_future(asyncio.to_thread(_set_sync_status, store, source_id, status))
+    try:
+        await asyncio.shield(write)
+    except asyncio.CancelledError:
+        with contextlib.suppress(BaseException):
+            await write
+        await _finalize_sync_status(store, source_id, "error")
+        raise
+
+
+def _claim_sync(store, source_id: str) -> bool:
+    """Move a source into 'syncing' and report whether THIS call won it.
+
+    The UPDATE's own WHERE clause is the guard, so the check and the write are
+    one statement: two concurrent syncs of one source cannot both start, however
+    the callers interleave. A read the caller re-checks cannot promise that once
+    an ``await`` sits between the read and the write.
+
+    Claimed by the background task rather than the handler, so a client
+    disconnect cannot commit 'syncing' and then fail to schedule the work that
+    clears it.
+    """
+    cur = store.db.execute(
+        "UPDATE sources SET sync_status = 'syncing' "
+        "WHERE id = ? AND sync_status <> 'syncing'",
+        (source_id,))
+    store.db.commit()
+    return cur.rowcount > 0
+
+
+def _add_source_unique(store, **kwargs) -> tuple[str, bool]:
+    """Insert a source, or name the row that already holds its ``uri``.
+
+    Returns ``(source_id, created)``. ``sources.uri`` is UNIQUE, so the insert
+    itself decides: two concurrent adds of one uri cannot both create a row, and
+    the loser is told which row won instead of getting a 500 from the
+    constraint. One off-loop take, so the insert and the recovery read cannot
+    straddle an await.
+    """
+    try:
+        return store.add_source(**kwargs), True
+    except sqlite3.IntegrityError:
+        row = store.get_source_by_uri(kwargs["uri"])
+        if row is None:
+            raise  # a different constraint, not the uri collision
+        return row["id"], False
+
+
+def _create_source_audited(store, source_type: str, **kwargs) -> tuple[str, bool]:
+    """:func:`_add_source_unique`, auditing only a row this call created."""
+    sid, created = _add_source_unique(store, source_type=source_type, **kwargs)
+    if created:
+        _sel_log("source.add", source_id=sid, source_type=source_type)
+    return sid, created
+
+
+def _set_file_state(store, source_id: str, file_path: str, status: str) -> None:
+    """Reset one scanned file to *status* and clear its error, in one off-loop take.
+
+    One take per logical write, for the reason ``_set_sync_status`` documents.
+    """
+    store.db.execute(
+        "UPDATE folder_file_state SET status = ?, error_message = NULL "
+        "WHERE source_id = ? AND file_path = ?",
+        (status, source_id, file_path))
+    store.db.commit()
+
+
+def _source_rows(store, uri_filter: str | None) -> list:
+    """The sources listing with per-source item counts, in one off-loop take.
+
+    Sync on purpose: the dashboard polls the sources list while a source is
+    syncing -- exactly the window in which the knowledge DB is contended --
+    and the LEFT JOIN aggregates over ``items``, which grows without bound.
+    The caller dispatches this to a worker thread; ``store.db`` is
+    thread-local, so the thread gets its own connection.
+    """
+    if uri_filter:
+        resolved_filter = str(Path(uri_filter).resolve()) if uri_filter.startswith('/') else uri_filter
+        return store.db.execute(
+            "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
+            "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
+            "ON s.id = c.source_id WHERE s.uri = ? ORDER BY s.updated_at DESC",
+            (resolved_filter,)
+        ).fetchall()
+    return store.db.execute(
+        "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
+        "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
+        "ON s.id = c.source_id ORDER BY s.updated_at DESC"
+    ).fetchall()
+
+
 async def list_sources(request: web.Request) -> web.Response:
     """GET /api/knowledge/sources.
 
@@ -758,21 +1150,7 @@ async def list_sources(request: web.Request) -> web.Response:
     cost surfaces is a credit balance after the fact.
     """
     store = _store(request)
-    uri_filter = request.query.get("uri")
-    if uri_filter:
-        resolved_filter = str(Path(uri_filter).resolve()) if uri_filter.startswith('/') else uri_filter
-        rows = store.db.execute(
-            "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
-            "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
-            "ON s.id = c.source_id WHERE s.uri = ? ORDER BY s.updated_at DESC",
-            (resolved_filter,)
-        ).fetchall()
-    else:
-        rows = store.db.execute(
-            "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
-            "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
-            "ON s.id = c.source_id ORDER BY s.updated_at DESC"
-        ).fetchall()
+    rows = await asyncio.to_thread(_source_rows, store, request.query.get("uri"))
     sources = [dict(r) for r in rows]
     # Aggregate scans plus a size stat per outstanding file, and the dashboard polls
     # this list while a source is syncing -- offloaded so a large folder cannot stall
@@ -944,9 +1322,11 @@ async def add_source(request: web.Request) -> web.Response:
             return web.json_response({"error": "URI too long (max 2048)"}, status=400)
 
     # Check for existing source with same URI
-    existing = store.get_source_by_uri(uri)
+    existing = await asyncio.to_thread(store.get_source_by_uri, uri)
     if existing:
-        return web.json_response({"error": "source already exists", "id": existing["id"]}, status=409)
+        return web.json_response(
+            {"error": "source already exists", "id": existing["id"],
+             "code": "source_exists"}, status=409)
 
     # Folder sources: discovery walk + pending_confirmation (no auto-scan)
     if source_type in ("local_folder", "obsidian_vault"):
@@ -983,9 +1363,13 @@ async def add_source(request: web.Request) -> web.Response:
             # Fold top-level namespace into properties for folder watchers
             if namespace and "namespace" not in properties:
                 properties["namespace"] = namespace
-        sid = store.add_source(name=name or uri, source_type=source_type, uri=uri,
-                               properties=properties)
-        _sel_log("source.add", source_id=sid, source_type=source_type)
+        sid, created = await asyncio.to_thread(
+            _create_source_audited, store, source_type, name=name or uri, uri=uri,
+            properties=properties)
+        if not created:
+            return web.json_response(
+                {"error": "source already exists", "id": sid,
+                 "code": "source_exists"}, status=409)
         return web.json_response(
             {
                 "id": sid,
@@ -1003,17 +1387,20 @@ async def add_source(request: web.Request) -> web.Response:
             status=201,
         )
 
-    sid = store.add_source(name=name or uri, source_type=source_type, uri=uri,
-                           properties=properties)
-    _sel_log("source.add", source_id=sid, source_type=source_type)
+    sid, created = await asyncio.to_thread(
+        _create_source_audited, store, source_type, name=name or uri, uri=uri,
+        properties=properties)
+    if not created:
+        return web.json_response(
+            {"error": "source already exists", "id": sid,
+             "code": "source_exists"}, status=409)
 
-    # Trigger immediate ingestion for local_file sources
+    # Trigger immediate ingestion for local_file sources. The task claims
+    # 'syncing' itself, so nothing is written here that a disconnect could
+    # commit before the work is scheduled.
     if source_type == "local_file":
         pipeline = request.app.get("knowledge_pipeline")
         if pipeline:
-            store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (sid,))
-            store.db.commit()
-
             task = asyncio.create_task(_ingest_local_file_task(pipeline, store, uri, sid))
             app_tasks = request.app.setdefault("_bg_tasks", set())
             app_tasks.add(task)
@@ -1022,35 +1409,140 @@ async def add_source(request: web.Request) -> web.Response:
     return web.json_response({"id": sid, "status": "created"}, status=201)
 
 
-async def _ingest_local_file_task(pipeline, store, path: str, source_id: str) -> None:  # type: ignore[no-untyped-def]
+async def _ingest_local_file_task(  # type: ignore[no-untyped-def]
+    pipeline, store, path: str, source_id: str, *, claim_settled: asyncio.Event | None = None
+) -> None:
     """Re-ingest a local_file source via the FileReader pipeline.
 
     Shared by add_source (initial ingest) and sync_source (manual re-sync) so both
     entry points route local files through the same FileReader path and apply the
     same read-time sensitive-path re-validation (defense-in-depth against TOCTOU).
-    Updates sync_status to 'synced' on success or 'error' on failure.
+
+    Owns the row's whole sync lifecycle: it claims 'syncing' atomically, and
+    then stamps 'synced', 'pending' when the import budget defers the ingest,
+    or 'error'. Holding both ends here is what stops a cancelled request from
+    leaving a row 'syncing' with no work behind it. It returns without touching
+    the row at all in two cases: another sync already holds the claim, or the
+    claim could not be taken -- neither is this source failing to sync.
+
+    *claim_settled* is set once the claim has been decided either way: a
+    scheduling caller that holds the ingestion gate across this task's claim
+    (``sync_source``) waits on it, so the orphan sweep cannot take an itemless
+    row in a terminal status between that caller's read and the claim here.
     """
+    claim = asyncio.ensure_future(asyncio.to_thread(_claim_sync, store, source_id))
+    try:
+        try:
+            claimed = await asyncio.shield(claim)
+        except asyncio.CancelledError:
+            # A cancel here does not stop the worker: the thread runs to
+            # completion and can still commit 'syncing' after this task is
+            # gone -- the same strand the work sites below close. Wait for the
+            # thread's answer and finalize only a claim THIS task won; a lost
+            # claim is a sibling sync's row. Everything is suppressed because
+            # a finalizer must never replace the cancellation.
+            with contextlib.suppress(BaseException):
+                if await claim:
+                    await _finalize_sync_status(store, source_id, "error")
+            raise
+        except Exception:
+            # Failing to TAKE the work is not the work failing. 'error' is terminal --
+            # sync_all skips an errored row on every sweep -- so stamping it for a
+            # transient writer-lock timeout would quiesce a healthy source until
+            # someone re-syncs by hand. Leave the row as it was and let the next sweep
+            # retry it. Caught rather than left to propagate: these tasks carry
+            # `add_done_callback(set.discard)`, which never retrieves an exception.
+            logger.exception(
+                "Could not claim sync for source %s; leaving its status untouched", source_id)
+            return
+    finally:
+        if claim_settled is not None:
+            claim_settled.set()
+    if not claimed:
+        return
     try:
         if is_sensitive_path(str(Path(path).resolve())):
             _sel_log("source.sensitive_path_blocked", path=path, source_id=source_id)
             logger.warning("Sensitive path detected at ingest time: %s", path)
-            store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
-            store.db.commit()
+            await asyncio.to_thread(_set_sync_status, store, source_id, "error")
             return
         await pipeline.ingest_file(path, source_id=source_id)
-        store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
-        store.db.commit()
-    except Exception:
-        logger.exception("Background ingestion failed for %s", path)
-        store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
-        store.db.commit()
+        await asyncio.to_thread(_set_sync_status, store, source_id, "synced")
+    except ImportChunkBudgetError as exc:
+        # A budget deferral is transient, so it must not land in 'error': sync_all
+        # skips an errored source, which would quiesce this local_file permanently
+        # over a window that clears in a minute. 'pending' keeps it in the sweep,
+        # and the file on disk is still there to re-read -- the same test that
+        # keeps 'pending' off an upload, whose only copy is the unlinked temp file.
+        # SyncScheduler.sync_source treats this exception the same way.
+        logger.warning("Ingestion deferred by import budget for %s: %s", path, exc)
+        await _write_status_cancel_safe(store, source_id, "pending")
+    except BaseException as exc:
+        # CancelledError is a BaseException in 3.8+, so an ``except Exception``
+        # arm lets a shutdown cancel skip finalization and strand the row at
+        # 'syncing' -- every later sync then answers 409 with no recovery. A
+        # cancelled sync lands in 'error' like any other incomplete sync (no
+        # new status value: the settings UI and the watcher read this column),
+        # and the cancellation is re-raised so task semantics are preserved --
+        # shutdown drains ``_bg_tasks`` by cancelling them. The shape follows
+        # ``_rebuild_embeddings_job``, this file's precedent.
+        is_cancel = isinstance(exc, asyncio.CancelledError)
+        if is_cancel:
+            logger.debug("Background ingestion cancelled for %s", path)
+        else:
+            logger.exception("Background ingestion failed for %s", path)
+        await _finalize_sync_status(store, source_id, "error")
+        if is_cancel:
+            raise
+
+
+async def _hand_off_under_gate(  # type: ignore[no-untyped-def]
+    request: web.Request, pipeline, make_task
+) -> asyncio.Task[None]:
+    """Start a background task while the ingestion gate is held, and keep the
+    hold until the task reports the row is protected.
+
+    The handler's own row read happens before the task exists, and an itemless
+    row in a terminal status is what the post-bind orphan sweep reclaims, so
+    without the hold the sweep could delete the row in that gap -- the client
+    told "syncing" / "processing" for a source that is gone. *make_task*
+    receives an event the task sets once the row is safe from the sweep: a
+    sync task once its 'syncing' claim is decided (``_claim_sync``), an upload
+    task once it holds its own gate. The caller enters the gate BEFORE this
+    call so its own lookup is covered too, and the gate's per-task re-entrancy
+    makes that outer hold the one that counts. The task is created in a
+    hand-off context: it takes a real hold of its own, admitted past any
+    maintenance window that began waiting while this hold is open, so the
+    wait below cannot deadlock against that window (``handoff_gate_context``).
+    """
+    settled: asyncio.Event = asyncio.Event()
+    async with pipeline.ingestion_in_flight():
+        # The task takes its own hold for its ingest, so it must not inherit
+        # this one through the copied context (it would read as nested).
+        task = asyncio.create_task(make_task(settled), context=handoff_gate_context())
+        app_tasks = request.app.setdefault("_bg_tasks", set())
+        app_tasks.add(task)
+        task.add_done_callback(app_tasks.discard)
+        await settled.wait()
+    return task
 
 
 async def sync_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/sync -- trigger sync for a source."""
+    pipeline = _pipeline(request)
+    if pipeline is None:
+        return await _sync_source_body(request)
+    # The gate is held from the row read through the task hand-off: an itemless
+    # row in a terminal status is what the post-bind orphan sweep reclaims, and
+    # the read here is what the branches below act on.
+    async with pipeline.ingestion_in_flight():
+        return await _sync_source_body(request)
+
+
+async def _sync_source_body(request: web.Request) -> web.Response:
     source_id = request.match_info["id"]
     store = _store(request)
-    source = store.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+    source = await asyncio.to_thread(_source_row, store, source_id)
     if not source:
         return web.json_response({"error": "not found"}, status=404)
 
@@ -1075,12 +1567,13 @@ async def sync_source(request: web.Request) -> web.Response:
         pipeline = _pipeline(request)
         if not pipeline:
             return web.json_response({"error": "pipeline not configured"}, status=503)
-        store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (source_id,))
-        store.db.commit()
-        task = asyncio.create_task(_ingest_local_file_task(pipeline, store, file_uri, source_id))
-        app_tasks = request.app.setdefault("_bg_tasks", set())
-        app_tasks.add(task)
-        task.add_done_callback(app_tasks.discard)
+        # The task claims the row; this read is only the fast 409 for the common
+        # case, so a lost claim ends the task rather than double-starting a sync.
+        await _hand_off_under_gate(
+            request, pipeline,
+            lambda settled: _ingest_local_file_task(
+                pipeline, store, file_uri, source_id, claim_settled=settled),
+        )
         _sel_log("source.sync.local_file", source_id=source_id)
         return web.json_response({"synced": False, "status": "syncing", "source_id": source_id})
 
@@ -1094,9 +1587,6 @@ async def sync_source(request: web.Request) -> web.Response:
     if source["sync_status"] == "syncing":
         return web.json_response({"error": "sync already in progress", "source_id": source_id}, status=409)
 
-    store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (source_id,))
-    store.db.commit()
-
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
@@ -1104,18 +1594,55 @@ async def sync_source(request: web.Request) -> web.Response:
     if pool is None:
         # Compatibility for minimal callers that predate workload-isolated pools.
         pool = request.app["knowledge_llm_pool"]
-    task = asyncio.create_task(_background_agent_sync(source_id, url, source["name"], store, pipeline, pool))
-    app_tasks = request.app.setdefault("_bg_tasks", set())
-    app_tasks.add(task)
-    task.add_done_callback(app_tasks.discard)
+    await _hand_off_under_gate(
+        request, pipeline,
+        lambda settled: _background_agent_sync(
+            source_id, url, source["name"], store, pipeline, pool, claim_settled=settled),
+    )
     _sel_log("source.sync.agent", source_id=source_id, url=url)
     return web.json_response({"synced": False, "status": "syncing", "source_id": source_id})
 
 
 async def _background_agent_sync(  # type: ignore[no-untyped-def]
-    source_id: str, url: str, name: str, store, pipeline, pool: LLMPool
+    source_id: str, url: str, name: str, store, pipeline, pool: LLMPool,
+    *, claim_settled: asyncio.Event | None = None,
 ) -> None:
-    """Background task: fetch content via agent, then ingest."""
+    """Background task: fetch content via agent, then ingest.
+
+    Claims 'syncing' first, for the reason ``_ingest_local_file_task`` documents:
+    the claim is atomic and the task owns both ends of the row's lifecycle.
+    *claim_settled* is set once the claim is decided (see that task).
+    """
+    claim = asyncio.ensure_future(asyncio.to_thread(_claim_sync, store, source_id))
+    try:
+        try:
+            claimed = await asyncio.shield(claim)
+        except asyncio.CancelledError:
+            # A cancel here does not stop the worker: the thread runs to
+            # completion and can still commit 'syncing' after this task is
+            # gone -- the same strand the work sites below close. Wait for the
+            # thread's answer and finalize only a claim THIS task won; a lost
+            # claim is a sibling sync's row. Everything is suppressed because
+            # a finalizer must never replace the cancellation.
+            with contextlib.suppress(BaseException):
+                if await claim:
+                    await _finalize_sync_status(store, source_id, "error")
+            raise
+        except Exception:
+            # Failing to TAKE the work is not the work failing. 'error' is terminal --
+            # sync_all skips an errored row on every sweep -- so stamping it for a
+            # transient writer-lock timeout would quiesce a healthy source until
+            # someone re-syncs by hand. Leave the row as it was and let the next sweep
+            # retry it. Caught rather than left to propagate: these tasks carry
+            # `add_done_callback(set.discard)`, which never retrieves an exception.
+            logger.exception(
+                "Could not claim sync for source %s; leaving its status untouched", source_id)
+            return
+    finally:
+        if claim_settled is not None:
+            claim_settled.set()
+    if not claimed:
+        return
     try:
         content = await fetch_url_content(url, pool)
         redacted = _redact(content)
@@ -1127,35 +1654,46 @@ async def _background_agent_sync(  # type: ignore[no-untyped-def]
             await pipeline.ingest_file(tmp.name, original_name=name, source_id=source_id)
         finally:
             Path(tmp.name).unlink(missing_ok=True)
-        store.db.execute(
-            "UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,)
-        )
-        store.db.commit()
+        await asyncio.to_thread(_set_sync_status, store, source_id, "synced")
         logger.info("Agent sync complete: source=%s url=%s", source_id, url)
-    except Exception:
-        logger.exception("Agent sync failed: source=%s url=%s", source_id, url)
-        store.db.execute(
-            "UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,)
+    except ImportChunkBudgetError as exc:
+        # Transient, so not 'error': sync_all skips an errored source, which would
+        # quiesce this agent-url source permanently over a window that clears in a
+        # minute. The URL is re-fetchable, so a retry has content to act on.
+        logger.warning(
+            "Agent sync deferred by import budget: source=%s url=%s: %s", source_id, url, exc
         )
-        store.db.commit()
+        await _write_status_cancel_safe(store, source_id, "pending")
+    except BaseException as exc:
+        # ``except BaseException`` for the reason _ingest_local_file_task
+        # documents: a cancel must not strand the row at 'syncing'.
+        is_cancel = isinstance(exc, asyncio.CancelledError)
+        if is_cancel:
+            logger.debug("Agent sync cancelled: source=%s url=%s", source_id, url)
+        else:
+            logger.exception("Agent sync failed: source=%s url=%s", source_id, url)
+        await _finalize_sync_status(store, source_id, "error")
+        if is_cancel:
+            raise
 
 
 async def delete_source(request: web.Request) -> web.Response:
     """DELETE /api/knowledge/sources/{id} -- remove a source and its items."""
     store = _store(request)
     source_id = request.match_info["id"]
-    row = store.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+    row = await asyncio.to_thread(_source_row, store, source_id)
     if not row:
         return web.json_response({"error": "not found"}, status=404)
     try:
         # BEGIN IMMEDIATE takes the write lock eagerly and the connection's
         # busy_timeout is 10s, so a concurrent ingestion writer could park this
         # call for that long -- never on the event loop.
-        await asyncio.to_thread(store.delete_source_cascade, source_id)
+        await _audited_write(
+            partial(store.delete_source_cascade, source_id),
+            event="source.delete", fields={"source_id": source_id})
     except Exception:
         logger.exception("delete_source failed: source_id=%s", source_id)
         return web.json_response({"error": "internal server error"}, status=500)
-    _sel_log("source.delete", source_id=source_id)
     return web.json_response({"status": "deleted"})
 
 
@@ -1166,7 +1704,7 @@ async def rename_source(request: web.Request) -> web.Response:
     """
     store = _store(request)
     source_id = request.match_info["id"]
-    if not store.db.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone():
+    if not await asyncio.to_thread(_source_row, store, source_id):
         return web.json_response({"error": "not found"}, status=404)
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
@@ -1181,9 +1719,75 @@ async def rename_source(request: web.Request) -> web.Response:
     if len(name) > _MAX_SOURCE_NAME_LEN:
         return web.json_response(
             {"error": f"name must be {_MAX_SOURCE_NAME_LEN} characters or fewer"}, status=400)
-    store.update_source(source_id, name=name)
-    _sel_log("source.rename", source_id=source_id)
+    await _audited_write(
+        partial(store.update_source, source_id, name=name),
+        event="source.rename", fields={"source_id": source_id})
     return web.json_response({"ok": True, "name": name})
+
+
+def _adopt_source(store, source_id: str, *, event: str):
+    """Activate a source and stamp it adopted, in ONE off-loop take.
+
+    Returns ``(outcome, row, props)``: ``"missing"`` when the row is gone,
+    ``"denied"`` when its path is restricted, ``"ok"`` when it was activated.
+
+    The ``properties`` mutation goes through ``store.merge_source_properties``,
+    which reads and writes the blob under one ``BEGIN IMMEDIATE``. That is what
+    closes the lost-update window, not the fact that this helper runs in one
+    take: ``properties`` is a whole-column rewrite, so before this the read and
+    the write were two statements on an autocommit connection and a concurrent
+    pause could be erased by a resume that had read the older blob. On the loop
+    that could not happen, because nothing else ran between the two statements;
+    off the loop the database has to be the serialization point.
+
+    One take still earns its keep for the rest: it puts the ``resolve()`` and
+    sensitive-path check off the loop, which is filesystem I/O the coroutine was
+    doing inline, and it keeps the check in front of the write, so a denied
+    source is never activated.
+
+    Confirming (or resuming) IS the user adopting this source, so stamp it as
+    adopted in the same write that activates it. Without this, a row Kiro Crew
+    registered itself would be refused by the scan funnel's gate immediately
+    after the user satisfied that very gate, and bounce back to
+    pending_confirmation.
+    """
+    row = _source_row(store, source_id)
+    if not row:
+        return "missing", None, {}
+    # TOCTOU: re-resolve path in case the symlink was swapped since add-time
+    if is_sensitive_path(str(Path(row["uri"]).resolve())):
+        _sel_log(f"{event}_denied", source_id=source_id, reason="sensitive_path")
+        return "denied", row, {}
+    props = store.merge_source_properties(
+        source_id,
+        set_keys={AUTO_REGISTRATION_RETIRED_PROP: True},
+        remove_keys=("scan_paused",),
+        sync_status="active")
+    if props is None:
+        # Deleted between the read above and the write. Same answer as a row
+        # that was never there: the caller 404s.
+        return "missing", None, {}
+    _sel_log(event, source_id=source_id)
+    return "ok", row, props
+
+
+def _pause_source_row(store, source_id: str) -> bool:
+    """Mark a source paused, in ONE off-loop take. False when the row is gone.
+
+    The blob write goes through ``store.merge_source_properties`` for the reason
+    ``_adopt_source`` documents: ``properties`` is a whole-column rewrite, so the
+    read and the write happen under one ``BEGIN IMMEDIATE`` and a concurrent
+    resume cannot erase this pause.
+
+    The watcher's pre-scan skip reads the sync_status COLUMN, so this write is
+    what stops the sweep from walking and delete-reconciling the whole folder;
+    the deeper scan_paused gate in folder_watcher stops the ingestion itself.
+    """
+    if store.merge_source_properties(
+            source_id, set_keys={"scan_paused": True}, sync_status="paused") is None:
+        return False
+    _sel_log("source.pause", source_id=source_id)
+    return True
 
 
 def _track_scan_task(app: web.Application, task: asyncio.Task) -> None:  # type: ignore[type-arg]
@@ -1198,23 +1802,12 @@ async def confirm_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/confirm -- confirm and start scanning."""
     store = _store(request)
     source_id = request.match_info["id"]
-    row = store.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
-    if not row:
+    outcome, row, props = await asyncio.to_thread(
+        _adopt_source, store, source_id, event="source.confirm")
+    if outcome == "missing":
         return web.json_response({"error": "not found"}, status=404)
-    # TOCTOU: re-resolve path in case symlink was swapped since add-time
-    resolved_uri = str(Path(row["uri"]).resolve())
-    if is_sensitive_path(resolved_uri):
-        _sel_log("source.confirm_denied", source_id=source_id, reason="sensitive_path")
+    if outcome == "denied":
         return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
-    props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
-    props.pop("scan_paused", None)
-    # Confirming (or resuming) IS the user adopting this source, so stamp it as
-    # adopted in the same write that activates it. Without this, a row Kiro Crew
-    # registered itself would be refused by the scan funnel's gate immediately after
-    # the user satisfied that very gate, and bounce back to pending_confirmation.
-    props[AUTO_REGISTRATION_RETIRED_PROP] = True
-    store.update_source(source_id, properties=props, sync_status="active")
-    _sel_log("source.confirm", source_id=source_id)
     # Trigger scan
     watcher = request.app.get("knowledge_watcher")
     if watcher:
@@ -1233,16 +1826,8 @@ async def pause_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/pause -- pause active scan."""
     store = _store(request)
     source_id = request.match_info["id"]
-    row = store.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
-    if not row:
+    if not await asyncio.to_thread(_pause_source_row, store, source_id):
         return web.json_response({"error": "not found"}, status=404)
-    props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
-    props["scan_paused"] = True
-    # The watcher's pre-scan skip reads the sync_status COLUMN, so this write is
-    # what stops the sweep from walking and delete-reconciling the whole folder;
-    # the deeper scan_paused gate in folder_watcher stops the ingestion itself.
-    store.update_source(source_id, properties=props, sync_status="paused")
-    _sel_log("source.pause", source_id=source_id)
     return web.json_response({"status": "paused"})
 
 
@@ -1250,23 +1835,12 @@ async def resume_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/resume -- resume paused scan."""
     store = _store(request)
     source_id = request.match_info["id"]
-    row = store.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
-    if not row:
+    outcome, row, props = await asyncio.to_thread(
+        _adopt_source, store, source_id, event="source.resume")
+    if outcome == "missing":
         return web.json_response({"error": "not found"}, status=404)
-    # TOCTOU: re-resolve path in case symlink was swapped while paused
-    resolved_uri = str(Path(row["uri"]).resolve())
-    if is_sensitive_path(resolved_uri):
-        _sel_log("source.resume_denied", source_id=source_id, reason="sensitive_path")
+    if outcome == "denied":
         return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
-    props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
-    props.pop("scan_paused", None)
-    # Confirming (or resuming) IS the user adopting this source, so stamp it as
-    # adopted in the same write that activates it. Without this, a row Kiro Crew
-    # registered itself would be refused by the scan funnel's gate immediately after
-    # the user satisfied that very gate, and bounce back to pending_confirmation.
-    props[AUTO_REGISTRATION_RETIRED_PROP] = True
-    store.update_source(source_id, properties=props, sync_status="active")
-    _sel_log("source.resume", source_id=source_id)
     # Trigger scan to pick up remaining files
     watcher = request.app.get("knowledge_watcher")
     if watcher:
@@ -1277,14 +1851,25 @@ async def resume_source(request: web.Request) -> web.Response:
     return web.json_response({"status": "scanning"})
 
 
+def _folder_file_rows(store, source_id: str) -> list:
+    """A source's per-file scan state, in one off-loop take.
+
+    Sync on purpose: the dashboard polls this every few seconds during a scan
+    -- exactly the window in which the knowledge DB is contended. The caller
+    dispatches this to a worker thread; ``store.db`` is thread-local, so the
+    thread gets its own connection.
+    """
+    return store.db.execute(
+        "SELECT file_path, status, error_message, mtime, content_hash, item_ids, last_seen "
+        "FROM folder_file_state WHERE source_id = ? ORDER BY last_seen DESC",
+        (source_id,)).fetchall()
+
+
 async def list_source_files(request: web.Request) -> web.Response:
     """GET /api/knowledge/sources/{id}/files -- list files with scan status."""
     store = _store(request)
     source_id = request.match_info["id"]
-    rows = store.db.execute(
-        "SELECT file_path, status, error_message, mtime, content_hash, item_ids, last_seen "
-        "FROM folder_file_state WHERE source_id = ? ORDER BY last_seen DESC",
-        (source_id,)).fetchall()
+    rows = await asyncio.to_thread(_folder_file_rows, store, source_id)
     files = [{"file_path": r["file_path"], "status": r["status"] or "pending",
               "error_message": _redact(r["error_message"]) if r["error_message"] else None,
               "mtime": r["mtime"],
@@ -1311,11 +1896,9 @@ async def retry_file(request: web.Request) -> web.Response:
     if is_sensitive_path(file_path) or is_sensitive_path(str(Path(file_path).resolve())):
         _sel_log("source.file.retry_denied", source_id=source_id, reason="sensitive_path")
         return web.json_response({"error": "path is restricted"}, status=403)
-    store.db.execute(
-        "UPDATE folder_file_state SET status = 'pending', error_message = NULL WHERE source_id = ? AND file_path = ?",
-        (source_id, file_path))
-    store.db.commit()
-    _sel_log("source.file.retry", source_id=source_id)
+    await _audited_write(
+        partial(_set_file_state, store, source_id, file_path, "pending"),
+        event="source.file.retry", fields={"source_id": source_id})
     return web.json_response({"status": "pending"})
 
 
@@ -1333,11 +1916,9 @@ async def skip_file(request: web.Request) -> web.Response:
     if is_sensitive_path(file_path) or is_sensitive_path(str(Path(file_path).resolve())):
         _sel_log("source.file.skip_denied", source_id=source_id, reason="sensitive_path")
         return web.json_response({"error": "path is restricted"}, status=403)
-    store.db.execute(
-        "UPDATE folder_file_state SET status = 'skipped', error_message = NULL WHERE source_id = ? AND file_path = ?",
-        (source_id, file_path))
-    store.db.commit()
-    _sel_log("source.file.skip", source_id=source_id)
+    await _audited_write(
+        partial(_set_file_state, store, source_id, file_path, "skipped"),
+        event="source.file.skip", fields={"source_id": source_id})
     return web.json_response({"status": "skipped"})
 
 
@@ -1345,40 +1926,67 @@ async def ingest_text(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/ingest-text -- agent submits fetched text."""
     source_id = request.match_info["id"]
     store = _store(request)
-    source = store.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
-    if not source:
-        return web.json_response({"error": "source not found"}, status=404)
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
-    body, body_err = await read_bounded_json(request, max_bytes=None)
-    if body_err is not None:
-        return body_err
-    assert body is not None  # read_bounded_json returns (dict, None) on success
-    text = body.get("text", "")
-    if not text:
-        return web.json_response({"error": "no text provided"}, status=400)
-    redacted = _redact(text)
-    text = redacted if redacted is not None else text
-    name = body.get("name", source["name"])
-    namespace = body.get("namespace", "default")
-    # Write to temp file and ingest
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".md", prefix="agent_sync_")
-    try:
-        tmp.write(text.encode())
-        tmp.close()
-        job_id = await pipeline.ingest_file(tmp.name, original_name=name,
-                                            namespace=namespace, source_id=source_id)
-        # Update source status
-        store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
-        store.db.commit()
-        _sel_log("source.ingest_text", source_id=source_id, name=name)
-        return web.json_response({"ok": True, "job_id": job_id})
-    except Exception:
-        logger.exception("Agent ingest_text failed for source %s", source_id)
-        return web.json_response({"error": "internal server error"}, status=500)
-    finally:
-        Path(tmp.name).unlink(missing_ok=True)
+    # The gate is held from the source lookup through the ingest: the orphan
+    # sweep reclaims an itemless source with a terminal status, and the body
+    # read below is an await between the two, so the whole span is one hold.
+    async with pipeline.ingestion_in_flight():
+        source = await asyncio.to_thread(_source_row, store, source_id)
+        if not source:
+            return web.json_response({"error": "source not found"}, status=404)
+        body, body_err = await read_bounded_json(request, max_bytes=None)
+        if body_err is not None:
+            return body_err
+        assert body is not None  # read_bounded_json returns (dict, None) on success
+        text = body.get("text", "")
+        if not text:
+            return web.json_response({"error": "no text provided"}, status=400)
+        redacted = _redact(text)
+        text = redacted if redacted is not None else text
+        name = body.get("name", source["name"])
+        namespace = body.get("namespace", "default")
+        # Write to temp file and ingest
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".md", prefix="agent_sync_")
+        try:
+            tmp.write(text.encode())
+            tmp.close()
+            job_id = await pipeline.ingest_file(tmp.name, original_name=name,
+                                                namespace=namespace, source_id=source_id)
+            # Update source status. INVARIANT: the 'synced' write and the
+            # source.ingest_text audit ride in ONE worker take (_audited_write),
+            # with no await between them -- that is what makes the audit
+            # un-skippable by a cancellation. Do not split them or move one
+            # off-loop on its own.
+            await _audited_write(
+                partial(_set_sync_status, store, source_id, "synced"),
+                event="source.ingest_text", fields={"source_id": source_id, "name": name})
+            return web.json_response({"ok": True, "job_id": job_id})
+        except ImportChunkBudgetError as exc:
+            # The cross-file import budget deferred this ingest. Surface the reasoned
+            # refusal (429, not a generic 500) so the caller learns it is a transient
+            # budget deferral it can retry, not a server fault. Nothing was written.
+            return web.json_response(
+                {"error": str(exc), "code": "import_budget_exceeded"},
+                status=429)
+        except BaseException as exc:
+            # ``except BaseException`` so a cancel is seen and re-raised (task
+            # semantics), but this handler writes NO terminal status: it holds
+            # no claim, so a row reading 'syncing' here belongs to the sync
+            # task that requested this text, and that task's own finalizer
+            # clears it (a shutdown cancels every ``_bg_tasks`` member, this
+            # handler's caller included). Stamping 'error' from here would
+            # steal a live sibling claim and admit a concurrent replacement
+            # ingest. Non-cancel failures keep the existing 500 body.
+            is_cancel = isinstance(exc, asyncio.CancelledError)
+            if is_cancel:
+                logger.debug("Agent ingest_text cancelled for source %s", source_id)
+                raise
+            logger.exception("Agent ingest_text failed for source %s", source_id)
+            return web.json_response({"error": "internal server error"}, status=500)
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
 
 
 # ---------- Config ----------
@@ -1404,13 +2012,30 @@ async def get_config(request: web.Request) -> web.Response:
 # ---------- Stats ----------
 
 
+def _stats_counts(store, with_embedded: bool) -> tuple[dict, int]:
+    """The corpus counters, in one off-loop take.
+
+    Sync on purpose: every counter is an unfiltered ``COUNT(*)`` over a table
+    that grows without bound, and the dashboard polls this endpoint -- so on a
+    large library, taken on the loop, it is the busiest stall in the module.
+    The caller dispatches this to a worker thread; ``store.db`` is thread-local,
+    so the thread gets its own connection.
+    """
+    stats = store.get_stats()
+    if not with_embedded:
+        return stats, 0
+    embedded = store.db.execute(
+        "SELECT COUNT(*) FROM items WHERE embedding IS NOT NULL").fetchone()[0]
+    return stats, embedded
+
+
 async def get_stats(request: web.Request) -> web.Response:
     """GET /api/knowledge/stats."""
     store = _store(request)
-    stats = store.get_stats()
     embedder = request.app.get("knowledge_embedder")
+    stats, embedded_count = await asyncio.to_thread(
+        _stats_counts, store, embedder is not None)
     if embedder:
-        embedded_count = store.db.execute("SELECT COUNT(*) FROM items WHERE embedding IS NOT NULL").fetchone()[0]
         available = await embedder.is_available_async()
         stats["embeddings"] = {
             "enabled": True,
@@ -1497,10 +2122,9 @@ async def ingest_file(request: web.Request) -> web.Response:
     try:
         # The signature gate (CWE-434) and the byte ceiling are both enforced by
         # the shared streaming path, which judges the leading bytes while they
-        # are still in memory. That is stricter than this call site used to be:
-        # it wrote the whole file first and only then sniffed, so rejected
-        # content did reach the filesystem. Cleanup on cancellation is the
-        # helper's, not this function's -- see part_stream's docstring.
+        # are still in memory, so rejected content never reaches the filesystem.
+        # Cleanup on cancellation is the helper's, not this function's -- see
+        # part_stream's docstring.
         await part_stream.stream_part_to_file(
             field,  # type: ignore[arg-type]
             staged,
@@ -1518,6 +2142,9 @@ async def ingest_file(request: web.Request) -> web.Response:
             {"error": f"file content does not match its type: {ext}"}, status=400
         )
 
+    # Bound before the try so the handler's own failure path can reclaim it even
+    # if the reservation below never happened.
+    budget_token: int | None = None
     try:
         # Decompression-bomb guard (CWE-770): a valid-signature OOXML/zip can
         # still be a bomb whose members expand unbounded once python-docx / the
@@ -1534,40 +2161,175 @@ async def ingest_file(request: web.Request) -> web.Response:
                 return web.json_response(
                     {"error": f"{ext} archive rejected ({reason})"}, status=400)
 
+        # Admission BEFORE acceptance. This route answers 'processing' and ingests
+        # in the background, and the staged temp file is the only server-side copy
+        # -- the finally below unlinks it -- so a refusal discovered after the
+        # response would discard a file the client was told had been accepted.
+        # Reserving here makes 429 the answer to an exhausted window, the same one
+        # ingest_text gives, and the token is handed to ingest_file so admission
+        # cannot be lost between the check and the work.
+        try:
+            budget_token = await pipeline.reserve_import_budget()
+        except ImportChunkBudgetError as exc:
+            staged.unlink(missing_ok=True)
+            _sel_log("ingest", filename=filename, outcome="deferred")
+            return web.json_response(
+                {"error": str(exc), "code": "import_budget_exceeded"}, status=429)
+
         # Create source record immediately so it appears in the UI
         store = _store(request)
         uri = f"upload://{filename}"
-        existing = store.get_source_by_uri(uri)
-        if not existing:
-            source_id = store.add_source(
-                name=filename, source_type='local_file', uri=uri,
-                properties={},
-            )
-            store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (source_id,))
-            store.db.commit()
-        else:
-            source_id = existing['id']
 
-        # Run extraction in background so response returns immediately
-        async def _bg_ingest(tmp_path: str, src_id: str) -> None:
+        # Run extraction in background so response returns immediately. For a
+        # created row the stamp lives here rather than in the handler so a
+        # disconnect cannot commit 'syncing' and then fail to schedule the work
+        # that clears it. A plain stamp, not a claim: an upload has no
+        # single-flight rule, and refusing the second one would drop a file the
+        # user just handed over.
+        async def _bg_ingest(tmp_path: str, src_id: str, gate_taken: asyncio.Event) -> None:
+            # The task holds the ingestion gate from its own re-read through the
+            # ingest, so the deferred orphan sweep never reads the row's items,
+            # entities and mentions half-written. The handler keeps its own
+            # hold until `gate_taken` fires, so the two holds overlap and the
+            # sweep never sees the row unprotected. The re-read guards the one
+            # way the row can be gone by now -- a delete that landed between
+            # the response and this task -- and then the ingest is skipped:
+            # nothing is re-created behind a delete, and the client already
+            # holds an id that the delete answered for.
             try:
-                await pipeline.ingest_file(tmp_path, original_name=filename, namespace=namespace, source_id=src_id)
-            except Exception:
-                logger.exception("Background ingestion failed for %s", filename)
-                store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (src_id,))
-                store.db.commit()
+                async with pipeline.ingestion_in_flight():
+                    gate_taken.set()
+                    # Off-loop: the store hands out one connection per thread.
+                    if await asyncio.to_thread(_source_row, store, src_id) is None:
+                        logger.info("Upload: source %s removed before ingest; skipping", src_id)
+                        # ingest_file's finally is what returns the admission
+                        # otherwise; on this path nothing else will.
+                        pipeline.release_import_budget(budget_token)
+                        return
+                    # A progress marker, never a precondition. The staged temp file is
+                    # this upload's only server-side copy and the finally below unlinks
+                    # it, so a contended writer lock on a cosmetic status write must
+                    # not reach the except arm and take the file with it -- the client
+                    # was already told 'processing'. ingest_file stamps the terminal
+                    # status itself on both its paths (ingestion.py:1128 / 1144), so a
+                    # skipped stamp costs a UI hint and heals on its own.
+                    stamp = asyncio.ensure_future(
+                        asyncio.to_thread(_set_sync_status, store, src_id, "syncing"))
+                    try:
+                        await asyncio.shield(stamp)
+                    except asyncio.CancelledError:
+                        # The stamp's worker outlives a cancel and can commit
+                        # 'syncing' AFTER the outer arm's CAS finalize ran,
+                        # which would re-strand the row. Drain it, then
+                        # re-raise so the outer arm finalizes a stamp that has
+                        # actually landed -- the same shield-and-drain the
+                        # claim takes use.
+                        with contextlib.suppress(BaseException):
+                            await stamp
+                        raise
+                    except Exception:
+                        # The row id, not the filename: an upload's name is
+                        # client-supplied and can carry a secret, and the row is what
+                        # a reader needs to correlate a status write that did not land.
+                        logger.exception(
+                            "Could not stamp 'syncing' for source %s; ingesting anyway",
+                            src_id)
+                    await pipeline.ingest_file(
+                        tmp_path, original_name=filename, namespace=namespace,
+                        source_id=src_id,
+                        # Admission was settled above, so this call must not enter the
+                        # budget again -- including when the reservation returned None
+                        # because the budget is disabled, which is the default.
+                        count_toward_import_budget=False,
+                        import_budget_token=budget_token,
+                    )
+            except BaseException as exc:
+                # No dedicated ImportChunkBudgetError branch here, and none is
+                # reachable from the front door: admission was reserved above, so
+                # an exhausted window answered 429 before this task existed and
+                # this call cannot be refused for budget. What remains is a
+                # genuine failure, for which 'error' is the honest terminal state
+                # -- an upload's only copy is the staged temp file the finally
+                # unlinks, and an upload:// source has no re-fetchable URI, so
+                # unlike the local_file / agent-url paths there is nothing to
+                # retry from and 'pending' would promise one.
+                # ``except BaseException`` for the reason _ingest_local_file_task
+                # documents: a cancel must not strand the row at 'syncing'.
+                is_cancel = isinstance(exc, asyncio.CancelledError)
+                if is_cancel:
+                    logger.debug("Background ingestion cancelled for %s", src_id)
+                else:
+                    logger.exception("Background ingestion failed for %s", filename)
+                # ('syncing', 'pending'): a cancel can land before this path's
+                # best-effort 'syncing' stamp -- during the source re-read --
+                # while a freshly inserted row still reads the INSERT default
+                # 'pending'. A committed 'synced' is still never overwritten.
+                # The re-read above sits between reserving the admission and
+                # handing it to ingest_file, so a failure there leaves the
+                # reservation open and its placeholder stranded in the window
+                # for the process lifetime. Release is a no-op once ingest_file
+                # has taken the token (its own finally settles or releases it),
+                # so this is safe on every path through the try -- the cancel
+                # path included. First, before the status write: that write
+                # must not skip the reclaim.
+                pipeline.release_import_budget(budget_token)
+                if is_cancel:
+                    await _finalize_sync_status(
+                        store, src_id, "error", from_statuses=("syncing", "pending"))
+                    raise
+                # Unconditional, NOT the CAS: this path's 'syncing' stamp is
+                # best-effort, so a failed stamp co-occurring with a failed
+                # ingest would leave the CAS nothing to move and the row
+                # holding a stale prior status over a deleted upload.
+                await asyncio.to_thread(_set_sync_status, store, src_id, "error")
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
 
-        task = asyncio.create_task(_bg_ingest(str(staged), source_id))
-        app_tasks = request.app.setdefault("_bg_tasks", set())
-        app_tasks.add(task)
-        task.add_done_callback(app_tasks.discard)
+        # The gate is held from the lookup, through the re-used row's 'syncing'
+        # stamp, until the task holds its own gate: an itemless row in a
+        # terminal status from an earlier upload of this name is what the
+        # sweep reclaims, and the id goes back to the client in this response.
+        async with pipeline.ingestion_in_flight():
+            # One take: the UNIQUE uri decides, so a repeated upload of the same
+            # filename cannot race two inserts. A row this call CREATES is
+            # stamped by nothing here: the INSERT's own status keeps it out of
+            # the orphan sweep until its ingest ends, and a disconnect cannot
+            # commit a 'syncing' the scheduled work then never clears.
+            source_id, created = await asyncio.to_thread(
+                _add_source_unique, store,
+                name=filename, source_type='local_file', uri=uri, properties={},
+            )
+            if not created:
+                # Marking a re-used row owed an ingest keeps the id the client
+                # receives the row the ingest fills; a disconnect in between
+                # leaves a pre-existing row reading 'syncing', a hint the next
+                # upload of the name clears.
+                # A hint, never a precondition: this write sits inside the outer
+                # try, whose except unlinks the staged file -- the upload's only
+                # copy -- so a contended writer lock here must not turn a
+                # re-upload into a 500 with nothing ingested. The gate is held
+                # across the gap, and the task re-stamps under its own hold.
+                try:
+                    await asyncio.to_thread(_set_sync_status, store, source_id, "syncing")
+                except Exception:
+                    logger.exception(
+                        "Could not stamp 'syncing' for re-used source %s; ingesting anyway",
+                        source_id)
+            staged_path = str(staged)
+            await _hand_off_under_gate(
+                request, pipeline,
+                lambda gate_taken: _bg_ingest(staged_path, source_id, gate_taken),
+            )
 
         _sel_log("ingest", filename=filename)
         return web.json_response({"source_id": source_id, "status": "processing"})
     except Exception:
         logger.exception("Ingestion failed for %s", filename)
+        # Reclaim the admission if the failure landed between reserving it and
+        # handing it to ingest_file; otherwise the placeholder would sit in the
+        # window for its duration and refuse imports that should pass. Once the
+        # background task exists, ingest_file's finally owns the token.
+        pipeline.release_import_budget(budget_token)
         staged.unlink(missing_ok=True)
         return web.json_response({"error": "internal server error"}, status=500)
 
@@ -1575,8 +2337,9 @@ async def ingest_file(request: web.Request) -> web.Response:
 async def get_job(request: web.Request) -> web.Response:
     """GET /api/knowledge/jobs/{id}."""
     store = _store(request)
-    row = store.db.execute("SELECT * FROM ingestion_jobs WHERE id = ?",
-                           (request.match_info["id"],)).fetchone()
+    row = await asyncio.to_thread(
+        lambda: store.db.execute("SELECT * FROM ingestion_jobs WHERE id = ?",
+                                 (request.match_info["id"],)).fetchone())
     if not row:
         return web.json_response({"error": "not found"}, status=404)
     return web.json_response(dict(row))
@@ -1589,7 +2352,7 @@ async def export_item(request: web.Request) -> web.Response:
     """GET /api/knowledge/items/{id}/export -- .knowledge JSON bundle."""
     store = _store(request)
     item_id = request.match_info["id"]
-    bundle = store.export_item(item_id)
+    bundle = await asyncio.to_thread(store.export_item, item_id)
     if not bundle:
         return web.json_response({"error": "not found"}, status=404)
     _sel_log("export_item", item_id=item_id)
@@ -1601,7 +2364,7 @@ async def export_all(request: web.Request) -> web.Response:
     namespace = request.query.get("namespace")
     _sel_log("export_all", namespace=namespace)
     store = _store(request)
-    bundle = store.export_all(namespace=namespace)
+    bundle = await asyncio.to_thread(store.export_all, namespace=namespace)
     safe_ns = re.sub(r'[^\w.-]', '_', namespace) if namespace else None
     filename = f"{safe_ns}.knowledge" if safe_ns else "knowledge.knowledge"
     return web.json_response(bundle, headers={"Content-Disposition": f"attachment; filename={filename}"})
@@ -1635,8 +2398,25 @@ async def import_bundle(request: web.Request) -> web.Response:
         redacted_type = _redact(rel.get("relation_type"))
         rel["relation_type"] = redacted_type if redacted_type is not None else ""
         rel["description"] = _redact(rel.get("description"))
+    store = _store(request)
+
+    # BEGIN IMMEDIATE takes the write lock eagerly (busy_timeout 10s) and a
+    # large bundle inserts thousands of rows before the commit rebuilds the
+    # entity graph with a full table scan -- never on the event loop. The
+    # success audit rides in the same worker as the commit: a client
+    # disconnect cancels the awaiting coroutine, and a cancellation landing
+    # after the worker committed must not skip the SEL record (the worker
+    # thread runs to completion regardless; SEL writes are lock-guarded).
+    # The worker re-raises here, so every arm below still catches exactly
+    # what the synchronous call raised; the rejection arms keep their own
+    # audit lines because they are tied to the HTTP response they build.
+    def _import_and_audit() -> dict:
+        result = store.import_bundle(body)
+        _sel_log("import", **result)
+        return result
+
     try:
-        result = _store(request).import_bundle(body)
+        result = await asyncio.to_thread(_import_and_audit)
     except KnowledgeBundleError as exc:
         # The store enforces the JSON-column well-formedness invariant
         # (sources.properties / entities.aliases) at the writer; surface its
@@ -1677,23 +2457,35 @@ async def import_bundle(request: web.Request) -> web.Response:
             {"error": "internal server error", "code": "knowledge_import_failed"},
             status=500,
         )
-    _sel_log("import", **result)
     return web.json_response(result)
 
 
 # ---------- Route registration ----------
 
 
-async def get_embedding_status(request: web.Request) -> web.Response:
-    """GET /api/knowledge/embedding/status -- embedding config and progress."""
-    store = _store(request)
-    embedder = request.app.get("knowledge_embedder")
+def _embedding_counts(store) -> tuple[int, int]:
+    """(total active items, active items with a vector) in one off-loop take.
+
+    Sync on purpose: the dashboard polls the status endpoint repeatedly, and
+    running these COUNTs on the gateway loop busy-waits every task (watchdog
+    heartbeat included) whenever the knowledge DB is contended. The caller
+    dispatches this to a worker thread; ``store.db`` is thread-local, so the
+    thread gets its own connection.
+    """
     total = store.db.execute(
         "SELECT COUNT(*) as c FROM items WHERE status = 'active'"
     ).fetchone()["c"]
     embedded = store.db.execute(
         "SELECT COUNT(*) as c FROM items WHERE status = 'active' AND embedding IS NOT NULL"
     ).fetchone()["c"]
+    return total, embedded
+
+
+async def get_embedding_status(request: web.Request) -> web.Response:
+    """GET /api/knowledge/embedding/status -- embedding config and progress."""
+    store = _store(request)
+    embedder = request.app.get("knowledge_embedder")
+    total, embedded = await asyncio.to_thread(_embedding_counts, store)
     # Polled every 30s by the frontend — loop-safe probe.
     available = await embedder.is_available_async() if embedder else False
     return web.json_response({
@@ -1705,6 +2497,97 @@ async def get_embedding_status(request: web.Request) -> web.Response:
     })
 
 
+def _finalize_job(store, job_id: str, status: str, *,
+                  processed: int | None = None, error: str | None = None) -> bool:
+    """Stamp a terminal state on an ingestion job row, in one off-loop take.
+
+    True when this call is the one that moved the row. Only a row still
+    ``processing`` is moved, and that compare-and-set is what stops a second
+    finalize from overwriting the first: a shutdown cancel delivered while the
+    success finalize is in its worker lands in the caller's
+    ``except BaseException`` arm, which would otherwise stamp 'cancelled' over
+    the 'completed' that already committed. Reporting the rowcount is what lets
+    the caller's audit line record what happened rather than what it attempted
+    -- see ``_finalize_job_audited``.
+
+    One take per logical write, for the reason ``_set_sync_status`` documents.
+    """
+    if processed is not None:
+        cur = store.db.execute(
+            "UPDATE ingestion_jobs SET status = ?, items_processed = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'processing'",
+            (status, processed, datetime.now().isoformat(), job_id))
+    else:
+        cur = store.db.execute(
+            "UPDATE ingestion_jobs SET status = ?, error = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'processing'",
+            (status, error, datetime.now().isoformat(), job_id))
+    store.db.commit()
+    return cur.rowcount > 0
+
+
+def _finalize_job_audited(store, job_id: str, status: str, *, fields: dict,
+                          processed: int | None = None,
+                          error: str | None = None) -> bool:
+    """Finalize a rebuild job and audit the outcome, in ONE off-loop take.
+
+    The audit rides inside the take for the reason ``_audited_write`` documents,
+    but this caller cannot use that helper: the line has to be *conditional* on
+    the compare-and-set having moved the row. Both terminal paths of a rebuild
+    job race -- a shutdown cancel is delivered to the coroutine after the
+    success finalize already committed 'completed' -- and the loser's CAS moves
+    nothing. Auditing anyway records an outcome the job never reached: a
+    'cancelled' line for a run that completed and embedded every vector.
+    Gating on the rowcount means exactly one outcome line is written per job,
+    and it names the state the row actually holds.
+    """
+    moved = _finalize_job(store, job_id, status, processed=processed, error=error)
+    if moved:
+        _sel_log("batch_embed", **fields)
+    return moved
+
+
+def _active_rebuild_job(store):
+    """The rebuild job already holding the single-flight slot, in one off-loop take."""
+    return store.db.execute(
+        "SELECT id FROM ingestion_jobs WHERE source_id IS NULL AND status = 'processing' "
+        "ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+
+
+def _unembedded_rows(store) -> list:
+    """Up to 200 active items still missing an embedding, in one off-loop take.
+
+    Sync on purpose: the predicate is not indexed, so this scans ``items``, which
+    grows without bound. The caller dispatches this to a worker thread;
+    ``store.db`` is thread-local, so the thread gets its own connection.
+    """
+    return store.db.execute(
+        "SELECT id, title, summary, content FROM items "
+        "WHERE status = 'active' AND embedding IS NULL LIMIT 200"
+    ).fetchall()
+
+
+def _write_embedding(store, item_id: str, vector: bytes, sig: str) -> None:
+    """Store one item's vector, in one off-loop take.
+
+    Per item rather than per batch on purpose: the connection runs in autocommit
+    mode, so each write is already durable on its own, and deferring writes to
+    batch them would lose finished embeddings if the request were cancelled.
+    """
+    store.db.execute(
+        "UPDATE items SET embedding = ?, embedding_sig = ?, embedded_at = ? WHERE id = ?",
+        (vector, sig, datetime.now().isoformat(), item_id))
+    store.db.commit()
+
+
+def _unembedded_count(store) -> int:
+    """How many active items still have no embedding, in one off-loop take."""
+    return store.db.execute(
+        "SELECT COUNT(*) as c FROM items WHERE status = 'active' AND embedding IS NULL"
+    ).fetchone()["c"]
+
+
 async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id: str,
                                   force: bool = False) -> None:
     """Background wrapper: run the sig-gated rebuild and finalize the job row.
@@ -1713,6 +2596,11 @@ async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id:
     the watcher self-heal path shares one implementation. Vectors are overwritten
     one item at a time, so existing vectors stay queryable throughout -- search
     degrades gracefully during the rebuild instead of going dark.
+
+    PRIORITY_NORMAL, stated rather than defaulted: this is the ATTENDED rebuild --
+    a user clicked it and is polling the job row for progress -- so it keeps the
+    full interactive pool. The watcher's unattended twin passes PRIORITY_BULK, and
+    the difference is the point.
     """
     try:
         # pace=False: this job exists because a human clicked Rebuild and is
@@ -1721,26 +2609,33 @@ async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id:
         # path stays on the paced default.
         processed = await rebuild_embeddings(store, embedder, job_id=job_id, force=force,
                                              pace=False)
-        store.db.execute(
-            "UPDATE ingestion_jobs SET status = 'completed', items_processed = ?, updated_at = ? "
-            "WHERE id = ?",
-            (processed, datetime.now().isoformat(), job_id))
-        store.db.commit()
-        _sel_log("batch_embed", count=processed, rebuild=True, force=force)
+        # Audit from inside the worker, gated on the CAS: a cancel delivered
+        # while this await is in flight would otherwise skip the completed line
+        # (it is the coroutine that dies, not the thread), and a cancel that
+        # already stamped the row must not collect a completed line either.
+        await asyncio.to_thread(
+            _finalize_job_audited, store, job_id, "completed", processed=processed,
+            fields={"count": processed, "rebuild": True, "force": force,
+                    "outcome": "completed"})
     except BaseException as exc:
-        # CancelledError is a BaseException in 3.8+; finalize the row so a shutdown
-        # cancellation can't leave it 'processing' and block the single-flight guard.
+        # CancelledError is a BaseException in 3.8+; finalize the row so a
+        # shutdown cancellation does not leave it 'processing'.
         is_cancel = isinstance(exc, asyncio.CancelledError)
         status = "cancelled" if is_cancel else "failed"
         if is_cancel:
             logger.debug("Embedding rebuild job %s cancelled", job_id)
         else:
             logger.exception("Embedding rebuild job %s failed", job_id)
-        store.db.execute(
-            "UPDATE ingestion_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?",
-            (status, str(exc), datetime.now().isoformat(), job_id))
-        store.db.commit()
-        _sel_log("batch_embed", rebuild=True, force=force, outcome=status)
+        # Off-loop like every other write here, on the cancellation path too. A
+        # re-cancel can interrupt this await before the worker returns, but the
+        # thread runs to completion, so the write still lands; and even if the
+        # process dies first, `start_rebuild_job` sweeps a stale 'processing'
+        # row to 'abandoned', so the single-flight guard cannot stay blocked.
+        # Suppressing the re-cancel keeps `exc` current for the bare `raise`.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.to_thread(
+                _finalize_job_audited, store, job_id, status, error=str(exc),
+                fields={"rebuild": True, "force": force, "outcome": status})
         if is_cancel:
             raise
 
@@ -1775,10 +2670,7 @@ async def batch_embed_items(request: web.Request) -> web.Response:
         # event loop (no-blocking-call-on-event-loop).
         job_id = await asyncio.to_thread(start_rebuild_job, store)
         if job_id is None:
-            active = store.db.execute(
-                "SELECT id FROM ingestion_jobs WHERE source_id IS NULL AND status = 'processing' "
-                "ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
+            active = await asyncio.to_thread(_active_rebuild_job, store)
             return web.json_response(
                 {"job_id": active["id"] if active else None, "status": "processing"}
             )
@@ -1789,10 +2681,7 @@ async def batch_embed_items(request: web.Request) -> web.Response:
         task.add_done_callback(app_tasks.discard)
         return web.json_response({"job_id": job_id, "status": "processing"})
 
-    rows = store.db.execute(
-        "SELECT id, title, summary, content FROM items "
-        "WHERE status = 'active' AND embedding IS NULL LIMIT 200"
-    ).fetchall()
+    rows = await asyncio.to_thread(_unembedded_rows, store)
 
     loop = asyncio.get_running_loop()
     sig = embedder_signature(embedder)
@@ -1802,17 +2691,11 @@ async def batch_embed_items(request: web.Request) -> web.Response:
             None, embedder.embed_for_item, row["title"], row["summary"], row["content"]
         )
         if vec:
-            store.db.execute(
-                "UPDATE items SET embedding = ?, embedding_sig = ?, embedded_at = ? WHERE id = ?",
-                (floats_to_bytes(vec), sig, datetime.now().isoformat(), row["id"]))
+            await asyncio.to_thread(
+                _write_embedding, store, row["id"], floats_to_bytes(vec), sig)
             embedded += 1
-            if embedded % 50 == 0:
-                store.db.commit()
 
-    store.db.commit()
-    remaining = store.db.execute(
-        "SELECT COUNT(*) as c FROM items WHERE status = 'active' AND embedding IS NULL"
-    ).fetchone()["c"]
+    remaining = await asyncio.to_thread(_unembedded_count, store)
     _sel_log("batch_embed", count=embedded, rebuild=False)
     return web.json_response({"embedded": embedded, "total": len(rows), "remaining": remaining})
 
@@ -1884,12 +2767,13 @@ async def search_for_context(request: web.Request) -> web.Response:
         limit = top_n
 
     embedder = request.app.get("knowledge_embedder")
-    embed_fn = embedder.embed if embedder and await embedder.is_available_async() else None
-    retriever = HybridRetriever(store, embedder=embed_fn)
+    available = bool(embedder) and await embedder.is_available_async()
+    embed_fn, embed_sig = vector_leg(embedder if available else None)
+    retriever = HybridRetriever(store, embedder=embed_fn, embed_sig=embed_sig)
     # HybridRetriever.search runs on an mc-embed worker thread; KnowledgeStore
     # hands each thread its own sqlite connection, so all sqlite
-    # access is thread-safe here. mc-embed bulkhead: the query embed
-    # blocks on Ollama.
+    # access is thread-safe here. mc-embed bulkhead: the query embed occupies
+    # the shared model.
     results = await run_in_embed_pool(retriever.search, q, limit=limit)
 
     cards = []
@@ -1980,6 +2864,9 @@ def setup_knowledge_routes(app: web.Application) -> None:
             pool_size=cfg.knowledge.extraction_pool_size,
             effort=DEFAULT_EXTRACTION_EFFORT,
             use_config_pool_size=False,
+            # Seeded from knowledge.extraction_pool_size above, so it follows a
+            # later write to that key (applied at the next idle boundary).
+            track_config_pool_size=True,
         )
         fetch_pool = LLMPool(
             pool_size=1,
@@ -2034,6 +2921,9 @@ def setup_knowledge_routes(app: web.Application) -> None:
         app.on_startup.append(_start_watcher_async)
         # Start artifact ingest watcher (no-op unless auto-ingest is enabled)
         app.on_startup.append(_start_artifact_ingest_async)
+        # Follow knowledge.* live: embedder tuning, artifact auto-ingest on/off,
+        # and the eligible artifact kinds.
+        app.on_startup.append(_watch_knowledge_config)
 
     app.router.add_get("/api/knowledge/config", get_config)
     app.router.add_get("/api/knowledge/items", list_items)

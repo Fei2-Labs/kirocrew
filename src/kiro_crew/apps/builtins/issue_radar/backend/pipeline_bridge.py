@@ -202,8 +202,8 @@ def _remember_owned(owner: str, repo: str, root: Path | None, name: str, crew_id
     """
     path = _owned_path(owner, repo, root)
     lock_path = path.with_suffix(".lock")
-    with open(lock_path, "w") as fd:
-        with platform_compat.file_lock(fd.fileno(), exclusive=True):
+    with platform_compat.open_lock_file(lock_path) as lock_fd:
+        with platform_compat.file_lock(lock_fd, exclusive=True):
             owned = _owned_ids(owner, repo, root)
             owned[name] = crew_id
             atomic_write(path, json.dumps(owned, indent=2))
@@ -571,8 +571,8 @@ def replay(
     # nonsense. `record_stage` needs no such lock: it is a single event whose only
     # shared write is the ownership index, which has its own.
     lock_path = _replay_lock_path(owner, repo, pipeline, root)
-    with open(lock_path, "w") as fd:
-        with platform_compat.file_lock(fd.fileno(), exclusive=True):
+    with platform_compat.open_lock_file(lock_path) as lock_fd:
+        with platform_compat.file_lock(lock_fd, exclusive=True):
             return _replay_locked(owner, repo, events, pipeline=pipeline, table=table, root=root)
 
 

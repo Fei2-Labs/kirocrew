@@ -65,16 +65,10 @@ separate `computer_get_state`. Two things to remember:
 computer_get_state(app="Finder", screenshot=True)
 ```
 
-**Do NOT pass `screenshot=false` here.** Omitting the argument already captures one
-(the operator's Settings default), and that capture is what opens the user's **live
-view**: the dashboard mirrors the JPEG into a floating panel, which only appears once
-a frame exists. Turning it off on the first call leaves the user watching a blank
-space while you drive their machine. Passing `screenshot=True` explicitly is fine and
-harmless if you want to be sure.
-
-The capture is not for your benefit — you get a file PATH, not an image, and you
-should keep reading the outline. One frame opens the panel; it stays open for the rest
-of the task.
+Request a screenshot on the first snapshot of each turn: do not pass
+`screenshot=false` while the user is watching. The capture opens the floating live
+view. You receive a file path, not an image; keep using the outline unless the
+pixels are needed.
 
 Optional: `text_limit` (per-element text cap), `max_tree_nodes`, `max_tree_depth`,
 `screenshot` (bool). You get a numbered outline:
@@ -203,6 +197,9 @@ single/double/triple), and `click_method`:
   one method built on a private Apple API, so it can stop working on a future macOS —
   when it is unavailable the refusal says so and names `app_post`. Do not reach for it
   first; reach for it when a covered window is the reason a click did nothing.
+  It is a **left-button recipe only**: pairing it with `mouse_button: right` or
+  `middle` is refused, and the refusal names `app_post` as the route for those,
+  since that reaches the same application through a public API.
 
 `computer_drag` is coordinate-only — no accessibility action expresses a sweep
 between two points — and it takes the same `mouse_button` / `click_method` options.
@@ -270,20 +267,6 @@ computer_end_turn()
 Drops the cached snapshots. Call it when the desktop part of the task is done. It
 is cheap and it prevents a stale-index refusal later in the conversation.
 
-## A screenshot has TWO purposes — keep them straight
-
-This trips models up, so be explicit about which one you are serving:
-
-1. **The user's live view (usually why you want one).** Capturing a screenshot is
-   what makes the floating panel appear and update, so the user can watch you work.
-   This costs you almost nothing: you get a file PATH, not an image, and you do not
-   read it. **Ask for it on your first snapshot and after each visible change.**
-2. **Your own perception (rarely).** Actually READING the file costs ~8,000 tokens
-   and is a last resort — the outline is your channel.
-
-So "take a screenshot" and "look at a screenshot" are different acts. Do the first
-liberally; do the second only when the tree genuinely cannot answer the question.
-
 ## When something does not work: change the MECHANISM, not the arguments
 
 This is the rule that separates a two-call fix from a twenty-call loop. When an
@@ -344,15 +327,10 @@ Screenshot: /var/folders/.../kirocrew-computer-shots/shot-1769472013411.jpeg
   insufficient.
 ```
 
-Open it with the file-read tool **only** when the outline genuinely cannot answer
-the question — a chart, a rendered document, a layout problem, or a control the
-accessibility layer did not expose. Reading it costs roughly 8,000 tokens. If the
-user asked "show me", just give them the path; the dashboard renders it.
-
-Pass `screenshot=false` only when nobody is watching and you purely need
-structure — a long mechanical loop over many elements, for instance. Prefer leaving
-it on: the cost of capturing (not reading) one is small, and it is what keeps the
-user's live view alive.
+Read the file only when the outline cannot answer the question: a chart, rendered
+document, layout problem, or unexposed control. Reading costs roughly 8,000 tokens;
+capture alone is cheap. If the user asked "show me", give them the path to render.
+Use `screenshot=false` only for unwatched, structure-only work.
 
 ## Reading the refusals correctly
 
@@ -372,6 +350,7 @@ These are **answers**, not failures. Relay them and adapt; do not loop.
 | `computer use is disabled …` | the primary switch is off | tell the user to enable it in Settings → Computer Use; do not retry |
 | `computer use is not supported on this platform (…)` | no driver for this OS (e.g. Linux) | say so once |
 | `click_method 'app_post' is macOS-only …` / `'sky_click' is macOS-only …` | a macOS-only click method on Windows | use an `element_index` (no pointer moves), or name `click_method: "global"` to accept the cursor move |
+| `click_method 'sky_click' supports only the left mouse button (…)` | `sky_click` is a left-button-only recipe | use `left`, or switch to `app_post` for a right/middle click — the refusal names it |
 | `click_method 'auto' with coordinates cannot be served on Windows` | `auto` + x/y, where the only coordinate route moves the real cursor | pass an `element_index`, or name `global` explicitly — `auto` never takes the pointer on its own |
 | `element N … advertises no action this platform can perform` | the element implements no invoke / toggle / select / legacy default action | try its parent or a child from `computer_get_state` |
 | `dragging on Windows moves the operator's real cursor …` | a drag with the default `click_method` (the macOS app-scoped route) | pass `click_method: "global"` explicitly — Windows has no pointer-free drag, so the opt-in is the whole point. There is no element form of a drag |

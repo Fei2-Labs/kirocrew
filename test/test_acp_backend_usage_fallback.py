@@ -117,13 +117,17 @@ class TestOwnRecordsFallback:
 
 
 class TestFallbackSelection:
-    def test_kiro_host_still_reports_the_error(
+    def test_kiro_host_falls_through_to_the_ordinary_empty_parse(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """On a kiro host an absent directory genuinely means something is wrong."""
+        """On a kiro host an absent directory is upstream's own empty-stats
+        case (test_usage.py::test_empty_session_stats), not an error: nothing
+        has been recorded yet, which is complete data."""
         monkeypatch.setattr(usage, "_sessions_dir", lambda: tmp_path / "gone")
         monkeypatch.setattr(usage, "_configured_acp_backend", lambda: "")
-        assert usage._parse_sessions() == {"error": "No sessions directory"}
+        result = usage._parse_sessions()
+        assert "error" not in result
+        assert result["total_sessions"] == 0
 
     def test_other_backend_uses_the_fallback(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, shards: Path

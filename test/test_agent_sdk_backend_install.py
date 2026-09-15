@@ -30,9 +30,11 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_KNOWN,
 )
 from kiro_crew.agent_sdk import backend_install as probe
+from kiro_crew.agent_sdk import host_auth
 
 
 @pytest.fixture(autouse=True)
@@ -54,8 +56,9 @@ def _stub_resolvers(
     kiro="/usr/local/bin/kiro-cli",
     adapter=(["node", "/n/acp.js"], "/usr/bin"),
     claude_cli="/usr/local/bin/claude",
+    opencode=("/usr/local/bin/opencode", "/usr/bin"),
 ):
-    """Patch the three spawn resolvers on the module the driver imports from.
+    """Patch the four spawn resolvers on the module the driver imports from.
 
     Patched on ``kiro_crew.acp.client`` -- the DEFINING module -- because the
     driver imports them function-locally at call time, so that is the namespace
@@ -67,6 +70,212 @@ def _stub_resolvers(
     monkeypatch.setattr(client, "_resolve_kiro_bin", lambda **_kw: kiro)
     monkeypatch.setattr(client, "_resolve_claude_acp_bin", lambda: adapter)
     monkeypatch.setattr(client, "_resolve_claude_code_executable", lambda: claude_cli)
+    # Stubbed like the other three, and for a sharper reason: this harness IS
+    # installed on the recording host, so a payload assertion that reached the real
+    # resolver would read ``installed`` here and ``missing`` in CI.
+    monkeypatch.setattr(client, "_resolve_opencode_bin", lambda: opencode)
+
+
+# ── The opencode driver seams ──
+
+
+class TestOpencodeDriverSeams:
+    """One harness, one component: the seam answers presence and nothing else.
+
+    There is deliberately no cached-negative seam here, unlike the two Node
+    adapters. Their spawn path publishes a module-level argv cache the probe reads
+    to tell "absent" from "absent when this process last looked"; the opencode spawn
+    path caches a plain ``(path, search_path)`` pair with no such published
+    negative, so a ``restart_required`` answer would be invented rather than read.
+    """
+
+    def test_a_resolved_binary_is_a_yes(self, monkeypatch):
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        _stub_resolvers(monkeypatch, opencode=("/opt/opencode", "/usr/bin"))
+        assert driver.opencode_resolves() is True
+
+    def test_an_absent_binary_is_a_no(self, monkeypatch):
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        _stub_resolvers(monkeypatch, opencode=(None, "/usr/bin"))
+        assert driver.opencode_resolves() is False
+
+    def test_the_install_command_is_the_spawn_paths_own_constant(self):
+        """Read from the constant, so the advice cannot drift from the binary searched for.
+
+        Compared against the import rather than a literal: a literal here would pin
+        the WORDING of operator advice, when the contract is that the two agree.
+        """
+        from kiro_crew.acp.client import OPENCODE_INSTALL_COMMAND
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        assert driver.opencode_install_command() == OPENCODE_INSTALL_COMMAND
+        assert OPENCODE_INSTALL_COMMAND
+
+
+class TestOpencodeCachedNegative:
+    """The same six cases the adapter seams honour, on the opencode cache."""
+
+    def test_unresolved_sentinel_is_not_a_negative(self, monkeypatch):
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_opencode_bin_cache", client._UNRESOLVED)
+        assert driver.opencode_cached_negative() is False
+
+    def test_a_cached_absence_is_a_negative(self, monkeypatch):
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_opencode_bin_cache", (None, "/usr/bin"))
+        assert driver.opencode_cached_negative() is True
+
+    def test_a_cached_path_is_not_a_negative(self, monkeypatch):
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_opencode_bin_cache", ("/opt/opencode", "/usr/bin"))
+        assert driver.opencode_cached_negative() is False
+
+    def test_an_unparseable_cache_fails_safe(self, monkeypatch):
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_opencode_bin_cache", 42)
+        assert driver.opencode_cached_negative() is False
+
+    def test_installed_after_a_cached_miss_reports_restart_required(self, monkeypatch):
+        """The divergence the flag exists for: on disk now, absent in this process."""
+        from kiro_crew.acp import client
+
+        _stub_resolvers(monkeypatch, opencode=("/opt/opencode", "/usr/bin"))
+        monkeypatch.setattr(client, "_opencode_bin_cache", (None, "/usr/bin"))
+        state = probe.probe_backend(ACP_BACKEND_OPENCODE)
+        assert state.installed == probe.INSTALLED
+        assert state.restart_required is True
+
+
+class TestOpencodeVerdicts:
+    """The probe says installed, or names the one thing to install."""
+
+    def test_a_resolved_binary_is_installed_and_names_nothing(self, monkeypatch):
+        from kiro_crew.acp import client
+
+        _stub_resolvers(monkeypatch, opencode=("/opt/opencode", "/usr/bin"))
+        monkeypatch.setattr(client, "_opencode_bin_cache", client._UNRESOLVED)
+        state = probe.probe_backend(ACP_BACKEND_OPENCODE)
+        assert state.installed == probe.INSTALLED
+        assert state.missing_components == ()
+        assert state.install_command == ""
+        assert state.restart_required is False
+        assert state.policy_id == "opencode"
+
+    def test_an_absent_binary_names_the_component_and_the_command(self, monkeypatch):
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        _stub_resolvers(monkeypatch, opencode=(None, "/usr/bin"))
+        state = probe.probe_backend(ACP_BACKEND_OPENCODE)
+        assert state.installed == probe.MISSING
+        assert state.missing_components == (probe.COMPONENT_OPENCODE,)
+        assert state.install_command == driver.opencode_install_command()
+
+
+# ── The codex driver seams ──
+
+
+class TestCodexDriverSeams:
+    """The three functions ``_probe_codex`` reads its verdict from.
+
+    Tested at the driver rather than only through the probe because the
+    cached-negative logic is the part with a real hazard: an operator installs the
+    adapter a MISSING row told them to install, and every spawn in the running
+    gateway still reuses the cached ``None`` until a restart. Reporting
+    ``restart_required`` instead of a bare ``installed`` is what keeps the panel
+    from promising something the next session breaks.
+    """
+
+    def test_resolves_reports_a_runnable_argv(self, monkeypatch):
+        """One component, unlike claude's two: the adapter ships its own Codex binary."""
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_resolve_codex_acp_bin", lambda: (["node", "/n/c.js"], "/p"))
+        assert driver.codex_adapter_resolves() is True
+
+    def test_resolves_reports_absence(self, monkeypatch):
+        """``(None, searched_path)`` is the resolver's own "not found", not an error."""
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_resolve_codex_acp_bin", lambda: (None, "/searched"))
+        assert driver.codex_adapter_resolves() is False
+
+    def test_unresolved_cache_is_not_a_negative(self, monkeypatch):
+        """No session has needed the adapter yet, so the fresh answer is the true one.
+
+        Reading the sentinel as a negative would report ``restart_required`` on a
+        gateway that has simply never spawned codex.
+        """
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_codex_acp_argv_cache", client._UNRESOLVED)
+        assert driver.codex_adapter_cached_negative() is False
+
+    def test_absent_cache_attribute_is_not_a_negative(self, monkeypatch):
+        """A build without the global must not read as a cached failure."""
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.delattr(client, "_codex_acp_argv_cache", raising=False)
+        assert driver.codex_adapter_cached_negative() is False
+
+    def test_cached_negative_is_reported(self, monkeypatch):
+        """A cached ``None`` is the case the whole function exists for.
+
+        The adapter may be on disk NOW while this process still refuses to spawn
+        it, so the row has to say "restart" rather than "installed".
+        """
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_codex_acp_argv_cache", (None, "/searched"))
+        assert driver.codex_adapter_cached_negative() is True
+
+    def test_cached_positive_is_not_a_negative(self, monkeypatch):
+        """A cached runnable argv means spawns work; nothing to disclose."""
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_codex_acp_argv_cache", (["node", "/n/c.js"], "/p"))
+        assert driver.codex_adapter_cached_negative() is False
+
+    def test_unreadable_cache_shape_fails_safe(self, monkeypatch):
+        """A cache that will not unpack must not crash a dashboard GET.
+
+        Fails toward "no disclosure" rather than toward an exception: the row is
+        built on a read-only path that must degrade, not 500.
+        """
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(client, "_codex_acp_argv_cache", object())
+        assert driver.codex_adapter_cached_negative() is False
+
+    def test_install_command_names_the_package_the_resolver_searches_for(self):
+        """The advice and the resolution ladder must agree by construction.
+
+        A global install of the SCOPED package puts the UNSCOPED binary on PATH,
+        which is what the ladder looks for -- so the command is built from the same
+        constant rather than restated, and cannot drift from what satisfies it.
+        """
+        from kiro_crew.acp.client import CODEX_ACP_NPM_PKG
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        command = driver.codex_adapter_install_command()
+        assert command == f"npm i -g {CODEX_ACP_NPM_PKG}"
+        assert CODEX_ACP_NPM_PKG in command
 
 
 # ── Per-backend verdicts ──
@@ -424,23 +633,51 @@ class TestInstallSnapshot:
         # upstream's three-backend world and fail on every adapter added.
         from kiro_crew.acp_backends import ACP_BACKENDS_KNOWN
 
+        rows = sorted(snapshot.values(), key=lambda row: row["policy_id"])
         assert set(snapshot) == set(ACP_BACKENDS_KNOWN)
-        for row in snapshot.values():
+        assert [r["policy_id"] for r in rows] == [
+            "claude",
+            "codex",
+            "copilot",
+            "goose",
+            "kas",
+            "kiro",
+            "opencode",
+            "pi",
+        ]
+        for row in rows:
             assert set(row) == {
+                "id",
                 "policy_id",
+                "selectable",
                 "installed",
                 "missing_components",
                 "install_command",
                 "restart_required",
+                "auth",
             }
+            # Sign-in is the harness's own third fact, so every row carries it --
+            # including a row whose harness this build cannot serve, which is the
+            # one an operator is most likely to be asking about.
+            assert set(row["auth"]) == {"sign_in_remedy", "signs_in_separately"}
 
         by_policy = {row["policy_id"]: row for row in snapshot.values()}
         assert by_policy["kiro"] == {
+            "id": "",
             "policy_id": "kiro",
+            "selectable": True,
             "installed": "installed",
             "missing_components": [],
             "install_command": "",
             "restart_required": False,
+            # Compared against the declaration rather than a literal copy of the
+            # remedy: the string is rendered verbatim by the panel, so a literal
+            # here would pin the WORDING, and every reword of the operator advice
+            # would read as a wire-contract break.
+            "auth": {
+                "sign_in_remedy": host_auth.declaration_for("").sign_in_remedy,
+                "signs_in_separately": False,
+            },
         }
         # The kiro backend's id is "" in code and cannot be its own wire name.
         assert snapshot[""]["policy_id"] == "kiro"
@@ -452,15 +689,23 @@ class TestInstallSnapshot:
         # codex is in ACP_BACKENDS_KNOWN with no entry in ``_PROBES``, so it gets a
         # row -- the endpoint lists every id the switch can show -- but the row can
         # only say ``unknown`` and must name nothing to install. That gap is why
-        # codex is absent from BASELINE_SELECTABLE_BACKENDS: offering the switch
-        # would offer a verdict this payload cannot supply.
-        assert by_policy["codex"]["installed"] == "unknown"
-        assert by_policy["codex"]["missing_components"] == []
-        assert by_policy["codex"]["install_command"] == ""
-        # ``selectable`` is NOT asserted here: this module owns the machine half
-        # only, and the field is minted by the endpoint's merge with the registry
-        # descriptors -- pinned in ``test_acp_backends_endpoint.py``. The exact
-        # five-key row shape asserted above is what keeps it from reappearing.
+        # codex now has a probe, so its row carries a real verdict rather than
+        # ``unknown``. That is the whole reason it could be offered: the operator
+        # gets the component name and the command that installs it.
+        assert by_policy["codex"]["installed"] == "missing"
+        assert by_policy["codex"]["missing_components"] == ["codex-acp"]
+        assert by_policy["codex"]["install_command"].startswith("npm i -g ")
+        # ``selectable`` is the same derivation the PATCH allowlist uses, not a
+        # literal: this test asserts the payload shape, not the registry.
+        from kiro_crew.dashboard.handlers.core import _selectable_acp_backends
+
+        assert by_policy["codex"]["selectable"] is ("codex" in set(_selectable_acp_backends()))
+        # opencode's row is the one-component shape. The resolver is stubbed PRESENT
+        # above, so this pins the installed form -- and with it that the row invents
+        # neither a component nor a command when there is nothing to install.
+        assert by_policy["opencode"]["installed"] == "installed"
+        assert by_policy["opencode"]["missing_components"] == []
+        assert by_policy["opencode"]["install_command"] == ""
 
     def test_an_unknown_row_names_no_components(self, monkeypatch):
         """The three-state rule, enforced at the payload boundary too.

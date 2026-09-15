@@ -19,7 +19,7 @@ socket egress (B7).
 
 Spec: ``docs/system-specs/modules/workflows.md``. Never relax a check here without
 a matching update to the invariant tests (GATE group B in
-``docs/system-specs/modules/workflow-gates.md``).
+``docs/system-specs/modules/workflows.md``).
 """
 
 from __future__ import annotations
@@ -145,15 +145,33 @@ DETERMINISM_MODULES = frozenset({"time", "random", "uuid", "datetime", "secrets"
 FORBIDDEN_ATTRS = frozenset(
     {
         # generator / coroutine / async-generator introspection
-        "gi_frame", "gi_code", "gi_yieldfrom", "gi_running",
-        "cr_frame", "cr_code", "cr_await", "cr_running", "cr_origin",
-        "ag_frame", "ag_code", "ag_await", "ag_running",
+        "gi_frame",
+        "gi_code",
+        "gi_yieldfrom",
+        "gi_running",
+        "cr_frame",
+        "cr_code",
+        "cr_await",
+        "cr_running",
+        "cr_origin",
+        "ag_frame",
+        "ag_code",
+        "ag_await",
+        "ag_running",
         # frame object
-        "f_back", "f_globals", "f_builtins", "f_locals", "f_code", "f_trace",
+        "f_back",
+        "f_globals",
+        "f_builtins",
+        "f_locals",
+        "f_code",
+        "f_trace",
         # traceback object
-        "tb_frame", "tb_next",
+        "tb_frame",
+        "tb_next",
         # function object (py2-era aliases still resolve on some builds)
-        "func_globals", "func_code", "func_builtins",
+        "func_globals",
+        "func_code",
+        "func_builtins",
     }
 )
 
@@ -305,7 +323,7 @@ def check_ctx_surface(source: str, available: "frozenset[str] | set[str]") -> li
     references bound to the ``workflow`` entrypoint's context parameter are
     checked; a helper whose OWN parameter or local happens to share the name
     (e.g. ``def read(ctx): return ctx.get("key")`` called with a dict) is out of
-    scope — flagging it would retroactively reject previously-valid scripts.
+    scope — flagging it would retroactively reject already-valid scripts.
     Helpers that receive the REAL context are under-enforced by design: their
     misuse still fails at run time with the explicit unwired-port RuntimeError.
     A syntactically invalid source returns ``[]`` — ``validate`` rejects it.
@@ -450,9 +468,7 @@ class _Validator(ast.NodeVisitor):
         # use, and tying the check to call-site analysis would reopen the gap.
         if isinstance(node.value, str):
             for reason in _format_field_reasons(node.value):
-                self.errors.append(
-                    f"line {node.lineno}: {reason} (in a format string)"
-                )
+                self.errors.append(f"line {node.lineno}: {reason} (in a format string)")
         self.generic_visit(node)
 
     def visit_BinOp(self, node: ast.BinOp) -> None:  # noqa: N802 (ast.NodeVisitor API)
@@ -466,8 +482,7 @@ class _Validator(ast.NodeVisitor):
             if combined is not None:
                 for reason in _format_field_reasons(combined):
                     self.errors.append(
-                        f"line {node.lineno}: {reason} "
-                        f"(in a concatenated format string)"
+                        f"line {node.lineno}: {reason} " f"(in a concatenated format string)"
                     )
         self.generic_visit(node)
 
@@ -544,7 +559,7 @@ def _check_undefined_names(source: str, errors: list[str]) -> None:
 
 def _is_ctx_call(node: ast.AST, methods: frozenset[str]) -> str | None:
     """If ``node`` is a call ``ctx.<m>(...)`` with ``<m>`` in ``methods``, return
-    the method name; else None. Used to spot DSL-contract misuse structurally."""
+    the method name; else None. Spots DSL-contract misuse structurally."""
     if not isinstance(node, ast.Call):
         return None
     func = node.func

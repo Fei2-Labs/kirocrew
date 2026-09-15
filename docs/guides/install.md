@@ -37,19 +37,19 @@ Builds use plain `pip` + `npm`/Vite + `pytest`, driven by the repo-root
 | Requirement | Needed for | Floor |
 |-------------|------------|-------|
 | **Python** | Backend | `>= 3.12` (`requires-python` in `pyproject.toml`; `make build` provisions a 3.12 `.venv` by default) |
-| **Node.js + npm** | Building the dashboard | `20 \|\| >= 22` (`website/package.json` `engines`); `ensure-node.sh` targets 20, and drops to 16 on Amazon Linux 2 where newer official builds need a glibc that host does not have |
+| **Node.js + npm** | Building the dashboard | `>= 22` (`website/package.json` `engines`; Node 24 LTS recommended); on x86_64 Amazon Linux 2, the glibc-217 fallback installs Node 24 because official builds need a newer glibc (no glibc-217 arm64 build is available) |
 | **`kiro-cli`** | Driving the LLM | Required; see below |
 
 Node is only needed to *build* the dashboard. The prebuilt wheel, the DMG, the
 AppImage, and the Linux `.deb` / `.rpm` packages all ship the dashboard already
 bundled, so end users of those artifacts need neither Node nor a compiler.
 
-### Agent backend: `kiro-cli` (required)
+### Default agent backend: `kiro-cli`
 
-Kiro Crew drives an LLM through the **`kiro-cli`** agent over the
+Kiro Crew drives the default agent through **`kiro-cli`** over the
 [Agent Client Protocol](https://github.com/zed-industries/agent-client-protocol)
-(ACP). It is the only provider: `agent.provider` is fixed to `acp`, and the
-gateway spawns `kiro-cli acp --agent <name>`.
+(ACP). Other ACP backends can be selected with `agent.acp_backend`, but a fresh
+configuration uses Kiro and the gateway spawns `kiro-cli acp --agent <name>`.
 
 Install `kiro-cli` per its own docs, put it on your `PATH`, and log in:
 
@@ -59,8 +59,10 @@ kiro-cli login
 
 If `kiro-cli` is not on `PATH`, spawning a session fails with
 `kiro-cli not found in PATH`. On the first dashboard launch the **Set up Kiro**
-page walks through installing the CLI and completing device-code sign-in.
-`kirocrew doctor` reports both the binary and the login state.
+page detects the missing prerequisite, links to the official Kiro CLI setup
+guide, and shows the login commands to run yourself. Kiro Crew does not download
+the CLI or start its login flow. `kirocrew doctor` reports both the binary and
+the login state.
 
 ### Embeddings: nothing to install
 
@@ -82,6 +84,28 @@ hatches exist for mirrored or airgapped installs:
 
 `memory.embedding_provider` accepts only `llama_cpp`; any other value in an old
 config is coerced to it on load.
+
+Global V1 retains its existing session-start memory retrieval. Crew Member V2
+injects current persona, permanent rules and admitted project guides every turn;
+facts and past experiences are retrieved through the explicit `memory_recall`
+tool. All stores share one model and inference worker. The interactive
+`memory.embedding_threads` default is 4; `memory.embedding_bulk_threads` remains
+1. Explicit settings are honored up to the host's CPU count. Bulk threads may
+be 0 to inherit the normal setting. Background jobs share the configured bulk
+duty cycle, while waiting interactive queries take priority. A full inference
+queue leaves new rows pending and permits keyword retrieval, so additional
+members do not create unbounded native work.
+
+Private V2 execution requires `agent.sandbox=auto` and working Linux/WSL namespaces
+or macOS outer Seatbelt. Native Windows, unconfined execution, unsupported MCP
+backends and Kiro internal delegation refuse private member turns with a reason.
+The owner can still manage memory in the dashboard. Existing members, including
+the default assistant selection, keep their declared V1 memory after upgrading.
+To opt in, open Crew Manager, select the member, open **Workspace · Memory**, and
+choose **Create private memory**. The new V2 store starts empty; previous V1
+stores remain available for an explicit copy of selected starting knowledge.
+Check the execution requirements above before choosing V2. New members receive
+V2 automatically, and an existing V2 member never falls back to V1 on failure.
 
 ## Install paths
 
@@ -148,24 +172,35 @@ home (`~/.kiro/crew-venv`, override with `KIROCREW_VENV`) and symlinks
 data home, so no whole-home operation can ever delete the live interpreter. The
 selected channel is recorded to `~/.kiro/crew/channel`.
 
-If the host has no Python 3.12+, the installer provisions one itself instead of
-touching the system: it downloads a SHA-256-pinned [uv](https://docs.astral.sh/uv/)
-binary (or uses an already-installed `uv` on `PATH`), then installs a
+The installer provisions its own Python by default instead of depending on the
+system one: it downloads a SHA-256-pinned [uv](https://docs.astral.sh/uv/)
+binary (an installed `uv` on `PATH` is deliberately never executed -- `PATH`
+commonly leads with agent-writable directories), then installs a
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
 CPython 3.12 into a user-owned directory beside the data home
 (`~/.kiro/crew-python`, override with `KIROCREW_PYTHON_DIR`). No package
 manager, no sudo, and the prebuilt interpreter runs on old-glibc distros
-(CentOS 7) whose base repos never reach 3.10. Pass `--managed-python` (or set
-`KIROCREW_MANAGED_PYTHON=1`) to always use the uv-provisioned interpreter and
-skip the system ones entirely — useful when the system Python is fragile or
-version-managed. The choice is sticky: it is recorded in the data home
-(`python-mode`, next to `channel`), so later installer runs — including the
-re-run `kirocrew update` performs — keep it without the flag; opt back out
-with `--system-python`. The signed installer never pipes an unsigned
-third-party script into a shell: uv is fetched as a tarball and verified
-against pinned digests, exactly like the wheel itself. When it finishes it
-prints the next step: `kirocrew gateway` to start now, or `kirocrew service
-install` to run it as a service.
+(CentOS 7) whose base repos never reach 3.10. Pass `--system-python` (or set
+`KIROCREW_MANAGED_PYTHON=0`) to run on a system Python 3.12+ instead — the
+choice is sticky: it is recorded in the data home (`python-mode`, next to
+`channel`), so later installer runs keep it without the flag; opt back in
+with `--managed-python`.
+Installs that predate the managed default migrate onto it at their next
+direct installer run — on a managed venv, a staged update applied from the
+dashboard or the CLI's update command keeps its current interpreter — unless
+they recorded the `--system-python` opt-out. A re-run resolves the
+interpreter through the pinned uv binary; an already-provisioned interpreter
+is reused rather than re-downloaded.
+If the managed
+interpreter cannot be downloaded and a usable system Python 3.12+ exists, the
+run falls back to it with a warning (and retries the managed default next
+time); air-gapped hosts can point `KIROCREW_UV_URL` at a mirror of the uv
+release tree and `UV_PYTHON_INSTALL_MIRROR` at a mirror of the interpreter
+archives — the pinned SHA-256 digests are enforced either way. The signed
+installer never pipes an unsigned third-party script into a shell: uv is
+fetched as a tarball and verified against pinned digests, exactly like the
+wheel itself. When it finishes it prints the next step: `kirocrew gateway` to
+start now, or `kirocrew service install` to run it as a service.
 
 ### b. From source (development)
 
@@ -260,6 +295,33 @@ dashboard's changelog view works on a wheel install with no source tree.
 
 The pip install name is **`kirocrew`**; the import package is `kiro_crew`.
 
+#### Installing a PUBLISHED wheel with pip
+
+Kiro Crew is not on PyPI, so `pip` reaches it through the release CDN. Two forms
+are published, and they serve different needs:
+
+```bash
+# 1. Track a channel. A PEP 503 simple index per channel, so pip resolves the
+#    newest version itself. --pre is required: every published version carries a
+#    prerelease suffix on nightly and insider.
+pip install --pre kirocrew --extra-index-url https://updates.crew.kiro.dev/feed/stable/simple/
+
+# 2. Pin one exact wheel by hash. Every version directory publishes a SHA256SUMS
+#    file beside the wheel; take your wheel's hash from there. pip verifies it and
+#    consults no index for Kiro Crew itself.
+pip install "https://download.crew.kiro.dev/cli/stable/<version>/kirocrew-<version>-py3-none-any.whl#sha256=<sha256>"
+```
+
+Swap `stable` for `insider` or `nightly` in either URL. The two names split by
+class as a convention — `updates.crew.kiro.dev` for mutable pointers and indexes,
+`download.crew.kiro.dev` for the bytes — and today both alias the same
+distribution, which is why `KIROCREW_CDN_BASE` (or `cli.sh --cdn`) overrides both
+at once. Use the documented name for each class rather than relying on the
+aliasing.
+
+Form 1 is the one to use unless a deployment must pin a byte-exact artifact — a
+locked requirements file, an airgapped mirror, or a reproducible image build.
+
 Installed console script:
 
 | Command | Entry point |
@@ -305,7 +367,9 @@ on Linux, and an assisted NSIS Setup.exe on Windows, under
 drag-to-Applications layout carrying the opening animation's artwork. The
 Windows wizard keeps native controls and its
 per-user default while carrying matching Kiro Crew artwork through its sidebar
-and header. On macOS the default is ONE universal DMG: the Electron shell is
+and header. Its Finish page links to the external Kiro CLI setup guide and names
+the login command required by the default agent before offering to launch Kiro
+Crew. On macOS the default is ONE universal DMG: the Electron shell is
 lipo-merged, and the backend, which cannot be lipo-merged, ships as two complete
 PBS trees selected at launch by `process.arch`. The x86_64 backend is built
 under Rosetta 2, so a universal build needs an Apple-Silicon host;
@@ -390,6 +454,14 @@ app" interstitial.
 ## First run
 
 After installing by any path:
+
+Install Kiro CLI from <https://kiro.dev/cli/> and sign in for the default agent:
+
+```bash
+kiro-cli login
+```
+
+Then start Kiro Crew:
 
 ```bash
 kirocrew setup            # interactive wizard
@@ -585,6 +657,33 @@ the installer sets `User=` to the account behind `sudo` (`$SUDO_USER`, else
 login (or `sudo` with no `$SUDO_USER`), first create or pick a normal account and
 install as it, e.g. `sudo -u <user> KIROCREW_KIRO_BIN=... kirocrew service
 install` (the official Docker image already runs as the `kirocrew` user).
+
+### SELinux-enforcing hosts with kirocrew under `$HOME`
+
+On an SELinux-enforcing host whose kirocrew lives under `$HOME` — the default on
+Bazzite, Fedora Silverblue/Kinoite and other atomic desktops — a **system**
+service cannot start at all. systemd (PID 1) runs in the `init_t` domain, the
+policy does not allow that domain to `execute` a file carrying a home label
+(`user_home_t`), and the unit fails every start with `status=203/EXEC` until it
+exhausts its restart limit.
+
+The binary is fine. `test -x` on it succeeds, the shebang is correct, and the
+permissions are right — the policy's execute check is the only thing that fails,
+which is why `203/EXEC` here looks identical to a genuinely missing or
+non-executable path. `kirocrew service install` therefore asks the loaded policy
+before writing anything, and if the unit provably cannot start it **refuses up
+front** and prints a ready-to-paste per-user unit instead of leaving a
+crash-looping service enabled at every boot.
+
+A per-user unit is not affected, because the per-user systemd manager does not
+run in PID 1's domain. Follow the commands the refusal prints, then manage the
+service with `systemctl --user status|restart kirocrew` and `journalctl --user -u
+kirocrew -f`. Note that `kirocrew service status` / `uninstall` only look at the
+system unit, so they will not see a user unit ([#7165] tracks adding a first-class
+`--user` scope). Installing kirocrew onto a system-labelled path such as
+`/usr/local/bin` also avoids the problem.
+
+[#7165]: https://github.com/kirodotdev/KiroCrew/issues/7165
 
 ### Setting the service port
 

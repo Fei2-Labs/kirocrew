@@ -493,76 +493,6 @@ def test_subcommand_matches_the_discovery_mapping():
     assert command
 
 
-def test_computer_use_sources_are_scrub_lint_clean():
-    """Every computer-use source file passes the De-Amazon scrub-lint pattern.
-
-    ``scripts/scrub-lint.sh`` is a BLOCKING CI job, and its ``INTERNAL_PATTERN``
-    includes a bare ``\\.amazon\\.`` — which matches the product's own macOS bundle
-    id (``com.amazon.kiro.crew``). That id is genuinely needed by the self-denylist
-    (KiroCrew's dashboard can flip this feature's own primary enable, so driving our
-    own window must be refused), so the fix is an anchored
-    ``scripts/scrub-allowlist.txt`` entry for the one file that needs it — not
-    deleting the denylist row and not broadening the pattern.
-
-    This test exists because the scrub gate lives in a shell script that only runs
-    as its own CI job: a Python-suite failure here surfaces the same problem in the
-    fast per-commit gate, where it is one line to read instead of a red job at the
-    end of a PR.
-    """
-    import re
-    from pathlib import Path
-
-    repo = Path(agent.__file__).resolve().parents[2]
-    script = repo / "scripts" / "scrub-lint.sh"
-    if not script.exists():  # pragma: no cover - python-only checkout
-        pytest.skip("scrub-lint.sh not present in this checkout")
-
-    # Read the pattern from the script itself rather than restating it: a copy here
-    # would drift and start passing while the real gate failed.
-    match = re.search(r"^INTERNAL_PATTERN='([^']+)'", script.read_text(encoding="utf-8"), re.M)
-    assert match, "could not read INTERNAL_PATTERN out of scrub-lint.sh"
-    pattern = re.compile(match.group(1))
-
-    allowlist_path = repo / "scripts" / "scrub-allowlist.txt"
-    allow_patterns = [
-        line.strip()
-        for line in (
-            allowlist_path.read_text(encoding="utf-8").splitlines()
-            if allowlist_path.exists()
-            else []
-        )
-        if line.strip() and not line.startswith("#")
-    ]
-
-    # Globbed from the FILESYSTEM, not from ``git ls-files``: the real gate scans
-    # the working tree, and an untracked-but-present file is exactly the state a
-    # feature branch is in before its first ``git add`` — which is when this check
-    # is most useful. Deriving the list from git would make the whole test pass
-    # vacuously on zero files.
-    sources = sorted((repo / "src" / "kiro_crew" / "computer_use").rglob("*.py"))
-    mcp_shim = repo / "src" / "kiro_crew" / "mcp_computer.py"
-    if mcp_shim.exists():
-        sources.append(mcp_shim)
-    assert sources, "no computer-use sources found — this check would pass vacuously"
-
-    offenders: list[str] = []
-    for path in sources:
-        rel = path.relative_to(repo).as_posix()
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not pattern.search(line):
-                continue
-            hit = f"{rel}:{number}:{line}"
-            # The real gate filters through the allowlist as ``grep -v`` patterns.
-            if any(re.search(allowed, hit) for allowed in allow_patterns):
-                continue
-            offenders.append(hit)
-
-    assert offenders == [], (
-        "these lines trip the BLOCKING De-Amazon scrub-lint job; add an anchored "
-        f"scripts/scrub-allowlist.txt entry for each: {offenders}"
-    )
-
-
 class TestGatedEntryIsNotPreserved:
     """**A withheld entry's user fields are deliberately NOT restored.**
 
@@ -1150,7 +1080,7 @@ class TestSpecEmissionGate:
         assert CU_SERVER not in cfg["mcpServers"]
         assert "kirocrew-core" in cfg["mcpServers"]
         # Withholding the ENTRY is the whole control. The refs name a server this
-        # spec no longer defines, which resolves to nothing and mounts nothing, so
+        # spec does not define, which resolves to nothing and mounts nothing, so
         # they are left exactly as the user left them.
         assert CU_REF in cfg["tools"]
         assert cfg["allowedTools"] == [f"{CU_REF}/computer_get_state"]
@@ -1378,6 +1308,17 @@ class TestSpecEmissionGate:
 # ── The data-home pin ──
 
 
+def _fake_host_home(monkeypatch, host_home: Path) -> None:
+    """Point every default-home resolver at *host_home* instead of the operator's.
+
+    ``HOME`` for ``expanduser``, ``Path.home`` for ``paths._default_home()`` and for
+    the recovery breadcrumb ``config_dir()`` writes BESIDE the default home.
+    """
+    host_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: host_home))
+
+
 class TestDataHomePin:
     """``KIROCREW_HOME`` must reach the stdio shims, or they read a DIFFERENT home.
 
@@ -1394,7 +1335,7 @@ class TestDataHomePin:
     """
 
     @staticmethod
-    def _entries(monkeypatch, home: "str | None") -> dict:
+    def _entries(monkeypatch, home: "str | None", default_home: Path) -> dict:
         """Build a fresh spec with (or without) an override in effect."""
         import kiro_crew.config.paths as paths
 
@@ -1403,27 +1344,32 @@ class TestDataHomePin:
         else:
             monkeypatch.setenv("KIROCREW_HOME", home)
         monkeypatch.setattr(paths, "_resolved_home", None)
+        # With no (valid) override the resolver falls through to the DEFAULT home.
+        # Relocate the WHOLE host home, not just the resolver: left alone, this helper
+        # resolved, and created, the operator's real ~/.kiro/crew, and a resolver-only
+        # stand-in still wrote the real ~/.kirocrew.breadcrumb beside it (audit 3).
+        _fake_host_home(monkeypatch, default_home)
         with patch.multiple("kiro_crew.agent", _MANAGED_MCP_SERVERS=_MANAGED):
             with patch("kiro_crew.agent._prompt_path", return_value=Path("/tmp/p.md")):
                 return agent.build_agent_config()["mcpServers"]
 
     def test_every_managed_server_is_pinned_under_an_override(self, tmp_path, monkeypatch):
-        servers = self._entries(monkeypatch, str(tmp_path))
+        servers = self._entries(monkeypatch, str(tmp_path), tmp_path / "default")
         for name in _MANAGED:
             assert servers[name]["env"]["KIROCREW_HOME"] == str(tmp_path.resolve()), name
 
-    def test_a_default_install_emits_no_env_at_all(self, monkeypatch):
+    def test_a_default_install_emits_no_env_at_all(self, tmp_path, monkeypatch):
         """The emitted spec must be byte-for-byte unchanged where there is no override.
 
         An empty ``env`` is a launch-behaviour no-op but a real diff in the file, and
         ``_prune_empty`` treats present-but-empty as equivalent — so emitting one
         would churn every existing user's ``kirocrew.json`` for nothing.
         """
-        servers = self._entries(monkeypatch, None)
+        servers = self._entries(monkeypatch, None, tmp_path)
         for name in _MANAGED:
             assert "env" not in servers[name], name
 
-    def test_a_ROOT_override_is_not_propagated(self, monkeypatch):
+    def test_a_ROOT_override_is_not_propagated(self, tmp_path, monkeypatch):
         """``config_dir()`` refuses a filesystem root and falls back to the default.
 
         Propagating one would INVERT the bug — the shim would honour a home the
@@ -1431,12 +1377,12 @@ class TestDataHomePin:
         root test is the portable ``p == p.parent`` one (``/`` → ``/``, ``D:\\`` →
         ``D:\\``), so ``"/"`` is refused on Windows too.
         """
-        servers = self._entries(monkeypatch, "/")
+        servers = self._entries(monkeypatch, "/", tmp_path)
         assert "env" not in servers[CU_SERVER]
 
     @pytest.mark.skipif(not IS_POSIX, reason="POSIX system-directory prefixes only")
     @pytest.mark.parametrize("bad", ["/usr", "/System"])
-    def test_an_INVALID_POSIX_SYSTEM_override_is_not_propagated(self, bad, monkeypatch):
+    def test_an_INVALID_POSIX_SYSTEM_override_is_not_propagated(self, bad, tmp_path, monkeypatch):
         """The named-system-directory half of the same refusal.
 
         POSIX-gated because the resolver matches on ``p.parts[:2] == ("/", "usr")``
@@ -1453,7 +1399,7 @@ class TestDataHomePin:
         gateway and the shim still agree on whatever it decides. Asserting a refusal
         here would be asserting behaviour the resolver does not have.)
         """
-        servers = self._entries(monkeypatch, bad)
+        servers = self._entries(monkeypatch, bad, tmp_path)
         assert "env" not in servers[CU_SERVER]
 
     def test_the_pin_always_AGREES_with_the_resolver(self, tmp_path, monkeypatch):
@@ -1492,7 +1438,7 @@ class TestDataHomePin:
         # A user's own variable must survive the merge.
         assert env["MY_VAR"] == "keep"
 
-    def test_a_refresh_CLEARS_a_stale_pin_when_the_override_is_gone(self, monkeypatch):
+    def test_a_refresh_CLEARS_a_stale_pin_when_the_override_is_gone(self, tmp_path, monkeypatch):
         """A config written under an override, refreshed on a default install.
 
         Leaving the old value would point the shims at a home the gateway is no
@@ -1502,6 +1448,7 @@ class TestDataHomePin:
 
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.setattr(paths, "_resolved_home", None)
+        _fake_host_home(monkeypatch, tmp_path / "default")
         cfg = {
             "mcpServers": {
                 CU_SERVER: {"command": "old", "args": [], "env": {"KIROCREW_HOME": "/stale"}},

@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react'
-import { ChevronDown, ImageOff, Minus } from 'lucide-react'
+import { ChevronDown, ImageOff } from 'lucide-react'
 import { i18nT } from '../../i18n/t'
-import { ROW_PAD_Y, PINNED_PREVIEW_LINES, pinnedImageUrl } from '../../utils/pinnedPrompt'
+import { useReducedMotion } from '../../hooks/useReducedMotion'
+import { ROW_PAD_Y, PINNED_PREVIEW_LINES, PINNED_RESTING_LINES, pinnedImageUrl } from '../../utils/pinnedPrompt'
 
 interface PinnedPromptProps {
   /** Clamped plain-text preview of the pinned prompt (images stripped out). */
@@ -32,11 +33,6 @@ interface PinnedPromptProps {
   onToggleExpanded: () => void
   /** Jump the transcript back to this prompt. */
   onJump: () => void
-  /**
-   * Collapse the banner to the corner chip (`PinnedPromptPill`). Rendered in the
-   * BAND rather than the card's control row — see the note on the band below.
-   */
-  onMinimize: () => void
   /** Ref on the card — measured for the push geometry. */
   cardRef: React.Ref<HTMLDivElement>
   /**
@@ -63,6 +59,31 @@ const MORPH_MS = 150
 const MORPH_EASE = 'cubic-bezier(0.2,0,0,1)'
 
 /**
+ * How long the pointer must rest on the card before the peek opens. Long enough
+ * that a pointer crossing the card on its way to the title row does not fire
+ * the morph, short enough that a deliberate hover feels immediate. The same
+ * order as the morph itself, so open-then-close on a slow transit still reads
+ * as one gesture rather than a flicker.
+ */
+export const PEEK_OPEN_DELAY_MS = 120
+
+/**
+ * Frame for the prompt's image thumbnails: a solid `bg-muted` plate showing
+ * through the image's own padding. Two things a ring cannot do here:
+ *   - `ring-inset` is painted BELOW an `<img>`'s replaced content, so on an
+ *     opaque image it never shows at all; a 1px outset ring in the border tone
+ *     was measured too faint on the dark card (UX review on #9538: "a black
+ *     square on a dark box that I nearly missed", "looks broken"). The plate is
+ *     a mid-grey in both themes, so a dark screenshot separates from a dark
+ *     card and a white one from a white card regardless of the border tokens.
+ *   - Padding renders the background AROUND the content, so the plate is a
+ *     real frame, not a shadow that an opaque bitmap can cover.
+ * The frame is inside the element's box (sizes below already include it), so
+ * the card's pixel parity with the bubble is untouched.
+ */
+const THUMB_FRAME = 'bg-muted forced-colors:border'
+
+/**
  * The most recent prompt that has scrolled fully behind the band, pinned under
  * the session title.
  *
@@ -74,7 +95,10 @@ const MORPH_EASE = 'cubic-bezier(0.2,0,0,1)'
  * at the same place at the moment of hand-off, so the bubble appears to stop
  * travelling and stick rather than being replaced. A taller prompt hands over
  * once its bottom edge reaches the band's bottom (`pinHandoffY`), i.e. once it is
- * completely covered by the band, so the swap still happens out of sight. Keep
+ * completely covered by the band, so the swap still happens out of sight. The
+ * box also carries the bubble's `user-bubble` theme hook, so a theme that tints
+ * the bubble (kiro-light) tints the card identically and the swap stays
+ * invisible there too. Keep
  * these values in sync with `UserMessage`'s `bubble` and with `MD_COMPONENTS.p`
  * in MarkdownRenderer.
  *
@@ -100,32 +124,118 @@ const MORPH_EASE = 'cubic-bezier(0.2,0,0,1)'
  *     full push it reported 0. `items-start` keeps the card at its natural height
  *     so the measurement is a fixed point.
  *   - The chevron takes its room from the TEXT, never from the box, and it only
- *     appears once the text is actually clamped. That gate keeps the box honest: a
- *     clamped line means the card has already hit its max width, so inserting the
- *     chevron cannot widen it — it only narrows the text further. A short prompt is
- *     unclamped, gets no chevron, and keeps hugging its text exactly like the
- *     bubble. The two states are each stable, so the measurement below cannot
- *     oscillate: "overflowing at width W" still overflows at W minus the chevron.
- *
- *     Minimize is NOT in that cluster — it renders in the band, ahead of the card.
- *     The card's row may carry at most two action controls and the jump region plus
- *     the chevron already fill it; siting it outside also leaves the card's box
- *     untouched, so its pixel equality with the bubble survives.
- *   - `PinnedPromptPill` is the minimized form. It is a SEPARATE component rather
- *     than a branch in here on purpose — none of the geometry above applies to a
- *     chip, and reusing this component for it would leave every effect running
- *     against refs that are meaningless in that state.
+ *     appears once the text is actually clamped. That gate is what keeps the
+ *     box honest: a clamped line means the card has already hit its max width,
+ *     so inserting the chevron cannot widen it — it only narrows the text
+ *     further. A short prompt is unclamped, gets no chevron, and keeps hugging
+ *     its text exactly like the bubble does. The two states are each stable, so
+ *     the measurement below cannot oscillate: "overflowing at width W" still
+ *     overflows at W minus the chevron.
  *   - Images are shown as thumbnails rather than dropped. `promptPreview` strips
  *     image markdown from the text, so a prompt whose entire content was an
  *     image used to pin as a blank card.
+ *
+ * Three heights, one box. At REST the text is clamped to `PINNED_RESTING_LINES`
+ * (one line) so the card costs the reply beneath it as little as possible. While
+ * the pointer is over the card, or a control inside it has keyboard focus, the
+ * clamp opens to `PINNED_PREVIEW_LINES` — the PEEK — and closes again on leave.
+ * The chevron still EXPANDS to the whole prompt. Every transition between the
+ * three runs through the same height morph below, so the card is visibly one
+ * object changing size rather than two things swapping (the failure #8714
+ * reverted). The peek is pointer-and-keyboard only: a touch `pointerenter` is
+ * ignored, because a tap has no matching leave and the card would stick open.
+ * The peek and the expansion grow the LIVE card, which the push geometry reads;
+ * neither ever re-reports the collapsed height, so the hand-off line stays on
+ * the resting height and a hover cannot move it. The peek also closes as soon
+ * as the card is being pushed out, so a departing card is always its resting
+ * size and the band it slides through is sized for it.
  */
 export default function PinnedPrompt({
-  text, fullText, images, bodyBeyondPreview, pushUp, bannerH, expanded, onToggleExpanded, onJump, onMinimize, cardRef, onCollapsedHeight,
+  text, fullText, images, bodyBeyondPreview, pushUp, bannerH, expanded, onToggleExpanded, onJump, cardRef, onCollapsedHeight,
 }: PinnedPromptProps) {
   const textRef = useRef<HTMLParagraphElement | null>(null)
   const boxRef = useRef<HTMLDivElement | null>(null)
   const lastBoxH = useRef<number | null>(null)
   const [clamped, setClamped] = useState(false)
+  const reducedMotion = useReducedMotion()
+  // Pointer over the card, or keyboard focus inside it. Two sources feed one
+  // flag: a hover peek that closed the moment the pointer left would also close
+  // while a keyboard user Tabs onto the chevron — so focus holds it open too.
+  // Reset when the pinned prompt changes: the pointer may still be resting where
+  // the old card was, and the new card must start at rest like any other.
+  const [hovered, setHovered] = useState(false)
+  const [focused, setFocused] = useState(false)
+  useEffect(() => { setHovered(false); setFocused(false) }, [fullText])
+  // Peek only while collapsed AND at rest in the band: expanded already shows
+  // everything, and a card being pushed out (`pushUp > 0`) has no reader to
+  // peek for — the next prompt is arriving under it. Closing the peek there
+  // keeps the push geometry honest: `pinHandoffY` and `pinPushTravel` are
+  // derived from the RESTING height, so a three-line card sliding up through a
+  // band sized for one line would overhang it. With the peek closed on push,
+  // the card is its resting size for the whole departure and the clip below
+  // can treat "pushed" and "at rest" as the same shape.
+  const peek = !expanded && pushUp <= 0 && (hovered || focused)
+  const clampLines = peek ? PINNED_PREVIEW_LINES : PINNED_RESTING_LINES
+  // Native listeners on the box rather than JSX handlers: the box is a plain
+  // container (its two buttons are the interactive elements), and `pointerenter`
+  // / `pointerleave` do not bubble, which is exactly the "over the card as a
+  // whole" semantics wanted here. `focusin` / `focusout` DO bubble, so the box
+  // hears both buttons.
+  useEffect(() => {
+    const box = boxRef.current
+    if (!box) return
+    // Touch has no leave, so a touch `pointerenter` must not open the peek — it
+    // would stay open until the next tap. A tap still jumps (the button's
+    // onClick) and the chevron is still the way to more than one line.
+    //
+    // A short intent delay before opening: the card sits top-centre of the
+    // reading surface, on the way to the title row and its controls, so a
+    // pointer merely crossing it would otherwise fire the grow-then-shrink
+    // morph over the reply on every pass. The pointer has to REST on the card
+    // for PEEK_OPEN_DELAY_MS; a transit that leaves sooner cancels the timer
+    // and nothing moves. Closing is immediate — the pointer has gone.
+    let openTimer: ReturnType<typeof setTimeout> | null = null
+    const cancelOpen = () => { if (openTimer != null) { clearTimeout(openTimer); openTimer = null } }
+    const enter = (e: PointerEvent) => {
+      if (e.pointerType === 'touch') return
+      cancelOpen()
+      openTimer = setTimeout(() => { openTimer = null; setHovered(true) }, PEEK_OPEN_DELAY_MS)
+    }
+    const leave = () => { cancelOpen(); setHovered(false) }
+    // Focus holds the peek only when it arrived by KEYBOARD. A mouse click on the
+    // chevron focuses it too, and without this a mouse user who collapsed the
+    // card would be left looking at three lines until they clicked elsewhere —
+    // the click that said "smaller" would have made it bigger. `pointerdown`
+    // runs before the click's default focus action, so a flag set there and
+    // consumed by the `focusin` it causes tells the two apart; `pointerup`
+    // clears it in case the press moved no focus (button already focused).
+    let viaPointer = false
+    const down = () => { viaPointer = true }
+    const up = () => { viaPointer = false }
+    const focusIn = () => { if (!viaPointer) setFocused(true); viaPointer = false }
+    // `focusout` fires before the next `focusin` when focus moves between the
+    // two buttons, so relatedTarget decides: a move that stays inside the box
+    // keeps the peek.
+    const focusOut = (e: FocusEvent) => {
+      if (e.relatedTarget instanceof Node && box.contains(e.relatedTarget)) return
+      setFocused(false)
+    }
+    box.addEventListener('pointerenter', enter)
+    box.addEventListener('pointerleave', leave)
+    box.addEventListener('pointerdown', down)
+    box.addEventListener('pointerup', up)
+    box.addEventListener('focusin', focusIn)
+    box.addEventListener('focusout', focusOut)
+    return () => {
+      cancelOpen()
+      box.removeEventListener('pointerenter', enter)
+      box.removeEventListener('pointerleave', leave)
+      box.removeEventListener('pointerdown', down)
+      box.removeEventListener('pointerup', up)
+      box.removeEventListener('focusin', focusIn)
+      box.removeEventListener('focusout', focusOut)
+    }
+  }, [])
   // Sources whose fetch failed (a prompt can reference a file that has since been
   // deleted or moved, so `/api/file-raw` 404s). Tracked per-src rather than as one
   // flag so one dead image does not suppress its siblings.
@@ -139,16 +249,17 @@ export default function PinnedPrompt({
   useEffect(() => { setFailed([]) }, [fullText])
   const shown = images.filter(src => !failed.includes(src))
 
-  // Height MORPH on expand/collapse. The card's height is content-driven (the
-  // <p> switches truncate↔wrap), so there is no fixed value to CSS-transition
+  // Height MORPH on expand/collapse and on peek open/close. The card's height is
+  // content-driven (the <p> switches between clamps and full wrap), so there is
+  // no fixed value to CSS-transition
   // between. FLIP it instead: this layout effect runs after React commits the
   // NEW content but before paint, so `getBoundingClientRect` reads the new
   // natural height (`target`); we snap back to the PREVIOUS height (`from`),
   // force a reflow, then transition to `target`. `overflow:hidden` for the
   // duration clips the taller content while the box grows/shrinks so text is
   // revealed/consumed by the moving edge rather than spilling. Keyed on
-  // `expanded` only, so scroll-driven pushes (which move the card via transform,
-  // not height) never trigger it.
+  // `expanded` and `peek` only, so scroll-driven pushes (which move the card via
+  // transform, not height) never trigger it.
   useLayoutEffect(() => {
     const el = boxRef.current
     if (!el) return
@@ -165,14 +276,18 @@ export default function PinnedPrompt({
     const from = current ?? lastBoxH.current
     lastBoxH.current = target
     // `target` is the natural height React has just committed, read with no inline
-    // override in play — i.e. the settled collapsed height whenever this runs
-    // collapsed (mount, and every collapse). Reporting it from here is what keeps
-    // ChatPage from having to measure the card itself: a measurement taken during
-    // the 150ms morph reads an intermediate, up-to-expanded-size height, and the
-    // hand-off line derived from it would jump by the difference — hiding a
-    // transcript row that is still on screen.
-    if (!expanded) onCollapsedHeight?.(target)
+    // override in play — i.e. the settled RESTING height whenever this runs at
+    // rest (mount, every collapse, every peek close). Reporting it from here is
+    // what keeps ChatPage from having to measure the card itself: a measurement
+    // taken during the 150ms morph reads an intermediate, up-to-expanded-size
+    // height, and the hand-off line derived from it would jump by the difference
+    // — hiding a transcript row that is still on screen. A peeked height is never
+    // reported for the same reason: it is not where the card rests.
+    if (!expanded && !peek) onCollapsedHeight?.(target)
     if (from == null || Math.abs(from - target) < 0.5) return
+    // Reduced motion: land on the new height in one step. The peek makes this
+    // morph fire on every hover, which is far more often than the chevron did.
+    if (reducedMotion) return
     el.style.overflow = 'hidden'
     el.style.height = `${from}px`
     void el.getBoundingClientRect() // force reflow so the next assignment animates
@@ -187,13 +302,15 @@ export default function PinnedPrompt({
     }
     el.addEventListener('transitionend', done)
     return () => el.removeEventListener('transitionend', done)
-  }, [expanded, onCollapsedHeight])
+  }, [expanded, peek, reducedMotion, onCollapsedHeight])
 
   useEffect(() => {
     // While expanded the text wraps in full and stops overflowing, so re-measuring
     // would report "not clamped" and take the chevron away — leaving no way back.
-    // Hold the collapsed-state verdict instead; it is re-taken on collapse.
-    if (expanded) return
+    // Hold the collapsed-state verdict instead; it is re-taken on collapse. The
+    // peek is held out for the same reason, plus one more: its taller box is not
+    // the resting height and must not be re-reported as one.
+    if (expanded || peek) return
     const el = textRef.current
     const box = boxRef.current
     if (!el) return
@@ -216,7 +333,7 @@ export default function PinnedPrompt({
     ro.observe(el)
     if (box) ro.observe(box)
     return () => ro.disconnect()
-  }, [text, expanded, onCollapsedHeight])
+  }, [text, expanded, peek, onCollapsedHeight])
 
   // Images earn the chevron on their own. Without this an image-only prompt never
   // clamps (no text to clamp), so the readable expanded strip was unreachable and
@@ -240,7 +357,9 @@ export default function PinnedPrompt({
         // With the continuous height below, flipping
         // `visible`→`hidden` at pushUp>0 is seamless: the card has 4px of band
         // padding beneath it, enough for `--shadow-sm` (`0 1px 2px`) to still
-        // render in the first push frame, so nothing pops.
+        // render in the first push frame, so nothing pops. The peek needs no
+        // term here: it closes the moment `pushUp > 0` (see `peek` above), so a
+        // pushed card is always its resting size.
         overflow: pushUp > 0 && !expanded ? 'hidden' : 'visible',
         // Height must be CONTINUOUS through pushUp === 0, or the clip box jumps
         // the moment the push starts. Carrying both paddings (ROW_PAD_Y * 2)
@@ -254,40 +373,16 @@ export default function PinnedPrompt({
           : undefined,
       }}
     >
-      {/* Minimize lives in the BAND, not in the card's control row: that row may
-          hold at most two action controls and the jump region plus the chevron
-          already fill it. It is anchored ADJACENT to the card's left edge rather
-          than the band's, because `mr-auto` stranded it at the far left of a ~900px
-          column — a bare glyph over the transcript, nowhere near the card whose
-          size it controls. Still the card's width away from the chevron, so the two
-          cannot be mis-tapped for each other. Opaque (`bg-card` + ring, matching the
-          chip) because the band is an overlay the transcript scrolls beneath, so a
-          bare glyph sits over passing text — illegible, and readable as content.
-          ABSOLUTE, not an in-flow sibling: in flow it cost the card 34px of column
-          (w-7 + mr-1.5), so at a clamped width the card came out NARROWER than the
-          bubble it stands in for pixel-for-pixel and the hand-off visibly re-wrapped.
-          `-mr-4` lands its right edge on the card's own `px-4` padding, so it clears
-          the text while needing only 12px of gutter — at 390px the card starts at 16px,
-          so 4px is left over, where a full `right-full` offset would have run off-screen. The shared
-          wrapper carries the push transform, so control and card travel together. */}
-      <div className="relative w-fit max-w-full min-w-0" style={{ transform: `translateY(${-pushUp}px)` }}>
-      <button
-        type="button"
-        data-testid="pinned-prompt-minimize"
-        onClick={onMinimize}
-        aria-label={i18nT('pages.chat.pinnedPrompt.minimize_pinned_prompt')}
-        title={i18nT('pages.chat.pinnedPrompt.minimize_pinned_prompt')}
-        className="pointer-events-auto absolute top-0 right-full -mr-4 z-10 shrink-0 flex items-center justify-center h-7 w-7 rounded-full bg-card text-muted ring-1 ring-inset forced-colors:border ring-border shadow-sm border-none p-0 m-0 hover:text-text transition-colors cursor-pointer"
-      >
-        <Minus size={16} />
-      </button>
       <div
         ref={cardRef}
         data-testid="pinned-prompt"
         className="pointer-events-auto max-w-[550px] min-w-0"
-        style={{ willChange: 'transform' }}
+        style={{ transform: `translateY(${-pushUp}px)`, willChange: 'transform' }}
       >
-        <div ref={boxRef} className="flex items-start gap-2 rounded-xl bg-card text-card-fg ring-1 ring-inset forced-colors:border ring-border shadow-sm px-4 py-2 text-sm">
+        <div
+          ref={boxRef}
+          className="user-bubble flex items-start gap-2 rounded-xl bg-card text-card-fg ring-1 ring-inset forced-colors:border ring-border shadow-sm px-4 py-2 text-sm"
+        >
           <button
             type="button"
             onClick={onJump}
@@ -302,7 +397,7 @@ export default function PinnedPrompt({
                   // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle event (drop the 404'd src so `shown` falls back to the ImageOff glyph), not a user interaction; there is nothing here for a keyboard to reach
                   <img key={src} src={pinnedImageUrl(src)} alt="" loading="lazy"
                     onError={() => markFailed(src)}
-                    className="h-20 w-auto max-w-[160px] rounded object-cover ring-1 ring-inset forced-colors:border ring-border" />
+                    className={`h-20 w-auto max-w-[160px] rounded object-cover p-0.5 ${THUMB_FRAME}`} />
                 ))}
               </span>
             )}
@@ -320,11 +415,12 @@ export default function PinnedPrompt({
               className={`my-1 leading-6 ${expanded ? 'whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto' : 'overflow-hidden'}`}
               style={expanded ? { overflowWrap: 'anywhere' } : {
                 // Tailwind ships `line-clamp-<n>` only for a literal n, and the
-                // line count is shared with the geometry module — so set the clamp
-                // from the constant rather than duplicating it in a class name.
+                // line counts are shared with the geometry module — so set the
+                // clamp from the constants rather than duplicating them in a class
+                // name. One line at rest, PINNED_PREVIEW_LINES while peeking.
                 display: '-webkit-box',
                 WebkitBoxOrient: 'vertical',
-                WebkitLineClamp: PINNED_PREVIEW_LINES,
+                WebkitLineClamp: clampLines,
                 overflowWrap: 'anywhere',
               }}
             >
@@ -342,12 +438,12 @@ export default function PinnedPrompt({
                   height instead. Nothing is traded away: parity with the bubble is
                   already unattainable for an image-only prompt, whose bubble is a
                   full-size image, and the taller card only moves the hand-off line
-                  DOWN (see PINNED_PREVIEW_LINES). */}
+                  DOWN (see PINNED_RESTING_LINES). */}
               {!expanded && shown.map(src => (
                 // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle event (drop the 404'd src so `shown` falls back to the ImageOff glyph), not a user interaction; there is nothing here for a keyboard to reach
                 <img key={src} src={pinnedImageUrl(src)} alt="" loading="lazy"
                   onError={() => markFailed(src)}
-                  className={`inline-block align-middle mr-1.5 rounded-sm object-cover ring-1 ring-inset forced-colors:border ring-border ${
+                  className={`inline-block align-middle mr-1.5 rounded-sm object-cover p-px ${THUMB_FRAME} ${
                     text ? 'h-[1.4em] w-[1.4em]' : 'h-[2.8em] w-[3.6em]'}`} />
               ))}
               {/* Every image 404'd (deleted/moved file) AND there is no text: hiding
@@ -360,30 +456,24 @@ export default function PinnedPrompt({
             </p>
           </button>
           {showChevron && (
-            /* `my-1` + a one-line box mirrors the paragraph's own metrics, so this
-               centres on the first line and adds NO height to the card, which
-               `bannerH` and every line derived from it depend on. The button inside
-               is a 28px touch target that overflows this 24px box symmetrically via
-               `-my-0.5`, so the hit area grows without the card growing. */
-            <span className="shrink-0 my-1 h-6 flex items-center">
-              <button
-                type="button"
-                onClick={onToggleExpanded}
-                aria-expanded={expanded}
-                aria-label={expanded
-                  ? i18nT('pages.chat.pinnedPrompt.collapse_pinned_prompt')
-                  : i18nT('pages.chat.pinnedPrompt.expand_pinned_prompt')}
-                className="h-7 w-7 -my-0.5 flex items-center justify-center bg-transparent border-none p-0 m-0 text-muted hover:text-text transition-colors cursor-pointer"
-              >
-                <ChevronDown
-                  size={16}
-                  className={`transition-transform duration-150 ease-[cubic-bezier(0.2,0,0,1)] ${expanded ? 'rotate-180' : ''}`}
-                />
-              </button>
-            </span>
+            <button
+              type="button"
+              onClick={onToggleExpanded}
+              aria-expanded={expanded}
+              aria-label={expanded
+                ? i18nT('pages.chat.pinnedPrompt.collapse_pinned_prompt')
+                : i18nT('pages.chat.pinnedPrompt.expand_pinned_prompt')}
+              /* my-1 + one line box mirrors the paragraph's own metrics, so the
+                 icon centres on the first line and adds no height to the card. */
+              className="shrink-0 my-1 h-6 flex items-center bg-transparent border-none p-0 m-0 text-muted hover:text-text transition-colors cursor-pointer"
+            >
+              <ChevronDown
+                size={16}
+                className={`transition-transform duration-150 ease-[cubic-bezier(0.2,0,0,1)] ${expanded ? 'rotate-180' : ''}`}
+              />
+            </button>
           )}
         </div>
-      </div>
       </div>
     </div>
   )

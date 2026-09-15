@@ -39,6 +39,30 @@ def state(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.parametrize("phase", ["preparing", "global_failed", "member_failed"])
+def test_status_remains_available_during_scoped_memory_recovery(
+    state: DashboardState, tmp_path, phase: str
+) -> None:
+    from kiro_crew.learn import Lesson, LessonStore
+    from kiro_crew.memory_startup import MemoryStartup
+
+    state.lessons = LessonStore(base_dir=tmp_path / "status-lessons")
+    state.lessons.save(Lesson("2026-09-08", "Keep the accepted decision", "knowledge"))
+    assert state._count_lessons() == 1  # Warm the real JSONL cache before recovery.
+    startup = MemoryStartup.begin()
+    try:
+        if phase != "preparing":
+            failed_store = "default" if phase == "global_failed" else "member-alice"
+            startup.fail_store(failed_store, ValueError("staged recovery failed"))
+            assert startup.complete()
+        snapshot = state.status_snapshot()
+        assert snapshot["sessions"] == 0
+        assert snapshot["lessons"] == (1 if phase == "member_failed" else None)
+    finally:
+        startup.stop()
+        startup.release()
+
+
 class TestSubagentSubscribers:
     def test_subscribe_and_unsubscribe(self, state: DashboardState) -> None:
         ws = MagicMock()
@@ -279,7 +303,7 @@ class TestSlotsBroadcastCarriesFolders:
 
 
 class TestOwnerScopedBroadcast:
-    """Owner-only typed broadcast + its delivery count (PR #461)."""
+    """Owner-only typed broadcast + its delivery count."""
 
     @staticmethod
     def _ws(closed: bool = False) -> MagicMock:
@@ -306,8 +330,8 @@ class TestOwnerScopedBroadcast:
     async def test_awaited_delivery_counts_only_completed_sends(
         self, state: DashboardState
     ) -> None:
-        """Round 12 BLOCKING: a socket count is taken BEFORE any send runs, so a
-        peer that drops in that window was reported as delivered. Only a send
+        """A socket count taken BEFORE any send runs must not count a
+        peer that drops in that window as delivered. Only a send
         that completed counts."""
         good, broken = self._ws(), self._ws()
         broken.send_str = AsyncMock(side_effect=ConnectionResetError("peer gone"))
@@ -595,7 +619,7 @@ class TestSlotEffectiveAgent:
         """The degraded-defaults path must SHRINK the snapshot, not union into it.
 
         Leaving a stale alias published would have the resolver honor a name that
-        no longer loads, which is the false-negative twin of a false marker.
+        does not load, which is the false-negative twin of a false marker.
         """
         import dataclasses
 
@@ -685,6 +709,78 @@ class TestChatSlotStopState:
         d = slot.to_dict()
         assert d["stop_state"] == "soft_pending"
         assert d["stopping"] is True
+
+
+class TestSubagentProbeWiring:
+    """Tests for chat_utils.wire_session_subagent_probe.
+
+    The RSS ceiling in SessionManager consults this probe before recycling an
+    idle session; the probe must reach the dashboard's sub-agent registry and
+    the slot displaying the session, and both boot paths must install it.
+    """
+
+    def _installed_probe(self, state: DashboardState):
+        from kiro_crew.dashboard.chat_utils import wire_session_subagent_probe
+
+        wire_session_subagent_probe(state)
+        state.sessions.set_subagent_probe.assert_called_once()
+        probe = state.sessions.set_subagent_probe.call_args[0][0]
+        assert callable(probe)
+        return probe
+
+    def test_wire_installs_probe_on_sessions(self, state: DashboardState) -> None:
+        self._installed_probe(state)
+
+    def test_probe_reports_running_children(self, state: DashboardState) -> None:
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for.return_value = [{"id": "a1"}]
+        state.subagents._queued_depth.return_value = 0
+        probe = self._installed_probe(state)
+
+        assert probe("dashboard:chat-1") is True
+        state.subagents.running_agents_for.assert_called_once_with("dashboard:chat-1")
+
+    def test_probe_without_a_tab_answers_from_the_registry(self, state: DashboardState) -> None:
+        """No open tab means no slot: the registry probes alone decide."""
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for.return_value = []
+        state.subagents._queued_depth.return_value = 0
+        probe = self._installed_probe(state)
+
+        assert state.get_slot("chat-1") is None
+        assert probe("dashboard:chat-1") is False
+
+        state.subagents._queued_depth.return_value = 1
+        assert probe("dashboard:chat-1") is True
+
+    def test_probe_sees_in_flight_delivery_on_the_slot(self, state: DashboardState) -> None:
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for.return_value = []
+        state.subagents._queued_depth.return_value = 0
+        slot = state.get_or_create_slot("chat-1")
+        probe = self._installed_probe(state)
+
+        assert probe("dashboard:chat-1") is False
+        slot._subagent_deliveries_inflight = 1
+        assert probe("dashboard:chat-1") is True
+
+    def test_probe_without_registry_reports_no_children(self, state: DashboardState) -> None:
+        state.subagents = None
+        probe = self._installed_probe(state)
+        assert probe("dashboard:chat-1") is False
+
+    def test_both_boot_paths_install_the_probe(self) -> None:
+        """start_dashboard AND start_api_server wire the probe after the state exists."""
+        import inspect
+
+        from kiro_crew.dashboard import server
+
+        for fn in (server.start_dashboard, server.start_api_server):
+            src = inspect.getsource(fn)
+            assert "wire_session_subagent_probe(state)" in src, fn.__name__
+            assert src.index("state = DashboardState(") < src.index(
+                "wire_session_subagent_probe(state)"
+            ), fn.__name__
 
 
 class TestCompactCallbackWiring:
@@ -869,7 +965,7 @@ def test_folder_breadcrumb_empty_or_unknown_id(state):
 
 
 def test_folder_breadcrumb_dangling_parent(state):
-    # parent_id points at a folder that no longer exists — walk stops gracefully.
+    # parent_id points at a folder that does not exist — walk stops gracefully.
     state._folders = [{"id": "b", "name": "Backend", "parent_id": "gone"}]
     assert state.folder_breadcrumb("b") == "Backend"
 
@@ -926,7 +1022,7 @@ class TestOwnerSourceStatusTransport:
         state.push_slots_update()
 
         # SSE carries the BARE list: the SSE queue has NO per-app filtering, so
-        # status must never ride it (GPT #6789 — an app token on /api/stream
+        # status must never ride it (an app token on /api/stream
         # would otherwise receive credential-backed chip status). The enriched
         # list is carried separately in `_slots_list_ws` for the WS path only.
         sse_note = sse_queue.get_nowait()
@@ -946,7 +1042,7 @@ class TestOwnerSourceStatusTransport:
         assert dash_messages[0]["data"][0]["source_links"][0]["ci"] == "passed"
         assert dash_messages[0]["data"][0]["source_links"][0]["state"] == "OPEN"
         # Owner: EXACTLY ONE frame (the enriched owner frame). `_send_ws_all`
-        # skips owner sockets for `slots` (PR #6795), so the generic frame no
+        # skips owner sockets for `slots`, so the generic frame no
         # longer backstops an owner; the owner frame is its only one and carries
         # full status.
         assert len(owner_messages) == 1
@@ -960,6 +1056,11 @@ class TestOwnerSourceStatusTransport:
         assert (
             owner_messages[0]["gitlabHostsGeneration"]
             == dash_messages[0]["gitlabHostsGeneration"]
+        )
+        assert isinstance(owner_messages[0]["governanceGeneration"], int)
+        assert (
+            owner_messages[0]["governanceGeneration"]
+            == dash_messages[0]["governanceGeneration"]
         )
 
     def test_owner_sockets_still_receive_non_slot_broadcasts(
@@ -1067,8 +1168,12 @@ class TestOwnerSourceStatusTransport:
         # Real folder list (a MagicMock attr would coerce to [] via
         # _safe_folder_tree); lets the dashboard-user branch below assert the
         # connect-time frame carries the folder tree — the frame that fixes the
-        # first-paint flicker (#4127).
+        # first-paint flicker.
         state._folders = [{"id": "f1", "name": "Work", "order": 0}]
+        # The snapshot is really dumped now (offender-note seam), so every
+        # frame field must be JSON-serializable — a bare MagicMock return
+        # value does not slip through a fake send_json unserialized.
+        state.folders_generation.return_value = 7
 
         class Request(dict):
             def __init__(self) -> None:
@@ -1100,6 +1205,11 @@ class TestOwnerSourceStatusTransport:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self
@@ -1141,7 +1251,7 @@ class TestOwnerSourceStatusTransport:
             # test seeds no visibility, so the public gate fails closed), and the
             # connection MUST drive NEITHER refresh — both the status read and
             # the visibility probe run the operator's credentials, so only the
-            # owner's connection may trigger them (GPT round-13). A non-owner
+            # owner's connection may trigger them. A non-owner
             # renders the owner-populated caches read-only; it spawns no provider
             # work of its own.
             assert "ci" not in str(initial_slots)
@@ -1150,7 +1260,7 @@ class TestOwnerSourceStatusTransport:
             vis_refresh.assert_not_called()
             # The connect-time frame is what populates the sidebar on a cold
             # load, so a dashboard user MUST receive the folder tree here — this
-            # is the frame that fixes the #4127 flicker.
+            # is the frame that fixes the first-paint flicker.
             assert initial_frame["folders"] == [{"id": "f1", "name": "Work", "order": 0}]
         state.unregister_ws.assert_called_once_with(fake_ws)
 
@@ -1161,7 +1271,7 @@ class TestOwnerSourceStatusTransport:
         """A non-owner dashboard connection drives NEITHER a status refresh NOR
         a visibility probe, even when a confirmed-public repo is present — both
         run the operator's credentials, so only the owner's connection may
-        trigger them (GPT round-13). The non-owner renders the owner-populated
+        trigger them. The non-owner renders the owner-populated
         caches read-only."""
         from kiro_crew.dashboard import ws as dashboard_ws
         from kiro_crew.dashboard import ws_event_scope
@@ -1219,6 +1329,11 @@ class TestOwnerSourceStatusTransport:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self
@@ -1333,6 +1448,11 @@ class TestPeriodicCheckStatusRefresh:
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
 
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
+
             def __aiter__(self):
                 return self
 
@@ -1413,6 +1533,11 @@ class TestPeriodicCheckStatusRefresh:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self
@@ -1524,6 +1649,11 @@ class TestPeriodicCheckStatusRefresh:
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
 
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
+
             def __aiter__(self):
                 return self
 
@@ -1584,6 +1714,11 @@ class TestPeriodicCheckStatusRefresh:
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
 
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
+
             def __aiter__(self):
                 return self
 
@@ -1611,7 +1746,7 @@ class TestPeriodicCheckStatusRefresh:
         """A signed-in dashboard user who is NOT the owner renders PUBLIC-repo
         chip status READ-ONLY from the owner-populated caches, so it must NOT
         start the periodic driver — both the status and visibility refreshes run
-        the operator's credentials and are owner-only (GPT round-13)."""
+        the operator's credentials and are owner-only."""
         from kiro_crew.dashboard import ws as dashboard_ws
         from kiro_crew.dashboard.handlers import source_providers
 
@@ -1651,6 +1786,11 @@ class TestPeriodicCheckStatusRefresh:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self
@@ -1730,6 +1870,11 @@ class TestPeriodicCheckStatusRefresh:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self
@@ -1813,6 +1958,11 @@ class TestPeriodicCheckStatusRefresh:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self
@@ -1907,7 +2057,7 @@ class TestTurnBoundarySourceStatus:
     def test_turn_boundary_non_owner_drives_no_refresh(
         self, state: DashboardState, monkeypatch
     ) -> None:
-        """GPT #6789 round-13: at a turn boundary with ONLY a non-owner
+        """At a turn boundary with ONLY a non-owner
         dashboard-user window open (no owner window), NEITHER the credentialed
         status read NOR the visibility probe fires — both run the operator's
         credentials and are owner-only. A non-owner audience triggers nothing."""
@@ -1988,7 +2138,7 @@ class TestTurnBoundarySourceStatus:
     ) -> None:
         """The dashboard wiring must register the owner-scoped sink AND clean it up.
 
-        Regression for the production-wiring gap: the transport tests above call
+        This closes a production-wiring gap: the transport tests above call
         ``push_source_status`` / ``register_status_delta_sink`` directly, so they
         would stay green even if ``start_dashboard`` stopped wiring the sink or
         dropped its shutdown cleanup. This drives the real wiring helper: it must

@@ -104,7 +104,7 @@ class CancellationCoordinator(ManagerComponent):
                 # past max_concurrent. The respawned _run owns the slot from
                 # here (its finally decrements). The informational
                 # subagent_recovering emit happens after, where a cancellation
-                # can no longer leak the counter.
+                # cannot leak the counter.
                 self._manager._running_count += 1
                 # The interrupted run's finally already consumed this info's
                 # slot token to free its slot. The respawn occupies a FRESH slot,
@@ -157,7 +157,7 @@ class CancellationCoordinator(ManagerComponent):
                     )
             finally:
                 # Whether respawned, aborted, or cancelled: this pending
-                # recovery is no longer outstanding.
+                # recovery is not outstanding.
                 _reg = self._manager._tasks.get(recovery_key)
                 if _reg is asyncio.current_task():
                     self._manager._tasks.pop(recovery_key, None)
@@ -180,9 +180,9 @@ class CancellationCoordinator(ManagerComponent):
                 # `_reap_started`, not just `reaped`: `_force_reap` cancels this
                 # task BEFORE it sets `reaped` (which must stay false until the
                 # reaper owns the record — see `_reap_started`). Consulting only
-                # `reaped` made this arm win the race and persist a neutral user
-                # Stop as a FAILURE, with a failure stat and a "cancelled"
-                # tombstone the reaper could no longer correct.
+                # `reaped` would let this arm win the race and persist a neutral
+                # user Stop as a FAILURE, with a failure stat and a "cancelled"
+                # tombstone the reaper could not correct.
                 if not info.done and not info._reap_started and not info.reaped:
                     info.done = True
                     info.error = "cancelled"
@@ -239,8 +239,9 @@ class CancellationCoordinator(ManagerComponent):
         )
         info._raw_task = raw_task
         if fence is None:
-            if info.batch_id and self._manager._on_done:
-                await self._manager._safe_announce(info)
+            # No coordinator claim to reject: this is upstream's queued stop, so it
+            # takes upstream's own report (terminal event + announcement).
+            self._manager._report_queued_stop(params)
             return
         info._coordinator_admitted = True
         info._coordinator_command = params.get("_coordinator_command")
@@ -254,6 +255,83 @@ class CancellationCoordinator(ManagerComponent):
             mark_delivered_on_success=True,
             settle_digest=True,
         )
+
+    def _report_queued_stop_impl(self, params: dict) -> None:
+        """Publish a neutral terminal record for work stopped before startup."""
+        info = SubagentInfo(
+            id=str(params.get("_preassigned_id") or ""),
+            task=str(params.get("task") or "(stopped before start)"),
+            parent_session_key=str(params.get("parent_session_key") or ""),
+            agent=str(params.get("agent") or ""),
+            user_stopped=True,
+            queued=True,
+            batch_id=str(params.get("batch_id") or ""),
+            batch_total=max(0, int(params.get("batch_total") or 0)),
+        )
+        if not info.id:
+            return
+        # Queued runs have no `_agents` record yet. Register every synthetic
+        # terminal before report tasks can run, leaving `done=False` until each
+        # task starts. That keeps earlier reports from treating themselves as
+        # the final batch member and flushing a partial digest while sibling
+        # queued-stop reports are still pending.
+        self._manager._agents[info.id] = info
+        if not self._manager._claim_finalize(info):
+            self._manager._agents.pop(info.id, None)
+            return
+        self._manager._spawn_terminal_report(
+            info,
+            source="Queued stop",
+            injection_timeout_reason="delivery timed out after queued subagent stop",
+            mark_delivered_on_success=False,
+            settle_digest=True,
+        )
+
+    async def cancel_for_parent_impl(self, parent_session_key: str) -> tuple[int, int]:
+        """Stop one parent's running and queued agents.
+
+        Queue entries are removed before the first suspending await, so a stagger
+        timer cannot start work after the user clicked Stop all. Agents parked on
+        a spawn-approval prompt remain pending because that prompt has its own
+        explicit reject action.
+        """
+        if not parent_session_key:
+            return (0, 0)
+        queued_ids = [
+            str(params.get("_preassigned_id") or "")
+            for params in self._manager._queue
+            if params.get("parent_session_key", "") == parent_session_key
+        ]
+        queued_stopped = 0
+        for agent_id in queued_ids:
+            if not agent_id:
+                continue
+            dropped = self._manager._unqueue(agent_id)
+            if not dropped:
+                continue
+            # Same durable commit the single-agent path takes: a queued run holds
+            # a coordinator claim, so publishing a synthetic terminal without
+            # rejecting that claim leaves the command owned by a run that will
+            # never start. One entry at a time, so a failure leaves the entries
+            # whose rejection has NOT committed for a retry.
+            for entry in dropped:
+                await self._manager._finalize_queued_cancel(entry)
+            queued_stopped += 1
+
+        running_ids = [
+            info.id
+            for info in self._manager._agents.values()
+            if info.parent_session_key == parent_session_key
+            and not info.done
+            and not info.queued
+            and not (info._awaiting_approval and info._exec_started is None)
+        ]
+        results = await asyncio.gather(
+            *(self._manager.cancel(agent_id) for agent_id in running_ids),
+            return_exceptions=True,
+        )
+        running_stopped = sum(result is True for result in results)
+        return (running_stopped, queued_stopped)
 
     async def cancel_impl(self, agent_id: str) -> bool:
         """Cancel a single running subagent. Returns True if found and cancelled.

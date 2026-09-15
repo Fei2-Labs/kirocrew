@@ -220,9 +220,9 @@ def _head_meta(path: Path, within_root: Path, cap: int = 2048) -> dict[str, str]
     a second open per field would add a whole pass over the slowest half of
     ``GET /api/steering``.
 
-    The description comes from the document BODY, not from the raw head.  A
-    document opening with front matter used to be summarized as its first
-    declaration — the Steering tab showed ``inclusion: manual`` where the
+    The description comes from the document BODY, not from the raw head: reading
+    the head would summarize a document opening with front matter as its first
+    declaration, showing ``inclusion: manual`` in the Steering tab where the
     author's title belongs.
     """
     # Read through the guarded reader, not ``path.open()``: the scan above rejects
@@ -321,7 +321,7 @@ def list_steering_blocking(project_dir: Path | None = None) -> dict[str, Any]:
                 resolved = entry.resolve(strict=True)
             except (OSError, RuntimeError):
                 # RuntimeError is a symlink LOOP (pathlib raises it instead of
-                # ELOOP) — reachable now that leaf links are resolved at all;
+                # ELOOP) — reachable because leaf links are resolved at all;
                 # one loop.md must hide itself, not 500 the whole listing.
                 continue
             # Reject symlinked intermediate directories that escape the trust
@@ -757,7 +757,7 @@ def _update_file_blocking(target: Path, content: str) -> str | None:
     ``os.replace`` swaps the directory entry rather than writing through it, so
     it cannot follow a symlink raced into place after the check below — and no
     truncate happens at all, which is why this needs no descriptor-identity
-    check the way the old in-place path did.
+    check of its own.
     """
     try:
         pre = target.lstat()
@@ -812,9 +812,9 @@ def _update_file_blocking(target: Path, content: str) -> str | None:
             # The file vanished or turned into a link between the lstat above and
             # here; treat it the same as the lstat miss above.
             return "notfound"
-        # Preserve the file's existing permissions rather than forcing 0o600:
-        # the old in-place write inherited them, and a project steering file
-        # checked out group-readable should not be silently tightened by a save.
+        # Preserve the file's existing permissions rather than forcing 0o600: a
+        # project steering file checked out group-readable should not be silently
+        # tightened by a save.
         # preserve_access_control_from is ADDITIVE to mode=: bits plus the ACL.
         #
         # Read off the descriptor where there is one, so the bits and the ACL come

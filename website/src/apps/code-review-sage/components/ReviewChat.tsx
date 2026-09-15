@@ -22,6 +22,7 @@ import { useNavigate } from 'react-router-dom'
 
 import { api } from '../../../api/client'
 import MarkdownRenderer from '../../../components/MarkdownRenderer'
+import ErrorNotice from '../../../components/ErrorNotice'
 import { i18nT } from '../../../i18n/t'
 import { SageApiError, sageApi } from '../api'
 import type { ChatTurn } from '../lib/types'
@@ -152,8 +153,8 @@ export default function ReviewChat(
       // is given, so sending them again on a continue would revert a session the
       // user has since renamed or moved into a folder of their own.
       const slot = await api.createChatSlot(
-        prep.slot_key, prep.agent, undefined, undefined, undefined,
-        alreadyOpen ? undefined : prep.title, undefined, undefined,
+        prep.slot_key, prep.agent, undefined, undefined, 'persistent',
+        alreadyOpen ? undefined : prep.title, undefined,
         alreadyOpen ? undefined : (prep.folder_id || undefined),
       )
       return slot.key || prep.slot_key
@@ -255,8 +256,10 @@ export default function ReviewChat(
             </div>
           )}
 
+          {/* This panel has no composer of its own (see the header comment), so a
+              failed resume leaves nothing on screen to lose. */}
           {error && (
-            <div className="text-[11.5px] text-danger">{error}</div>
+            <ErrorNotice message={error} variant="inline" askAgent />
           )}
         </div>
       )}

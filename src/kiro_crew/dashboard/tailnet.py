@@ -856,8 +856,8 @@ _TAILNET_RANGES = (
     ipaddress.ip_network("fd7a:115c:a1e0::/48"),
 )
 
-#: The login `tailscale whois` reports for EVERY ACL-tagged node
-#: (tailscale/tailscale#4605). Under ``pin_scope: "login"`` that single value
+#: The login `tailscale whois` reports for EVERY ACL-tagged node.
+#: Under ``pin_scope: "login"`` that single value
 #: would collapse the pin across the entire tagged fleet, so a resolved login
 #: equal to this is ALWAYS pinned at node scope — a hard override, not a
 #: preference.
@@ -908,6 +908,16 @@ class TailnetTrust:
     trust_identity: bool = False
     allowed_logins: tuple[str, ...] = ()
     pin_scope: str = PIN_SCOPE_NODE
+    #: Bind a refresh CHAIN to the peer that opened it, so a stolen refresh
+    #: cookie cannot be replayed from a different allowed node.
+    #: Default ON: without it the chain is the laundering path around the access
+    #: token's own pin -- a cookie stolen from node A rotates from node B and the
+    #: replacement access token comes back pinned to B. Turning it OFF restores
+    #: that behaviour, and is only the right answer for an operator who needs
+    #: cross-DEVICE roaming at ``pin_scope: "node"``; at ``"login"`` scope the
+    #: pin key is the identity rather than the device, so roaming between a
+    #: person's own devices already works with the binding on.
+    bind_refresh_chains: bool = True
     #: The operator wrote a tailnet identity policy that config load could not
     #: read (see ``DEGRADED_TAILSCALE``). Distinct from ``trust_identity=False``,
     #: which means they never asked for one: an unreadable narrowing must DENY,
@@ -1229,6 +1239,7 @@ async def governed_tailnet_trust(
     allowed_logins: tuple[str, ...],
     pin_scope: str,
     *,
+    bind_refresh_chains: bool = True,
     identity_unknown: bool = False,
     unreadable_files: tuple[str, ...] = (),
 ) -> TailnetTrust:
@@ -1254,6 +1265,11 @@ async def governed_tailnet_trust(
     calls at all, and with the integration off there is no allowlist left to
     fail closed on.
 
+    ``bind_refresh_chains`` is the availability escape hatch for refresh-chain
+    peer binding. It defaults to the SAFER value at every layer,
+    including here, so a caller that has not been taught about it cannot
+    accidentally construct the unbound posture.
+
     ``unreadable_files`` names the config file(s) involved, for the refusal to
     quote. It matters more than it looks: the file is often
     ``config.local.json`` rather than ``config.json``, and an operator who has
@@ -1264,6 +1280,7 @@ async def governed_tailnet_trust(
         trust_identity=trust_identity,
         allowed_logins=allowed_logins,
         pin_scope=pin_scope,
+        bind_refresh_chains=bind_refresh_chains,
         identity_unknown=identity_unknown,
     )
     if trust.enforces_identity and await asyncio.to_thread(

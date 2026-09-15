@@ -70,11 +70,15 @@ class TestRunOnceEarlyReturns:
     """Each guard makes the loop fail CLOSED: a missing precondition is a log
     line and a return, never an unconfirmed AWS call. One test per guard."""
 
-    def test_no_registered_profile_skips(self):
-        # With no default profile resolved there is no account to back up, so
-        # the loop must return before probing identity.
+    def test_no_healthy_registered_key_skips(self):
+        # With no working key resolved there is nothing the loop may run under,
+        # so it must return before probing identity. The resolution is the one
+        # the grant was recorded against, so a key it rejects is a key the
+        # consent gate would refuse anyway.
         with (
-            mock.patch.object(hooks.deploy_profiles, "resolve_profile", return_value=None),
+            mock.patch.object(
+                hooks.accounts_mod, "resolve_default_account_profile", AsyncMock(return_value=None)
+            ),
             mock.patch.object(hooks.aws_consent, "probe_identity") as probe,
         ):
             _run(hooks._run_once())
@@ -86,7 +90,9 @@ class TestRunOnceEarlyReturns:
         # returns before the due-check.
         with (
             mock.patch.object(
-                hooks.deploy_profiles, "resolve_profile", return_value=("p", "us-west-2")
+                hooks.accounts_mod,
+                "resolve_default_account_profile",
+                AsyncMock(return_value=("p", "us-west-2")),
             ),
             mock.patch.object(
                 hooks.aws_consent,
@@ -103,7 +109,9 @@ class TestRunOnceEarlyReturns:
         # both, so this distinct branch must also return before due-check.
         with (
             mock.patch.object(
-                hooks.deploy_profiles, "resolve_profile", return_value=("p", "us-west-2")
+                hooks.accounts_mod,
+                "resolve_default_account_profile",
+                AsyncMock(return_value=("p", "us-west-2")),
             ),
             mock.patch.object(
                 hooks.aws_consent,
@@ -121,7 +129,9 @@ class TestRunOnceEarlyReturns:
         # never even asked to spend money.
         with (
             mock.patch.object(
-                hooks.deploy_profiles, "resolve_profile", return_value=("p", "us-west-2")
+                hooks.accounts_mod,
+                "resolve_default_account_profile",
+                AsyncMock(return_value=("p", "us-west-2")),
             ),
             mock.patch.object(
                 hooks.aws_consent,
@@ -140,7 +150,9 @@ class TestRunOnceEarlyReturns:
         # revoked grant produces no S3 read and no upload.
         with (
             mock.patch.object(
-                hooks.deploy_profiles, "resolve_profile", return_value=("p", "us-west-2")
+                hooks.accounts_mod,
+                "resolve_default_account_profile",
+                AsyncMock(return_value=("p", "us-west-2")),
             ),
             mock.patch.object(
                 hooks.aws_consent,
@@ -160,7 +172,9 @@ class TestRunOnceEarlyReturns:
         # snapshot backup (and before the "invoked" audit).
         with (
             mock.patch.object(
-                hooks.deploy_profiles, "resolve_profile", return_value=("p", "us-west-2")
+                hooks.accounts_mod,
+                "resolve_default_account_profile",
+                AsyncMock(return_value=("p", "us-west-2")),
             ),
             mock.patch.object(
                 hooks.aws_consent,
@@ -178,6 +192,79 @@ class TestRunOnceEarlyReturns:
         audit.assert_not_called()
 
 
+class TestSharedDriveNotice:
+    """A shared drive is a NOTICE, never a gate. Two installs pointed at one
+    account each write under their own prefix, so the nightly loop records the
+    fact and PROCEEDS -- refusing would silently stop backing one machine up."""
+
+    def _proceeding_run(self, *, others):
+        """Run ``_run_once`` past every guard to the backup, with the
+        shared-drive check returning (or raising) ``others``."""
+        others_patch = (
+            mock.patch.object(hooks.backup_mod, "other_install_ids", side_effect=others)
+            if isinstance(others, Exception)
+            else mock.patch.object(hooks.backup_mod, "other_install_ids", return_value=others)
+        )
+        with (
+            mock.patch.object(
+                hooks.accounts_mod,
+                "resolve_default_account_profile",
+                AsyncMock(return_value=("p", "us-west-2")),
+            ),
+            mock.patch.object(
+                hooks.aws_consent,
+                "probe_identity",
+                AsyncMock(return_value=aws_consent.Identity(ok=True, account=ACCOUNT)),
+            ),
+            mock.patch.object(hooks.backup_mod, "due_for_nightly", return_value=True),
+            mock.patch.object(hooks.aws_consent, "refuse_and_log", AsyncMock(return_value=True)),
+            mock.patch.object(hooks.storage_mod, "find_drive", return_value="kirocrew-drive-abc"),
+            others_patch,
+            mock.patch.object(
+                hooks.backup_mod, "run_snapshot_backup", return_value={"key": "snapshots/x"}
+            ) as backup,
+            mock.patch.object(hooks, "_audit") as audit,
+        ):
+            _run(hooks._run_once())
+        return backup, audit
+
+    def test_another_install_present_still_backs_up_and_audits_the_shared_drive(self):
+        # The decisive pin: the run does NOT refuse. The backup still runs, and a
+        # `backup_shared_drive` record is emitted so the shared state is visible
+        # in the same SEL trail as the upload it precedes.
+        backup, audit = self._proceeding_run(others=["b" * 32])
+        backup.assert_called_once()
+        shared = [c for c in audit.call_args_list if c.args[0] == "backup_shared_drive"]
+        assert shared, "the shared-drive notice was not audited"
+        assert shared[0].args[2] == "invoked"
+
+    def test_a_failing_shared_drive_check_never_blocks_the_backup(self):
+        # The notice is best-effort: if other_install_ids raises, the check is
+        # one less log line, never a missed nightly. The backup still runs and no
+        # shared-drive record is emitted.
+        backup, audit = self._proceeding_run(others=RuntimeError("list denied"))
+        backup.assert_called_once()
+        assert not [c for c in audit.call_args_list if c.args[0] == "backup_shared_drive"]
+
+    def test_no_other_install_emits_no_shared_drive_record(self):
+        # A drive only this install writes to is not shared, so there is nothing
+        # to record. The backup runs; the shared-drive audit does not fire.
+        backup, audit = self._proceeding_run(others=[])
+        backup.assert_called_once()
+        assert not [c for c in audit.call_args_list if c.args[0] == "backup_shared_drive"]
+
+    def test_the_notice_costs_exactly_one_paid_list_call(self):
+        # The nightly uploads snapshots and nothing else, so it asks about the
+        # snapshot prefix and stops. Sweeping both prefixes spent a second paid
+        # LIST on every scheduled run to answer a question about a run that is not
+        # happening -- a real cost on the one path that spends without a human
+        # present, which is exactly where an unread call is least defensible.
+        with mock.patch.object(hooks.backup_mod, "_install_folders", return_value=set()) as folders:
+            hooks.backup_mod.other_install_ids("p", "us-west-2", "bkt", account="111122223333")
+        assert folders.call_count == 1
+        assert folders.call_args.args[3] == hooks.backup_mod.KIND_SNAPSHOT
+
+
 class TestRunOnceCancellation:
     """A cancel during the backup is audited as ``cancelled`` and re-raised, so
     teardown stops the loop cleanly AND leaves a trail that it was interrupted."""
@@ -185,7 +272,9 @@ class TestRunOnceCancellation:
     def test_cancelled_backup_is_audited_and_reraised(self):
         with (
             mock.patch.object(
-                hooks.deploy_profiles, "resolve_profile", return_value=("p", "us-west-2")
+                hooks.accounts_mod,
+                "resolve_default_account_profile",
+                AsyncMock(return_value=("p", "us-west-2")),
             ),
             mock.patch.object(
                 hooks.aws_consent,

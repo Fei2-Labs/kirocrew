@@ -28,6 +28,13 @@ contextBridge.exposeInMainWorld("kirocrew", {
 });
 
 contextBridge.exposeInMainWorld("electronAPI", {
+  // Evict the HTTP cache of one remote-crew pane origin (a loopback tunnel
+  // port) before reloading it. Used when the pane's module graph reports a
+  // load error: a hashed chunk the gateway once answered 404+immutable is
+  // replayed from cache forever, and only eviction gets the pane past Loading.
+  // Resolves to whether a purge ran; the caller reloads regardless.
+  clearPaneHttpCache: (origin) =>
+    ipcRenderer.invoke("pane:clear-http-cache", String(origin || "")),
   onStatus: (cb) => {
     const handler = (_e, msg) => cb(msg);
     ipcRenderer.on("status", handler);
@@ -141,6 +148,23 @@ contextBridge.exposeInMainWorld("localGatewayAPI", {
   set: (enabled) => ipcRenderer.invoke("local-gateway:set", !!enabled),
 });
 
+// Crash-artifact notice for the dashboard banner (CrashReportNotice).
+//
+// The app already captures a minidump and, on macOS, the OS writes an .ips
+// report — and until now nothing ever mentioned that either exists, which is how
+// a main-process crash reaches us as "it closed by itself" with the evidence
+// still unread on the reporter's disk. This bridge is what closes that loop.
+//
+// `get` resolves { newCount } and NOTHING else: no paths, no filenames, no
+// exception codes, not even a timestamp. `reveal` takes no argument — main.js knows
+// where the log is from the scan it performed, so this cannot be turned into a
+// request to open an arbitrary file. Absent in plain browsers and in the PWA,
+// where there is no local disk to reveal; the banner hides itself.
+contextBridge.exposeInMainWorld("crashReportsAPI", {
+  get: () => ipcRenderer.invoke("crash-reports:get"),
+  reveal: () => ipcRenderer.invoke("crash-reports:reveal"),
+});
+
 // Read-only WSL2 host-runtime readout for the Host runtime card on System >
 // Services (HostRuntimeCard). Detection only — no config writes, no
 // persistence. The main-process handler rejects every sender whose gateway is
@@ -150,6 +174,16 @@ contextBridge.exposeInMainWorld("localGatewayAPI", {
 // shell" and renders nothing.
 contextBridge.exposeInMainWorld("wslAPI", {
   detect: () => ipcRenderer.invoke("wsl:detect"),
+});
+
+// File-open bridge for the chat path chip's "Open in editor" affordance. Hands
+// a filesystem PATH — never a URL scheme — to the main process, which validates
+// it and calls shell.openPath so the file opens in the OS default handler on the
+// user's own machine. Resolves { ok, error? }. Absent in a plain browser and in
+// the PWA — the renderer treats a missing bridge as "cannot open externally" and
+// hides the control, keeping the built-in viewer as the only path there.
+contextBridge.exposeInMainWorld("fileOpenAPI", {
+  open: (filePath) => ipcRenderer.invoke("dashboard:open-file", String(filePath || "")),
 });
 
 // Native zoom bridge for the Settings > Display "Zoom Level" stepper.
@@ -200,6 +234,11 @@ contextBridge.exposeInMainWorld("browserAPI", {
     ipcRenderer.invoke("browser:set-control-owner", panelId, owner),
   getControl: (panelId) => ipcRenderer.invoke("browser:get-control", panelId),
   control: (panelId, op, args) => ipcRenderer.invoke("browser:control", panelId, op, args),
+  // Human-initiated element annotation on the page in the native view:
+  // start/stop pick mode, poll the notes the user typed in the in-page
+  // overlay, remove/edit/clear, capture a screenshot with the markers. Read
+  // through executeJavaScript + capturePage, not the agent control plane.
+  annotate: (panelId, op, args) => ipcRenderer.invoke("browser:annotate", panelId, op, args),
   // Declares that a chat session may host a browser panel, so the agent command
   // channel polls for it even before the Browser tab is ever opened. Grants no
   // authorization — authorization to drive the built-in browser is Browser Mode

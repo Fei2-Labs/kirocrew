@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from conftest import absent_sysconf
 from kiro_crew import subagent as sa
 from kiro_crew.subagent import SubagentInfo, SubagentManager
 
@@ -321,34 +322,46 @@ class TestDigestHoldSecs:
 
 
 class TestCheckMemoryAvailable:
-    def test_parses_mem_available(self) -> None:
-        text = "MemTotal:       1000 kB\nMemAvailable:    8388608 kB\n"
-        with patch.object(sa, "safe_read_file", return_value=text):
-            ok, gb = sa.check_memory_available(min_gb=4.0)
+    def test_parses_mem_available(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemTotal:       1000 kB\nMemAvailable:    8388608 kB\n")
+        ok, gb = sa.check_memory_available(min_gb=4.0, path=str(f))
         assert ok is True
         assert gb == 8.0
 
-    def test_below_threshold_reports_not_ok(self) -> None:
-        text = "MemAvailable:    1048576 kB\n"
-        with patch.object(sa, "safe_read_file", return_value=text):
-            ok, gb = sa.check_memory_available(min_gb=4.0)
+    def test_below_threshold_reports_not_ok(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:    1048576 kB\n")
+        ok, gb = sa.check_memory_available(min_gb=4.0, path=str(f))
         assert (ok, gb) == (False, 1.0)
 
-    def test_sensitive_path_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", side_effect=PermissionError):
+    def test_path_gate_not_consulted(self, tmp_path: Path) -> None:
+        """The fixed kernel path is read with plain open, never the gate."""
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:    8388608 kB\n")
+        with (
+            patch("kiro_crew.hooks.safe_read_file", side_effect=AssertionError),
+            patch("kiro_crew.hooks.is_sensitive_path", side_effect=AssertionError),
+        ):
+            assert sa.check_memory_available(min_gb=4.0, path=str(f)) == (True, 8.0)
+
+    def test_permission_error_fails_open(self) -> None:
+        with patch("builtins.open", side_effect=PermissionError):
             assert sa.check_memory_available() == (True, -1.0)
 
     def test_read_error_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", side_effect=OSError):
+        with patch("builtins.open", side_effect=OSError):
             assert sa.check_memory_available() == (True, -1.0)
 
-    def test_malformed_line_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", return_value="MemAvailable:  notanumber kB\n"):
-            assert sa.check_memory_available() == (True, -1.0)
+    def test_malformed_line_fails_open(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:  notanumber kB\n")
+        assert sa.check_memory_available(path=str(f)) == (True, -1.0)
 
-    def test_missing_key_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", return_value="MemTotal: 12 kB\n"):
-            assert sa.check_memory_available() == (True, -1.0)
+    def test_missing_key_fails_open(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemTotal: 12 kB\n")
+        assert sa.check_memory_available(path=str(f)) == (True, -1.0)
 
 
 class TestReadIntFile:
@@ -485,27 +498,53 @@ class TestMacosAvailableMemory:
     ``raising=False`` — the probe's own ``hasattr`` guard is what CI exercises."""
 
     def test_page_size_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            os, "sysconf", lambda _name: (_ for _ in ()).throw(ValueError), raising=False
-        )
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+
+        def fake_sysconf(name):
+            if name == "SC_PAGE_SIZE":
+                raise ValueError("SC_PAGE_SIZE unavailable")
+            return real_sysconf(name)
+
+        monkeypatch.setattr(os, "sysconf", fake_sysconf, raising=False)
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_nonpositive_page_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 0, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os, "sysconf", lambda n: 0 if n == "SC_PAGE_SIZE" else real_sysconf(n), raising=False
+        )
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_no_reclaimable_pages(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 4096, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os,
+            "sysconf",
+            lambda n: 4096 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
+        )
         monkeypatch.setattr(sa, "_macos_vm_reclaimable_pages", lambda: None)
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_zero_pages_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 4096, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os,
+            "sysconf",
+            lambda n: 4096 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
+        )
         monkeypatch.setattr(sa, "_macos_vm_reclaimable_pages", lambda: 0)
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_computes_gb_from_pages(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 4096, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os,
+            "sysconf",
+            lambda n: 4096 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
+        )
         monkeypatch.setattr(sa, "_macos_vm_reclaimable_pages", lambda: 262144)
         assert sa._macos_available_memory_gb() == pytest.approx(1.0)
 
@@ -810,7 +849,7 @@ class TestSampleLiveCounts:
         assert (info.last_procs, info.last_stubs) == (7, 6)
 
     def test_one_walk_per_agent_not_one_per_metric(self) -> None:
-        """The whole point of #3970: RSS, CPU and both counts come off ONE walk.
+        """The whole point: RSS, CPU and both counts come off ONE walk.
 
         Patching the shared sample is not enough to prove that — a sweep that
         still called three readers would also pass the assertions above. Count
@@ -1078,10 +1117,10 @@ class TestReadSurfaces:
         assert mgr.task_memory_rows() == []
 
     def test_task_memory_rows_redact_before_truncate(self) -> None:
-        """#5582: a credential straddling the 80-char cut must not leak a fragment.
+        """A credential straddling the 80-char cut must not leak a fragment.
 
         The old spelling ``_redact(a.task[:80])`` sliced first, so a key cut at
-        the boundary lost its tail and no longer matched the credential regex —
+        the boundary loses its tail and does not match the credential regex —
         the raw prefix escaped into the session-memory surface.
         The fabricated AKIA-shaped literal is inlined rather than bound to a
         ``secret``-named variable, which would trip CodeQL's name-based
@@ -1116,6 +1155,30 @@ class TestReadSurfaces:
         mgr = _manager(max_concurrent=7)
         mgr._running_count = 4
         assert (mgr.max_concurrent, mgr.running_count) == (7, 4)
+
+    @pytest.mark.asyncio
+    async def test_pending_work_count_covers_post_slot_lifecycle_tasks(self) -> None:
+        mgr = _manager()
+        release = asyncio.Event()
+        recovery = asyncio.create_task(release.wait())
+        report = asyncio.create_task(release.wait())
+        followup = asyncio.create_task(release.wait())
+        reconcile = asyncio.create_task(release.wait())
+        completed = asyncio.create_task(asyncio.sleep(0))
+        await completed
+        mgr._running_count = 0
+        mgr._queue = [{"parent_session_key": "dash:1"}]
+        mgr._tasks = {"run:recovery": recovery, "done": completed}
+        mgr._report_tasks = {report}
+        mgr._followup_watchers = {"run": followup}
+        mgr._reconcile_task = reconcile
+        mgr._abandoned_state_writers = {"state-writer"}
+        try:
+            # queue + recovery + report + follow-up + reconciliation + writer
+            assert mgr.pending_work_count == 6
+        finally:
+            release.set()
+            await asyncio.gather(recovery, report, followup, reconcile)
 
 
 class TestQueueDepth:
@@ -1918,13 +1981,33 @@ class TestGetParentRuntime:
 
 
 class TestIsCcProvider:
-    def test_delegates_to_backend_probe(self) -> None:
-        with patch("kiro_crew.providers.acp.is_claude_backend", return_value=True):
-            assert SubagentManager._is_cc_provider(object()) is True
+    """Which HOME tree a session's files live in, asked as a capability.
 
-    def test_non_claude_backend(self) -> None:
-        with patch("kiro_crew.providers.acp.is_claude_backend", return_value=False):
-            assert SubagentManager._is_cc_provider(object()) is False
+    ``_is_cc_provider`` reads ``SessionCapabilities.provider_seam`` through
+    ``capabilities_of``, so these tests hand it a provider carrying a real
+    capability record instead of patching a module-level predicate. The third case
+    is the one a bare attribute read gets wrong: a shape that is not a provider
+    must answer False, which is what the ``isinstance`` gate in ``capabilities_of``
+    buys.
+    """
+
+    @staticmethod
+    def _provider(backend: str) -> SimpleNamespace:
+        from kiro_crew.agent_sdk.capabilities import capabilities_for
+
+        return SimpleNamespace(capabilities=capabilities_for(backend))
+
+    def test_claude_seam_routes_to_the_claude_home(self) -> None:
+        from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+
+        assert SubagentManager._is_cc_provider(self._provider(ACP_BACKEND_CLAUDE)) is True
+
+    @pytest.mark.parametrize("backend", ["", "kas", "codex"])
+    def test_non_claude_backend(self, backend: str) -> None:
+        assert SubagentManager._is_cc_provider(self._provider(backend)) is False
+
+    def test_a_shape_that_is_not_a_provider_answers_false(self) -> None:
+        assert SubagentManager._is_cc_provider(object()) is False
 
 
 # ── Manager: intentional cancel contract ──────────────────────────────────

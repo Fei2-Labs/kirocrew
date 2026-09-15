@@ -246,12 +246,14 @@ def workflow_run(name: str, args: dict[str, Any]) -> str:
     if isinstance(args.get("budget_total"), int):
         wf_body["budget_total"] = args["budget_total"]
     if workflow_ref:
-        session_key = mcp_core._resolve_session_key_strict()
+        session_key, _strict_err = mcp_core.require_strict_session_key(
+            "Error: cannot verify caller identity for workflow_run. Refusing to start a "
+            "session-bound workflow."
+        )
         if not session_key:
             return _wf_return(
                 "workflow_run",
-                "Error: cannot verify caller identity for workflow_run. Refusing to start a "
-                "session-bound workflow." + mcp_core.strict_identity_diagnosis(),
+                _strict_err,
                 outcome="error",
             )
         if args.get("input"):
@@ -365,6 +367,8 @@ def workflow_result(name: str, args: dict[str, Any]) -> str:
         "error": _redact_obj(d.get("error")),
         "events": _redact_obj(d.get("events", [])),
     }
+    if d.get("agent_results"):
+        wf_payload["agent_results"] = _redact_obj(d.get("agent_results"))
     if d.get("partial_results"):
         wf_payload["partial_results"] = _redact_obj(d.get("partial_results"))
     if d.get("agent_errors"):

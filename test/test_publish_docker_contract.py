@@ -165,7 +165,9 @@ def test_promotion_requires_a_recorded_digest_and_disables_rebuild_paths() -> No
 
     release = yaml.safe_load(CALLERS[1].read_text(encoding="utf-8"))
     call = release["jobs"]["publish-docker"]["with"]
-    assert call["promote"].endswith(" == 'stable' }}")
+    # promote_mode, not channel: a stable rebuild runs ON the stable channel and
+    # must build its own image rather than re-tag the candidate's digest.
+    assert call["promote"] == "${{ needs.version.outputs.promote_mode == 'true' }}"
     assert "resolve-promotion.outputs.docker_digest" in call["promote_digest"]
 
 
@@ -322,9 +324,7 @@ def test_public_access_gate_is_required_by_every_canonical_caller() -> None:
 def test_callers_do_not_inherit_secrets_into_the_lane() -> None:
     """The lane authenticates with the implicit GITHUB_TOKEN only. Callers
     passing ``secrets: inherit`` would expose every repo secret (signing,
-    CDN) to a workflow documented as needing none. Parsed structurally —
-    an indentation-based line scan here previously never reached its own
-    assertion."""
+    CDN) to a workflow documented as needing none. Parsed structurally."""
     import yaml
 
     for caller in CALLERS:

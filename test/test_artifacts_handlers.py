@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from conftest import cap_project_root_walk
 from kiro_crew import artifacts as art_mod
 from kiro_crew.artifacts import ArtifactStore
 from kiro_crew.dashboard.handlers.artifacts import (
@@ -20,6 +21,7 @@ from kiro_crew.dashboard.handlers.artifacts import (
     api_artifact_detail,
     api_artifact_materialize,
     api_artifact_relocate,
+    api_artifact_reprobe_notice,
     api_artifact_session_docs,
     api_artifact_set_pinned,
     api_artifact_settle_blank,
@@ -102,12 +104,16 @@ def linkable_project(tmp_path: Path, monkeypatch):
     gets a ``.git`` marker to make it a real repo.
 
     Returns the project dir. Project-root discovery is stubbed to empty so the
-    test never reads the developer's real ``recent_projects.json``.
+    test never reads the developer's real ``recent_projects.json``. The marker
+    walk is capped at ``tmp_path`` (``conftest.cap_project_root_walk``) so only
+    the ``.git`` planted here can earn a LINK, whatever sits above the host's
+    temp root.
     """
     from kiro_crew import artifact_source
 
     (tmp_path / "tmp").mkdir()
     monkeypatch.setattr(artifact_source, "_tempdir", lambda: str(tmp_path / "tmp"))
+    cap_project_root_walk(monkeypatch, tmp_path)
     proj = tmp_path / "project"
     (proj / ".git").mkdir(parents=True)
     return proj
@@ -121,6 +127,7 @@ def disposable_file(tmp_path: Path, monkeypatch):
     tmp = tmp_path / "tmp"
     tmp.mkdir()
     monkeypatch.setattr(artifact_source, "_tempdir", lambda: str(tmp))
+    cap_project_root_walk(monkeypatch, tmp_path)
     target = tmp / "scratch.md"
     target.write_text("# scratch", encoding="utf-8")
     return target
@@ -563,12 +570,10 @@ class TestCreate:
     async def test_artifact_error_fallback_returns_500(
         self, isolated_store, patch_restricted, monkeypatch
     ) -> None:
-        # Regression: store.create() raising the base ArtifactError (e.g. a
-        # sensitive-path refusal from _write_text() that fires after the
-        # duplicate-slug check passes) used to be caught by the same except
-        # branch as ArtifactAlreadyExistsError, returning a misleading 409. Now
-        # the two are distinguished — duplicates are 409, all other store
-        # errors are 500.
+        # store.create() raising the base ArtifactError (e.g. a sensitive-path
+        # refusal from _write_text() that fires after the duplicate-slug check
+        # passes) must be distinguished from ArtifactAlreadyExistsError:
+        # duplicates are 409, all other store errors are 500.
         from kiro_crew.artifacts import ArtifactError
 
         def _boom(*_a, **_kw):
@@ -784,7 +789,7 @@ class TestCreate:
         # NOT silently merge into one — because a chat-backed artifact's
         # identity is its slug, not its source. Regression guard for the
         # bug alice hit where a markdown file's "Add to artifacts" was
-        # matching a previously-saved widget because the lookup degraded
+        # matching an already-saved widget because the lookup degraded
         # to "first artifact in list".
         body = {"name": "widget", "content": "<p>hi</p>", "kind": "widget", "source": "chat"}
         first = await api_artifacts_create(_request(body=body))
@@ -797,10 +802,10 @@ class TestCreate:
     async def test_mcp_dedup_resave_tags_event_as_agent(
         self, isolated_store, patch_restricted, linkable_project
     ) -> None:
-        # review-bot round 12: the dedup path used to hardcode actor='user' so
-        # MCP-driven re-saves silently appeared on the activity timeline as
-        # 'edited by user' instead of 'iterated by agent'. Now the handler
-        # infers actor from X-Internal-Secret like api_artifact_update.
+        # The dedup path must not hardcode actor='user': it infers actor from
+        # X-Internal-Secret like api_artifact_update, so an MCP-driven re-save
+        # appears on the activity timeline as 'iterated by agent', not
+        # 'edited by user'.
         src = linkable_project / "brd.md"
         src.write_text("# v1", encoding="utf-8")
         body = {
@@ -1013,6 +1018,7 @@ class TestPromoteVerdict:
 
         (tmp_path / "tmp").mkdir()
         monkeypatch.setattr(artifact_source, "_tempdir", lambda: str(tmp_path / "tmp"))
+        cap_project_root_walk(monkeypatch, tmp_path)
         loose = tmp_path / "loose" / "doc.md"
         loose.parent.mkdir()
         loose.write_text("x", encoding="utf-8")
@@ -1268,9 +1274,9 @@ class TestUpdate:
     async def test_dashboard_save_without_snapshot_keeps_version(
         self, isolated_store, patch_restricted
     ) -> None:
-        # New behavior (round 5, explicit-snapshot model): a
-        # dashboard PATCH with no snapshot flag updates the live state but
-        # does NOT bump version. Versioning becomes deliberate.
+        # Explicit-snapshot model: a dashboard PATCH with no snapshot flag
+        # updates the live state but does NOT bump version. Versioning is
+        # deliberate.
         isolated_store.create(name="x", content="v1", slug="x")
         resp = await api_artifact_update(_request(body={"content": "v2"}, match={"slug": "x"}))
         assert resp.status == 200
@@ -1331,10 +1337,9 @@ class TestUpdate:
     async def test_artifact_error_fallback_returns_500(
         self, isolated_store, patch_restricted, monkeypatch
     ) -> None:
-        # Regression: store.update() raising the base ArtifactError (e.g. a
-        # sensitive-path refusal from _write_text) used to escape the handler
-        # and surface as an unhandled 500 with no audit trail. Now caught
-        # explicitly and audited as an error.
+        # store.update() raising the base ArtifactError (e.g. a sensitive-path
+        # refusal from _write_text) must be caught explicitly and audited as an
+        # error, not escape the handler as an unhandled 500 with no audit trail.
         from kiro_crew.artifacts import ArtifactError
 
         isolated_store.create(name="x", content="v1", slug="x")
@@ -1369,12 +1374,331 @@ class TestDelete:
         assert resp.status == 403
 
     @pytest.mark.asyncio
+    async def test_withdraws_the_published_copy_before_deleting_locally(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        """The publication is the only handle that can withdraw the destination copy, so
+        the attempt has to happen while it still exists. Die between the two steps in this
+        order and the copy is withdrawn but the artifact remains -- the user deletes again.
+        In the reverse order the record is gone while the content is still public."""
+        from kiro_crew.artifacts import ArtifactPublication
+
+        isolated_store.create(name="x", content="a", slug="x")
+        isolated_store.set_publication(
+            "x",
+            ArtifactPublication(
+                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+            ),
+        )
+        order: list[str] = []
+
+        async def _withdraw(art):
+            order.append("withdraw")
+            assert isolated_store.get("x") is not None, "the handle must still exist here"
+
+        real_delete = isolated_store.delete
+
+        def _delete(slug, **kw):
+            order.append("delete")
+            return real_delete(slug, **kw)
+
+        monkeypatch.setattr("kiro_crew.publish_sync.delete_for_artifact", _withdraw)
+        monkeypatch.setattr(isolated_store, "delete", _delete)
+        resp = await api_artifact_delete(_request(match={"slug": "x"}))
+        assert resp.status == 200
+        assert order == ["withdraw", "delete"]
+
+    @pytest.mark.asyncio
+    async def test_a_recreate_during_the_withdrawal_is_not_deleted(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        """The withdrawal is a network round trip and ``delete()`` removes by SLUG, so a
+        delete-and-recreate landing in that window would make the delayed request remove
+        the REPLACEMENT -- an artifact the user never asked to delete and that nothing can
+        restore. The ordering note above reasons that a save in that window "is included in
+        the delete the user asked for", which holds for a save to the SAME artifact; a
+        recreate is a different artifact wearing the same slug.
+        """
+        import kiro_crew.publish_sync as _ps
+        from kiro_crew.artifacts import ArtifactPublication
+
+        isolated_store.create(name="x", content="a", slug="x")
+        isolated_store.set_publication(
+            "x",
+            ArtifactPublication(
+                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+            ),
+        )
+
+        async def _withdraw(art):
+            # The concurrent delete + recreate completes while this await is in flight.
+            isolated_store.delete("x")
+            isolated_store.create(name="x-replacement", content="b", slug="x")
+            return _ps.DeleteWithdrawal.WITHDRAWN
+
+        monkeypatch.setattr("kiro_crew.publish_sync.delete_for_artifact", _withdraw)
+        resp = await api_artifact_delete(_request(match={"slug": "x"}))
+        assert resp.status == 409
+        # The replacement must survive, and still be the replacement.
+        survivor = isolated_store.get("x")
+        assert survivor is not None
+        assert survivor.name == "x-replacement"
+
+    @pytest.mark.asyncio
+    async def test_the_post_withdrawal_reread_runs_off_the_event_loop(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        """`store.get` returns the artifact WITH content, so on a large artifact it is a
+        multi-megabyte synchronous read -- and this handler is async, so doing it inline
+        stalls the gateway loop for every other task.
+
+        Only the read AFTER the withdrawal is asserted: the capture read at the top of the
+        handler is pre-existing on main and is a separate defect, not this PR's.
+        """
+        import threading
+
+        import kiro_crew.publish_sync as _ps
+        from kiro_crew.artifacts import ArtifactPublication
+
+        isolated_store.create(name="x", content="a", slug="x")
+        isolated_store.set_publication(
+            "x",
+            ArtifactPublication(
+                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+            ),
+        )
+
+        state = {"withdrawn": False}
+        after_threads: list[str] = []
+        real_get = isolated_store.get
+
+        def _recording_get(slug, **kw):
+            if state["withdrawn"]:
+                after_threads.append(threading.current_thread().name)
+            return real_get(slug, **kw)
+
+        async def _withdraw(art):
+            state["withdrawn"] = True
+            return _ps.DeleteWithdrawal.WITHDRAWN
+
+        monkeypatch.setattr("kiro_crew.publish_sync.delete_for_artifact", _withdraw)
+        monkeypatch.setattr(isolated_store, "get", _recording_get)
+
+        loop_thread = threading.current_thread().name
+        resp = await api_artifact_delete(_request(match={"slug": "x"}))
+        assert resp.status == 200
+        assert after_threads, "the post-withdrawal re-read never happened"
+        assert all(t != loop_thread for t in after_threads), (
+            f"re-read ran on the event-loop thread {loop_thread!r}: {after_threads!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_republish_landing_after_the_withdrawal_refuses_the_delete(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        """A publish landing between the withdrawal and the removal must not be erased.
+
+        The pre-existing ``created_at`` guard cannot catch this one: it compares artifact
+        GENERATIONS, and a republish is the SAME artifact, so its ``created_at`` is
+        unchanged and that guard passes. What differs is the publication -- a new copy is
+        live at the destination and the record naming it is the only handle able to take
+        it down. Removing the artifact would drop that record.
+
+        The window is reproduced where it actually exists: the republish is injected right
+        after the handler clears the withdrawn record, which is the exact gap between that
+        clear and the removal. The refusal has to come from inside the store's lock, so
+        the assertion is that the artifact and the NEW record both survive.
+        """
+        import kiro_crew.publish_sync as _ps
+        from kiro_crew.artifacts import ArtifactPublication
+
+        isolated_store.create(name="x", content="a", slug="x")
+        isolated_store.set_publication(
+            "x",
+            ArtifactPublication(
+                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+            ),
+        )
+
+        async def _withdraw(art):
+            return _ps.DeleteWithdrawal.WITHDRAWN
+
+        real_clear = isolated_store.clear_publication
+
+        def _clear_then_republish(slug):
+            result = real_clear(slug)
+            # The concurrent publish: a NEW copy, so a NEW handle.
+            isolated_store.set_publication(
+                slug,
+                ArtifactPublication(
+                    provider="default",
+                    artifact_id="uuid-2",
+                    view_url="https://d/x2",
+                    visibility="PUBLIC",
+                ),
+            )
+            return result
+
+        monkeypatch.setattr("kiro_crew.publish_sync.delete_for_artifact", _withdraw)
+        monkeypatch.setattr(isolated_store, "clear_publication", _clear_then_republish)
+
+        resp = await api_artifact_delete(_request(match={"slug": "x"}))
+        assert resp.status == 409, "a republish in the window must refuse the delete"
+
+        survivor = isolated_store.get("x")
+        assert survivor is not None, "the artifact must survive so the new copy keeps a handle"
+        assert survivor.publication is not None, "the new publication record must survive"
+        assert survivor.publication.artifact_id == "uuid-2", (
+            "the surviving record must be the NEW publication, not the withdrawn one"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unregistered_destination_refuses_the_delete_and_the_handler_adds_no_guard(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        """Two things. First, the handler owns no guard of its own: a stub that raises
+        propagates straight through it, so the decision genuinely lives in
+        ``delete_for_artifact`` rather than being duplicated here.
+
+        Second, a publication naming a destination this edition does not register
+        yields UNREACHABLE, and the delete is REFUSED. Completing the delete instead
+        -- on the grounds that refusing "would leave an artifact its owner could never
+        delete" -- trades a recoverable annoyance for an unrecoverable one: the record
+        it drops is the only handle that can ever withdraw a world-readable copy. A
+        refused delete can be retried, or the owner can unpublish and accept the
+        exposure deliberately.
+        """
+        from kiro_crew.artifacts import ArtifactPublication
+
+        isolated_store.create(name="x", content="a", slug="x")
+        isolated_store.set_publication(
+            "x",
+            ArtifactPublication(
+                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+            ),
+        )
+
+        async def _boom(art):
+            raise RuntimeError("destination unreachable")
+
+        import kiro_crew.publish_sync as _ps
+
+        real_withdraw = _ps.delete_for_artifact
+        # The decision lives in delete_for_artifact; patching past it proves the handler
+        # does not carry a second copy of it.
+        monkeypatch.setattr("kiro_crew.publish_sync.delete_for_artifact", _boom)
+        with pytest.raises(RuntimeError):
+            await api_artifact_delete(_request(match={"slug": "x"}))
+        # With the real function, an unregistered destination now REFUSES. Restore only
+        # THIS patch -- monkeypatch.undo() would also drop the restricted-session fixture
+        # and the handler would answer 403.
+        monkeypatch.setattr("kiro_crew.publish_sync.delete_for_artifact", real_withdraw)
+        resp = await api_artifact_delete(_request(match={"slug": "x"}))
+        assert resp.status == 502
+        # The artifact and the handle that could still withdraw the copy both survive.
+        assert (isolated_store.root / "x").exists()
+        assert isolated_store.get("x").publication is not None
+
+    @pytest.mark.asyncio
+    async def test_a_reachable_withdrawal_failure_keeps_the_artifact_and_its_handle(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        """When the destination is REACHABLE but rejects the
+        withdrawal, a retry can still succeed -- so the publication (the only handle that
+        can withdraw the still-public copy) must NOT be discarded. The delete is refused
+        with an error, the artifact stays, and its publication record survives."""
+        import kiro_crew.publish_sync as _ps
+        from kiro_crew.artifacts import ArtifactPublication
+
+        isolated_store.create(name="x", content="a", slug="x")
+        isolated_store.set_publication(
+            "x",
+            ArtifactPublication(
+                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+            ),
+        )
+
+        async def _reachable_but_rejected(art):
+            return _ps.DeleteWithdrawal.FAILED
+
+        monkeypatch.setattr("kiro_crew.publish_sync.delete_for_artifact", _reachable_but_rejected)
+        resp = await api_artifact_delete(_request(match={"slug": "x"}))
+        assert resp.status == 502
+        # The artifact and its retry handle both survive.
+        assert (isolated_store.root / "x").exists()
+        assert isolated_store.get("x").publication is not None
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_destination_refuses_the_delete(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        """An unreachable destination must NOT be an "escape hatch" that lets the
+        delete proceed on the reasoning that "no retry from here can reach it".
+
+        The premise was that an unreachable destination means the copy is beyond help. It
+        does not -- unreachable describes THIS PROCESS's access (revoked credentials, a
+        closed account, no network), not the object, which may still be served to the whole
+        internet. Deleting the record then erased the only handle that could withdraw it,
+        with nothing able to recover. Refusing is recoverable: restore access and retry, or
+        unpublish to accept the exposure in the open.
+        """
+        import kiro_crew.publish_sync as _ps
+        from kiro_crew.artifacts import ArtifactPublication
+
+        isolated_store.create(name="x", content="a", slug="x")
+        isolated_store.set_publication(
+            "x",
+            ArtifactPublication(
+                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+            ),
+        )
+
+        async def _unreachable(art):
+            return _ps.DeleteWithdrawal.UNREACHABLE
+
+        monkeypatch.setattr("kiro_crew.publish_sync.delete_for_artifact", _unreachable)
+        resp = await api_artifact_delete(_request(match={"slug": "x"}))
+        assert resp.status == 502
+        assert (isolated_store.root / "x").exists()
+        assert isolated_store.get("x").publication is not None
+
+    @pytest.mark.asyncio
+    async def test_a_confirmed_gone_destination_lets_the_delete_through(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        """The one case that still deletes, and the reason the distinction has to be a TYPE.
+
+        A destination CONFIRMED absent has nothing left to serve, so there is no copy to
+        strand and no handle worth keeping -- that is `NOTHING_PUBLISHED`. It is reached
+        only from a typed `DriveNotFound`; read off an error message instead, a throttled or
+        unauthorized reply would land here too and delete the handle to a live copy.
+        """
+        import kiro_crew.publish_sync as _ps
+        from kiro_crew.artifacts import ArtifactPublication
+
+        isolated_store.create(name="x", content="a", slug="x")
+        isolated_store.set_publication(
+            "x",
+            ArtifactPublication(
+                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+            ),
+        )
+
+        async def _gone(art):
+            return _ps.DeleteWithdrawal.NOTHING_PUBLISHED
+
+        monkeypatch.setattr("kiro_crew.publish_sync.delete_for_artifact", _gone)
+        resp = await api_artifact_delete(_request(match={"slug": "x"}))
+        assert resp.status == 200
+        assert not (isolated_store.root / "x").exists()
+
+    @pytest.mark.asyncio
     async def test_artifact_error_fallback_returns_500(
         self, isolated_store, patch_restricted, monkeypatch
     ) -> None:
-        # Regression: a base ArtifactError raised by store.delete() (e.g. a
-        # future store-level sensitive-path or filesystem refusal) used to
-        # escape the handler and 500 silently. Now caught and audited.
+        # A base ArtifactError raised by store.delete() (e.g. a future
+        # store-level sensitive-path or filesystem refusal) must be caught and
+        # audited, not escape the handler and 500 silently.
         from kiro_crew.artifacts import ArtifactError
 
         isolated_store.create(name="x", content="a", slug="x")
@@ -1386,6 +1710,63 @@ class TestDelete:
         resp = await api_artifact_delete(_request(match={"slug": "x"}))
         assert resp.status == 500
         assert "sensitive path" in _json_body(resp)["error"]
+
+
+class TestReprobeNotice:
+    """Tests for ``POST /api/artifacts/{slug}/publish/reprobe-notice`` — the
+    re-probe route that brings a stale publish notice up to date."""
+
+    @pytest.mark.asyncio
+    async def test_reprobe_returns_updated_artifact(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        """The handler delegates to ``publish_sync.reprobe_notice`` and returns
+        the reconciled artifact (200)."""
+        import kiro_crew.publish_sync as _ps
+        from kiro_crew.artifacts import ArtifactPublication
+
+        isolated_store.create(name="x", content="a", slug="x")
+        isolated_store.set_publication(
+            "x",
+            ArtifactPublication(
+                provider="default",
+                artifact_id="uuid-1",
+                view_url="https://d/x",
+                visibility="PUBLIC",
+                notice="still rolling out",
+                notice_code="rolling_out",
+            ),
+        )
+
+        async def _reconcile(slug):
+            # Simulate the destination having gone healthy: clear both halves.
+            return isolated_store.update_publication(slug, notice="", notice_code="")
+
+        monkeypatch.setattr(_ps, "reprobe_notice", _reconcile)
+        resp = await api_artifact_reprobe_notice(_request(match={"slug": "x"}))
+        assert resp.status == 200
+        pub = _json_body(resp)["publication"]
+        assert pub["notice"] == ""
+        assert pub["notice_code"] == ""
+
+    @pytest.mark.asyncio
+    async def test_reprobe_restricted_session_is_denied(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        """A restricted session cannot reprobe (403), matching the other
+        meta.json-mutating routes."""
+        isolated_store.create(name="x", content="a", slug="x")
+        resp = await api_artifact_reprobe_notice(
+            _request(match={"slug": "x"}, restricted=True)
+        )
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_reprobe_missing_artifact_returns_404(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        resp = await api_artifact_reprobe_notice(_request(match={"slug": "nope"}))
+        assert resp.status == 404
 
 
 # ── Versions ────────────────────────────────────────────────────────────────

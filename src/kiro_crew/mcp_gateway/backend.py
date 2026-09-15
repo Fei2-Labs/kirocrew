@@ -28,7 +28,11 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from kiro_crew import platform_compat
-from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
+from kiro_crew.constants import (
+    KIROCREW_SPAWNED_ENV,
+    KIROCREW_SPAWNED_VALUE,
+    SUBAGENT_TIMEOUT_SECS,
+)
 from kiro_crew.executors import image_executor, maintenance_executor
 from kiro_crew.mcp_caller import (
     CALLER_CAPABILITY_KEY,
@@ -61,6 +65,12 @@ from kiro_crew.mcp_gateway.image_budget import (
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES, RESPONSE_SPILL_THRESHOLD_BYTES
 from kiro_crew.mcp_gateway.spill import maybe_spill_response
 from kiro_crew.mcp_gateway.tool_surface import ToolSurface, project_tool_surface
+from kiro_crew.sandbox import (
+    CANONICAL_TEMP_KEYS,
+    classify_declared_temp_env,
+    declared_temp_refusal_reasons,
+    format_declared_temp_refusals,
+)
 from kiro_crew.security import redact
 from kiro_crew.sel import SecurityEventLog
 
@@ -177,8 +187,18 @@ PING_STALE_SECS = 150.0
 
 # Absolute ceiling: recycle regardless of ping freshness. Protects against a
 # pathological case where the tool itself is stuck but the MCP server's read
-# loop still services ping requests. Set to wait_max (1800s) + 5-min margin.
-HARD_WEDGE_CEILING_SECS = 2100.0
+# loop still services ping requests.
+#
+# It has to sit ABOVE the longest LEGITIMATE in-flight request, or it stops
+# being a wedge detector and becomes a deadline: a blocking ``spawn_sub_agents``
+# is in flight for as long as its slowest member runs, so a ceiling at or below
+# the subagent deadline recycles the backend under a caller whose work is
+# healthy, reporting ``backend gone`` while the subagent keeps running detached
+# and its result is stranded. The subagent deadline is therefore the binding
+# term (``wait``'s 1800s max is well under it), plus a 5-minute margin. An
+# operator who raises ``agent.subagent_timeout_secs`` past the default re-opens
+# that gap; the load-time clamp bounds how far.
+HARD_WEDGE_CEILING_SECS = float(SUBAGENT_TIMEOUT_SECS + 300)
 
 # Upper bound on a single stub's pending-delivery inbox. Backend->stub frames
 # are enqueued by the stdout pump without awaiting the stub's socket drain, so
@@ -335,8 +355,8 @@ def _strip_caller_meta(msg: dict[str, Any]) -> dict[str, Any]:
     BOTH gateway-owned blocks are stripped here, in ONE place, deliberately: the
     tenant nonce decides which namespace an unnamed co-tenant's per-tenant state
     lands in, so a stub allowed to supply its own could choose to land in a
-    PEER's namespace — the same collision #5322 fixed, only chosen instead of
-    accidental. Giving the nonce its own strip function would have added a second
+    PEER's namespace — the same collision the nonce prevents, only chosen instead
+    of accidental. Giving the nonce its own strip function would add a second
     site that every future forward path has to remember; both call sites of this
     one (``forward_from_stub`` and ``_handle_initialize``) already exist.
     """
@@ -453,7 +473,7 @@ def _mcp_apps_enabled() -> bool:
        shared without its server-authored UI.
     2. A stored ``mcp_gateway.apps_enabled = false`` -> disabled, EVEN with the
        env flag on. This key is retired going forward — nothing writes it, the
-       MCP Management page does not surface it, and the docs no longer teach it —
+       MCP Management page does not surface it, and the docs do not teach it —
        but a released version honoured it as a trustworthy opt-out, so a config
        that already carries ``false`` keeps its opt-out. Dropping it here would
        silently start executing server-authored UI for the one operator who took
@@ -550,7 +570,7 @@ def _inject_tenant_meta(msg: dict[str, Any], nonce: str) -> dict[str, Any]:
     including the ones with no caller — that is the case it exists for. A backend
     serving a caller the gateway cannot name falls back to a per-PROCESS
     namespace, which on a pooled backend is one namespace for every unnamed
-    co-tenant (#5322); the nonce splits it per connection.
+    co-tenant; the nonce splits it per connection.
 
     Deliberately NOT on the gateway's own synthesized lease frames
     (``resources/subscribe`` / ``resources/unsubscribe`` replays): those carry the
@@ -1262,7 +1282,7 @@ class Backend:
         alongside (3) and independently of it: a caller the gateway cannot name
         gets no identity block but still gets a nonce, which is what keeps two
         unnamed co-tenants of one pooled backend out of each other's per-tenant
-        state (#5322). Empty means "no separator available" and leaves the
+        state. Empty means "no separator available" and leaves the
         backend on its own per-process fallback.
         """
         if not self.is_alive:
@@ -3674,7 +3694,7 @@ class Backend:
         * ``"idle"``   -- no stubs attached (``refcount == 0``). LEFT ALONE:
           the idle-sweep owns eviction of these on its own timer. Recycling
           idle-but-healthy backends here would re-introduce the cr-guide
-          over-reaping regression (MCPool 0.2.7).
+          over-reaping regression.
         * ``"wedged"`` -- a stub is attached AND BOTH: (1) an in-flight request
           exceeds :data:`HEARTBEAT_TIMEOUT_SECS`, AND (2) no ping response has
           arrived within :data:`PING_STALE_SECS` (backend unresponsive). OR the
@@ -3973,6 +3993,7 @@ async def spawn_backend(
     env: Mapping[str, str],
     work_dir: str,
     declared_temp_keys: tuple[str, ...] = (),
+    secret_env_keys: tuple[str, ...] = (),
 ) -> Backend:
     """Spawn a real MCP subprocess and wrap it in a :class:`Backend`.
 
@@ -3980,13 +4001,16 @@ async def spawn_backend(
     any casing) the operator's agent spec DECLARES for this server -- the
     caller knows the declared-env set and this function does not (``env``
     also carries the daemon's ambient values, which must not suppress
-    containment; see the containment block below).
+    containment; see the containment block below). ``secret_env_keys`` marks
+    values resolved from ``secret://`` URIs so a refusal can name its key and
+    cause without persisting the resolved value in the daemon log.
 
-    ``env`` is passed verbatim — callers MUST NOT rely on parent process
-    env inheritance. The rewriter layer computes the effective env for
-    each :class:`PoolKey` and includes it in the hash; spawning with a
-    different env than the key claims is a correctness bug that would
-    allow cross-tenant leakage.
+    ``env`` is the complete effective environment; callers MUST NOT rely on
+    parent-process inheritance. The temp rule may replace its declared temp
+    keys, and this function adds the positive spawn marker. The PoolKey still
+    hashes the caller's original effective map, so a refused declaration may
+    conservatively split two equivalent managed-temp backends but can never
+    collapse specs that declared different environments into one pool.
 
     Security boundary (accepted risk, documented in
     ``docs/system-specs/modules/security.md`` under MCP Gateway): backends
@@ -4012,7 +4036,9 @@ async def spawn_backend(
     """
     logger.info(
         "spawning backend pool=%s command=%s args=%s",
-        pool_key.human_readable(), command, redact(" ".join(args)),
+        pool_key.human_readable(),
+        command,
+        redact(" ".join(args)),
     )
     # Positive-identity marker for the orphan sweep. Safe re: the pooled-backend
     # PoolKey invariant — the marker is a compile-time constant, so it is
@@ -4020,52 +4046,80 @@ async def spawn_backend(
     # identity (unlike a per-session value, which would be a correctness bug).
     spawn_env = dict(env)
     spawn_env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
-    # Per-process temp containment (#5064). Safe re: the pooled-backend
+    # Per-process temp containment. Safe re: the pooled-backend
     # PoolKey invariant for the same reason as the marker above -- the value
     # is derived from the key's own digest plus a token generated AFTER
     # pool-identity resolution and is never folded into the hash, so it can
-    # neither split nor collapse pool identity. Allocated off-loop (mkdir is
-    # filesystem work), and fail-open: containment is hygiene, not a spawn
-    # prerequisite -- a host where the dir cannot be created still gets a
-    # working backend with today's inherited-temp behavior.
+    # neither split nor collapse pool identity. Allocation and declaration
+    # classification run off-loop because both touch the filesystem.
     #
-    # An OPERATOR-DECLARED temp wins: a spec that sets any of TMPDIR/TMP/TEMP
-    # deliberately points a heavy server at chosen storage (e.g. a capacity
-    # volume), and overriding it would trade litter for ENOSPC. No allocation
-    # happens at all in that case -- no empty dir, nothing to sweep.
+    # An operator-declared temp wins only when the shared sandbox rule clears
+    # every declared key. One refusal drops the whole declaration: ``tempfile``
+    # may consult a sibling key first, so keeping a surviving key would make
+    # the result depend on spelling order. The managed temp takes over. If its
+    # allocation fails after a refusal, no temp key survives to point the child
+    # back at the refused path.
     #
-    # Declaration is signalled by the CALLER (``declared_temp_keys``), not
-    # read off ``spawn_env``: the resolver folds the daemon's own inherited
-    # environment into ``env``, and macOS always exports TMPDIR (Windows
-    # always exports TMP/TEMP), so an env-membership test would read the
-    # ambient value as a declaration and silently disable containment on
-    # those platforms. Ambient keys are OVERRIDDEN by the managed triple on
-    # success, left untouched on allocation failure (the documented fail-open
-    # "inherited temp" fallback), and PRUNED down to the declared set when
-    # the operator declared a temp (see the else branch).
+    # Declaration is signalled by the caller, not inferred from ``spawn_env``.
+    # The resolver folds the daemon's ambient temp into ``env`` on macOS and
+    # Windows, and an env-membership test would mistake that for operator input.
     backend_tmp: Optional[Path] = None
-    _declared_upper = {key.upper() for key in declared_temp_keys}
+    _declared_upper: set[str] = set()
+    refused: dict[str, tuple[str, str]] = {}
+    failure = ""
+    if declared_temp_keys:
+        accepted, refused, failure = await asyncio.to_thread(
+            classify_declared_temp_env,
+            spawn_env,
+            declared_temp_keys,
+        )
+        _declared_upper = set(accepted)
+        if refused:
+            logger.warning(
+                "MCP backend [%s]: ignoring spec-declared %s — %s; spawning with the "
+                "managed temp instead",
+                pool_key.server_name,
+                format_declared_temp_refusals(
+                    refused,
+                    hidden_keys=secret_env_keys,
+                    redactor=redact,
+                ),
+                "; ".join(
+                    declared_temp_refusal_reasons(
+                        refused,
+                        failure,
+                        redactor=redact,
+                    )
+                ),
+            )
+            spawn_env = {
+                key: value
+                for key, value in spawn_env.items()
+                if key.upper() not in CANONICAL_TEMP_KEYS
+            }
     if not _declared_upper:
         try:
-            backend_tmp = await asyncio.to_thread(
-                allocate_backend_tmp, pool_key.stable_hash()
-            )
+            backend_tmp = await asyncio.to_thread(allocate_backend_tmp, pool_key.stable_hash())
             spawn_env.update(tmp_env(backend_tmp))
         except OSError:
+            has_inherited_temp = any(key.upper() in CANONICAL_TEMP_KEYS for key in spawn_env)
+            fallback = "inherited temp" if has_inherited_temp else "platform default"
             logger.warning(
-                "backend-tmp: could not allocate a contained temp dir; spawning "
-                "with inherited temp",
+                "backend-tmp: could not allocate a contained temp dir; spawning with %s",
+                fallback,
                 exc_info=True,
             )
     else:
-        # Yielding is not enough on its own: the daemon's AMBIENT temp keys
-        # are still in ``spawn_env``, and ``tempfile`` consults TMPDIR before
-        # TMP -- a spec declaring only ``TMP`` on macOS would silently write
-        # through the inherited ambient TMPDIR. Strip the canonical keys the
-        # operator did NOT declare so the declared one actually governs.
-        for key in ("TMPDIR", "TMP", "TEMP"):
-            if key not in _declared_upper:
-                spawn_env.pop(key, None)
+        # Keep only the declared values and re-emit their canonical spellings.
+        # Ambient siblings cannot outrank the declaration, and lowercase spec
+        # keys govern on POSIX as well as on case-insensitive Windows env maps.
+        declared_values = {
+            key.upper(): value for key, value in spawn_env.items() if key.upper() in _declared_upper
+        }
+        spawn_env = {
+            key: value for key, value in spawn_env.items() if key.upper() not in CANONICAL_TEMP_KEYS
+        }
+        spawn_env.update(declared_values)
     try:
         process = await asyncio.create_subprocess_exec(
             command,

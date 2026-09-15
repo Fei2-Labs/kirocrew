@@ -1,14 +1,32 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect, SettingsInput, SettingsButtonGroup } from '../../components/settings'
-import { loadChatConfig, saveChatConfig, type ChatConfig, type ContentWidth, type DashboardConfig, type SendMode } from '../chat/ChatSettings'
-import { api } from '../../api/client'
+import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect, SettingsInput, SettingsButtonGroup, SettingsField, SettingsMultiSelect } from '../../components/settings'
+import { Btn, Input } from '../../components/ui'
+import { Plus, Trash2 } from 'lucide-react'
+import { configPatternRefused, configUrlTemplateOk } from '../../utils/autolinkRules'
+
+/** One `dashboard.link_patterns` rule as it travels the config wire; the
+ * renderer-side validation lives in `utils/autolinkRules.setConfigAutolinkRules`. */
+export interface LinkPatternRule {
+  pattern: string
+  url: string
+}
+import { loadChatConfig, saveChatConfig, type ChatConfig, type ContentWidth, type DashboardConfig, type MemoryMode, type SendMode } from '../chat/ChatSettings'
+import { api, type FeatureVideoStatus } from '../../api/client'
+import { useAppSelector } from '../../store'
+import { serializeDefaultMemoryModeUpdate } from '../../api/queryClient'
 import { useOptimisticConfigPaths, setConfigPathValue } from './useOptimisticConfigPaths'
-import { useAvailableModels } from '../../hooks/useAvailableModels'
+import { useAvailableModelsQuery } from '../../hooks/useAvailableModels'
+import { usePlainDiff } from '../../hooks/usePlainDiff'
+import { useDiffSplit } from '../../hooks/useDiffSplit'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
 import { isMac } from '../../utils/platform'
+import { readBusySendDefault, setBusySendDefault, type BusySendMode } from '../../components/BusySendButton'
+import { platformShortcut } from '../../utils/platform'
 import { capRoleOther, clampRoleOther } from '../../lib/userProfile'
 import { ROLE_SLUGS, TECH_SLUGS } from '../../lib/profileOptions'
+import { fmtNumber } from '../../i18n/format'
+import { normalizeHiddenModels } from '../../hooks/useInteractiveModels'
 
 import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -31,8 +49,13 @@ const RESTORE_OPTIONS = ['15', '30', '60', '120', '360', '720', '1440', '0']
 function restoreLabels(): string[] {
   return ['15m', '30m', '1h', '2h', '6h', '12h', '24h', i18nT('pages.settings.chatPanel.no_limit')]
 }
+/** How often the feature-video cache readout re-reads while the panel is open. */
+const FEATURE_VIDEO_POLL_MS = 15_000
+
 const COMPACT_OPTIONS = ['20', '40', '60', '70', '80', '90']
-const COMPACT_LABELS = ['20% (aggressive)', '40%', '60%', '70% (default)', '80%', '90%']
+function compactLabels(): string[] {
+  return ['20%', '40%', '60%', `70% (${i18nT('components.jobForm.default')})`, '80%', '90%']
+}
 
 // About You — slugs shared with onboarding step 2 and context.py's prompt maps.
 const ROLE_OPTIONS = ['', ...ROLE_SLUGS]
@@ -66,6 +89,23 @@ const COMPLETION_KEEP_OPTIONS: CompletionKeepMode[] = ['head', 'tail', 'both']
 
 type VerbosityLevel = 'default' | 'concise' | 'ultra' | 'answer_only'
 const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'ultra', 'answer_only']
+
+const MEMORY_MODE_OPTIONS: MemoryMode[] = ['persistent', 'incognito', 'temporary']
+const DEFAULT_MEMORY_MODE_PATH = 'dashboardConfig.default_memory_mode'
+
+function memoryModeLabels(): string[] {
+  return [
+    i18nT('settings.chat.defaultMemoryMode.persistent'),
+    i18nT('components.welcomeView.incognito'),
+    i18nT('components.welcomeView.temporary'),
+  ]
+}
+
+function asMemoryMode(value: unknown): MemoryMode {
+  return MEMORY_MODE_OPTIONS.includes(value as MemoryMode)
+    ? value as MemoryMode
+    : 'persistent'
+}
 
 /**
  * Narrow a persisted `dashboard.verbosity` to a level this Select can render.
@@ -113,6 +153,275 @@ type KirocrewConfigShape = {
   dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string; prevent_sleep?: boolean }
 }
 
+function invalidRegex(pattern: string): boolean {
+  if (!pattern.trim()) return false
+  try {
+    new RegExp(pattern)
+    return false
+  } catch {
+    return true
+  }
+}
+
+/** Row editor for `dashboard.link_patterns` (regex -> URL template rewrite
+ * rules the transcript renderer applies at display time).
+ *
+ * Carries `label` itself and renders the SettingsField frame internally --
+ * the composite-primitive contract (same as TagListEditor) that makes the
+ * settings-registry extractor and deep-link highlighting see it as one row.
+ *
+ * Commit points are blur and remove/add — not keystrokes — so one edit is one
+ * PUT. Only persistable rows (non-empty pattern, http(s) url) go on the wire;
+ * a half-typed row stays local until it qualifies. An invalid regex still
+ * SAVES (the renderer skips rules the browser rejects) so a typo cannot eat
+ * the rule text; the row flags it instead. Exported for its regression tests. */
+/**
+ * Client-side validation hint for a rule-editor field. Deliberately NOT
+ * `ErrorNotice`: nothing has failed — these describe input still being
+ * typed, and the errors-use-error-notice rule forbids dressing validation
+ * hints as errors (`role="alert"`, danger styling, agent hand-off).
+ * `role="status"` announces politely, matching the AboutPanel status idiom.
+ */
+function FieldHint({ message }: { message: string }) {
+  if (!message) return null
+  return <div className="text-[12px] text-warn mt-0.5" role="status">{message}</div>
+}
+
+export function LinkPatternsEditor({ label, description, configKey, rules, onSave, disabled }: {
+  label: string
+  description?: string
+  configKey?: string
+  rules: readonly LinkPatternRule[]
+  /**
+   * Persist the cleaned rules. Returning the save's settlement promise lets
+   * the editor advance its adopted watermark once the write is CONFIRMED —
+   * without it, a later external change back to the pre-save value would be
+   * indistinguishable from a failed save's rollback and silently swallowed,
+   * leaving stale rows to overwrite the external change on the next blur.
+   */
+  onSave: (next: LinkPatternRule[]) => void | Promise<unknown>
+  disabled?: boolean
+}) {
+  const [rows, setRows] = useState<LinkPatternRule[]>(() => rules.map(r => ({ ...r })))
+  // A commit swallowed by the half-edited gate, so the editor can say so at
+  // the commit point instead of relying on the offending row's own hint
+  // (which may be scrolled out of view when a DIFFERENT row was edited).
+  const [saveBlocked, setSaveBlocked] = useState(false)
+  const serverKey = JSON.stringify(rules)
+  // Two watermarks decide whether a server-value movement may replace local
+  // rows. `adopted` is the last server value local rows were built from —
+  // re-captured at each save, because that displayed value is exactly where
+  // a FAILED save's optimistic overlay rolls back to. `pending` is the value
+  // a save submitted, i.e. our own edit echoing back (the optimistic mask,
+  // then the confirmed write). Neither may overwrite rows: the rollback
+  // arriving as a "change" is how a rejected save (e.g. 400 on a duplicate
+  // pattern) would silently erase everything typed since the last save.
+  const adoptedKeyRef = useRef(serverKey)
+  // Save serialization state: how many PUTs are unsettled, and the tail of
+  // the chain a new save must launch behind while any are in flight.
+  const savesInFlightRef = useRef(0)
+  const saveChainRef = useRef<Promise<unknown>>(Promise.resolve())
+  const pendingKeyRef = useRef<string | null>(null)
+  // Adopt an external change (another tab, `kirocrew config set`) whenever
+  // the server VALUE moves somewhere new; identity-only refetches leave
+  // local drafts alone because the key is the serialized value.
+  useEffect(() => {
+    if (serverKey === adoptedKeyRef.current) return // unmoved, or a failed save's rollback: rows win
+    if (serverKey === pendingKeyRef.current) return // our own save echoing: rows already show it
+    // Rows typed since the last sync are absent from the outgoing baseline;
+    // carry them across the adopt instead of erasing them. A clean row the
+    // external change deleted IS in the baseline, so it still goes. The
+    // surviving draft rendered beside the adopted rules is the conflict
+    // surface: the user sees both and the next blur commits the merge.
+    const baseline: LinkPatternRule[] = JSON.parse(adoptedKeyRef.current)
+    adoptedKeyRef.current = serverKey
+    pendingKeyRef.current = null
+    setRows(prev => {
+      const same = (a: LinkPatternRule, b: LinkPatternRule) =>
+        a.pattern === b.pattern && a.url.trim() === b.url.trim()
+      const drafts = prev.filter(r =>
+        (r.pattern.trim() !== '' || r.url.trim() !== '') &&
+        !baseline.some(b => same(b, r)) &&
+        !rules.some(s => same(s, r)))
+      return [...rules.map(r => ({ ...r })), ...drafts]
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- serverKey IS the value identity of `rules`
+  }, [serverKey])
+  const persistable = (list: readonly LinkPatternRule[]) => list
+    // Pattern text goes on the wire EXACTLY as typed — whitespace in a regex
+    // is load-bearing, so trimming here would broaden what the operator wrote
+    // (the server preserves it verbatim too and trims only URLs).
+    .map(r => ({ pattern: r.pattern, url: r.url.trim() }))
+    .filter(r => r.pattern.trim().length > 0 && configUrlTemplateOk(r.url))
+  // Inline flags for the two mistakes that otherwise fail silently: a URL the
+  // commit filter treats as half-edited (the row LOOKS accepted but is never
+  // PUT and vanishes on the next server adopt), and a duplicate pattern (the
+  // one editor-typable error that reaches the server's 400, which surfaces
+  // only as the generic failed-to-save banner). The URL check is the
+  // registry's own acceptance rule (`configUrlTemplateOk`), so userinfo and a
+  // `{match}` in the authority — templates a bare scheme regex passes but
+  // registration refuses — flag here instead of saving-then-never-linkifying.
+  const urlIncomplete = (url: string) =>
+    url.trim() !== '' && !configUrlTemplateOk(url.trim())
+  const duplicatePattern = (list: readonly LinkPatternRule[], i: number) => {
+    // Exact comparison, mirroring the server's dedup: patterns differing only
+    // in edge whitespace are DIFFERENT regexes and both may be saved.
+    const p = list[i].pattern
+    return p.trim() !== '' && list.some((r, j) => j < i && r.pattern === p)
+  }
+  const commit = (next: readonly LinkPatternRule[]) => {
+    // A half-edited row (some text, not yet persistable) blocks the whole
+    // save: clearing a URL to retype it must not delete the stored rule on
+    // blur. Deleting is the remove button's job, never a blur side effect.
+    // "Complete" is the registry's own acceptance rule (`configUrlTemplateOk`)
+    // so a template registration would refuse — userinfo, `{match}` in the
+    // authority — is withheld here exactly like an empty half, not silently
+    // filtered out of the PUT (which would delete the stored rule on blur).
+    const halfEdited = next.some(r => {
+      const pattern = r.pattern.trim()
+      const url = r.url.trim()
+      const complete = pattern.length > 0 && configUrlTemplateOk(url)
+      const empty = pattern.length === 0 && url.length === 0
+      return !complete && !empty
+    })
+    // Surface the block at the commit point, not only on the offending row:
+    // the row a user just edited may be far from the half-filled one, and a
+    // silently swallowed save reads as data loss.
+    setSaveBlocked(halfEdited)
+    if (halfEdited) return
+    const cleaned = persistable(next)
+    if (JSON.stringify(cleaned) !== JSON.stringify(persistable(rules))) {
+      // The currently-displayed server value is where the optimistic overlay
+      // rolls back to if this save is rejected; the submitted value is what
+      // echoes back if it lands. Mark both so the adopt effect can tell a
+      // rollback and our own echo apart from a genuine external change.
+      const submittedKey = JSON.stringify(cleaned)
+      adoptedKeyRef.current = serverKey
+      pendingKeyRef.current = submittedKey
+      // Serialize whole-list PUTs: two in-flight saves (edit-blur racing a
+      // remove) can settle out of order server-side, and last-writer-wins
+      // would resurrect the removed rule. A save launched while another is
+      // in flight defers behind it (failure included — both chain arms keep
+      // the tail alive); an idle chain launches inline, so single saves keep
+      // their synchronous shape. The pending/adopted marks above are
+      // per-launch and already guard a superseded save's handlers.
+      const settled = savesInFlightRef.current > 0
+        ? saveChainRef.current.then(() => onSave(cleaned))
+        : onSave(cleaned)
+      // The echo alone cannot advance the adopted watermark: the optimistic
+      // mask echoes the same value BEFORE the server accepts it, and doing so
+      // there would make a failed save's rollback look external and erase the
+      // typed rows. Only the settlement says which side of that fork we are
+      // on. Both handlers are guarded on the pending mark so a superseded
+      // save (edit + blur while the first save is in flight) cannot clobber
+      // the newer save's marks.
+      if (settled && typeof (settled as Promise<unknown>).then === 'function') {
+        savesInFlightRef.current += 1
+        const dec = () => {
+          savesInFlightRef.current -= 1
+        }
+        saveChainRef.current = (settled as Promise<unknown>).then(dec, dec)
+        ;(settled as Promise<unknown>).then(
+          () => {
+            // Confirmed: the submitted value is now the base rows are built
+            // from, so a later external change back to the pre-save value is
+            // adopted instead of being swallowed as a rollback.
+            if (pendingKeyRef.current === submittedKey) {
+              adoptedKeyRef.current = submittedKey
+              pendingKeyRef.current = null
+            }
+          },
+          () => {
+            // Rejected: the server never took the value, so it can only
+            // reappear as a genuine external change — drop the echo mark.
+            // The rollback itself still matches the adopted (pre-save)
+            // watermark, so the typed rows survive.
+            if (pendingKeyRef.current === submittedKey) pendingKeyRef.current = null
+          },
+        )
+      }
+    }
+  }
+  const update = (i: number, field: 'pattern' | 'url', value: string) => {
+    setRows(rs => rs.map((r, j) => (j === i ? { ...r, [field]: value } : r)))
+  }
+  const remove = (i: number) => {
+    const next = rows.filter((_, j) => j !== i)
+    setRows(next)
+    commit(next)
+  }
+  return (
+    <SettingsField label={label} description={description} configKey={configKey}>
+      <div className="flex flex-col gap-1.5">
+      {rows.map((row, i) => (
+        // Narrow-first: fields stack below the `sm` breakpoint — side-by-side
+        // at ~320px leaves each input ~100px, unusable for a regex. The URL
+        // input and remove button share a nested row so delete stays reachable
+        // without a third stacked line.
+        <div key={i} className="flex flex-col sm:flex-row items-stretch sm:items-start gap-1.5">
+          <div className="flex-1 min-w-0">
+            <Input
+              value={row.pattern}
+              onChange={e => update(i, 'pattern', e.target.value)}
+              onBlur={() => commit(rows)}
+              placeholder={i18nT('pages.settings.chatPanel.link_patterns_pattern_ph')}
+              aria-label={i18nT('pages.settings.chatPanel.link_patterns_pattern_aria')}
+              disabled={disabled}
+              className="w-full font-mono"
+            />
+            <FieldHint message={invalidRegex(row.pattern) ? i18nT('pages.settings.chatPanel.link_patterns_invalid_regex') : ''} />
+            <FieldHint message={!invalidRegex(row.pattern) && row.pattern.trim() !== '' && configPatternRefused(row.pattern) ? i18nT('pages.settings.chatPanel.link_patterns_unsafe_pattern') : ''} />
+            <FieldHint message={duplicatePattern(rows, i) ? i18nT('pages.settings.chatPanel.link_patterns_duplicate') : ''} />
+            <FieldHint message={row.pattern.trim() === '' && row.url.trim() !== '' ? i18nT('pages.settings.chatPanel.link_patterns_row_incomplete') : ''} />
+          </div>
+          <div className="flex flex-1 min-w-0 items-start gap-1.5">
+          <div className="flex-1 min-w-0">
+          <Input
+            value={row.url}
+            onChange={e => update(i, 'url', e.target.value)}
+            onBlur={() => commit(rows)}
+            // The catalog value carries `{{placeholder}}` (well-formed i18next
+            // interpolation, identical in every locale) and the literal
+            // `{match}` token arrives through interpolation — the i18n identity
+            // gate refuses raw single-brace tokens in catalog values, and the
+            // added-lines gate refuses a hardcoded attribute string here.
+            placeholder={i18nT('pages.settings.chatPanel.link_patterns_url_ph', { placeholder: '{match}' })}
+            aria-label={i18nT('pages.settings.chatPanel.link_patterns_url_aria')}
+            disabled={disabled}
+            className="w-full"
+          />
+          <FieldHint message={urlIncomplete(row.url) ? i18nT('pages.settings.chatPanel.link_patterns_url_invalid', { placeholder: '{match}' }) : ''} />
+          {/* A pattern with no URL yet blocks every commit from this editor
+              (the half-edited guard in `commit`), and nothing else marks it:
+              `urlIncomplete` only fires once the URL field holds text. */}
+          <FieldHint message={row.pattern.trim() !== '' && row.url.trim() === '' ? i18nT('pages.settings.chatPanel.link_patterns_row_incomplete') : ''} />
+          </div>
+          <Btn
+            onClick={() => remove(i)}
+            aria-label={i18nT('pages.settings.chatPanel.link_patterns_remove')}
+            disabled={disabled}
+          ><Trash2 className="lucide-inline" /></Btn>
+          </div>
+        </div>
+      ))}
+      <div>
+        <Btn
+          onClick={() => setRows(rs => [...rs, { pattern: '', url: '' }])}
+          disabled={disabled}
+        ><Plus className="lucide-inline" /> {i18nT('pages.settings.chatPanel.link_patterns_add')}</Btn>
+        <FieldHint message={saveBlocked ? i18nT('pages.settings.chatPanel.link_patterns_row_incomplete') : ''} />
+      </div>
+      </div>
+    </SettingsField>
+  )
+}
+
+type HiddenModelsUpdate = {
+  next: string[]
+  add?: string[]
+  remove?: string[]
+}
+
 export function ChatPanel() {
   const qc = useQueryClient()
   const [chatCfg, setChatCfg] = useState<ChatConfig>(loadChatConfig)
@@ -158,7 +467,11 @@ export function ChatPanel() {
   // second toggle during a save carries the first one's value forward.
   const dashCfg = overlay.shown(
     'dashboardConfig',
-    dashQ.data ?? { restore_sessions: false, restore_window_minutes: 30, merge_queued_messages: false, widget_density: 'more' as const, verbosity: 'default' as const, quick_send: false, session_grid: false, tail_fork_enabled: false, link_previews: false, mcp_app_panel: false, auto_open_git_panel: false, session_card_source_links: true, folder_suggestions_enabled: true, use_builtin_browser: true },
+    dashQ.data ?? { restore_sessions: false, restore_window_minutes: 30, merge_queued_messages: false, default_memory_mode: 'persistent' as const, widget_density: 'more' as const, verbosity: 'default' as const, quick_send: false, session_grid: false, tail_fork_enabled: false, link_previews: false, link_patterns: [], mcp_app_panel: false, auto_open_git_panel: false, session_card_source_links: true, folder_suggestions_enabled: true, use_builtin_browser: true, model_picker_hidden_models: [] },
+  )
+  const shownDefaultMemoryMode = overlay.shown(
+    DEFAULT_MEMORY_MODE_PATH,
+    dashCfg.default_memory_mode,
   )
 
   // ── Feature Tips opt-out (server-side per-user state) ──
@@ -187,6 +500,66 @@ export function ChatPanel() {
   const tipsConfigOff = tipsQ.data ? !tipsQ.data.enabled_config : false
   const shownOptedOut = overlay.shown('tipsStatus.opted_out', tipsQ.data?.opted_out)
 
+  // ── Feature-video cache (read-only readout + one manual action) ──
+  //
+  // Both calls carry the ACTIVE SLOT's key. The status route's read gate reads
+  // "not restricted" for a missing key and for the shared `dashboard:ui`
+  // placeholder alike, so a request without one is served the permanent
+  // engagement history even from a temporary session -- the one kind of session
+  // whose contract is that reads are withheld. Naming the slot is what makes the
+  // server's own gate reachable, exactly as the startup modal does for the two
+  // routes it calls.
+  const activeSlot = useAppSelector(s => s.chat.activeSlot)
+  const fvSessionKey = activeSlot ? `dashboard:${activeSlot}` : undefined
+  //
+  // Polled rather than pushed, and only while this panel is mounted: the clips
+  // are fetched by a background pass that reports no events, so the only way to
+  // watch it move is to ask. 15s is slow enough to be free and quick enough that
+  // a clip finishing feels live. Closing the panel unmounts this and the polling
+  // stops with it -- which is why the interval is safe to leave running.
+  //
+  // The key is IN the query key: a restricted slot and an ordinary one get
+  // different answers from the same route, so one cache entry for both would
+  // serve whichever landed first.
+  const fvQ = useQuery<FeatureVideoStatus>({
+    queryKey: ['featureVideoStatus', fvSessionKey],
+    queryFn: () => api.featureVideoStatus(fvSessionKey),
+    refetchInterval: FEATURE_VIDEO_POLL_MS,
+  })
+  // Kicks the background pass and returns immediately; the readout above is what
+  // reports progress, so this refetches once rather than tracking the work.
+  const fvFetchMut = useMutation({
+    mutationFn: () => api.featureVideoFetchAll(fvSessionKey),
+    onSuccess: () => { void qc.invalidateQueries({ queryKey: ['featureVideoStatus'] }) },
+  })
+  const fv = fvQ.data
+  /**
+   * One line, three states, in the order that the most specific wins.
+   *
+   * Returns null while the read is still out, when the feature is off, and when
+   * the gateway reports no cache at all -- so the row is absent rather than
+   * showing a zero-of-zero that reads like an empty cache, or a policy that was
+   * never stated.
+   */
+  const featureVideoStatusLine = (): string | null => {
+    if (!fv || !fv.enabled) return null
+    // No `download_enabled` means this gateway has no cache to report -- the
+    // route answers 200 with an older payload that carries none of these
+    // fields. Show nothing rather than reading the absence as `false`, which
+    // would put a download policy on screen that does not exist.
+    if (fv.download_enabled === undefined) return null
+    if (fv.downloading) {
+      return i18nT('pages.settings.chatPanel.feature_videos_downloading', { id: fv.downloading })
+    }
+    if (!fv.download_enabled) {
+      return i18nT('pages.settings.chatPanel.feature_videos_downloads_disabled')
+    }
+    return i18nT('pages.settings.chatPanel.feature_videos_cached', {
+      cached: fv.cached, total: fv.total, release: fv.release,
+    })
+  }
+  const featureVideoLine = featureVideoStatusLine()
+
   // Only the CHANGED keys go on the wire, the way `BrowserPanel`'s own dashboard
   // mutation already does it: the config handler applies whichever keys the body
   // carries, so a full-object PUT rebuilt from this tab's cache would write every
@@ -205,6 +578,21 @@ export function ChatPanel() {
     displayValue: patch => ({ ...dashCfg, ...patch }),
     applyToCache: (cached, patch) => ({ ...(cached as DashboardConfig), ...patch }),
     onFailure: () => setPathSaveError('dashboardConfig', i18nT('pages.settings.chatPanel.failed_to_save_dashboard_config')),
+    onSupersede: clearOwnPathError,
+  }))
+  const defaultModeMut = useMutation(overlay.mutationOpts<MemoryMode>({
+    queryKey: ['dashboardConfig'],
+    mutationFn: (value: MemoryMode) => serializeDefaultMemoryModeUpdate(
+      value,
+      () => api.updateDashboardConfig({ default_memory_mode: value }),
+    ),
+    path: () => DEFAULT_MEMORY_MODE_PATH,
+    displayValue: value => value,
+    applyToCache: (cached, value) => ({
+      ...(cached as DashboardConfig),
+      default_memory_mode: value,
+    }),
+    onFailure: () => setPathSaveError(DEFAULT_MEMORY_MODE_PATH, i18nT('pages.settings.chatPanel.failed_to_save_dashboard_config')),
     onSupersede: clearOwnPathError,
   }))
 
@@ -293,6 +681,12 @@ export function ChatPanel() {
   }
 
   const [localBudget, setLocalBudget] = useState('')
+  // What Enter does while the agent is working, for sessions whose split button
+  // was never touched (those keep their own per-slot choice). Persisted by
+  // BusySendButton's default writer, not by ChatConfig: the per-slot choice and
+  // the default must share one storage family or the fallback chain breaks.
+  const [busyDefault, setBusyDefaultState] = useState<BusySendMode>(() => readBusySendDefault())
+  const setBusyDefault = (m: BusySendMode) => { setBusySendDefault(m); setBusyDefaultState(m) }
   const budgetInitRef = useRef(false)
   useEffect(() => {
     if (mcQ.data && !budgetInitRef.current) {
@@ -377,7 +771,81 @@ export function ChatPanel() {
   // These are the DEFAULTS for new sessions. A session's own model/effort
   // picker still overrides them per-slot; nothing here touches live sessions.
   // Same query key as every other model picker so the list is fetched once.
-  const availableModels = useAvailableModels()
+  const availableModelsQ = useAvailableModelsQuery()
+  const availableModels = availableModelsQ.data
+  const hiddenModels = overlay.shown(
+    'dashboard.model_picker_hidden_models',
+    normalizeHiddenModels(dashCfg.model_picker_hidden_models),
+  )
+  const hiddenModelSet = new Set(hiddenModels)
+  const selectedModelIds = new Set(
+    availableModels
+      .filter(model => model.name === 'auto' || !hiddenModelSet.has(model.name))
+      .map(model => model.name),
+  )
+  const selectedModelCount = selectedModelIds.size
+  const modelPickerSummary = selectedModelCount === availableModels.length
+    ? i18nT('pages.settings.chatPanel.model_picker_all_models', { count: fmtNumber(availableModels.length) })
+    : i18nT('pages.settings.chatPanel.model_picker_selected_models', {
+        selected: fmtNumber(selectedModelCount),
+        total: fmtNumber(availableModels.length),
+      })
+  const hiddenModelsOpts = overlay.mutationOpts<HiddenModelsUpdate>({
+      queryKey: ['dashboardConfig'],
+      mutationFn: ({ add, remove }: HiddenModelsUpdate) => api.updateDashboardConfig({
+        ...(add ? { model_picker_hidden_models_add: add } : {}),
+        ...(remove ? { model_picker_hidden_models_remove: remove } : {}),
+      }),
+      path: () => 'dashboard.model_picker_hidden_models',
+      displayValue: update => update.next,
+      applyToCache: (cached, update) => ({
+        ...(cached as DashboardConfig),
+        model_picker_hidden_models: update.next,
+        model_picker_configured: true,
+      }),
+      onFailure: () => {
+        setPathSaveError(
+          'dashboard.model_picker_hidden_models',
+          i18nT('pages.settings.chatPanel.failed_to_save_selectable_models'),
+        )
+      },
+      onSupersede: clearOwnPathError,
+    })
+  const hiddenModelsMut = useMutation({
+    ...hiddenModelsOpts,
+    onSuccess: (data, update, token) => {
+      // This acknowledgement is monotonic even if a newer list edit superseded
+      // the successful save. Never mark a visit, pending write, or failure.
+      qc.setQueryData<DashboardConfig>(['dashboardConfig'], cached => cached
+        ? { ...cached, model_picker_configured: true }
+        : cached)
+      return hiddenModelsOpts.onSuccess(data, update, token)
+    },
+    // Serializing this path keeps this tab's delta sequence in UI order while the
+    // server applies each delta against the current config under its write lock.
+    scope: { id: 'dashboard.model_picker_hidden_models' },
+  })
+  const saveHiddenModels = (update: HiddenModelsUpdate) => {
+    hiddenModelsMut.mutate(update)
+  }
+  const toggleVisibleModel = (model: string, selected: boolean) => {
+    if (model === 'auto') return
+    const next = selected
+      ? hiddenModels.filter(value => value !== model)
+      : [...hiddenModels.filter(value => value !== model), model]
+    saveHiddenModels(selected ? { next, remove: [model] } : { next, add: [model] })
+  }
+  const advertisedModelIds = new Set(availableModels.map(model => model.name))
+  const hiddenUnadvertisedModels = hiddenModels.filter(model => !advertisedModelIds.has(model))
+  const advertisedOptionalModelIds = availableModels.filter(model => model.name !== 'auto').map(model => model.name)
+  const selectAllModels = () => saveHiddenModels({
+    next: hiddenUnadvertisedModels,
+    remove: advertisedOptionalModelIds,
+  })
+  const deselectAllModels = () => saveHiddenModels({
+    next: [...hiddenUnadvertisedModels, ...advertisedOptionalModelIds],
+    add: advertisedOptionalModelIds,
+  })
   // '' in config means "unset" and resolves the same way 'auto' does, so both
   // render as the 'auto' option rather than as a missing selection.
   const defaultModel = mcCfg?.agent?.model || 'auto'
@@ -471,6 +939,16 @@ export function ChatPanel() {
     optimisticConfigOpts('agent.role_efforts.subagent', () => i18nT('pages.settings.chatPanel.failed_to_save_role_effort'))
   )
 
+  // ── Plain diffs (localStorage, browser-local) ──
+  // Deliberately NOT server config, unlike every other row in the Messages
+  // section: the machine painting the diff is the one spending the CPU, so the
+  // choice belongs to this client rather than to the whole instance.
+  const [plainDiff, setPlainDiff] = usePlainDiff()
+  // Default layout every diff surface opens in (side-by-side vs unified),
+  // backed by the same client-local `mc-diff-split` preference the surfaces
+  // read. Browser-local for the same reason as plain diffs above.
+  const [diffSplit, setDiffSplit] = useDiffSplit()
+
   // ── Local chat config (localStorage) ──
   const setChat = useCallback(<K extends keyof ChatConfig>(k: K, v: ChatConfig[K]) => {
     setChatCfg(prev => {
@@ -488,17 +966,42 @@ export function ChatPanel() {
 
   return (
     <>
+      {/* No hand-off: `localRoleOther`, `localBudget` and `localKeepChars` are
+          this panel's live drafts. A hand-off click blurs the field, which STARTS
+          a save — and if that save fails after the navigation has unmounted the
+          panel, the typed value is gone with nothing left on screen to say so. */}
       <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" />
       {dashQ.isError && (
-        <div className="mb-4 text-[13px] text-danger">
-          {i18nT('pages.settings.chatPanel.failed_to_load_dashboard_config')}{' '}
-          <button className="underline cursor-pointer bg-transparent border-none text-danger" onClick={() => dashQ.refetch()}>{i18nT('pages.settings.chatPanel.retry')}</button>
+        <div className="mb-4 flex flex-wrap items-center gap-3">
+          {/* No hand-off: the rest of the panel — and its `localRoleOther` /
+              `localBudget` / `localKeepChars` drafts — stays mounted under this
+              banner, so the navigation would discard them. Retry is the path. */}
+          <ErrorNotice
+            className="flex-1 min-w-[16rem]"
+            message={i18nT('pages.settings.chatPanel.failed_to_load_dashboard_config')}
+          />
+          <Btn onClick={() => dashQ.refetch()}>{i18nT('pages.settings.chatPanel.retry')}</Btn>
         </div>
       )}
       {mcQ.isError && (
-        <div className="mb-4 text-[13px] text-danger">
-          {i18nT('pages.settings.chatPanel.failed_to_load_config')}{' '}
-          <button className="underline cursor-pointer bg-transparent border-none text-danger" onClick={() => mcQ.refetch()}>{i18nT('pages.settings.chatPanel.retry')}</button>
+        <div className="mb-4 flex flex-wrap items-center gap-3">
+          {/* No hand-off: same drafts as above share this panel. */}
+          <ErrorNotice
+            className="flex-1 min-w-[16rem]"
+            message={i18nT('pages.settings.chatPanel.failed_to_load_config')}
+          />
+          <Btn onClick={() => mcQ.refetch()}>{i18nT('pages.settings.chatPanel.retry')}</Btn>
+        </div>
+      )}
+      {(availableModelsQ.isError || availableModelsQ.isDegraded) && (
+        <div className="mb-4 flex flex-wrap items-center gap-3">
+          {/* No hand-off: the editable drafts in this panel stay mounted while
+              the catalog retry runs; navigating away could discard them. */}
+          <ErrorNotice
+            className="flex-1 min-w-[16rem]"
+            message={i18nT('pages.settings.chatPanel.failed_to_load_config')}
+          />
+          <Btn onClick={() => availableModelsQ.refetch()}>{i18nT('pages.settings.chatPanel.retry')}</Btn>
         </div>
       )}
 
@@ -518,6 +1021,35 @@ export function ChatPanel() {
             optionLabels={modelOptions.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.default_auto') : m))}
             onChange={v => defaultModelMut.mutate(v)}
             disabled={!mcQ.isSuccess}
+          />
+          <SettingsMultiSelect
+            label={i18nT('pages.settings.chatPanel.selectable_models')}
+            description={i18nT('pages.settings.chatPanel.selectable_models_description')}
+            options={availableModels.map(model => ({
+              value: model.name,
+              label: model.name,
+              description: model.name === 'auto'
+                ? i18nT('pages.settings.chatPanel.auto_always_visible')
+                : model.description,
+              locked: model.name === 'auto',
+            }))}
+            selected={selectedModelIds}
+            onToggle={toggleVisibleModel}
+            bulkActions={[
+              {
+                label: i18nT('components.multiSelect.select_all'),
+                onSelect: selectAllModels,
+              },
+              {
+                label: i18nT('components.multiSelect.deselect_all'),
+                onSelect: deselectAllModels,
+              },
+            ]}
+            summary={modelPickerSummary}
+            searchPlaceholder={i18nT('pages.settings.chatPanel.search_models')}
+            disabled={!dashQ.isSuccess || !availableModelsQ.isSuccess || availableModelsQ.isDegraded}
+            configKey="dashboard.model_picker_hidden_models"
+            settingId="chat.selectable-models"
           />
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.default_reasoning_effort')}
@@ -652,6 +1184,18 @@ export function ChatPanel() {
             optionLabels={[i18nT('pages.settings.chatPanel.enter_sends'), i18nT('pages.settings.chatPanel.mod_enter_sends', { mod: isMac ? '⌘' : 'Ctrl' }), i18nT('pages.settings.chatPanel.enter_sends_mod_enter_newline', { mod: isMac ? '⌘' : 'Ctrl' })]}
             onChange={v => setChat('sendOnEnter', v as SendMode)}
           />
+          <SettingsButtonGroup
+            label={i18nT('pages.settings.chatPanel.what_enter_does_while_the_agent_is_working')}
+            description={chatCfg.sendOnEnter === 'enter'
+              ? i18nT('pages.settings.chatPanel.busy_alt_action_desc', { chord: platformShortcut('Cmd+Enter') })
+              : i18nT('pages.settings.chatPanel.busy_alt_action_desc_no_chord')}
+            value={busyDefault}
+            options={[
+              { value: 'steer', label: i18nT('components.chatInput.steer') },
+              { value: 'queue', label: i18nT('components.chatInput.queue') },
+            ]}
+            onChange={v => setBusyDefault(v as BusySendMode)}
+          />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.quick_send')} description={i18nT('pages.settings.chatPanel.click_a_suggested_reply_to_send_it_instantly', { mod: isMac ? '⇧' : 'Shift' })} checked={dashCfg.quick_send} onChange={v => setDash({ quick_send: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.merge_queued_messages')} description={i18nT('pages.settings.chatPanel.combine_follow_up_messages_into_a_single_labeled')} checked={dashCfg.merge_queued_messages} onChange={v => setDash({ merge_queued_messages: v })} disabled={dashDisabled} />
           <SettingsButtonGroup label={i18nT('pages.settings.chatPanel.follow_up_bar_layout')} description={i18nT('pages.settings.chatPanel.multiline_wraps_suggestions_onto_multiple_rows_s')} value={chatCfg.followUpLayout} options={[{ value: "multiline", label: i18nT('pages.settings.chatPanel.multiline') }, { value: "scroll", label: i18nT('pages.settings.chatPanel.single_line') }]} onChange={v => setChat('followUpLayout', v as ChatConfig['followUpLayout'])} />
@@ -690,15 +1234,32 @@ export function ChatPanel() {
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_timestamps')} description={i18nT('pages.settings.chatPanel.display_time_on_each_message')} checked={chatCfg.showTimestamps} onChange={v => setChat('showTimestamps', v)} />
           <SettingsButtonGroup label={i18nT('pages.settings.chatPanel.content_width')} description={i18nT('pages.settings.chatPanel.compact_is_the_original_view_comfortable_and_ful')} value={chatCfg.contentWidth} options={[{ value: "compact", label: i18nT('pages.settings.chatPanel.compact') }, { value: "comfortable", label: i18nT('pages.settings.chatPanel.comfortable') }, { value: "full", label: i18nT('pages.settings.chatPanel.full') }]} onChange={v => setChat('contentWidth', v as ContentWidth)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_thinking_inline')} description={i18nT('pages.settings.chatPanel.show_intermediate_reasoning_text_between_tool_ca')} checked={!chatCfg.collapseAllSteps} onChange={v => setChat('collapseAllSteps', !v)} />
-          <SettingsToggle label={i18nT('pages.settings.chatPanel.pin_last_prompt')} description={i18nT('pages.settings.chatPanel.pin_last_prompt_desc')} checked={chatCfg.pinLastPrompt} onChange={v => {
-            setChat('pinLastPrompt', v)
-            // Enabling promises the sticky banner this description names; a minimized
-            // flag stored earlier would deliver the chip and read as a broken toggle.
-            if (v) setChat('pinPromptMinimized', false)
-          }} />
+          <SettingsToggle label={i18nT('pages.settings.chatPanel.pin_last_prompt')} description={i18nT('pages.settings.chatPanel.pin_last_prompt_desc')} checked={chatCfg.pinLastPrompt} onChange={v => setChat('pinLastPrompt', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.simplified_tool_call_names')} description={i18nT('pages.settings.chatPanel.when_enabled_inline_tool_pills_show_simplified_t')} checked={chatCfg.simplifiedToolNames} onChange={v => setChat('simplifiedToolNames', v)} />
           <SettingsSelect label={i18nT('pages.settings.chatPanel.file_change_chips')} description={i18nT('pages.settings.chatPanel.how_file_diff_chips_appear_below_assistant_messa')} value={chatCfg.fileChipStyle} options={['expanded', 'minimal']} optionLabels={[i18nT('pages.settings.chatPanel.expanded_icon_name_stats'), i18nT('pages.settings.chatPanel.minimal_stats_only_name_on_hover')]} onChange={v => setChat('fileChipStyle', v as ChatConfig['fileChipStyle'])} />
+          {/* Sits beside File change chips because it governs the same surface —
+              how a diff reads in the transcript. Phrased as "plain diffs ON"
+              rather than "highlighting OFF" so the switch position matches the
+              stored value — no inverted checkbox. Browser-local, hence no
+              `configKey`. */}
+          <SettingsToggle
+            label={i18nT('settings.chat.plainDiff.label')}
+            description={i18nT('settings.chat.plainDiff.description')}
+            checked={plainDiff}
+            onChange={setPlainDiff}
+          />
+          {/* Sits beside Plain diffs because it governs the same surface -- how a
+              diff opens in the transcript. Phrased as "split ON" so the switch
+              position matches the stored value. Browser-local, hence no
+              `configKey`. */}
+          <SettingsToggle
+            label={i18nT('settings.chat.diffLayout.label')}
+            description={i18nT('settings.chat.diffLayout.description')}
+            checked={diffSplit}
+            onChange={setDiffSplit}
+          />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.link_previews')} description={i18nT('pages.settings.chatPanel.show_a_favicon_and_page_title_instead_of_the_raw')} checked={dashCfg.link_previews} onChange={v => setDash({ link_previews: v })} disabled={dashDisabled} />
+          <LinkPatternsEditor label={i18nT('pages.settings.chatPanel.link_patterns')} description={i18nT('pages.settings.chatPanel.link_patterns_desc', { placeholder: '{match}' })} configKey="dashboard.link_patterns" rules={dashCfg.link_patterns ?? []} onSave={next => dashMut.mutateAsync({ link_patterns: next })} disabled={dashDisabled} />
           <SettingsSelect label={i18nT('pages.settings.chatPanel.widget_density')} description={i18nT('pages.settings.chatPanel.how_aggressively_the_agent_uses_inline_widgets_f')} value={dashCfg.widget_density ?? 'more'} options={['more', 'less']} optionLabels={[i18nT('pages.settings.chatPanel.more_encourage_widgets'), i18nT('pages.settings.chatPanel.less_only_when_needed')]} onChange={v => setDash({ widget_density: v as 'more' | 'less' })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.mcp_apps_in_side_panel')} description={i18nT('pages.settings.chatPanel.render_interactive_mcp_apps_in_the_right_side_pa')} checked={dashCfg.mcp_app_panel} onChange={v => setDash({ mcp_app_panel: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.auto_open_git_panel')} description={i18nT('pages.settings.chatPanel.expand_the_side_panel_to_the_git_tab_each_time_yo')} checked={dashCfg.auto_open_git_panel} onChange={v => setDash({ auto_open_git_panel: v })} disabled={dashDisabled} />
@@ -707,6 +1268,67 @@ export function ChatPanel() {
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_context_percentage')} description={i18nT('pages.settings.chatPanel.display_usage_percentage_next_to_the_context_pro')} checked={chatCfg.showContextPct} onChange={v => setChat('showContextPct', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_token_usage')} description={i18nT('pages.settings.chatPanel.display_used_and_total_tokens_next_to_the_contex')} checked={chatCfg.showContextTokens} onChange={v => setChat('showContextTokens', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.feature_tips')} description={tipsConfigOff ? i18nT('pages.settings.chatPanel.disabled_by_instance_config_tips_enabled_false') : i18nT('pages.settings.chatPanel.show_occasional_feature_discovery_tips_above_the')} checked={!!tipsQ.data && tipsQ.data.enabled_config && !shownOptedOut} onChange={v => tipsMut.mutate(v)} disabled={tipsConfigOff || tipsQ.isLoading || tipsQ.isError} />
+          {/* A failed status read used to only grey the toggle out, which is
+              indistinguishable from the instance-config gate above. Say why.
+              No hand-off: this panel's `localRoleOther` / `localBudget` /
+              `localKeepChars` drafts would be unmounted by the navigation. */}
+          <ErrorNotice
+            variant="inline"
+            message={tipsQ.isError ? i18nT('pages.settings.chatPanel.failed_to_load_tips_preference') : null}
+          />
+          {/* Feature-video cache. A READOUT, not a setting: whether the clips play
+              at all is `feature_videos.enabled` on the backend, and this row only
+              says what is on disk for the current release plus the one action that
+              is the user's to take. It sits beside Feature Tips because the two
+              are the same discovery surface, and it is absent entirely when the
+              feature is off -- a cache count for something that never plays is
+              noise.
+
+              The geometry below is `SettingsToggle`'s, copied deliberately rather
+              than approximated: `py-1.5`, a `flex-1 min-w-0 mr-4` caption block, a
+              13px semibold label and a 12px muted sub-line. This row sits between
+              two toggles, and a few pixels of drift in the label's left edge or
+              size reads as a foreign component dropped into the list. It is not a
+              `SettingsToggle` itself because it writes no config -- the only
+              control here is an action. */}
+          {featureVideoLine && (
+            <div className="flex items-center justify-between py-1.5">
+              <div className="flex-1 min-w-0 mr-4">
+                <div className="text-[13px] font-semibold text-text">
+                  {i18nT('pages.settings.chatPanel.feature_videos')}
+                </div>
+                <p data-testid="feature-video-status" className="text-[12px] text-muted mt-0.5 mb-0">
+                  {featureVideoLine}
+                </p>
+              </div>
+              {/* Hidden, not disabled, when policy forbids downloads: a control
+                  whose only outcome is a refusal explains a policy the user
+                  cannot act on. Same render-gate posture as the share entry on
+                  the startup clip. Disabled only while a fetch is already
+                  running, where pressing again would queue the same work twice. */}
+              {fv?.download_enabled && (
+                <Btn
+                  onClick={() => fvFetchMut.mutate()}
+                  disabled={fvFetchMut.isPending || !!fv.downloading}
+                  aria-busy={fvFetchMut.isPending}
+                >
+                  {i18nT('pages.settings.chatPanel.feature_videos_download_all')}
+                </Btn>
+              )}
+            </div>
+          )}
+          {/* Two separate failures, and the user can act on neither by retrying a
+              toggle, so each says which half broke. No hand-off: this panel's
+              `localRoleOther` / `localBudget` / `localKeepChars` drafts would be
+              unmounted by the navigation. */}
+          <ErrorNotice
+            variant="inline"
+            message={
+              fvQ.isError ? i18nT('pages.settings.chatPanel.failed_to_load_feature_video_status')
+              : fvFetchMut.isError ? i18nT('pages.settings.chatPanel.failed_to_start_feature_video_download')
+              : null
+            }
+          />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.folder_suggestions')} description={i18nT('pages.settings.chatPanel.offer_to_file_a_new_session_into_a_matching_fold')} checked={dashCfg.folder_suggestions_enabled} onChange={v => setDash({ folder_suggestions_enabled: v })} disabled={dashDisabled} />
         </SettingsCard>
       </SettingsSection>
@@ -716,7 +1338,18 @@ export function ChatPanel() {
           <SettingsToggle label={i18nT('pages.settings.chatPanel.split_view_session_grid')} description={i18nT('pages.settings.chatPanel.opt_in_split_the_chat_into_resizable_session_pan', { mod: isMac ? '⌘' : 'Ctrl' })} checked={dashCfg.session_grid} onChange={v => setDash({ session_grid: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.history_expanded')} description={i18nT('pages.settings.chatPanel.expand_history_sidebar_by_default')} checked={chatCfg.historyExpanded} onChange={v => setChat('historyExpanded', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.confirm_before_closing_session')} description={i18nT('pages.settings.chatPanel.show_a_confirmation_dialog_when_closing_a_sessio')} checked={chatCfg.confirmCloseSession} onChange={v => setChat('confirmCloseSession', v)} />
+          <SettingsToggle label={i18nT('pages.settings.chatPanel.compact_empty_folders')} description={i18nT('pages.settings.chatPanel.a_folder_with_no_chats_takes_one_row_instead_of')} checked={chatCfg.hideEmptyFolderBody} onChange={v => setChat('hideEmptyFolderBody', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.default_to_autopilot_mode')} description={i18nT('pages.settings.chatPanel.new_sessions_start_in_autopilot_mode_plan_approv')} checked={chatCfg.defaultAutopilot} onChange={v => setChat('defaultAutopilot', v)} />
+          <SettingsSelect
+            label={i18nT('settings.chat.defaultMemoryMode.label')}
+            description={i18nT('settings.chat.defaultMemoryMode.description')}
+            value={asMemoryMode(shownDefaultMemoryMode)}
+            options={MEMORY_MODE_OPTIONS}
+            optionLabels={memoryModeLabels()}
+            onChange={v => defaultModeMut.mutate(v as MemoryMode)}
+            disabled={dashDisabled || defaultModeMut.isPending}
+            configKey="dashboard.default_memory_mode"
+          />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.tail_only_fork')} description={i18nT('pages.settings.chatPanel.fork_keeps_only_the_messages_after_the_chosen_po')} checked={dashCfg.tail_fork_enabled} onChange={v => setDash({ tail_fork_enabled: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.restore_sessions')} description={i18nT('pages.settings.chatPanel.re_open_recently_active_sessions_on_startup')} checked={dashCfg.restore_sessions} onChange={v => setDash({ restore_sessions: v })} disabled={dashDisabled} />
           {dashCfg.restore_sessions && (
@@ -733,7 +1366,7 @@ export function ChatPanel() {
             description={i18nT('pages.settings.chatPanel.context_usage_at_which_auto_compaction_triggers')}
             value={String(mcCfg?.session?.autocompact_pct ?? 70)}
             options={COMPACT_OPTIONS}
-            optionLabels={COMPACT_LABELS}
+            optionLabels={compactLabels()}
             onChange={v =>
               api.patchConfig('session.autocompact_pct', Number(v))
                 .then(() => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }))

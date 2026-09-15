@@ -1,8 +1,7 @@
 /**
- * SIDEBAR_ANIM_CAP gate: above the cap, session rows must render WITHOUT
- * framer layout projection (no layoutId, layout=false) so a 200+ session
- * sidebar stops paying a group-wide getBoundingClientRect pass per commit.
- * At or below the cap the animation contract is unchanged.
+ * Session-row projection window: at every total list size, only the first
+ * SIDEBAR_DISPLACEMENT_WINDOW paint positions enroll in Framer layout
+ * projection. This bounds group measurement without a 49-row motion cliff.
  *
  * The shared framer mock maps `layoutId` -> `data-layout-id`, which is what
  * these assertions read.
@@ -64,7 +63,7 @@ Object.defineProperty(window, 'matchMedia', {
   })),
 })
 
-import ChatSidebar from '../pages/ChatSidebar'
+import ChatSidebar, { SIDEBAR_DISPLACEMENT_WINDOW } from '../pages/ChatSidebar'
 
 function mkSlots(n: number) {
   return Array.from({ length: n }, (_, i) => ({
@@ -108,24 +107,20 @@ afterEach(() => vi.clearAllMocks())
 
 const rowWrappers = () => Array.from(document.querySelectorAll<HTMLElement>('[data-slot-key]'))
 
-describe('SIDEBAR_ANIM_CAP layout-animation gate', () => {
-  it('keeps layout projection at or below the cap', () => {
-    renderSidebar(mkSlots(5))
+describe('sidebar layout-projection window', () => {
+  it('enrolls only the first displacement window at every list size', () => {
+    const total = SIDEBAR_DISPLACEMENT_WINDOW + 40
+    renderSidebar(mkSlots(total))
     const rows = rowWrappers()
-    expect(rows.length).toBe(5)
-    for (const el of rows) {
-      expect(el.getAttribute('data-layout-id')).toMatch(/^slot-/)
-      expect(el.getAttribute('data-layout')).toBe('position')
-    }
-  })
-
-  it('drops layout projection above the cap', () => {
-    renderSidebar(mkSlots(201))
-    const rows = rowWrappers()
-    expect(rows.length).toBe(201)
-    for (const el of rows) {
-      expect(el.getAttribute('data-layout-id')).toBeNull()
-      expect(el.getAttribute('data-layout')).toBe('false')
+    expect(rows.length).toBe(total)
+    for (const [index, el] of rows.entries()) {
+      if (index < SIDEBAR_DISPLACEMENT_WINDOW) {
+        expect(el.getAttribute('data-layout-id')).toMatch(/^slot-/)
+        expect(el.getAttribute('data-layout')).toBe('position')
+      } else {
+        expect(el.getAttribute('data-layout-id')).toBeNull()
+        expect(el.getAttribute('data-layout')).toBe('false')
+      }
     }
   })
 })

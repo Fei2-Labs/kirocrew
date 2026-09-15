@@ -2,8 +2,8 @@
 
 ``hooks.json`` is shared between two writers: ``ScriptHookStore`` owns the
 ``hooks`` key, while the ``register_hook`` MCP tool stores one top-level key per
-webhook resume context. The store used to write ``{"hooks": [...]}`` wholesale,
-so any script-hook mutation silently dropped every pending context — the data a
+webhook resume context. A store writing ``{"hooks": [...]}`` wholesale would let
+any script-hook mutation silently drop every pending context — the data a
 webhook callback needs to resume with prior intent.
 """
 
@@ -273,7 +273,7 @@ class TestMergeIsSerialised:
 class TestConcurrentMutationsAreSerialised:
     """Offloading persistence must not let a mutation be lost.
 
-    The CRUD methods used to be implicitly serialised by running on the single
+    The CRUD methods were implicitly serialised by running on the single
     event-loop thread; they are now dispatched with ``asyncio.to_thread`` because
     the persist path takes a file lock and fsyncs. Two hazards follow, and only
     the second is deterministic enough to pin:
@@ -281,8 +281,8 @@ class TestConcurrentMutationsAreSerialised:
     1. Iterating ``self._hooks`` to build the payload while another thread
        mutates it can raise "dictionary changed size during iteration". Real but
        GIL-timing-dependent, so not asserted here.
-    2. A persist driven from a PRE-CAPTURED snapshot (what ``fire()`` used to do:
-       snapshot on the loop, write later in a worker) drops any mutation that
+    2. A persist driven from a PRE-CAPTURED snapshot (snapshotting on the loop,
+       writing later in a worker) drops any mutation that
        lands in between. That one can be forced exactly, below.
     """
 
@@ -361,3 +361,55 @@ class TestConcurrentMutationsAreSerialised:
         assert "review:pr-123" in after
         assert len(after["hooks"]) == 16
         assert len(store.list_all()) == 16
+
+
+class TestAcquiringTheSharedLockDoesNotTruncateTheLockFile:
+    """A lock file must be opened WRITABLE but never TRUNCATING.
+
+    ``msvcrt.locking`` needs a writable handle, so the fd cannot be opened
+    ``"r"``. But ``"w"`` truncates at open, and on Windows a truncating open of
+    a lock file whose first byte another holder already locked raises a sharing
+    violation instead of waiting — so the contending acquirer crashes with a
+    bare ``OSError`` *before* it reaches ``file_lock``, and the serialisation
+    the lock exists to provide never happens. POSIX ``flock`` tolerates the
+    truncate, which is why the defect is invisible on Linux and reddens only
+    the Windows shards.
+
+    Same defect and same fix as ``work_ledger._open_lock``
+    and ``session_pid.py``'s three lock helpers.
+    ``webhooks.locked`` matters doubly: it guards ``hooks.json.lock``, the SAME
+    file ``register_hook`` (``mcp_tools/control.py``) locks from another
+    module, so cross-process contention on it is the store's normal state.
+
+    Truncation is the direct, PLATFORM-INDEPENDENT observable, and that is what
+    this asserts: seed the lock file with bytes, take and release the lock, and
+    require the bytes to have survived. Under the old ``open(lock_path, "w")``
+    this fails on every platform, so the guard does not depend on running the
+    suite on Windows to have teeth.
+    """
+
+    SEED = b"lock-file-content-that-must-survive"
+
+    def test_locked_preserves_the_lock_file(self, tmp_path):
+        from kiro_crew import webhooks
+
+        path = tmp_path / "hooks.json"
+        lock_path = tmp_path / "hooks.json.lock"
+        lock_path.write_bytes(self.SEED)
+
+        with webhooks.locked(path):
+            pass
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_locked_works_when_the_lock_file_is_absent(self, tmp_path):
+        """First acquisition must create the lock file rather than raise."""
+        from kiro_crew import webhooks
+
+        path = tmp_path / "hooks.json"
+        assert not (tmp_path / "hooks.json.lock").exists()
+
+        with webhooks.locked(path):
+            pass
+
+        assert (tmp_path / "hooks.json.lock").exists()

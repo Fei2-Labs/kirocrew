@@ -40,8 +40,8 @@ def _normalize_link(raw: object) -> dict[str, str]:
     """Coerce a raw link entry to ``{"url": str, "context": str}``.
 
     The nav panel posts arbitrary client JSON; a non-dict entry or a
-    non-string ``url``/``context`` previously raised (TypeError/AttributeError)
-    inside prompt construction and surfaced as a 500. Normalizing at this
+    non-string ``url``/``context`` would raise (TypeError/AttributeError) inside
+    prompt construction and surface as a 500. Normalizing at this
     boundary keeps downstream logic string-only, and is index-aligned with the
     input so the positional ``summaries`` response still lines up per link.
     """
@@ -76,7 +76,7 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
     """Generate summaries for a batch of links using the background session."""
     prompt = _build_link_summary_prompt(links)
     # Link labeling is a trivial classification task — run on the cheapest model
-    # via the shared background one-liner helper (denials SEL-logged as before).
+    # via the shared background one-liner helper (denials are SEL-logged).
     text = await run_bg_oneliner(
         state.sessions, prompt, model=_LINK_SUMMARY_MODEL, sel_source="chat_nav"
     )

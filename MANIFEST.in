@@ -18,6 +18,7 @@ include setup.py
 
 # --- Top-level package data files (mirror [options.package_data]) ------------
 include src/kiro_crew/py.typed
+include src/kiro_crew/BUILD_VERSION
 include src/kiro_crew/slack-manifest.yaml
 include src/kiro_crew/model_tokens.json
 
@@ -34,7 +35,13 @@ recursive-include src/kiro_crew/apps *.json
 # for apps ported from third-party work; Apache-2.0 attribution must ship.
 recursive-include src/kiro_crew/apps *.md
 recursive-include src/kiro_crew/eval/scenarios *.json
+recursive-include src/kiro_crew/eval/bench/data *.json
 recursive-include src/kiro_crew/docs *.md
+# The generated settings registry beside those docs (see settings-deeplink.md).
+# `[options.package_data]`'s `docs/*.json` covers the WHEEL only; the sdist is
+# built from this file, and `python -m build` builds the wheel FROM the sdist, so
+# a missing line here drops the file from every published artifact.
+recursive-include src/kiro_crew/docs *.json
 recursive-include src/kiro_crew/tests_fixtures *
 
 # --- Pruning: never ship test trees, vendored node deps, or build cruft ------
@@ -61,3 +68,26 @@ recursive-include src/kiro_crew/deploy/skills *
 # published Linux wheel ships a vendored llama_cpp that cannot load its own
 # shared library and in-process embeddings fail at gateway startup.
 recursive-include src/kiro_crew/_vendor/llama_cpp_libs *
+# The AWS Control crew container image's build context, re-included AFTER the excludes
+# for the same reason as the block above, and it is the ORDERING that does the work here.
+# `python -m build` builds the wheel from the SDIST, so a file absent from this file is
+# absent from every published wheel whatever `package_data` in setup.cfg says. The tree
+# holds Dockerfiles, `requirements*.txt`, CONTRACT.md and a vendor placeholder, none of
+# which any pattern above reaches: `*` does not cross a path separator, so
+# `recursive-include src/kiro_crew/apps *.md` matches nothing under `crew/runtime/`
+# beyond `.md`, and the Dockerfiles have no extension at all.
+#
+# Without these lines the image builds from a source checkout and silently cannot build
+# from an installed copy, with nothing raising at install time to say so.
+#
+# Three rules naming what the image needs, not one `recursive-include <runtime> *`. That
+# one also carried `container_tests/` -- a 4,000 line suite of the image's own tests --
+# into every sdist and so into every wheel and DMG, where nothing can run it: those
+# tests exercise a Linux container's supervisor, and the machine that installed the app
+# never runs that container. Written as an allowlist rather than the broad rule plus a
+# `prune`, because a `prune` here would be the last exclude in the file and would put
+# every rule above it back out of scope -- distutils applies these in file order, which
+# is the same reason this block sits at the end.
+recursive-include src/kiro_crew/apps/builtins/aws_control/crew/runtime Dockerfile*
+recursive-include src/kiro_crew/apps/builtins/aws_control/crew/runtime/container *
+recursive-include src/kiro_crew/apps/builtins/aws_control/crew/runtime/vendor *

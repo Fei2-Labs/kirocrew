@@ -12,6 +12,15 @@ from __future__ import annotations
 from aiohttp import web
 
 from kiro_crew.dashboard import handlers, ws
+from kiro_crew.feature_videos import (
+    api_feature_videos_feedback,
+    api_feature_videos_next,
+    api_feature_videos_status,
+)
+from kiro_crew.feature_videos_cache import (
+    api_feature_video_file,
+    api_feature_videos_fetch_all,
+)
 from kiro_crew.suggestions import api_suggestions
 from kiro_crew.tips import api_tips_feedback, api_tips_next, api_tips_status
 
@@ -55,6 +64,9 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/sso-ttl", handlers.api_sso_ttl)
     app.router.add_get("/api/dashboard/branding", handlers.api_branding)
     app.router.add_get("/api/health", handlers.api_health)
+    # Authenticated, NOT a probe path: the version-equality gate for remote
+    # execution reads it over an instance tunnel with the dashboard cookie.
+    app.router.add_get("/api/version", handlers.api_version)
     app.router.add_get("/api/live", handlers.api_live)
     app.router.add_get("/api/ready", handlers.api_ready)
     app.router.add_get("/api/theme/boot", handlers.api_theme_boot)
@@ -93,7 +105,9 @@ def register(app: web.Application) -> None:
 
     app.router.add_get("/api/kas-login", _lazy_kas("api_kas_login_status"))
     app.router.add_post("/api/kas-login/device", _lazy_kas("api_kas_login_begin_device"))
+    app.router.add_post("/api/kas-login/loopback", _lazy_kas("api_kas_login_begin_loopback"))
     app.router.add_post("/api/kas-login/poll", _lazy_kas("api_kas_login_poll"))
+    app.router.add_post("/api/kas-login/cancel", _lazy_kas("api_kas_login_cancel"))
     app.router.add_post("/api/kas-login/logout", _lazy_kas("api_kas_login_logout"))
     app.router.add_get("/api/governance/channels", handlers.api_governance_channels)
 
@@ -104,3 +118,13 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/tips/next", api_tips_next)
     app.router.add_get("/api/tips/status", api_tips_status)
     app.router.add_post("/api/tips/feedback", api_tips_feedback)
+
+    # Feature videos (feature-intro clips, sibling of tips above)
+    app.router.add_get("/api/feature-videos/next", api_feature_videos_next)
+    app.router.add_get("/api/feature-videos/status", api_feature_videos_status)
+    app.router.add_post("/api/feature-videos/feedback", api_feature_videos_feedback)
+    app.router.add_post("/api/feature-videos/fetch-all", api_feature_videos_fetch_all)
+    # The cached-clip reader. A dynamic route rather than ``add_static``: the tree
+    # is in the user's data home, so this serves one validated file per request
+    # and never a directory listing (``feature_videos_cache``).
+    app.router.add_get("/feature-videos/{release}/{name}", api_feature_video_file)

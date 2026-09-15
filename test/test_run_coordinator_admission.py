@@ -21,12 +21,16 @@ from kiro_crew.subagent_command_authority import CommandIdentity
 
 class _Request:
     def __init__(self, subagents: object, body: dict[str, object], *, agent_id: str = "") -> None:
-        self.app = {"state": SimpleNamespace(subagents=subagents)}
+        self.app = {"state": SimpleNamespace(subagents=subagents, conversation_log=None)}
         self._body = body
         self.match_info = {"agent_id": agent_id}
 
     async def json(self) -> dict[str, object]:
         return self._body
+
+    def get(self, key: str, default: object = None) -> object:
+        # aiohttp's Request is a MutableMapping; the handlers read request['app'].
+        return default
 
 
 def _response_json(response: object) -> dict[str, object]:

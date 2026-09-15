@@ -145,6 +145,38 @@ class TestMapResponse:
         ]}
         assert "bonus_limit" not in api._map_response(data)
 
+    def test_warns_on_two_credit_typed_pools(self, caplog):
+        # The exact payload nobody has captured: TWO entries typed literally
+        # "CREDIT". The picker takes the first by list order; detection must fire
+        # AND selection must stay byte-for-byte identical (first entry wins).
+        data = {"usageBreakdownList": [
+            {"resourceType": "CREDIT", "currentUsage": 5, "usageLimit": 100},
+            {"resourceType": "CREDIT", "currentUsage": 999, "usageLimit": 2000},
+        ]}
+        with caplog.at_level("WARNING", logger=api.logger.name):
+            out = api._map_response(data)
+        # Selection unchanged: the first CREDIT entry still wins.
+        assert out["credits_used"] == 5.0
+        assert out["credits_plan"] == 100.0
+        warnings = [r for r in caplog.records if "CREDIT-typed pools" in r.getMessage()]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert "2 CREDIT-typed pools" in msg
+        assert "index 0" in msg
+        # Shape only — no balances/identifiers leak into the log line.
+        assert "999" not in msg and "2000" not in msg
+
+    def test_no_warn_on_single_credit_typed_pool(self, caplog):
+        # Mutate the fixture: one CREDIT entry. Detection must NOT fire — a
+        # detector that fires on every payload is worse than none.
+        data = {"usageBreakdownList": [
+            {"resourceType": "CREDIT", "currentUsage": 5, "usageLimit": 100},
+            {"resourceType": "FREE_TRIAL", "currentUsage": 10, "usageLimit": 50},
+        ]}
+        with caplog.at_level("WARNING", logger=api.logger.name):
+            api._map_response(data)
+        assert not [r for r in caplog.records if "CREDIT-typed pools" in r.getMessage()]
+
     def test_none_when_response_not_dict(self):
         assert api._map_response([]) is None
         assert api._map_response(None) is None
@@ -484,8 +516,8 @@ class TestWindowsCliStore:
         # Same end-to-end path for the CURRENT Windows layout
         # (%LOCALAPPDATA%\kiro-cli): a token read out of a Local-layout store
         # carries from_cli_store=True, so the provenance path accepts it when
-        # whoami reports no profile ARN -- the exact case #5783 reports, where
-        # the store exists only under AppData/Local and the pill vanished.
+        # whoami reports no profile ARN -- the case where the store exists only
+        # under AppData/Local, which would otherwise blank the pill.
         db = tmp_path / "AppData" / "Local" / "kiro-cli" / "data.sqlite3"
         db.parent.mkdir(parents=True)
         con = sqlite3.connect(str(db))
@@ -1040,8 +1072,8 @@ class TestCandidateOrdering:
 
     def test_freshest_expiry_ranks_first(self, tmp_path):
         # A stale-but-unexpired JSON credential sits in the highest-priority PATH
-        # slot; the SQLite store holds a newer one. Path order used to decide,
-        # which is how a signed-out profile won.
+        # slot; the SQLite store holds a newer one. Deciding on path order here
+        # would let a signed-out profile win.
         now = datetime.now(timezone.utc)
         soon = (now + timedelta(minutes=20)).isoformat()
         later = (now + timedelta(hours=8)).isoformat()
@@ -1217,3 +1249,137 @@ class TestTokenStoreSensitivePath:
                 # The DB and its WAL/SHM/journal sidecars must all be sensitive.
                 assert is_sensitive_path(str(home / base / app / "data.sqlite3"))
                 assert is_sensitive_path(str(home / base / app / "data.sqlite3-wal"))
+
+
+class TestExpectedArnSelection:
+    """The profile probe answers a question ("is the signed-in profile in this
+    token's list?"), never a position ("what is first?").
+
+    The failure mode being locked out: taking the FIRST entry carrying an
+    ARN means that, for a token entitled to two or more profiles, whether the
+    credit pill works depends on the order the upstream API happens to
+    return — the signed-in profile can be present in the list and never asked
+    about. A one-answer-per-token memo then makes that wrong selection sticky
+    for the process lifetime.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_arn_cache(self):
+        api._PROFILE_ARN_CACHE.clear()
+        api._PROFILE_NAME_CACHE.clear()
+        yield
+        api._PROFILE_ARN_CACHE.clear()
+        api._PROFILE_NAME_CACHE.clear()
+
+    ARN_A = "arn:aws:codewhisperer:us-east-1:1:profile/A"
+    ARN_B = "arn:aws:codewhisperer:us-east-1:2:profile/B"
+    USAGE = {"usageBreakdownList": [
+        {"resourceType": "CREDIT", "currentUsage": 1200.0, "usageLimit": 10000.0}]}
+
+    def _post_two_profiles(self, token, target, payload, **_kwargs):
+        # The signed-in profile (A) is SECOND — exactly the reporter's shape.
+        if target == api._TARGET_LIST_PROFILES:
+            return _resp(200, {"profiles": [
+                {"arn": self.ARN_B, "profileName": "Other Org"},
+                {"arn": self.ARN_A, "profileName": "My Org"}]})
+        return _resp(200, self.USAGE)
+
+    def test_expected_arn_second_in_list_is_matched(self):
+        # THE bug: a signed-in profile that is present but not first must still
+        # be found, and the pill must show real usage instead of degrading.
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=self._post_two_profiles):
+            out = api.fetch_usage_limits(expected_arn=self.ARN_A)
+        assert out is not None, "credential declined although the signed-in profile is listed"
+        assert out["_profile_arn"] == self.ARN_A
+        assert out["credits_used"] == 1200.0
+
+    def test_matched_profile_name_rides_along(self):
+        # The ``account`` label must be the MATCHED profile's name, not the
+        # first entry's — a wrong label attributes the credits to another org.
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=self._post_two_profiles):
+            out = api.fetch_usage_limits(expected_arn=self.ARN_A)
+        assert out is not None
+        assert out.get("account") == "My Org"
+
+    def test_expected_arn_absent_declines_the_credential(self):
+        # A multi-profile list WITHOUT the expected ARN proves nothing: the
+        # credential must be declined without spending a GetUsageLimits call —
+        # presence is the proof, and mere listing of OTHER profiles is not.
+        seen: list[str] = []
+
+        def recording(token, target, payload, **_kwargs):
+            seen.append(target)
+            if target == api._TARGET_LIST_PROFILES:
+                return _resp(200, {"profiles": [
+                    {"arn": self.ARN_B}, {"arn": "arn:other"}]})
+            return _resp(200, self.USAGE)
+
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=recording):
+            assert api.fetch_usage_limits(expected_arn=self.ARN_A) is None
+        assert api._TARGET_GET_USAGE not in seen
+
+    def test_single_profile_path_unchanged(self):
+        def fake_post(token, target, payload, **_kwargs):
+            if target == api._TARGET_LIST_PROFILES:
+                return _resp(200, {"profiles": [{"arn": self.ARN_A}]})
+            return _resp(200, self.USAGE)
+
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=fake_post):
+            out = api.fetch_usage_limits(expected_arn=self.ARN_A)
+        assert out is not None
+        assert out["_profile_arn"] == self.ARN_A
+
+    def test_no_expected_arn_keeps_first_with_arn(self):
+        # Source-anchored mode asks no question, so the first entry carrying an
+        # ARN is still the answer (the provenance check is the proof there).
+        with patch.object(api, "_post", side_effect=self._post_two_profiles):
+            assert api._list_profile_arn("tok") == self.ARN_B
+
+    def test_warm_cache_does_not_cross_expectations(self):
+        # Two probes with the same token and different expected ARNs must not
+        # return each other's answer: one memoized ARN per token digest made
+        # the wrong first selection sticky for the process lifetime.
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=self._post_two_profiles):
+            first = api.fetch_usage_limits(expected_arn=self.ARN_B)
+            second = api.fetch_usage_limits(expected_arn=self.ARN_A)
+        assert first is not None
+        assert first["_profile_arn"] == self.ARN_B
+        assert second is not None, "warm cache served the other expectation's answer"
+        assert second["_profile_arn"] == self.ARN_A
+
+    def test_name_cache_keyed_with_the_arn_it_belongs_to(self):
+        # The co-cached display name must follow the same composite key, so an
+        # account label can never be served for a different expectation.
+        with patch.object(api, "_post", side_effect=self._post_two_profiles):
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_A) == self.ARN_A
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_B) == self.ARN_B
+        assert api._account_name("tok", self.ARN_A) == "My Org"
+        assert api._account_name("tok", self.ARN_B) == "Other Org"
+
+    def test_anchored_miss_is_not_cached(self):
+        # An absent expected ARN may be post-login propagation lag; the next
+        # refresh must re-probe rather than serve a pinned miss.
+        with patch.object(api, "_post",
+                          return_value=_resp(200, {"profiles": [{"arn": self.ARN_B}]})):
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_A) is None
+        with patch.object(api, "_post", side_effect=self._post_two_profiles) as mp:
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_A) == self.ARN_A
+        assert mp.call_count == 1
+
+    def test_anchored_match_is_memoized(self):
+        # The composite key still saves the round-trip on the SAME question.
+        with patch.object(api, "_post", side_effect=self._post_two_profiles) as mp:
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_A) == self.ARN_A
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_A) == self.ARN_A
+        assert mp.call_count == 1
+
+    def test_empty_anchor_behaves_as_no_anchor_in_probe(self):
+        # A falsy anchor means "no question asked" — first-with-ARN, matching
+        # fetch_usage_limits' own truthiness convention for expected_arn.
+        with patch.object(api, "_post", side_effect=self._post_two_profiles):
+            assert api._list_profile_arn("tok", expected_arn="") == self.ARN_B

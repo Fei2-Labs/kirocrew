@@ -171,7 +171,7 @@ Send `/help` in the chat for the current list. Today:
 | `/stop` (`/cancel`) | Stop the reply in progress and clear the queue |
 | `/yolo on\|off\|renew` | Auto-approve tools **everywhere** until it expires — see below |
 | `/link` / `/unlink` | Resume / stop mirroring dashboard replies into this chat |
-| `/sessions [search words]` | Continue a recent dashboard chat here (owner only) |
+| `/sessions [search words]` | Continue a recent dashboard or same-chat session here (owner only) |
 | `/dashboard [<N>h\|<N>m]` | Get a **dashboard login link** — see Security notes |
 | `/help` | Show the command list |
 
@@ -185,13 +185,16 @@ progress. A message sent mid-turn is never lost — if it cannot be folded in, i
 held and shown in a single "⏳ Queued (N)" receipt that is edited in place, then
 answered as one combined turn.
 
-### Continuing a dashboard conversation
+### Continuing an earlier conversation
 
-`/sessions` lists your recent dashboard chats as buttons; press one and it continues in
-this Teams chat, with the last few messages replayed so you can see where you left off.
-`/sessions <words>` searches them — over message content as well as titles, so a phrase
-you remember from the conversation finds it. `/unlink` (or `/new`) comes back to your own
-Teams conversation.
+`/sessions` lists your recent dashboard chats plus generations from this exact Teams
+identity bucket; native sessions for another identity, agent, conversation, or channel
+are excluded. Press one and it continues in this Teams chat, with the last few messages
+replayed so you can see where you left off. `/sessions <words>` searches them — over
+message content as well as titles, so a phrase you remember from the conversation finds
+it. `/unlink` comes back to your own Teams conversation. `/new` leaves the resumed
+session and durably records the fresh generation before replying; its first real turn
+adds it to `/sessions`.
 
 It is **owner-only**: a dashboard session is your whole working transcript, so the list
 is available only when `teams.allowed_emails` holds exactly one address. With more than
@@ -232,7 +235,7 @@ None of this disables the security gate: the sensitive-path keystone, the
 enterprise governance ceiling, and the destructive-command deny-list all run ahead
 of auto-approval, so anything denied by policy stays denied.
 
-## Security notes
+## Access control
 
 - The webhook is **exempt from the dashboard cookie gate and from the CSRF origin
   check, for `POST` only**, because it performs its own Bot Framework JWT
@@ -269,7 +272,7 @@ of auto-approval, so anything denied by policy stays denied.
   that resolves into a private, loopback or link-local range is refused — so an
   activity cannot turn the gateway into a proxy for your internal network.
 
-## Limitations (this release)
+## Limits
 
 - 1:1 personal chat only — no team channels, group chats, or @mention handling.
   A reply in a channel would expose tool output to people who are not on your
@@ -303,3 +306,9 @@ of auto-approval, so anything denied by policy stays denied.
   with a channel or user target — its addressing, allow-list and threading are Slack
   concepts — so a Teams-only install should rely on the mirror rather than on that
   tool's own delivery.
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables

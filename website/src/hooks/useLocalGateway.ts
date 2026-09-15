@@ -6,12 +6,7 @@ import { useState, useEffect, useCallback } from 'react'
 // the client asking it. In a plain browser or the PWA the bridge is absent and
 // there is nothing to manage, so `supported` is false and the UI hides the
 // control rather than showing one that cannot work.
-type LocalGatewayAPI = {
-  get(): Promise<boolean>
-  set(enabled: boolean): Promise<boolean>
-}
-const localGatewayAPI = (): LocalGatewayAPI | undefined =>
-  (window as { localGatewayAPI?: LocalGatewayAPI }).localGatewayAPI
+const localGatewayAPI = (): LocalGatewayAPI | undefined => window.localGatewayAPI
 
 /**
  * Read/write the desktop app's "run a local gateway" choice.

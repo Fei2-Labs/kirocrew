@@ -142,14 +142,14 @@ class TestPrepareMessages:
 
         monkeypatch.setattr(chat_utils, "_collapse_wire_rows", record_collapse)
 
-        result = _prepare_messages(messages, running=True)
+        result = _prepare_messages(messages, running=True, live_child="")
 
         assert calls == [messages]
         assert result == [{"role": "streaming", "content": "hello", "cls": "msg msg-a"}]
 
     def test_strips_done(self):
         msgs = [{"role": "user", "content": "hi"}, {"role": "done", "content": ""}]
-        result = _prepare_messages(msgs, running=False)
+        result = _prepare_messages(msgs, running=False, live_child="")
         assert len(result) == 1
         assert result[0]["role"] == "user"
 
@@ -159,16 +159,67 @@ class TestPrepareMessages:
             {"role": "chunk", "content": "lo"},
             {"role": "user", "content": "next"},
         ]
-        result = _prepare_messages(msgs, running=False)
+        result = _prepare_messages(msgs, running=False, live_child="")
         assert result[0]["role"] == "streaming"
         assert "hel" in result[0]["content"]
         assert result[1]["role"] == "user"
 
     def test_trailing_chunks(self):
         msgs = [{"role": "chunk", "content": "partial"}]
-        result = _prepare_messages(msgs, running=True)
+        result = _prepare_messages(msgs, running=True, live_child="")
         assert len(result) == 1
         assert result[0]["role"] == "streaming"
+
+    def test_streaming_row_carries_the_newest_chunk_seq(self):
+        """The fold stands for every delta, so it vouches for the NEWEST seq.
+
+        The client seeds its replay guard from this value; the first delta's
+        seq would let every later delta be applied a second time.
+        """
+        msgs = [
+            {"role": "chunk", "content": "hel", "seq": 1},
+            {"role": "chunk", "content": "lo", "seq": 2},
+            {"role": "chunk", "content": "!", "seq": 3},
+        ]
+        result = _prepare_messages(msgs, running=True, live_child="")
+        assert result == [{"role": "streaming", "content": "hello!", "cls": "msg msg-a", "seq": 3}]
+
+    def test_streaming_row_carries_the_generation_beside_the_seq(self):
+        """The fold also carries the gateway generation the seqs belong to, so a
+        client can tell a floor numbered by a process that has since restarted
+        apart from this one instead of ordering the two against each other."""
+        msgs = [
+            {"role": "chunk", "content": "hel", "seq": 1, "gen": "abcd1234"},
+            {"role": "chunk", "content": "lo", "seq": 2, "gen": "abcd1234"},
+        ]
+        result = _prepare_messages(msgs, running=True, live_child="")
+        assert result == [
+            {
+                "role": "streaming",
+                "content": "hello",
+                "cls": "msg msg-a",
+                "seq": 2,
+                "gen": "abcd1234",
+            }
+        ]
+
+    def test_streaming_row_omits_seq_when_the_rows_carry_none(self):
+        """Legacy window rows have no seq; the wire shape stays as before."""
+        msgs = [{"role": "chunk", "content": "hel"}, {"role": "chunk", "content": "lo"}]
+        result = _prepare_messages(msgs, running=True, live_child="")
+        assert result == [{"role": "streaming", "content": "hello", "cls": "msg msg-a"}]
+
+    def test_collapse_keeps_the_max_seq_and_never_mutates_input(self):
+        rows = [
+            {"role": "chunk", "content": "a", "seq": 4},
+            {"role": "chunk", "content": "b", "seq": 5},
+            {"role": "user", "content": "next"},
+            {"role": "chunk", "content": "c", "seq": 6},
+        ]
+        snapshot = [dict(r) for r in rows]
+        out = chat_utils._collapse_wire_rows(rows)
+        assert [m.get("seq") for m in out] == [5, None, 6]
+        assert rows == snapshot
 
 
 class TestRedactForDisplay:

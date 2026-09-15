@@ -50,6 +50,7 @@ import { commitUrlFor, userUrlFor, repoScopeKey } from '../lib/links'
 import { providerTerms } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 import { fmtDateTime } from '../../../i18n/format'
 /** A relative timestamp that flips to the absolute local date-time on click
  * (and shows it on hover). Renders nothing for a missing/unparseable value. */
@@ -554,16 +555,11 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
   const copyLink = async () => {
     const attempt = ++copyAttemptRef.current
     if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
-    let next: 'copied' | 'failed'
-    try {
-      await copyToClipboard(detail?.url ?? pull.url)
-      next = 'copied'
-    } catch {
-      // Reported, never swallowed: a row that does nothing on press is
-      // indistinguishable from a copy that worked, so the URL is silently
-      // missing from the clipboard at the moment it is about to be pasted.
-      next = 'failed'
-    }
+    const ok = await copyToClipboard(detail?.url ?? pull.url)
+    // Reported, never swallowed: a row that does nothing on press is
+    // indistinguishable from a copy that worked, so the URL is silently
+    // missing from the clipboard at the moment it is about to be pasted.
+    const next = ok ? 'copied' : 'failed'
     if (attempt !== copyAttemptRef.current) return
     setCopyStatus(next)
     copyTimerRef.current = setTimeout(() => setCopyStatus('idle'), 1500)
@@ -952,11 +948,20 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
 
             {activityLoading && <TimelineSkeleton />}
             {activityError && (
-              <div className={`py-2 text-[12px] ${activityStale ? 'text-warn' : 'text-danger'}`}>
-                {activityStale
-                  ? i18nT('apps.issueRadar.components.prDetail.showing_the_last_successful_read', { error: activityError.message })
-                  : i18nT('apps.issueRadar.components.prDetail.couldnt_load_activity', { error: activityError.message })}
-              </div>
+              activityStale ? (
+                // Still showing the last successful read: a warning, not a failure.
+                <div className="py-2 text-[12px] text-warn">
+                  {i18nT('apps.issueRadar.components.prDetail.showing_the_last_successful_read', { error: activityError.message })}
+                </div>
+              ) : (
+                // A read of a persisted PR's timeline; nothing in this column is
+                // a draft (the actions bar's composer guards its own notice).
+                <ErrorNotice
+                  message={i18nT('apps.issueRadar.components.prDetail.couldnt_load_activity', { error: activityError.message })}
+                  askAgent
+                  className="my-2"
+                />
+              )
             )}
             {!activityLoading && !activityError && activityDesc.length === 0 && (
               <div className="py-2 text-[12px] text-muted">{i18nT('apps.issueRadar.components.prDetail.no_activity_yet')}</div>

@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { screen, waitFor, fireEvent, within, act } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 
-import DevFleetPage from '../pages/DevFleetPage'
+import DevFleetPage, { __resetDevFleetNoticesForTests } from '../pages/DevFleetPage'
 
 type Body = Record<string, unknown> | unknown[] | null
 type RouteHandler = (u: string, opts?: RequestInit) => Response | Promise<Response> | null
@@ -66,6 +66,9 @@ function renderPage() {
 // its own so waitFor and the polling effects behave as they do with real timers.
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true })
+  // The latest action failure is module state (survives unmount by design);
+  // do not let one test's failure seed the next test's page.
+  __resetDevFleetNoticesForTests()
 })
 afterEach(() => {
   vi.clearAllTimers()
@@ -470,7 +473,9 @@ describe('DevFleetPage rebase', () => {
     await confirmRebase()
     await waitFor(() => expect(screen.getByText('Conflicts \u2014 aborted')).toBeInTheDocument())
     expect(screen.getByText('Rebase conflicts')).toBeInTheDocument()
-    fireEvent.click(screen.getByLabelText('Dismiss'))
+    // The row's own notice (the page-level action error carries a Dismiss too).
+    fireEvent.click(within(screen.getByTestId('rebase-error-wt-a')).getByLabelText('Dismiss'))
+    await waitFor(() => expect(screen.queryByTestId('rebase-error-wt-a')).toBeNull())
   })
 
   it('surfaces the server error text for a failed rebase', async () => {
@@ -482,7 +487,8 @@ describe('DevFleetPage rebase', () => {
     await waitForRow('wt-a')
     await confirmRebase()
     await waitFor(() => expect(screen.getAllByText('dirty working tree').length).toBeGreaterThan(0))
-    fireEvent.click(screen.getByLabelText('Dismiss'))
+    fireEvent.click(within(screen.getByTestId('rebase-error-wt-a')).getByLabelText('Dismiss'))
+    await waitFor(() => expect(screen.queryByTestId('rebase-error-wt-a')).toBeNull())
   })
 
   it('reports a transport failure without leaving an inline marker behind', async () => {
@@ -494,8 +500,10 @@ describe('DevFleetPage rebase', () => {
     await waitForRow('wt-a')
     await confirmRebase()
     await waitFor(() => expect(screen.getByText('rebase endpoint down')).toBeInTheDocument())
-    // A throw produces no verdict, so there is nothing to dismiss on the row.
-    expect(screen.queryByLabelText('Dismiss')).toBeNull()
+    // A throw produces no verdict, so the row carries no rebase marker; the
+    // failure is reported by the page-level action notice instead.
+    expect(screen.queryByTestId('rebase-error-wt-a')).toBeNull()
+    expect(screen.getByTestId('devfleet-action-error')).toHaveTextContent('rebase endpoint down')
   })
 
   it('does not touch the branch when the rebase confirm is cancelled', async () => {
@@ -691,6 +699,77 @@ describe('DevFleetPage sync run lifecycle', () => {
     await waitFor(() => expect(screen.queryByLabelText('Dismiss sync status')).toBeNull())
   }, 20000)
 
+  it('names a failed step from its stderr tail, not from the stale stdout line that follows it', async () => {
+    // The sync runner merges every step's stdout and stderr into one pipe, and a
+    // child block-buffers stdout to a pipe while writing stderr unbuffered — so a
+    // refused `git merge --ff-only` ENDS with its `Updating <old>..<new>` progress
+    // line, after the diagnostic. Naming the failure from the last output line
+    // therefore yields "Pull+Build failed: Updating 2f9ed9724..bf09e50e5", which
+    // names nothing a user can act on. The runner labels the failing step's stderr
+    // tail, and that is what must render.
+    const output = [
+      '::step::1::Merge',
+      'error: Your local changes to the following files would be overwritten by merge:',
+      '\tconfig-baseline.json',
+      'Please commit your changes or stash them before you merge.',
+      'Aborting',
+      'Updating 2f9ed9724..bf09e50e5',
+      '::steperr::1::error: Your local changes to the following files would be overwritten by merge:',
+      '::steperr::1::\tconfig-baseline.json',
+      '::steperr::1::Please commit your changes or stash them before you merge.',
+      '::steperr::1::Aborting',
+    ]
+    installFetch(fleetOf(MAIN_ROW), (u, opts) => {
+      if (u.includes('/sync') && isPost(opts)) return res({ ok: true, run_id: 'sync-merge' })
+      if (u.includes('/run?id=sync-merge')) {
+        return res({ status: 'done', exit_code: 1, output, started: nowSec() - 5 })
+      }
+      return null
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('Pull+Build')).toBeInTheDocument(), { timeout: 4000 })
+    await startSync()
+    await waitFor(() => expect(screen.getByText('Pull+Build failed')).toBeInTheDocument(), { timeout: 8000 })
+
+    const notice = screen.getByTestId('sync-error')
+    expect(notice.textContent).toContain('would be overwritten by merge')
+    expect(notice.textContent).toContain('config-baseline.json')
+    // The progress line is not what the failure is named after.
+    expect(notice.textContent).not.toContain('Updating 2f9ed9724')
+
+    // Both markers are protocol: the log shows the transcript once, with no
+    // duplicated tail and no `::steperr::` prefixes leaking through.
+    fireEvent.click(screen.getByLabelText('Toggle log'))
+    const pre = await waitFor(() => document.querySelector('pre') as HTMLPreElement)
+    expect(pre.textContent).not.toContain('::steperr::')
+    expect(pre.textContent).not.toContain('::step::')
+    expect(pre.textContent).toContain('Updating 2f9ed9724..bf09e50e5')
+    expect(pre.textContent?.match(/Aborting/g)).toHaveLength(1)
+  }, 20000)
+
+  it('keeps the failure notice visible when a step forges a blank stderr marker', async () => {
+    // `::steperr::` is a label on a worktree-controlled stream, so a step can
+    // print one itself. An all-blank forged tail must not resolve to the empty
+    // message ErrorNotice renders as nothing — that would hide the failure.
+    installFetch(fleetOf(MAIN_ROW), (u, opts) => {
+      if (u.includes('/sync') && isPost(opts)) return res({ ok: true, run_id: 'sync-forged' })
+      if (u.includes('/run?id=sync-forged')) {
+        return res({
+          status: 'done',
+          exit_code: 1,
+          output: ['::step::0::Pull', 'real failure text', '::steperr::0::   '],
+          started: nowSec() - 5,
+        })
+      }
+      return null
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('Pull+Build')).toBeInTheDocument(), { timeout: 4000 })
+    await startSync()
+    await waitFor(() => expect(screen.getByText('Pull+Build failed')).toBeInTheDocument(), { timeout: 8000 })
+    expect(screen.getByTestId('sync-error').textContent).toContain('real failure text')
+  }, 20000)
+
   it('declares the run lost when the registry 404s mid-poll instead of freezing the bar', async () => {
     installFetch(fleetOf(MAIN_ROW), (u, opts) => {
       if (u.includes('/sync') && isPost(opts)) return res({ ok: true, run_id: 'sync-gone' })
@@ -753,7 +832,7 @@ describe('DevFleetPage provision failures', () => {
     await waitFor(() => expect(screen.getByText('Provision failed')).toBeInTheDocument())
     // Both the toast and the stepper's last-output line carry the reason.
     expect(screen.getAllByText('Provision failed to start').length).toBeGreaterThan(0)
-    fireEvent.click(screen.getByLabelText('Dismiss provision status'))
+    fireEvent.click(within(screen.getByTestId('provision-error-wt-new')).getByLabelText('Dismiss'))
     await waitFor(() => expect(screen.queryByText('Provision failed')).toBeNull())
   })
 
@@ -767,7 +846,7 @@ describe('DevFleetPage provision failures', () => {
     fireEvent.click(screen.getByText('Provision'))
     await waitFor(() => expect(screen.getByText('Provision failed')).toBeInTheDocument())
     expect(screen.getAllByText('provision endpoint down').length).toBeGreaterThan(0)
-    fireEvent.click(screen.getByLabelText('Dismiss provision status'))
+    fireEvent.click(within(screen.getByTestId('provision-error-wt-new')).getByLabelText('Dismiss'))
   })
 
   it('rides out unreadable polls and treats a non-running status as terminal', async () => {
@@ -1224,7 +1303,7 @@ describe('DevFleetPage gateway restart handshake', () => {
     const banner = await waitFor(() => screen.getByTestId('gateway-restart-error'))
     expect(banner).toHaveTextContent('systemctl: unit not loaded')
     // Dismissing the banner is the user's job, so it must survive until then.
-    fireEvent.click(within(banner).getByRole('button'))
+    fireEvent.click(within(banner).getByRole('button', { name: 'Dismiss' }))
     await waitFor(() => expect(screen.queryByTestId('gateway-restart-error')).toBeNull())
   }, 15000)
 

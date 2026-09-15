@@ -5,9 +5,9 @@ until this install has started at least ``NEW_USER_SESSION_THRESHOLD`` genuine
 user chats (``SlotOrigin.USER``). Counting only user-origin sessions whose
 creation path opts in via ``count_user_session`` -- not cron, app, system,
 restored-untagged slots, or agent-driven session-control creates (which mint
-USER-origin slots for privacy semantics but are not a person chatting, #6139)
--- keeps the gate a measure of real human engagement, matching the only
-surface the survey ever shows on.
+USER-origin slots for privacy semantics but are not a person chatting) -- keeps
+the gate a measure of real human engagement, matching the only surface the
+survey ever shows on.
 
 The count is persisted next to the other dashboard state files via
 ``config_dir()`` so it honors ``KIROCREW_HOME`` and survives restarts. The
@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 _FILE = "session_pulse_sessions.json"
 _KEY = "user_sessions"
 
-# Serializes the counter's read-modify-write. Needed because the increment is
-# scheduled into an executor (see `increment_user_session_count_off_loop`), so it
-# is no longer serialized by the event loop the way an inline call was.
+# Serializes the counter's read-modify-write. The increment is scheduled into an
+# executor (see `increment_user_session_count_off_loop`), so the event loop does
+# not serialize it for us.
 _WRITE_LOCK = threading.Lock()
 
 # Minimum genuine user-initiated chats before the survey may appear. A person
@@ -118,11 +118,11 @@ def increment_user_session_count_off_loop() -> None:
     increment is already best-effort (it swallows its own I/O errors and returns
     the pre-increment value), so a slot birth has no reason to wait for it.
 
-    Deliberately fixed HERE rather than by making the caller async: the
-    allocation inside ``get_or_create_slot`` must not suspend part-way, because
-    callers depend on the slot being fully configured before anything else can
-    observe it. Offloading the allocation would reintroduce exactly that window;
-    offloading the I/O does not.
+    Offloaded HERE rather than by making the caller async: the allocation inside
+    ``get_or_create_slot`` must not suspend part-way, because callers depend on
+    the slot being fully configured before anything else can observe it.
+    Offloading the allocation would open exactly that window; offloading the I/O
+    does not.
 
     Fire-and-forget by design: the future is not awaited, which is safe only
     because the callee cannot raise. A count lost to shutdown racing the executor

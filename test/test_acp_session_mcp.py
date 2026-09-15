@@ -9,6 +9,7 @@ registry pointer, Crew's own control plane).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
@@ -36,6 +37,9 @@ def agents_dir(tmp_path, monkeypatch):
     d = tmp_path / "agents"
     d.mkdir()
     monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", d)
+    # The global settings file is a second source of per-tool restrictions;
+    # these tests supply it (or leave it absent) rather than read the machine's.
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "settings-mcp.json")
     # Materialization would try to REBUILD the managed default from bundled
     # defaults; these tests supply the spec themselves.
     monkeypatch.setattr(session_mcp, "ensure_agent_materialized", lambda _a: True)
@@ -352,11 +356,129 @@ class TestMounting:
         # And without the checkout it is silently lost -- the defect, pinned.
         assert session_mcp.session_mcp_deny_rules("kirocrew") == []
 
+    def test_disabled_tools_is_the_structured_form_and_exempts_no_server(self, agents_dir):
+        """``(server, tool)`` pairs, the control plane included.
+
+        The deny-rule spelling is lossy (``mcp__a__b__c`` splits on the LAST
+        ``__``), so a consumer comparing against a two-field identity must take the
+        pairs. And this set answers "what did the user switch off", which is as true
+        of ``kirocrew-core`` as of any server -- HOW a backend honours it is the
+        caller's question (the restricted set exempts the control plane from
+        withholding; this does not exempt it from anything).
+        """
+        _write_spec(
+            agents_dir,
+            servers={
+                "kirocrew-core": {"command": "/x", "disabledTools": ["spawn_run"]},
+                "third": {"command": "/y", "disabledTools": ["a__b", 3, ""]},
+                "clean": {"command": "/z"},
+            },
+            tools=["@kirocrew-core", "@third", "@clean"],
+        )
+        pairs = session_mcp.session_mcp_disabled_tools("kirocrew")
+        assert pairs == frozenset({("kirocrew-core", "spawn_run"), ("third", "a__b")})
+        # The rule spelling is derived from the same pairs, so the two cannot drift.
+        assert session_mcp.session_mcp_deny_rules("kirocrew") == [
+            "mcp__kirocrew-core__spawn_run",
+            "mcp__third__a__b",
+        ]
+        assert session_mcp.session_mcp_disabled_tools(None) == frozenset()
+
+    def test_disabled_tools_written_by_the_dashboard_to_the_global_file_count(
+        self, tmp_path, agents_dir
+    ):
+        """The dashboard's tool-off action writes ``disabledTools`` to the GLOBAL
+        ``settings/mcp.json`` and nowhere else, and the spec rebuild never copies a
+        global entry onto a managed server -- so a restriction on ``kirocrew-core``
+        written the ordinary way lives only there. kiro-cli reads both; so must this,
+        or the one path a user actually takes is the one that is missed."""
+        _write_spec(
+            agents_dir,
+            servers={"kirocrew-core": {"command": "/x"}, "third": {"command": "/y"}},
+            tools=["@kirocrew-core", "@third"],
+        )
+        (tmp_path / "settings-mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "kirocrew-core": {"disabledTools": ["spawn_run"]},
+                        "third": {"command": "/y", "disabledTools": ["a"]},
+                        "elsewhere": {"disabledTools": ["b"]},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        pairs = session_mcp.session_mcp_disabled_tools("kirocrew")
+        assert {("kirocrew-core", "spawn_run"), ("third", "a"), ("elsewhere", "b")} <= pairs
+        # The withhold set is derived from the SAME pairs: a third-party server the
+        # dashboard narrowed globally is withheld, the control plane never is, and a
+        # server named only in the global file is a harmless name nothing mounts.
+        restricted = session_mcp.session_mcp_projection("kirocrew").restricted
+        assert "third" in restricted
+        assert "kirocrew-core" not in restricted
+        assert "elsewhere" in restricted
+        # Both sources reach claude's deny rules too.
+        assert "mcp__kirocrew-core__spawn_run" in session_mcp.session_mcp_deny_rules("kirocrew")
+        # A malformed or missing global file switches nothing off from that source.
+        (tmp_path / "settings-mcp.json").write_text("[not a dict]", encoding="utf-8")
+        assert session_mcp.session_mcp_disabled_tools("kirocrew") == frozenset()
+
+    def test_an_explicit_none_spec_is_honoured_not_re_read(self, agents_dir, monkeypatch):
+        """``None`` means "there is no spec"; only "not supplied" reads.
+
+        The projection reads once and threads the ANSWER. If ``None`` also meant
+        "read it", a read that came back empty would have every helper read again,
+        and a spec appearing in between would be translated by one helper while
+        the allowlist -- computed from the ``None`` -- granted everything.
+        """
+        _write_spec(
+            agents_dir, servers={"srv": {"command": "/s", "disabledTools": ["t"]}}, tools=["@srv"]
+        )
+        reads: list[str] = []
+        real = session_mcp._agent_spec_and_snapshot_for
+
+        def counting(agent, work_dir=None):
+            reads.append(agent)
+            return real(agent, work_dir)
+
+        monkeypatch.setattr(session_mcp, "_agent_spec_and_snapshot_for", counting)
+        # Explicit None: no spec, nothing read, control plane only, nothing switched off.
+        names = [e["name"] for e in session_mcp.session_mcp_servers("kirocrew", spec=None)]
+        assert names == ["kirocrew-core", "kirocrew-cron"]
+        assert session_mcp.session_mcp_restricted_servers(frozenset()) == frozenset()
+        assert session_mcp.session_mcp_disabled_tools("kirocrew", spec=None) == frozenset()
+        assert reads == []
+        # Not supplied: read, once per call, and the spec's own answer applies.
+        assert "srv" in [e["name"] for e in session_mcp.session_mcp_servers("kirocrew")]
+        assert reads == ["kirocrew"]
+
+    def test_the_projection_threads_the_answer_even_when_it_is_no_spec(
+        self, agents_dir, monkeypatch
+    ):
+        """The window itself: the first read finds nothing, a spec appears, and no
+        helper may see it. Every part of the projection reflects the SAME read."""
+        spec_path = agents_dir / "kirocrew.json"
+        _write_spec(agents_dir, servers={"late": {"command": "/l"}}, tools=["@late"])
+        real = session_mcp._agent_spec_and_snapshot_for
+        calls = {"n": 0}
+
+        def flapping(agent, work_dir=None):
+            calls["n"] += 1
+            return (None, None) if calls["n"] == 1 else real(agent, work_dir)
+
+        monkeypatch.setattr(session_mcp, "_agent_spec_and_snapshot_for", flapping)
+        projection = session_mcp.session_mcp_projection("kirocrew")
+        assert calls["n"] == 1, "a helper read the spec behind the projection's back"
+        assert "late" not in [e["name"] for e in projection.servers]
+        assert projection.allowlist.applies is False
+        assert spec_path.exists()
+
     def test_a_stubbed_server_yields_to_its_broker_stub(self, agents_dir):
         """The caller appends the stub under the SAME name; two would collide.
 
         Either the raw entry shadows the stub and the session bypasses the broker,
-        or both register and every pooled backend runs twice (#927).
+        or both register and every pooled backend runs twice.
         """
         _write_spec(
             agents_dir,
@@ -447,7 +569,7 @@ class TestControlPlane:
 class TestClientSeam:
     """The client's projection of the agent spec into a session ``mcpServers`` array.
 
-    These target ``_mirror_session_mcp_servers`` -- the synchronous accessor that
+    These target ``_session_mcp_servers`` -- the synchronous accessor that
     owns the cached mirror projection -- and not the async
     ``_session_mcp_servers``, which owns the COMPLETE array. The complete array is
     ``mirror + Crew's managed control plane + pooled gateway stubs``, and its
@@ -476,12 +598,65 @@ class TestClientSeam:
         client = AcpClient(work_dir=tmp_path)
         # kiro-cli receives the same servers via --agent; a duplicate here would
         # shadow the spec's own entries.
-        assert client._mirror_session_mcp_servers() == []
+        assert client._session_mcp_servers() == []
 
     def test_claude_backend_translates_the_spec(self, tmp_path, agents_dir):
         _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
         client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
-        assert "foo" in _by_name(client._mirror_session_mcp_servers())
+        assert "foo" in _by_name(client._session_mcp_servers())
+
+    @pytest.mark.parametrize("private", [False, True])
+    def test_private_claude_keeps_the_original_server_in_its_projection(
+        self,
+        tmp_path,
+        agents_dir,
+        private,
+    ):
+        from kiro_crew.mcp_gateway.rewriter import _WRAPPER_MARKER
+
+        _write_spec(
+            agents_dir,
+            servers={"foo": {"command": "/bin/foo", "args": ["serve"], "env": {"K": "V"}}},
+            tools=["@foo"],
+        )
+        overlay = tmp_path / "broker-overlay"
+        overlay.mkdir()
+        (overlay / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "name": "kirocrew",
+                    "mcpServers": {
+                        "foo": {
+                            _WRAPPER_MARKER: True,
+                            "command": "broker-stub",
+                            "args": [],
+                            "env": {},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        client = self._seeded(
+            tmp_path,
+            agent="kirocrew",
+            acp_backend=ACP_BACKEND_CLAUDE,
+            private_memory=private,
+            mcp_gateway_overlay=overlay,
+        )
+        original = _by_name(client._session_mcp_servers()).get("foo")
+        # Present either way: privately as the spec's own entry, pooled as the
+        # broker stub the MIRROR appended (the spec's `tools` references foo, so
+        # the allowlist grants the stub).
+        assert original is not None
+        if private:
+            assert original["command"] == "/bin/foo"
+            assert original["args"] == ["serve"]
+            assert original["env"] == [{"name": "K", "value": "V"}]
+        else:
+            assert original["command"] == "broker-stub"
+        # The shared append is inert for claude -- the mirror placed the stubs.
+        assert client._pooled_mcp_servers() == []
 
     def test_neither_gate_is_an_identity_check(self, tmp_path, agents_dir, monkeypatch):
         """Two gates decide the seam, and neither reads the harness's identity.
@@ -495,7 +670,7 @@ class TestClientSeam:
         """
         _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
         client = self._seeded(tmp_path, agent="kirocrew")
-        assert client._mirror_session_mcp_servers() == []
+        assert client._session_mcp_servers() == []
 
         # Set widened, no mirror registered -> still nothing. Fail-closed.
         monkeypatch.setattr(
@@ -503,13 +678,13 @@ class TestClientSeam:
         )
         client._reset_state()
         client._write_claude_local_settings()  # reset ends the session's ownership
-        assert client._mirror_session_mcp_servers() == []
+        assert client._session_mcp_servers() == []
 
         # Register a mirror for that backend too, and the array populates.
         monkeypatch.setitem(mirrors_registry.MIRRORS, client.backend, ClaudeCodeMirror)
         client._reset_state()
         client._write_claude_local_settings()
-        assert "foo" in _by_name(client._mirror_session_mcp_servers())
+        assert "foo" in _by_name(client._session_mcp_servers())
 
     def test_the_seam_hands_down_the_pooled_stub_names(self, tmp_path, agents_dir, monkeypatch):
         # The client owns the overlay, so it is the only layer that can answer
@@ -523,7 +698,7 @@ class TestClientSeam:
             client_mod, "injection_server_names", lambda _o, _a: frozenset({"pooled"})
         )
         client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
-        names = _by_name(client._mirror_session_mcp_servers())
+        names = _by_name(client._session_mcp_servers())
         assert "pooled" not in names
         assert "direct" in names
 
@@ -540,7 +715,7 @@ class TestClientSeam:
 
         monkeypatch.setattr(client_mod, "injection_server_names", _boom)
         client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
-        assert "foo" in _by_name(client._mirror_session_mcp_servers())
+        assert "foo" in _by_name(client._session_mcp_servers())
 
     def test_the_shared_call_site_reads_no_disk_for_kiro(self, tmp_path, agents_dir, monkeypatch):
         """harness-parity H13: the kiro construction path gains nothing.
@@ -554,10 +729,10 @@ class TestClientSeam:
         def _never(*_a, **_kw):
             raise AssertionError("the kiro path must not translate a spec")
 
-        monkeypatch.setattr(claude_mirror, "session_mcp_servers", _never)
+        monkeypatch.setattr(claude_mirror, "session_mcp_projection", _never)
         monkeypatch.setattr(client_mod, "injection_server_names", _never)
         client = AcpClient(work_dir=tmp_path, agent="kirocrew")
-        result = client._mirror_session_mcp_servers()
+        result = client._session_mcp_servers()
         assert result == []
         # This accessor stays synchronous: the composed owner awaits an executor
         # hop, and a coroutine HERE would push that hop onto the shared
@@ -576,21 +751,21 @@ class TestClientSeam:
         """
         _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
         calls: list[int] = []
-        real = session_mcp.session_mcp_servers
+        real = session_mcp.session_mcp_projection
 
         def _counted(*a, **kw):
             calls.append(1)
             return real(*a, **kw)
 
-        monkeypatch.setattr(claude_mirror, "session_mcp_servers", _counted)
+        monkeypatch.setattr(claude_mirror, "session_mcp_projection", _counted)
         client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
-        assert "foo" in _by_name(client._mirror_session_mcp_servers())
-        assert "foo" in _by_name(client._mirror_session_mcp_servers())
+        assert "foo" in _by_name(client._session_mcp_servers())
+        assert "foo" in _by_name(client._session_mcp_servers())
         assert len(calls) == 1
         client._reset_state()
         assert client._session_mcp_cache is None
         client._write_claude_local_settings()  # the next spawn re-seeds before resolving
-        assert "foo" in _by_name(client._mirror_session_mcp_servers())
+        assert "foo" in _by_name(client._session_mcp_servers())
         assert len(calls) == 2
 
     def test_no_tools_reach_a_session_whose_permissions_crew_does_not_own(
@@ -621,7 +796,7 @@ class TestClientSeam:
         # No partial delivery -- the whole array is withheld, which is exactly how
         # a claude session behaved before this array existed. Nothing regresses;
         # it simply does not gain a tool Crew could not take back.
-        assert client._mirror_session_mcp_servers() == []
+        assert client._session_mcp_servers() == []
         assert client._write_claude_local_settings() is None
         assert path.read_text() == json.dumps({"permissions": {"allow": ["mcp__foo__write"]}})
 
@@ -630,9 +805,144 @@ class TestClientSeam:
         # cache itself would let one session/load mutation reach the next.
         _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
         client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
-        first = client._mirror_session_mcp_servers()
+        first = client._session_mcp_servers()
         first.clear()
-        assert "foo" in _by_name(client._mirror_session_mcp_servers())
+        assert "foo" in _by_name(client._session_mcp_servers())
+
+    def test_a_pooled_stub_the_spec_never_references_does_not_mount(self, tmp_path, agents_dir):
+        """The `tools` allowlist covers the pooled half of the array too.
+
+        The gateway rewriter writes each agent's overlay from the GLOBAL settings
+        file as well as the agent's own spec, so the overlay can carry a stub for
+        a server this agent's ``tools`` never references -- and a stub is that
+        server. Before the mirror placed the stubs, the shared append mounted it
+        anyway, so a claude session received a pooled server the same spec would
+        NOT mount on kiro-cli or codex. The unreferenced server is the widening
+        direction, and this is the parity this test pins.
+        """
+        _write_spec(agents_dir, servers={"direct": {"command": "/bin/direct"}}, tools=["@direct"])
+        client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
+        client._pooled_broker_stubs = lambda: [  # type: ignore[method-assign]
+            {"name": "unreferenced", "command": "/stub", "args": [], "env": [], "type": "stdio"},
+        ]
+        names = set(_by_name(client._session_mcp_servers()))
+        assert "direct" in names
+        assert "unreferenced" not in names
+        # And the shared append is inert for claude, so nothing re-adds it later.
+        assert client._pooled_mcp_servers() == []
+
+    def test_the_shared_append_still_pools_for_kiro(self, tmp_path):
+        """The mirror-less backend keeps the shared append.
+
+        kiro-cli reads the agent spec itself via ``--agent``, so the injected
+        array is the ONLY channel its broker stubs arrive on -- the injection
+        outranking the same-named spec entry is what pools them. Making the
+        append inert for every MIRRORED backend must not take kiro's away.
+        """
+        client = AcpClient(work_dir=tmp_path, agent="kirocrew")
+        stub = {"name": "pooled", "command": "/stub", "args": [], "env": [], "type": "stdio"}
+        client._pooled_broker_stubs = lambda: [dict(stub)]  # type: ignore[method-assign]
+        assert client._pooled_mcp_servers() == [stub]
+
+
+class TestPooledStubsOnTheClaudeMirror:
+    """The claude mirror places the pooled broker stubs itself (codex parity).
+
+    One withhold rule must cover both halves of the array: a stub carries the
+    SAME name as the agent-spec entry it rewrites, so a stub appended by the
+    client after the mirror's rules ran would re-add -- unfiltered -- exactly what
+    those rules withheld.
+    """
+
+    def test_the_mirror_places_the_pooled_stubs_itself(self, agents_dir):
+        _write_spec(agents_dir, servers={"granted": {"command": "/bin/g"}}, tools=["@granted"])
+        stubs = [{"name": "granted", "command": "/stub", "args": [], "env": [], "type": "stdio"}]
+        mirror = ClaudeCodeMirror()
+        projection = mirror.session_projection(
+            "kirocrew",
+            stub_server_names=("granted",),
+            stub_elements=stubs,
+            permission_surface_owned=True,
+        )
+        by_name = _by_name(projection.params["mcpServers"])
+        assert by_name["granted"]["command"] == "/stub"
+        # The wire face IS the projection's params, pinned so the two cannot drift.
+        assert (
+            mirror.session_params(
+                "kirocrew",
+                stub_server_names=("granted",),
+                stub_elements=stubs,
+                permission_surface_owned=True,
+            )
+            == projection.params
+        )
+
+    def test_a_pooled_stub_is_held_to_the_same_tools_allowlist(self, agents_dir):
+        """Same rule, same parse, as codex: `tools` gates the stubs too.
+
+        ``*`` still grants all, and a spec with no ``tools`` list grants nothing.
+        """
+        stubs = [
+            {"name": "granted", "command": "/stub", "args": [], "env": [], "type": "stdio"},
+            {"name": "unreferenced", "command": "/stub", "args": [], "env": [], "type": "stdio"},
+        ]
+        mirror = ClaudeCodeMirror()
+
+        def _names(tools):
+            _write_spec(agents_dir, servers={"granted": {"command": "/bin/g"}}, tools=tools)
+            projection = mirror.session_projection(
+                "kirocrew",
+                stub_server_names=("granted", "unreferenced"),
+                stub_elements=stubs,
+                permission_surface_owned=True,
+            )
+            return {e["name"] for e in projection.params["mcpServers"]}
+
+        assert "granted" in _names(["@granted"])
+        assert "unreferenced" not in _names(["@granted"])
+        assert {"granted", "unreferenced"} <= _names(["*"])
+        assert _names(None) & {"granted", "unreferenced"} == set()
+
+    def test_an_unowned_permission_surface_withholds_the_stubs_too(self, agents_dir):
+        """The fail-closed rule covers both halves of the array.
+
+        A stub is a WORKING server (``spawn_run``, ``cron_add``, every pooled
+        backend), so appending it after the translated half was withheld would
+        hand an ungoverned permission surface exactly the tools the withhold
+        exists to keep off it.
+        """
+        _write_spec(agents_dir, servers={"granted": {"command": "/bin/g"}}, tools=["@granted"])
+        stubs = [{"name": "granted", "command": "/stub", "args": [], "env": [], "type": "stdio"}]
+        projection = ClaudeCodeMirror().session_projection(
+            "kirocrew",
+            stub_server_names=("granted",),
+            stub_elements=stubs,
+            permission_surface_owned=False,
+        )
+        assert projection.params == {"mcpServers": []}
+
+    def test_a_narrowed_servers_stub_stays_mounted_unlike_codex(self, agents_dir):
+        """Claude honours `disabledTools` through `permissions.deny`, not withholding.
+
+        The deny rules in ``settings.local.json`` are keyed
+        ``mcp__<server>__<tool>`` and the stub registers under the same server
+        name, so the narrowing still applies to it. Withholding the stub, as
+        codex must (it has no deny channel), would drop a server this backend
+        can narrow correctly.
+        """
+        _write_spec(
+            agents_dir,
+            servers={"narrowed": {"command": "/bin/n", "disabledTools": ["dangerous"]}},
+            tools=["@narrowed"],
+        )
+        stubs = [{"name": "narrowed", "command": "/stub", "args": [], "env": [], "type": "stdio"}]
+        projection = ClaudeCodeMirror().session_projection(
+            "kirocrew",
+            stub_server_names=("narrowed",),
+            stub_elements=stubs,
+            permission_surface_owned=True,
+        )
+        assert "narrowed" in {e["name"] for e in projection.params["mcpServers"]}
 
 
 class TestLocalSettingsSeed:
@@ -640,33 +950,108 @@ class TestLocalSettingsSeed:
 
     The governing rule is ownership, and ownership is NOT the path -- a path under
     a checked-out repository is not Crew's to claim. It is having CREATED the file
-    in this session AND the bytes on disk still being the ones Crew wrote. Both
-    hold: Crew may overwrite (which is what lets a model-substitution re-seed
-    change the resolved model) and reset removes it. Either fails: Crew leaves the
-    path entirely alone, and reset removes nothing. Absent: Crew creates it with
-    ``O_EXCL``.
+    AND the bytes on disk still being the ones Crew wrote. Both hold: Crew may
+    overwrite (which is what lets a model-substitution re-seed change the resolved
+    model) and reset removes it. Either fails: Crew leaves the path entirely alone,
+    and reset removes nothing. Absent: Crew creates it with ``O_EXCL``.
 
     Nothing here reads, merges into, rewrites or deletes a file Crew did not
     author, which is what keeps a seam that writes into a checked-out project from
-    needing a snapshot, a cross-session ownership registry, or a restore write on
-    teardown.
+    needing a snapshot or a restore write on teardown.
+
+    The CROSS-SESSION half of the same rule -- recognizing a seed a killed session
+    left behind, by the digest recorded in
+    :mod:`kiro_crew.acp.seed_provenance` -- lives in
+    ``test_acp_seed_provenance.py``.
     """
 
     def _client(self, tmp_path, **kw):
         return AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE, **kw)
 
-    def test_seed_writes_the_model_allowlist(self, tmp_path):
+    @staticmethod
+    def _teardown(client):
+        """Tear a client down the way every real caller does.
+
+        Removing the seed is a DISK operation -- a durable revoke of the provenance
+        grant, then the unlink -- so it lives in the async
+        ``_discard_claude_settings_seed`` and reaches the filesystem through
+        ``asyncio.to_thread``. ``_reset_state`` stays synchronous and keeps only the
+        in-memory claim release, so calling it alone deliberately leaves the file
+        behind.
+        """
+        asyncio.run(client._discard_claude_settings_seed())
+        client._reset_state()
+
+    @staticmethod
+    def _advertised(monkeypatch, ids=("global.anthropic.claude-opus-5[1m]",)):
+        """Warm the advertised-model cache, the ONLY source the seed reads.
+
+        The seed writes ``availableModels``/``model`` only once the backend has
+        actually advertised a list; on a cold cache it deliberately writes neither
+        (see ``test_seed_omits_both_model_keys_on_a_cold_cache``). Tests that assert
+        on those keys therefore have to stand in for a captured ``session/new``.
+        """
         from kiro_crew import model_registry
 
+        monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {"claude_code": list(ids)})
+
+    def test_seed_writes_the_model_allowlist(self, tmp_path, monkeypatch):
+        from kiro_crew import model_registry
+
+        self._advertised(monkeypatch)
         client = self._client(tmp_path)
         client._write_claude_local_settings()
         data = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
         # Without the allowlist the adapter can collapse a versioned [1m] id back
         # to the 200K window. The seed writes the window-deduped list (a 200K base
         # id is dropped when its 1M sibling is present), so it can differ from the
-        # raw registry list — compare against seed_available_models, the deduped
+        # raw advertised list — compare against seed_available_models, the deduped
         # source the seed actually uses.
         assert data["availableModels"] == model_registry.seed_available_models("claude_code")
+
+    def test_seed_omits_both_model_keys_on_a_cold_cache(self, tmp_path, monkeypatch):
+        """A cold cache seeds NO model keys — the fix, not a degradation.
+
+        The adapter merges ``availableModels`` union+dedup across settings sources,
+        so seeding a list Crew guessed (the old static-registry fallback) REPLACED
+        the adapter's own provider-derived list with a staler one: a model the
+        registry had not caught up on contributed no ``[1m]`` id, so the pick
+        resolved to 200K. And a ``model`` key naming nothing in the list shipped
+        beside it is the same failure by another route. Writing neither leaves the
+        adapter on its own list, which already carries the versioned ids.
+        """
+        from kiro_crew import model_registry
+
+        monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {})
+        client = self._client(tmp_path, model="claude-opus-5", permission_mode="default")
+        client._write_claude_local_settings()
+        data = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
+        assert "availableModels" not in data
+        assert "model" not in data
+        # The permission surface is NOT deferred: it has to be on disk before
+        # session/new, which is the whole reason the seed runs at spawn.
+        assert data["permissions"]["defaultMode"] == "default"
+
+    def test_seed_never_writes_a_model_without_the_list_it_must_match(self, tmp_path, monkeypatch):
+        # The exact shape observed in the field: "model": "claude-opus-5" beside an
+        # allowlist that contains no Opus 5 entry, which resolves to 200K. The two
+        # keys are now written together or not at all.
+        from kiro_crew import model_registry
+
+        monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {})
+        client = self._client(tmp_path, model="claude-opus-5")
+        client._write_claude_local_settings()
+        path = tmp_path / ".claude" / "settings.local.json"
+        assert "model" not in json.loads(path.read_text())
+
+        # Same client, cache now warm (its own session/new was captured): the
+        # re-seed writes both, and the model folds onto the advertised spelling.
+        self._advertised(monkeypatch)
+        client._model = model_registry.resolve_wire_model_id("claude-opus-5", "claude_code")
+        client._write_claude_local_settings()
+        data = json.loads(path.read_text())
+        assert data["model"] == "global.anthropic.claude-opus-5[1m]"
+        assert data["model"] in data["availableModels"]
 
     def test_no_permission_mode_leaves_the_adapter_default(self, tmp_path):
         client = self._client(tmp_path)
@@ -680,7 +1065,8 @@ class TestLocalSettingsSeed:
         data = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
         assert data["permissions"]["defaultMode"] == "default"
 
-    def test_resolved_model_written_but_auto_omitted(self, tmp_path):
+    def test_resolved_model_written_but_auto_omitted(self, tmp_path, monkeypatch):
+        self._advertised(monkeypatch, ["claude-sonnet-4-5"])
         auto = self._client(tmp_path)
         auto._write_claude_local_settings()
         path = tmp_path / ".claude" / "settings.local.json"
@@ -711,7 +1097,7 @@ class TestLocalSettingsSeed:
         client._write_claude_local_settings()
         path = tmp_path / ".claude" / "settings.local.json"
         assert path.exists()
-        client._reset_state()
+        self._teardown(client)
         # A permission mode must not outlive its session, and an inherited
         # bypassPermissions must not survive a crash.
         assert not path.exists()
@@ -734,14 +1120,14 @@ class TestLocalSettingsSeed:
         assert path.read_text() == original
         assert client._claude_settings_authored is False
 
-        client._reset_state()
+        self._teardown(client)
         assert path.read_text() == original
 
     def test_an_inherited_bypass_mode_is_left_to_its_owner(self, tmp_path):
         """The disclosed cost of not touching a file Crew did not author.
 
         ``bypassPermissions`` takes every tool call out of the host gate, and Crew
-        no longer strips it -- stripping meant reading and rewriting a path a
+        does not strip it -- stripping meant reading and rewriting a path a
         checked-out repository controls, which is what produced the snapshot and
         restore machinery. The call still reaches Crew's gate unless the user's
         own file pre-approves it, the same boundary the inherited-``~/.claude``
@@ -830,19 +1216,19 @@ class TestLocalSettingsSeed:
         monkeypatch.setattr(client_mod.os, "open", boom)
         with pytest.raises(OSError):
             client._write_claude_local_settings()
-        # Nothing was authored, so reset has nothing to undo.
+        # Nothing was authored, so teardown has nothing to undo.
         assert client._claude_settings_authored is False
-        client._reset_state()
+        self._teardown(client)
 
     def test_reset_without_a_seed_removes_nothing(self, tmp_path):
         path = tmp_path / ".claude" / "settings.local.json"
         path.parent.mkdir(parents=True)
         path.write_text("{}", encoding="utf-8")
         client = self._client(tmp_path)
-        client._reset_state()
+        self._teardown(client)
         assert path.exists()
 
-    def test_a_reseed_overwrites_the_file_this_session_created(self, tmp_path):
+    def test_a_reseed_overwrites_the_file_this_session_created(self, tmp_path, monkeypatch):
         """The model-substitution retry has to be able to change what it wrote.
 
         ``_new_session_following_substitution`` adopts the gateway-served model and
@@ -851,6 +1237,7 @@ class TestLocalSettingsSeed:
         send byte-identical ``session/new`` params, take the same substitution
         advisory, and fail the session with "even after adopting substitute model".
         """
+        self._advertised(monkeypatch, ["claude-sonnet-4-5"])
         client = self._client(tmp_path)
         client._write_claude_local_settings()
         path = tmp_path / ".claude" / "settings.local.json"
@@ -862,7 +1249,7 @@ class TestLocalSettingsSeed:
         assert json.loads(path.read_text())["model"] == "claude-sonnet-4-5"
         assert client._claude_settings_authored is True
         # And it is still Crew's to remove.
-        client._reset_state()
+        self._teardown(client)
         assert not path.exists()
 
     def test_a_reseed_leaves_a_file_the_user_replaced_after_the_create(self, tmp_path):

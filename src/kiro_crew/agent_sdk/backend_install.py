@@ -9,6 +9,18 @@ nothing on the page ever said which component was absent. This module answers
 the third, machine-local question, and is the only one whose answer can change
 without a config write or a new build.
 
+**Installed is not signed in, and this module deliberately probes no credential.**
+Every verdict here is about a FILE resolving; none of it says a harness can
+authenticate. That gap is real -- an installed-and-signed-out harness still dies
+at ``session/new`` -- but the answer does not belong here: reading another
+harness's token is what the credential floor exists to forbid, and a probe that
+did it would be the one reader the floor cannot fence. The sign-in answer is
+declared per harness in :mod:`kiro_crew.agent_sdk.host_auth` and reaches the
+operator as a remedy string the doctor row and the backend panel render
+verbatim. So a caller that wants "can this harness actually run" reads a
+declaration beside this state, and nothing here grows a credential probe or a
+field claiming one ran.
+
 **The resolving itself is the driver's, not this module's.** Everything that has
 to reach the harness -- the binary resolves, the read of the spawn's own
 process-lifetime cache, the remedy's package name -- lives in
@@ -31,10 +43,12 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
 
-from kiro_crew.acp_backends import (
+from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_KNOWN,
     POLICY_ID_BY_BACKEND,
 )
@@ -62,6 +76,14 @@ COMPONENT_CLAUDE_ACP_ADAPTER = "claude-agent-acp"
 #: separate component because the adapter's SDK does NOT search PATH for it, so
 #: having one without the other is a real, distinguishable half-install.
 COMPONENT_CLAUDE_CODE_CLI = "claude"
+
+#: The codex-acp adapter. ONE component, not two: the adapter ships its own
+#: compatible Codex binary, so there is no second executable Crew resolves.
+COMPONENT_CODEX_ACP_ADAPTER = "codex-acp"
+
+#: The OpenCode binary. ONE component, and here that is not a simplification: the
+#: harness serves ACP itself, so there is no adapter beside it to be half-installed.
+COMPONENT_OPENCODE = "opencode"
 
 #: How long a verdict is reused. The Claude driver shells out to mise and globs
 #: the filesystem, and the dashboard polls this endpoint, so an uncached probe
@@ -193,10 +215,71 @@ def _probe_claude() -> BackendInstallState:
 #: Backend id → its probe. A registry rather than an ``if`` chain so an id with
 #: no probe is a lookup miss that degrades to ``UNKNOWN``, instead of falling
 #: through to whichever branch happened to be last.
+def _probe_opencode() -> BackendInstallState:
+    """The OpenCode backend needs one component, and names the installer for it.
+
+    Unlike the two Node adapters there is no second thing to resolve: the binary
+    that would be missing is the same binary that serves ACP. So an absent verdict
+    names one component and one command, and there is no half-installed state to
+    distinguish.
+
+    ``restart_required`` is read from the spawn path's own cache, like the
+    adapters': the binary resolves NOW, but this process already cached its absence,
+    so a session started right now still fails until the gateway restarts.
+    """
+    policy_id = _policy_id(ACP_BACKEND_OPENCODE)
+    if acp_driver.opencode_resolves():
+        return BackendInstallState(
+            ACP_BACKEND_OPENCODE,
+            policy_id,
+            INSTALLED,
+            restart_required=acp_driver.opencode_cached_negative(),
+        )
+    return BackendInstallState(
+        ACP_BACKEND_OPENCODE,
+        policy_id,
+        MISSING,
+        (COMPONENT_OPENCODE,),
+        acp_driver.opencode_install_command(),
+    )
+
+
+def _probe_codex() -> BackendInstallState:
+    """The Codex backend needs one component, and names it when it is absent.
+
+    Without this probe the switch could render with nothing to say about a session
+    that failed to start -- which was the stated reason the backend stayed out of
+    ``BASELINE_SELECTABLE_BACKENDS``. The install command comes from the same
+    constant the resolution ladder searches for, so the advice cannot drift from
+    what would actually satisfy it.
+
+    ``restart_required`` mirrors the claude probe: when the adapter resolves now
+    but the running gateway cached a negative, the honest answer is "installed,
+    restart to use it" rather than a promise the next spawn breaks.
+    """
+    policy_id = _policy_id(ACP_BACKEND_CODEX)
+    if acp_driver.codex_adapter_resolves():
+        return BackendInstallState(
+            ACP_BACKEND_CODEX,
+            policy_id,
+            INSTALLED,
+            restart_required=acp_driver.codex_adapter_cached_negative(),
+        )
+    return BackendInstallState(
+        ACP_BACKEND_CODEX,
+        policy_id,
+        MISSING,
+        (COMPONENT_CODEX_ACP_ADAPTER,),
+        acp_driver.codex_adapter_install_command(),
+    )
+
+
 _PROBES: Dict[str, Callable[[], BackendInstallState]] = {
     ACP_BACKEND_KIRO: _probe_kiro,
     ACP_BACKEND_KAS: _probe_kas,
     ACP_BACKEND_CLAUDE: _probe_claude,
+    ACP_BACKEND_CODEX: _probe_codex,
+    ACP_BACKEND_OPENCODE: _probe_opencode,
 }
 
 

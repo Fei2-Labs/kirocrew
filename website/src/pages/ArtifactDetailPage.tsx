@@ -5,7 +5,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import WebAppArtifactCard from '../components/WebAppArtifactCard'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query'
-import { ArrowLeft, AlertTriangle, ArrowUp, Camera, Check, Copy, ExternalLink, Download, GitFork, Pencil, RefreshCw, X, AlertCircle, RotateCcw, Plus, Sparkles, MessageSquare, Monitor, Undo2, Upload, Star, Folder as FolderIcon } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Camera, Check, Copy, ExternalLink, Download, GitFork, Pencil, RefreshCw, X, AlertCircle, AlertTriangle, RotateCcw, Plus, Sparkles, MessageSquare, Monitor, Undo2, Upload, Star, Folder as FolderIcon } from 'lucide-react'
 import { copyToClipboard } from '../utils/clipboard'
 import { useTheme } from '../hooks/useTheme'
 import { type IframeSelection } from '../hooks/useCommentBridge'
@@ -33,6 +33,7 @@ import { findCoords, resolveSourcePos } from '../components/MarkdownPanel'
 // Artifact body renderers, extracted here so the chat side panel shares them.
 import { ArtifactBodyNative, ArtifactBodyIframe, ArtifactBodyImage, artifactAssetUrl, isEditableKind } from '../components/ArtifactBody'
 import { useArtifactPopouts } from '../hooks/useArtifactPopouts'
+import { useArtifactLiveReload } from '../hooks/useArtifactLiveReload'
 import { forwardToMain, type NavIntent } from '../utils/artifactPopout'
 import { writePrefill } from '../utils/navIntent'
 import { announceCommentsChanged, onCommentsChanged } from '../utils/artifactCommentsSync'
@@ -40,13 +41,16 @@ import { setArtifactEditing } from '../utils/artifactEditGuard'
 import { consumeJustCreatedBlank } from '../lib/blankHandoff'
 import { hasPendingArtifactWrite } from '../lib/artifactWrites'
 import { USER_SELECTABLE_KINDS } from '../lib/artifactKinds'
-import { PublishHub } from '../components/PublishHub'
+import { PublishHub, publishNoticeKey } from '../components/PublishHub'
 import type { Artifact, ArtifactEvent, ArtifactComment, CommentAnchor, ChatSlot } from '../types'
 
 import { i18nT } from '../i18n/t'
+import { errMessage } from '../utils/thunkError'
 import { fmtDateFields } from '../i18n/format'
 import ErrorNotice from '../components/ErrorNotice'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+
+/** Human text for a rejected query/mutation, so every ErrorNotice on this page reads the same shape. */
 /**
  * The artifact's active companion session: the bound slot for `slug`, or the most
  * recently active one if a race or a History-page resume left more than one.
@@ -99,7 +103,12 @@ function FolderChip({ artifact }: { artifact: Artifact }) {
           {current ? current.name : 'folder'}
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="min-w-[190px] max-h-[300px] overflow-y-auto">
+      {/* Intentional tighter cap composed via min() with the primitive's
+          available-height var: 300px keeps the folder picker compact while
+          preserving the viewport never-clip floor (a bare max-h would override
+          the primitive, since cn()'s tailwind-merge dedupes max-h-*). overflow
+          is left to the primitive. */}
+      <DropdownMenuContent align="start" className="min-w-[190px] max-h-[min(300px,var(--radix-dropdown-menu-content-available-height))]">
         <FolderPickerItems
           folders={folders}
           currentFolderId={artifact.folder_id || null}
@@ -467,6 +476,13 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     queryFn: () => api.artifactEvents(slug),
     enabled: !!slug,
   })
+  // File-backed artifacts: an agent rewriting the backing file never passes
+  // through a handler, so the artifact_update WS event does not fire for it.
+  // Watch the live pointer and refetch through the shared cache instead. Bound to
+  // detailQuery (the Live record) rather than the selected snapshot, so a
+  // historical view still tracks the pointer it will return to. This also covers
+  // /popout/artifact/:slug, which renders this page in its own window.
+  useArtifactLiveReload(slug, detailQuery.data?.source_path)
 
   const versions = versionsQuery.data?.versions || []
   const effectiveVersion = selectedVersion ?? detailQuery.data?.version ?? null
@@ -500,6 +516,30 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       // versions or events queries.
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err))
+    }
+  }, [artifact, queryClient, slug])
+
+  const [reprobing, setReprobing] = useState(false)
+  const [reprobeError, setReprobeError] = useState<string | null>(null)
+  /** Re-check the destination behind a publish notice, and clear it if it no longer holds. */
+  const reprobeNotice = useCallback(async () => {
+    if (!artifact) return
+    setReprobeError(null)
+    setReprobing(true)
+    try {
+      await api.reprobeArtifactNotice(artifact.slug)
+      // The record may now carry no notice at all, so the banner's own condition has
+      // to be re-evaluated from fresh data -- and the library indicators read the same
+      // fields, so they are invalidated too.
+      await queryClient.invalidateQueries({ queryKey: ['artifact', slug] })
+      await queryClient.invalidateQueries({ queryKey: ['artifacts'] })
+    } catch (err) {
+      // A reprobe failure is NOT a save failure. Routing it to `setSaveError` put it in
+      // the editor's save channel, whose surrounding copy tells the user their edit did
+      // not persist -- untrue, and it sends them to re-save content nothing touched.
+      setReprobeError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setReprobing(false)
     }
   }, [artifact, queryClient, slug])
 
@@ -927,6 +967,10 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   const invalidateComments = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ['artifact-comments', slug] })
   }, [queryClient, slug])
+  // Last failed comment write (post/reply/resolve/review/reopen/delete/edit).
+  // Rendered via ErrorNotice near the top of the page; cleared by the next
+  // successful write or by dismissal.
+  const [commentActionError, setCommentActionError] = useState<string | null>(null)
 
   // Cross-window mirroring: a popout and the main window are separate JS
   // contexts with separate query caches, so a comment posted in one wouldn't
@@ -934,6 +978,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // and refetch on announcements from other windows — comments mirror
   // immediately in both directions.
   const invalidateAndAnnounce = useCallback(() => {
+    setCommentActionError(null)
     invalidateComments()
     announceCommentsChanged(slug)
   }, [invalidateComments, slug])
@@ -943,10 +988,14 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   }, [slug, invalidateComments])
 
   // Writes go through useMutation (use-react-query guideline): errors surface
-  // instead of being swallowed and cache invalidation is centralized. Errors
-  // invalidate locally only (safety-net refetch) — a failed mutation didn't
-  // change server state, so there's nothing for other windows to sync.
-  const onMutErr = useCallback(() => invalidateComments(), [invalidateComments])
+  // through `commentActionError` (rendered as an ErrorNotice) and cache
+  // invalidation is centralized. Errors invalidate locally only (safety-net
+  // refetch) — a failed mutation didn't change server state, so there's
+  // nothing for other windows to sync.
+  const onMutErr = useCallback((e: unknown) => {
+    setCommentActionError((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong')))
+    invalidateComments()
+  }, [invalidateComments])
   const postCommentMut = useMutation({
     mutationFn: (vars: { text: string; scope?: string; anchor?: object }) => api.postArtifactComment(slug, vars),
     onSuccess: invalidateAndAnnounce, onError: onMutErr,
@@ -1116,7 +1165,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       // The pinned title keeps the sidebar readable.
       const res = await api.createChatSlot(
         undefined, undefined, undefined, undefined, undefined,
-        i18nT('pages.artifactDetailPage.session_title', { name: artifact.name }), undefined, artifact.slug,
+        i18nT('pages.artifactDetailPage.session_title', { name: artifact.name }), artifact.slug,
       )
       if (prefillText) writePrefill(res.key, prefillText)
       dispatch(addSlotOptimistic({
@@ -1369,22 +1418,24 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     const attempt = ++copyAttemptRef.current
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
     setCopyStatus('idle')
+    // `copyToClipboard` resolves a boolean and never rejects: `true` only once
+    // the text actually reached the clipboard. Gate the confirmation on it so a
+    // `false` shows the failure glyph instead of a tick over an unchanged
+    // clipboard. (A `.catch` here would be unreachable dead code.)
     copyToClipboard(artifact?.content ?? '')
-      .then(() => {
+      .then((ok) => {
         if (attempt !== copyAttemptRef.current) return
-        setCopyStatus('copied')
-        copiedTimerRef.current = setTimeout(() => {
-          if (attempt === copyAttemptRef.current) setCopyStatus('idle')
-        }, 1500)
-      })
-      .catch(() => {
-        if (attempt !== copyAttemptRef.current) return
-        setCopyStatus('failed')
+        setCopyStatus(ok ? 'copied' : 'failed')
         copiedTimerRef.current = setTimeout(() => {
           if (attempt === copyAttemptRef.current) setCopyStatus('idle')
         }, 1500)
       })
   }, [artifact])
+  // Copy failure stays an icon-state glyph (the button itself turns danger with
+  // an aria-live label), not an ErrorNotice: it is a browser clipboard API
+  // outcome rather than a rejected request, and the editor buffer may be dirty,
+  // so there is nothing to hand to the agent. Same decision as the copy
+  // controls in AssistantMessage / PinnedMessagesPanel.
   const copyLabel = copyStatus === 'copied'
     ? i18nT('pages.artifactDetailPage.copied')
     : copyStatus === 'failed'
@@ -1429,8 +1480,10 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
 
   if (detailQuery.isLoading || (!isCurrent && versionQuery.isLoading))
     return <div className="p-6 text-muted">{i18nT('pages.artifactDetailPage.loading')}</div>
-  if (detailQuery.error) {
-    const msg = detailQuery.error instanceof Error ? detailQuery.error.message : String(detailQuery.error)
+  // A failed historical-snapshot fetch used to fall through to "Not found"
+  // (artifact is undefined either way); surface it as the load failure it is.
+  const loadError = detailQuery.error ?? (!isCurrent ? versionQuery.error : null)
+  if (loadError) {
     return (
       <>
         <div className="sticky top-0 z-10 bg-bg border-b border-border">
@@ -1438,18 +1491,21 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         </div>
         <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
           <Card>
-            <div className="flex items-start gap-3">
-              <AlertTriangle className="lucide-inline text-danger" />
-              <div>
-                <div className="text-sm text-danger font-medium">{i18nT('pages.artifactDetailPage.failed_to_load_artifact')}</div>
-                <div className="text-[13px] text-muted mt-1">{msg}</div>
-              </div>
-            </div>
-            <div className="mt-3">
+            {/* Load failure: no editor buffer exists yet (a version switch
+                clears it), so the hand-off risks nothing. */}
+            <ErrorNotice
+              title={i18nT('pages.artifactDetailPage.failed_to_load_artifact')}
+              message={(errMessage(loadError) || i18nT('components.errorBoundary.something_went_wrong'))}
+              askAgent
+            />
+            <div className="mt-3 flex flex-wrap gap-2">
               {/* In a popout this forwards to the main window (the popout must
                   never become the library page); in the main app it's a plain
                   local navigation. */}
               <Btn onClick={() => sendNav({ path: '/artifacts' })}>{i18nT('pages.artifactDetailPage.back_to_library')}</Btn>
+              {!detailQuery.error && (
+                <Btn onClick={() => setSelectedVersion(null)}>{i18nT('pages.artifactDetailPage.back_to_live')}</Btn>
+              )}
             </div>
           </Card>
         </div>
@@ -1652,6 +1708,12 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
                 }
               }}
             />
+            {/* No hand-off: editor buffer editedContent may be dirty */}
+            <ErrorNotice
+              variant="inline"
+              title={i18nT('pages.artifactDetailPage.versions_failed_to_load')}
+              message={versionsQuery.error ? (errMessage(versionsQuery.error) || i18nT('components.errorBoundary.something_went_wrong')) : null}
+            />
 
             {/* Revert: only meaningful when viewing a historical version */}
             {!isCurrent && (
@@ -1834,9 +1896,9 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
           </div>
         )}
 
-        {/* No agent hand-off here, deliberately. `saveError` is set exactly when
-            handleSave threw, so `dirty` is still true and `editedContent` was
-            never persisted — a route change unmounts this page and the buffer is
+        {/* No hand-off: editor buffer editedContent (unsaved). `saveError` is set
+            exactly when handleSave threw, so `dirty` is still true and the buffer
+            was never persisted — a route change unmounts this page and it is
             gone. Every other nav-away on this page gates on
             `dirty && confirm(discard_unsaved_changes)`, and the deleted-artifact
             handler sets `saveError` INSTEAD of navigating precisely so the user
@@ -1852,10 +1914,67 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             error visible (no controls) if a publishing provider is ever
             registered. Inert in the public edition, where the registry is empty
             and `artifact.publication` is always null. */}
-        {artifact.publication?.last_error && (
-          <div className="mb-3 flex items-start gap-2 px-3 py-2 rounded-md border border-danger/40 bg-danger-subtle text-[13px] text-danger">
-            <AlertCircle size={14} className="lucide-inline shrink-0 mt-0.5" />
-            <span><strong>{i18nT('pages.artifactDetailPage.publication_sync_issue')}</strong> {artifact.publication.last_error}</span>
+        {/* No hand-off: editor buffer editedContent may be dirty */}
+        <ErrorNotice
+          title={i18nT('pages.artifactDetailPage.publication_sync_issue')}
+          message={artifact.publication?.last_error}
+          className="mb-3"
+        />
+
+        {/* Comments that failed to LOAD would otherwise read as "no comments"
+            (the sidebar and the toolbar count both fall back to an empty list). */}
+        {/* No hand-off: editor buffer editedContent may be dirty */}
+        <ErrorNotice
+          title={i18nT('pages.artifactDetailPage.comments_failed_to_load')}
+          message={commentsQuery.error ? (errMessage(commentsQuery.error) || i18nT('components.errorBoundary.something_went_wrong')) : null}
+          className="mb-3"
+        />
+        {/* No hand-off: comment draft (sidebar / popover composer text) */}
+        <ErrorNotice
+          title={i18nT('pages.artifactDetailPage.comment_action_failed')}
+          message={commentActionError}
+          onDismiss={() => setCommentActionError(null)}
+          className="mb-3"
+        />
+
+        {/* Notice-only publication: the publish SUCCEEDED and the link is valid,
+            it just is not reachable yet (e.g. CloudFront still rolling out). That
+            is not a failure, so it renders as a neutral/warn line -- never the
+            danger surface `last_error` drives. Suppressed when a real error is
+            present, since that is the more important thing to show. */}
+        {artifact.publication?.notice && !artifact.publication.last_error && (
+          <div className="mb-3 flex items-start gap-2 px-3 py-2 rounded-md border border-warn/30 bg-warn-subtle text-[13px] text-warn">
+            <AlertTriangle className="lucide-inline shrink-0 mt-0.5" />
+            <span className="min-w-0 flex-1">{i18nT(publishNoticeKey({
+              rolling_out: 'pages.artifactDetailPage.publication_still_rolling_out',
+              distribution_disabled: 'pages.artifactDetailPage.publication_distribution_disabled',
+              notice_generic: 'pages.artifactDetailPage.publication_notice_generic',
+            }, artifact.publication.notice_code))}</span>
+            {/* A notice is recorded once, at publish time, and the ordinary happy path
+                never revisits it -- so a link that HAS since finished rolling out kept
+                this banner forever. This asks the destination again and clears the notice
+                only when the condition really cleared. User-triggered rather than polled:
+                the answer costs a call to the destination, and a timer would either clear
+                it without checking or hammer the destination on every visit. */}
+            <Btn
+              onClick={reprobeNotice}
+              disabled={reprobing}
+              aria-label={i18nT('pages.artifactDetailPage.recheck_publication_notice')}
+            >
+              {reprobing
+                ? i18nT('pages.artifactDetailPage.rechecking')
+                : i18nT('pages.artifactDetailPage.check_again')}
+            </Btn>
+            {/* Rendered here, beside the button that triggered it: a re-check failure used
+                to be written to the editor's save-error channel, which both mislabelled it
+                and put it far from the control the user just pressed.
+                No hand-off: this panel sits on the artifact detail page alongside an
+                editable buffer, and `askAgent` navigates away and destroys unsaved edits.
+                A failed re-check is retryable in place by pressing the button again, so the
+                hand-off would cost more than it could recover. */}
+            {reprobeError && (
+              <ErrorNotice message={reprobeError} className="mt-2" />
+            )}
           </div>
         )}
 
@@ -2040,6 +2159,12 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         {/* Lifecycle event log + activity timeline. */}
         <div className="mt-6">
           <h3 className="text-[13px] font-semibold text-text-strong mb-2">{i18nT('pages.artifactDetailPage.activity')}</h3>
+          {/* No hand-off: editor buffer editedContent may be dirty */}
+          <ErrorNotice
+            title={i18nT('pages.artifactDetailPage.activity_failed_to_load')}
+            message={eventsQuery.error ? (errMessage(eventsQuery.error) || i18nT('components.errorBoundary.something_went_wrong')) : null}
+            className="mb-2"
+          />
           <ActivityTimeline
             events={eventsQuery.data?.events ?? []}
             navigateToSlot={(slotKey) => sendNav({ path: '/chat', slotKey })}
@@ -2075,7 +2200,7 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
   // edition ships an empty registry, so providers resolves to [] and this
   // component renders nothing (an artifact can only carry fork_metadata /
   // publication once a companion provider existed to create them anyway).
-  const { data: providersData } = useQuery({
+  const { data: providersData, error: providersError } = useQuery({
     queryKey: ['publish-providers', artifact.kind],
     queryFn: () => api.getArtifactPublishProviders(artifact.kind),
     staleTime: 300_000,
@@ -2083,7 +2208,7 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
   const providers = providersData?.providers || []
   // Cheap, non-blocking upstream check — the local content renders immediately;
   // this only drives the "pull available" / "conflict" affordance.
-  const { data: status } = useQuery({
+  const { data: status, error: statusError } = useQuery({
     queryKey: ['upstream-status', artifact.slug],
     queryFn: () => api.upstreamStatus(artifact.slug),
     staleTime: 15_000,
@@ -2158,6 +2283,22 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
     }
   }
 
+  // A failed provider-registry or upstream-status probe used to hide the whole
+  // banner, so a sync problem looked like "nothing to sync". Surface it instead.
+  const probeError = providersError ?? statusError
+  if (probeError) {
+    return (
+      <div className="mb-3 flex items-center gap-2 text-[13px]">
+        {/* No hand-off: editor buffer editedContent may be dirty */}
+        <ErrorNotice
+          variant="inline"
+          title={i18nT('pages.artifactDetailPage.sync_status_unavailable')}
+          message={(errMessage(probeError) || i18nT('components.errorBoundary.something_went_wrong'))}
+        />
+      </div>
+    )
+  }
+
   // No registered provider → no sync surface (public edition renders nothing).
   if (providers.length === 0) return null
 
@@ -2174,7 +2315,8 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
       <div className="mb-3 flex items-center gap-2 px-3 py-2 rounded-md border text-[13px] border-warn/40 bg-warn-subtle text-warn">
         <Camera size={14} className="lucide-inline shrink-0" />
         <span className="flex-1">{i18nT('pages.artifactDetailPage.local_changes_not_yet_published_to')} {provLabel}.</span>
-        {error && <span className="text-danger">{error}</span>}
+        {/* No hand-off: editor buffer editedContent may be dirty */}
+        <ErrorNotice variant="inline" message={error} />
         <Btn
           type="button"
           onClick={handleSnapshot}
@@ -2252,7 +2394,8 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
           {i18nT('pages.artifactDetailPage.overwrite_remote')}
         </Btn>
       )}
-      {error && <span className="text-danger text-[11px]">{error}</span>}
+      {/* No hand-off: editor buffer editedContent may be dirty */}
+      <ErrorNotice variant="inline" message={error} />
       {notice && !error && <span className="text-muted text-[11px]">{notice}</span>}
     </div>
   )

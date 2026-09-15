@@ -13,6 +13,20 @@ from aiohttp.test_utils import make_mocked_request
 
 import kiro_crew.config.loader as loader
 import kiro_crew.dashboard.handlers.messaging as mod
+from conftest import forget_env_at_teardown
+
+
+@pytest.fixture(autouse=True)
+def _restore_live_token_env(monkeypatch):
+    """Return ``WEBEX_BOT_TOKEN`` to its pre-test state after every test here.
+
+    The save handler exports the token into the LIVE process env so GET reflects
+    it before a restart. A ``delenv`` placed AFTER the save records the just-written
+    token as the value to restore -- so teardown puts the credential back and every
+    later test on the worker inherits it (observed in a full run). Recording the
+    pre-test absence up front is what makes teardown remove it.
+    """
+    forget_env_at_teardown(monkeypatch, "WEBEX_BOT_TOKEN")
 
 
 def test_save_denies_non_loopback(monkeypatch) -> None:
@@ -83,7 +97,6 @@ class TestSave:
         import os
 
         assert os.environ.get("WEBEX_BOT_TOKEN") == "webex-tok-1234"
-        monkeypatch.delenv("WEBEX_BOT_TOKEN", raising=False)
 
     def test_rejected_token_blocks_save(self, monkeypatch, tmp_path: Path) -> None:
         resp, env, cfg_path = _save(
@@ -107,7 +120,6 @@ class TestSave:
         payload = json.loads(resp.body)
         assert payload["verify_warning"]  # saved, but flagged unverified
         assert "WEBEX_BOT_TOKEN=webex-tok-5678" in env.read_text(encoding="utf-8")
-        monkeypatch.delenv("WEBEX_BOT_TOKEN", raising=False)
 
     def test_token_clear_removes_env_key(self, monkeypatch, tmp_path: Path) -> None:
         (tmp_path / ".env").write_text("WEBEX_BOT_TOKEN=old\n", encoding="utf-8")
@@ -145,7 +157,6 @@ class TestSave:
         # .env still holds the token: config-purge ran first and failed, so the
         # .env delete never executed — the credential is intact, not resurrected.
         assert "WEBEX_BOT_TOKEN=live-token" in env.read_text(encoding="utf-8")
-        monkeypatch.delenv("WEBEX_BOT_TOKEN", raising=False)
 
     def test_invalid_email_rejected(self, monkeypatch, tmp_path: Path) -> None:
         resp, _, cfg_path = _save(monkeypatch, tmp_path, {"allowed_emails": ["not-an-email"]})
@@ -166,7 +177,6 @@ class TestSave:
         resp, env, _ = _save(monkeypatch, tmp_path, {"bot_token": "WEBEX_BOT_TOKEN=webex-tok-9"})
         assert resp.status == 200
         assert "WEBEX_BOT_TOKEN=webex-tok-9" in env.read_text(encoding="utf-8")
-        monkeypatch.delenv("WEBEX_BOT_TOKEN", raising=False)
 
     def test_noop_save_requires_no_restart(self, monkeypatch, tmp_path: Path) -> None:
         resp, _, _ = _save(monkeypatch, tmp_path, {"enabled": False, "allowed_emails": []})
@@ -186,7 +196,6 @@ class TestSave:
         data = json.loads(cfg_path.read_text(encoding="utf-8"))
         assert data["webex"]["bot_token"] == ""  # legacy copy gone
         assert "WEBEX_BOT_TOKEN=webex-tok-new" in env.read_text(encoding="utf-8")
-        monkeypatch.delenv("WEBEX_BOT_TOKEN", raising=False)
 
     def test_token_clear_purges_legacy_config_token(self, monkeypatch, tmp_path: Path) -> None:
         (tmp_path / "config.json").write_text(
@@ -238,7 +247,6 @@ class TestSave:
             "old-token" in env_text
         ), "Config-first: .env must be untouched when config write fails"
         assert "new-token" not in env_text, ".env must not hold new-token when config write failed"
-        monkeypatch.delenv("WEBEX_BOT_TOKEN", raising=False)
 
     def test_set_config_write_failure_preserves_process_only_credential(
         self, monkeypatch, tmp_path: Path
@@ -293,7 +301,6 @@ class TestSave:
         assert "new-token" not in env.read_text(
             encoding="utf-8"
         ), ".env must not be written when config write fails (config-first ordering)"
-        monkeypatch.delenv("WEBEX_BOT_TOKEN", raising=False)
 
 
 class TestSaveWritesEveryValidatedField:
@@ -337,9 +344,11 @@ class TestSaveWritesEveryValidatedField:
         assert webex["hard_threshold_pct"] == 90
 
     def test_every_new_field_is_reported_as_applied(self, monkeypatch, tmp_path: Path) -> None:
-        # ``applied`` is what the UI reads to decide whether to show the restart
-        # hint, so a field missing from it is invisible to the operator.
-        resp, _env, _cfg = _save(
+        # ``applied`` is what feeds the restart hint, so a field missing from it
+        # is invisible to the operator. Every field here is reloaded by the
+        # config watcher, so a truthful hint is False -- which makes the
+        # persisted document, not the hint, the proof that all five were seen.
+        resp, _env, cfg = _save(
             monkeypatch,
             tmp_path,
             {
@@ -351,7 +360,13 @@ class TestSaveWritesEveryValidatedField:
             },
         )
         payload = json.loads(resp.body)
-        assert payload["restart_required"] is True
+        assert payload["restart_required"] is False
+        webex = json.loads(cfg.read_text(encoding="utf-8"))["webex"]
+        assert webex["allow_group_rooms"] is True
+        assert webex["allowed_room_ids"] == ["R1"]
+        assert webex["reply_in_thread"] is False
+        assert webex["soft_threshold_pct"] == 70
+        assert webex["hard_threshold_pct"] == 85
 
     def test_a_repeat_save_of_the_same_values_is_a_no_op(self, monkeypatch, tmp_path: Path) -> None:
         """Otherwise ``restart_required`` is permanently true.

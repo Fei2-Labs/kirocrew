@@ -8,6 +8,7 @@ import { useLanguage } from '../../i18n/LanguageProvider'
 import { DERIVE_LABEL_THRESHOLD_CHARS, deriveShellSummary, pickToolLabel } from '../../utils/toolLabel'
 import { LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
+import ErrorNotice from '../../components/ErrorNotice'
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
 import type { ChatMessage } from '../../types'
 import { ToolDetails } from './ToolDetails'
@@ -79,6 +80,21 @@ export function resetOpenedDiffCards(): void {
 // costs one scrollTop write.
 const SLIDE_DURATION = 0.22
 const SLIDE_EASE = [0.4, 0, 0.2, 1] as const
+
+// ── Shell elapsed line threshold ──
+// The "Running · Ns" line under a shell pill exists so a reader can tell that a
+// LONG command is still going. Most shell calls (a grep, a git show) return well
+// under a second, and a line under every one of them is noise: the elapsed clock
+// only ticks once a second, so a call that finishes before its first tick reads
+// a meaningless "0s". The line therefore waits until the command has run this
+// many seconds before it appears, and is removed the moment the command ends.
+//
+// This is also what keeps the transcript steady above a bottom-pinned reader: a
+// status line that appears and then collapses moves everything above it by its
+// own height, once per tool boundary. Short calls now add no line and remove
+// none, so that step only ever happens at the end of a command that genuinely
+// ran long — not at every tool boundary of a working turn.
+const SHELL_ACTIVITY_MIN_SECS = 10
 
 // ── Collapsed label clamp ──
 // A tool title is whatever the transport hands us, and for a shell call that is
@@ -289,8 +305,10 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // Shell commands do not expose a reliable total, so their live indicator is
   // deliberately indeterminate. The existing tool output remains the source
   // of truth; this status only makes an in-flight command visible while its
-  // details panel is collapsed after approval.
-  const showShellActivity = isShell && turnRunning && !hasPendingPerm
+  // details panel is collapsed after approval. Whether the line is actually
+  // SHOWN is decided below, once the elapsed clock is known — see
+  // SHELL_ACTIVITY_MIN_SECS.
+  const liveShellActivity = isShell && turnRunning && !hasPendingPerm
 
   // ── `wait` countdown ──
   // Matched to this pill by tool NAME, not by id: the wait_id is minted inside
@@ -354,6 +372,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // is not overwritten by the pre-approval ts.
   const approvalResolvedRef = useRef(false)
   const [endingWait, setEndingWait] = useState(false)
+  // The refused End-wait press. Previously the button only rolled back to its
+  // idle label, so a transport failure looked like a press that did nothing.
+  const [endWaitError, setEndWaitError] = useState<string | null>(null)
 
   // Re-arm the button for a NEW sleep. Left latched otherwise: after a
   // successful request the row lives on for up to one poll interval, and a
@@ -364,16 +385,20 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     if (id !== endedWaitIdRef.current) {
       endedWaitIdRef.current = id
       setEndingWait(false)
+      setEndWaitError(null)
     }
   }, [waitState?.wait_id])
 
   const endWaitNow = useCallback(() => {
     if (!waitSlotKey || !waitState || endingWait) return
     setEndingWait(true)
+    setEndWaitError(null)
     void api.endWait(waitSlotKey, waitState.wait_id).catch(() => {
-      // Roll back so a transport failure is retryable. A 409 also lands here,
-      // and re-enabling is still right: the countdown it referred to is gone.
+      // Roll back so a transport failure is retryable, and say so. A 409 also
+      // lands here, and re-enabling is still right: the countdown it referred
+      // to is gone — the row leaves on the next poll and takes the notice.
       setEndingWait(false)
+      setEndWaitError(i18nT('pages.chat.toolCallLine.end_wait_failed'))
     })
   }, [waitSlotKey, waitState, endingWait])
 
@@ -410,16 +435,23 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   }, [ts, hasPendingPerm, executionStartedAt])
 
   useEffect(() => {
-    if (!showShellActivity && !showWaitCountdown) return
+    if (!liveShellActivity && !showWaitCountdown) return
     const timer = window.setInterval(() => setActivityNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
-  }, [showShellActivity, showWaitCountdown])
+  }, [liveShellActivity, showWaitCountdown])
 
   const elapsedSeconds = Math.max(0, Math.floor((activityNow - activityStartRef.current) / 1000))
   const elapsedLabel = fmtDurationParts(
     [[Math.floor(elapsedSeconds / 60), 'minute'], [elapsedSeconds % 60, 'second']],
     { dropZero: true },
   )
+  // Live only, and only once the command has run long enough to be worth a
+  // line. The clock is anchored to the tool's own start (execution_started_at,
+  // then the log ts), so a row that mounts mid-command — the virtualizer
+  // re-mounting a scrolled-back row, a reload — shows the line at once when
+  // the command is already past the threshold rather than waiting another
+  // ten ticks.
+  const showShellActivity = liveShellActivity && elapsedSeconds >= SHELL_ACTIVITY_MIN_SECS
 
   // Remaining time on the sleeping wait. Ceil so the label reads "1s" for the
   // final fractional second instead of flashing "0s" while the tool is still
@@ -596,6 +628,13 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // fetch for server state). Gives request dedup across pills touching the same
   // file and stale-while-revalidate caching so re-renders don't re-probe —
   // replacing the manual AbortController + onFileOpenRef + setFileExists dance.
+  //
+  // The query's error is deliberately NOT read: this gates an affordance (the
+  // Open-file pill), it is not something the person asked for. A refused probe
+  // collapses to `fileExists = false` on purpose — the pill is simply not
+  // offered, which is the same outcome as the file not being there, and a
+  // failed-probe notice on every tool row would be noise about a link nobody
+  // clicked. Opening the file itself reports its own failure when pressed.
   const { data: fileExists = false } = useQuery({
     queryKey: ['tool-pill-file-exists', filePath],
     queryFn: async ({ signal }) => {
@@ -668,13 +707,24 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // flood-length shell label is substituted with a derived command digest
   // (binaries + redirect target), so the visible line is meaningful. Short
   // labels pass through untouched, and raw mode always shows the exact command.
+  //
+  // The digest parses COMMANDS, so it only ever runs when the shown label
+  // actually fell back to the raw title (no purpose, or purpose suppressed by
+  // the language guard — `pickToolLabel` returns `rawLabel` in exactly those
+  // cases). A prose purpose parsed as a command keeps only its head token —
+  // "Run the full benchmark…" rendered as "Run" — and the `Running:` prefix
+  // path inside deriveShellSummary parses regardless of `bareCommand`, so the
+  // gate is on the call itself, not just the flag. Long purposes pass through
+  // and CSS truncation owns the overflow, exactly as it does for
+  // restored-history rows.
   const pillLabelText = useMemo(() => {
     if (!simplified) return displayLabel
     if (displayLabel.length <= DERIVE_LABEL_THRESHOLD_CHARS && !displayLabel.includes('\n')) {
       return displayLabel
     }
+    if (toolLabel !== label) return displayLabel
     return deriveShellSummary(displayLabel, { bareCommand: isShell }) ?? displayLabel
-  }, [displayLabel, simplified, isShell])
+  }, [displayLabel, simplified, isShell, toolLabel, label])
   // Hover reveals the verbatim command whenever the pill shows a substitute.
   const pillLabelTitle = pillLabelText === displayLabel ? undefined : displayLabel
   // Keep transcript-sized shell payloads out of accessibility announcements,
@@ -988,6 +1038,10 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
               ? i18nT('pages.chat.toolCallLine.wait_ending')
               : i18nT('pages.chat.toolCallLine.wait_end_now')}
           </button>
+          {/* askAgent on: a transcript row holds no draft of its own, the
+              composer draft is persisted per slot, and an in-chat hand-off
+              opens a fresh slot rather than navigating away. */}
+          <ErrorNotice variant="inline" message={endWaitError} askAgent testId="wait-end-error" />
         </div>
       </StatusRow>
 

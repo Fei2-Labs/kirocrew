@@ -3,15 +3,20 @@
 Core owns the AWS deploy layer directly; the "Artifact Deploy" page lives
 at ``/artifacts/deploy`` in the main dashboard.
 """
+
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 from pathlib import Path
 
 from kiro_crew.config.paths import config_dir
-from kiro_crew.platform_compat import is_link_or_junction, unlink_link_or_junction
+from kiro_crew.platform_compat import (
+    ensure_owner_rwx_dirs,
+    is_link_or_junction,
+    rmtree_force,
+    unlink_link_or_junction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,24 +24,6 @@ _SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
 
 _MANAGED_MARKER = ".kirocrew-managed"
-
-
-def _remove_managed_tree(path: Path) -> None:
-    """Remove a managed skill tree without following nested junctions/symlinks."""
-    if is_link_or_junction(path):
-        unlink_link_or_junction(path)
-        return
-    os.chmod(path, 0o700)
-    for child in path.iterdir():
-        if child.is_dir() and not is_link_or_junction(child):
-            _remove_managed_tree(child)
-        elif child.exists() or is_link_or_junction(child):
-            if is_link_or_junction(child):
-                unlink_link_or_junction(child)
-            else:
-                os.chmod(child, 0o600)
-                child.unlink()
-    path.rmdir()
 
 
 def _register_core_skills() -> None:
@@ -74,11 +61,25 @@ def _register_core_skills() -> None:
                     link,
                 )
                 continue
-            _remove_managed_tree(link)
+            # A managed copy made from a read-only source carries read-only
+            # FILES (copytree preserves file modes), which plain rmtree
+            # refuses on Windows -- and this runs at startup, so that refusal
+            # aborts the gateway. rmtree_force clears the read-only bit and
+            # retries; a tree that still survives is a genuinely failed
+            # install and keeps the fail-loud contract below.
+            if not rmtree_force(link):
+                raise OSError(f"could not remove managed deploy-skill copy {link}")
 
         # Always copy (not symlink) so realpath stays within skill root.
         try:
             shutil.copytree(skill_dir, link)
+            # copytree preserves source modes verbatim, so a read-only
+            # install source (0o555 -- a Nix store path, a read-only mount)
+            # yields a copy whose directories reject the marker write below,
+            # which the OSError re-raise turns into a gateway abort. Add
+            # owner rwx to the copy's directories first: marker creation
+            # needs a writable and searchable parent.
+            ensure_owner_rwx_dirs(link)
             # Write the managed marker so future refreshes know it's ours
             (link / _MANAGED_MARKER).write_text("")
             logger.debug("Copied deploy skill %s", skill_dir.name)

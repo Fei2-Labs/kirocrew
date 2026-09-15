@@ -6,8 +6,13 @@ import base64
 import json
 import logging
 import threading
+import time
 from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -32,11 +37,139 @@ logger = logging.getLogger(__name__)
 AUTO_ADDED_PROP = "auto_added"
 
 # Marker recording that a row Kiro Crew registered itself has been adopted by the
-# user, the feature that registered it no longer existing. Written by
+# user (the auto-registration feature that created such rows is gone). Written by
 # `retire_auto_registered_folder` when the scan funnel refuses such a row, and by the
 # confirm and resume endpoints when the user adopts one; its presence is what keeps a
 # later refusal from undoing that decision.
 AUTO_REGISTRATION_RETIRED_PROP = "auto_registration_retired"
+
+#: How long ``maintenance_window`` waits for in-flight ingestion to drain
+#: before giving the sweep up for this launch.
+MAINTENANCE_WAIT_SECS = 600.0
+
+
+class IngestionGate:
+    """Reader/writer gate between ingestion and store maintenance.
+
+    Ingestion writes a source in several autocommit steps -- the source row,
+    its ingestion job, its items, its entities and their mentions -- and the
+    orphan sweep's predicates read exactly those half-states as orphans: a
+    source without items, an entity without a mention. The sweep runs after the
+    listener is up, concurrently with requests, so the two need an ordering
+    that is not a clock: ``ingestion_in_flight()`` brackets one whole ingest
+    (many may hold it at once) and ``maintenance_window()`` waits until no
+    holder remains, then holds the sweep's turn, during which a NEW ingest
+    waits at its entry rather than starting under the sweep.
+
+    The wait is bounded. Ingestion that never drains inside ``timeout`` makes
+    the window yield ``False`` -- the caller skips its sweep and the next
+    launch retries -- rather than either side killing the other. While the
+    window is waiting, new ingestion is already held back, so a steady stream
+    of ingests cannot starve the sweep indefinitely; a single long ingest can,
+    and that is the bounded case.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._ingesting = 0
+        self._maintenance = False
+
+    @contextmanager
+    def ingestion_in_flight(self, *, admitted: bool = False) -> Iterator[None]:
+        """Hold the gate for one ingest.
+
+        *admitted* is for a hold handed on from a current holder to a task it
+        starts: the holder's own hold means no sweep is running, so the new
+        hold joins it without waiting for a maintenance window that may have
+        begun waiting in between -- waiting there would hold the parent's
+        release hostage to the window's timeout (the window waits for the
+        parent; the parent waits for this entry). An admitted hold still counts,
+        so the window keeps waiting for it like any other.
+        """
+        with self._cond:
+            while self._maintenance and not admitted:
+                self._cond.wait()
+            self._ingesting += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._ingesting -= 1
+                if self._ingesting == 0:
+                    self._cond.notify_all()
+
+    @contextmanager
+    def maintenance_window(self, timeout: float = MAINTENANCE_WAIT_SECS) -> Iterator[bool]:
+        """Yield ``True`` with the store quiescent, ``False`` if it never drained."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._maintenance:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._cond.wait(remaining):
+                    break
+            if self._maintenance:
+                logger.warning(
+                    "Knowledge maintenance skipped: another maintenance window "
+                    "held for %.0fs", timeout)
+                yield False
+                return
+            self._maintenance = True
+            while self._ingesting > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._cond.wait(remaining):
+                    break
+            if self._ingesting > 0:
+                self._maintenance = False
+                self._cond.notify_all()
+                logger.warning(
+                    "Knowledge maintenance skipped: %d ingestion(s) still in flight "
+                    "after %.0fs", self._ingesting, timeout)
+                yield False
+                return
+        try:
+            yield True
+        finally:
+            with self._cond:
+                self._maintenance = False
+                self._cond.notify_all()
+
+
+@dataclass(frozen=True)
+class SourceContentStats:
+    """One source's share of the admitted content.
+
+    ``source_id`` is None for the bucket holding items that belong to no source.
+    The store deliberately does not spell that bucket with the dashboard's
+    ``__none__`` wire sentinel: that string is a contract between the items API
+    and the SPA, and a third copy down here in the store would have to change
+    with them while nothing in SQLite needs it.
+    """
+
+    source_id: str | None
+    name: str
+    documents: int
+    items: int
+
+
+@dataclass(frozen=True)
+class ContentStats:
+    """Admitted knowledge content: totals plus the same numbers per source.
+
+    ``sources`` counts registered sources, so it excludes the sourceless bucket
+    that ``per_source`` may carry. Both totals reconcile against ``per_source``
+    exactly -- summing its ``items`` gives ``items`` and summing its
+    ``documents`` gives ``documents`` -- which is the property that makes these
+    numbers auditable, and the reason membership here is plain ownership
+    (``items.source_id``) rather than the ownership-OR-location rule
+    ``knowledge_list_sources`` uses to estimate what a scope would yield. Under
+    that rule an item surviving a cross-source dedup collapse counts for two
+    sources and the per-source numbers over-sum the totals.
+    """
+
+    sources: int
+    documents: int
+    items: int
+    per_source: tuple[SourceContentStats, ...]
 
 
 def is_auto_registered(props: dict) -> bool:
@@ -64,24 +197,41 @@ _WALKING_SOURCE_TYPES = ("local_folder", "obsidian_vault")
 
 # Every query in this module funnels through the ``db`` property, so one check
 # there covers every caller at any stack depth -- including the ones a lexical
-# ``async def`` scan cannot see, which is why this guard exists (#7078, the
-# interprocedural half of #3057).
+# ``async def`` scan cannot see, which is why this guard exists.
 #
 # Both narrowings below are temporary and exist for the same reason: this store
-# still has 85 recorded on-loop callers -- the whole of
-# ``.github/sync-io-in-async-baseline.txt``, all of it knowledge paths, owned by
-# the cleanup at #7019.
+# still has on-loop callers left -- the watcher's marked cancel-path finalize
+# (``# on-loop-io-ok`` in ``knowledge/watcher.py``; the lexical baseline in
+# ``.github/sync-io-in-async-baseline.txt`` is now empty, and a marker is an
+# exemption, not an offload) plus the interprocedural path below.
+#
+# ``dashboard/handlers/knowledge.py`` takes the store through a worker for every
+# take of its OWN, endpoints and background tasks alike. It is not the whole
+# story, so the claim is scoped deliberately: the connector branch of
+# ``sync_source`` awaits ``SyncScheduler.sync_source``, which writes the row
+# inline from an async method (``sync.py``'s ``update_source`` after a successful
+# fetch, and ``_record_failure``), so a handler still reaches the store on the
+# loop ONE FRAME DOWN. That path is interprocedural backlog, invisible to the
+# lexical baseline, and stays with the cleanup rather than with this file.
+#
+# Two takes stay inline, carried as ``# on-loop-io-ok`` markers, and the
+# lexical baseline is empty. The watcher's self-heal rebuild
+# finalizes its job row inline on its cancellation path, where an interrupted
+# ``to_thread`` could drop the write -- ``start_rebuild_job`` sweeps a stale
+# 'processing' row to 'abandoned', so the single-flight guard recovers either
+# way. And ``dashboard/state.py`` builds this store lazily, whose migrations run
+# under ``allow_on_loop()`` below.
 #
 # * ``strict_env=STORE_STRICT_ENV`` keeps this store off the SHARED
 #   ``KIROCREW_STRICT_ON_LOOP_PERSIST`` switch, which ``setup.py``'s ``test_e2e``
 #   and ``ci.yml`` already export into the e2e gateway for history's clean
-#   surface. On the shared flag, the on-loop ``/api/knowledge/stats`` and
-#   ``/api/knowledge/namespaces`` handlers would raise and 500 the e2e run.
+#   surface. On the shared flag, the watcher's finalize would raise inside the
+#   e2e gateway.
 # * ``dev_mode_arms_strict=False`` keeps a developer gateway from raising on that
 #   same backlog, which would report tracked work as a regression and push the
 #   developer to unset ``KIROCREW_DEV_MODE`` -- silencing history.py's guard too.
 #
-# When #7019 empties that baseline, delete both arguments and this store joins
+# When that baseline is empty, delete both arguments and this store joins
 # the shared switch.
 _ON_LOOP_DB_GUARD = OnLoopDBGuard(
     label="knowledge store",
@@ -163,6 +313,28 @@ def _validated_aliases(value: object) -> str:
     if not all(isinstance(alias, str) for alias in parsed):
         raise KnowledgeBundleError("'entities.aliases' must be a JSON array of strings")
     return text
+
+
+def _validated_embedding_sig(value: object) -> str | None:
+    """``items.embedding_sig``: an opaque signature string, or NULL.
+
+    Deliberately shape-only. The value's grammar belongs to its producer
+    (:func:`kiro_crew.knowledge.embedder.embed_signature`), and a signature this
+    store cannot recognise is safe in the only direction that matters: it fails
+    to equal the importing store's own signature, so ``_vector_search`` refuses
+    the vector instead of scoring it across spaces. What is NOT safe is a
+    non-string reaching the bind, which raises past the typed-error contract --
+    hence the guard here rather than at one HTTP path.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise KnowledgeBundleError("'items.embedding_sig' must be a non-empty string or null")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise KnowledgeBundleError("'items.embedding_sig' must be valid UTF-8 text") from None
+    return value
 
 
 def _without_sync_status(properties):
@@ -376,9 +548,17 @@ _OWNERSHIP_HASH_COL: dict[str, str] = {
 # ``text_hash`` and the row becomes correct for transformed documents too.
 
 
+#: Orphan sources deleted per writer transaction by :meth:`KnowledgeStore.reclaim_orphans`.
+_RECLAIM_CHUNK = 200
+
+
 class KnowledgeStore:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, read_only: bool = False):
         self._db_path = db_path
+        # A read-only store runs neither the schema DDL nor `_migrate()` and opens
+        # every connection with SQLite `mode=ro`, so a write is refused by the
+        # engine rather than by convention -- see `open_read_only`.
+        self._read_only = read_only
         # One connection PER THREAD. sqlite3 connections carry
         # thread affinity (check_same_thread=True by default), but callers
         # like HybridRetriever.search() run on worker threads via
@@ -408,30 +588,73 @@ class KnowledgeStore:
         # known to be CJK-segmented, None while unknown. Never cached as False --
         # see `_fts_terms_segmented`.
         self._fts_segmented: bool | None = None
-        self.graph = SimpleDiGraph()
+        # The entity graph is materialised on first READ, not here -- see
+        # `ensure_graph_loaded`. `_graph` is the backing store for the `graph`
+        # property; nothing outside `_load_graph` and that property should touch
+        # it. RE-ENTRANT because both the first-touch accessor and `_load_graph`
+        # itself acquire it: the accessor holds it across the call so two readers
+        # cannot each start a scan, and `_load_graph` acquires it again so that
+        # EVERY rebuild -- including the six mutation-refresh call sites, which
+        # hold no lock of their own -- serializes against every other. A plain
+        # `Lock` would self-deadlock on that nesting.
+        self._graph = SimpleDiGraph()
+        self._graph_loaded = False
+        self._graph_lock = threading.RLock()
+        # Orders ingestion against the deferred orphan sweep -- see
+        # `IngestionGate`, `ingestion_in_flight` and `maintenance_window`.
+        self._ingestion_gate = IngestionGate()
         # This constructor runs on the event-loop thread by documented design
         # (see the thread-affinity note above). It is not an edge case:
         # `setup_knowledge_routes()` reads the gateway's lazy `knowledge_store`
         # property at route registration, which `start_dashboard` runs BEFORE
         # the socket binds, so construction happens on the loop on every
         # launch. The take is deliberate, so the on-loop guard -- which exists
-        # to police reader/writer query paths -- warned spuriously on every
-        # boot (#8231). Deliberate is not free, though: `_migrate()` runs an
-        # unconditional writer-locked orphan sweep and `_load_graph()`
-        # full-scans two tables, both data-scaled (only the FTS rebuild is
-        # deferred to the first off-loop reader). Moving that work off the
-        # boot path is #8329; suppressing the diagnostic for the sanctioned
-        # take is all this block does. The suppression ends with the block:
-        # the six non-constructor `_load_graph()` call sites and every query
-        # path stay fully guarded.
+        # to police reader/writer query paths -- would warn spuriously on every
+        # boot. Deliberate is not free, though, so neither data-scaled piece of
+        # construction sits on the boot path: `_load_graph()` is deferred to
+        # the first graph reader (`ensure_graph_loaded`), the same shape the
+        # FTS rebuild uses, and the writer-locked orphan sweep is
+        # `reclaim_orphans()`, kicked from a worker thread by `start_dashboard`
+        # once the listener is up. What remains here is the schema DDL and the
+        # per-column ALTERs, which are O(schema), not O(data).
+        # The suppression ends with the block: the six non-constructor
+        # `_load_graph()` call sites and every query path stay fully guarded.
+        if read_only:
+            return
         with _ON_LOOP_DB_GUARD.allow_on_loop():
             self._init_schema()
             self._migrate()
-            self._load_graph()
+
+    @classmethod
+    def open_read_only(cls, db_path: str) -> "KnowledgeStore":
+        """Open an EXISTING library for reading only: no DDL, no migration, no reap.
+
+        The constructor runs `_migrate()` on every open, and that sweep takes the
+        writer lock and deletes any itemless source row nothing references. That
+        is the right cost for a surface that goes on to write and the wrong one
+        for a verb documented as read-only -- `kirocrew knowledge stats` runs in
+        a fresh process, so it would re-run the sweep on every invocation. Here
+        the file is opened with SQLite `mode=ro`: nothing on this store can
+        write, because the engine refuses rather than a convention asking. The
+        trade is that a schema behind the code is reported, not repaired -- a
+        read that meets a missing table or column raises
+        `sqlite3.OperationalError`, and any migrating open (the gateway,
+        `kirocrew knowledge dedup --apply`) is the fix.
+        """
+        return cls(db_path, read_only=True)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, timeout=30, isolation_level=None)
-        conn.execute("PRAGMA journal_mode=WAL")
+        if self._read_only:
+            # `as_uri()` percent-encodes the path, which is the escaping SQLite
+            # undoes when it parses a URI filename, so a path holding `?` or `#`
+            # cannot be read as the start of the query string. journal_mode is
+            # left alone: a read-only connection may not change it, and a WAL
+            # file is readable as-is.
+            uri = Path(self._db_path).resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=30, isolation_level=None)
+        else:
+            conn = sqlite3.connect(self._db_path, timeout=30, isolation_level=None)
+            conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
@@ -596,7 +819,10 @@ class KnowledgeStore:
             -- Same shape and role as artifact_item_state: it is what lets one
             -- aggregate source hold many independently-replaceable documents,
             -- and what gives de-duplication a per-document unit to act on
-            -- instead of the whole source.
+            -- instead of the whole source. source_uri is the document's own
+            -- REDACTED locator, kept so a search hit can cite the document it
+            -- came from rather than the aggregate's control uri (agent://);
+            -- NULL on rows written before the column existed.
             CREATE TABLE IF NOT EXISTS agent_item_state (
                 source_id TEXT NOT NULL REFERENCES sources(id),
                 slug TEXT NOT NULL,
@@ -606,6 +832,7 @@ class KnowledgeStore:
                 name TEXT,
                 status TEXT DEFAULT 'active',
                 merged_into_source_id TEXT,
+                source_uri TEXT,
                 PRIMARY KEY (source_id, slug)
             );
 
@@ -649,14 +876,21 @@ class KnowledgeStore:
         # source_locations predates being an identity table: pre-existing DBs have
         # neither the (item_id, source_id) uniqueness nor any index. De-duplicate
         # first so the unique index can be created, then add both lookup indexes.
-        self.db.execute("""
-            DELETE FROM source_locations WHERE id NOT IN (
-                SELECT MIN(id) FROM source_locations GROUP BY item_id, source_id
-            )
-        """)
-        self.db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_source_locations_item_source "
-            "ON source_locations(item_id, source_id)")
+        # The de-dup is a full GROUP BY over the table, so it is gated on the
+        # unique index NOT existing yet: once the index is in place duplicates
+        # are impossible, and the scan would run on every open for nothing.
+        has_unique = self.db.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'index' "
+            "AND name = 'idx_source_locations_item_source'").fetchone()
+        if has_unique is None:
+            self.db.execute("""
+                DELETE FROM source_locations WHERE id NOT IN (
+                    SELECT MIN(id) FROM source_locations GROUP BY item_id, source_id
+                )
+            """)
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_source_locations_item_source "
+                "ON source_locations(item_id, source_id)")
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS idx_source_locations_item_id "
             "ON source_locations(item_id)")
@@ -718,9 +952,8 @@ class KnowledgeStore:
         #
         # Nothing in-tree can write that escaped form any more (`json.dumps`
         # never escapes ASCII, and `_without_sync_status` re-serializes on every
-        # insert and update), but `import_bundle` used to store a bundle's
-        # properties text verbatim, so a row imported before this change can
-        # still hold one.
+        # insert and update), but a row imported by an early `import_bundle` --
+        # which stored properties text verbatim -- can still hold one.
         blob_copies = self.db.execute(
             "SELECT id, properties, sync_status FROM sources").fetchall()
         for row in blob_copies:
@@ -811,6 +1044,72 @@ class KnowledgeStore:
         if "merged_into_source_id" not in agent_cols:
             self.db.execute(
                 "ALTER TABLE agent_item_state ADD COLUMN merged_into_source_id TEXT")
+        # The document's own REDACTED locator, attached to agent-source search
+        # hits so a citation names where the document came from instead of the
+        # aggregate's control uri. Legacy rows carry NULL, which citation
+        # enrichment treats as "unknown" and falls back to agent://; the next
+        # add of that document backfills it.
+        if "source_uri" not in agent_cols:
+            self.db.execute(
+                "ALTER TABLE agent_item_state ADD COLUMN source_uri TEXT")
+        # The orphan sweep is NOT here any more -- see `reclaim_orphans`. The
+        # constructor runs on the event loop before the socket binds, and the
+        # sweep is data-scaled and writer-locked, so on a large store it
+        # stalled boot long enough for runtime timeouts to kill the gateway.
+        # `start_dashboard` kicks it from a worker thread once the listener is
+        # up (`_kick_knowledge_orphan_reclaim`).
+
+    def ingestion_in_flight(self, *, admitted: bool = False):
+        """Bracket one whole ingest so the deferred sweep never sees it half-written.
+
+        Held from the source row through the last mention commit; entering
+        waits while :meth:`maintenance_window` holds the sweep's turn.
+        """
+        return self._ingestion_gate.ingestion_in_flight(admitted=admitted)
+
+    def maintenance_window(self, timeout: float = MAINTENANCE_WAIT_SECS):
+        """Wait for ingestion to drain, then hold new ingestion off for the body.
+
+        Yields ``True`` once the store is quiescent; ``False`` -- logged -- when
+        ingestion does not drain within ``timeout``, in which case the caller
+        skips its sweep. See :class:`IngestionGate`.
+        """
+        return self._ingestion_gate.maintenance_window(timeout)
+
+    def reclaim_orphans(self) -> None:
+        """Delete orphan sources, entities and stale relations -- off the boot path.
+
+        Formerly the tail of :meth:`_migrate`, so it ran inside ``__init__`` on
+        the event-loop thread on every launch, before the socket bound. The
+        body is data-scaled (every predicate is a full scan over ``sources``,
+        ``items`` and the state tables) and takes SQLite's writer lock, so a
+        large knowledge store stalled the gateway for long enough to trip the
+        runtime's boot timeouts. ``start_dashboard`` now runs this from a
+        worker thread AFTER the listener is accepting, via
+        ``_kick_knowledge_orphan_reclaim``; the store is readable throughout
+        (WAL readers do not wait on the writer).
+
+        Running after the listener is up means a request can be ingesting
+        concurrently: :meth:`add_source` commits the source row on its own, and
+        the rows that protect it from the orphan predicate (its ingestion job,
+        its items, its entities' mentions) are written by the caller's pipeline
+        some time later. A sweep observing that half state would delete a
+        source the user just added. The deferred worker therefore runs this
+        inside :meth:`maintenance_window`, which waits for every
+        :meth:`ingestion_in_flight` holder to finish and holds new ingestion
+        off for the duration; this method itself sweeps every row it finds.
+
+        A caller that looks up an existing source and ingests into it later
+        holds ``pipeline.ingestion_in_flight()`` across the whole span, so the
+        sweep waits for it rather than racing it.
+
+        Thread-safe by the same rules as every other write path: the calling
+        thread gets its own connection through :attr:`db`, and the sweep runs
+        as a series of short ``BEGIN IMMEDIATE`` transactions (see the body). Because it may now run after a reader
+        has materialised the graph, it refreshes the in-memory graph when one is
+        loaded -- the constructor-time sweep never had to, since it always ran
+        before the first load.
+        """
         # Clean orphan sources (no items), entities (no mentions/relations), and stale relations
         #
         # Folder sources are EXCLUDED: a watched folder with zero discovered
@@ -818,31 +1117,73 @@ class KnowledgeStore:
         # user-set state -- notably a paused empty folder would be dropped on
         # restart and then re-created as active by auto-discovery, silently
         # un-pausing it. The row is user-registered configuration, not derived
-        # data, so only its items are reclaimable.
+        # data, so only its items are reclaimable. The agent-document and
+        # artifact aggregate sources are containers of the same kind: each is
+        # created empty ('active', no items, no state rows) the moment its
+        # feature first needs it and filled by a later write, so an empty one
+        # is a feature waiting for its first document, not garbage.
+        orphan_pred = (
+            "id NOT IN (SELECT DISTINCT source_id FROM items WHERE source_id IS NOT NULL) "
+            "AND source_type NOT IN ('local_folder', 'obsidian_vault', 'quip', 'agent', 'artifact') "
+            "AND id NOT IN (SELECT source_id FROM ingestion_jobs WHERE status IN ('pending', 'processing')) "
+            # Only a source whose ingest has run to an end state is reclaimable.
+            # Every other status is a claim on the row: 'pending' (the column
+            # default a fresh add_source row carries until its background ingest
+            # writes its gate holder and job row), 'pending_confirmation',
+            # 'syncing', 'active' (a producible initial status for a source a
+            # feature fills later) and 'paused' (user-set) all mean somebody
+            # still intends to write under it. The allowlist is written by the
+            # row's own INSERT or by the ingest that finished, so there is no
+            # window in which a live source reads as an orphan.
+            "AND COALESCE(sync_status, '') IN ('synced', 'error', 'missing') "
+            "AND id NOT IN (SELECT DISTINCT source_id FROM folder_file_state) "
+            "AND id NOT IN (SELECT DISTINCT source_id FROM artifact_item_state) "
+            "AND id NOT IN (SELECT DISTINCT source_id FROM agent_item_state) "
+            # A source can hold documents it does not OWN: after a duplicate
+            # collapse it is a location of the surviving copy. Reaping it here
+            # would delete the very rows that record co-ownership, on every
+            # gateway start, and the document would stop being reachable from it.
+            "AND id NOT IN (SELECT DISTINCT source_id FROM source_locations)"
+        )
+        # The candidate list is read outside any transaction, and the deletes run
+        # in chunks of short BEGIN IMMEDIATE transactions that re-check the
+        # predicate under the lock. A knowledge write issued on the event loop
+        # while the sweep runs waits for at most one chunk instead of the whole
+        # data-scaled sweep, so the post-bind sweep cannot stall the loop for
+        # the duration the pre-bind one did.
+        orphan_ids = [
+            row[0] for row in self.db.execute(f"SELECT id FROM sources WHERE {orphan_pred}").fetchall()
+        ]
+        for offset in range(0, len(orphan_ids), _RECLAIM_CHUNK):
+            chunk = orphan_ids[offset : offset + _RECLAIM_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            still_orphan = f"SELECT id FROM sources WHERE id IN ({marks}) AND {orphan_pred}"
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(f"DELETE FROM source_locations WHERE source_id IN ({still_orphan})", chunk)
+                self.db.execute(f"DELETE FROM ingestion_jobs WHERE source_id IN ({still_orphan})", chunk)
+                self.db.execute(f"DELETE FROM sources WHERE id IN ({still_orphan})", chunk)
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            orphan_sources_q = (
-                "SELECT id FROM sources WHERE id NOT IN (SELECT DISTINCT source_id FROM items WHERE source_id IS NOT NULL) "
-                "AND source_type NOT IN ('local_folder', 'obsidian_vault', 'quip') "
-                "AND id NOT IN (SELECT source_id FROM ingestion_jobs WHERE status IN ('pending', 'processing')) "
-                "AND id NOT IN (SELECT DISTINCT source_id FROM folder_file_state) "
-                "AND id NOT IN (SELECT DISTINCT source_id FROM artifact_item_state) "
-                "AND id NOT IN (SELECT DISTINCT source_id FROM agent_item_state) "
-                # A source can hold documents it does not OWN: after a duplicate
-                # collapse it is a location of the surviving copy. Reaping it here
-                # would delete the very rows that record co-ownership, on every
-                # gateway start, and the document would stop being reachable from it.
-                "AND id NOT IN (SELECT DISTINCT source_id FROM source_locations)"
-            )
-            self.db.execute(f"DELETE FROM source_locations WHERE source_id IN ({orphan_sources_q})")
-            self.db.execute(f"DELETE FROM ingestion_jobs WHERE source_id IN ({orphan_sources_q})")
-            self.db.execute(f"DELETE FROM sources WHERE id IN ({orphan_sources_q})")
             self.db.execute("DELETE FROM entity_relations WHERE source_id NOT IN (SELECT id FROM entities) OR target_id NOT IN (SELECT id FROM entities)")
             self._prune_orphan_entities()
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+        # Only a graph somebody already materialised can be holding the entities
+        # just dropped; an unloaded one is built fresh by its first reader. The
+        # flag is read under ``_graph_lock`` so a first load racing this sweep
+        # cannot slip between the check and the refresh: a load that holds the
+        # lock finishes first and then reads as loaded (so it is refreshed), and
+        # a load that arrives later reads the tables after the prune committed.
+        with self._graph_lock:
+            if self._graph_loaded:
+                self._load_graph()
 
     def _prune_orphan_entities(self) -> None:
         """Delete entities nothing references any more -- no mention, no relation.
@@ -885,13 +1226,115 @@ class KnowledgeStore:
         row = self.db.execute(sql + " LIMIT 1", tuple(params)).fetchone()
         return dict(row) if row else None
 
+    @property
+    def graph(self) -> SimpleDiGraph:
+        """The entity graph, materialised on first access.
+
+        A backstop, not the intended entry point. Every reader that can run on
+        the event loop should call :meth:`ensure_graph_loaded` from a worker
+        thread first; this property exists so that a caller nobody found is
+        served a CORRECT graph -- and flagged by the on-loop guard if it is on
+        the loop -- rather than a silently empty one. An empty graph returned to
+        a reader is indistinguishable from "this entity has no neighbours",
+        which is the failure mode worth paying a stall to avoid.
+        """
+        self.ensure_graph_loaded()
+        return self._graph
+
+    def ensure_graph_loaded(self) -> None:
+        """Materialise the entity graph if no reader has done so yet.
+
+        Called by each graph reader before it touches :attr:`graph` --
+        ``get_entity_graph`` and ``get_full_graph`` in the dashboard handlers --
+        from a worker thread via ``asyncio.to_thread``. Deliberately NOT called
+        from ``__init__``, for the reason ``ensure_fts_index_current`` gives
+        about itself: the constructor runs on the event-loop thread and this
+        work is proportional to ``entities`` + ``entity_relations``, so doing it
+        there stalls the gateway before the socket binds.
+
+        **The offload is load-bearing, not hygiene.** Both handlers are
+        ``async def`` and read the graph on the loop, where the loop-stall
+        watchdog IS armed (it is started after the bind). Reaching this lazily
+        from the loop would move a data-scaled read out of the pre-bind window,
+        where nothing is armed and nothing is served, into the one window where
+        a stall can hard-exit the gateway. ``allow_on_loop()`` is not an option
+        here either -- its own contract restricts it to constructor-shaped setup
+        paths and directs production code to offload.
+
+        Steady state is a single boolean check. The first caller takes the lock
+        and does the work; concurrent readers wait rather than each starting
+        their own scan. The lock is re-entrant and :meth:`_load_graph` takes it
+        again, so a mutation refresh cannot interleave with this load -- see that
+        method for why serializing every rebuild is the property that matters.
+        """
+        if self._graph_loaded:
+            return
+        with self._graph_lock:
+            if self._graph_loaded:
+                return
+            self._load_graph()
+
     def _load_graph(self):
-        self.graph.clear()
-        for row in self.db.execute("SELECT id, name, entity_type FROM entities"):
-            self.graph.add_node(row["id"], name=row["name"], entity_type=row["entity_type"])
-        for row in self.db.execute("SELECT id, source_id, target_id, relation_type, weight FROM entity_relations"):
-            self.graph.add_edge(row["source_id"], row["target_id"],
-                                id=row["id"], relation_type=row["relation_type"], weight=row["weight"])
+        """Rebuild the in-memory graph from the tables, atomically.
+
+        Takes ``_graph_lock`` around the WHOLE rebuild, not just the first one.
+        Holding it only at the first-touch call site was not enough: the six
+        mutation-refresh sites acquire no lock of their own, so a first graph GET
+        racing a source DELETE put two threads through the rebuild at once, and
+        the loser's rows survived into a graph whose ``_graph_loaded`` was then
+        set True -- a flag asserting "loaded" over data that is wrong, which is
+        worse than an unloaded graph because it never gets rescanned.
+
+        Serializing the whole rebuild also fixes WHICH snapshot wins: the SELECTs
+        below run after acquisition, so the rebuild that acquires last reads the
+        freshest committed state rather than replaying rows it captured earlier.
+
+        **Build a fresh graph, then publish it with one reference assignment.**
+        Clearing the live ``self._graph`` and re-adding row
+        by row would be stale-publish-safe under serialization but leave the object a
+        reader could be iterating momentarily empty: a reader holding
+        ``self._graph`` between the ``clear()`` and the last insert would see a torn
+        (empty or truncated) graph, and a multi-step reader that re-read
+        ``self.graph`` across its own steps -- degree ranking, then per-node
+        attribute reads -- could miss a node that ``clear()`` had just removed.
+        Building into a NEW ``SimpleDiGraph`` and swapping the reference
+        under the lock closes that window: the old object is never mutated, so a
+        reader holding it sees a complete, consistent OLD graph until it drops the
+        reference, and the next read sees the complete NEW one. The multi-step
+        readers pin one reference for the duration of their read (see
+        ``get_entity_subgraph`` / ``get_neighbors`` and the graph handlers) so a
+        swap mid-read cannot mix old and new nodes.
+
+        The lock is only ever taken here and in :meth:`ensure_graph_loaded`, and
+        this method never takes SQLite's writer lock -- it is read-only, and all
+        six refresh sites call it after their own COMMIT -- so there is no
+        ordering against ``BEGIN IMMEDIATE`` to invert. (That is the hazard the
+        ``_fts_lock`` comment warns about, and it does not apply here: the FTS
+        rebuild acquires its lock and THEN a writer lock.)
+        """
+        with self._graph_lock:
+            rebuilt = SimpleDiGraph()
+            for row in self.db.execute("SELECT id, name, entity_type FROM entities"):
+                rebuilt.add_node(row["id"], name=row["name"], entity_type=row["entity_type"])
+            for row in self.db.execute(
+                "SELECT id, source_id, target_id, relation_type, weight FROM entity_relations"
+            ):
+                rebuilt.add_edge(
+                    row["source_id"],
+                    row["target_id"],
+                    id=row["id"],
+                    relation_type=row["relation_type"],
+                    weight=row["weight"],
+                )
+            # Single-reference publish. A reader that captured the previous
+            # ``self._graph`` keeps iterating that complete object; readers after
+            # this point see ``rebuilt``. Neither ever observes a half-built graph.
+            self._graph = rebuilt
+            # Truthful bookkeeping for the refresh call sites too: after any
+            # rebuild the graph IS materialised, so a later first-touch must not
+            # scan again. Set inside the lock, so no reader can observe the flag
+            # True over a half-rebuilt graph.
+            self._graph_loaded = True
 
     def add_item(self, title, content, item_type, source_id=None, chunk_index=0,
                  summary=None, tags=None, embedding=None, namespace="default",
@@ -935,17 +1378,25 @@ class KnowledgeStore:
         safe = {k: v for k, v in fields.items() if k in self._ITEM_COLUMNS}
         if not safe:
             return
-        # Read old FTS values BEFORE the update
-        fts_fields = {"title", "content", "tags"} & set(fields)
-        old_row = None
-        if fts_fields:
-            old_row = self.db.execute(
-                "SELECT rowid, title, content, tags FROM items WHERE id = ?", (item_id,)
-            ).fetchone()
         cols = ", ".join(f"{k} = ?" for k in safe)
         vals = [json.dumps(v) if isinstance(v, (list, dict)) else v for v in safe.values()]
+        fts_fields = {"title", "content", "tags"} & set(fields)
+        # The write lock comes first, BEFORE the old-row read, because the FTS
+        # delete is built from what that read returns. Two concurrent PATCHes of
+        # one item would otherwise both read the same old title, and the loser
+        # would unindex terms the winner had already replaced -- leaving the item
+        # searchable under a superseded title, with nothing that repairs it
+        # (``ensure_fts_index_current`` re-indexes on a term-representation
+        # version bump, never on content staleness). Holding the lock across the
+        # read costs one indexed lookup by id, and it is the shape
+        # ``merge_source_properties`` documents for the same reason.
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            old_row = None
+            if fts_fields:
+                old_row = self.db.execute(
+                    "SELECT rowid, title, content, tags FROM items WHERE id = ?", (item_id,)
+                ).fetchone()
             self.db.execute(f"UPDATE items SET {cols} WHERE id = ?", (*vals, item_id))  # noqa: S608
             # Sync FTS: delete with OLD values, insert with NEW values
             if old_row:
@@ -994,7 +1445,7 @@ class KnowledgeStore:
         Matched on ``content_hash`` because that is what identifies the document
         independently of which source holds it. Appends rather than replaces, so a
         multi-item group (a chunked file) is not truncated to one, and clears any
-        deferral marker: a row that owns an item is no longer deferring to anyone.
+        deferral marker: a row that owns an item is not deferring to anyone.
 
         A hash is only an identifier while it picks out ONE row. Two distinct
         documents in one source may legitimately hold identical text, and writing the
@@ -1037,14 +1488,14 @@ class KnowledgeStore:
                 (json.dumps(ids), healthy, st["rowid"]))
 
     def detach_source_location_by_hash(self, source_id: str, content_hash: str) -> int:
-        """Drop this source's CLAIM on a document it no longer has a copy of.
+        """Drop this source's CLAIM on a document it has no copy of.
 
         The counterpart to :meth:`_adopt_reassigned_item`. A source that lost a dedup
         holds no items for that document -- its state row is 'deduped' with an empty
         group -- yet it IS still a location of the winner's items, which is what keeps
         the document reachable if the winner goes away. When the losing copy is
         genuinely removed (its file deleted from that folder), the claim has to go too,
-        or the source stays a candidate to inherit a document it no longer has and the
+        or the source stays a candidate to inherit a document it does not have and the
         content resurfaces there as searchable text with no file behind it.
 
         Identified by ``content_hash`` because that is the only handle such a row has:
@@ -1085,7 +1536,7 @@ class KnowledgeStore:
     def release_stale_claim(self, source_id: str, prev_hash: str | None,
                             new_hash: str, prev_item_ids: list[str],
                             prev_text_hash: str | None = None) -> int:
-        """Release a claim made for content this source no longer has.
+        """Release a claim made for content this source does not have.
 
         A source that lost a dedup owns no items but IS a location of the winner's,
         and that claim is specific to the content it was made for. When the source's
@@ -1233,10 +1684,8 @@ class KnowledgeStore:
     def delete_source_cascade(self, source_id):
         """Delete a source and all its items in a single transaction (batch SQL).
 
-        No tombstone is written. One used to be, so a recurring discovery sweep could
-        not re-create the auto source a user had just deleted; with both discovery
-        loops removed nothing re-creates a source behind the user, so recording the
-        deletion would be a write nothing reads. The ``dismissed_auto_sources`` table
+        No tombstone is written. Nothing re-creates a source behind the user, so
+        recording the deletion would be a write nothing reads. The ``dismissed_auto_sources`` table
         is left in place unused rather than dropped, so no schema migration rides
         along with a feature removal.
         """
@@ -1450,6 +1899,68 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             self.db.execute("ROLLBACK")
             raise
 
+    def merge_source_properties(self, source_id: str, *, set_keys: dict | None = None,
+                                remove_keys: tuple[str, ...] = (),
+                                sync_status: str | None = None) -> dict | None:
+        """Apply a key delta to one source's ``properties``, in ONE write-locked take.
+
+        Returns the properties as persisted, or None when the row is gone.
+
+        ``properties`` is a whole-column rewrite, so a read-modify-write split
+        across two statements loses a concurrent writer's change: whoever writes
+        last replaces the other's blob wholesale, and a dropped ``scan_paused``
+        means a folder the user paused keeps being walked. This takes the write
+        lock BEFORE reading (``BEGIN IMMEDIATE``, the shape
+        :meth:`retire_auto_registered_folder` uses), so no other writer can land
+        between this read and this write, and guards the UPDATE with the blob it
+        read (``WHERE properties = ?``, the shape :meth:`_retire_one_in_txn`
+        uses). Under the lock that guard cannot fail, which is the point: it
+        states the invariant in SQL, so a future caller that drops the
+        transaction gets a no-op rather than a silent overwrite.
+
+        A failed ``BEGIN IMMEDIATE`` is NOT swallowed here, unlike in
+        :meth:`retire_auto_registered_folder`: that sweep gets another pass, a
+        request does not, so a lock timeout has to reach the caller instead of
+        being reported as a missing row.
+
+        ``sync_status`` is written to the COLUMN and stripped from the blob by
+        ``_without_sync_status``, for the reason that helper documents.
+
+        Synchronous and takes the write lock, so an event-loop caller hands it to
+        ``asyncio.to_thread``.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT properties FROM sources WHERE id = ?", (source_id,)).fetchone()
+            if row is None:
+                self.db.execute("COMMIT")
+                return None
+            try:
+                props = json.loads(row["properties"] or "{}")
+            except (ValueError, TypeError, RecursionError):
+                props = {}
+            if not isinstance(props, dict):
+                props = {}
+            for key in remove_keys:
+                props.pop(key, None)
+            props.update(set_keys or {})
+            text = _without_sync_status(json.dumps(props))
+            if sync_status is None:
+                cur = self.db.execute(
+                    "UPDATE sources SET properties = ? WHERE id = ? AND properties = ?",
+                    (text, source_id, row["properties"]))
+            else:
+                cur = self.db.execute(
+                    "UPDATE sources SET properties = ?, sync_status = ? "
+                    "WHERE id = ? AND properties = ?",
+                    (text, sync_status, source_id, row["properties"]))
+            self.db.execute("COMMIT")
+            return props if cur.rowcount > 0 else None
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
     def _migrate_fts_index(self) -> None:
         """Re-index ``items_fts`` when its stored term representation is stale.
 
@@ -1619,8 +2130,18 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             "INSERT INTO entities (id, name, entity_type, description, aliases, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (eid, name, entity_type, description, json.dumps(aliases or []), now, now))
-        self.graph.add_node(eid, name=name, entity_type=entity_type)
-        self.db.commit()
+        # Hold ``_graph_lock`` across BOTH the commit and the in-memory add, as one
+        # critical section. ``_load_graph`` -- which every delete / merge /
+        # import path runs after its own COMMIT -- takes this same lock for its whole
+        # rebuild-and-swap, so serializing commit+add here means a concurrent rebuild
+        # can never land BETWEEN this commit and this add. Without that, a source
+        # deletion that removes this entity's rows could rebuild and swap in the
+        # window, and this late add would re-inject the deleted entity into the
+        # published graph when SQLite has already dropped it. Whichever of the two paths
+        # acquires last leaves the in-memory graph agreeing with the committed rows.
+        with self._graph_lock:
+            self.db.commit()
+            self._graph.add_node(eid, name=name, entity_type=entity_type)
         return eid
 
     def find_entity(self, name):
@@ -1660,8 +2181,13 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             "INSERT INTO entity_relations (id, source_id, target_id, relation_type, description, weight, source_item_id, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (rid, source_id, target_id, relation_type, description, weight, source_item_id, now))
-        self.graph.add_edge(source_id, target_id, id=rid, relation_type=relation_type, weight=weight)
-        self.db.commit()
+        # Hold ``_graph_lock`` across commit + add, one critical section -- see
+        # add_entity. This closes the delete-then-restore race: a source deletion
+        # whose rebuild+swap would otherwise land between this commit and this add
+        # cannot interleave, so this edge is never re-injected after its row is gone.
+        with self._graph_lock:
+            self.db.commit()
+            self._graph.add_edge(source_id, target_id, id=rid, relation_type=relation_type, weight=weight)
         return rid
 
     def add_mention(self, item_id, entity_id, context=None):
@@ -1821,15 +2347,21 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                         (new_source_id, item_id))
 
     def get_neighbors(self, entity_id, depth=1) -> list:
+        # Pin one graph reference for the whole traversal. ``_load_graph``
+        # publishes a rebuilt graph by swapping ``self._graph``, so
+        # re-reading ``self.graph`` at each step could mix an old and a new graph
+        # across the successor/predecessor walk and the per-node attribute reads.
+        # Capturing it once means this read sees a single consistent snapshot.
+        graph = self.graph
         visited = set()
         frontier = {entity_id}
         for _ in range(depth):
             next_frontier = set()
             for nid in frontier:
-                for neighbor in self.graph.successors(nid):
+                for neighbor in graph.successors(nid):
                     if neighbor not in visited and neighbor != entity_id:
                         next_frontier.add(neighbor)
-                for neighbor in self.graph.predecessors(nid):
+                for neighbor in graph.predecessors(nid):
                     if neighbor not in visited and neighbor != entity_id:
                         next_frontier.add(neighbor)
             visited |= frontier
@@ -1838,32 +2370,120 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
         visited.discard(entity_id)
         result = []
         for nid in visited:
-            data = self.graph.nodes.get(nid, {})
+            data = graph.nodes.get(nid, {})
             result.append({"id": nid, "name": data.get("name"), "entity_type": data.get("entity_type")})
         return result
 
-    def get_entity_subgraph(self, entity_id, depth=2) -> dict:
+    def get_entity_subgraph(self, entity_id, depth=2) -> dict | None:
+        """The D3-shaped subgraph around ``entity_id``, or ``None`` if absent.
+
+        Pins ONE graph reference for the whole read and does the existence check
+        against it, so the check and the traversal see the same snapshot -- a
+        rebuild swapping in a fresh graph between them cannot let an entity pass
+        the check on the old graph and be walked on the new one, returning a
+        degenerate ``name: None`` subgraph instead of ``None``. The
+        ``get_entity_graph`` handler relies on this ``None`` to answer 404.
+        """
+        graph = self.graph
+        if not graph.has_node(entity_id):
+            return None
         visited = set()
         frontier = {entity_id}
         for _ in range(depth):
             next_frontier = set()
             for nid in frontier:
-                for neighbor in self.graph.successors(nid):
+                for neighbor in graph.successors(nid):
                     next_frontier.add(neighbor)
-                for neighbor in self.graph.predecessors(nid):
+                for neighbor in graph.predecessors(nid):
                     next_frontier.add(neighbor)
             visited |= frontier
             frontier = next_frontier - visited
         visited |= frontier
         nodes = []
         for nid in visited:
-            data = self.graph.nodes.get(nid, {})
+            data = graph.nodes.get(nid, {})
             nodes.append({"id": nid, "name": data.get("name"), "type": data.get("entity_type")})
         edges = []
-        for u, v, data in self.graph.edges(data=True):
+        for u, v, data in graph.edges(data=True):
             if u in visited and v in visited:
                 edges.append({"source": u, "target": v, "type": data.get("relation_type"), "weight": data.get("weight")})
         return {"nodes": nodes, "edges": edges}
+
+    def aggregate_stats(self) -> ContentStats:
+        """Admitted content, totalled and broken down by source.
+
+        Distinct from ``get_stats``, which reports raw table cardinality for the
+        dashboard overview: this counts ACTIVE items only, because a superseded
+        or deduped copy is not content the library will serve, and it resolves
+        the two units a reader conflates otherwise. An ``items`` row IS a chunk
+        -- the unit ``knowledge_list_sources`` and ``/source-counts`` already
+        call an item -- and every chunk of one document carries that document's
+        whole-text ``content_hash``, so ``(source_id, content_hash)`` is the
+        document identity, the same one ``dedup`` groups on. An item written
+        without a content hash is therefore counted in ``items`` and belongs to
+        no document.
+
+        Read-only: no write, no repair, no rebuild. A caller that finds the
+        numbers wrong has a diagnosis, not a fix.
+        """
+        totals = self.db.execute(
+            "SELECT COUNT(*) AS items, "
+            "COUNT(DISTINCT CASE WHEN content_hash IS NOT NULL AND content_hash != '' "
+            "  THEN COALESCE(source_id, '') || char(31) || content_hash END) AS documents "
+            "FROM items WHERE status = 'active'"
+        ).fetchone()
+        # char(31) is a unit separator: concatenating the two keys raw would let
+        # a source id ending in a hash prefix collide with its neighbour.
+        by_source = {
+            row["sid"]: row
+            for row in self.db.execute(
+                "SELECT COALESCE(source_id, '') AS sid, COUNT(*) AS items, "
+                "COUNT(DISTINCT CASE WHEN content_hash IS NOT NULL AND content_hash != '' "
+                "  THEN content_hash END) AS documents "
+                "FROM items WHERE status = 'active' GROUP BY sid"
+            ).fetchall()
+        }
+        per_source: list[SourceContentStats] = []
+        source_rows = self.db.execute("SELECT id, name FROM sources ORDER BY name").fetchall()
+        for src in source_rows:
+            counted = by_source.get(src["id"])
+            per_source.append(
+                SourceContentStats(
+                    source_id=src["id"],
+                    name=src["name"],
+                    documents=int(counted["documents"]) if counted else 0,
+                    items=int(counted["items"]) if counted else 0,
+                )
+            )
+        # Every registered source is listed even at zero, so a source that
+        # ingested nothing is visible rather than absent. The sourceless bucket
+        # is the opposite: it is not a registered row, so it appears only when it
+        # holds something. It holds every active item no registered source owns:
+        # the NULL-source rows, and any row whose source_id names a source that no
+        # longer exists. `items.source_id REFERENCES sources(id)` keeps the second
+        # kind out of anything this store writes, but a database written before
+        # the foreign key was enforced can still hold one, and a row counted in
+        # `items` that appeared on no line would break the reconciliation this
+        # breakdown promises. A document is identified by (source_id,
+        # content_hash), so summing the per-source_id document counts is exact.
+        registered = {src["id"] for src in source_rows}
+        unowned = [row for sid, row in by_source.items() if sid not in registered]
+        unowned_items = sum(int(row["items"]) for row in unowned)
+        if unowned_items > 0:
+            per_source.append(
+                SourceContentStats(
+                    source_id=None,
+                    name="(no source)",
+                    documents=sum(int(row["documents"]) for row in unowned),
+                    items=unowned_items,
+                )
+            )
+        return ContentStats(
+            sources=len(source_rows),
+            documents=int(totals["documents"]) if totals else 0,
+            items=int(totals["items"]) if totals else 0,
+            per_source=tuple(per_source),
+        )
 
     def get_stats(self) -> dict:
         return {
@@ -2013,12 +2633,22 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                         raw_emb = base64.b64decode(raw_emb)
                     except Exception:
                         raw_emb = None
+                # ``embedding_sig`` travels WITH the blob. It is the only thing
+                # that says which vector space the imported vector belongs to,
+                # and ``HybridRetriever._vector_search`` pins it -- so dropping
+                # it lands every imported item at NULL, which the vector leg
+                # reads as unproven provenance and refuses. The vectors are in
+                # the bundle and would simply never be scored again until a full
+                # re-embed. A foreign-space signature is exactly as welcome: it
+                # will not match the importing store's own signature, so those
+                # vectors are refused on purpose rather than by accident.
                 cursor = self.db.execute(
-                    "INSERT OR IGNORE INTO items (id, title, content, item_type, source_id, chunk_index, namespace, summary, tags, embedding, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO items (id, title, content, item_type, source_id, chunk_index, namespace, summary, tags, embedding, embedding_sig, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (item["id"], item["title"], item["content"], item["item_type"],
                      item.get("source_id"), item.get("chunk_index", 0), item.get("namespace", "default"), item.get("summary"),
-                     item.get("tags", "[]"), raw_emb, item.get("status", "active"),
+                     item.get("tags", "[]"), raw_emb, _validated_embedding_sig(item.get("embedding_sig")),
+                     item.get("status", "active"),
                      item.get("created_at", now), now))
                 if cursor.rowcount > 0:
                     items_imported += 1

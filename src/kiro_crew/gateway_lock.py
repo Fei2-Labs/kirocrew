@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+from dataclasses import dataclass
 from pathlib import Path
 
 from kiro_crew import platform_compat
@@ -69,6 +70,29 @@ class GatewayLockError(RuntimeError):
         else:
             detail = f"another gateway already owns {home}"
         super().__init__(f"{detail}; stop it first or set KIROCREW_HOME to an isolated directory")
+
+
+class LockProbeError(RuntimeError):
+    """Raised by :func:`lock_holder` when the lock's state cannot be established.
+
+    Two cases. The lock file exists but the non-destructive probe could not
+    OPEN it (an ``OSError`` from ``os.open``), so whether a gateway holds the
+    lock is INDETERMINATE -- a failure inside the lock call itself is not one
+    of them: ``platform_compat.try_acquire_lock`` folds that into ``False``,
+    which the probe reads as held, the conservative answer. Or the probe says
+    held but nothing can name a LIVE holder (the recorded acquirer is gone, or
+    the file records no live pid). Neither is folded into "free" or into a
+    named holder: "free" would let a caller spawn a second writer, and naming
+    the pid recorded in the file -- a number ``release`` never clears and the
+    kernel reuses -- would let a caller signal an unrelated live process.
+    Callers that act on the answer (``kirocrew stop``/``restart``) report this
+    and exit without signalling anything.
+    """
+
+    def __init__(self, path: Path, cause: OSError) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"could not determine whether a gateway holds the lock at {path}: {cause}")
 
 
 class GatewayLock:
@@ -296,6 +320,165 @@ class GatewayLock:
             return [f"does not hold port {self._port}"]
         answering = "answering" if _port_answers_http(self._port) else "not answering"
         return [f"holds port {self._port}, {answering} HTTP"]
+
+
+@dataclass(frozen=True)
+class LockHolder:
+    """Who holds ``<home>/gateway.lock`` right now, per :func:`lock_holder`.
+
+    ``pid`` is ``None`` when nothing holds the lock (no split-brain refusal to
+    diagnose). A named ``pid`` is always a LIVE process (``alive`` is ``True``
+    for it): :func:`lock_holder` reports a held lock whose acquirer is gone --
+    the orphaned-flock wedge :class:`GatewayLock` diagnoses in prose
+    (``_describe_orphaned_lock``) -- as indeterminate (:class:`LockProbeError`)
+    rather than as a dead holder, so no caller can read it as nobody running.
+    ``source`` says which surface produced the pid.
+    """
+
+    pid: int | None
+    alive: bool
+    source: str  # "flock_owner" | "recorded_pid" | "none"
+
+
+_NO_HOLDER = LockHolder(pid=None, alive=False, source="none")
+
+
+def lock_holder(home: Path) -> LockHolder:
+    """Non-destructive oracle: who (if anyone) holds ``<home>/gateway.lock``.
+
+    Shares its resolution logic with :meth:`GatewayLock._diagnose` so a caller
+    that never intends to ACQUIRE the lock -- ``cli_perf``'s profiler target,
+    and ``_stop``/``_restart``'s port-probe fallback -- can still ask who owns a
+    home without opening it for writing first. A missing lock file reports
+    ``pid=None, source="none"``, the same "nothing to diagnose" shape as no
+    lock existing at all; a file that exists but cannot be read is still
+    probed, since being unable to read it is not evidence that nobody holds it.
+
+    The file's contents are NOT evidence on their own. ``acquire`` stamps the
+    holder's pid but ``release`` never clears it, so after a clean stop the file
+    keeps naming a dead pid -- and pids are reused, so that number can later
+    name an unrelated live process (on macOS and Windows, where ``/proc/locks``
+    does not exist, that would be the ONLY source consulted). ``_diagnose`` is
+    safe from this because it only ever runs after an acquire has failed, when
+    the lock is known to be held; this oracle has no such precondition, so it
+    establishes it first with a non-destructive probe: try the lock
+    non-blockingly, release at once if it was free. A free lock is ``pid=None,
+    source="none"`` whatever the file says.
+
+    A ``LockHolder`` naming a pid is returned only on POSITIVE ownership of a
+    LIVE process: either ``/proc/locks`` names a live acquirer
+    (``source="flock_owner"``, whether or not the probe answered), or the probe
+    positively says held AND the pid recorded in the file is alive
+    (``source="recorded_pid"``, the non-Linux fallback). A named holder is
+    therefore always ``alive=True``; the field stays so callers read one shape. A recorded pid alone
+    cannot outrank the authoritative source, since a forked inheritor keeps the
+    flock alive under a DIFFERENT pid than the one last written to the file,
+    and a recorded pid that is dead is reported as nobody rather than as a
+    holder.
+
+    Raises :class:`LockProbeError` when the probe cannot answer and
+    ``/proc/locks`` does not name a live acquirer either, and also when the
+    probe says HELD but nothing can name a LIVE holder: the kernel names an
+    acquirer that is gone (the forked-inheritor wedge, where a child keeps the
+    flock alive under a pid nothing records), or neither the kernel nor the
+    file names a live pid (the non-Linux case of an unreadable or stale pid).
+    These states are
+    indeterminate, not "held" and not "free": "free" would let a caller spawn a
+    second writer, and a "held" that names the recorded pid would point at
+    whatever process happens to carry that number now. Liveness is always checked fresh: a caller acting on this a
+    moment later still wants that gap kept as small as the check itself, not
+    stretched by an extra round trip.
+    """
+    path = home / LOCK_FILENAME
+    if not path.exists():
+        return _NO_HOLDER
+    recorded: int | None = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        # A file that exists but cannot be opened for reading (a Windows
+        # mandatory lock held by the gateway, a permission gap) is not
+        # evidence of "nobody": the probe below still decides held or free,
+        # and a held lock with no readable pid is reported as indeterminate.
+        pass
+    else:
+        try:
+            recorded = _read_pid(fd)
+        finally:
+            os.close(fd)
+
+    try:
+        held = _lock_is_held(path)
+    except LockProbeError:
+        # The probe could not answer. The one thing that still counts as
+        # positive ownership is the kernel naming a LIVE acquirer.
+        owner = platform_compat.flock_owner_pid(path)
+        if owner is not None and platform_compat.pid_exists(owner):
+            return LockHolder(pid=owner, alive=True, source="flock_owner")
+        raise
+
+    if not held:
+        return _NO_HOLDER
+
+    owner = platform_compat.flock_owner_pid(path)
+    if owner is not None:
+        if platform_compat.pid_exists(owner):
+            return LockHolder(pid=owner, alive=True, source="flock_owner")
+        # Held, and the kernel names an acquirer that is gone: the flock lives
+        # on in a process that inherited the descriptor (a forked child), which
+        # nothing here can name. Reporting the dead pid as "not alive" reads to
+        # stop and restart as nobody running, and restart then spawns a
+        # replacement straight into the held lock. Indeterminate instead.
+        raise LockProbeError(
+            path,
+            OSError(f"the lock is held but its recorded acquirer (pid {owner}) is gone"),
+        )
+    if recorded is not None and recorded > 0 and platform_compat.pid_exists(recorded):
+        return LockHolder(pid=recorded, alive=True, source="recorded_pid")
+    # Positively held, yet nothing names the holder: the kernel has no owner
+    # surface here and the file records no live pid (unreadable under a
+    # mandatory lock, garbage, or a dead pid left by a forked inheritor). That
+    # is a running holder this process cannot identify, so it is indeterminate
+    # rather than "nobody": "nobody" would make stop and restart report nothing
+    # running while `kirocrew gateway` refuses to start on the very same lock.
+    raise LockProbeError(
+        path, OSError("the lock is held but no live holder pid can be established")
+    )
+
+
+def _lock_is_held(path: Path) -> bool:
+    """True when something holds the lock at *path* (i.e. a gateway is running).
+
+    Non-destructive: the acquire is only a probe and is released at once, so a
+    real holder is never disturbed. An ``OSError`` from OPENING the file raises
+    :class:`LockProbeError` instead of being folded into either answer: the
+    callers of :func:`lock_holder` act on the answer (refuse naming the pid,
+    profile it), so a false "free" would let them spawn a second writer. A
+    failure inside the lock call itself is folded by
+    ``platform_compat.try_acquire_lock`` into ``False``, which reads here as
+    "held": the conservative answer, since every caller treats a held lock as
+    a reason to refuse rather than to act on the recorded pid.
+
+    The probe window itself is the one this process could win a race against a
+    gateway acquiring at the same instant; it is microseconds wide and the
+    gateway's own refusal names this pid, which is the same exposure the
+    ``cli_perf`` probe carries.
+    """
+    fd: int | None = None
+    try:
+        fd = os.open(path, os.O_RDWR)
+        if platform_compat.try_acquire_lock(fd, exclusive=True):
+            platform_compat.release_lock(fd)
+            return False
+        return True
+    except OSError as exc:
+        raise LockProbeError(path, exc) from exc
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _port_answers_http(port: int, timeout: float = 1.5) -> bool:

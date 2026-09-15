@@ -1,13 +1,13 @@
 {
   "name": "kirocrew-desktop",
-  "version": "0.4.0-rc.9",
+  "version": "0.7.0",
   "description": "Kiro Crew \u2014 AI agent desktop app",
   "homepage": "https://github.com/kirodotdev/KiroCrew",
   "desktopName": "kirocrew-desktop.desktop",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/*.test.js mochi/test/*.test.js crew-companion/test/*.test.js",
+    "test": "node --require ./test/_preload.cjs --test test/*.test.js mochi/test/*.test.js crew-companion/test/*.test.js",
     "postinstall": "node scripts/patch-nsis-template.js",
     "dist": "electron-builder",
     "dist:mac": "electron-builder --mac",
@@ -24,7 +24,7 @@
   },
   "overrides": {
     "fast-uri": "3.1.7",
-    "js-yaml": "4.3.1"
+    "js-yaml": "4.3.2"
   },
   "build": {
     "appId": "com.amazon.kiro.crew",
@@ -170,13 +170,19 @@
       "gateway-liveness.js",
       "gateway-recovery.js",
       "renderer-recovery.js",
+      "hang-recovery.js",
       "native-logging.js",
+      "crash-collector.js",
       "disable-gpu.js",
+      "early-boot-guard.js",
       "memory-watch-log.js",
+      "frame-load-log.js",
+      "pane-asset-journal.js",
       "cage-trace.js",
       "pyspy-dump.js",
       "perf-metrics.js",
       "host-config.js",
+      "open-path.js",
       "store-rename.js",
       "remote-token.js",
       "token-acquire.js",
@@ -187,6 +193,7 @@
       "browser-view.js",
       "browser-control.js",
       "browser-ops.js",
+      "browser-annotate.js",
       "browser-agent-channel.js",
       "external-scheme.js",
       "validation.js",
@@ -216,7 +223,8 @@
       "icon.png",
       "icon-nightly.png",
       "trayTemplate.png",
-      "trayTemplate@2x.png"
+      "trayTemplate@2x.png",
+      "EXTERNALLY-MANAGED"
     ],
     "extraResources": [
       {

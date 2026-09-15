@@ -1,10 +1,15 @@
 import { createSlice, createAsyncThunk, createSelector, type PayloadAction } from '@reduxjs/toolkit'
+import { whenScrollQuiet } from '../lib/scrollQuiet'
+import { emitSlotRead } from '../lib/slotReadRelay'
 import { api } from '../api/client'
+import { resolveDefaultMemoryMode } from '../api/queryClient'
+import { devLog, inspectorOn } from '../dev/scrollInspector'
 import { addSlotOptimistic, updateSlot, removeSlotOptimistic, markSlotRead, fetchSlots, slotSurfaceKey, sseSlots, sseConnected } from './dashboardSlice'
 import { resolveDefaultColor } from '../utils/sessionColors'
 import { isChatPageSurface } from '../utils/channelOrigin'
 import { isSystemNoticeKind } from '../lib/systemNotice'
 import { isStopEvent } from '../lib/stopEvent'
+import { isNoteRow } from '../lib/noteContract'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { gcSessionStorage } from '../utils/storageGc'
 import type { RootState } from './index'
@@ -19,6 +24,9 @@ import { i18nT } from '../i18n/t'
 import { secureRandomId } from '../utils/secureId'
 import { mergeIntoDraft } from '../utils/chatDrafts'
 import { isRejectedDecision } from '../utils/approvalDecision'
+import { automationForSlot, type AutomationRecord } from '../monitoring/automation'
+import { findReport, parseErrorCode } from '../utils/errorReport'
+import type { HistoryDeleteRefusal } from '../utils/historyDeleteRefusal'
 
 const SKIP_ROLES = new Set(['chunk', 'done'])
 const filterMessages = (msgs: ChatMessage[]) => msgs.filter(m => !SKIP_ROLES.has(m.role))
@@ -146,9 +154,13 @@ const RECONCILE_WINDOW = 50
 /** Reconcile a server echo (carrying both `sendId` and `mid`) against the
  *  optimistic user bubble that was appended client-side at send time.
  *
- *  Scans backward over non-steer user messages looking for a `sendId` match.
- *  On match: updates ts/meta, clears the `optimistic` flag, and strips the
- *  one-shot `sendId` from persisted meta (it served its correlation purpose).
+ *  Scans the bounded tail for an exact `sendId` match, including past newer
+ *  steers that may have been appended before this echo arrived.
+ *  A matching optimistic steer can have raced onto a new turn; the ordinary
+ *  user echo then also clears its provisional steer flag.
+ *  On match: updates ts/meta and clears the `optimistic` flag. Keep `sendId`
+ *  so a pending HTTP request can still recognize delivery if its receipt
+ *  times out or the connection resets after this echo.
  *
  *  Returns `true` if reconciliation succeeded (caller should `return` to skip
  *  the push), `false` if no match was found (caller falls through to push).
@@ -167,14 +179,15 @@ function reconcileOptimisticEcho(
   for (let i = msgs.length - 1; i >= reconcileFloor; i--) {
     const m = msgs[i]
     if (m.role !== 'user') continue
-    if (m.meta?.steer) break // steer boundary — stop scanning
     if (m.meta?.sendId === echoSendId) {
+      // Keep the rendered row's identity when the server supplies its timestamp.
+      if (ts && m.ts && ts !== m.ts) {
+        m.meta = { ...(m.meta || {}), clientTs: m.meta?.clientTs ?? m.ts }
+      }
       if (ts) m.ts = ts
       m.meta = { ...(m.meta || {}), ...meta }
-      // The sendId is a one-shot wire correlation ID — strip it from the
-      // persisted meta now that reconciliation succeeded (#3898 item 2).
-      delete (m.meta as Record<string, unknown>).sendId
       delete (m.meta as Record<string, unknown>).optimistic
+      if (!meta.steer) delete (m.meta as Record<string, unknown>).steer
       return true
     }
     // #3898 fix: continue scanning past non-matching user messages so
@@ -185,34 +198,39 @@ function reconcileOptimisticEcho(
 
 /** Frame roles that retire a slot's pending STATELESS question card.
  *
- *  Deliberately NARROWER than "every role that starts a turn". The card's
- *  contract is "the user's answer arrives as the next message", and the roles
- *  here are the ones where that answer channel is genuinely gone:
+ *  Exactly one role, `user`, and the narrowness is the whole rule. The card's
+ *  contract is "the user's answer arrives as the next message", so the only
+ *  frame that consumes that channel is one the HUMAN sent: they answered in the
+ *  composer, or said something else, and either way spent their next message.
  *
- *  - `user` — the human spoke (composer answer, or something else entirely);
- *    either way the next-message channel was consumed by its owner.
- *  - `nudge` — an auto-nudge cycle deliberately moved the session on past the
- *    question; the loop's instruction, not the answer, became the next turn.
+ *  `nudge` was in this set (PR #2131) on the theory that an auto-nudge cycle
+ *  moves the session past the question. It does not consume the answer channel:
+ *  a nudge wakes the SAME agent in the SAME conversation, so a message the user
+ *  sends ten cycles later still lands on the agent that asked. Retiring on it
+ *  deleted the user's only affordance for a question nobody had answered —
+ *  observed on a monitored conductor session, where the card was gone by the
+ *  time the user came back to it, and the server record went with it so a reload
+ *  had nothing to rehydrate. An unanswered card now stays until it is answered
+ *  or explicitly DISMISSED; dismissal is a server round-trip that retires the
+ *  record too, and it is the control that keeps a genuinely stale card from
+ *  lingering — the auto-retire was covering for a control that now exists.
  *
  *  `inject` (cron notifications, recovery resumes) and `subagent` (completion
- *  events) also start turns, but they interleave with a question the agent may
- *  STILL be waiting on: an agent that spawns work, asks the user a question,
- *  and ends its turn will absorb completion events while the question remains
- *  genuinely open — clearing the card on those frames would delete the user's
- *  only UI for answering a live question. If a session moves on for real, its
- *  next user/nudge frame still retires the card. Extending coverage is a data
- *  edit here, not a code change (per Design Review on PR #2131). */
-const QUESTION_RETIRING_ROLES = new Set(['user', 'nudge'])
+ *  events) also start turns and are out for the same reason they always were:
+ *  they interleave with a question the agent may STILL be waiting on. Extending
+ *  coverage is a data edit here, not a code change (per Design Review on PR
+ *  #2131), and the backend's `_QUESTION_RETIRING_ROLES` must be edited with it
+ *  (parity is pinned by test_slot_needs_input_status.py). */
+const QUESTION_RETIRING_ROLES = new Set(['user'])
 
-/** Drop a slot's pending STATELESS question card (no ``ask_id``) when a
- *  turn-consuming frame lands on that slot.
+/** Drop a slot's pending STATELESS question card (no ``ask_id``) when the user's
+ *  own frame lands on that slot.
  *
  *  A stateless card's contract is "the user's answer arrives as the next
  *  message" (the agent ended its turn on it — `post_question_card`, no
- *  server-side wait). So the frame that STARTS the slot's next turn consumes
- *  the card's answer channel and makes it stale. Without this, a monitored
- *  session that asked a question and was then nudged onward parks the card
- *  above the composer FOREVER — it invites an answer no turn is waiting for.
+ *  server-side wait). A `user` row IS that next message, so the card it was
+ *  waiting for has arrived and the card is spent. Nothing else retires it —
+ *  see `QUESTION_RETIRING_ROLES` for why a nudge does not.
  *
  *  Server-owned cards (with `ask_id`) are exempt: their lifecycle is the
  *  `question_card_resolved` broadcast (answered / timed out / cancelled /
@@ -334,7 +352,8 @@ const slotKeyedMaps = (state: ChatState) => [
   state.slotSide, state.slotSideClosed, state.slotStatusDetail,
   state.slotContextPct, state.slotContextTokens, state.slotRateLimit, state.stopPressedAt,
   state.followups, state.folderSuggestions,
-  state.pendingQuestions, state.subagentQueued, state.goalLoops,
+  state.pendingQuestions, state.subagentQueued,
+  state.automations,
   // A surviving pane marker makes a recreated slot's hydrate early-return into
   // nothing, so these must die with the transcript they describe. The retained
   // server count belongs with them: kept past an eviction it would read as a
@@ -347,7 +366,7 @@ const slotKeyedMaps = (state: ChatState) => [
 /** Every slot key that still has residue anywhere in chat state.
  *
  *  A reconcile can only evict a slot it visits, so this has to cover the same
- *  surfaces `evictSlotState` clears — including the two that are not plain
+ *  ephemeral surfaces `evictSlotState` clears — including the two that are not plain
  *  slot-keyed maps: `mcpApps`, whose keys carry the slot as a prefix, and
  *  `slotHistory`, where a slot can outlive every map entry. */
 const slotKeysWithResidue = (state: ChatState): Set<string> => new Set([
@@ -356,13 +375,14 @@ const slotKeysWithResidue = (state: ChatState): Set<string> => new Set([
   ...(state.slotHistory ?? []),
 ])
 
-/** Drop every trace of one slot from chat state.
+/** Drop every ephemeral trace of one slot from chat state.
  *
  *  A local delete and a reconcile against the authoritative slot list both end
  *  here, so the two cannot disagree about what a departing slot leaves behind.
  *  Both spellings are removed: `safeKey` is identity for ordinary slot names and
  *  a no-op on an already-rewritten key, so one pass covers a caller holding
- *  either form. */
+ *  either form. Durable automation evidence remains on the server and is
+ *  available through the per-slot projection while the session exists. */
 /** Evict every slot carrying residue that the authoritative list does not name.
  *  Both authoritative writers (`sseSlots`, `fetchSlots.fulfilled`) reconcile
  *  through here, so neither can drift from the other. The active slot is never
@@ -391,6 +411,40 @@ const evictSlotState = (state: ChatState, slotKey: string): void => {
   // authoritative snapshot said it is gone, and restoring it would re-create
   // exactly the dead-slot selection the origin exists to unwind (#6309).
   if (state.slotSwitchOrigin && spellings.includes(state.slotSwitchOrigin.key)) state.slotSwitchOrigin = null
+}
+
+/** Retire folder-suggestion cards for slots an authoritative list reports as
+ *  already filed.
+ *
+ *  The card is per-window Redux state, but the question it asks — "file this
+ *  unfiled session?" — is answered globally the moment ANY window files the
+ *  session: accepting the card, the sidebar row menu, and drag-to-folder all
+ *  land in PATCH /api/chat/slots/{slot}/folder, whose push_slots_update
+ *  broadcasts the new folder_id to every connected client. Without this pass
+ *  every OTHER window keeps offering a move that already happened, and
+ *  accepting there re-issues it. Deliberately unconditional on the card's
+ *  `ts`: the backend offers at most one card per slot and never re-offers
+ *  after filing, so any card for a filed slot is moot regardless of
+ *  generation. That holds only for a list that is CURRENT — a session key can
+ *  be reused after close, and a stale list then reports the PREVIOUS tenant's
+ *  folder_id against the replacement's card — so each caller must ensure its
+ *  payload is not stale relative to the suggestion stream: WS frames are
+ *  ordered with the suggestion frames on one socket, and the fetch reply is
+ *  only trusted before the first live snapshot (see its call site). Declining,
+ *  by contrast, writes nothing server-side, so a decline stays window-local
+ *  and other windows age their copy out (FOLDER_SUGGESTION_MAX_TURNS) — the
+ *  offer is still answerable there. */
+const clearFiledFolderSuggestions = (
+  state: ChatState,
+  payload: readonly { key: string; folder_id?: string }[],
+): void => {
+  if (!state.folderSuggestions) return
+  for (const s of payload) {
+    if (!s.folder_id) continue
+    // Both spellings, same as evictSlotState: some writers key through safeKey().
+    delete state.folderSuggestions[s.key]
+    delete state.folderSuggestions[safeKey(s.key)]
+  }
 }
 
 /** Read one slot's pending question card, or null.
@@ -515,13 +569,99 @@ function hydrateQueuedBubbles(
   return base
 }
 
-/** Single-sourced "N chunk(s) missed" degradation marker. Shared by the reducer's
- *  defensive non-batched path and the useWebSocket flush buffer (the live path)
- *  so the marker text and gap arithmetic cannot drift between the two copies.
+/** Single-sourced "N chunk(s) missed" degradation marker. Used by the reducer's
+ *  defensive non-batched path and by `batchedTextAboveFloor` for the live
+ *  batched path, so the marker text and gap arithmetic cannot drift.
  *  Returns '' when the seqs are adjacent (no gap). */
 export const missedChunkMarker = (prevSeq: number, curSeq: number): string => {
   const missed = curSeq - prevSeq - 1
   return missed > 0 ? `\n[${missed} chunk(s) missed]\n` : ''
+}
+
+/** The chunk-seq floor a slot snapshot vouches for: the `seq` the server folded
+ *  onto the snapshot's trailing `streaming` row (chat_utils._prepare_messages),
+ *  i.e. the newest chunk whose text that snapshot already contains. A live
+ *  `chat_chunk` with a seq at or below it is a replay of text the snapshot
+ *  holds and must be dropped, not appended — the duplicated leading fragment
+ *  seen after a reconnect. Returns `undefined` for a snapshot without one (an
+ *  older gateway, or no stream in flight), which leaves the guard as it was. */
+export const snapshotChunkSeq = (messages: ChatMessage[]): number | undefined => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role === 'streaming') return typeof m.seq === 'number' ? m.seq : undefined
+  }
+  return undefined
+}
+
+/** The generation a snapshot's trailing streaming row was numbered by (the
+ *  `gen` the server folds beside `seq`); `undefined` for an older gateway. */
+export const snapshotChunkGen = (messages: ChatMessage[]): string | undefined => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role === 'streaming') return typeof m.gen === 'string' ? m.gen : undefined
+  }
+  return undefined
+}
+
+/** The seq floor to order an incoming chunk or snapshot against, given the
+ *  generation it carries. Seqs are a per-slot counter that continues across
+ *  turns but restarts with the gateway process, so a floor this generation
+ *  cannot vouch for says nothing about it: the floor is dropped (`undefined`)
+ *  rather than compared, which is what stops a pre-restart floor from
+ *  swallowing the new process's early chunks.
+ *
+ *  A floor with NO generation (`floorGen === undefined`) counts as unvouched
+ *  too, not as a match. It is what an older gateway's seq-only frames leave
+ *  behind, so after an upgrade or a reconnect the first generation-stamped chunk
+ *  arrives numbered from a restarted counter and sits below that stale floor —
+ *  treating "no generation" as compatible dropped the new process's reply text
+ *  and left every later snapshot reconciling against a floor from a dead
+ *  process.
+ *
+ *  An incoming frame with no generation keeps the floor: that is the same older
+ *  gateway still running, where seqs are the only ordering available. */
+export const floorForGen = (floor: number | undefined, floorGen: string | undefined, gen: string | undefined): number | undefined =>
+  gen !== undefined && gen !== floorGen ? undefined : floor
+
+/** Raise a chunk-seq floor to what a snapshot vouches for; never lower it. A
+ *  live frame may already have moved the floor past a snapshot taken earlier,
+ *  and lowering it would let the frames between the two be applied again. */
+export const raiseChunkSeq = (current: number | undefined, fromSnapshot: number | undefined): number | undefined => {
+  if (fromSnapshot === undefined) return current
+  return current === undefined || fromSnapshot > current ? fromSnapshot : current
+}
+
+/** One chunk inside a batched `sseChatMessage` frame: the text the hook
+ *  buffered for it and the seq the WS frame carried; gap markers are derived by
+ *  the reducer from the seqs, not carried in the text. */
+export type BatchedChunkPart = { seq?: number; text: string }
+
+/** The text of a batched frame that lies ABOVE a slot's chunk-seq floor, with
+ *  the gap markers recomputed over the parts that survive. The reducer is the
+ *  single owner of that floor (`lastChunkSeq`, raised by a snapshot's trailing
+ *  streaming row and by every applied chunk); the hook only batches per
+ *  animation frame and has no view of it. A part at or below the floor is text
+ *  a snapshot already holds — the duplicated leading fragment seen after a
+ *  reconnect or a mid-stream refresh — and is dropped; a part with no seq
+ *  cannot be placed against the floor and is kept. Markers are derived HERE,
+ *  from the floor and the kept seqs, rather than carried in the parts: a gap
+ *  the hook saw on the wire may be exactly what the snapshot filled in, and a
+ *  marker inlined at arrival would then flag a chunk that is on screen.
+ *  Returns `undefined` when nothing survives so the caller leaves the slot
+ *  untouched (no run-state bump, no streaming row). */
+export const batchedTextAboveFloor = (parts: BatchedChunkPart[], floor: number | undefined): string | undefined => {
+  const kept = parts.filter(p => p.seq === undefined || floor === undefined || p.seq > floor)
+  if (kept.length === 0) return undefined
+  let prev = floor
+  let text = ''
+  for (const p of kept) {
+    if (p.seq !== undefined) {
+      if (prev !== undefined) text += missedChunkMarker(prev, p.seq)
+      prev = p.seq
+    }
+    text += p.text
+  }
+  return text
 }
 
 /** Per-slot activity-panel open/closed state, persisted to localStorage so the
@@ -717,10 +857,21 @@ interface ChatState {
      *  while running is true, so deriving one from the other drops it. */
     run: { state: SlotState; running: boolean; stopping: boolean }
   } | null
+  /** A user-facing switch gesture hit a session the server no longer has
+   *  (#6372). ChatPage renders it through the pane-level ErrorNotice — the
+   *  `errors-use-error-notice` surface — above the composer. Carries the
+   *  NAME, not the sentence, so the copy re-resolves on locale switch; ''
+   *  when the slot list no longer knew the title. Cleared by the next
+   *  `switchSlot.pending` or the notice's dismiss. */
+  switchSlotGone: { name: string; kind: 'gone' | 'failed' } | null
   loadingOlder: boolean
   /** Last older-history fetch was rejected; surfaced on the top-of-transcript bar. */
   slotOlderError: boolean
   lastChunkSeq: number | undefined
+  /** The gateway process generation `lastChunkSeq` was numbered by (see
+   *  chunk_generation server-side); a chunk or snapshot from a different
+   *  generation replaces the floor instead of being ordered against it. */
+  lastChunkGen: string | undefined
   _wsChunkedDuringFetch: boolean
   /** How many `chat_message` frames were dropped as redeliveries (see
    *  `isRedeliveredMessage`), across every slot, for the life of this tab.
@@ -762,6 +913,14 @@ interface ChatState {
    *  sequence ref, which could only order ITS OWN clicks -- a palette resume
    *  racing a sidebar resume was unordered before. */
   lastResumeRequestId: string | null
+  /** A history delete the gateway REFUSED (409 with a `code`), sibling of
+   *  `unresumableResume` above and rendered at the same site. The row is still
+   *  in `history` -- nothing was deleted -- so without this the click looked
+   *  dead: `api.deleteSession` throws on any non-2xx and nothing narrated it.
+   *  Raw facts, not a sentence: the render site localizes from `code` (see
+   *  utils/historyDeleteRefusal) while `report` keeps the API journal context
+   *  for ErrorNotice's agent hand-off. Cleared on dismiss or on the next attempt. */
+  undeletableHistory: HistoryDeleteRefusal | null
   pendingInput: string | null
   /** Transient feedback for agent-rebind failures shared by the picker and
    *  global cycle shortcuts. The App shell owns rendering and expiry. */
@@ -794,18 +953,15 @@ interface ChatState {
    *  by slot name so it survives active-slot switches without the subagents
    *  map's active/non-active split. Populated by `subagent_queued` WS events. */
   subagentQueued: Record<string, number>
-  /** Live goal-loop (auto-nudge) progress per slot, keyed by the BARE slot key
-   *  the sidebar renders — `binding_key_for` strips the `dashboard:` prefix, so
-   *  these match `Slot.key` directly. Channel loops (`slack:`/`discord:` keys)
-   *  land here too and simply match no sidebar row.
-   *  Only ACTIVE loops are held: a loop that hit `max_cycles` stays in the
-   *  service registry with `active=false`, and a stopped loop must not keep
-   *  showing progress, so presence in this map IS "looping".
-   *  Cold-seeded from `GET /api/autonudge`, then kept live by `autonudge_state`
-   *  WS events — the service emits one per fired cycle (autonudge.py
-   *  `_emit("fired", …)` right after the `cycle_count` bump), which is what
-   *  makes the counter tick without rebroadcasting the whole slots list. */
-  goalLoops: Record<string, { cycle_count: number; max_cycles: number }>
+  /** The authoritative automation record for each bare slot key.
+   *
+   * Structured monitors remain here after reaching a terminal outcome so the
+   * dashboard can explain the stop and offer the explicit restart route.
+   * Legacy goal loops keep their historical presence-means-active behavior.
+   * Both REST snapshots and WS frames pass through the same pure normalizer
+   * before reaching this collection, so the sidebar and detail surface cannot
+   * disagree about transport fields or status. */
+  automations: Record<string, AutomationRecord>
   /** Agent id the user picked from the chip — the Activity Subagents tab
    *  scrolls to, expands, and auto-loads this card (1-click transcript). */
   selectedSubagentId: string | null
@@ -888,7 +1044,7 @@ interface ChatState {
   thinkingOrphans: Record<string, Array<ParkedThinking<ChatMessage>>>
   /** Path B: per-slot live stream state so a non-active pane shows its own
    *  streaming/tool/idle indicator (mirrors slotActivity for tool events). */
-  slotRun: Record<string, { state: SlotState; lastChunkSeq?: number }>
+  slotRun: Record<string, { state: SlotState; lastChunkSeq?: number; lastChunkGen?: string }>
   /** Path B: per-slot one-time hydration guard so the server history is
    *  prepended exactly once even if a WS frame seeds slotMessages first. */
   slotHydrated: Record<string, boolean>
@@ -899,6 +1055,21 @@ interface ChatState {
    *  list, which must. */
   slotsSnapshotSeen: boolean
   stopPressedAt: Record<string, number | null>
+  /** Per-slot count of turn STARTS this tab has seen: a non-steer user frame,
+   *  an inject row (cron / continue / auto-nudge), a local send, the active
+   *  slot's server snapshot flipping to running, and the FIRST busy frame
+   *  (chunk / tool / compacting) after idle. That last one matters: a user
+   *  row typed in another dashboard tab is not broadcast (state.py skips
+   *  `role == "user"` unless a channel replays it), so a background pane can
+   *  see a new turn only as its chunks — without counting them, a settlement
+   *  about the previous turn would idle the new one unchallenged. A frame of
+   *  a turn already counted does not bump (the slot is no longer idle).
+   *  Captured before a `/stop` request and, by `ChatPane`, on every render in
+   *  which the snapshot reports running, then checked by
+   *  `settleStopNotRunning` and the background branch of
+   *  `syncSlotRunningFromServer`, so an answer or snapshot that was true for
+   *  THAT turn cannot idle a NEWER one (#9547, GPT rounds 2 and 7). */
+  runEpoch: Record<string, number>
   /** Pending ask_question cards keyed by slot. Keyed (rather than a single
    *  card) so concurrent ask_question calls from two slots cannot evict each
    *  other — the losing agent would block until its timeout. */
@@ -973,9 +1144,11 @@ const initialState: ChatState = {
   slotSwitchRequestId: null,
   slotSwitchTarget: null,
   slotSwitchOrigin: null,
+  switchSlotGone: null,
   loadingOlder: false,
   slotOlderError: false,
   lastChunkSeq: undefined,
+  lastChunkGen: undefined,
   _wsChunkedDuringFetch: false,
   _redeliveredFramesDropped: 0,
   history: [],
@@ -983,6 +1156,7 @@ const initialState: ChatState = {
   historyOffset: 0,
   unresumableResume: null,
   lastResumeRequestId: null,
+  undeletableHistory: null,
   pendingInput: null,
   agentSwitchNotice: null,
   creatingSlot: false,
@@ -993,7 +1167,7 @@ const initialState: ChatState = {
   voiceAudio: null,
   subagents: {},
   subagentQueued: {},
-  goalLoops: {},
+  automations: {},
   selectedSubagentId: null,
   toolLog: [],
   workflowRuns: {},
@@ -1022,6 +1196,7 @@ const initialState: ChatState = {
   followups: {},
   folderSuggestions: {},
   stopPressedAt: {},
+  runEpoch: {},
   pendingTurnSlot: null,
 }
 
@@ -1044,6 +1219,14 @@ function syncOriginRun(state: ChatState, slot: string, runState: SlotState): voi
   const o = state.slotSwitchOrigin
   if (!o || safeKey(o.key) !== safeKey(slot)) return
   o.run = { state: runState, running: runState !== 'idle', stopping: runState === 'stopping' }
+}
+
+/** Count one turn START for `slot` (see `ChatState.runEpoch`). */
+function bumpRunEpoch(state: ChatState, slot: string | null): void {
+  if (!slot || isUnsafeKey(slot)) return
+  if (!state.runEpoch) state.runEpoch = {}
+  const k = safeKey(slot)
+  state.runEpoch[k] = (state.runEpoch[k] ?? 0) + 1
 }
 
 /** Load a slot's cached activity-panel state (or the empty defaults) into the
@@ -1073,9 +1256,10 @@ function loadSlotActivity(state: ChatState, key: string): void {
  */
 function applyNonActiveFrame(
   state: ChatState,
-  p: { slot: string; role: string; content: string; ts?: string; seq?: number; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean },
+  p: { slot: string; role: string; content: string; ts?: string; seq?: number; gen?: string; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean; parts?: BatchedChunkPart[] },
 ) {
-  const { slot, role, content, ts, seq, cls, meta, kind, batched } = p
+  const { slot, role, ts, seq, gen, cls, meta, kind, batched, parts } = p
+  let content = p.content
   if (isUnsafeKey(slot)) return  // never index a state map with __proto__/constructor/prototype
   const msgs = (state.slotMessages[safeKey(slot)] ??= [])
   const run = (state.slotRun[safeKey(slot)] ??= { state: 'idle' })
@@ -1096,6 +1280,24 @@ function applyNonActiveFrame(
     return
   }
   if (role === 'chunk') {
+    // Replay floor, owned here. `run.lastChunkSeq` is raised by a snapshot's
+    // trailing streaming row (switchSlot / refreshSlot / warmSlotCache) and by
+    // every applied chunk. A batched frame carries each chunk's seq in `parts`;
+    // only the parts above the floor are appended, and a frame with nothing
+    // above it leaves the slot untouched. A direct (non-batched) chunk at or
+    // below the floor is a replayed seq and is dropped whole. A frame from
+    // another gateway generation replaces the floor first (floorForGen).
+    run.lastChunkSeq = floorForGen(run.lastChunkSeq, run.lastChunkGen, gen)
+    if (gen !== undefined) run.lastChunkGen = gen
+    if (batched && parts) {
+      const kept = batchedTextAboveFloor(parts, run.lastChunkSeq)
+      if (kept === undefined) return
+      content = kept
+    }
+    if (!batched && seq !== undefined && run.lastChunkSeq !== undefined && seq <= run.lastChunkSeq) {
+      return
+    }
+    if (run.state === 'idle') bumpRunEpoch(state, slot)
     run.state = 'streaming'
     syncOriginRun(state, slot, 'streaming')
     // Drop only the EMPTY thinking placeholder (mirror the active
@@ -1120,13 +1322,14 @@ function applyNonActiveFrame(
     if (streamIdx >= 0) {
       const msg = msgs[streamIdx]
       // Share missedChunkMarker with the active path so the two cannot drift.
-      // Skip on batched frames: the live WS flush buffer already owns gap
-      // detection across the chunks it merges and inlines the marker into the
-      // batch content, and it dispatches each batch carrying only the batch's
-      // LAST seq. Comparing consecutive batches' last-seqs here would treat the
-      // batch size as a gap and fabricate a false "[N chunk(s) missed]" marker
-      // on every multi-chunk background-pane batch. Mirror the active path,
-      // which guards the identical branch with `!batched`.
+      // Skip on batched frames: `batchedTextAboveFloor` owns gap detection
+      // across the chunks a batch merges — it walks the batch's `parts`, calls
+      // `missedChunkMarker` between consecutive seqs and inlines the result into
+      // the text it returns — while the frame itself carries only the batch's
+      // LAST seq. Comparing consecutive batches' last-seqs HERE would therefore
+      // treat the batch size as a gap and fabricate a false "[N chunk(s)
+      // missed]" marker on every multi-chunk background-pane batch. Mirror the
+      // active path, which guards the identical branch with `!batched`.
       if (!batched && seq !== undefined && run.lastChunkSeq !== undefined) {
         msg.content += missedChunkMarker(run.lastChunkSeq, seq)
       }
@@ -1147,7 +1350,7 @@ function applyNonActiveFrame(
     }
     return
   }
-  if (role === 'compacting') { run.state = 'compacting'; syncOriginRun(state, slot, 'compacting'); return }
+  if (role === 'compacting') { if (run.state === 'idle') bumpRunEpoch(state, slot); run.state = 'compacting'; syncOriginRun(state, slot, 'compacting'); return }
   // Permission rows carry request_id/tool_input inside `cls` (JSON); lift it
   // here — BEFORE the guard — so the identity comparison sees the same
   // `tool_call_id` the stored row has.
@@ -1168,7 +1371,14 @@ function applyNonActiveFrame(
   // placed after the redelivery guard so a replayed frame cannot clear a
   // live card (see dropStaleStatelessQuestion).
   dropStaleStatelessQuestion(state, slot, role)
+  // An inject row (cron, continue, auto-nudge) starts a turn like a user
+  // message does — count it (see `ChatState.runEpoch`). A `/note` is also an
+  // inject row but is PASSIVE: it starts no turn, so counting it would make a
+  // Stop settlement captured a moment earlier read as stale and leave the pane
+  // falsely busy (GPT round 10).
+  if (role === 'inject' && !isNoteRow({ cls, meta })) bumpRunEpoch(state, slot)
   if (role === 'tool') {
+    if (run.state === 'idle') bumpRunEpoch(state, slot)
     run.state = 'tool_running'
     syncOriginRun(state, slot, 'tool_running')
     let insertIdx = msgs.length
@@ -1197,6 +1407,7 @@ function applyNonActiveFrame(
     // A steered message does not start a new turn — skip the "stale permissions"
     // cleanup so the approval bar remains visible and answerable (#1667).
     if (!meta?.steer) {
+      bumpRunEpoch(state, slot)
       sa.toolLog = []
       for (const m of msgs) {
         if (m.role === 'permission' && !m.meta?.resolved) { if (m.meta) m.meta.resolved = 'rejected'; else m.meta = { resolved: 'rejected' } }
@@ -1227,8 +1438,16 @@ function applyNonActiveFrame(
 const EMPTY_MESSAGES: ChatMessage[] = []
 export const selectSlotMessages = (state: RootState, slot: string): ChatMessage[] =>
   slot === state.chat.activeSlot ? state.chat.messages : (state.chat.slotMessages[slot] ?? EMPTY_MESSAGES)
+/** Only a server-confirmed row for THIS send proves delivery, even if the POST
+ *  subsequently fails. An optimistic bubble or identical text proves nothing. */
+export const selectSendConfirmed = (state: RootState, slot: string, sendId: string): boolean =>
+  selectSlotMessages(state, slot).some(m => m.role === 'user' && m.meta?.sendId === sendId && !m.meta?.optimistic)
 export const selectSlotStreamState = (state: RootState, slot: string): SlotState =>
   slot === state.chat.activeSlot ? state.chat.slotState : (state.chat.slotRun[slot]?.state ?? 'idle')
+/** The turn-start count for `slot` (see `ChatState.runEpoch`): the identity a
+ *  settlement captures so a late answer about one turn cannot idle the next. */
+export const selectSlotRunEpoch = (state: RootState, slot: string): number =>
+  state.chat.runEpoch?.[safeKey(slot)] ?? 0
 
 const EMPTY_TOOLLOG: ToolActivity[] = []
 /** Per-slot tool log, falling back to the global active mirror. */
@@ -1278,6 +1497,213 @@ export const fetchHistory = createAsyncThunk(
  *  for both keeps the scrollback walk uniform: the first page a slot opens
  *  with is simply page one of the same pagination `loadOlderMessages` runs. */
 export const OLDER_PAGE_LIMIT = 100
+
+/** Page size for walking BACK through history (loadOlderMessages).
+ *
+ * Equal to OLDER_PAGE_LIMIT: a load is a load, and the reader cannot tell which
+ * door issued it. The larger page this used to carry was justified by amortizing
+ * round trips across a walk that ran to the START of history ("a 13-page walk
+ * becomes 5") -- but the walk is now bounded to a few pages per expression of
+ * intent, so it cannot reach the start on one gesture no matter how big its page
+ * is, and the amortization has nothing left to amortize. What the big page did
+ * instead was multiply the cost of a single flick: measured on a phone, one
+ * gesture pulled 706 rows / ~260,000px of transcript with the reader's finger
+ * nowhere near the screen, which reads as history loading without end.
+ *
+ * The unit is worth stating because it is the trap: this counts MESSAGES, while
+ * a reader consumes SCREENS. Measured on the reporter's device a display row is
+ * 0.6-1.2 viewports, so ~3 messages fill a screen -- one page of 100 is already
+ * some 30 screens of reading. A page that looks modest in messages is enormous
+ * in the unit the reader actually experiences. */
+export const OLDER_WALK_PAGE_LIMIT = OLDER_PAGE_LIMIT
+
+/** The handler's own ceiling (`min(int(limit), 500)` in chat_handlers). Asking
+ *  for more is silently clamped, so a caller that needs to KNOW whether its
+ *  window covered the cache has to compare against this, not against what it
+ *  asked for. */
+export const SLOT_DETAIL_MAX_LIMIT = 500
+
+/**
+ * Rows to request when switching to a slot, or `undefined` for the unbounded
+ * shape.
+ *
+ * A switch used to go UNBOUNDED for any slot with rows already painted, and the
+ * comment beside it carried its own measurement: 6.2MB/~1s unbounded against
+ * 0.7MB/57ms bounded. So the FIRST visit to a session was the fast one and every
+ * return to it paid for the whole chained transcript — on a 43MB session that is
+ * the reported "switching chats got slow and janky", and it got worse as more
+ * history became reachable.
+ *
+ * The reason for going unbounded was real but narrower than the rule: a bounded
+ * page is a WINDOW, and if the server grew past it the window could sit entirely
+ * newer than the cache, leaving a hole in the middle of the transcript. That is
+ * a question of COVERAGE, not of boundedness — and coverage is VERIFIED after the
+ * response (`slotCoverageShortfall` asks which cached rows the window does not
+ * contain), so it does not have to be pre-purchased with a larger window.
+ *
+ * Which matters because the window extends BACKWARD from the newest row: every
+ * row of headroom is a row of OLDER history nobody asked for. Buying a page of
+ * margin therefore grew the transcript upward by a page on every revisit, and
+ * since the next revisit measures the cache it just grew, it ratcheted — one page
+ * per switch until the handler ceiling. Reported from a phone as history loading
+ * itself on every session switch, from a reader parked at the live end, with no
+ * gesture and no spinner (this path never sets `loadingOlder`, so it is invisible
+ * to every guard on the automatic older-history doors).
+ *
+ * So ask for exactly what this tab already holds — never fewer than one page —
+ * and let the coverage check pay for the rare case instead.
+ *
+ * A STREAMING slot is not an exception to that, though it used to be. The
+ * carve-out rested on the same pre-purchase argument the paragraph above
+ * retires: unseen growth can push a window clear of a small cache. That is the
+ * hole the coverage check verifies for, and it verifies it for a streaming
+ * response exactly as it does for a settled one — so the streaming exemption was
+ * the retired argument surviving in the one branch that did not get revisited.
+ *
+ * What it cost is the whole point of bounding: a slot mid-turn is the most likely
+ * slot a reader switches away from and back to, so the exemption applied the
+ * unbounded shape to the commonest switch there is. Measured on a phone as one
+ * switch into a streaming session turning 303 loaded messages into 6,265 (7,303
+ * raw rows, ~293,000px of transcript) with no gesture, no spinner, and no paging
+ * door involved -- and, because the whole transcript is replaced at once, the
+ * reader's saved position with it.
+ *
+ * Order matters here: bounding this is only safe once a streaming response can
+ * leave a comparable baseline behind (`retainServerTotal`). Without one the
+ * coverage check cannot prove overlap, and every streaming switch would take the
+ * unbounded RETRY instead — the same payload, one round-trip later.
+ */
+export function slotSwitchFetchLimit(input: {
+  cached: number
+  pageLimit?: number
+  maxLimit?: number
+}): number | undefined {
+  const pageLimit = input.pageLimit ?? OLDER_PAGE_LIMIT
+  const maxLimit = input.maxLimit ?? SLOT_DETAIL_MAX_LIMIT
+  if (input.cached <= 0) return pageLimit
+  return Math.min(maxLimit, Math.max(pageLimit, input.cached))
+}
+
+/** The fields coverage needs off a transcript row. Structural rather than the full
+ *  `ChatMessage`, so the contract is readable and testable without a whole message. */
+export type CoverageRow = {
+  ts?: string
+  role?: string
+  content?: unknown
+  meta?: { mid?: unknown }
+}
+
+/** A row's identity for the coverage test, in the same vocabulary `deduplicateByMid`
+ *  uses:
+ *  the server-minted `meta.mid` with `role` and the instant, since a mid can be
+ *  supplied by a caller and is not trustworthy alone. A row with no mid falls back to
+ *  its content, which is what the transcript itself renders and the only thing left to
+ *  compare.
+ *
+ *  A mid is matched ALONE, without role or timestamp beside it. Every other field on a
+ *  row is mutable while the mid is not: a `ts` is overwritten from the optimistic client
+ *  value to the server's authoritative one (`sseChatMessage` stashes the old one as
+ *  `meta.clientTs` precisely because it changes), a role flips `streaming` -> `assistant`
+ *  on finalization, and content grows from partial to final. Pairing any of them with a
+ *  stable id defeats the id: the same row read twice reports as two rows, and the
+ *  resulting false shortfall reloads the whole transcript -- after nothing more exotic
+ *  than sending a message and switching slots. `deduplicateByMid` does pair mid with role
+ *  and ts, for a different job: it COLLAPSES rows in the rendered transcript, so it must
+ *  not let a crafted mid hide a legitimate row. Coverage cannot be fooled that way
+ *  because it COUNTS -- two cached rows carrying one mid still need two window rows
+ *  carrying it -- so the discrimination that dedup needs costs coverage nothing to drop.
+ *
+ *  Without a mid the fallback keys on the INSTANT rather than the raw `ts`: the
+ *  seconds-or-ISO union means one row can be spelled two ways, and an identity that
+ *  changed with the spelling would call the same row two rows.
+ *
+ *  Two rows can still be genuinely indistinguishable -- the same role, instant and text,
+ *  with no mid on either. Coverage counts them rather than deduplicating them, so a
+ *  cache holding two and a window holding one reports the one that would be lost.
+ *
+ *  A JSON array rather than a delimiter-joined string: no delimiter can collide with
+ *  field content, and no string literal here trips the zero-tolerance i18n gate. */
+function coverageRowIdentity(r: CoverageRow): string {
+  const mid = r.meta?.mid
+  if (typeof mid === 'string' && mid) return JSON.stringify([mid])
+  return JSON.stringify([null, r.role ?? null, transcriptTsMs(r.ts), String(r.content ?? '')])
+}
+
+/**
+ * How many rows the tab already holds would be LOST if the bounded window replaced
+ * them -- the multiset of cached rows the window does not contain.
+ *
+ * This is the definition, not a proxy for it. The totals cannot answer the question:
+ * a tab holding one page of a long transcript and a tab whose slot grew past its cache
+ * look identical as counts (`cached` small, `serverTotal` large), so a count comparison
+ * has to assume the worst whenever it has no earlier total to subtract -- which is every
+ * FIRST visit to a slot. That assumption read an entire transcript to close a gap that
+ * was not there: measured on a phone as 110 loaded messages becoming 2,645 with a server
+ * total of 2,644, on a slot whose window already covered its cache exactly.
+ *
+ * Ordering cannot answer it either, and three rounds of boundary defects came from
+ * trying: comparing timestamps as strings, then treating a row tied with the window's
+ * oldest as covered, then collapsing two identical rows into one. Each is a different
+ * way for "is this row in that set" to be inferred from "is this row older than that
+ * row" -- so the fix is to ASK the real question. A row is covered when the window
+ * holds a matching row, and each window row can cover only ONE cached row, which is
+ * what makes duplicates count.
+ *
+ * A row the server does not KEEP is skipped on both sides, read through the shared
+ * `isDurableRow`. `CLIENT_ONLY_ROLES` -- `queued`, `streaming`, `thinking`,
+ * `permission` -- exist only in this client, so the server's window cannot contain one
+ * however wide it is asked to be. Counting one as missing is therefore not a hole that
+ * a bigger read closes: it is a shortfall that never goes away, so EVERY switch into a
+ * slot holding a queued message or a permission card refetches the whole transcript.
+ * A narrower test came first here -- skip a row whose `ts` cannot be read -- which
+ * happened to catch `streaming` and missed the other three, and the same file already
+ * carried the right predicate two consumers deep.
+ *
+ * The unreadable-`ts` skip stays, for its own reason rather than that one: a row that
+ * cannot be placed in time has no whole identity key to match on. An unstamped row is
+ * also a live TAIL row, which a newest-N window necessarily reaches, so skipping it
+ * cannot hide a hole above it.
+ *
+ * The one case that declines outright is a window with NO comparable row at all:
+ * nothing to compare against, and such a window replacing a populated cache is the
+ * shrink this guard is for.
+ */
+export function slotCoverageShortfall(input: {
+  cached: readonly CoverageRow[]
+  window: readonly CoverageRow[]
+}): number {
+  const { cached, window: win } = input
+  // Rows this comparison can say anything about at all. Two independent reasons a row
+  // is excluded, and they are NOT the same question:
+  //   `isDurableRow` -- can the server's window contain this row even in principle?
+  //   a readable `ts`  -- can the row be placed, so its identity key is whole?
+  const comparable = (r: CoverageRow) => isDurableRow(r) && transcriptTsMs(r.ts) !== null
+  const held = cached.filter(comparable)
+  if (held.length === 0) return 0
+  const floor = win.filter(comparable)
+  // Nothing to compare against: an unplaceable window replacing a populated cache is
+  // the shrink this guard is for. Counted over the COMPARABLE cache, not the whole of
+  // it, or a slot holding only client-only rows against an empty window reports a
+  // shortfall it cannot lose.
+  if (floor.length === 0) return held.length
+  // The window as a MULTISET: a row present twice can cover two cached rows, and a row
+  // present once can only cover one.
+  const have = new Map<string, number>()
+  for (const r of floor) {
+    const k = coverageRowIdentity(r)
+    have.set(k, (have.get(k) ?? 0) + 1)
+  }
+  let outside = 0
+  for (const r of held) {
+    const k = coverageRowIdentity(r)
+    const n = have.get(k) ?? 0
+    if (n > 0) have.set(k, n - 1)
+    else outside += 1
+  }
+  return outside
+}
+
+
 
 // Aborts the in-flight older-history fetch, or null when none is running.
 // Module-level because switchSlot must reach a fetch it did not start.
@@ -1532,9 +1958,15 @@ function olderHeadAbovePage(
  *  in the first and silently drop scrollback in the second. */
 const CLIENT_ONLY_ROLES: ReadonlySet<string> = new Set(['queued', 'streaming', 'thinking', 'permission'])
 
-/** Does this row survive in the server's transcript? */
-function isDurableRow(m: ChatMessage): boolean {
-  return !CLIENT_ONLY_ROLES.has(m.role)
+/** Does this row survive in the server's transcript?
+ *
+ *  Typed on the ROLE alone rather than on `ChatMessage`, so the coverage comparison
+ *  below can ask the same question of its own narrower row shape. One predicate is the
+ *  point: a second copy of this list is how a caller ends up agreeing with three of the
+ *  four roles. A row carrying no role at all reads as durable, which is the direction
+ *  that keeps a genuine hole observable. */
+function isDurableRow(m: { role?: string }): boolean {
+  return !CLIENT_ONLY_ROLES.has(m.role ?? '')
 }
 
 /** How many rows of a kept older head came from SERVER history, for shifting the
@@ -1588,15 +2020,26 @@ function pagingCursorAfterKeptHead(
  *  0 is written like any other: the server reporting an empty slot is a fact, and
  *  treating it as absent would read a later non-zero count as growth.
  *
- *  A count from a RUNNING response is refused, because it is not comparable with
- *  a settled one: an unbounded read counts raw rows, so a streaming response is
- *  inflated by rows that collapse at turn end. Retaining it makes the next warm read
- *  that ordinary collapse as a truncation and suppress the rescue, dropping a live
- *  row -- the opposite direction to the re-append the baseline exists to prevent.
- *  Refusing leaves no baseline rather than a wrong one, which is the same
- *  "decline, not guess" rule the merge's cut and `tsEpoch` already follow. */
-function retainServerTotal(state: ChatState, key: string, total: number | undefined, running?: boolean, seq?: number): void {
-  if (running) return
+ *  A running count is refused only when the read was UNBOUNDED, which is where the
+ *  incomparability actually lives: the unbounded branch counts raw rows, so a
+ *  streaming response is inflated by rows that collapse at turn end, and retaining
+ *  it makes the next warm read that ordinary collapse as a truncation and suppress
+ *  the rescue, dropping a live row. A BOUNDED read is collapsed by the handler
+ *  before it slices (`_collapse_wire_rows`), so its count is already in the same
+ *  units as a settled one and refusing it buys nothing.
+ *
+ *  Refusing every running count -- which is what this did -- manufactured the
+ *  absence it was trying to avoid guessing from. A slot that streams for most of
+ *  its life then has NO baseline at all, and the switch's coverage check treats an
+ *  absent baseline as unproven overlap and refetches the whole transcript: measured
+ *  on a phone as one switch turning 305 loaded messages into 6,203, with the tab
+ *  eventually killed. So the narrow refusal is not an optimization -- declining a
+ *  comparable count is what produced the guess.
+ *
+ *  `boundedRead` absent still refuses while running, so a caller that cannot say
+ *  keeps the conservative answer. */
+function retainServerTotal(state: ChatState, key: string, total: number | undefined, running?: boolean, seq?: number, boundedRead?: boolean): void {
+  if (running && !boundedRead) return
   if (typeof total !== 'number' || !Number.isFinite(total)) return
   if (!state.slotServerTotal) state.slotServerTotal = {}
   if (!state.slotServerTotalSeq) state.slotServerTotalSeq = {}
@@ -1620,7 +2063,7 @@ async function fetchSlotDetail(key: string, limit?: number) {
   // unbounded to keep the one-arg shape.
   const d = await (limit === undefined ? api.chatSlotDetail(key) : api.chatSlotDetail(key, limit))
   type QueueItem = string | { content: string; id: string }
-  return { key, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString() }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
+  return { key, boundedRead: limit !== undefined, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString() }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
 }
 
 /** SINGLE hydration path for the slot-detail context-meter fields — the one
@@ -1660,14 +2103,32 @@ function seedContextUsage(
 }
 
 /** `switchSlot`'s argument. The plain-string spelling is the overwhelmingly
- *  common one; the object form exists for the ONE caller class that must NOT
- *  have a 404 unwound: a switch into a slot the caller just created (e.g. the
- *  error handoff), where a 404 is a create/fetch race on a slot that exists
- *  and the seeded composer must stay visible. Handling it as a per-call option
- *  keeps the decision inside the reducer's atomic unwind instead of a caller
- *  patching half the state back afterwards -- the exact #6260 failure class
- *  this fix removes. */
-export type SwitchSlotArg = string | { key: string; keepTargetOnMissing?: boolean }
+ *  common one; the object form exists for caller classes that must opt out of a
+ *  default or opt into a surface:
+ *
+ *  - `keepTargetOnMissing`: the ONE caller class that must NOT have a 404
+ *    unwound — a switch into a slot the caller just created (e.g. the error
+ *    handoff), where a 404 is a create/fetch race on a slot that exists and
+ *    the seeded composer must stay visible. Handling it as a per-call option
+ *    keeps the decision inside the reducer's atomic unwind instead of a caller
+ *    patching half the state back afterwards -- the exact #6260 failure class
+ *    this fix removes.
+ *  - `announceOnMissing`: a USER-FACING gesture on a reference to a listed
+ *    session — the sidebar rows, the command palette recents, the command
+ *    bar's session picker, the notification panel's go-to-chat buttons, the
+ *    keyboard session jump, the worlds scene. On a 404 the thunk then says
+ *    why the gesture did nothing and evicts the gone entry synchronously via
+ *    `removeSlotOptimistic` (#6372) — but only when the selection escapes the
+ *    gone key (the rejected reducer restores a differing `slotSwitchOrigin`);
+ *    evicting the session the user was already in would leave `activeSlot`
+ *    naming a row the sidebar no longer lists. It is opt-IN because the remaining
+ *    caller classes self-handle their 404 — the side-chat re-bind and
+ *    worktree-open paths render their own in-page error, creation and
+ *    recovery paths (auto-improvement, issue-radar, cold-boot restore, the
+ *    Slack-token reconnect) silently fall back to a fresh session — so
+ *    announcing there would double-report or contradict a successful
+ *    recovery. */
+export type SwitchSlotArg = string | { key: string; keepTargetOnMissing?: boolean; announceOnMissing?: boolean }
 
 /** The slot key of a `switchSlot` argument, in either spelling. Non-object
  *  values pass through untouched: a hand-rolled test dispatch can omit
@@ -1681,12 +2142,37 @@ export const switchSlot = createAsyncThunk<
   { rejectValue: StatusRejection }
 >(
   'chat/switchSlot',
-  async (arg, { dispatch, getState, rejectWithValue }) => {
+  async (arg, { dispatch, getState, rejectWithValue, requestId }) => {
     const key = switchSlotKey(arg)
+    // Row-identity snapshot for the 404 eviction below. The authoritative slot
+    // writers (`sseSlots`, `fetchSlots.fulfilled`) rebuild `dashboard.slots`
+    // with fresh objects on every frame, so this reference doubles as a
+    // request-scoped token: if ANY frame lands between this dispatch and the
+    // catch — including one delivering a same-key replacement session — the
+    // identity check below fails and the eviction is skipped. The stale row
+    // then lingers exactly as it did pre-change, and the next frame owns it.
+    const rowAtDispatch = (getState() as RootState).dashboard?.slots?.find(s => s.key === key)
     // Safe unconditionally: this fetch resets the pane's messages and cursor, so
     // any older page still in flight is superseded even when the key is unchanged.
     _abortLoadOlder?.()
     dispatch(markSlotRead(key))
+    // Opening a session is the canonical read gesture: relay it so every
+    // other open dashboard window retires this slot's unread bubble too —
+    // but only AFTER the transcript fetch succeeds (see the emits by the
+    // return paths below). A failed load displays no transcript, and a
+    // pre-fetch relay would clear sibling badges for messages this window
+    // never showed. Watermark = the slot's server-minted last_ts when
+    // known, read AT EMIT TIME — after the fetch — so messages that arrived
+    // while the transcript loaded (a reconnect window) are covered by the
+    // relayed watermark instead of a stale pre-fetch capture. When none is
+    // known the relay goes out with NO watermark — receivers then keep any
+    // badge that recorded a watermark of its own (covering nothing is the
+    // conservative default). Client time is never minted here: windows
+    // disagreeing about the same message would strand badges against valid
+    // relays. Optional-chained like the slotRun guard below: a partial
+    // preloaded test state can omit the dashboard slice, and throwing here
+    // would abort the switch fetch itself.
+    const _newestSlotTs = () => (getState() as RootState).dashboard?.slots?.find(s => s.key === key)?.last_ts
     // Bounded to the page size so opening a long session costs one page, not the
     // whole chained transcript; `loadOlderMessages` walks back from the cursor
     // this fetch returns. Unbounded while the slot is streaming, for the same
@@ -1698,13 +2184,52 @@ export const switchSlot = createAsyncThunk<
     // still describes the OUTGOING slot. `slotRun` is keyed per slot, so it
     // answers for the incoming one. Guarded because a partial preloaded state
     // can omit `slotRun` entirely, and throwing here would skip the fetch.
-    const state = (getState() as { chat: ChatState }).chat
-    const streaming = (state.slotRun?.[key]?.state ?? 'idle') !== 'idle'
-    // A bounded page is a WINDOW, and unseen server growth can push that window clear
-    // of a small cache entirely, so only a slot with nothing painted may be bounded.
-    const cached = state.slotMessages?.[safeKey(key)]?.length ?? 0
     try {
-      return await fetchSlotDetail(key, streaming || cached > 0 ? undefined : OLDER_PAGE_LIMIT)
+      // EVERY switch is bounded, including into a slot mid-turn: ask for what
+      // this tab already holds (never fewer than one page) and let the coverage
+      // check below prove the window overlaps the cache. A bounded page is a
+      // WINDOW and unseen growth can push it clear of a small cache, but that is
+      // verified after the response rather than pre-purchased with a wider one --
+      // see slotSwitchFetchLimit, and the shrink contract in
+      // chatSlice.boundedRefetchShrink.test.ts that the pair has to satisfy.
+      // Measured 6.2MB/~1s unbounded against 0.7MB/57ms bounded.
+      const state = (getState() as { chat: ChatState }).chat
+      const cachedRows = state.slotMessages?.[safeKey(key)] ?? []
+      const cached = cachedRows.length
+      const limit = slotSwitchFetchLimit({ cached })
+      const first = await fetchSlotDetail(key, limit)
+      // Coverage, MEASURED from the rows the window returned against the rows this
+      // tab already holds. The older count-based check had to assume a hole whenever
+      // it had no earlier server total to subtract -- true on every first visit to a
+      // slot -- and closed that assumed hole with an UNBOUNDED read, which is how a
+      // 110-message tab became 2,645 (the whole transcript) on a slot whose window
+      // already covered its cache exactly. See slotCoverageShortfall.
+      const shortfall = slotCoverageShortfall({ cached: cachedRows, window: first.messages })
+      if (shortfall > 0) {
+        // Named in the inspector because this is the one path that can multiply the
+        // loaded transcript in a single step with no paging door involved. Reaching it
+        // now means a hole was OBSERVED between the cache and the window, not merely
+        // assumed for want of an earlier total.
+        if (inspectorOn()) {
+          devLog('SWITCH', `unbounded short=${shortfall} lim=${limit ?? '-'} cached=${cached} total=${first.total ?? '?'}`)
+        }
+        // Unbounded deliberately: the hole's width is server rows this tab never saw,
+        // so a locally-sized window cannot be proven to reach the cache, and this path
+        // REPLACES rather than merges. Carry the bounded read's count forward -- it is
+        // the only one of the two in settled units, and returning only the retry threw
+        // away the baseline the next switch needs.
+        const wide = await fetchSlotDetail(key)
+        // Emit only while this request still owns the slot switch: a rapid
+        // A->B switch leaves A's fetch resolving after B took over, and A's
+        // transcript never rendered — relaying its read would clear sibling
+        // badges for messages nobody displayed. `pending` assigns activeSlot
+        // atomically before this thunk body runs, so a superseded request
+        // observes someone else's key here.
+        if ((getState() as { chat: ChatState }).chat.activeSlot === key) emitSlotRead(key, _newestSlotTs())
+        return { ...wide, comparableTotal: first.total }
+      }
+      if ((getState() as { chat: ChatState }).chat.activeSlot === key) emitSlotRead(key, _newestSlotTs())
+      return first
     } catch (e) {
       // A thrown error crosses the thunk boundary as `miniSerializeError(e)`,
       // which keeps string fields only -- `ApiError.status` (a number) never
@@ -1716,7 +2241,113 @@ export const switchSlot = createAsyncThunk<
       // against a class the mock does not export throws inside this very
       // handler (see utils/agentSwitchFeedback.ts for the precedent).
       const status = (e as { status?: unknown } | null)?.status
-      if (typeof status === 'number') return rejectWithValue({ status, message: errMessage(e) })
+      if (typeof status === 'number') {
+        const payload: StatusRejection = { status, message: errMessage(e) }
+        // A 404 means the target is GONE — classified on the STRUCTURED payload
+        // with the same `isMissingSlotError` the rejected reducer applies, so
+        // the two ends of this thunk cannot disagree about what a 404 is. The
+        // reducer restores the pre-switch selection but cannot dispatch, which
+        // made the recovery SILENT: nothing told the user why the click did
+        // nothing, and the dead entry stayed listed until the next
+        // authoritative refresh, inviting the same wordless bounce again
+        // (#6372). For an `announceOnMissing` caller — a user-facing gesture on
+        // a listed session, see SwitchSlotArg for why it is opt-in — surface
+        // both halves here, BEFORE rejecting so the payload reaches
+        // `.unwrap()` consumers and the reducer unchanged.
+        // The eviction is `removeSlotOptimistic`: the 404 is exactly the
+        // server-confirmed deletion that reducer asks its callers for, it
+        // drops the row and its unread state synchronously with no network
+        // round-trip, and the next authoritative slots write reconciles either
+        // way.
+        const announce = typeof arg === 'object' && arg !== null && arg.announceOnMissing === true
+        if (announce && isMissingSlotError(payload)) {
+          // Read BEFORE the eviction below removes the row. Optional-chained
+          // like the other dashboard reads in this thunk: a partial preloaded
+          // test state can omit the slice.
+          const name = (getState() as RootState).dashboard?.slots?.find(s => s.key === key)?.title
+          const chat = (getState() as RootState).chat
+          // The announcement is ESCAPES-ONLY: re-activating the session the
+          // user is already in (the live-claimed origin names the gone key)
+          // stays silent, the pre-change behavior for exactly that gesture.
+          // The intent's scenario is a click on a LISTED (other) session; a
+          // notice over the still-open pane ships three contradicting signals
+          // (deleted-notice, kept row, composer inviting input). Gated on the
+          // live claim: a stale 404 that lost its claim to a newer gesture
+          // cannot trust `slotSwitchOrigin` (the newer `pending` overwrote it).
+          const reactivation = chat.slotSwitchRequestId === requestId && chat.slotSwitchOrigin !== null && chat.slotSwitchOrigin.key === key
+          if (!reactivation) {
+            // The page-level acknowledgment: ChatPage renders this
+            // through its pane ErrorNotice above the composer (the
+            // errors-use-error-notice surface), with the agent hand-off on. The
+            // NAME is stored, not the sentence, so the copy re-resolves on a
+            // locale switch. Cleared by the next `switchSlot.pending` or the
+            // notice's own dismiss.
+            dispatch(chatSlice.actions.setSwitchSlotGone({ name: name ?? '', kind: 'gone' }))
+          }
+          // Evict only when the selection will ESCAPE the evicted key. The
+          // rejected reducer restores `slotSwitchOrigin` only when it differs
+          // from the target (chat's `deleteSlot` states the invariant: the
+          // active slot must already name a surviving peer by the time a slot
+          // leaves the list). When the gone session IS the origin — the user
+          // re-activated the session they were already in — no restore runs,
+          // so evicting here would leave `activeSlot` naming a key no sidebar
+          // row lists: the pane stays open, the header chips render blank
+          // (`currentSlot` is undefined), and nothing heals it because an
+          // authoritative write will not re-add a deleted slot. Keeping the
+          // row for that one case is the pre-change behaviour, the notice
+          // still explains the failure, and the next authoritative slots
+          // frame retires the row once the user navigates away.
+          // `keepTargetOnMissing` keeps the selection ON the target by the
+          // reducer's own contract, so the selection never escapes there.
+          const keepTarget = typeof arg === 'object' && arg !== null && arg.keepTargetOnMissing === true
+          const escapes = !keepTarget && chat.slotSwitchOrigin !== null && chat.slotSwitchOrigin.key !== key
+          // Freshness conditions on the DESTRUCTIVE half only (the notice above
+          // stays: it truthfully explains the dead click even when stale).
+          // (1) The row must still be the OBJECT captured at dispatch (see
+          // `rowAtDispatch`): any authoritative frame that changed row `key` in
+          // ANY way — a replacement session included — breaks the identity and
+          // disarms the eviction. `applySlots` reuses a row's identity only
+          // when it is jsonEqual, and a genuinely recreated session cannot be
+          // byte-identical (its message count and last_ts differ from the dead
+          // one's), so identity is honest about content freshness.
+          // (2) This switch must still be the LIVE one: `pending` stored this
+          // thunk's requestId in `slotSwitchRequestId` and any newer switch
+          // overwrote it, so a stale 404 that lost a race to a newer gesture —
+          // a successful same-key re-open included — cannot evict.
+          const rowNow = (getState() as RootState).dashboard?.slots?.find(s => s.key === key)
+          if (escapes && rowAtDispatch !== undefined && rowNow === rowAtDispatch && chat.slotSwitchRequestId === requestId) {
+            dispatch(removeSlotOptimistic(key))
+          }
+        } else if (typeof arg === 'object' && arg !== null && arg.announceOnMissing === true) {
+          // A non-404 failure on the SAME user gesture (a 5xx, a proxy error)
+          // is just as silent by default: the rejected reducer keeps the
+          // target selected with an empty pane (the transient-failure branch),
+          // and nothing says why the transcript did not load. Announced
+          // callers get the same pane ErrorNotice with failure copy — no
+          // eviction (the session exists) and no new affordance: the row and
+          // composer already invite the natural retry. Gated on the live
+          // claim, UNLIKE the gone notice above: "was deleted" stays true
+          // whenever the 404 lands, but "could not be opened" describes THIS
+          // attempt — a superseded rejection reporting it would overwrite the
+          // notice belonging to the user's current gesture with one about a
+          // click they already moved past.
+          if ((getState() as RootState).chat.slotSwitchRequestId === requestId) {
+            const name = (getState() as RootState).dashboard?.slots?.find(s => s.key === key)?.title
+            dispatch(chatSlice.actions.setSwitchSlotGone({ name: name ?? '', kind: 'failed' }))
+          }
+        }
+        return rejectWithValue(payload)
+      }
+      // Status-less errors (a transport failure, a thrown TypeError) cross the
+      // boundary as miniSerializeError. The same announced-gesture contract
+      // applies: say the open failed where the user is looking — gated on the
+      // live claim like the numeric branch above, so a superseded rejection
+      // cannot overwrite the current gesture's notice.
+      if (typeof arg === 'object' && arg !== null && arg.announceOnMissing === true
+          && (getState() as RootState).chat.slotSwitchRequestId === requestId) {
+        const name = (getState() as RootState).dashboard?.slots?.find(s => s.key === key)?.title
+        dispatch(chatSlice.actions.setSwitchSlotGone({ name: name ?? '', kind: 'failed' }))
+      }
       throw e
     }
   },
@@ -2038,7 +2669,7 @@ function mergePreservedThinking<M extends { role: string; content: string; cls?:
       // A PLAIN optimistic send is deliberately NOT resolved this way, even
       // though it carries a `sendId` too: for a non-steer send, "a persisted
       // row with this id exists" does not prove "the turn above this bubble is
-      // over" — crew mode persists the user row as a durable queue entry and
+      // over" — a durable-queue ingress (the retired Crew Mode was one) can persist the user row and
       // starts no turn at all — so recording a boundary there re-opens the
       // over-drop class the text heuristics were retired for. For a steer
       // bubble the inference is sound precisely because the row's own `steer`
@@ -2487,6 +3118,9 @@ export const refreshSlot = createAsyncThunk(
 let warmSeqCounter = 0
 const nextWarmSeq = (): number => ++warmSeqCounter
 
+const configuredDefaultMemoryMode = () =>
+  resolveDefaultMemoryMode(() => api.dashboardConfig())
+
 export const warmSlotCache = createAsyncThunk(
   'chat/warmSlotCache',
   async (key: string, { getState }) => {
@@ -2507,16 +3141,15 @@ export const warmSlotCache = createAsyncThunk(
 
 export const createSlot = createAsyncThunk<
   ChatSlot,
-  { agent?: string; model?: string; mode?: string; memory_mode?: string; clean_mode?: boolean; folder_id?: string | null; title?: string; color_index?: number | null; color_hex?: string | null; project?: string | null; activate?: boolean } | string | undefined,
+  { agent?: string; model?: string; mode?: string; memory_mode?: string; clean_mode?: boolean; folder_id?: string | null; title?: string; color_index?: number | null; color_hex?: string | null; project?: string | null; activate?: boolean; instanceId?: string; adoptRemoteSlot?: string } | string | undefined,
   { fulfilledMeta: { originActiveSlot: string | null; activate: boolean } }
 >(
   'chat/createSlot',
-  async (opts, { dispatch, getState, fulfillWithValue }) => {
+  async (opts, { getState, fulfillWithValue }) => {
     const agent = typeof opts === 'string' ? opts : opts?.agent
     const model = typeof opts === 'string' ? undefined : opts?.model
     const mode = typeof opts === 'string' ? undefined : opts?.mode
-    const memory_mode = typeof opts === 'string' ? undefined : opts?.memory_mode
-    const clean_mode = typeof opts === 'string' ? undefined : opts?.clean_mode
+    const requestedMemoryMode = typeof opts === 'string' ? undefined : opts?.memory_mode
     const folderId = typeof opts === 'string' ? undefined : opts?.folder_id
     // Title at BIRTH, for the same reason folder membership rides this payload:
     // the server pins it (locking the background auto-titler out) and the create
@@ -2531,6 +3164,20 @@ export const createSlot = createAsyncThunk<
       : opts?.project !== undefined
         ? opts.project
         : root.dashboard.slots.find(slot => slot.key === root.chat.activeSlot)?.project
+    // Bind the new session to a connected crew for EXECUTION. Sent at birth, not
+    // patched on afterwards: the backend has to open the peer's slot before it
+    // creates the local one, so a failure leaves nothing behind — patching later
+    // would put a session in the sidebar that looks ready and refuses every send.
+    const instanceId = typeof opts === 'string' ? undefined : opts?.instanceId
+    // ADOPT an EXISTING peer session instead of minting a new one on the peer: the
+    // value is that session's own slot key, as listed by
+    // `GET /api/instances/{id}/chat-slots`. The local slot created here is fresh
+    // either way — only what it binds to changes — so this rides the same create
+    // round-trip rather than a second route. Meaningless without `instanceId`
+    // (the peer that owns the key), which the backend refuses with
+    // `400 adopt_needs_instance` rather than guessing an owner.
+    const adoptRemoteSlot = typeof opts === 'string' ? undefined : opts?.adoptRemoteSlot
+    const clean_mode = typeof opts === 'string' ? undefined : opts?.clean_mode
     // `activate: false` creates the session WITHOUT stealing focus, so a caller
     // that must finish setting the slot up (e.g. scoping it to a worktree) can
     // do so before the user is able to type into it. Defaults to true — every
@@ -2542,7 +3189,14 @@ export const createSlot = createAsyncThunk<
     // pending (e.g. New Chat spun on "Creating" under memory pressure and they
     // moved to another tab), the new slot must NOT hijack the view.
     const originActiveSlot = (getState() as RootState).chat.activeSlot
-    const slot = await api.createChatSlot(undefined, agent, model, mode, memory_mode, title, clean_mode, undefined, folderId || undefined, project)
+    // An explicit Incognito/Temporary menu choice wins. All other dashboard chat
+    // entry points resolve the persisted preference here, before the first turn
+    // can read or write memory. An ADOPT skips the resolution entirely: the
+    // adopted slot inherits the PEER session's mode (see `api.createChatSlot`),
+    // and resolving a local default here would only race it.
+    const memory_mode = requestedMemoryMode
+      || (adoptRemoteSlot ? undefined : await configuredDefaultMemoryMode())
+    const slot = await api.createChatSlot(undefined, agent, model, mode, memory_mode, title, undefined, folderId || undefined, instanceId, adoptRemoteSlot, clean_mode, project)
     const dashState = (getState() as RootState).dashboard
     // An explicit color (e.g. carried from a slot being recreated on a
     // mode switch) wins; otherwise fall back to the default-color policy.
@@ -2594,7 +3248,8 @@ export const createSlot = createAsyncThunk<
     if (project) {
       slot.project = project
       // Await the scope on BOTH paths before publishing the slot. Publishing
-      // via addSlotOptimistic makes the slot selectable (and, when activated,
+      // (dashboardSlice's createSlot.fulfilled matcher) makes the slot
+      // selectable (and, when activated,
       // keys the agents-roster fetch to this optimistic project), so anything
       // that observes the slot before the server records the project runs
       // against the DEFAULT checkout: a turn would execute in the wrong
@@ -2610,7 +3265,10 @@ export const createSlot = createAsyncThunk<
         throw err
       }
     }
-    dispatch(addSlotOptimistic(slot))
+    // No `addSlotOptimistic` here: dashboardSlice registers the slot on this
+    // thunk's `fulfilled` action, so the row and the activation land in one
+    // commit. Everything that must precede publication (colour, project
+    // scope) has already been awaited above.
     // Carry the origin slot in the action meta (fulfillWithValue) rather than on
     // the payload, so it can never leak into the persisted slot object. The
     // fulfilled reducer reads action.meta.originActiveSlot to decide whether
@@ -2688,7 +3346,7 @@ export const resumeFromHistory = createAsyncThunk(
     const cursor = typeof d.next_before === 'number' ? d.next_before : null
     // `surface` (falling back to `mode`) is returned so a caller resuming from
     // a surface that cannot display every slot (ChatPage's unified view only
-    // shows default/orchestrator/crew, see isChatPageSurface) can tell a
+    // shows default/orchestrator, see isChatPageSurface) can tell a
     // silently-unusable resume apart from a genuinely failed one (#3624) --
     // the request succeeds either way, so `ok` alone cannot distinguish them.
     return { ok: d.ok, key: d.key, surface: d.surface ?? d.mode, nextBefore: cursor ?? 0, messages: filterMessages(d.messages || []), hasMore: cursor !== null && (d.has_more || false), total: d.total || 0 }
@@ -2705,16 +3363,56 @@ export const forkSlot = createAsyncThunk(
       ? await api.forkChatSlot(slot, atIndex, prompt, mode, direction, messageId)
       : await api.forkChatSlot(slot, atIndex, prompt, mode, direction)
     if (d.ok) {
-      dispatch(addSlotOptimistic({ key: d.key, title: d.title || d.key, messages: d.messages || 0, running: false, folder_id: d.folder_id }))
+      // memory_mode is the parent's, echoed by the server; without it the new
+      // tab would read as persistent until the next slots refresh.
+      dispatch(addSlotOptimistic({ key: d.key, title: d.title || d.key, messages: d.messages || 0, running: false, folder_id: d.folder_id, memory_mode: d.memory_mode }))
     }
     return d
   },
 )
 
-export const deleteHistorySession = createAsyncThunk(
+/** Delete a history row. A refusal REJECTS WITH A VALUE rather than throwing:
+ *  `api.deleteSession` throws an `ApiError` on any non-2xx, and the thunk
+ *  boundary's `miniSerializeError` keeps string fields only, so a rethrow
+ *  would reach the reducer as a bare message with the status and body gone
+ *  (see utils/thunkError). The payload carries what the notice renders from:
+ *  the row's key and title, plus the gateway's machine-readable `code` (`''`
+ *  when the body carried none -- a dropped connection, a 5xx). The title is
+ *  read from `history` HERE, while the row is still there to read. */
+export const deleteHistorySession = createAsyncThunk<
+  string,
+  string,
+  { rejectValue: HistoryDeleteRefusal }
+>(
   'chat/deleteHistorySession',
-  async (key: string) => { await api.deleteSession(key); return key },
+  async (key, { getState, rejectWithValue }) => {
+    try {
+      await api.deleteSession(key)
+      return key
+    } catch (e) {
+      // Duck-typed on `body`, not `instanceof ApiError`, so a mocked transport
+      // (`Object.assign(new Error(), { status, body })`) reads the same way.
+      const body = (e as { body?: unknown } | null)?.body
+      const title = (getState() as { chat: ChatState }).chat.history.find(s => s.key === key)?.title ?? ''
+      const code = parseErrorCode(typeof body === 'string' ? body : undefined) ?? ''
+      const report = findReport(e instanceof Error ? e.message : '')
+      const refusal: HistoryDeleteRefusal = { key, title, code }
+      return rejectWithValue(report ? { ...refusal, report } : refusal)
+    }
+  },
 )
+
+/** Abort any in-flight older-page fetch. Wired to transcript MOTION: the
+ *  settle gates guard the DISPATCH moment, but a page dispatched during a
+ *  reading pause lands 1-2s later — mid-fling on a phone, where the prepend
+ *  compensation fights the momentum curve (reproduced on the momentum rig as
+ *  ±3000px content jumps during coast). Aborting on motion means a landing
+ *  can only ever commit while the scroller is still; the walk re-dispatches
+ *  when stillness returns. An abort rejection carries no payload, so the
+ *  rejected reducer sets no error flag. */
+export function abortActiveOlderFetch(): void {
+  _abortLoadOlder?.()
+}
 
 export const loadOlderMessages = createAsyncThunk(
   'chat/loadOlder',
@@ -2727,7 +3425,24 @@ export const loadOlderMessages = createAsyncThunk(
     const abort = () => controller.abort()
     _abortLoadOlder = abort
     try {
-      const d = await api.chatSlotDetail(slot, OLDER_PAGE_LIMIT, state.slotOldestIndex, controller.signal)
+      // Landing size is a LAYOUT BURST: on a phone (slow CPU, slow network)
+      // a 300-row landing is a long task during which the anchor
+      // compensation paints late and the reader visibly loses their place
+      // ('突然加载一大堆就不在原来的位置'). Narrow viewports take smaller,
+      // cheaper landings; the walk simply takes more of them.
+      const isNarrow = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+        && window.matchMedia('(max-width: 640px)').matches
+      const walkLimit = isNarrow ? OLDER_PAGE_LIMIT : OLDER_WALK_PAGE_LIMIT
+      const d = await api.chatSlotDetail(slot, walkLimit, state.slotOldestIndex, controller.signal)
+      // LANDING BUFFER: the fetch overlaps the reader's gesture, but the
+      // MUTATION must not -- splicing rows mid-glide races the pre-paint
+      // anchor machinery against the gesture's own pixel-addressed window
+      // recompute (phone rig: kilopixel per-landing jumps whose anchor
+      // consume mis-bound and stood down). Hold the payload until the
+      // scroller has been quiet for a beat; bounded, so a reader who never
+      // pauses still gets the page (see scrollQuiet.ts).
+      await whenScrollQuiet(controller.signal)
+      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError')
       return { slot, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), hasMore: d.has_more || false, total: d.total || 0 }
     } catch (e) {
       // Rethrow a cancellation so the reducer can tell it from a real failure;
@@ -2750,24 +3465,53 @@ export const loadOlderMessages = createAsyncThunk(
   },
 )
 
-export const requestStop = createAsyncThunk(
+/** Shape of the `/stop` reply this thunk reads. `info` is set only on the
+ *  backend's no-op branch (`not running` / `stop already in progress`); a real
+ *  stop answers a bare `{ok: true}`. */
+type StopReply = { ok?: boolean; info?: string; already_stopping?: boolean; error?: string; code?: string } | null | undefined
+
+/** A Stop press's failure, for the host that rendered the button: `null` when
+ *  the request landed (a real stop, an in-flight cancel, a settled no-op, or a
+ *  debounced repeat), otherwise the error message the host must SHOW (#9547
+ *  round 2): a swallowed failure is indistinguishable from the dead Stop
+ *  button this fix exists to remove. */
+export type StopFailure = { error: string } | null
+
+export const requestStop = createAsyncThunk<StopFailure, { slotId: string; force: boolean }>(
   'chat/requestStop',
-  async ({ slotId, force }: { slotId: string; force: boolean }, { getState, dispatch }) => {
+  async ({ slotId, force }, { getState, dispatch }) => {
     const state = (getState() as { chat: ChatState }).chat
     if (!force) {
       const lastPress = state.stopPressedAt[slotId] ?? 0
-      if (Date.now() - lastPress < SOFT_STOP_DEBOUNCE_MS) return
+      if (Date.now() - lastPress < SOFT_STOP_DEBOUNCE_MS) return null
     }
+    // The turn this press is about. A `not running` answer that lands after a
+    // NEWER turn started on the slot must not idle that turn.
+    const epoch = state.runEpoch?.[safeKey(slotId)] ?? 0
     dispatch(chatSlice.actions.setStopPressedAt({ slotId, ts: Date.now() }))
+    let reply: StopReply
     try {
-      if (force) {
-        await api.stopChatSlotForce(slotId)
-      } else {
-        await api.stopChatSlot(slotId)
-      }
-    } catch {
+      reply = (force ? await api.stopChatSlotForce(slotId) : await api.stopChatSlot(slotId)) as StopReply
+    } catch (e) {
       dispatch(chatSlice.actions.setStopPressedAt({ slotId, ts: 0 }))
+      return { error: e instanceof Error ? e.message : String(e) }
     }
+    // A 2xx can still carry a refusal — a peer-bound slot whose crew could
+    // not be reached answers `{ok: false, error, code}` — and `j()` only
+    // throws on non-2xx. That is a failed stop the host must show too.
+    if (reply && reply.ok === false) {
+      dispatch(chatSlice.actions.setStopPressedAt({ slotId, ts: 0 }))
+      return { error: reply.error || reply.code || 'stop refused' }
+    }
+    // The backend found no turn on the slot. Its answer is authoritative and
+    // the client's busy view is what was wrong, so settle it — otherwise the
+    // Stop button stays, every press repeats this no-op, and the user reads
+    // it as "Stop does not work" (#9547). `already_stopping` is the other
+    // no-op (a cancel already in flight) and changes nothing here.
+    if (reply?.info === 'not running' && !reply.already_stopping) {
+      dispatch(chatSlice.actions.settleStopNotRunning({ slot: slotId, epoch }))
+    }
+    return null
   },
 )
 
@@ -3022,16 +3766,15 @@ export const selectSidebarWorkflowActiveKeys = createSelector(
   (active) => Object.keys(active),
 )
 
-/** Keys of sessions with an active goal loop — the same presence-only
- *  contract as `selectSidebarWorkflowActiveKeys`: a mid-loop cycle-count bump
- *  rewrites the map value but leaves this key set (and so, under
- *  `shallowEqual`, the subscriber) untouched. `Object.keys` returns own keys
- *  only, so membership tests over the result are inherently own-property —
- *  the `safeKey` prototype-pollution caveat on direct map reads does not
- *  apply here. */
-export const selectGoalLoopKeys = createSelector(
-  [(state: RootState) => state.chat.goalLoops],
-  (goalLoops) => Object.keys(goalLoops ?? {}),
+/** Slot keys with a live automation. Memoization keeps the sidebar shell from
+ * repainting when only a probe count or terminal detail changes. */
+export const selectSidebarAutomationRunningKeys = createSelector(
+  [(state: RootState) => state.chat.automations],
+  (automations) => Object.values(automations ?? {})
+    .filter(record => record.kind === 'legacy_goal_loop'
+      ? record.active
+      : record.active && !record.terminal)
+    .map(record => record.slotKey),
 )
 
 /**
@@ -3071,7 +3814,8 @@ const CONTINUE_SCAN_SKIP = new Set(['queued', 'tool_call', 'tool_result', 'injec
  * True when the active slot can be handed back to the agent — i.e. Continue is
  * worth offering on an empty composer.
  *
- * The rule is simply "the slot is idle and has a conversation under it". It is
+ * The rule is "the slot is idle and has a conversation under it", except for
+ * a current typed member-memory setup refusal that requires the owner editor. It is
  * NOT limited to turns that visibly died, because a transcript cannot reliably
  * show that they did: a force-quit or force-exit runs no cleanup, so no error
  * row is ever written and a killed turn reads exactly like a finished one (see
@@ -3129,6 +3873,19 @@ export const selectContinuable = (state: RootState): boolean => {
   return false
 }
 
+/** The characters Python's no-argument `str.split()` splits on. JS `\s` is NOT
+ *  the same set: it adds U+FEFF and lacks U+0085 and U+001C-001F, so a `\s`
+ *  scan of the same content can produce a different first token than the
+ *  backend's `content.split()[0]` -- the rule `is_turn_interrupted` and the
+ *  runner's `user_requested_compaction` key on. */
+const PYTHON_WHITESPACE_RE = /[\t\n\v\f\r\u001c-\u001f \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/
+
+/** First whitespace-separated token by PYTHON's splitting rule, or undefined
+ *  for all-whitespace content. Mirrors `content.split()[:1]` in
+ *  `src/kiro_crew/dashboard/state.py`. */
+const firstPythonToken = (content: string): string | undefined =>
+  content.split(PYTHON_WHITESPACE_RE).find(Boolean)
+
 /**
  * True when the transcript SHOWS the last turn ending without the assistant
  * handing the floor back — the user's row is last, or an `error` row trails the
@@ -3141,10 +3898,19 @@ export const selectContinuable = (state: RootState): boolean => {
  *
  * A false result means "nothing in the transcript proves an interruption", never
  * "the turn definitely finished": the force-quit case leaves no evidence.
+ *
+ * A `/compact` answered by its compaction notice (the assistant row tagged
+ * `meta.kind="compaction"`) reads as FINISHED: the slash command IS the whole
+ * request and the notice IS its result. The tag alone cannot decide -- an
+ * automatic compaction can write the same tagged row inside an ordinary turn
+ * whose real reply never arrived, and that tail is a genuine interruption --
+ * so the rule needs BOTH halves, matching `is_turn_interrupted` in
+ * `src/kiro_crew/dashboard/state.py`.
  */
 export const selectTurnInterrupted = (state: RootState): boolean => {
   const msgs = state.chat.messages
   let sawTrailingError = false
+  let sawCompactionResult = false
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
     // A deliberate Stop ENDS the turn; it does not interrupt it. This must be
@@ -3162,8 +3928,25 @@ export const selectTurnInterrupted = (state: RootState): boolean => {
     if (m.role === 'error') { sawTrailingError = true; continue }
     if (CONTINUE_SCAN_SKIP.has(m.role)) continue
     if ((m.role === 'user' || m.role === 'assistant') && m.content) {
-      if (m.role === 'assistant' && isSystemNoticeKind((m.meta as { kind?: string } | undefined)?.kind)) continue
-      return m.role === 'user' ? true : sawTrailingError
+      const meta = m.meta as { kind?: string; notice?: string } | undefined
+      if (m.role === 'assistant' && isSystemNoticeKind(meta?.kind)) {
+        // Remember a compaction RESULT row on the newest turn; whether it
+        // completes the turn depends on the user row it leads back to. The
+        // recycle and stuck-turn notices borrow `kind="compaction"` and mark
+        // themselves with `meta.notice`; they report no compaction, so they
+        // must not complete one.
+        if (meta?.kind === 'compaction' && !meta?.notice) sawCompactionResult = true
+        continue
+      }
+      if (m.role !== 'user') return sawTrailingError
+      // A `/compact` answered by its compaction notice is a FINISHED turn --
+      // unless an error row trails the notice, the same evidence the
+      // plain-assistant branch honors. First-whitespace-token match using
+      // PYTHON's whitespace set (the backend rule is `content.split()`, and
+      // JS `\s` / `trim()` disagree with it on U+FEFF and U+0085), so the two
+      // mirrors cannot split the same content differently.
+      if (sawCompactionResult && firstPythonToken(m.content) === '/compact') return sawTrailingError
+      return true
     }
   }
   return false
@@ -3196,18 +3979,25 @@ const chatSlice = createSlice({
   initialState,
   reducers: {
     setActiveSlot(state, action: PayloadAction<string | null>) { state.activeSlot = action.payload; state.slotState = 'idle'; state.pendingTurnSlot = null },
-    clearSlotState(state) { state.messages = []; state.toolLog = []; state.subagents = {}; state.activityTab = 'changes'; state.slotRunning = false; state.slotStopping = false; state.slotState = 'idle'; setPagingCursor(state, false, 0); state.loadingOlder = false; state.lastChunkSeq = undefined; state._wsChunkedDuringFetch = false; state.slotStatusDetail = {}; state.voicePlaying = false; state.voiceAudio = null; if (state.activeSlot) delete state.pendingQuestions?.[state.activeSlot]; state.pendingTurnSlot = null },
+    clearSlotState(state) { state.messages = []; state.toolLog = []; state.subagents = {}; state.activityTab = 'changes'; state.slotRunning = false; state.slotStopping = false; state.slotState = 'idle'; setPagingCursor(state, false, 0); state.loadingOlder = false; state.lastChunkSeq = undefined; state.lastChunkGen = undefined; state._wsChunkedDuringFetch = false; state.slotStatusDetail = {}; state.voicePlaying = false; state.voiceAudio = null; if (state.activeSlot) delete state.pendingQuestions?.[state.activeSlot]; state.pendingTurnSlot = null },
     setPendingInput(state, action: PayloadAction<string | null>) { state.pendingInput = action.payload },
     setAgentSwitchNotice(state, action: PayloadAction<string | null>) {
       // Always create a fresh value so repeating the same refusal restarts the
       // App shell's expiry effect instead of inheriting the previous timer.
       state.agentSwitchNotice = action.payload === null ? null : { message: action.payload }
     },
+    /** See `switchSlotGone` on ChatState. Set by `switchSlot`'s catch for an
+     *  `announceOnMissing` caller whose target 404ed. */
+    setSwitchSlotGone(state, action: PayloadAction<{ name: string; kind: 'gone' | 'failed' }>) { state.switchSlotGone = action.payload },
+    clearSwitchSlotGone(state) { state.switchSlotGone = null },
     /** Dismiss the unresumable-surface notice (#5925). Deliberately does NOT
      *  clear `lastResumeRequestId`: that ordering token belongs to the resume
      *  in flight, and forgetting it would let an older resume's late answer
      *  re-open a notice the user just closed. */
     clearUnresumableResume(state) { state.unresumableResume = null },
+    /** Dismiss the refused-delete notice. The row stays in `history`: nothing
+     *  was deleted, and the user retries from the sidebar as before. */
+    clearUndeletableHistory(state) { state.undeletableHistory = null },
     setQuestionCard(state, action: PayloadAction<{ slot: string; ask_id?: string; card_id?: string; questions: ChatState['pendingQuestions'][string]['questions']; fresh?: boolean }>) {
       // Defensive init: existing test fixtures build partial preloaded state
       // without this key.
@@ -3546,20 +4336,13 @@ const chatSlice = createSlice({
     },
     removeThinking(state) { state.messages = state.messages.filter(m => m.role !== 'thinking') },
     /** Retire a bubble's "pending confirmation" state once the send's own HTTP
-     *  response accepted it (`ok` or `queued`).
-     *
-     *  This is the PRIMARY confirmation path, not a fallback. The `chat_message`
-     *  echo that `reconcileOptimisticEcho` waits for is only broadcast for rows
-     *  the composer did NOT render — a message typed in a channel and replayed
-     *  into the slot (`channel_slots`, the sole `broadcast_user=True` caller).
-     *  `DashboardState.append` suppresses it for every dashboard send by design,
-     *  precisely BECAUSE the composer already rendered the bubble, so waiting on
-     *  it left every composer bubble optimistic forever and the 30s sweep flagged
-     *  all of them (#4131).
+     *  response accepted it as an immediate turn. A correlated user echo can
+     *  also confirm it; the receipt remains useful if that echo was missed.
+     *  Never insert here: the user echo supplies a skipped bubble before the
+     *  reply, independently of receipt timing.
      *
      *  Clears only the pending-confirmation flags and deliberately KEEPS
-     *  `sendId`: a channel-linked slot can still deliver a later echo, and
-     *  `reconcileOptimisticEcho` needs that id to update this row in place
+     *  `sendId`: a later echo needs that id to update this row in place
      *  instead of pushing a duplicate bubble.
      *
      *  Scans BOTH arrays rather than resolving the slot's own: `appendMessage`
@@ -3579,8 +4362,7 @@ const chatSlice = createSlice({
           delete meta.optimistic
           // Stamp the server-minted row id the receipt carried back. The bubble
           // was appended client-side with only a `sendId` (no server identity),
-          // and no `chat_message` echo carries the `mid` for a dashboard send,
-          // so this is the only point it can land before the chat_done refresh.
+          // so either the user echo or this receipt can supply its identity.
           // The message-pin control is gated on `meta.mid`, so without it the
           // just-sent message cannot be pinned for the whole turn. Only set when
           // the row has none yet — never overwrite a `mid` a refresh already
@@ -3601,7 +4383,8 @@ const chatSlice = createSlice({
      *  already broadcast a `queue_push` — including the turn teardown, which is
      *  why the requeued arm does not re-broadcast. That card owns the text, so
      *  the bubble is REMOVED or the same message renders twice. A receipt with
-     *  neither flag raced `chat_done` onto a new turn: only the flag drops.
+     *  neither flag raced `chat_done` onto a new turn: only the flag drops. No
+     *  receipt in time: the caller takes the `queued` (drop) arm -- see below.
      *
      *  Both modes need the bubble still `optimistic` — once an echo or
      *  `confirmOptimisticSend` cleared that, the server owns the row. Scans BOTH
@@ -3616,6 +4399,12 @@ const chatSlice = createSlice({
           const m = msgs[i]
           if (m.role !== 'user' || m.meta?.sendId !== sendId) continue
           if (!m.meta?.steer || !m.meta?.optimistic) return true
+          // The drop arm. Also taken for a steer whose receipt never came (the
+          // transport's deadline aborted the POST and the text went back to the
+          // composer): a bubble left standing would read as delivered, and a
+          // late `steer_push` echo that does arrive re-creates the row from the
+          // server's copy (reconcileOptimisticEcho appends when no row carries
+          // the sendId).
           if (outcome === 'queued') { msgs.splice(i, 1); return true }
           const meta = { ...(m.meta || {}) }
           delete meta.steer
@@ -3701,16 +4490,62 @@ const chatSlice = createSlice({
     startLocalTurn(state, action: PayloadAction<string>) {
       const slot = action.payload
       state.pendingTurnSlot = slot
+      bumpRunEpoch(state, slot)
       if (slot === state.activeSlot) state.slotRunning = true
+    },
+    /** The inverse of `startLocalTurn` for a send that did NOT start a turn
+     *  (refused, or never left). Slot-keyed like its counterpart: only the slot
+     *  the send was for loses its pending mark, and only when that slot is the
+     *  active one does the visible footer change -- a failure that lands after
+     *  the user switched to a RUNNING session must not clear that session's
+     *  running state (which `setSlotRunning(false)` would). */
+    endLocalTurn(state, action: PayloadAction<string>) {
+      const slot = action.payload
+      if (state.pendingTurnSlot === slot) state.pendingTurnSlot = null
+      if (slot === state.activeSlot) state.slotRunning = false
     },
     /** Reconcile the active slot's running state from a WS slots broadcast.
      *  running=true is always trusted (also catches Slack/cron-initiated turns);
      *  running=false is ignored while a local turn is pending confirmation, since
      *  the snapshot may predate the send. Turn end is owned by _done/refreshSlot. */
-    syncSlotRunningFromServer(state, action: PayloadAction<{ slot: string; running: boolean; stopping: boolean }>) {
-      const { slot, running, stopping } = action.payload
-      if (slot !== state.activeSlot) return
+    syncSlotRunningFromServer(state, action: PayloadAction<{ slot: string; running: boolean; stopping: boolean; epoch?: number }>) {
+      const { slot, running, stopping, epoch } = action.payload
+      if (slot !== state.activeSlot) {
+        // A BACKGROUND slot (a member DM thread, a split pane) keeps its run
+        // state in `slotRun`, written only by ordered live frames (chunk /
+        // tool -> busy, _done -> idle). Nothing else ever idled it: a `_done`
+        // that never reached this tab — a turn that died with the gateway, a
+        // frame lost across a socket drop — left the pane busy for good, so
+        // its composer kept offering a Stop button for a turn the backend had
+        // long finished, and every press came back `not running` (#9547).
+        // The slots snapshot IS the server's answer, so take the idle
+        // direction from it. Only that direction: the running direction stays
+        // with the live frames (see warmSlotCache.fulfilled for why a snapshot
+        // may not promote a pane to busy).
+        if (isUnsafeKey(slot)) return
+        if (running) return
+        // The snapshot answered about the turn the caller OBSERVED running.
+        // A turn that started since — its first live frame bumped the epoch —
+        // is not that turn, and idling it here would finalize its streaming
+        // row mid-reply and split it (GPT round 7). Same guard as
+        // `settleStopNotRunning`.
+        if (epoch !== undefined && (state.runEpoch?.[safeKey(slot)] ?? 0) !== epoch) return
+        // Optional: tests and older persisted shapes preload a partial state.
+        const run = state.slotRun?.[safeKey(slot)]
+        if (!run || run.state === 'idle') return
+        // `stopping` is ignored on purpose: a slot that is not running has
+        // nothing left to stop, whatever flag the cancel left behind.
+        run.state = 'idle'
+        run.lastChunkSeq = undefined
+        syncOriginRun(state, slot, 'idle')
+        // The `_done` this settlement stands in for would also have finalized
+        // the trailing streaming row; a reply left as `streaming` hides its
+        // final-only rendering and actions (GPT round 3).
+        finalizeTrailingStreaming(state.slotMessages?.[safeKey(slot)] ?? [])
+        return
+      }
       if (running) {
+        if (!state.slotRunning) bumpRunEpoch(state, slot)
         state.slotRunning = true
         state.slotStopping = stopping
         state.pendingTurnSlot = null
@@ -3722,6 +4557,43 @@ const chatSlice = createSlice({
       // prior turn can't falsely show a "stopping" state on the new turn.
     },
     setSlotStopping(state, action: PayloadAction<boolean>) { state.slotStopping = action.payload },
+    /** The backend answered a Stop press with `not running`: nothing is in
+     *  flight on that slot, so whatever made this tab think otherwise is
+     *  stale. Settle the client's own view to match, on whichever path holds
+     *  it (the active mirror or a background slot's `slotRun`), so the
+     *  composer stops offering a Stop button that can never do anything and
+     *  the press has a visible result (#9547). */
+    settleStopNotRunning(state, action: PayloadAction<{ slot: string; epoch?: number }>) {
+      const { slot, epoch } = action.payload
+      if (isUnsafeKey(slot)) return
+      // A turn that STARTED after the press was made is not the one the
+      // backend answered about: a delayed reply must not idle it.
+      if (epoch !== undefined && (state.runEpoch?.[safeKey(slot)] ?? 0) !== epoch) return
+      if (slot === state.activeSlot) {
+        // A send still awaiting its first frame owns this slot's running state:
+        // the backend answered "not running" because the turn had not been
+        // registered yet, not because it is gone. Settling here would reopen
+        // the composer mid-send and invite a duplicate turn; the same guard
+        // syncSlotRunningFromServer applies to a stale snapshot applies to this
+        // answer. startLocalTurn/endLocalTurn and the first live frame own the
+        // mark's lifecycle.
+        if (state.pendingTurnSlot === slot) return
+        state.slotRunning = false
+        state.slotStopping = false
+        state.slotState = 'idle'
+        state.lastChunkSeq = undefined
+        finalizeTrailingStreaming(state.messages)
+        return
+      }
+      const run = state.slotRun?.[safeKey(slot)]
+      if (!run || run.state === 'idle') return
+      run.state = 'idle'
+      run.lastChunkSeq = undefined
+      syncOriginRun(state, slot, 'idle')
+      // Stand-in for the `_done` that never came: finalize the trailing
+      // streaming row as that frame would have (GPT round 3).
+      finalizeTrailingStreaming(state.slotMessages?.[safeKey(slot)] ?? [])
+    },
     setStopPressedAt(state, action: PayloadAction<{ slotId: string; ts: number }>) {
       if (isUnsafeKey(action.payload.slotId)) return
       state.stopPressedAt[safeKey(action.payload.slotId)] = action.payload.ts
@@ -3850,32 +4722,45 @@ const chatSlice = createSlice({
       if (n === 0) delete state.subagentQueued[safeKey(action.payload.slot)]
       else state.subagentQueued[safeKey(action.payload.slot)] = n
     },
-    /** Replace the whole goal-loop map from a cold `GET /api/autonudge` seed.
-     *  A full replace (not a merge) is correct here: the response is the
-     *  service's complete registry, so a loop this client still holds but the
-     *  server no longer reports has ended and must disappear. */
-    setGoalLoops(state, action: PayloadAction<{ slot: string; active: boolean; cycle_count: number; max_cycles: number }[]>) {
-      const next: Record<string, { cycle_count: number; max_cycles: number }> = {}
-      for (const loop of action.payload) {
-        if (!loop.active || isUnsafeKey(loop.slot)) continue
-        next[safeKey(loop.slot)] = {
-          cycle_count: Math.max(0, Math.floor(Number(loop.cycle_count) || 0)),
-          max_cycles: Math.max(0, Math.floor(Number(loop.max_cycles) || 0)),
+    /** Reconcile whichever independent REST snapshots completed successfully.
+     * A failed read is unknown, not an authoritative empty collection. */
+    setAutomations(state, action: PayloadAction<{
+      records: AutomationRecord[]
+      legacyComplete: boolean
+      structuredComplete: boolean
+      protectedSlots?: string[]
+    }>) {
+      const next: Record<string, AutomationRecord> = { ...(state.automations ?? {}) }
+      const protectedSlots = new Set(action.payload.protectedSlots ?? [])
+      for (const [key, record] of Object.entries(next)) {
+        if (!protectedSlots.has(record.slotKey)
+          && ((record.kind === 'legacy_goal_loop' && action.payload.legacyComplete)
+          || (record.kind === 'structured_monitor' && action.payload.structuredComplete))) {
+          delete next[key]
         }
       }
-      state.goalLoops = next
-    },
-    /** Upsert (or drop) one loop from an `autonudge_state` WS event. */
-    sseGoalLoop(state, action: PayloadAction<{ slot: string; active: boolean; cycle_count: number; max_cycles: number }>) {
-      const { slot, active } = action.payload
-      if (isUnsafeKey(slot)) return
-      // Same partial-preloaded-state tolerance as subagentQueued above.
-      state.goalLoops ??= {}
-      if (!active) { delete state.goalLoops[safeKey(slot)]; return }
-      state.goalLoops[safeKey(slot)] = {
-        cycle_count: Math.max(0, Math.floor(Number(action.payload.cycle_count) || 0)),
-        max_cycles: Math.max(0, Math.floor(Number(action.payload.max_cycles) || 0)),
+      for (const record of action.payload.records) {
+        if (isUnsafeKey(record.slotKey)) continue
+        if (record.kind === 'legacy_goal_loop' && !record.active) continue
+        next[safeKey(record.slotKey)] = record
       }
+      state.automations = next
+    },
+    /** Upsert one normalized WS or mutation result into the same collection. */
+    sseAutomation(state, action: PayloadAction<AutomationRecord>) {
+      const record = action.payload
+      if (isUnsafeKey(record.slotKey)) return
+      state.automations ??= {}
+      if (record.kind === 'legacy_goal_loop' && !record.active) {
+        delete state.automations[safeKey(record.slotKey)]
+        return
+      }
+      state.automations[safeKey(record.slotKey)] = record
+    },
+    removeAutomation(state, action: PayloadAction<string>) {
+      if (isUnsafeKey(action.payload)) return
+      state.automations ??= {}
+      delete state.automations[safeKey(action.payload)]
     },
     sseSubagentPending(state, action: PayloadAction<{ slot: string; id: string; task: string; approval_id: string }>) {
       if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
@@ -4005,7 +4890,7 @@ const chatSlice = createSlice({
       state.selectedSubagentId = action.payload
     },
     /** "Dismiss done": drop terminal cards for a slot (backend clear is the
-     *  caller's job via DELETE /api/spawn; this trims the local view). */
+     *  caller's job via per-id DELETE /api/spawn/{id}; this trims the local view). */
     clearTerminalSubagents(state, action: PayloadAction<{ slot: string }>) {
       const slot = action.payload.slot
       if (isUnsafeKey(slot)) return
@@ -4329,8 +5214,14 @@ const chatSlice = createSlice({
     },
     sseSubagentSnapshot(state, action: PayloadAction<{ id: string; slot: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean; idle_secs?: number }>) {
       const d = action.payload
-      if (isUnsafeKey(d.slot) || isUnsafeKey(d.id)) return
-      const subs = d.slot && d.slot !== state.activeSlot
+      // A snapshot without an owning slot is an orphan, not evidence that it
+      // belongs to whichever chat this browser happens to show. Popout windows
+      // cold-subscribe to the complete replay after activating their own slot;
+      // treating `slot: ''` as the active map made every such window adopt all
+      // unresolved-parent agents. Fail closed: ownerless runs remain available
+      // through the global spawn inventory, but never appear inside a chat.
+      if (!d.slot || isUnsafeKey(d.slot) || isUnsafeKey(d.id)) return
+      const subs = d.slot !== state.activeSlot
         ? (state.slotActivity[safeKey(d.slot)] ??= { toolLog: [], subagents: {} }).subagents
         : state.subagents
       const existing = subs[d.id]
@@ -4699,8 +5590,9 @@ const chatSlice = createSlice({
       if (open?.role === 'thinking') { open.content += content; return }
       state.messages.splice(at, 0, { role: 'thinking', content, cls: '', meta: { clientTs: mintMsgId() } })
     },
-    sseChatMessage(state, action: PayloadAction<{ slot: string; role: string; content: string; ts?: string; seq?: number; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean }>) {
-      const { slot, role, content, ts, seq, cls, meta, kind, batched } = action.payload
+    sseChatMessage(state, action: PayloadAction<{ slot: string; role: string; content: string; ts?: string; seq?: number; gen?: string; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean; parts?: BatchedChunkPart[] }>) {
+      const { slot, role, ts, seq, gen, cls, meta, kind, batched, parts } = action.payload
+      let content = action.payload.content
       if (slot !== state.activeSlot) { applyNonActiveFrame(state, action.payload); return }
       // stop_event — replace in place by id, or insert new
       const effectiveKind = kind ?? (meta?.kind as string | undefined)
@@ -4718,6 +5610,25 @@ const chatSlice = createSlice({
       }
       // WS chunk — accumulate into streaming message, preserve rawText
       if (role === 'chunk') {
+        // Replay floor, owned here. `state.lastChunkSeq` is raised by a
+        // snapshot's trailing streaming row (switchSlot / refreshSlot) and by
+        // every applied chunk. A batched frame carries each chunk's seq in
+        // `parts`; only the parts above the floor are appended, and a frame with
+        // nothing above it leaves the slot untouched. A direct (non-batched)
+        // chunk at or below the floor is a replayed seq and is dropped whole.
+        // A frame from another gateway generation replaces the floor first
+        // (floorForGen).
+        state.lastChunkSeq = floorForGen(state.lastChunkSeq, state.lastChunkGen, gen)
+        if (gen !== undefined) state.lastChunkGen = gen
+        if (batched && parts) {
+          const kept = batchedTextAboveFloor(parts, state.lastChunkSeq)
+          if (kept === undefined) return
+          content = kept
+        }
+        if (!batched && seq !== undefined && state.lastChunkSeq !== undefined && seq <= state.lastChunkSeq) {
+          return
+        }
+        if (state.slotState === 'idle') bumpRunEpoch(state, slot)
         state.slotState = 'streaming'
         state._wsChunkedDuringFetch = true
         // Drop only the empty "Thinking…" placeholder; keep content-bearing
@@ -4741,9 +5652,10 @@ const chatSlice = createSlice({
           const msg = state.messages[streamIdx]
           // Defensive non-batched gap detection. The live WS path always sets
           // `batched` — the useWebSocket flush buffer owns gap detection across
-          // the chunks it merges and inlines the marker itself — so this branch
-          // only runs for a direct (test/legacy) non-batched chunk dispatch. It
-          // shares missedChunkMarker with the buffer so the two cannot drift.
+          // the chunks it merges and inlines the marker into each part's text —
+          // so this branch only runs for a direct (test/legacy) non-batched
+          // chunk dispatch. It shares missedChunkMarker with the buffer so the
+          // two cannot drift.
           if (!batched && seq !== undefined && state.lastChunkSeq !== undefined) {
             msg.content += missedChunkMarker(state.lastChunkSeq, seq)
           }
@@ -4776,6 +5688,7 @@ const chatSlice = createSlice({
       // Compacting — block input, show footer indicator (no visible message)
       if (role === 'compacting') {
         if (action.payload.slot && action.payload.slot !== state.activeSlot) return
+        if (state.slotState === 'idle') bumpRunEpoch(state, slot)
         state.slotState = 'compacting'
         state.slotRunning = true
         return
@@ -4811,8 +5724,12 @@ const chatSlice = createSlice({
       // placed after the redelivery guard so a replayed frame cannot clear a
       // live card (see dropStaleStatelessQuestion).
       dropStaleStatelessQuestion(state, slot, role)
+      // An inject row starts a turn like a user message does (see runEpoch);
+      // a passive `/note` does not (GPT round 10).
+      if (role === 'inject' && !isNoteRow({ cls, meta })) bumpRunEpoch(state, slot)
       // Tool call — update state, insert before streaming message
       if (role === 'tool') {
+        if (state.slotState === 'idle') bumpRunEpoch(state, slot)
         state.slotState = 'tool_running'
         // Insert tool before any trailing streaming message so
         // chat_segment can still find and finalize it with redacted text.
@@ -4848,6 +5765,7 @@ const chatSlice = createSlice({
         // A steered message does not start a new turn — skip the "stale permissions"
         // cleanup so the approval bar remains visible and answerable (#1667).
         if (!meta?.steer) {
+          bumpRunEpoch(state, slot)
           state.toolLog = []
           // Auto-resolve any stale permissions from previous turn so they don't block the new turn
           for (const m of state.messages) {
@@ -4906,9 +5824,14 @@ const chatSlice = createSlice({
       const cached = state.slotMessages[slot]
       if (cached) apply(cached)
     },
-    /** Remove the first queued message matching content and append a user bubble at the end. */
-    removeQueuedMessage(state, action: PayloadAction<{ slot: string; content: string; queue_id?: string }>) {
-      const { slot, content, queue_id } = action.payload
+    /** Remove the first queued message matching content and append a user bubble at the end.
+     *  The frame's `meta` (the entry's attachment lists, `files` / `dirs`) rides
+     *  onto the rebuilt row: no `chat_message` echo follows for a user row, so
+     *  this rebuild IS the row until the next reload, and without the lists the
+     *  renderer resolves `[attached_file N]` markers by whitespace -- a spaced
+     *  path (`/tmp/My Report.pdf`) truncates to `/tmp/My`. */
+    removeQueuedMessage(state, action: PayloadAction<{ slot: string; content: string; queue_id?: string; meta?: Record<string, unknown> }>) {
+      const { slot, content, queue_id, meta } = action.payload
       const msgs = slot === state.activeSlot ? state.messages : state.slotMessages[slot]
       if (!msgs) return
       const idx = queue_id
@@ -4917,7 +5840,7 @@ const chatSlice = createSlice({
       if (idx >= 0) {
         const ts = msgs[idx].ts
         msgs.splice(idx, 1)
-        msgs.push({ role: 'user', content, cls: 'msg msg-u', ts })
+        msgs.push({ role: 'user', content, cls: 'msg msg-u', ts, ...(meta && Object.keys(meta).length ? { meta } : {}) })
         // Deliberately NO card retirement here. Three review rounds each found
         // a different way this path could retire the wrong card (system queue
         // items hydrated as indistinguishable rows; duplicate rows from the
@@ -5020,6 +5943,7 @@ const chatSlice = createSlice({
         // even when it is empty.
         if (action.payload.length === 0 && !seenSnapshot) return
         reconcileSlotResidue(state, action.payload)
+        clearFiledFolderSuggestions(state, action.payload)
       })
       /** The other authoritative slot-list writer. A request's reply is
        *  authoritative even when empty — nothing to disambiguate — so this is
@@ -5031,6 +5955,16 @@ const chatSlice = createSlice({
       .addCase(fetchSlots.fulfilled, (state, action) => {
         if (state.slotsSnapshotSeen === true) return
         reconcileSlotResidue(state, action.payload)
+        // Gated behind the snapshot bit like the residue reconcile above, and
+        // for the same staleness reason: an HTTP reply can be OLDER than the WS
+        // stream. A filed slot's key can be reused by a fresh session that has
+        // already received its own suggestion card; a pre-reuse reply still
+        // names the key with folder_id set, and clearing on it would delete the
+        // replacement's one-shot card — which the backend never re-offers. The
+        // WS path has no such window (suggestion frames and slots frames arrive
+        // in order on one socket), so after the first live snapshot the frames
+        // own this cleanup exclusively.
+        clearFiledFolderSuggestions(state, action.payload)
       })
       .addCase(fetchHistory.fulfilled, (state, action) => {
         const { sessions, hasMore, offset, append } = action.payload
@@ -5039,6 +5973,12 @@ const chatSlice = createSlice({
         state.historyOffset = offset + sessions.length
       })
       .addCase(switchSlot.pending, (state, action) => {
+        // A new USER gesture supersedes the previous gone-notice — and only a
+        // user gesture: `announceOnMissing` is exactly the user-facing-gesture
+        // marker (see SwitchSlotArg). Programmatic switches (route sync, the
+        // rejected restore's follow-ups, creation flows) must not eat a notice
+        // the user has not seen.
+        if (typeof action.meta.arg === 'object' && action.meta.arg !== null && action.meta.arg.announceOnMissing === true) state.switchSlotGone = null
         const target = switchSlotKey(action.meta.arg)
         // Must precede the reassignment below: true while the active slot's own
         // switch is in flight, i.e. while `slotHasMore` is still the old chat's.
@@ -5090,6 +6030,22 @@ const chatSlice = createSlice({
         }
         // Restore target slot's activity (or empty)
         loadSlotActivity(state, target)
+        // The replay floor is per slot (each slot numbers its own chunks). Park
+        // the outgoing slot's floor on its background run entry (raise, never
+        // lower, so a frame that moved it past an earlier snapshot is not
+        // undone) and take over the target's, which its background frames
+        // maintain: carrying A's higher floor into a running B would drop B's
+        // opening chunks as replays.
+        const runs = (state.slotRun ??= {})
+        if (state.activeSlot !== null && state.activeSlot !== target && !isUnsafeKey(state.activeSlot)) {
+          const outgoing = (runs[safeKey(state.activeSlot)] ??= { state: 'idle' })
+          outgoing.lastChunkSeq = raiseChunkSeq(floorForGen(outgoing.lastChunkSeq, outgoing.lastChunkGen, state.lastChunkGen), state.lastChunkSeq)
+          if (state.lastChunkGen !== undefined) outgoing.lastChunkGen = state.lastChunkGen
+        }
+        if (target !== state.activeSlot) {
+          state.lastChunkSeq = runs[safeKey(target)]?.lastChunkSeq
+          state.lastChunkGen = runs[safeKey(target)]?.lastChunkGen
+        }
         // Set activeSlot immediately so WS events for the new slot are accepted.
         // Restore cached messages if available (instant switch), otherwise show loading.
         state.activeSlot = target
@@ -5113,7 +6069,12 @@ const chatSlice = createSlice({
         const { key, messages, running, hasMore, queue, nextBefore } = action.payload
         if (isUnsafeKey(key)) return
         if (state.activeSlot !== key) return  // user switched away during fetch
-        retainServerTotal(state, key, action.payload.total, running)
+        // A payload carrying `comparableTotal` came from the coverage retry: its
+        // own `total` is the raw unbounded count, the carried one is the settled
+        // bounded count, and only the latter may become the baseline.
+        const comparable = (action.payload as { comparableTotal?: number }).comparableTotal
+        retainServerTotal(state, key, comparable ?? action.payload.total, running,
+          undefined, comparable !== undefined || action.payload.boundedRead)
         state.slotState = running ? 'streaming' : 'idle'
         // Mark stale permissions as resolved so ApprovalBar ignores them
         if (!running) {
@@ -5201,6 +6162,21 @@ const chatSlice = createSlice({
         state.slotRunning = running
         state.slotStopping = action.payload.stopping ?? false
         state.pendingTurnSlot = null
+        // Seed the replay guard from the PURE fetched page: its trailing
+        // streaming row carries the newest chunk seq the server folded into
+        // it, so a live chunk racing this snapshot is dropped, not re-appended.
+        // Seqs are the slot's and never restart, so a snapshot from an earlier
+        // turn can only sit at or below the live floor (raise, never lower). A
+        // snapshot of a slot that is NOT running says no stream is in flight:
+        // the floor is cleared, so a gateway restart (which does restart the
+        // counter) cannot leave a stale floor over the next turn's chunks.
+        if (running) {
+          const snapGen = snapshotChunkGen(messages)
+          state.lastChunkSeq = raiseChunkSeq(floorForGen(state.lastChunkSeq, state.lastChunkGen, snapGen), snapshotChunkSeq(messages))
+          if (snapGen !== undefined) state.lastChunkGen = snapGen
+        } else {
+          state.lastChunkSeq = undefined
+        }
         /* The cursor is a row OFFSET, not the array's first row, so keeping a head
          * above the page without shifting it made the next "load earlier" re-fetch
          * exactly the rows just kept. `loadOlderMessages` dedupes them, so the
@@ -5270,6 +6246,16 @@ const chatSlice = createSlice({
         // as transient below: the target is real, so keeping it selected with an
         // empty pane lets a retry succeed.
         if (!keepTarget && origin && origin.key !== target && isMissingSlotError(action.payload ?? action.error)) {
+          // The floor is per slot: park whatever the target accrued on its run
+          // entry and take the origin's back from where `pending` parked it.
+          const runs = (state.slotRun ??= {})
+          if (!isUnsafeKey(target)) {
+            const gone = (runs[safeKey(target)] ??= { state: 'idle' })
+            gone.lastChunkSeq = raiseChunkSeq(floorForGen(gone.lastChunkSeq, gone.lastChunkGen, state.lastChunkGen), state.lastChunkSeq)
+            if (state.lastChunkGen !== undefined) gone.lastChunkGen = state.lastChunkGen
+          }
+          state.lastChunkSeq = runs[safeKey(origin.key)]?.lastChunkSeq
+          state.lastChunkGen = runs[safeKey(origin.key)]?.lastChunkGen
           state.activeSlot = origin.key
           // Re-hydrate the cached page when one exists, [] otherwise. The cache
           // can be older than the pane was (a cleared or transiently-failed pane
@@ -5324,7 +6310,7 @@ const chatSlice = createSlice({
         const { key, messages, running, hasMore, queue, nextBefore } = action.payload
         if (isUnsafeKey(key)) return
         if (state.activeSlot !== key) return  // user switched away
-        retainServerTotal(state, key, action.payload.total, running)
+        retainServerTotal(state, key, action.payload.total, running, undefined, action.payload.boundedRead)
         // Merge permission messages: prefer state perms (have frontend resolved flags)
         // but include API perms for any we don't have locally (e.g. arrived while disconnected)
         const statePerms = new Map<string, typeof state.messages[0]>()
@@ -5413,6 +6399,19 @@ const chatSlice = createSlice({
         state.slotRunning = running
         state.slotStopping = action.payload.stopping ?? false
         state.pendingTurnSlot = null
+        // Same seeding as switchSlot: this refresh is the reconnect recovery,
+        // and the frames that raced it are exactly the ones it must not let
+        // through a second time (the duplicated leading fragment).
+        // A snapshot of a slot that is NOT running says no stream is in flight:
+        // the floor is cleared, so a lost `_done` cannot leave the closed
+        // turn's seq in place to swallow the next turn's opening chunks.
+        if (running) {
+          const snapGen = snapshotChunkGen(messages)
+          state.lastChunkSeq = raiseChunkSeq(floorForGen(state.lastChunkSeq, state.lastChunkGen, snapGen), snapshotChunkSeq(messages))
+          if (snapGen !== undefined) state.lastChunkGen = snapGen
+        } else {
+          state.lastChunkSeq = undefined
+        }
         setPagingCursor(state, keptCursor.hasMore, keptCursor.nextBefore)
         seedContextUsage(state, key, action.payload.context)
       })
@@ -5547,7 +6546,7 @@ const chatSlice = createSlice({
         const boundedLen = boundaryIdx >= 0 ? boundaryIdx + 1 : pageRows.length
         writeSlotPage(state, key, revived, warmIsPrefix ? hasMore : undefined,
           warmIsPrefix && hasMore ? boundedLen : undefined)
-        retainServerTotal(state, key, total, running, warmSeq)
+        retainServerTotal(state, key, total, running, warmSeq, action.payload.boundedRead)
         // Idle the per-slot run indicator only when the server says the turn is
         // NOT running. This is a pure non-regression gate for the reconnect
         // caller (which warms slots MID-TURN): idling is idempotent with the
@@ -5575,6 +6574,19 @@ const chatSlice = createSlice({
           // fulfillment landing mid-switch could mark a mid-turn origin idle
           // and the restore would unlock its composer. Only the ORDERED frame
           // writers in applyNonActiveFrame feed syncOriginRun.
+        } else {
+          // A running pane's warm carries the newest chunk seq its streaming
+          // row stands for; raise (never lower) the background replay floor so
+          // a live chunk that raced this warm is not applied a second time.
+          // Only the floor moves: run.state stays with the ordered frame
+          // writers for the reason given above.
+          const seeded = snapshotChunkSeq(messages)
+          if (seeded !== undefined) {
+            const run = (state.slotRun[safeKey(key)] ??= { state: 'idle' })
+            const snapGen = snapshotChunkGen(messages)
+            run.lastChunkSeq = raiseChunkSeq(floorForGen(run.lastChunkSeq, run.lastChunkGen, snapGen), seeded)
+            if (snapGen !== undefined) run.lastChunkGen = snapGen
+          }
         }
         seedContextUsage(state, key, action.payload.context)
       })
@@ -5587,8 +6599,8 @@ const chatSlice = createSlice({
         state.creatingSlot = false
         // Switched-away guard: if the user moved to a different
         // session while this create was pending (a slow "Creating…" under memory
-        // pressure), do NOT hijack the view. The new slot is already registered
-        // via addSlotOptimistic; just leave the user where they are. Mirrors the
+        // pressure), do NOT hijack the view. The new slot is registered by
+        // dashboardSlice on this same action; just leave the user where they are. Mirrors the
         // guard switchSlot/refreshSlot/warmSlotCache already have. `send()`'s
         // forceNew path and welcome-screen New Chat both leave activeSlot equal
         // to the origin, so they still activate normally.
@@ -5609,6 +6621,15 @@ const chatSlice = createSlice({
           state.slotHistory = pushHistory(state.slotHistory, state.activeSlot)
         }
         state.activeSlot = action.payload.key
+        // The replay floor belongs to the slot that was streaming, not to this
+        // one. `state.lastChunkSeq` is the ACTIVE slot's floor, and a brand-new
+        // chat has no replay history at all — carrying the outgoing slot's floor
+        // in makes this slot's own opening chunks look like replays (they share
+        // the process generation, so `floorForGen` keeps the floor) and the
+        // reducer drops them. Cleared rather than parked-and-restored, because
+        // there is nothing to restore for a slot that has never streamed.
+        state.lastChunkSeq = undefined
+        state.lastChunkGen = undefined
         state.messages = []
         state.toolLog = []
         state.subagents = {}
@@ -5702,6 +6723,14 @@ const chatSlice = createSlice({
           // (see switchSlot for why 'files' is no longer one of these tabs).
           state.activityTab = (cached?.activityTab && !['tools', 'nav', 'files'].includes(cached.activityTab as string)) ? cached.activityTab : 'changes'
           state.activityOpen = cached?.activityOpen ?? false
+          // Same handover switchSlot performs: the floor is per-slot, so entering
+          // a slot restores ITS parked floor (undefined when it has none) instead
+          // of inheriting the one belonging to the slot being left. Without this a
+          // resume into a quiet slot kept the streaming slot's floor and discarded
+          // the resumed slot's first chunks.
+          const resumedRun = state.slotRun[safeKey(action.payload.key)]
+          state.lastChunkSeq = resumedRun?.lastChunkSeq
+          state.lastChunkGen = resumedRun?.lastChunkGen
           state.activeSlot = action.payload.key
           state.messages = mergePreservedPastes(state.messages, action.payload.messages)
           state.slotState = 'idle'
@@ -5726,6 +6755,16 @@ const chatSlice = createSlice({
       })
       .addCase(deleteHistorySession.fulfilled, (state, action) => {
         state.history = state.history.filter(s => s.key !== action.payload)
+      })
+      .addCase(deleteHistorySession.pending, (state) => {
+        // A fresh attempt supersedes the last refusal's notice, whichever row it
+        // named: the outcome of THIS click is what the user is now waiting on.
+        state.undeletableHistory = null
+      })
+      .addCase(deleteHistorySession.rejected, (state, action) => {
+        // The row is deliberately NOT filtered out: the gateway kept the file,
+        // so the sidebar must keep the row. Only the notice changes.
+        if (action.payload) state.undeletableHistory = action.payload
       })
       .addCase(loadOlderMessages.pending, (state) => {
         state.loadingOlder = true
@@ -5765,15 +6804,24 @@ const chatSlice = createSlice({
 })
 
 export const {
-  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, clearUnresumableResume, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, confirmOptimisticSend, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
+  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, clearSwitchSlotGone, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
+  removeThinking, confirmOptimisticSend, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,
-  setGoalLoops, sseGoalLoop,
+  setAutomations, sseAutomation, removeAutomation,
   sseSubagentSnapshot, sseToolActivity, sseToolResult, sseActivityEvent,
   sseMcpAppRender,
   sseWorkflowEvent, clearWorkflowRun, reconcileWorkflowRuns,
   sseSideResult, sseSideQueue, sideReleaseConsumed, sideClose, sideOptimisticAppend, sideOptimisticRollback,
 } = chatSlice.actions
+
+export function selectAutomationForSlot(
+  state: { chat: Pick<ChatState, 'automations'> },
+  slotKey: string,
+): AutomationRecord | null {
+  if (isUnsafeKey(slotKey)) return null
+  return automationForSlot(state.chat.automations, safeKey(slotKey))
+}
+
 export default chatSlice.reducer

@@ -34,9 +34,40 @@ logger = logging.getLogger(__name__)
 _DIR_NAME = "website"
 _SIBLING_DIR_NAME = "KiroCrewWebsite"
 
-# Build timeouts (seconds). npm installs/builds can be slow on cold caches.
+# Build timeouts (seconds). These are WEDGE backstops, not schedules: whatever is
+# still running when one expires is SIGKILLed, so the build budget has to clear
+# the slowest HEALTHY build while still FIRING BEFORE the caller's own deadline --
+# a budget that never fires cannot report anything.
+#
+# 300s does not cover the build. `npm run build` is `tsc -b` followed by a
+# production bundle; on one developer machine it took 75-98s as a repeat build but
+# 328s and 420s on the first build after `npm ci` -- and it is that slow case the
+# budget has to clear, because the caller which hits this most, Dev Fleet's
+# Pull+Build, always builds immediately after `npm ci`. The type-check is the bulk
+# of it and does not amortize: the app project sets `noEmit`, so build mode looks
+# for an output file that never exists (`tsc -b --dry --verbose`: "out of date
+# because output file 'src/App.js' does not exist") and re-checks the whole app
+# every run. Shrinking that work is the real cure and is not attempted here.
+#
+# The CEILING is that same caller: dev_fleet's stream watchdog kills the whole
+# sync run at ``runtime._RUN_DEADLINE_S`` (1800s), counted from fetch -- before
+# preflight, merge, pip and `npm ci` have even reached the build. A build budget
+# at or near 1800s therefore never expires there; the watchdog kills the tree
+# first and the warning below is never emitted, which is the silent-stale-bundle
+# outage this change exists to end. So the build claims at most HALF that
+# deadline, leaving the other half for everything the sync does before it.
+#
+# Residual, deliberately not closed here: if the steps before the build consume
+# more than the build budget, the watchdog still pre-empts it and reports its own
+# `[timeout] ... deadline` line instead of the specific one below. Closing that
+# needs the REMAINING deadline threaded from dev_fleet into the build child, which
+# is a change to that app's run supervisor rather than to this module.
+#
+# _INSTALL_TIMEOUT is left at its original value: the installs measured here ran
+# 11s (warm cache) and 136s (full), which it already clears, and dev_fleet's own
+# `npm ci` is a separate raw step this does not bound at all.
 _INSTALL_TIMEOUT = 300
-_BUILD_TIMEOUT = 300
+_BUILD_TIMEOUT = 900
 #: How long to wait for a killed install tree to actually exit before restoring
 #: over it. Short by design: the group has already been SIGKILLed, so this only
 #: covers reaping, and waiting longer would delay a recovery that is already late.
@@ -347,7 +378,10 @@ def _npm_build_and_stage_locked(
             proc.wait(timeout=_BUILD_KILL_GRACE)
         except subprocess.TimeoutExpired:
             log("  ⚠️  Frontend build did not die after SIGKILL")
-        log("  ⚠️  Frontend build timed out — dashboard may be stale")
+        log(
+            f"  ⚠️  Frontend build timed out after {_BUILD_TIMEOUT}s"
+            " — dashboard may be stale"
+        )
         return False
     if proc.returncode != 0:
         log("  ⚠️  Frontend build failed — dashboard may be stale")
@@ -360,6 +394,7 @@ def build_and_stage(
     proj_path: "str | Path | None" = None,
     npm: str | None = None,
     log: Callable[[str], None] = print,
+    git: str | None = None,
 ) -> bool:
     """Build this install's frontend and stage it, both under one lock.
 
@@ -372,8 +407,10 @@ def build_and_stage(
     ``proj_path`` accepts a string because the callers that need it are
     out-of-process and pass it through ``argv``. ``npm`` names the executable to
     run, so a caller that resolved a trusted path passes it rather than having it
-    re-resolved here. Returns ``True`` when ``static/dist`` holds the newly built
-    bundle.
+    re-resolved here. ``git`` likewise names the git executable for the read-only
+    build-source fingerprint: the Dev Fleet sync passes its trusted-bin absolute
+    path so the fingerprint's git calls never depend on a PATH search. Returns
+    ``True`` when ``static/dist`` holds the newly built bundle.
     """
     root = (
         Path(proj_path)
@@ -388,23 +425,118 @@ def build_and_stage(
     if not npm_bin:
         log("  ⚠️  npm not found — cannot build the frontend")
         return False
+    git_bin = git or shutil.which("git") or "git"
     try:
         with _staging_lock(root / "src" / "kiro_crew" / "static"):
-            return _npm_build_and_stage_locked(website_dir, root, npm_bin, log)
+            staged = _npm_build_and_stage_locked(website_dir, root, npm_bin, log)
+            if staged:
+                _write_build_source_fingerprint(root, git_bin, log)
+            return staged
     except OSError as exc:
         log(f"  ⚠️  Could not acquire the static/dist staging lock: {exc}")
         return False
 
 
+#: Records WHICH ``website/`` source the currently staged bundle was built from.
+#: Written beside the staged dist on every successful build+stage, and read by
+#: Dev Fleet's backend-only-sync skip: the skip is only safe when this equals the
+#: source the sync will end up with. It is the fingerprint the skip needs
+#: to distinguish "the build is already current" from a STALE tree left when a
+#: prior frontend sync merged new source but its ``npm ci`` failed and the
+#: transaction restored the old node_modules -- a case where the subtree stops
+#: changing yet the staged bundle was never built from it.
+_BUILD_SOURCE_FINGERPRINT = "kirocrew-build-source.txt"
+
+
+def _write_build_source_fingerprint(root: Path, git_bin: str, log: Callable[[str], None]) -> None:
+    """Stamp the git tree id of ``website/`` at HEAD beside the staged dist.
+
+    The git tree object id of ``website/`` is the exact identity of the built
+    source: it changes iff any tracked file under ``website/`` changes, and it
+    costs one ``git rev-parse``. Written to ``static/dist`` so it travels with
+    the bundle and is swept/replaced with it. Best-effort: a failure to stamp
+    leaves no fingerprint, and a missing fingerprint makes the skip decision fall
+    through to a rebuild (the safe direction), so this never blocks a build.
+
+    ``git_bin`` is the git executable to run -- the Dev Fleet sync passes its
+    trusted-bin absolute path, so these read-only calls do not depend on a PATH
+    search. Both calls are fixed list-argv, shell-free, and carry no
+    agent-supplied component; ``root`` is the operator's own registered checkout.
+
+    STAMPED ONLY WHEN ``website/`` IS CLEAN. ``HEAD:website`` names the committed
+    tree, but the build compiles the WORKING tree -- so if ``website/`` carried
+    uncommitted edits, the bundle was built from content ``HEAD:website`` does
+    not describe. Stamping anyway would let a later backend-only sync skip on a
+    fingerprint that matches HEAD while the dirty edit that was actually built
+    has since been reverted, serving a bundle built from content no longer on
+    disk. So a dirty ``website/`` writes NO fingerprint, and the next sync
+    rebuilds. The sync's own build runs after a ``merge --ff-only`` and is clean;
+    this guard covers the other callers (pod provision, dashboard update) and any
+    path that could build a dirty tree.
+    """
+    static_dist = root / "src" / "kiro_crew" / "static" / "dist"
+    try:
+        dirty = subprocess.run(  # nosec B603 - argv list, no shell
+            [git_bin, "-C", str(root), "status", "--porcelain", "--", "website"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if dirty.returncode != 0 or (dirty.stdout or b"").strip():
+            # Non-zero: cannot establish cleanliness. Non-empty: website/ has
+            # uncommitted changes, so HEAD:website does not describe what was
+            # built. Either way, leave no fingerprint -> the next sync rebuilds.
+            log(
+                "  ⚠️  website/ was not clean at build time; not fingerprinting "
+                "the bundle, so the next backend-only sync will rebuild"
+            )
+            return
+        proc = subprocess.run(  # nosec B603 - argv list, no shell
+            [git_bin, "-C", str(root), "rev-parse", "HEAD:website"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode != 0:
+            log(
+                "  ⚠️  Could not fingerprint the built frontend source; the next "
+                "backend-only sync will rebuild rather than skip"
+            )
+            return
+        tree_id = proc.stdout.decode(errors="replace").strip()
+        if not tree_id:
+            # An empty rev-parse output proves nothing; leave no fingerprint so
+            # the next sync rebuilds rather than trusting an empty tree id.
+            return
+        (static_dist / _BUILD_SOURCE_FINGERPRINT).write_text(tree_id, encoding="utf-8")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(
+            f"  ⚠️  Could not write the build source fingerprint ({exc}); the next "
+            "backend-only sync will rebuild rather than skip"
+        )
+
+
 def _discard_path(path: Path) -> None:
     """Best-effort remove a file, symlink or directory.
 
-    A staged-aside entry can be any of the three — ``static/dist`` is a symlink
+    A staged-aside entry can be any of the three — ``static/dist`` is a link
     on a source install and a real tree once staged — and ``shutil.rmtree``
-    refuses a symlink even though ``is_dir()`` follows it and returns True.
+    refuses a link even though ``is_dir()`` follows it and returns True.
+
+    The link half must be ``is_link_or_junction``, not ``is_symlink``: this
+    module publishes ``static/dist`` itself via
+    :func:`platform_compat.symlink_or_junction`, which falls back to a directory
+    JUNCTION on Windows, and ``is_symlink`` reports False for one. A live
+    junction would then reach the ``rmtree`` branch, whose refusal
+    ``ignore_errors=True`` swallows — leaving the entry behind for good; a
+    DANGLING junction answers False to all three and was never removed at all.
+    ``unlink_link_or_junction`` detaches either shape without touching what it
+    points at.
     """
     try:
-        if path.is_symlink() or path.is_file():
+        if platform_compat.is_link_or_junction(path):
+            platform_compat.unlink_link_or_junction(path)
+        elif path.is_file():
             path.unlink(missing_ok=True)
         elif path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
@@ -509,15 +641,22 @@ def _stage_dist_locked(
         # (the normal source install) just as much as a staged tree — so a
         # failed publication can put it back. Deleting first means a replace
         # error publishes nothing and the dashboard serves no assets at all.
-        # is_symlink() is checked first so a BROKEN symlink is still moved.
-        if static_dist.is_symlink() or static_dist.exists():
+        # The link check comes first so a BROKEN link is still moved — and it
+        # must be is_link_or_junction, not is_symlink: this module publishes
+        # static/dist itself via platform_compat.symlink_or_junction, which
+        # falls back to a directory JUNCTION on Windows, and a dangling
+        # junction answers False to both is_symlink() and exists(). Without
+        # the wider predicate the move-aside is skipped and the os.replace
+        # below lands on the surviving entry — the same "Could not stage
+        # static/dist" failure _discard_path and build_dist guard against.
+        if platform_compat.is_link_or_junction(static_dist) or static_dist.exists():
             backup = static_dist.parent / f".dist.previous.{os.getpid()}"
             _discard_path(backup)
             os.replace(static_dist, backup)
         os.replace(tmp_dist, static_dist)
     except OSError as exc:
         log(f"  ⚠️  Could not stage static/dist: {exc}")
-        published = static_dist.is_symlink() or static_dist.exists()
+        published = platform_compat.is_link_or_junction(static_dist) or static_dist.exists()
         if backup is not None and not published:
             try:
                 os.replace(backup, static_dist)
@@ -644,10 +783,9 @@ def build_frontend_sync(
     # process would deadlock against itself (see _staging_lock). Hence the build
     # and stage happen inside here too, via the _locked variant.
     #
-    # The cost is real and deliberate: a peer now waits for an install (up to
+    # The cost is real and deliberate: a peer waits for an install (up to
     # _INSTALL_TIMEOUT) rather than only for a build. Two frontend builds on one
-    # checkout were already mutually destructive, so waiting is the correct
-    # outcome, not a regression.
+    # checkout are mutually destructive, so waiting is the correct outcome.
     #
     # RESIDUAL: this closes races between Kiro Crew's own Python flows. Dev Fleet's
     # Pull+Build takes this same lock for its build+stage child, but its `npm ci`
@@ -707,7 +845,10 @@ def build_frontend_sync(
                     # reason to skip it.
                     _reap_tree(proc)
                     backup.rollback()
-                    log("  ⚠️  Frontend npm install timed out — the dependency tree was left as it was")
+                    log(
+                        f"  ⚠️  Frontend npm install timed out after {_INSTALL_TIMEOUT}s"
+                        " — the dependency tree was left as it was"
+                    )
                     return
                 if proc.returncode != 0:
                     backup.rollback()
@@ -726,7 +867,7 @@ def build_frontend_sync(
                 # Reap FIRST, and note WHY that is not optional here: the install
                 # runs in its own session (so its whole tree can be signalled on
                 # timeout), which also means a terminal Ctrl-C does NOT reach it --
-                # SIGINT goes to the foreground process group, and npm is no longer
+                # SIGINT goes to the foreground process group, and npm is not
                 # in it. So npm survives the interrupt and would keep writing into
                 # the directory being restored.
                 _reap_tree(proc)
@@ -889,7 +1030,10 @@ async def build_frontend_async(
             # Killed mid-install, so what is on disk is PARTIAL. Restore before
             # reporting, so the message is true by the time anyone reads it.
             await _offload(backup.rollback)
-            _warn("Frontend npm install timed out -- the dependency tree was left as it was")
+            _warn(
+                f"Frontend npm install timed out after {_INSTALL_TIMEOUT}s"
+                " -- the dependency tree was left as it was"
+            )
             return
         if npm_i.returncode != 0:
             await _offload(backup.rollback)
@@ -925,8 +1069,8 @@ async def build_frontend_async(
         # Otherwise a cancellation here releases the flock while this thread is
         # still running `npm run build` (which rewrites website/dist) and staging
         # it, and a peer would publish a bundle vite is mid-rewrite -- the mixed
-        # bundle the lock exists to prevent. Before this PR the lock was taken
-        # INSIDE the worker, so a cancelled await could not release it early.
+        # bundle the lock exists to prevent. The lock is held OUTSIDE the worker, so
+        # a cancelled await can release it early unless the future is tracked.
         staged = await _offload(_build_and_stage)
     except asyncio.CancelledError:
         # Gateway shutdown during the install. Left alone this strands the tree:

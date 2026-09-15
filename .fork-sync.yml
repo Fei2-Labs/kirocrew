@@ -358,22 +358,37 @@ divergences:
     pinned_by: "test/test_permission_argument_race.py"
     decided: 2026-09-07
 
-  - id: opencode-backend-pending-upstream
+  - id: upstream-owned-harnesses
     what: |
-      The fork ships `ACP_BACKEND_OPENCODE` as a selectable harness with its own
-      adapter (`acp/opencode.py`) and registry entries.
+      claude, codex and opencode are UPSTREAM's harnesses: the spawn chain in
+      `acp/client.py`, `harness/`, `agent_sdk/backends.py` and the frame corpora
+      under `test/fixtures/acp_frames/` are taken from upstream verbatim at every
+      sync. The fork's own adapters for the same three ids -- `acp/claude.py`,
+      `acp/codex.py`, `acp/opencode.py`, `acp/tool_gate.py` and their tests
+      (`test_acp_codex_models_and_agents.py`, `test_acp_backend_opencode_pi.py`'s
+      opencode half) -- are RETIRED, pending deletion in the follow-up after the
+      2026-09-15 sync lands.
     why: |
-      Upstream PR #6777 (`feat(acp): add OpenCode harness`) is OPEN and does the
-      same thing its own way. When it lands, PREFER the upstream harness and
-      retire the fork's -- including divergences/permission-argument-race-park if
-      upstream's frame handling makes it unnecessary. Carrying both is how two
-      opencode identities end up in one `ACP_BACKENDS_*` set with different
-      capability memberships.
+      Upstream #10006 shipped OpenCode and #10449 the codex `model[effort]` pick,
+      doing what the fork's adapters did their own way. The operator's rule for
+      this fork: use upstream wherever upstream has it, keep fork code only for
+      what upstream lacks. Carrying both was how two opencode identities ended up
+      in one `ACP_BACKENDS_*` set with different capability memberships.
 
-      Check the PR's state at the start of every sync; do not re-derive the
-      fork's adapter on top of it.
-    pinned_by: "test/test_acp_backends_endpoint.py (selectable set), test/test_permission_argument_race.py"
+      Concretely at the 2026-09-15 sync: the handler-side codex effort split
+      (`_codex_selection_effort`, `codex.wire_model_id`) went, because upstream
+      splits inside `AcpClient.set_model` (`_push_model_via_effort_split`); the
+      `_wire_model_id` spec-adapter branch went, because `to_acp_id` passes an
+      advertised id through unchanged; `select_provider_backend` lost its
+      Kiro-dialect narrowing, because upstream serves codex/opencode through the
+      same `AcpProvider`. The fork keeps ONLY: `copilot`, `goose`, `pi`
+      (divergences/fork-adapters-without-corpus), the `explicit` arm on
+      `select_provider_backend` (divergences/member-backend-explicit-arm) and the
+      registry-merged `/api/acp-backends` row
+      (divergences/acp-backends-registry-merged-route).
+    pinned_by: "test/test_acp_client.py (upstream classes), test/test_harness_parity.py, test/test_agent_sdk_capabilities.py"
     decided: 2026-09-07
+    revised: 2026-09-15
 
   - id: external-agent-handoff
     what: |
@@ -430,37 +445,29 @@ divergences:
     pinned_by: "test/test_push_branch_gate.py, test/test_security.py"
     decided: 2026-08-23
 
-  - id: opencode-copilot-selectable
-    what: "The fork ships copilot and opencode as selectable IN ADDITION TO upstream's set."
+  - id: copilot-selectable
+    what: "The fork ships copilot as selectable IN ADDITION TO upstream's set."
     why: |
-      The fork's core resolves and spawns `copilot --acp` / `opencode acp`
-      directly and both were driven end to end here, so a build that serves them
-      must let an operator select them.
+      The fork's core resolves and spawns `copilot --acp` directly and it was
+      driven end to end here, so a build that serves it must let an operator
+      select it.
 
-      NARROWED at the 2026-09-04 sync: this entry used to also record that the
-      fork WITHHELD claude where upstream shipped it. That half is retired —
-      claude was ADOPTED from upstream at this sync. Upstream's criterion was
-      accepted: `acp/client.py` already owns the whole Claude spawn path, the
-      adapter is a public npm package, and `agent_sdk/backend_install.py` probes
-      for both of its components, so the exclusion removed only the switch. The
-      remaining divergence is purely additive: upstream {kiro, kas, claude} plus
-      the fork's {copilot, opencode}.
+      NARROWED at the 2026-09-15 sync (was `opencode-copilot-selectable`):
+      opencode is upstream's now (divergences/upstream-owned-harnesses), so the
+      remaining divergence is purely additive -- upstream {kiro, kas, claude,
+      codex, opencode} plus the fork's {copilot}. `BASELINE_SELECTABLE_BACKENDS`
+      stays DERIVED as `ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE`, and
+      `NOT_SHIPPED_SELECTABLE` is {goose, pi}: each has no install probe in
+      `agent_sdk/backend_install.py`, so its readiness verdict is UNKNOWN with
+      nothing an operator could act on. codex left that set when upstream gave
+      it a probe.
 
-      The mechanism also moved. `BASELINE_SELECTABLE_BACKENDS` is now DERIVED as
-      `ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE`, adopting upstream's
-      NOT_SHIPPED_SELECTABLE as the one place a narrowing is recorded — promoted
-      from the test file into `acp_backends.py` so the module owns it. The fork's
-      membership is {codex, goose, pi}, each because `backend_install.py` carries
-      no install probe for it (`_PROBES` covers kiro, kas, claude only), so their
-      readiness verdict is UNKNOWN with nothing an operator could act on. Claude
-      is NOT a member.
-
-      Selectability entitles claude to no capability set: it stays OUT of
-      ACP_BACKENDS_KIRO_DIALECT (so the direct Kiro factory cannot be handed it),
-      out of INTERNAL_SANDBOX, STEER, SESSION_SHARING and ACP_RUNTIME.
-    pinned_by: "test/test_harness_parity.py::test_initial_adapter_selection_is_limited_to_reviewed_backends, test/test_acp_backend_opencode_pi.py::test_opencode_is_known_and_admitted, test/test_agent_backend_editable.py::test_baseline_ships_the_reviewed_backends_only, test/test_acp_claude_backend.py::TestRoutingRestsOnTheAdapterReadPath::test_claude_is_selectable_only_because_its_tool_calls_are_gated, test/test_provider_dispatch.py::TestKiroDialectSet"
+      The fork's `ACP_BACKENDS_MODEL_NAMESPACE` adds copilot beside upstream's
+      {kiro, kas}; every other capability set is upstream's, copilot opts into
+      none of them.
+    pinned_by: "test/test_harness_parity.py::test_initial_adapter_selection_is_limited_to_reviewed_backends, test/test_agent_backend_editable.py::test_baseline_ships_the_reviewed_backends_only, test/test_agent_sdk_capabilities.py (KNOWN list), test/test_provider_dispatch.py::TestKiroDialectSet"
     decided: 2026-08-31
-    revised: 2026-09-04
+    revised: 2026-09-15
 
   - id: copilot-backend-identity
     what: "is_copilot_backend predicate + 'copilot' in session_pid._MANAGED_AGENT_MARKERS."
@@ -471,14 +478,159 @@ divergences:
     pinned_by: "test/test_acp_backend_kas.py::test_exactly_one_predicate_holds_for_every_known_backend, test/test_acp_backend_labels.py::TestManagedAgentMarkers"
     decided: 2026-08-31
 
-  - id: mcp-injection-composition
-    what: "Crew's managed MCP servers reach spec adapters via _session_mcp_servers."
+  - id: fork-adapters-without-corpus
+    what: |
+      copilot, goose and pi have no recorded frame corpus under
+      `test/fixtures/acp_frames/`, no rows in the host-contract bucket tables
+      (`docs/system-specs/modules/agent-host-contract.md` reads `—` for them),
+      and `test_acp_frame_replay.py::test_every_known_backend_has_fixtures` names
+      them out explicitly.
     why: |
+      Upstream's replay ratchet requires a corpus per `ACP_BACKENDS_KNOWN` id.
+      None of the three has been captured against a live host here, and a
+      fabricated .jsonl would pin nothing real. The exemption is a named set, not
+      a filter, so the gate still fails the moment a NEW id lands without one.
+      Capture a corpus (`scripts/update_acp_frame_snapshots.py` after recording)
+      and delete the id from the set in the same change.
+    pinned_by: "test/test_acp_frame_replay.py::test_every_known_backend_has_fixtures"
+    decided: 2026-09-15
+
+  - id: registry-mirror-projection
+    what: |
+      `providers/mirrors/registry.py` PROJECTIONS carries a `McpProjection` for
+      copilot, goose and pi (`kind=NO_CHANNEL`, tracking
+      `docs/request-for-change/rfc-agent-config-mirror.md#5-migration`).
+    why: |
+      Upstream's registry requires every known id to declare how Crew's MCP
+      servers reach it; a missing entry fails at import. NO_CHANNEL is the
+      truthful answer until one of these adapters grows an MCP channel. Add the
+      row beside the id, never widen the set the registry iterates.
+    pinned_by: "test/test_provider_mirrors.py"
+    decided: 2026-09-15
+
+  - id: registry-adapter-vocabulary
+    what: |
+      `agent_sdk/backends.py` declares `ACP_BACKENDS_REGISTRY_ADAPTERS =
+      {copilot, goose, pi}` (driver-internal disposition): the ids
+      `members._direct_factory_backend` degrades to kiro when the direct Kiro
+      provider factory is the caller -- their dialect-correct route is the
+      registry dispatcher, not `AcpProvider`. Upstream's own harnesses (kiro,
+      kas, claude, codex, opencode) are never members and pass through
+      unnarrowed. Session MCP composition does NOT read this set (see
+      divergences/mcp-injection-composition): the gate there is `self._is_kiro`,
+      applying to every non-kiro backend upstream's and this build's alike, not
+      to this narrower registry-adapter membership.
+    why: |
+      Giving the provider-factory narrowing a named set (rather than an inline
+      backend-id check) is what keeps it legible on its own, and matches the
+      shape `host_auth.py` uses to declare sign-in for the same three ids (no
+      credential leaf -- none has been verified on disk here, see
+      divergences/fork-adapters-without-corpus).
+    pinned_by: "test/test_agent_sdk_capabilities.py, test/test_provider_dispatch.py::TestAcpBackendOverride, test/test_agent_sdk_host_auth.py::test_every_known_harness_has_a_declaration"
+    decided: 2026-09-15
+
+  - id: acp-backends-registry-merged-route
+    what: |
+      `GET /api/acp-backends` is served by the fork's
+      `dashboard/handlers/acp_backends.py` (registry half: label, dialect,
+      routing, capabilities, degraded_count, selectable) merged with the machine
+      half from upstream's `acp_backend_status._snapshot()`, reached through the
+      fork's `install_snapshot()` wrapper appended to that upstream module. The
+      merged row carries upstream's `auth` object too.
+    why: |
+      Upstream registers `api_acp_backend_status` on the same path with only the
+      machine half; the fork's overview `AcpBackendCard` reads the registry half.
+      aiohttp answers from the FIRST registration, so both halves must come from
+      one handler on one route (`test_dashboard_route_table.py` pins uniqueness).
+      Take upstream's `_snapshot()` changes verbatim -- the wrapper is a keyed
+      view of its rows, never a second probe.
+    pinned_by: "test/test_dashboard_route_table.py::test_acp_backends_resolves_once_and_serves_both_halves, test/test_acp_backends_endpoint.py, test/test_agent_sdk_backend_install.py::TestInstallSnapshot"
+    decided: 2026-09-15
+
+  - id: member-backend-explicit-arm
+    what: |
+      `members.select_provider_backend(explicit, session_key, member_backend,
+      configured_default)` -- one arm ahead of upstream's three, because the
+      fork's `create_provider_factory` passes the caller's `acp_backend` pick.
+      Every arm crosses `_direct_factory_backend`, which degrades to kiro ONLY
+      an id in `ACP_BACKENDS_REGISTRY_ADAPTERS` (divergences/
+      registry-adapter-vocabulary) -- upstream's own harnesses (kas, claude,
+      codex, opencode) pass through unnarrowed, since upstream already serves
+      them through the direct `AcpProvider` factory.
+    why: |
+      Upstream's factory takes no per-call backend. The fork's old
+      `_kiro_dialect_only` narrowing degraded EVERY spec-dialect id, which
+      silently broke the private-member refusal for codex once codex became
+      upstream's (a spec-dialect id `AcpProvider` now serves directly). Scoping
+      the narrowing to the fork's own registry-adapter set fixes that without
+      giving up the degrade this build's copilot/goose/pi still need. Upstream
+      tests call the three-arg form; adapt them by passing `None` first, not by
+      dropping the arm.
+    pinned_by: "test/test_member_dispatch_mount.py::TestSelectProviderBackend, test/test_member_memory_auth.py::test_private_execution_requires_direct_mcp_tools, test/test_provider_dispatch.py::TestAcpBackendOverride"
+    decided: 2026-09-15
+
+  - id: durable-run-coordinator
+    what: |
+      `src/kiro_crew/run_coordinator/` (models, sqlite, shadow, delivery, recovery,
+      memory, legacy) plus its wiring in `subagent_manager/`: `_coordinator_fence`,
+      `_coordinator_mark_running`, `_coordinator_record_process`,
+      `_commit_terminal_event`, `_outbox_live_contexts`, `_ack_delivery_for_run`,
+      `_finalize_queued_cancel`, and `_unqueue` returning a LIST rather than one
+      entry (the queue cancel commits each rejection durably, one at a time).
+    why: |
+      rfc-durable-run-coordinator PRs 1-4 are implemented HERE and nowhere upstream:
+      upstream keeps that RFC at `draft` with nothing on main. The eight modules do
+      not conflict — upstream has no file of those names — so a sync preserves them
+      automatically and then silently cuts the WIRING, because every call site sits
+      in a file upstream also edits. The modules stay, nothing errors, and the runs
+      stop being recorded.
+
+      Two shapes to watch at every sync: an upstream rewrite of a
+      `subagent_manager/` method that drops the `_coordinator_*` call beside it,
+      and any change that narrows `_unqueue` back to `dict | None` — upstream's
+      `cancel_for_parent_impl` is written against that narrower contract, so it
+      must be adapted to the list, never the other way round.
+
+      The RFC status row in docs/request-for-change/README.md describes THIS tree,
+      so upstream's "draft / Nothing" row is wrong here and must not be taken.
+    pinned_by: "test/test_run_coordinator_sqlite.py, test/test_run_coordinator_delivery.py, test/test_run_coordinator_recovery.py, test/test_subagent_command_authority.py"
+    decided: 2026-09-14
+
+  - id: mcp-injection-composition
+    what: |
+      Crew's managed MCP servers reach EVERY non-kiro backend (upstream's
+      claude/codex/opencode included, not just this build's copilot/goose/pi)
+      through ONE tool-gate-gated call, `_gated_session_mcp_servers()`, which
+      merges upstream's `_session_mcp_servers()` (sync, cache-backed base
+      array) with `_spec_session_mcp_delivery()`'s tool-gate-approved managed
+      servers and the pooled broker stubs. Upstream's own wire splat --
+      `*(self._claude_session_mcp_servers() if self._is_claude else []), ...`,
+      each guarded only by its own `self._is_<harness>` check -- is REPLACED at
+      both `_new_session_following_substitution` and `_initialize_session` by
+      `[] if self._is_kiro else await asyncio.to_thread(self._gated_session_mcp_servers)`.
+      The three named per-harness accessors (`_claude_session_mcp_servers` etc.)
+      still exist, unchanged, as directly-callable seams for the MCP ref guard
+      and other unit tests that need the raw ungated array -- they are simply no
+      longer spliced onto the wire.
+    why: |
+      Upstream has no tool-gate concept here at all: a claude or codex session
+      with an unproven permission route still gets the full managed array.
+      This build's tool-gate hard floor (`_spec_session_mcp_delivery`) predates
+      that and is unconditional across every spec-dialect backend it drives,
+      copilot/goose/pi included -- narrowing it to only the fork's OWN adapters
+      during the 2026-09-15 sync was caught by `test_acp_spec_mcp_delivery.py`
+      and `test_acp_spec_mcp_tools.py` (both fork-owned, parametrized over
+      codex/goose/pi/kiro) failing on the newly-ungated claude/codex/opencode
+      path; the fix widens the gate rather than narrowing the tests.
+
       kiro stays spec-free (--agent loads its own, injecting would double-launch);
       pooled stub outranks spec entry; fail-soft on malformed spec. Must COMPOSE
-      with upstream's acp/spec_servers.py, never duplicate it.
-    pinned_by: "test/test_acp_spec_mcp_delivery.py, test/test_acp_runtime.py (builder-consultation guard)"
+      with upstream's acp/spec_servers.py, never duplicate it. The pooled roster
+      goes over VERBATIM for a runtime backend with nothing managed (KAS) --
+      test_acp_harness_wire_parity pins that upstream never reshapes it.
+    pinned_by: "test/test_acp_spec_mcp_delivery.py, test/test_acp_spec_mcp_tools.py, test/test_acp_runtime.py (builder-consultation guard), test/test_acp_harness_wire_parity.py, test/test_harness_parity.py::test_each_mcp_seam_is_spliced_only_for_its_own_harness"
     decided: 2026-08-29
+    revised: 2026-09-15
 
   - id: connections-disconnect-owner-gate
     what: "api_connections_disconnect requires require_owner_dashboard_request."
@@ -679,7 +831,29 @@ environmental_failures:
     reason: "shlex.split breaks on this checkout's space-containing path ('My Apps')."
   - pattern: "test/test_ci_surface_tests.py::test_explicit_cli_target_bypasses_collect_ignore"
     reason: "Asserts a pytest-version behavior; unrelated to Kiro Crew code."
+  - pattern: "test/test_codex_session_mcp.py::test_the_real_adapter_guard_is_reachable_at_all"
+    reason: |
+      Spawns a REAL out-of-process node adapter driver; under xdist parallel
+      workers a sibling worker's env (CODEX_ACP_BIN) leaks into this one's
+      `os.environ` snapshot. Passes in isolation every time; fails under
+      `-n auto`/`-n 6` intermittently. Not a logic bug in the adapter guard.
   - pattern: "website/src/i18n/style/hiStyle.test.ts"
     reason: |
       Ratchet ceiling vs actual violation count. Bumped 118→119 on 2026-08-31;
-      if it fails again the catalog grew — bump the ceiling, do not silence it.
+      bumped the punctuation ceiling (a separate assertion in the same file)
+      30→31 on 2026-09-15 for one new upstream string
+      (`apps.mdNotebook.connect.cloneHelp`). If either fails again the catalog
+      grew — bump the ceiling, do not silence it.
+  - pattern: "scripts/docs-lint.sh"
+    reason: |
+      A local `website/electron/backend-dist/` or `website/electron/dist/`
+      desktop-build tree on disk (gitignored, never tracked) is scanned by
+      docs-lint's citation check and reports dozens of "doc does not exist" and
+      "line past end of file" findings against its bundled site-packages copy.
+      Remove the build tree (or run docs-lint from a clean checkout) to see the
+      real signal underneath. One genuinely pre-existing finding under that
+      noise, predating this sync (already on fork `main`): "packaged docs with
+      an unrecorded consumer" for `src/kiro_crew/docs/experimental-acp-adapters.md`
+      (named in `website/src/pages/overview/AcpBackendCard.tsx` but never added
+      to `CODE_COUPLED_DOCS` in `scripts/docs_lint.py`) -- register the pairing
+      there in a follow-up, not part of this sync's scope.

@@ -27,7 +27,7 @@ from kiro_crew.trust_patterns import matches_trusted_pattern as _canonical_match
 def _legacy_title_command(value: str) -> str:
     """Adapt old title-shaped fixtures into canonical command input.
 
-    Production helpers no longer strip display prefixes.  Most segmentation
+    Production helpers do not strip display prefixes.  Most segmentation
     tests below predate structured ``tool_input`` and still use title-shaped
     fixtures; explicit boundary regressions exercise the raw helpers directly.
     """
@@ -1098,6 +1098,57 @@ class TestApproveHandlerTrustCommand:
         set_policy.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_broad_trust_lands_without_command_scope_proof(self, tmp_path):
+        """A card whose COMMAND is underivable can still trust the session.
+
+        The session grant auto-approves whatever the slot asks for next, so it
+        names no command and cannot be gated on one.  Only the command-scoped
+        tiers need ``trust_command_grantable``.
+        """
+        state = _make_state(tmp_path)
+        slot = _ChatSlot(key="slot-1")
+        state._slots["slot-1"] = slot
+        set_policy = MagicMock()
+        state.sessions.set_approval_policy = set_policy
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        slot._approval_futures["req-scopeless"] = fut
+        slot.messages.append(
+            {
+                "role": "permission",
+                "content": "Hidden input",
+                "cls": json.dumps({"request_id": "req-scopeless", "trust_grantable": "1"}),
+            }
+        )
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            # The command-scoped tier is still refused, and refusing it leaves
+            # the approval live.
+            scoped = await client.post(
+                "/api/chat/slots/slot-1/approve",
+                json={
+                    "action": "trust_command",
+                    "request_id": "req-scopeless",
+                    "pattern": "ls",
+                },
+            )
+            assert scoped.status == 400
+            assert (await scoped.json())["code"] == "pattern_underivable"
+            assert slot._trust is False
+            assert not fut.done()
+
+            granted = await client.post(
+                "/api/chat/slots/slot-1/approve",
+                json={"action": "trust", "request_id": "req-scopeless"},
+            )
+            assert granted.status == 200
+
+        assert slot._trust is True
+        assert fut.result() == "approved"
+        set_policy.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_trust_resolves_future_on_another_slot(self, tmp_path):
         """Regression: the pending approval future may be registered on a
         different slot object than the one named in the URL (session-sharing or
@@ -1269,7 +1320,7 @@ class TestApproveHandlerTrustCommand:
         The session-identity owner scan skips the mismatched candidate, and the
         state-level fallback (resolve_state_approval) does not re-scan slots — so
         the crafted collision 404s instead of approving/executing slot-2's tool.
-        Regression for the cross-slot authorization hole in the old
+        Guards against the cross-slot authorization hole in the
         resolve_approval fallback."""
         state = _make_state(tmp_path)
         state.sessions.set_approval_policy = MagicMock()

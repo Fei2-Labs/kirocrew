@@ -18,6 +18,13 @@
     "Reviews GitHub pull requests; needs an authenticated `gh` CLI on the gateway host"
   ],
   "defaultEnabled": false,
+  "platform": {
+    "os": [
+      "macos",
+      "linux",
+      "windows"
+    ]
+  },
   "skills": [
     "skills/sage-review",
     "skills/learn-from-sage"

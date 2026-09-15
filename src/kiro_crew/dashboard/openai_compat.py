@@ -314,6 +314,40 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                 },
                 status=409,
             )
+        # A remote-bound slot runs its turn on a connected peer and streams the
+        # reply over the dashboard WebSocket; this endpoint has no such channel —
+        # its collectors read only local `chunk`/`assistant` rows. Reaching the
+        # local dispatch chokepoint (`_run_chat`, keyed on `executor == "remote"`)
+        # would append the prompt and emit a WS-only `chat_done`, leaving this HTTP
+        # caller waiting forever on a turn the peer never received and history
+        # holding an unsent turn. Refuse BEFORE any mutation — keyed on
+        # `executor` (not `is_remote`) so a half-open binding is refused too,
+        # matching the chokepoint and the `api_chat` incomplete-binding guard. A
+        # freshly-created slot is always local, so this only rejects an existing
+        # remote-bound target.
+        if getattr(slot, "executor", "") == "remote":
+            sel().log_api_access(
+                caller=request.remote or "",
+                operation="openai_compat.chat",
+                outcome="denied",
+                source="openai_compat",
+                resources=f"slot={slot_id}",
+                error="remote-bound slot not supported on OpenAI-compat endpoint",
+            )
+            return web.json_response(
+                {
+                    "error": {
+                        "message": (
+                            "this session is bound to a remote crew; the "
+                            "OpenAI-compatible endpoint cannot relay remote turns"
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "remote_slot_unsupported",
+                    },
+                    "code": "remote_slot_unsupported",
+                },
+                status=409,
+            )
         # Busy check — prevent concurrent writes to same slot
         if slot.task is not None and not slot.task.done():
             sel().log_api_access(
@@ -388,8 +422,9 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
             # skips and thread-open refuses (orphaned the moment the slot
             # dies). Same rare-send thread-IO budget as the registry check.
             if slot.key.startswith(members_mod.DM_SLOT_KEY_PREFIX):
-                _member_slug = slot.key[len(members_mod.DM_SLOT_KEY_PREFIX) :]
-                _send_binding = await asyncio.to_thread(members_mod.read_dm_binding, _member_slug)
+                _send_binding = await asyncio.to_thread(
+                    members_mod.read_dm_binding_for_slot, slot.key
+                )
                 if _send_binding is None or _send_binding.get("member", "") != slot.agent:
                     sel().log_api_access(
                         caller=request.remote or "",

@@ -1,16 +1,14 @@
 """``file_send``'s destination oracle -- the one place that answers "where does
 this file go, and may this caller send it there?" for BOTH delivery legs.
 
-PR #6044 gave the two legs of ``file_send`` one shared ADMISSION gate
+The two legs of ``file_send`` share one ADMISSION gate
 (:func:`~kiro_crew.dashboard.handlers.files._gate_upload_file`: containment, the
 descriptor-safe read, the binary MIME allowlist, the content credential scans).
-Destination and authorization stayed per-leg, inline in each endpoint -- the last
-surviving sibling of the "two paths, two behaviours" root cause that gate closed
-(issue #6060). This module is the destination half of the same move: the two
-resolvers now sit side by side in one file, each endpoint keeps only its own
-delivery verb and response shape, and every rung one leg runs and the other does
-not is written down below instead of being discoverable only by reading two
-handlers 200 lines apart.
+This module is the destination half: keeping the two resolvers per-leg and inline
+in each endpoint is what produces "two paths, two behaviours". Here they sit side
+by side in one file, each endpoint keeps only its own delivery verb and response
+shape, and every rung one leg runs and the other does not is written down below
+instead of being discoverable only by reading two handlers 200 lines apart.
 
 This is deliberately NOT a single ``resolve(leg, ...)`` dispatcher. Each endpoint
 knows its leg statically, so a union-typed dispatcher would buy nothing and force
@@ -19,11 +17,11 @@ resolvers live here, share one refusal/skip vocabulary, and are audited through
 one shape (``_audit_file_send`` in the handlers module, which owns the
 test-patchable ``_sel``).
 
-Rung by rung. Both legs now run the same two ceilings -- the ``channels``-scope
-governance vet and the restricted-session ceiling -- which is the convergence
-#6060 step 2 asked for and #7290 decided: the Slack leg calls them DIRECTLY
-(:func:`_slack_egress_permitted`) rather than joining ``channel_transports``,
-because its dedicated client genuinely cannot ride the shared ladder. The rows
+Rung by rung. Both legs run the same two ceilings -- the ``channels``-scope
+governance vet and the restricted-session ceiling -- but the Slack leg calls them
+DIRECTLY (:func:`_slack_egress_permitted`) rather than joining
+``channel_transports``, because its dedicated client genuinely cannot ride the
+shared ladder. The rows
 that still differ differ for a reason named in the row:
 
 ======================================  =============================  ===========================================
@@ -100,7 +98,7 @@ class Refusal:
     contract it branches on (RFC 9457 3.1.3, enforced by
     ``test_error_code_contract``); *audit_error* is what the SEL record carries,
     and differs on purpose -- the audit names the refused channel, the response
-    does not. *downstream* is set only where the shipped record set it.
+    does not. *downstream* is set only where the audit record names a service.
     """
 
     error: str
@@ -116,8 +114,8 @@ class Skip:
 
     Most sessions mirror nowhere and most callers name no Slack channel, so
     "cannot deliver here" is a skip the caller falls back from -- never an
-    error. Skips carry no ``downstream_service`` in the audit trail, matching
-    the shipped records on both legs.
+    error. Skips carry no ``downstream_service`` in the audit trail on either
+    leg.
     """
 
     reason: str
@@ -203,7 +201,7 @@ async def resolve_slack(
 ) -> SlackTarget | Refusal | Skip:
     """Resolve the Slack leg's destination and authorize the caller for it.
 
-    The shipped ladder, in order and unchanged: an explicitly named channel
+    The ladder, in order: an explicitly named channel
     wins; otherwise a linkable session's own Slack link supplies both channel
     and thread; otherwise the owner DM. A named channel must be tracked; a
     channel that came from the session map is accepted on a ``D`` prefix (the

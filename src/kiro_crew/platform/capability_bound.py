@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, Dict, List
 
+from kiro_crew.mcp_utils import registry_accepts_query
+
 if TYPE_CHECKING:
     from kiro_crew.platform.interfaces import CapabilityManager, CapabilityResult
 
@@ -79,24 +81,28 @@ class BoundedCapabilityManager:
         return self._inner.available()
 
     async def list_mcp(self) -> List[Dict[str, Any]]:
-        return await asyncio.wait_for(
-            self._inner.list_mcp(), timeout=CAPABILITY_READ_TIMEOUT
-        )
+        return await asyncio.wait_for(self._inner.list_mcp(), timeout=CAPABILITY_READ_TIMEOUT)
 
     async def list_skills(self) -> List[Dict[str, Any]]:
-        return await asyncio.wait_for(
-            self._inner.list_skills(), timeout=CAPABILITY_READ_TIMEOUT
-        )
+        return await asyncio.wait_for(self._inner.list_skills(), timeout=CAPABILITY_READ_TIMEOUT)
 
     async def list_agents(self) -> List[Dict[str, Any]]:
-        return await asyncio.wait_for(
-            self._inner.list_agents(), timeout=CAPABILITY_READ_TIMEOUT
-        )
+        return await asyncio.wait_for(self._inner.list_agents(), timeout=CAPABILITY_READ_TIMEOUT)
 
-    async def registry(self) -> List[Dict[str, Any]]:
-        return await asyncio.wait_for(
-            self._inner.registry(), timeout=CAPABILITY_READ_TIMEOUT
-        )
+    async def registry(self, query: "str | None" = None) -> List[Dict[str, Any]]:
+        """Forward the optional search hint, but only to an inner op that takes it.
+
+        The wrapper must advertise ``query`` in its OWN signature: every caller
+        reaches the manager through this bind, so a wrapper that dropped the
+        parameter would make the hint undetectable and every edition registry
+        unsearchable past the caller's row guard. Forwarding is feature-detected
+        so an edition still on the zero-arg signature is called the old way
+        instead of raising ``TypeError`` — the hint is dropped, which the caller's
+        own filter already tolerates.
+        """
+        inner = self._inner.registry
+        call = inner(query=query) if query and registry_accepts_query(inner) else inner()
+        return await asyncio.wait_for(call, timeout=CAPABILITY_READ_TIMEOUT)
 
     async def install_mcp(self, server_id: str) -> "CapabilityResult":
         return await asyncio.wait_for(
@@ -129,9 +135,7 @@ class BoundedCapabilityManager:
         )
 
     async def list_plugins(self) -> List[Dict[str, Any]]:
-        return await asyncio.wait_for(
-            self._inner.list_plugins(), timeout=CAPABILITY_READ_TIMEOUT
-        )
+        return await asyncio.wait_for(self._inner.list_plugins(), timeout=CAPABILITY_READ_TIMEOUT)
 
     async def plugins_out_of_sync(self) -> List[str]:
         return await asyncio.wait_for(

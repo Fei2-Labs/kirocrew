@@ -268,6 +268,10 @@ describe('LibraryPage — pin badge and persistence', () => {
 
 describe('LibraryPage — disabled tiles', () => {
   beforeEach(() => {
+    // Disabled apps are hidden by the Library's default "enabled only" view, so
+    // a suite about disabled-tile rendering opts into the show-all view (the
+    // persisted `mc-apps-library-show-all` toggle, '1' = show all).
+    localStorage.setItem('mc-apps-library-show-all', '1')
     listApps.mockResolvedValue([installedApp('secretary', 'Secretary', { enabled: false }), RADAR])
   })
 

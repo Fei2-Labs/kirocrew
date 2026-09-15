@@ -1021,6 +1021,17 @@ async def test_start_launches_run_and_injects_on_done(monkeypatch) -> None:
     assert done and done[0]["session_key"] == "slot:main"
 
 
+async def test_start_rejects_closed_gateway_admission() -> None:
+    sessions = FakeSessions([])
+    sessions.admission_closed = True
+    svc = WorkflowService(sessions=sessions, persist=False)
+
+    out = await svc.start(GOOD_SCRIPT)
+
+    assert out == {"error": "gateway admission is closed"}
+    assert svc.list_runs() == []
+
+
 async def test_start_rejects_invalid_script() -> None:
     svc = WorkflowService(sessions=FakeSessions([]))
     out = await svc.start("import os\n")
@@ -1216,7 +1227,7 @@ async def test_rerun_with_invalid_edited_source_rejected(monkeypatch) -> None:
 # originating slot AND (2) auto-run an agent turn so the launching agent actually
 # interprets the result. Drives the REAL WorkflowService -> runner -> on_done ->
 # inject_workflow_result(on_injected=...) wiring; only _run_chat is stubbed (no
-# model). Regression for "workflow result never reaches the agent to interpret".
+# model). Pins that the workflow result reaches the agent to interpret.
 # --------------------------------------------------------------------------- #
 
 

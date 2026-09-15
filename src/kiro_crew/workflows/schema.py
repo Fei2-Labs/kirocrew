@@ -22,7 +22,7 @@ separately). Pure functions + one async retry helper, all unit-testable against
 a stub text producer (never a real agent).
 
 Gates: C1 valid object returned · C2 malformed→retry→success, all-malformed→None ·
-C3 schema-violating object rejected. See ``docs/system-specs/modules/workflow-gates.md``.
+C3 schema-violating object rejected. See ``docs/system-specs/modules/workflows.md``.
 """
 
 from __future__ import annotations
@@ -82,9 +82,8 @@ def validate_against_schema(value: Any, schema: dict, *, path: str = "$") -> lis
     # spelling: any type mismatch already early-returned above, so a dict here
     # is schema-admissible whether ``type`` said "object", a union list
     # admitting object, or nothing. Keying on ``expected_type == "object"``
-    # missed the union spelling, so ``["object", "null"]`` skipped
-    # ``required``/``properties`` entirely and an invalid object validated
-    # (GPT review, #4974 round 2).
+    # would miss the union spelling, so ``["object", "null"]`` would skip
+    # ``required``/``properties`` entirely and let an invalid object validate.
     if isinstance(value, dict):
         for key in schema.get("required", []):
             if key not in value:

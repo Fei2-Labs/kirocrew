@@ -64,6 +64,8 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
         index,
         mounted: true,
         data,
+      farmIsMeasured: () => true,
+      farmRecord: () => true,
       })),
       isAtBottom: true,
       getFollow: () => true,
@@ -139,8 +141,8 @@ const SLOT_A = { key: 'chat-1', title: 'one', messages: 1, running: false, mode:
 const SLOT_B = { key: 'chat-2', title: 'two', messages: 1, running: false, mode: '', created: '', last_ts: '' }
 /** A surface ChatPage does not render, so it must never reach the chip roster. */
 const SLOT_DC = { key: 'chat-99-1700000000', title: 'dc-run', messages: 1, running: false, mode: 'design-critique', created: '', last_ts: '' }
-/** `crew` IS a chat surface, so it pins the filter against over-narrowing. */
-const SLOT_CREW = { key: 'chat-77-1700000001', title: 'crew run', messages: 1, running: false, mode: 'crew', created: '', last_ts: '' }
+/** `orchestrator` IS a chat surface, so it pins the filter against over-narrowing. */
+const SLOT_ORCH = { key: 'chat-77-1700000001', title: 'autopilot run', messages: 1, running: false, mode: 'orchestrator', created: '', last_ts: '' }
 
 const renderChatPage = (connected: boolean, extraSlots: typeof SLOT_A[] = []) => {
   const allSlots = [SLOT_A, SLOT_B, ...extraSlots]
@@ -274,32 +276,36 @@ describe('chip roster carries only surfaces ChatPage can show', () => {
     expect(lastAssistantProps.sessions?.has(SLOT_DC.key)).toBe(false)
   })
 
-  it('keeps a crew session, so the filter is not simply narrowed to the default', async () => {
+  it('keeps an autopilot session, so the filter is not simply narrowed to the default', async () => {
     // Positive control: excluding every non-empty surface would pass the test
     // above while silently dropping two surfaces the chat view does show.
-    const { store } = renderChatPage(true, [SLOT_CREW])
+    const { store } = renderChatPage(true, [SLOT_ORCH])
     seedMessage(store)
     await screen.findByTestId('chip')
 
-    expect(lastAssistantProps.sessions?.has(SLOT_CREW.key)).toBe(true)
+    expect(lastAssistantProps.sessions?.has(SLOT_ORCH.key)).toBe(true)
   })
 })
 
 describe('one session-entry path', () => {
   // A SOURCE guard: the two callees were behaviourally identical, so only the
   // structure can distinguish the collapsed form from the duplicated one.
-  const source = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf-8')
+  const pageSource = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf-8')
+  const sessionSource = readFileSync(join(__dirname, '..', 'pages', 'chat', 'useChatPageSessionController.ts'), 'utf-8')
 
   it('routes the in-message chip through the shared switch callee', () => {
-    expect(source).toContain('onSessionOpen={selectSessionTab}')
+    expect(pageSource).toContain('onSessionOpen={selectSessionTab}')
   })
 
   it('keeps no second spelling of the session-open guard', () => {
     // The duplicate would diverge the first time either side gained a side effect.
-    expect(source).not.toContain('handleSessionOpen')
+    expect(pageSource).not.toContain('handleSessionOpen')
+    expect(sessionSource).not.toContain('handleSessionOpen')
   })
 
   it('declares the shared callee exactly once', () => {
-    expect(source.match(/const selectSessionTab = useCallback/g)).toHaveLength(1)
+    // The callee is owned by the session controller; the page only receives it.
+    expect(sessionSource.match(/const selectSessionTab = useCallback/g)).toHaveLength(1)
+    expect(pageSource).not.toContain('const selectSessionTab = useCallback')
   })
 })

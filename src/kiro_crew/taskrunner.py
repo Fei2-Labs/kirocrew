@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
 
 from kiro_crew import git_coord, shutdown_event
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.llm_helpers import stream_and_collect_json
@@ -97,6 +98,14 @@ _HEARTBEAT_INTERVAL = 30  # watchdog checks process liveness every 30s
 _DEAD_THRESHOLD = 2  # consecutive dead checks before fail-fast reset
 _RESULT_MEM_CAP = 4000  # truncate task.result in memory after step completes
 _WORKFLOW_RESULT_SUMMARY_CAP = 120
+# Sources with no operator watching the run: an invalid workflow spec must fail
+# with the SEL denial rather than degrade to the LLM decomposer. Attended sources
+# (chat, dashboard, CLI/unsourced) keep the fallback.
+_UNATTENDED_SOURCES = frozenset({"cron", "mcp"})
+
+
+class WorkflowInitializing(RuntimeError):
+    """Task mutations are temporarily unavailable until workflow attachment."""
 
 
 class WorkflowRunPublisher(Protocol):
@@ -219,25 +228,42 @@ def _read_spec_prefix(path: str, max_chars: int) -> str:
         return spec_file.read(max_chars).strip()
 
 
-def _decompose_yaml_with_audit(yaml_content: str, task_id: str) -> list[Task]:
-    """Decompose YAML with SEL audit logging."""
+def _decompose_yaml_with_audit(
+    yaml_content: str,
+    task_id: str,
+    source: str = "",
+    spec_name: str = "",
+) -> list[Task]:
+    """Decompose YAML with SEL audit logging.
+
+    ``source``/``spec_name`` carry the run's provenance. Without them a
+    cron/MCP-sourced denial is recorded against ``dashboard`` — the one surface
+    that did not start the run — which makes the audit trail unusable for
+    exactly the unattended callers it exists to record.
+    """
+    metadata: dict[str, Any] = {"task_id": task_id}
+    if source:
+        metadata["source"] = source
+    if spec_name:
+        metadata["spec_name"] = spec_name
+    caller = source or "dashboard"
     try:
         tasks = decompose_yaml(yaml_content)
         sel().log_tool_invocation(
-            session_key="dashboard",
+            session_key=caller,
             source="taskrunner",
             tool_name="decompose_yaml",
             outcome="ok",
-            metadata={"task_id": task_id, "task_count": len(tasks)},
+            metadata={**metadata, "task_count": len(tasks)},
         )
         return tasks
     except Exception as exc:
         sel().log_tool_invocation(
-            session_key="dashboard",
+            session_key=caller,
             source="taskrunner",
             tool_name="decompose_yaml",
             outcome="error",
-            metadata={"task_id": task_id, "error": str(exc)},
+            metadata={**metadata, "error": str(exc)},
         )
         raise
 
@@ -281,6 +307,10 @@ class TaskRunner:
             self._work_dir = Path(self._workspace_dir)
         else:
             self._work_dir = work_dir or Path.cwd()
+        # What the constructor was handed, so a config write that later reverts
+        # ``taskrunner.workspace_dir`` restores exactly this (see _refresh_from_config).
+        self._ctor_workspace_dir = self._workspace_dir
+        self._ctor_work_dir = self._work_dir
         self._test_cmd: list[str] | None = None
         self._conversation_log = conversation_log
         self._consolidator = consolidator
@@ -297,14 +327,22 @@ class TaskRunner:
         # ``0`` (or unset) means "use the computed ceiling". An explicit value can
         # never raise concurrency above the host-safe maximum.
         try:
-            auto_cap = compute_max_subagents(KiroCrewConfig.load())
+            cfg: KiroCrewConfig | None = KiroCrewConfig.load()
         except Exception:
-            auto_cap = _MAX_PARALLEL_TASKS
-        auto_cap = max(1, auto_cap)
-        if max_parallel_steps and max_parallel_steps >= 1:
-            self._max_parallel_steps = min(max_parallel_steps, auto_cap)
-        else:
-            self._max_parallel_steps = auto_cap
+            cfg = None
+        self._max_parallel_steps = self._clamp_parallel_steps(max_parallel_steps, cfg)
+        # The ``taskrunner.*`` values the gateway constructed this runner from.
+        # Each run entry re-reads config and adopts a field whose config value has
+        # MOVED since this baseline (a hot write from any writer), while a field
+        # the config never changed keeps the constructor's argument -- so a test
+        # or embedder passing explicit values is not overridden by a config.json
+        # that never mentioned them. See ``_refresh_from_config``.
+        self._config_baseline: tuple[int, str] | None = (
+            (int(cfg.taskrunner.max_parallel_steps), str(cfg.taskrunner.workspace_dir))
+            if cfg is not None
+            else None
+        )
+        self._ctor_max_parallel_steps = max_parallel_steps
         self._runs: dict[str, Project] = {}
         # Serialize registry writes and enforce monotonic ordering. Snapshots
         # are always built on the event-loop thread (see _serialize_runs), so
@@ -316,7 +354,7 @@ class TaskRunner:
         self._persist_written = 0  # highest sequence persisted (lock-guarded)
         self._tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         self._start_lock = asyncio.Lock()
-        self._plan_ids_in_flight: set[str] = set()
+        self._start_ids_in_flight: set[str] = set()
         self._plan_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._on_tool_approval: Callable[[LLMEvent], Awaitable[bool]] | None = None
         self._stall_cancelled_ids: set[str] = set()
@@ -331,8 +369,72 @@ class TaskRunner:
         # remains the owner of planning/execution semantics; this port only
         # mirrors lifecycle and progress for one unified management surface.
         self._workflow_service = workflow_service
+        self._workflow_initializing = False
         self._agent: str = ""
         self._load_runs()
+
+    @staticmethod
+    def _clamp_parallel_steps(requested: int | None, cfg: KiroCrewConfig | None) -> int:
+        """Bound *requested* by the host-safe ceiling; ``0``/``None`` means the ceiling."""
+        try:
+            auto_cap = compute_max_subagents(cfg) if cfg is not None else _MAX_PARALLEL_TASKS
+        except Exception:
+            auto_cap = _MAX_PARALLEL_TASKS
+        auto_cap = max(1, auto_cap)
+        if requested and requested >= 1:
+            return min(int(requested), auto_cap)
+        return auto_cap
+
+    def _refresh_from_config(self) -> None:
+        """Adopt ``taskrunner.max_parallel_steps`` / ``workspace_dir`` for the NEXT run.
+
+        Called at each run entry so a write to ``config.json`` from any writer
+        takes effect on the next run without a gateway restart, while a run that
+        is already executing keeps the values it started with (its parallel cap
+        and work dir are bound per run, not read from ``self`` mid-flight).
+
+        Reads the watcher's last applied snapshot (a plain attribute read) and
+        falls back to the fingerprint-cached loader before the watcher is armed.
+        A field is adopted only when its config value MOVED since the baseline
+        this runner was constructed against; an unchanged field keeps the
+        constructor's argument. ``workspace_dir`` goes through the same
+        sensitive-path validation the constructor applies.
+        """
+        if self._config_baseline is None:
+            return
+        # The snapshot is a plain attribute read. Before the watcher has primed
+        # there is nothing to refresh from without a ``load()`` -- which parses
+        # and validates the file on the event loop these entry points run on --
+        # so the constructor's values stand until the first primed run.
+        cfg = live.snapshot()
+        if cfg is None:
+            return
+        base_steps, base_ws = self._config_baseline
+        try:
+            new_steps = int(cfg.taskrunner.max_parallel_steps)
+            new_ws = str(cfg.taskrunner.workspace_dir)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if new_steps != base_steps:
+            requested: int | None = new_steps
+        else:
+            requested = self._ctor_max_parallel_steps
+        self._max_parallel_steps = self._clamp_parallel_steps(requested, cfg)
+        if new_ws != base_ws:
+            try:
+                resolved = _resolve_workspace_dir(new_ws)
+            except ValueError:
+                # A rejected (sensitive) path keeps the current target; the
+                # rejection is already SEL-audited by the validator.
+                logger.warning(
+                    "taskrunner.workspace_dir rejected on reload; keeping current target"
+                )
+                return
+        else:
+            resolved = self._ctor_workspace_dir
+        if resolved != self._workspace_dir:
+            self._workspace_dir = resolved
+            self._work_dir = Path(resolved) if resolved else self._ctor_work_dir
 
     @property
     def current_run(self) -> Project | None:
@@ -342,11 +444,34 @@ class TaskRunner:
 
     @property
     def running(self) -> bool:
-        return any(not t.done() for t in self._tasks.values())
+        return bool(self._start_ids_in_flight) or any(not t.done() for t in self._tasks.values())
+
+    def _admission_closed(self) -> bool:
+        """Read SessionManager's shared gate without yielding."""
+        return getattr(self._sessions, "admission_closed", False) is True
+
+    async def _reserve_start(self, task_id: str) -> None:
+        """Reserve one start atomically against the shared admission gate."""
+        async with self._start_lock:
+            if self._admission_closed():
+                raise ValueError("gateway admission is closed")
+            self._start_ids_in_flight.add(task_id)
+
+    def _release_start(self, task_id: str) -> None:
+        self._start_ids_in_flight.discard(task_id)
+
+    def defer_workflow_attachment(self) -> None:
+        """Hold new work while an async host initializes the publication port."""
+        self._workflow_initializing = True
+
+    def _require_workflow_ready(self) -> None:
+        if self._workflow_initializing:
+            raise WorkflowInitializing("Task runner is initializing workflows; retry shortly.")
 
     def attach_workflow_service(self, service: WorkflowRunPublisher | None) -> None:
-        """Attach the shared workflow publication port after gateway startup."""
+        """Release admission with a ready port, or standalone mode on init failure."""
         self._workflow_service = service
+        self._workflow_initializing = False
 
     async def _workflow_begin(
         self, run: Project, *, source: str = "", persist_link: bool = False
@@ -529,6 +654,7 @@ class TaskRunner:
         workflow_source: str = "",
         session_key: str = "",
     ) -> Project:
+        self._require_workflow_ready()
         self._agent = agent
         if source == "file":
             p = Path(spec_path)
@@ -548,18 +674,21 @@ class TaskRunner:
             decompose_input = original_input = input_text
             spec_content = ""
 
+        self._refresh_from_config()
         _override = _resolve_workspace_dir(workspace_dir)
         async with self._start_lock:
+            if self._admission_closed():
+                raise ValueError("gateway admission is closed")
             id_suffix = time.time_ns()
             task_id = f"plan_{id_suffix}"
             while (
                 task_id in self._runs
                 or task_id in self._tasks
-                or task_id in self._plan_ids_in_flight
+                or task_id in self._start_ids_in_flight
             ):
                 id_suffix += 1
                 task_id = f"plan_{id_suffix}"
-            self._plan_ids_in_flight.add(task_id)
+            self._start_ids_in_flight.add(task_id)
         _effective_ws = _override or self._workspace_dir
         owns_task_dir = not _effective_ws
         task_dir = Path(_effective_ws) if _effective_ws else self._work_dir / f"plan_{task_id}"
@@ -573,24 +702,43 @@ class TaskRunner:
         except FileExistsError:
             pass
         except BaseException:
-            self._plan_ids_in_flight.discard(task_id)
+            self._start_ids_in_flight.discard(task_id)
             raise
-        run = Project(
-            spec_path=spec_path or "",
-            spec_content=spec_content,
-            original_input=original_input,
-            source=source,
-            status="planned",
-            task_id=task_id,
-            work_dir=str(task_dir),
-            name=workflow_name or auto_name(spec_content or original_input, spec_path),
-            workflow_id=workflow_id,
-            workflow_slug=workflow_slug,
-            workflow_revision=workflow_revision,
-        )
         try:
+            run = Project(
+                spec_path=spec_path or "",
+                spec_content=spec_content,
+                original_input=original_input,
+                source=source,
+                status="planned",
+                task_id=task_id,
+                work_dir=str(task_dir),
+                name=workflow_name or auto_name(spec_content or original_input, spec_path),
+                workflow_id=workflow_id,
+                workflow_slug=workflow_slug,
+                workflow_revision=workflow_revision,
+            )
+        except BaseException:
+            if created_task_dir:
+                try:
+                    task_dir.rmdir()
+                except OSError:
+                    logger.warning("Failed to remove rejected plan directory %s", task_dir)
+            self._start_ids_in_flight.discard(task_id)
+            raise
+        try:
+            from kiro_crew.context import inherit_session_memory
+
+            await inherit_session_memory(
+                self._ctx, session_key, f"{_SESSION_PREFIX}:{task_id}:runtime"
+            )
             if source == "yaml":
-                run.tasks = _decompose_yaml_with_audit(decompose_input, task_id)
+                run.tasks = _decompose_yaml_with_audit(
+                    decompose_input,
+                    task_id,
+                    source=source,
+                    spec_name=Path(spec_path).name if spec_path else "",
+                )
             else:
                 try:
                     run.tasks = await asyncio.wait_for(
@@ -603,7 +751,7 @@ class TaskRunner:
                     raise ValueError("Planning was cancelled.")
             if not run.tasks:
                 raise ValueError("Could not generate a plan. Try rephrasing.")
-        except Exception:
+        except BaseException:
             # Only the default plan directory belongs to this attempt. A caller's
             # workspace is an input and must survive a rejected plan unchanged.
             if created_task_dir:
@@ -611,7 +759,7 @@ class TaskRunner:
                     task_dir.rmdir()
                 except OSError:
                     logger.warning("Failed to remove rejected plan directory %s", task_dir)
-            self._plan_ids_in_flight.discard(task_id)
+            self._start_ids_in_flight.discard(task_id)
             raise
         if session_key:
             self._run_session_keys[task_id] = session_key
@@ -659,7 +807,7 @@ class TaskRunner:
                         logger.warning("Failed to remove cancelled plan directory %s", task_dir)
             raise
         finally:
-            self._plan_ids_in_flight.discard(task_id)
+            self._start_ids_in_flight.discard(task_id)
 
     async def start_workflow_definition(
         self,
@@ -699,6 +847,7 @@ class TaskRunner:
             self._plan_task.cancel()
 
     async def update_plan(self, task_id: str, tasks: list[dict]) -> Project:
+        self._require_workflow_ready()
         run = self._runs.get(task_id)
         if not run:
             raise ValueError(f"Run {task_id} not found")
@@ -716,6 +865,7 @@ class TaskRunner:
 
     async def update_task(self, task_id: str, index: int, updates: dict) -> dict:
         """Update a single PENDING task in-place without resetting the run."""
+        self._require_workflow_ready()
         run = self._resolve_task(task_id)
         if not run:
             raise ValueError(f"Run {task_id} not found")
@@ -782,59 +932,101 @@ class TaskRunner:
         workspace_dir: str = "",
         auto_approve: bool = False,
     ) -> str:
+        self._require_workflow_ready()
         run = self._runs.get(task_id)
         if not run:
             raise ValueError(f"Run {task_id} not found")
         restartable = {"planned", "paused", "cancelled", "failed"}
         if run.status not in restartable:
             raise ValueError(f"Run {task_id} is not in a startable state (status={run.status})")
+        # The status flips terminal BEFORE the prior run's finally-block
+        # finishes -- git finalize (which removes the worktree) runs after
+        # the terminal status is persisted. A restart accepted in that window
+        # validates a workspace the prior finalizer is about to delete, and
+        # then executes against a missing directory. The background task
+        # handle is the honest signal: refuse while it is still running.
+        # (Same guard as retry_from_task.)
+        prior = self._tasks.get(task_id)
+        if prior is not None and not prior.done():
+            raise ValueError("Cannot restart while the previous run is still finishing")
 
-        # Optional per-run workspace override: only applied to a run that has NOT
-        # begun yet (status "planned"). A resumed run (paused/cancelled/failed) keeps
-        # its original work_dir, so re-targeting the folder can't orphan work already
-        # produced there (files/commits, git worktree state). The path is still
-        # resolved+validated below regardless of status (audit/sensitive-path guard).
-        _override = _resolve_workspace_dir(workspace_dir)
-        if _override and run.status == "planned":
-            run.work_dir = _override
+        await self._reserve_start(task_id)
 
-        # Guard: limit concurrent running tasks — check BEFORE mutating state
-        active = sum(1 for t in self._tasks.values() if not t.done())
-        if active >= _MAX_CONCURRENT_TASKS:
-            raise ValueError(
-                f"Too many concurrent tasks ({active}/{_MAX_CONCURRENT_TASKS}). "
-                "Cancel or wait for a running task to finish."
-            )
+        try:
+            # Optional per-run workspace override: only applied to a run that has NOT
+            # begun yet (status "planned"). A resumed run (paused/cancelled/failed) keeps
+            # its original work_dir, so re-targeting the folder can't orphan work already
+            # produced there (files/commits, git worktree state). The path is still
+            # resolved+validated below regardless of status (audit/sensitive-path guard).
+            self._refresh_from_config()
+            _override = _resolve_workspace_dir(workspace_dir)
+            if _override and run.status == "planned":
+                run.work_dir = _override
 
-        if run.status in ("paused", "cancelled", "failed"):
-            for t in run.tasks:
-                if fresh or t.status not in (TaskStatus.PASSED, TaskStatus.SKIPPED):
-                    t.status = TaskStatus.PENDING
-                    t.error = ""
-                    t.result = ""
-                    t.attempts = 0
-            run.error = ""
-            run.replan_count = 0
-            run.status = "planned"
+            # Guard: limit concurrent running tasks — check BEFORE mutating state
+            active = sum(1 for t in self._tasks.values() if not t.done())
+            if active >= _MAX_CONCURRENT_TASKS:
+                raise ValueError(
+                    f"Too many concurrent tasks ({active}/{_MAX_CONCURRENT_TASKS}). "
+                    "Cancel or wait for a running task to finish."
+                )
+
+            if run.status in ("paused", "cancelled", "failed"):
+                for t in run.tasks:
+                    if fresh or t.status not in (TaskStatus.PASSED, TaskStatus.SKIPPED):
+                        t.status = TaskStatus.PENDING
+                        t.error = ""
+                        t.result = ""
+                        t.attempts = 0
+                run.error = ""
+                run.replan_count = 0
+                run.status = "planned"
+                await self._apersist_runs()
+
+            await self._grant_run_trust(run, bool(auto_approve))
             await self._apersist_runs()
 
-        self._grant_run_trust(run, bool(auto_approve))
-        await self._apersist_runs()
-
-        self._agent = agent
-        history_key = f"taskrunner:run:{task_id}"
+            self._agent = agent
+            history_key = await self._bound_history_key(run, f"taskrunner:run:{task_id}")
+        except BaseException:
+            self._release_start(task_id)
+            raise
 
         async def _execute() -> None:
             watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
+            # Pessimistic from entry for a run that already owns a worktree:
+            # the finally-block finalize() force-removes run.worktree_path,
+            # and until _ensure_resumable_workspace positively identifies
+            # that path as this run's own worktree, deleting it could destroy
+            # an unrelated directory. The flag is assigned before the first
+            # await, so no cancellation anywhere in this coroutine can reach
+            # the finally with an unvalidated workspace still marked safe.
+            # A planned first run starts False: its worktree is created by
+            # this invocation's init_workspace, so its identity is not in
+            # question.
+            workspace_lost = bool(run.branch_name)
             try:
                 run.status = "running"
                 run.started_at = run.last_task_time = time.time()
                 await self._workflow_rebind(run)
                 await self._apersist_runs()  # persist immediately so crash recovery works
-                try:
-                    await git_coord.init_workspace(run)
-                except Exception:
-                    logger.debug("Git init failed for plan execution", exc_info=True)
+                if run.branch_name:
+                    # A restart of a run that once had a worktree (paused /
+                    # cancelled / failed) resumes against it exactly like a
+                    # retry does, so it shares the retry path's guard: a lost
+                    # worktree is recovered or the run fails closed.
+                    #
+                    if not await self._ensure_resumable_workspace(run, "restart"):
+                        return
+                    workspace_lost = False
+                else:
+                    # First initialisation of a planned run: git is
+                    # best-effort and its failure is non-fatal (the run
+                    # continues without git coordination).
+                    try:
+                        await git_coord.init_workspace(run)
+                    except Exception:
+                        logger.debug("Git init failed for plan execution", exc_info=True)
                 save_progress(run)
                 task_list = "\n".join(f"  {t.index}. {t.title}" for t in run.tasks)
                 await self._notify(
@@ -871,7 +1063,7 @@ class TaskRunner:
                 run.finished_at = time.time()
                 save_progress(run)
                 await self._apersist_runs()
-                if run.branch_name:
+                if run.branch_name and not workspace_lost:
                     try:
                         await git_coord.finalize(run)
                     except Exception:
@@ -883,7 +1075,10 @@ class TaskRunner:
                     self._consolidator.maybe_consolidate(history_key)
                 self._tasks.pop(task_id, None)
 
-        self._tasks[task_id] = asyncio.create_task(_execute())
+        try:
+            self._tasks[task_id] = asyncio.create_task(_execute())
+        finally:
+            self._release_start(task_id)
         return task_id
 
     def plan_to_chat_context(self, task_id: str) -> str:
@@ -903,6 +1098,7 @@ class TaskRunner:
         workspace_dir: str = "",
         auto_approve: bool = False,
     ) -> Project:
+        self._require_workflow_ready()
         spec_path = Path(spec_path)
         if not spec_path.exists():
             raise FileNotFoundError(f"Spec not found: {spec_path}")
@@ -911,6 +1107,7 @@ class TaskRunner:
             raise ValueError("Spec file is empty")
         if not task_id:
             task_id = f"{spec_path.stem}_{int(time.time())}"
+        self._refresh_from_config()
         _override = _resolve_workspace_dir(workspace_dir)
         _effective_ws = _override or self._workspace_dir
         task_dir = Path(_effective_ws) if _effective_ws else self._work_dir / spec_path.stem
@@ -933,21 +1130,35 @@ class TaskRunner:
         run.task_id = task_id
         run.name = name or auto_name(spec_content, str(spec_path))
         run.work_dir = str(task_dir)
-        self._grant_run_trust(run, bool(auto_approve))
+        await self._grant_run_trust(run, bool(auto_approve))
         self._runs[task_id] = run
         watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
-        history_key = f"taskrunner:run:{spec_path.stem}"
+        history_key = await self._bound_history_key(run, f"taskrunner:run:{spec_path.stem}")
         try:
             await self._workflow_begin(run)
             await self._workflow_rebind(run)
             await self._apersist_runs()  # persist immediately so crash recovery works
             await self._notify("\U0001f680 Task started", f"Spec: `{spec_path.name}`", run=run)
             if source == "yaml":
-                run.tasks = _decompose_yaml_with_audit(spec_content, task_id)
-            elif not source and spec_path.suffix in (".yaml", ".yml"):
+                run.tasks = _decompose_yaml_with_audit(
+                    spec_content, task_id, source=source, spec_name=spec_path.name
+                )
+            elif spec_path.suffix in (".yaml", ".yml"):
+                # The suffix decides the decomposer, not the caller: a cron- or
+                # MCP-sourced workflow spec must decompose deterministically too.
                 try:
-                    run.tasks = _decompose_yaml_with_audit(spec_content, task_id)
+                    run.tasks = _decompose_yaml_with_audit(
+                        spec_content, task_id, source=source, spec_name=spec_path.name
+                    )
                 except (ValueError, KeyError):
+                    # Deny by default for UNATTENDED callers (cron/MCP): nobody is
+                    # watching, so an invalid spec fails with the audit trail above
+                    # rather than degrading to the unaudited LLM decomposer.
+                    # Attended callers (chat, dashboard, CLI) keep the fallback —
+                    # an operator is present to see the plan, and `/task run
+                    # <file>.yaml` on a non-workflow YAML worked before the gate.
+                    if source in _UNATTENDED_SOURCES:
+                        raise
                     logger.warning(
                         "YAML spec %s is not in workflow format; falling back to LLM decomposition",
                         spec_path.name,
@@ -1028,6 +1239,9 @@ class TaskRunner:
         return run
 
     async def _execute_tasks(self, run: Project, history_key: str) -> None:
+        # Bound once per execution: a config reload adopted at a LATER run's
+        # entry (``_refresh_from_config``) must not resize this run's groups.
+        max_parallel_steps = self._max_parallel_steps
         pending = [t for t in run.tasks if t.status == TaskStatus.PENDING]
         already_done = {
             t.index for t in run.tasks if t.status in (TaskStatus.PASSED, TaskStatus.SKIPPED)
@@ -1082,13 +1296,13 @@ class TaskRunner:
                     "\u26a1 Parallel group", f"Running {len(resolved)} tasks: {titles}", run=run
                 )
                 # Bound concurrency with a semaphore sized by the configurable
-                # `taskrunner.max_parallel_steps` knob (self._max_parallel_steps),
+                # `taskrunner.max_parallel_steps` knob (bound per run above),
                 # not a hardcoded batch size. All ready tasks are dispatched at once
                 # and the semaphore caps how many run simultaneously, so a slow task
                 # no longer stalls a whole fixed-size batch. The knob is the single
                 # place to lift concurrency (capped by compute_max_subagents ceiling).
                 results: list[bool | BaseException] = []
-                sem = asyncio.Semaphore(self._max_parallel_steps)
+                sem = asyncio.Semaphore(max_parallel_steps)
 
                 async def _run_bounded(t: Task) -> bool:
                     async with sem:
@@ -1140,7 +1354,9 @@ class TaskRunner:
 
     async def self_review(self, run: Project, task: Task, session_key: str = "") -> bool:
         """Delegate to standalone self_review for backward compat."""
-        return await self_review_fn(run, task, self._sessions, self._agent, session_key=session_key)
+        return await self_review_fn(
+            run, task, self._sessions, self._agent, session_key=session_key, ctx=self._ctx
+        )
 
     async def _execute_single_task(
         self,
@@ -1244,7 +1460,9 @@ class TaskRunner:
         await self._notify(
             "\U0001f4cb Revised plan", f"{len(new_tasks)} new task(s):\n{task_list}", run=run
         )
-        history_key = f"taskrunner:run:{Path(run.spec_path).stem}"
+        history_key = await self._bound_history_key(
+            run, f"taskrunner:run:{Path(run.spec_path).stem}"
+        )
         for task in new_tasks:
             if run.status != "running" or shutdown_event.is_set():
                 break
@@ -1288,6 +1506,9 @@ class TaskRunner:
         approval request, a denial) reach the surface the operator started the
         task on rather than one hard-wired destination.
         """
+        if self._admission_closed():
+            raise ValueError("gateway admission is closed")
+        self._require_workflow_ready()
         # Validate the per-run workspace override before entering the admission
         # lock so a bad/sensitive path fails without blocking other starts.
         _resolve_workspace_dir(workspace_dir)
@@ -1313,6 +1534,8 @@ class TaskRunner:
         # otherwise two same-spec starts can both pass the limit and overwrite
         # each other's timestamp-based ID before either appears in _tasks.
         async with self._start_lock:
+            if self._admission_closed():
+                raise ValueError("gateway admission is closed")
             active = sum(1 for task in self._tasks.values() if not task.done())
             if active >= _MAX_CONCURRENT_TASKS:
                 raise ValueError(
@@ -1342,55 +1565,96 @@ class TaskRunner:
             # the same value for two starts.
             id_suffix = time.time_ns()
             task_id = f"{Path(spec_path).stem}_{id_suffix}"
-            while task_id in self._runs or task_id in self._tasks:
+            while (
+                task_id in self._runs
+                or task_id in self._tasks
+                or task_id in self._start_ids_in_flight
+            ):
                 id_suffix += 1
                 task_id = f"{Path(spec_path).stem}_{id_suffix}"
+            self._start_ids_in_flight.add(task_id)
 
-            self._runs[task_id] = Project(
-                spec_path=str(spec_path),
-                spec_content=early_content,
-                task_id=task_id,
-                name=name or Path(spec_path).stem,
-                status="planning",
-                started_at=time.time(),
-                source=source,
-                auto_approve=bool(auto_approve),
-            )
-            if session_key:
-                self._run_session_keys[task_id] = session_key
-            await self._workflow_begin(self._runs[task_id])
             try:
-                await self._apersist_runs()  # durable before background execution
+                from kiro_crew.context import inherit_session_memory
+
+                await inherit_session_memory(
+                    self._ctx, session_key, f"{_SESSION_PREFIX}:{task_id}:runtime"
+                )
+                self._runs[task_id] = Project(
+                    spec_path=str(spec_path),
+                    spec_content=early_content,
+                    task_id=task_id,
+                    name=name or Path(spec_path).stem,
+                    status="planning",
+                    started_at=time.time(),
+                    source=source,
+                    auto_approve=bool(auto_approve),
+                )
+                if session_key:
+                    self._run_session_keys[task_id] = session_key
+                await self._workflow_begin(self._runs[task_id])
+                persist_task = asyncio.create_task(self._apersist_runs())
+                try:
+                    await asyncio.shield(persist_task)  # durable before background execution
+                except BaseException:
+                    # The off-thread atomic write cannot be cancelled once it
+                    # starts. Drain it before the outer rollback persists the
+                    # empty post-removal snapshot, or this stale planning row
+                    # can land after cleanup and reappear on restart.
+                    await asyncio.shield(persist_task)
+                    raise
+
+                async def _wrapped() -> None:
+                    try:
+                        await self.run(
+                            spec_path,
+                            task_id=task_id,
+                            name=name,
+                            source=source,
+                            workspace_dir=workspace_dir,
+                            auto_approve=auto_approve,
+                        )
+                    except Exception as exc:
+                        logger.exception("start_background task %s failed", task_id)
+                        placeholder = self._runs.get(task_id)
+                        if placeholder and placeholder.status == "planning":
+                            placeholder.status = "failed"
+                            placeholder.error = str(exc)
+                            await self._apersist_runs()
+                    finally:
+                        self._tasks.pop(task_id, None)
+
+                self._tasks[task_id] = asyncio.create_task(_wrapped())
+                return task_id
             except BaseException:
-                try:
-                    await asyncio.shield(self._workflow_delete_link(self._runs[task_id]))
-                finally:
-                    self._runs.pop(task_id, None)
-                    self._run_session_keys.pop(task_id, None)
+                rollback_run = self._runs.pop(task_id, None)
+                self._run_session_keys.pop(task_id, None)
+                if rollback_run is not None:
+                    delete_task = asyncio.create_task(self._workflow_delete_link(rollback_run))
+                    try:
+                        await asyncio.shield(delete_task)
+                    except asyncio.CancelledError:
+                        await asyncio.shield(delete_task)
+                    except Exception:
+                        logger.warning(
+                            "Failed to remove cancelled background workflow %s",
+                            task_id,
+                            exc_info=True,
+                        )
+                    cleanup_persist = asyncio.create_task(self._apersist_runs())
+                    try:
+                        await asyncio.shield(cleanup_persist)
+                    except asyncio.CancelledError:
+                        await asyncio.shield(cleanup_persist)
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist cancelled background start %s",
+                            task_id,
+                            exc_info=True,
+                        )
                 raise
-
-            async def _wrapped() -> None:
-                try:
-                    await self.run(
-                        spec_path,
-                        task_id=task_id,
-                        name=name,
-                        source=source,
-                        workspace_dir=workspace_dir,
-                        auto_approve=auto_approve,
-                    )
-                except Exception as exc:
-                    logger.exception("start_background task %s failed", task_id)
-                    placeholder = self._runs.get(task_id)
-                    if placeholder and placeholder.status == "planning":
-                        placeholder.status = "failed"
-                        placeholder.error = str(exc)
-                        await self._apersist_runs()
-                finally:
-                    self._tasks.pop(task_id, None)
-
-            self._tasks[task_id] = asyncio.create_task(_wrapped())
-            return task_id
+            finally:
+                self._release_start(task_id)
 
     @staticmethod
     def _reset_incomplete_tasks(run: Project) -> None:
@@ -1439,18 +1703,31 @@ class TaskRunner:
         # down (one kiro-cli process for the whole run).
         await self._release_run_runtime(run)
 
-    def _grant_run_trust(self, run: Project, enabled: bool) -> None:
+    async def _grant_run_trust(self, run: Project, enabled: bool) -> None:
         """Single owner of per-run trust — sets the persisted UI intent flag AND
         the authoritative SafetyOverride scoped grant together, so the two
         representations can never diverge at a call site. Enable activates an
         audited, TTL-bounded scoped grant; disable revokes it.
+
+        Async, and both halves are offloaded: each writes a SEL event, and arming
+        additionally consults the ``approval_modes`` policy. Both callers are async
+        methods, so running either inline put that filesystem work on the gateway's
+        event loop.
+
+        The flag is set FROM the activation result, never ahead of it. Arming can
+        now be refused -- an ``approval_modes`` deny of ``yolo`` disables scoped
+        grants too -- and assigning the flag first meant a refused arm still
+        persisted and reported ``auto_approve: True`` with no authoritative grant
+        behind it. That is the exact divergence this function exists to prevent,
+        so the refusal has to reach the flag.
         """
-        run.auto_approve = bool(enabled)
         scope = _auto_approve_scope(run.task_id)
-        if run.auto_approve:
-            safety_override().activate_scoped(scope, source="dashboard")
+        if enabled:
+            result = await asyncio.to_thread(safety_override().activate_scoped, scope, "dashboard")
+            run.auto_approve = bool(result.active)
         else:
-            safety_override().deactivate_scope(scope)
+            await asyncio.to_thread(safety_override().deactivate_scope, scope)
+            run.auto_approve = False
 
     async def _release_run_runtime(self, run: Project) -> None:
         """Kill the run's shared AcpRuntime once (idempotent) at run teardown.
@@ -1473,6 +1750,7 @@ class TaskRunner:
             logger.debug("deactivate auto-approve scope failed for %s", run.task_id, exc_info=True)
 
     async def delete_run(self, task_id: str) -> bool:
+        self._require_workflow_ready()
         run = self._runs.get(task_id)
         if not run:
             return False
@@ -1502,11 +1780,11 @@ class TaskRunner:
             logger.debug("SEL audit failed for delete_run %s", task_id)
         return True
 
-    def cancel(self, task_id: str | None = None) -> None:
+    def cancel(self, task_id: str | None = None, *, exact: bool = False) -> None:
         """Cancel running tasks. Sets status to 'cancelling'; the finally block
         in run()/retry_from_task() handles actual cleanup and final status."""
         if task_id:
-            matches = [r for r in self._runs.values() if r.name == task_id]
+            matches = [] if exact else [r for r in self._runs.values() if r.name == task_id]
             keys = [r.task_id for r in matches] if matches else [task_id]
             for key in keys:
                 run = self._runs.get(key)
@@ -1537,37 +1815,88 @@ class TaskRunner:
         if t and not t.done():
             t.cancel()
 
+    async def _ensure_resumable_workspace(self, run: Project, verb: str) -> bool:
+        """Validate (and if possible recover) the worktree of a resumed run.
+
+        Directory-exists alone is not enough: ``git worktree remove``
+        deregisters and deletes in separate steps, so an interrupted
+        ``finalize()`` (or the worktree being removed out from under the run
+        some other way) can leave the directory present but not registered as
+        a git worktree -- resuming against it would silently dispatch every
+        remaining step against a non-git directory while still reporting them
+        completed. Returns True when the run may proceed. On unrecoverable
+        loss the run is failed closed (persisted and notified) and False is
+        returned; the caller must return without dispatching any steps.
+        """
+        if not run.branch_name or await git_coord.workspace_is_valid(run):
+            return True
+        if await git_coord.reinit_workspace_for_retry(run):
+            return True
+        run.status = "failed"
+        run.error = (
+            "Task Runner workspace worktree was lost and " f"could not be restored before {verb}"
+        )
+        run.finished_at = time.time()
+        await self._apersist_runs()
+        await self._notify(
+            f"\u274c {verb.capitalize()} failed",
+            "Workspace could not be restored",
+            run=run,
+        )
+        return False
+
     async def retry_from_task(self, task_id: str, from_task: int, agent: str = "") -> str:
+        self._require_workflow_ready()
         run = self._resolve_task(task_id)
         if not run:
             raise ValueError(f"Run {task_id} not found")
+        # _resolve_task accepts a run NAME as well as the canonical id, but
+        # self._tasks is keyed by the canonical id. Canonicalize before any
+        # lookup, or a name-addressed retry misses the prior background-task
+        # handle, bypasses the finishing guard below, and races the prior
+        # run's finalizer (which is about to remove the worktree).
+        task_id = run.task_id
         if run.status == "running":
             raise ValueError("Cannot retry a running task")
         if run.status in ("cancelling", "pausing"):
             raise ValueError("Cannot retry while cancel is in progress")
-        for task in run.tasks:
-            if task.index >= from_task:
-                task.status = TaskStatus.PENDING
-                task.error = ""
-                task.result = ""
-                task.attempts = 0
-        run.status = "running"
-        run.error = ""
-        run.finished_at = 0.0
-        run.started_at = run.last_task_time = time.time()
-        await self._apersist_runs()  # persist immediately so crash recovery works
-        self._agent = agent
-        history_key = f"taskrunner:run:{Path(run.spec_path).stem}"
+        # The status flips terminal BEFORE the prior run's finally-block
+        # finishes -- git finalize (which removes the worktree) runs after
+        # the terminal status is persisted. A retry accepted in that window
+        # validates a workspace the prior finalizer is about to delete, and
+        # then executes against a missing directory. The background task
+        # handle is the honest signal: refuse while it is still running.
+        prior = self._tasks.get(task_id)
+        if prior is not None and not prior.done():
+            raise ValueError("Cannot retry while the previous run is still finishing")
+
+        await self._reserve_start(task_id)
+        try:
+            for task in run.tasks:
+                if task.index >= from_task:
+                    task.status = TaskStatus.PENDING
+                    task.error = ""
+                    task.result = ""
+                    task.attempts = 0
+            run.status = "running"
+            run.error = ""
+            run.finished_at = 0.0
+            run.started_at = run.last_task_time = time.time()
+            await self._apersist_runs()  # persist immediately so crash recovery works
+            self._agent = agent
+            history_key = await self._bound_history_key(
+                run, f"taskrunner:run:{Path(run.spec_path).stem}"
+            )
+        except BaseException:
+            self._release_start(task_id)
+            raise
 
         async def _retry() -> None:
             watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
             try:
                 await self._workflow_rebind(run)
-                if run.branch_name and not Path(run.work_dir).exists():
-                    try:
-                        await git_coord.init_workspace(run)
-                    except Exception:
-                        logger.debug("Git re-init on retry failed", exc_info=True)
+                if not await self._ensure_resumable_workspace(run, "retry"):
+                    return
                 await self._notify("\U0001f504 Retrying", f"From task {from_task}", run=run)
                 watchdog_task = asyncio.create_task(self._watchdog_loop(run))
                 await self._execute_tasks(run, history_key)
@@ -1600,7 +1929,10 @@ class TaskRunner:
                     watchdog_task.cancel()
                 self._tasks.pop(task_id, None)
 
-        self._tasks[task_id] = asyncio.create_task(_retry())
+        try:
+            self._tasks[task_id] = asyncio.create_task(_retry())
+        finally:
+            self._release_start(task_id)
         return task_id
 
     # ── Decomposition (delegates to task_planner) ──
@@ -1631,6 +1963,17 @@ class TaskRunner:
         await notify(title, body, run=run, callback=self._on_notify, session_key=session_key)
 
     # ── History Integration ──
+
+    async def _bound_history_key(self, run: Project, legacy_key: str) -> str:
+        from kiro_crew.context import inherit_session_memory
+        from kiro_crew.member_memory_auth import read_private_session_store
+
+        runtime_key = f"{_SESSION_PREFIX}:{run.task_id}:runtime"
+        if await asyncio.to_thread(read_private_session_store, runtime_key) is None:
+            return legacy_key
+        history_key = f"taskrunner:run:{run.task_id}"
+        await inherit_session_memory(self._ctx, runtime_key, history_key)
+        return history_key
 
     def _log_task(self, history_key: str, run: Project, task: Task) -> None:
         if not self._conversation_log:
@@ -1675,9 +2018,28 @@ class TaskRunner:
     # ── Learn from Failures ──
 
     async def _extract_lesson(self, task: Task, run: Project | None = None) -> None:
-        if not self._lesson_store:
-            return
         try:
+            from kiro_crew.member_memory_auth import read_private_session_store
+            from kiro_crew.memory_stores import UnknownMemoryStore
+
+            runtime_key = f"{_SESSION_PREFIX}:{run.task_id}:runtime" if run else ""
+            private_store = (
+                await asyncio.to_thread(read_private_session_store, runtime_key)
+                if runtime_key
+                else None
+            )
+            lesson_store = self._lesson_store
+            if not private_store and not lesson_store:
+                return
+            private_vectors = None
+            if private_store:
+                from kiro_crew.context import inherit_session_memory
+
+                context = self._ctx
+                if context is None:
+                    raise UnknownMemoryStore("The task's private lesson context is unavailable")
+                await inherit_session_memory(context, runtime_key, runtime_key)
+                private_vectors = await context.ensure_store(private_store)
             prompt = (
                 "A task failed after multiple attempts.\n\n"
                 f'Task: "{task.title}"\n'
@@ -1688,13 +2050,23 @@ class TaskRunner:
                 '"category": "tool"}\n\n'
                 "Respond with ONLY valid JSON."
             )
-            result = await self._call_llm_for_lesson(prompt)
+            result = (
+                await self._call_llm_for_lesson(prompt, runtime_key=runtime_key)
+                if private_store
+                else await self._call_llm_for_lesson(prompt)
+            )
             if not result or "rule" not in result:
                 return
             rule = result["rule"]
             category = result.get("category", "tool")
             negative = result.get("negative")
-            if self._consolidator and self._consolidator._vector_store:
+            if private_store:
+                if private_vectors is None:
+                    raise UnknownMemoryStore("The task's private lesson store is unavailable")
+                await run_in_embed_pool(
+                    private_vectors.write_lesson, rule, category, negative, "task_runner"
+                )
+            elif self._consolidator and self._consolidator._vector_store:
                 # write_lesson embeds via blocking urllib (Ollama); offload to
                 # keep the gateway event loop responsive (same pattern as
                 # dashboard/handlers/cron.py api_lessons_create).
@@ -1706,6 +2078,8 @@ class TaskRunner:
                     "task_runner",
                 )
             else:
+                if lesson_store is None:
+                    return
                 # Offloaded for the same reason as write_lesson above, and now
                 # necessarily so: LessonStore locks per PATH, so instances in
                 # different components share one lock. A dashboard writer holding
@@ -1713,7 +2087,7 @@ class TaskRunner:
                 # ran here. The lock is what makes the write atomic, so the fix is
                 # to move the caller off the loop rather than to weaken it.
                 await asyncio.to_thread(
-                    self._lesson_store.save,
+                    lesson_store.save,
                     Lesson(
                         ts=datetime.now(tz=timezone.utc).isoformat(),
                         rule=rule,
@@ -1728,20 +2102,32 @@ class TaskRunner:
         except Exception:
             logger.debug("Lesson extraction failed", exc_info=True)
 
-    async def _call_llm_for_lesson(self, prompt: str) -> dict | None:
-        session_key = BACKGROUND_KEY
+    async def _call_llm_for_lesson(self, prompt: str, *, runtime_key: str = "") -> dict | None:
+        session_key = f"{runtime_key}:lesson" if runtime_key else BACKGROUND_KEY
+        if runtime_key:
+            from kiro_crew.context import inherit_session_memory
+
+            await inherit_session_memory(self._ctx, runtime_key, session_key)
         try:
-            client, _is_new, _resumed = await self._sessions.get_or_create(
-                session_key,
-                agent=self._agent or None,
-            )
+            if runtime_key:
+                client, _is_new, _resumed = await self._sessions.open_task_session(
+                    runtime_key, session_key, agent=self._agent or None
+                )
+            else:
+                client, _is_new, _resumed = await self._sessions.get_or_create(
+                    session_key,
+                    agent=self._agent or None,
+                )
             return await stream_and_collect_json(client, prompt)
         except Exception:
             logger.debug("LLM lesson extraction call failed", exc_info=True)
             return None
         finally:
             self._sessions.release(session_key)
-            await self._sessions.recycle_background()
+            if runtime_key:
+                await self._sessions.reset(session_key)
+            else:
+                await self._sessions.recycle_background()
 
     # ── Task Watchdog ──
 
@@ -2045,7 +2431,7 @@ class TaskRunner:
                     # when the worktree location is actually known; otherwise
                     # fall back to the documented "task continues without git
                     # coordination" behaviour instead of committing into a path
-                    # no longer identified.
+                    # that is not identified.
                     git_enabled=bool(item.get("git_enabled", bool(_worktree_path))),
                     commit_hashes=list(item.get("commit_hashes", [])),
                     lessons_learned=list(item.get("lessons_learned", [])),

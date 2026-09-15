@@ -1,10 +1,10 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest'
 import { screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import { renderWithProviders } from '../../test/helpers'
 import { i18nT } from '../../i18n/t'
 import { fmtBytes } from '../../i18n/format'
 import type {
-  DriveStatus, DriveUsage, LibraryResponse, BackupStatus, SharesResponse,
+  DriveStatus, DriveUsage, DriveSearchHit, DriveListing, LibraryResponse, BackupStatus, RemoteBackup, SharesResponse, Share,
 } from './types'
 
 /* The sections read only through the api client; mocking it keeps every case
@@ -22,6 +22,8 @@ vi.mock('./api', async () => {
       driveBootstrapConfirm: vi.fn(),
       driveList: vi.fn(),
       driveDownload: vi.fn(),
+      drivePreview: vi.fn(),
+      driveSearch: vi.fn(),
       driveMove: vi.fn(),
       driveUpload: vi.fn(),
       driveDelete: vi.fn(),
@@ -38,6 +40,7 @@ vi.mock('./api', async () => {
       backupRun: vi.fn(),
       backupNightly: vi.fn(),
       backupRestore: vi.fn(),
+      installLabel: vi.fn(),
     },
   }
 })
@@ -50,6 +53,16 @@ vi.mock('../../api/client', () => ({
     grantAwsConsent: vi.fn(),
     revokeAwsConsent: vi.fn(),
   },
+}))
+
+/* The preview pane renders code through the dashboard's shared ContentRenderer,
+ * whose code surface is Pierre -- and Pierre's real chunk never resolves under
+ * vitest. Stub the mount so "the code viewer got the bytes" is assertable here;
+ * its chrome is Playwright's to check. */
+vi.mock('../../pierre', () => ({
+  PierreCode: ({ file }: { file: { contents: string } }) => (
+    <div data-testid="pierre-mounted">{file.contents}</div>
+  ),
 }))
 
 import { awsControlApi, AwsControlError } from './api'
@@ -80,7 +93,15 @@ const driveExists: Extract<DriveStatus, { exists: true }> = {
 }
 
 const emptyLibrary: LibraryResponse = { artifacts: [] }
-const emptyBackup: BackupStatus = { nightly: false, runs: {}, remote: { snapshot: [], sessions: [] } }
+const INSTALL_ID = 'a'.repeat(32)
+/** An empty remote half in the new shape: no archives, no co-tenants. */
+const emptyRemote = { snapshot: [], sessions: [], installs: [], others: 0, truncated: false, max: 8 }
+const emptyBackup: BackupStatus = {
+  nightly: false,
+  runs: {},
+  install: { id: INSTALL_ID, label: 'This Mac' },
+  remote: emptyRemote,
+}
 const noShares: SharesResponse = { shares: [] }
 
 function stubDrivePresent() {
@@ -186,6 +207,10 @@ describe('DrivePage sections', () => {
     // sibling controls: Download + More).
     fireEvent.keyDown(await screen.findByTestId('drive-more'), { key: 'Enter' })
     fireEvent.click(await screen.findByTestId('drive-share'))
+    // The dialog names the file it is about to publish.
+    expect(await screen.findByTestId('share-dialog')).toHaveTextContent(
+      i18nT('apps.awsControl.console.share_title', { name: 'report.pdf' }),
+    )
     fireEvent.click(await screen.findByTestId('share-create'))
 
     const result = await screen.findByTestId('share-result')
@@ -640,6 +665,41 @@ describe('DrivePage sections', () => {
     expect(line.textContent ?? '').toContain('12')
   })
 
+  it('the deleted count belongs to the folder the delete happened in, and leaving that folder retires it', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: ['invoices', 'docs'] })
+    let finish: (r: { deleted: true; path: string; objects: number }) => void = () => {}
+    vi.mocked(awsControlApi.driveFolderDelete).mockImplementation(
+      () => new Promise((resolve) => { finish = resolve }),
+    )
+    await renderDrive('drive')
+    await screen.findByTestId('drive-listing')
+
+    fireEvent.keyDown((await screen.findAllByTestId('drive-folder-more'))[0], { key: 'Enter' })
+    fireEvent.click(await screen.findByTestId('drive-folder-delete'))
+    fireEvent.click(await screen.findByTestId('drive-folder-delete-action'))
+    await waitFor(() => expect(awsControlApi.driveFolderDelete).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'invoices'))
+
+    // The reader walks into `docs` while the delete is still running. The
+    // count that arrives now belongs to the top level, not to `docs`.
+    fireEvent.click(screen.getAllByTestId('drive-folder-open')[1])
+    await waitFor(() => expect(awsControlApi.driveList).toHaveBeenLastCalledWith(ACCOUNT_ID, 'drive', 'docs', ''))
+    finish({ deleted: true, path: 'invoices', objects: 12 })
+    await waitFor(() => expect(awsControlApi.driveFolderDelete).toHaveBeenCalledTimes(1))
+    expect(screen.queryByTestId('drive-folder-deleted')).toBeNull()
+
+    // Back at the top level the count is waiting where it happened...
+    fireEvent.click(within(screen.getByTestId('drive-crumbs')).getByText(i18nT('apps.awsControl.console.section_files')))
+    expect((await screen.findByTestId('drive-folder-deleted')).textContent ?? '').toContain('12')
+
+    // ...and leaving again retires it: a later return does not replay it.
+    fireEvent.click((await screen.findAllByTestId('drive-folder-open'))[1])
+    await waitFor(() => expect(screen.queryByTestId('drive-folder-deleted')).toBeNull())
+    fireEvent.click(within(screen.getByTestId('drive-crumbs')).getByText(i18nT('apps.awsControl.console.section_files')))
+    await screen.findAllByTestId('drive-folder-open')
+    expect(screen.queryByTestId('drive-folder-deleted')).toBeNull()
+  })
+
   it('rejects a bad FOLDER name with folder wording, not the file message', async () => {
     // The shared drive_bad_name text names a file; the reader typed a folder.
     stubDrivePresent()
@@ -785,11 +845,15 @@ describe('DrivePage sections: folder disclosure and downloads', () => {
     // The current folder is rendered as text, not as a third control.
     expect(screen.getByTestId('drive-crumb-current')).toHaveTextContent('b')
 
-    // The overflow still navigates to the ancestor `a`.
-    fireEvent.click(screen.getByTestId('drive-crumb-more'))
-    const menu = screen.getByTestId('drive-crumb-menu')
-    expect(menu.querySelectorAll('button')).toHaveLength(1)
-    fireEvent.click(menu.querySelectorAll('button')[0])
+    // The overflow still navigates to the ancestor `a`. It is the shared
+    // `ui/dropdown-menu` now, so it opens like every other row menu here and
+    // its entries are menu items, not buttons.
+    fireEvent.keyDown(screen.getByTestId('drive-crumb-more'), { key: 'Enter' })
+    const menu = await screen.findByTestId('drive-crumb-menu')
+    const items = within(menu).getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0]).toHaveTextContent('a')
+    fireEvent.click(items[0])
     await waitFor(() =>
       expect(awsControlApi.driveList).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'a', ''),
     )
@@ -2222,7 +2286,8 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
     vi.mocked(awsControlApi.backup).mockResolvedValue({
       nightly: false,
       runs: { snapshot: { key: 'snap-1', bytes: 1024, at: '2026-08-24T00:00:00Z' } },
-      remote: { snapshot: [], sessions: [] },
+      install: { id: INSTALL_ID, label: 'This Mac' },
+      remote: emptyRemote,
     })
     vi.mocked(awsControlApi.backupRun).mockResolvedValue({
       started: true, kind: 'snapshot', runId: 'a'.repeat(32),
@@ -2245,18 +2310,23 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
     await waitFor(() => expect(awsControlApi.backupNightly).toHaveBeenCalledWith(ACCOUNT_ID, true))
   })
 
-  it('discloses the stored-backups archive and restores a file, showing the staged path', async () => {
+  it('discloses the stored-backups archive and restores a self-owned file, showing the staged path', async () => {
     stubDrivePresent()
     vi.mocked(awsControlApi.backup).mockResolvedValue({
       nightly: true,
       runs: {},
+      install: { id: INSTALL_ID, label: 'This Mac' },
       remote: {
-        snapshot: [{ key: 'backup/snapshot/2026-08-24.tar', size: 4096, modified: '2026-08-24T00:00:00Z' }],
+        snapshot: [{ key: 'snapshots/' + INSTALL_ID + '/2026-08-24.tar', size: 4096, modified: '2026-08-24T00:00:00Z', install: INSTALL_ID, origin: 'self' }],
         sessions: [],
+        installs: [{ id: INSTALL_ID, label: 'This Mac', origin: 'self' }],
+        others: 0,
+        truncated: false,
+        max: 8,
       },
     })
     vi.mocked(awsControlApi.backupRestore).mockResolvedValue({
-      downloaded: true, path: '/home/u/.kiro/restore/2026-08-24', bytes: 4096,
+      downloaded: true, path: '/home/u/.kiro/restore/2026-08-24', bytes: 4096, origin: 'self', install: INSTALL_ID,
     })
 
     await renderDrive('backup')
@@ -2268,16 +2338,17 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
     // The write-only-tier restore caveat renders alongside.
     expect(screen.getByTestId('backup-restore-caveat')).toBeTruthy()
 
-    // Restore stages the archive locally and echoes the landed path.
+    // A self-owned row restores at once, with no confirm and no foreignOk.
     fireEvent.click(within(archive).getByTestId('backup-restore'))
-    await waitFor(() => expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, 'backup/snapshot/2026-08-24.tar'))
+    expect(screen.queryByTestId('backup-restore-confirm')).toBeNull()
+    await waitFor(() => expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, 'snapshots/' + INSTALL_ID + '/2026-08-24.tar', undefined))
     expect(await screen.findByTestId('backup-restored')).toHaveTextContent('/home/u/.kiro/restore/2026-08-24')
   })
 
   it('shows the backup remote-error note when the archive could not be read', async () => {
     stubDrivePresent()
     vi.mocked(awsControlApi.backup).mockResolvedValue({
-      nightly: false, runs: {}, remote: null, remoteError: 'AccessDenied',
+      nightly: false, runs: {}, install: { id: INSTALL_ID, label: 'This Mac' }, remote: null, remoteError: 'AccessDenied',
     })
 
     await renderDrive('backup')
@@ -2323,6 +2394,403 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
     fireEvent.click(await screen.findByTestId('cli-drawer-toggle'))
     const body = await screen.findByTestId('cli-drawer-body')
     expect(body).toHaveTextContent('aws s3 ls s3://kirocrew-drive-abc123/artifacts/')
+  })
+})
+
+describe('DrivePage sections: per-install backup attribution', () => {
+  const OTHER_ID = 'b'.repeat(32)
+
+  /**
+   * A remote half carrying one archive per origin, and an install roster that
+   * gives the foreign install a label. `label` on the other row is chosen by the
+   * caller so the label vs id split can be exercised.
+   */
+  function remoteWith(opts?: { otherLabel?: string; others?: number; truncated?: boolean }): RemoteBackup {
+    return {
+      snapshot: [
+        { key: `snapshots/${INSTALL_ID}/self.tar`, size: 10, modified: '2026-09-01T00:00:00Z', install: INSTALL_ID, origin: 'self' },
+        { key: `snapshots/${OTHER_ID}/other.tar`, size: 10, modified: '2026-09-01T00:00:00Z', install: OTHER_ID, origin: 'other' },
+        { key: 'snapshots/legacy.tar', size: 10, modified: '2026-09-01T00:00:00Z', install: '', origin: 'legacy' },
+      ],
+      sessions: [],
+      installs: [
+        { id: INSTALL_ID, label: 'This Mac', origin: 'self' },
+        ...(opts?.otherLabel !== undefined ? [{ id: OTHER_ID, label: opts.otherLabel, origin: 'other' as const }] : []),
+      ],
+      others: opts?.others ?? 1,
+      truncated: opts?.truncated ?? false,
+      // Served by the backend rather than derived from `installs.length`, which
+      // counts THIS install too and would be off by one.
+      max: 8,
+    }
+  }
+
+  function stubBackup(remote: RemoteBackup, install = { id: INSTALL_ID, label: 'This Mac' }) {
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      nightly: false, runs: {}, install, remote,
+    } as BackupStatus)
+  }
+
+  async function openArchive() {
+    await renderDrive('backup')
+    fireEvent.click(await screen.findByTestId('backup-remote-toggle'))
+    return within(await screen.findByTestId('backup-archive'))
+  }
+
+  it('renders the self row as the install label and the self origin', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-origin')
+    // self row: the catalog's own self shape, with this install's label in it.
+    expect(rows[0].textContent).toBe(
+      i18nT('apps.awsControl.console.backup_attribution_self', { label: 'This Mac' }),
+    )
+  })
+
+  it('keeps the attribution caption on every row, not hidden below a viewport width', async () => {
+    // The caption is the one thing this whole change adds, so a narrow window
+    // must still show it -- it wraps to its own line, it does not disappear.
+    // jsdom has no layout, so this pins the CLASS rather than a measured width:
+    // a future `hidden`/`sm:inline` pair would silently remove it on a phone.
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    const archive = await openArchive()
+    const captions = archive.getAllByTestId('backup-archive-origin')
+    expect(captions).toHaveLength(3)
+    for (const caption of captions) {
+      // The text is really there (not an empty node the layout would show).
+      expect(caption.textContent?.trim()).not.toBe('')
+      // And nothing hides it at a breakpoint.
+      expect(caption.className).not.toMatch(/\bhidden\b/)
+      expect(caption.className).not.toMatch(/\bsm:inline\b/)
+    }
+    // The self row's caption reads as this install, proving it is the real
+    // attribution and not a placeholder kept only to satisfy the class check.
+    expect(captions[0].textContent).toBe(
+      i18nT('apps.awsControl.console.backup_attribution_self', { label: 'This Mac' }),
+    )
+  })
+
+  it('renders a labelled foreign row with the quoted label, the other origin, and 8 hex', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-origin')
+    // other + label: the catalog quotes the label, because the string was written
+    // by whoever wrote the archive, and names the id beside it.
+    expect(rows[1].textContent).toBe(
+      i18nT('apps.awsControl.console.backup_attribution_other', {
+        label: 'Alice laptop',
+        id: OTHER_ID.slice(0, 8),
+      }),
+    )
+    expect(rows[1].textContent).toContain('"Alice laptop"')
+  })
+
+  it('renders an unlabelled foreign row as the other origin and 8 hex, no quotes', async () => {
+    stubDrivePresent()
+    // No roster entry for the other install -> label falls back to the no-label form.
+    stubBackup(remoteWith())
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-origin')
+    expect(rows[1].textContent).toBe(
+      i18nT('apps.awsControl.console.backup_attribution_other_unnamed', {
+        id: OTHER_ID.slice(0, 8),
+      }),
+    )
+    expect(rows[1].textContent).not.toContain('"')
+  })
+
+  it('renders a legacy row as unknown origin', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-origin')
+    expect(rows[2].textContent).toBe(i18nT('apps.awsControl.console.backup_origin_unknown'))
+  })
+
+  it('refuses a foreign restore until confirmed, then sends foreignOk true', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.backupRestore).mockResolvedValue({
+      downloaded: true, path: '/tmp/x', bytes: 10, origin: 'other', install: OTHER_ID,
+    })
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-row')
+
+    // The foreign row is the second one. Its Restore asks first -- nothing sent.
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore'))
+    expect(awsControlApi.backupRestore).not.toHaveBeenCalled()
+    const confirm = within(rows[1]).getByTestId('backup-restore-confirm')
+    // The confirm names the archive's owning id (first 8 hex), not its label.
+    expect(confirm.textContent).toContain(OTHER_ID.slice(0, 8))
+
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore-confirm-yes'))
+    await waitFor(() =>
+      expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, `snapshots/${OTHER_ID}/other.tar`, true),
+    )
+  })
+
+  it('confirms a legacy restore, then sends the override like every unproven row', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.backupRestore).mockResolvedValue({
+      downloaded: true, path: '/tmp/x', bytes: 10, origin: 'legacy', install: '',
+    })
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-row')
+
+    // The legacy row is the third. It asks first...
+    fireEvent.click(within(rows[2]).getByTestId('backup-restore'))
+    expect(awsControlApi.backupRestore).not.toHaveBeenCalled()
+    expect(within(rows[2]).getByTestId('backup-restore-confirm').textContent).toContain(
+      i18nT('apps.awsControl.console.backup_restore_unknown_confirm'),
+    )
+
+    // ...and confirming sends the override. The backend refuses every origin it
+    // cannot PROVE is this install's own, and an archive with no id has an unknown
+    // author -- "unknown" includes "somebody else's".
+    fireEvent.click(within(rows[2]).getByTestId('backup-restore-confirm-yes'))
+    await waitFor(() =>
+      expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, 'snapshots/legacy.tar', true),
+    )
+  })
+
+  /**
+   * An archive under THIS install's own prefix but with no local upload record.
+   *
+   * The prefix is a folder name any bucket writer can create, so a match on it
+   * proves nothing. Such a row is `unverified`, not `self`: it renders the
+   * unverified attribution and confirms before it downloads, exactly like a
+   * legacy archive -- and, like legacy, it then sends the override, because the
+   * backend refuses every origin it cannot prove is this install's own.
+   */
+  const unverifiedRemote: RemoteBackup = {
+    snapshot: [
+      { key: `snapshots/${INSTALL_ID}/planted.tar`, size: 10, modified: '2026-09-01T00:00:00Z', install: INSTALL_ID, origin: 'unverified' },
+    ],
+    sessions: [],
+    installs: [{ id: INSTALL_ID, label: 'This Mac', origin: 'self' }],
+    others: 0,
+    truncated: false,
+    max: 8,
+  }
+
+  it('renders an unverified row as the unverified attribution, not the self one', async () => {
+    stubDrivePresent()
+    stubBackup(unverifiedRemote)
+    const archive = await openArchive()
+    const origin = archive.getByTestId('backup-archive-origin')
+    expect(origin.textContent).toBe(
+      i18nT('apps.awsControl.console.backup_attribution_unverified'),
+    )
+    // It must NOT be dressed as this install's own archive, named or unnamed.
+    expect(origin.textContent).not.toBe(
+      i18nT('apps.awsControl.console.backup_attribution_self', { label: 'This Mac' }),
+    )
+    expect(origin.textContent).not.toBe(
+      i18nT('apps.awsControl.console.backup_attribution_self_unnamed'),
+    )
+  })
+
+  it('asks before restoring an unverified row, then sends the override', async () => {
+    stubDrivePresent()
+    stubBackup(unverifiedRemote)
+    vi.mocked(awsControlApi.backupRestore).mockResolvedValue({
+      downloaded: true, path: '/tmp/x', bytes: 10, origin: 'unverified', install: INSTALL_ID,
+    })
+    const archive = await openArchive()
+    const row = archive.getByTestId('backup-archive-row')
+
+    // Unlike a self row, it does not restore at once: it asks first.
+    fireEvent.click(within(row).getByTestId('backup-restore'))
+    expect(awsControlApi.backupRestore).not.toHaveBeenCalled()
+    expect(within(row).getByTestId('backup-restore-confirm').textContent).toContain(
+      i18nT('apps.awsControl.console.backup_restore_unverified_confirm'),
+    )
+
+    // Confirming sends the override. Sitting under this install's own prefix is
+    // not proof of anything -- a prefix is a folder name any bucket writer can
+    // create, which is exactly what this origin exists to say.
+    fireEvent.click(within(row).getByTestId('backup-restore-confirm-yes'))
+    await waitFor(() =>
+      expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, `snapshots/${INSTALL_ID}/planted.tar`, true),
+    )
+  })
+
+  it('does not consult the label when gating a restore: a labelled foreign row still confirms', async () => {
+    // The label is written by another install into a shared bucket, so it must
+    // never decide what a restore may do. A foreign row with a friendly label is
+    // still gated on its origin: it asks first and sends foreignOk true.
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Totally Trusted' }))
+    vi.mocked(awsControlApi.backupRestore).mockResolvedValue({
+      downloaded: true, path: '/tmp/x', bytes: 10, origin: 'other', install: OTHER_ID,
+    })
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-row')
+
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore'))
+    // A label, however friendly, does not skip the confirm.
+    expect(within(rows[1]).getByTestId('backup-restore-confirm')).toBeTruthy()
+    expect(awsControlApi.backupRestore).not.toHaveBeenCalled()
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore-confirm-yes'))
+    await waitFor(() =>
+      expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, `snapshots/${OTHER_ID}/other.tar`, true),
+    )
+  })
+
+  it('surfaces the foreign-refused sentence when the mutation still returns the refusal code', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.backupRestore).mockRejectedValue(
+      new AwsControlError('foreign_install_archive', 409),
+    )
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-row')
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore'))
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore-confirm-yes'))
+
+    expect(await screen.findByTestId('backup-restore-error')).toHaveTextContent(
+      i18nT('apps.awsControl.console.backup_restore_foreign_refused'),
+    )
+  })
+
+  it('shows the shared-drive notes and the truncation note when other installs exist', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop', others: 3, truncated: true }))
+    await openArchive()
+    expect(screen.getByTestId('backup-shared-note')).toBeTruthy()
+    expect(screen.getByTestId('backup-others-on-drive')).toBeTruthy()
+    expect(screen.getByTestId('backup-others-truncated')).toBeTruthy()
+  })
+
+  it('the others-toggle drives `others` on the backup request and re-queries', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    await renderDrive('backup')
+    fireEvent.click(await screen.findByTestId('backup-remote-toggle'))
+    await screen.findByTestId('backup-archive')
+
+    // Before the toggle, others is off in the request.
+    expect(awsControlApi.backup).toHaveBeenCalledWith(ACCOUNT_ID, { remote: true, others: false })
+    vi.mocked(awsControlApi.backup).mockClear()
+
+    const toggle = within(screen.getByTestId('backup-others-toggle')).getByRole('switch')
+    fireEvent.click(toggle)
+    await waitFor(() =>
+      expect(awsControlApi.backup).toHaveBeenCalledWith(ACCOUNT_ID, { remote: true, others: true }),
+    )
+  })
+
+  it('renames this install through the api and does not touch the label until it succeeds', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.installLabel).mockResolvedValue({
+      install: { id: INSTALL_ID, label: 'Renamed Mac' },
+    })
+    await renderDrive('backup')
+
+    const row = await screen.findByTestId('backup-install')
+    expect(within(row).getByTestId('backup-install-label')).toHaveTextContent('This Mac')
+    fireEvent.click(within(row).getByTestId('backup-install-rename'))
+    const input = await screen.findByTestId('backup-install-name')
+    fireEvent.change(input, { target: { value: 'Renamed Mac' } })
+    fireEvent.click(screen.getByTestId('backup-install-save'))
+    await waitFor(() => expect(awsControlApi.installLabel).toHaveBeenCalledWith('Renamed Mac'))
+  })
+
+  it('Enter saves the install name and Escape abandons it, like the drive rename editors', async () => {
+    // Three rename editors on this page commit on Enter and close on Escape. A
+    // reader habituated by those presses Enter here, so a name lost to a key that
+    // works everywhere else on the page is the worst version of the divergence.
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.installLabel).mockResolvedValue({
+      install: { id: INSTALL_ID, label: 'Typed name' },
+    })
+    await renderDrive('backup')
+
+    fireEvent.click(await screen.findByTestId('backup-install-rename'))
+    const input = await screen.findByTestId('backup-install-name')
+    fireEvent.change(input, { target: { value: 'Typed name' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(awsControlApi.installLabel).toHaveBeenCalledWith('Typed name'))
+
+    vi.mocked(awsControlApi.installLabel).mockClear()
+    fireEvent.click(await screen.findByTestId('backup-install-rename'))
+    const reopened = await screen.findByTestId('backup-install-name')
+    fireEvent.change(reopened, { target: { value: 'abandoned' } })
+    fireEvent.keyDown(reopened, { key: 'Escape' })
+    await waitFor(() =>
+      expect(screen.queryByTestId('backup-install-name')).not.toBeInTheDocument(),
+    )
+    expect(awsControlApi.installLabel).not.toHaveBeenCalled()
+  })
+
+  it('connects the co-tenant count to the toggle when this install has no rows of its own', async () => {
+    // The replacement-machine case this feature exists for: a fresh install owns
+    // nothing, so every archive on the drive is behind the off-by-default toggle. A
+    // count above an empty list is the failure -- the reader is told others are here
+    // and given nothing that reveals them.
+    stubBackup({ ...remoteWith(), snapshot: [], sessions: [], others: 1 })
+    const card = await openArchive()
+
+    expect(card.getByTestId('backup-others-on-drive')).toBeInTheDocument()
+    expect(card.getByTestId('backup-no-own-archives')).toHaveTextContent(
+      i18nT('apps.awsControl.console.backup_none_from_this_install'),
+    )
+  })
+
+  it('drops the no-rows line once this install has archives of its own', async () => {
+    stubBackup(remoteWith())
+    const card = await openArchive()
+
+    expect(card.getAllByTestId('backup-archive-row').length).toBeGreaterThan(0)
+    expect(card.queryByTestId('backup-no-own-archives')).not.toBeInTheDocument()
+  })
+
+  it('drops the no-rows line when the toggle is already on, since it would name a done action', async () => {
+    // The line's sentence is an instruction to use the toggle. With the toggle on
+    // there is nothing left to instruct, so repeating it would read as the control
+    // having failed.
+    stubBackup({ ...remoteWith(), snapshot: [], sessions: [], others: 1 })
+    const card = await openArchive()
+    expect(card.getByTestId('backup-no-own-archives')).toBeInTheDocument()
+
+    fireEvent.click(within(card.getByTestId('backup-others-toggle')).getByRole('switch'))
+    await waitFor(() =>
+      expect(card.queryByTestId('backup-no-own-archives')).not.toBeInTheDocument(),
+    )
+  })
+
+  it('the rename commit button reads Save name, not Rename', async () => {
+    // Rename OPENS the editor; the commit button SAVES it. One word for both was
+    // the UX defect this fixes, so the commit control must not reuse the rename
+    // label.
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    await renderDrive('backup')
+
+    fireEvent.click(await screen.findByTestId('backup-install-rename'))
+    const save = await screen.findByTestId('backup-install-save')
+    expect(save).toHaveTextContent(i18nT('apps.awsControl.console.backup_install_save'))
+    expect(save).not.toHaveTextContent(i18nT('apps.awsControl.console.backup_install_rename'))
+  })
+
+  it('reports a failed rename and leaves the stored name in place', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.installLabel).mockRejectedValue(new AwsControlError('invalid_label', 400))
+    await renderDrive('backup')
+
+    fireEvent.click(await screen.findByTestId('backup-install-rename'))
+    fireEvent.change(await screen.findByTestId('backup-install-name'), { target: { value: '' } })
+    fireEvent.click(screen.getByTestId('backup-install-save'))
+    expect(await screen.findByTestId('backup-install-error')).toHaveTextContent(
+      i18nT('apps.awsControl.console.backup_install_rename_failed'),
+    )
   })
 })
 
@@ -2499,6 +2967,39 @@ describe('DrivePage sections: drag and drop', () => {
       }),
     })
     expect(await screen.findByTestId('drive-move-error')).toBeTruthy()
+  })
+
+  it('a stale drag refusal does not stand in for a later delete failure', async () => {
+    // The two are different failures on different slots. If one line served
+    // both, a refused drop left on screen would mask the delete that failed
+    // after it -- and the file that is still there would look deleted.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveMove).mockRejectedValue(new AwsControlError('destination_exists', 409))
+    let failDelete: (e: unknown) => void = () => {}
+    vi.mocked(awsControlApi.driveDelete).mockImplementation(
+      () => new Promise((_resolve, reject) => { failDelete = reject }),
+    )
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({ results: [], capped: false, limit: 200 })
+    await renderDrive('drive')
+
+    fireEvent.dragStart(await screen.findByTestId('drive-file'), { dataTransfer: dt({ setData: () => {} }) })
+    fireEvent.drop(await screen.findByTestId('drive-folder'), {
+      dataTransfer: dt({ types: ['application/x-drive-object-key'], getData: () => 'report.pdf' }),
+    })
+    const refusal = await screen.findByTestId('drive-move-error')
+
+    // Now a delete whose inline strip is gone (the view swapped to search) fails.
+    await chooseFromMenu(screen.getByTestId('drive-more'), 'drive-delete')
+    fireEvent.click(await screen.findByTestId('drive-delete-confirm-action'))
+    await waitFor(() => expect(awsControlApi.driveDelete).toHaveBeenCalledTimes(1))
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'zzz' } })
+    await screen.findByTestId('drive-search-empty')
+    failDelete(new Error('AccessDenied'))
+
+    const failure = await screen.findByTestId('drive-page-error')
+    expect(failure).toHaveTextContent('report.pdf')
+    expect(failure).not.toBe(refusal)
   })
 
   it('moving a file with a live share link surfaces the share-specific refusal', async () => {
@@ -2716,9 +3217,14 @@ describe('DrivePage sections: error surfaces reach the agent', () => {
     vi.mocked(awsControlApi.backup).mockResolvedValue({
       nightly: true,
       runs: {},
+      install: { id: INSTALL_ID, label: 'This Mac' },
       remote: {
-        snapshot: [{ key: 'backup/snapshot/2026-08-24.tar', size: 4096, modified: '2026-08-24T00:00:00Z' }],
+        snapshot: [{ key: 'snapshots/' + INSTALL_ID + '/2026-08-24.tar', size: 4096, modified: '2026-08-24T00:00:00Z', install: INSTALL_ID, origin: 'self' }],
         sessions: [],
+        installs: [{ id: INSTALL_ID, label: 'This Mac', origin: 'self' }],
+        others: 0,
+        truncated: false,
+        max: 8,
       },
     })
     vi.mocked(awsControlApi.backupRestore).mockRejectedValue(new AwsControlError('aws_call_failed', 502))
@@ -2796,5 +3302,1465 @@ describe('DrivePage sections: error surfaces reach the agent', () => {
     const notice = await screen.findByTestId('drive-delete-error')
     expect(within(notice).queryByRole('button', { name: /ask the agent/i })).toBeNull()
     expect(screen.getByTestId('drive-folder-name')).toHaveValue('quarterly')
+  })
+})
+
+describe('DrivePage sections: preview, rename, search', () => {
+  const listing = {
+    files: [
+      { key: 'photo.png', size: 10, modified: '2026-09-01T00:00:00Z' },
+      { key: 'notes.md', size: 20, modified: '2026-09-01T00:00:00Z' },
+      { key: 'data.bin', size: 30, modified: '2026-09-01T00:00:00Z' },
+    ],
+    folders: [],
+  }
+
+  it('clicking an image name opens the preview with the presigned URL', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveDownload).mockResolvedValue({ url: 'https://signed/photo', expiresSecs: 60 })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    const img = await screen.findByTestId('drive-preview-image')
+    expect(img).toHaveAttribute('src', 'https://signed/photo')
+    // The dialog downloads through the SAME path the row uses, and closes.
+    fireEvent.click(screen.getByTestId('drive-preview-close'))
+    expect(screen.queryByTestId('drive-preview-dialog')).toBeNull()
+  })
+
+  it('a PDF previews in a fully sandboxed iframe, so a disguised HTML object cannot run script', async () => {
+    // The preview branch is chosen by extension, not by the stored
+    // Content-Type, so `report.pdf` may really be HTML. The empty sandbox is
+    // what keeps that object from running script or navigating the top
+    // window; a PDF renders without any sandbox permission.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'report.pdf', size: 2048, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.driveDownload).mockResolvedValue({ url: 'https://signed/report', expiresSecs: 60 })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    const frame = await screen.findByTestId('drive-preview-pdf')
+    expect(frame).toHaveAttribute('src', 'https://signed/report')
+    expect(frame).toHaveAttribute('sandbox', '')
+  })
+
+  it('a text file previews through the gateway endpoint, with the truncation notice', async () => {
+    // Text goes through the proxy, never a browser fetch of the presigned URL:
+    // the bucket has no CORS config, so that fetch would fail while img tags
+    // (CORS-exempt) succeed — the split is the contract this test pins.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({ content: '# hello', truncated: true, redacted: false })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[1])
+    expect((await screen.findByTestId('drive-preview-text')).textContent).toBe('hello')
+    expect(screen.getByTestId('drive-preview-truncated')).toBeTruthy()
+    expect(awsControlApi.drivePreview).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'notes.md')
+    expect(awsControlApi.driveDownload).not.toHaveBeenCalled()
+  })
+
+  it('a markdown file renders as markdown, the way the file side panel renders it', async () => {
+    // The dialog used to print the source, so a design doc read as `#` and
+    // `**` instead of headings and bold. It now goes through the dashboard's
+    // shared ContentRenderer, so the same file reads the same in both surfaces.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({
+      content: '# Title\n\nsome **bold** text\n',
+      truncated: false,
+      redacted: false,
+    })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[1])
+    const body = await screen.findByTestId('drive-preview-text')
+    expect(within(body).getByRole('heading', { level: 1 })).toHaveTextContent('Title')
+    expect(within(body).getByText('bold').tagName).toBe('STRONG')
+    // The syntax itself is gone from the reading surface, and it renders under
+    // the same prose wrapper the side panel uses.
+    expect(body.textContent).not.toContain('**')
+    expect(body.querySelector('.msg-content')).toBeTruthy()
+  })
+
+  it('a code file gets the syntax viewer, not a wall of plain text', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'probe.py', size: 40, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({
+      content: 'def probe():\n    return 1\n', truncated: false, redacted: false,
+    })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    const body = await screen.findByTestId('drive-preview-text')
+    // The code surface received the bytes verbatim (the stub stands in for
+    // Pierre, whose real chunk does not resolve under vitest).
+    expect(within(body).getByTestId('pierre-mounted')).toHaveTextContent('def probe():')
+  })
+
+  it('an html file renders as a page, in a fully sandboxed frame', async () => {
+    // Bucket bytes are untrusted, so the shared viewer's `sandbox=""` is the
+    // load-bearing part: no script, no same-origin, no top-level navigation.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'report.html', size: 400, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({
+      content: '<h1>Quarter</h1>', truncated: false, redacted: false,
+    })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    const frame = (await screen.findByTestId('drive-preview-text')).querySelector('iframe')
+    expect(frame).toBeTruthy()
+    expect(frame).toHaveAttribute('sandbox', '')
+    expect(frame).toHaveAttribute('srcdoc', '<h1>Quarter</h1>')
+  })
+
+  it('a csv file renders as a table', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'spend.csv', size: 60, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({
+      content: 'service,cost\ns3,2.25\n', truncated: false, redacted: false,
+    })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    const body = await screen.findByTestId('drive-preview-text')
+    expect(body.querySelector('table')).toBeTruthy()
+    expect(body.textContent).toContain('service')
+    expect(body.textContent).toContain('2.25')
+  })
+
+  it('a tsv splits on tabs, not on commas', async () => {
+    // The csv viewer picks its delimiter from the extension, so the key has to
+    // reach it: without one a tab-separated row splits on nothing and the whole
+    // line lands in a single cell.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'spend.tsv', size: 60, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({
+      content: 'service\tcost\ns3\t2.25\n', truncated: false, redacted: false,
+    })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    const body = await screen.findByTestId('drive-preview-text')
+    expect(body.querySelectorAll('th')).toHaveLength(2)
+    expect(body.querySelectorAll('td')).toHaveLength(2)
+    expect(body.querySelectorAll('th')[1]).toHaveTextContent('cost')
+    expect(body.querySelectorAll('td')[1]).toHaveTextContent('2.25')
+  })
+
+  it('a json file renders as a tree', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'state.json', size: 60, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({
+      content: '{"region": "us-west-2"}', truncated: false, redacted: false,
+    })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    const body = await screen.findByTestId('drive-preview-text')
+    expect(body.textContent).toContain('region')
+    // The viewer parsed it, so it did not fall through to its own parse-error
+    // state -- which is what a truncated read must land in instead.
+    expect(screen.queryByTestId('json-viewer-error')).toBeNull()
+  })
+
+  it('a TRUNCATED json shows its source, so a capped read is not read as a broken file', async () => {
+    // Half a JSON object is an unfinished read, not an invalid document. The
+    // tree viewer would accuse the file of being broken; the source plus the
+    // truncation notice says what actually happened.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'huge.json', size: 900_000, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({
+      content: '{"region": "us-west-2", "objects": [1, 2', truncated: true, redacted: false,
+    })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    const body = await screen.findByTestId('drive-preview-text')
+    expect(body.tagName).toBe('PRE')
+    expect(body.textContent).toBe('{"region": "us-west-2", "objects": [1, 2')
+    expect(screen.getByTestId('drive-preview-truncated')).toBeTruthy()
+    expect(screen.queryByTestId('json-viewer-error')).toBeNull()
+  })
+
+  it('a log file stays verbatim — its own bytes, not reflowed', async () => {
+    // A log IS its own text and reaches the code surface, not the prose one:
+    // rendering `---` as a rule or eating a leading `#` would change what the
+    // reader is looking at.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'gateway.log', size: 40, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({
+      content: '# not a heading\nINFO ready\n', truncated: false, redacted: false,
+    })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    const body = await screen.findByTestId('drive-preview-text')
+    expect(within(body).getByTestId('pierre-mounted')).toHaveTextContent('# not a heading')
+    expect(body.querySelector('h1')).toBeNull()
+  })
+
+  it('a spreadsheet says so honestly: its parse needs the file on the gateway', async () => {
+    // The sheet and Office viewers render a GATEWAY-SIDE parse of a file on
+    // disk. A drive object is in S3, so there is nothing to open: it is a
+    // download, and no text read is attempted.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'budget.xlsx', size: 8000, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    expect(await screen.findByTestId('drive-preview-fallback')).toBeTruthy()
+    expect(awsControlApi.drivePreview).not.toHaveBeenCalled()
+    expect(awsControlApi.driveDownload).not.toHaveBeenCalled()
+  })
+
+  it('an avif image previews like every other image', async () => {
+    // The pane no longer keeps its own extension table, so the format it knew
+    // about had to move INTO the shared one rather than be dropped.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'shot.avif', size: 900, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.driveDownload).mockResolvedValue({ url: 'https://signed/shot', expiresSecs: 60 })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    expect(await screen.findByTestId('drive-preview-image')).toHaveAttribute('src', 'https://signed/shot')
+    expect(awsControlApi.drivePreview).not.toHaveBeenCalled()
+  })
+
+  it('an unpreviewable type says so honestly instead of a broken pane', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[2])
+    expect(await screen.findByTestId('drive-preview-fallback')).toBeTruthy()
+    expect(awsControlApi.drivePreview).not.toHaveBeenCalled()
+    expect(awsControlApi.driveDownload).not.toHaveBeenCalled()
+  })
+
+  it('rename is a same-directory move through the move endpoint', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'docs/old.md', size: 10, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.driveMove).mockResolvedValue({ moved: true })
+    await renderDrive('drive')
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-rename')
+    const input = await screen.findByTestId('drive-rename-input')
+    expect(input).toHaveValue('old.md')
+    fireEvent.change(input, { target: { value: 'new.md' } })
+    fireEvent.click(screen.getByTestId('drive-rename-save'))
+    await waitFor(() =>
+      expect(awsControlApi.driveMove).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'docs/old.md', 'docs/new.md'),
+    )
+    // The editor closes on success — the committed name needs no cleanup.
+    await waitFor(() => expect(screen.queryByTestId('drive-rename-row')).toBeNull())
+  })
+
+  it('a rename finishing while another row is being edited leaves that editor alone', async () => {
+    // The completion belongs to the row that started it. An unconditional
+    // close on success would throw away the name being typed on the other
+    // row -- half a filename gone without a word.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [
+        { key: 'docs/a.md', size: 10, modified: '2026-09-01T00:00:00Z' },
+        { key: 'docs/b.md', size: 10, modified: '2026-09-01T00:00:00Z' },
+      ],
+      folders: [],
+    })
+    let finishA: (v: { moved: boolean }) => void = () => {}
+    vi.mocked(awsControlApi.driveMove).mockImplementation(
+      () => new Promise((resolve) => { finishA = resolve }),
+    )
+    await renderDrive('drive')
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-rename')
+    fireEvent.change(await screen.findByTestId('drive-rename-input'), { target: { value: 'a2.md' } })
+    fireEvent.click(screen.getByTestId('drive-rename-save'))
+    await waitFor(() => expect(awsControlApi.driveMove).toHaveBeenCalledTimes(1))
+
+    // While A flies, open B and start typing.
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[1], 'drive-rename')
+    const inputB = await screen.findByTestId('drive-rename-input')
+    expect(inputB).toHaveValue('b.md')
+    fireEvent.change(inputB, { target: { value: 'b-half' } })
+
+    // B's Rename button is held while A flies (one mutation observer); it
+    // coming back is the signal that A has settled.
+    expect(screen.getByTestId('drive-rename-save')).toBeDisabled()
+    finishA({ moved: true })
+    await waitFor(() => expect(screen.getByTestId('drive-rename-save')).not.toBeDisabled())
+    // B's editor and its half-typed name survive A's completion.
+    expect(screen.getByTestId('drive-rename-input')).toHaveValue('b-half')
+  })
+
+  it('a rename failing while another row is being edited is reported page-level, naming the file', async () => {
+    // No strip under A to carry the message any more; dropping it would leave
+    // A's old name in the listing looking like nothing was ever attempted.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [
+        { key: 'docs/a.md', size: 10, modified: '2026-09-01T00:00:00Z' },
+        { key: 'docs/b.md', size: 10, modified: '2026-09-01T00:00:00Z' },
+      ],
+      folders: [],
+    })
+    let failA: (e: unknown) => void = () => {}
+    vi.mocked(awsControlApi.driveMove).mockImplementation(
+      () => new Promise((_resolve, reject) => { failA = reject }),
+    )
+    await renderDrive('drive')
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-rename')
+    fireEvent.change(await screen.findByTestId('drive-rename-input'), { target: { value: 'a2.md' } })
+    fireEvent.click(screen.getByTestId('drive-rename-save'))
+    await waitFor(() => expect(awsControlApi.driveMove).toHaveBeenCalledTimes(1))
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[1], 'drive-rename')
+    await screen.findByTestId('drive-rename-input')
+
+    failA(new AwsControlError('destination_exists', 409))
+    const notice = await screen.findByTestId('drive-page-error')
+    expect(notice).toHaveTextContent('a.md')
+    expect(notice).toHaveTextContent(i18nT('apps.awsControl.console.rename_conflict'))
+    // B's editor is untouched: no inline error for a failure that was not its own.
+    expect(screen.queryByTestId('drive-rename-error')).toBeNull()
+    expect(screen.getByTestId('drive-rename-input')).toHaveValue('b.md')
+  })
+
+  it('a failed delete on one file does not pre-render its error under the next file\'s strip', async () => {
+    // One mutation serves every row; without a reset on open, B's strip would
+    // say "Delete failed" before anything was tried on B.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveDelete).mockRejectedValueOnce(new Error('AccessDenied'))
+    await renderDrive('drive')
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-delete')
+    fireEvent.click(await screen.findByTestId('drive-delete-confirm-action'))
+    await waitFor(() =>
+      expect(screen.getByTestId('drive-delete-confirm')).toHaveTextContent(
+        i18nT('apps.awsControl.console.delete_failed'),
+      ),
+    )
+    fireEvent.click(screen.getByTestId('drive-delete-cancel'))
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[1], 'drive-delete')
+    const strip = await screen.findByTestId('drive-delete-confirm')
+    expect(strip).toHaveTextContent('notes.md')
+    expect(strip).not.toHaveTextContent(i18nT('apps.awsControl.console.delete_failed'))
+  })
+
+  it('a delete failing while another file\'s strip is open lands page-level, not under that strip', async () => {
+    // One mutation serves every row. The strip is keyed to the row whose
+    // delete it is: A's failure goes to the page-level notice and must not
+    // also appear inline under B just because the mutation is shared.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    let failA: (e: unknown) => void = () => {}
+    vi.mocked(awsControlApi.driveDelete).mockImplementation(
+      () => new Promise((_resolve, reject) => { failA = reject }),
+    )
+    await renderDrive('drive')
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-delete')
+    fireEvent.click(await screen.findByTestId('drive-delete-confirm-action'))
+    await waitFor(() => expect(awsControlApi.driveDelete).toHaveBeenCalledTimes(1))
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[1], 'drive-delete')
+    const strip = await screen.findByTestId('drive-delete-confirm')
+    expect(strip).toHaveTextContent('notes.md')
+
+    failA(new Error('AccessDenied'))
+    const notice = await screen.findByTestId('drive-page-error')
+    expect(notice).toHaveTextContent('photo.png')
+    expect(screen.getByTestId('drive-delete-confirm')).not.toHaveTextContent(
+      i18nT('apps.awsControl.console.delete_failed'),
+    )
+  })
+
+  it('a delete that fails after the view swapped to search is reported page-level, naming the file', async () => {
+    // The inline notice lives in the confirmation strip; a query change tears
+    // that strip down with the folder view. Without a fallback the rejection
+    // has no surface at all and the file, still there, looks deleted.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({ results: [], capped: false, limit: 200 })
+    let failDelete: (e: unknown) => void = () => {}
+    vi.mocked(awsControlApi.driveDelete).mockImplementation(
+      () => new Promise((_resolve, reject) => { failDelete = reject }),
+    )
+    await renderDrive('drive')
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-delete')
+    fireEvent.click(await screen.findByTestId('drive-delete-confirm-action'))
+    await waitFor(() => expect(awsControlApi.driveDelete).toHaveBeenCalledTimes(1))
+
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'zzz' } })
+    await screen.findByTestId('drive-search-empty')
+    expect(screen.queryByTestId('drive-delete-confirm')).toBeNull()
+
+    failDelete(new Error('AccessDenied'))
+    const notice = await screen.findByTestId('drive-page-error')
+    expect(notice).toHaveTextContent('photo.png')
+  })
+
+  it('a rename that fails after the view swapped to search is reported page-level', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({ results: [], capped: false, limit: 200 })
+    let failRename: (e: unknown) => void = () => {}
+    vi.mocked(awsControlApi.driveMove).mockImplementation(
+      () => new Promise((_resolve, reject) => { failRename = reject }),
+    )
+    await renderDrive('drive')
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-rename')
+    fireEvent.change(await screen.findByTestId('drive-rename-input'), { target: { value: 'photo2.png' } })
+    fireEvent.click(screen.getByTestId('drive-rename-save'))
+    await waitFor(() => expect(awsControlApi.driveMove).toHaveBeenCalledTimes(1))
+
+    // The view swap closes the editor even though its commit is on the wire.
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'zzz' } })
+    await screen.findByTestId('drive-search-empty')
+    expect(screen.queryByTestId('drive-rename-row')).toBeNull()
+
+    failRename(new AwsControlError('destination_exists', 409))
+    const notice = await screen.findByTestId('drive-page-error')
+    expect(notice).toHaveTextContent('photo.png')
+    expect(notice).toHaveTextContent(i18nT('apps.awsControl.console.rename_conflict'))
+  })
+
+  it('a delete that fails while the Move picker is open lands on the page strip, not inside the picker', async () => {
+    // The picker renders the move slot as ITS refusal, so a delete failure
+    // written there would read as "this move was refused". Separate slots.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({ ...listing, folders: ['docs'] })
+    let failDelete: (e: unknown) => void = () => {}
+    vi.mocked(awsControlApi.driveDelete).mockImplementation(
+      () => new Promise((_resolve, reject) => { failDelete = reject }),
+    )
+    await renderDrive('drive')
+
+    const more = await screen.findAllByTestId('drive-more')
+    await chooseFromMenu(more[0], 'drive-delete')
+    fireEvent.click(await screen.findByTestId('drive-delete-confirm-action'))
+    await waitFor(() => expect(awsControlApi.driveDelete).toHaveBeenCalledTimes(1))
+    // Move the confirmation to another row (its strip is gone from photo.png),
+    // then open the picker for a third file.
+    await chooseFromMenu(more[1], 'drive-delete')
+    await chooseFromMenu(more[2], 'drive-move')
+    await screen.findByTestId('move-dialog')
+
+    failDelete(new Error('AccessDenied'))
+    const strip = await screen.findByTestId('drive-page-error')
+    expect(strip).toHaveTextContent('photo.png')
+    expect(screen.queryByTestId('move-error')).toBeNull()
+  })
+
+  it('saving an untouched name that ends in a space is a no-op, not a move', async () => {
+    // The key grammar allows a trailing space, so such a file can exist.
+    // Trimming the editor's value before comparing would turn "open Rename,
+    // press Save" into a rename to a different key.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'docs/notes ', size: 10, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.driveMove).mockResolvedValue({ moved: true })
+    await renderDrive('drive')
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-rename')
+    const input = await screen.findByTestId('drive-rename-input')
+    expect(input).toHaveValue('notes ')
+    fireEvent.click(screen.getByTestId('drive-rename-save'))
+    await waitFor(() => expect(screen.queryByTestId('drive-rename-row')).toBeNull())
+    expect(awsControlApi.driveMove).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('drive-rename-error')).toBeNull()
+  })
+
+  it('a rename refused for a live share shows the share-specific sentence inline', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'shared.md', size: 10, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.driveMove).mockRejectedValue(new AwsControlError('share_active', 409))
+    await renderDrive('drive')
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-rename')
+    fireEvent.change(await screen.findByTestId('drive-rename-input'), { target: { value: 'renamed.md' } })
+    fireEvent.click(screen.getByTestId('drive-rename-save'))
+    const err = await screen.findByTestId('drive-rename-error')
+    // Rename's OWN sentence: the user pressed Rename, so the refusal must not
+    // talk about moving or a destination folder they never chose.
+    expect(err).toHaveTextContent(i18nT('apps.awsControl.console.rename_shared'))
+    expect(err).not.toHaveTextContent(i18nT('apps.awsControl.console.move_shared'))
+  })
+
+  it('a rename that collides with an existing name says so in rename terms', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'a.md', size: 10, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.driveMove).mockRejectedValue(new AwsControlError('exists', 409))
+    await renderDrive('drive')
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-rename')
+    fireEvent.change(await screen.findByTestId('drive-rename-input'), { target: { value: 'b.md' } })
+    fireEvent.click(screen.getByTestId('drive-rename-save'))
+    const err = await screen.findByTestId('drive-rename-error')
+    expect(err).toHaveTextContent(i18nT('apps.awsControl.console.rename_conflict'))
+  })
+
+  it('a grid tile hides its name (the preview trigger) while its rename editor is open', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'a.md', size: 10, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    await renderDrive('drive')
+    fireEvent.click(await screen.findByTitle('Grid view'))
+    await screen.findByTestId('drive-grid')
+    expect(await screen.findByTestId('drive-grid-preview-open')).toBeTruthy()
+
+    await chooseFromMenu((await screen.findAllByTestId('drive-grid-more'))[0], 'drive-grid-rename')
+    await screen.findByTestId('drive-grid-rename-input')
+    // Opening a preview over the editor would stack two editing contexts.
+    expect(screen.queryByTestId('drive-grid-preview-open')).toBeNull()
+    fireEvent.click(screen.getByTestId('drive-grid-rename-cancel'))
+    expect(await screen.findByTestId('drive-grid-preview-open')).toBeTruthy()
+  })
+
+  it('a media error re-mints the presign, re-arms on each successful load, and falls back on two in a row', async () => {
+    // The download presign is a 60s grant; a clip longer than that 403s
+    // mid-play and the element reports a media error. Re-minting (another
+    // short grant, not a longer one) is the recovery, and it must work for
+    // EVERY expiry a long clip crosses — so a successful load re-arms it.
+    // Two errors with no load between them is a URL that never worked.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'clip.mp4', size: 10, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.driveDownload)
+      .mockResolvedValueOnce({ url: 'https://signed/1', expiresSecs: 60 })
+      .mockResolvedValueOnce({ url: 'https://signed/2', expiresSecs: 60 })
+      .mockResolvedValueOnce({ url: 'https://signed/3', expiresSecs: 60 })
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    const video = await screen.findByTestId('drive-preview-video')
+    expect(video).toHaveAttribute('src', 'https://signed/1')
+    // First expiry: re-mint.
+    fireEvent.error(video)
+    await waitFor(() => expect(screen.getByTestId('drive-preview-video')).toHaveAttribute('src', 'https://signed/2'))
+    expect(awsControlApi.driveDownload).toHaveBeenCalledTimes(2)
+    // The new URL loads -> re-armed; second expiry re-mints again.
+    fireEvent.loadedMetadata(screen.getByTestId('drive-preview-video'))
+    fireEvent.error(screen.getByTestId('drive-preview-video'))
+    await waitFor(() => expect(screen.getByTestId('drive-preview-video')).toHaveAttribute('src', 'https://signed/3'))
+    expect(awsControlApi.driveDownload).toHaveBeenCalledTimes(3)
+    // An error with NO load since the last re-mint is a real failure — reported
+    // through the shared notice, whose Try again re-mints once more.
+    fireEvent.error(screen.getByTestId('drive-preview-video'))
+    const notice = await screen.findByTestId('drive-preview-error')
+    expect(notice).toHaveTextContent(i18nT('apps.awsControl.console.preview_failed'))
+    expect(screen.queryByTestId('drive-preview-fallback')).toBeNull()
+    expect(awsControlApi.driveDownload).toHaveBeenCalledTimes(3)
+    fireEvent.click(screen.getByTestId('drive-preview-error-retry'))
+    await waitFor(() => expect(awsControlApi.driveDownload).toHaveBeenCalledTimes(4))
+  })
+
+  it('searching replaces the folder view with whole-section hits, and clearing restores it', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+      capped: false,
+      limit: 200,
+    })
+    await renderDrive('drive')
+    await screen.findAllByTestId('drive-file')
+
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    // Debounced 300ms — waitFor absorbs the timer.
+    const hit = await screen.findByTestId('drive-search-hit')
+    // The FULL relative key, because hits span the whole section -- and the
+    // untruncated key rides on the title, since a long folder prefix is what
+    // the cell truncates (the basename stays whole).
+    expect(hit.textContent).toContain('docs/deep/report.pdf')
+    expect(screen.getByTestId('drive-search-open')).toHaveAttribute('title', 'docs/deep/report.pdf')
+    expect(awsControlApi.driveSearch).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'report')
+    expect(screen.queryByTestId('drive-listing')).toBeNull()
+
+    fireEvent.click(screen.getByTestId('drive-search-clear'))
+    await screen.findAllByTestId('drive-file')
+    expect(screen.queryByTestId('drive-search-results')).toBeNull()
+  })
+
+  it('a capped search says the walk stopped, and the goto action jumps to the folder', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+      capped: true,
+      limit: 37,
+    })
+    await renderDrive('drive')
+
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    // The number in the notice is the SERVER's cap, echoed in the payload —
+    // no locale spells it, so a cap change never strands a translation.
+    expect(await screen.findByTestId('drive-search-capped')).toHaveTextContent('37')
+    // Hit actions sit behind the same labeled overflow the file rows use.
+    await chooseFromMenu(screen.getByTestId('drive-search-more'), 'drive-search-goto')
+    // Search cleared, folder view restored at the hit's directory.
+    await waitFor(() => expect(screen.queryByTestId('drive-search-results')).toBeNull())
+    expect(await screen.findByTestId('drive-crumbs')).toBeTruthy()
+  })
+
+  it('the goto action marks the hit in the landed folder and scrolls it into view', async () => {
+    // A large folder with no pointer to the file makes the reader re-find by
+    // eye what they just searched for; the row is marked and centred instead.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockImplementation(async (_acct, _section, prefix) =>
+      prefix === 'docs/deep'
+        ? {
+            files: [
+              { key: 'docs/deep/other.md', size: 1, modified: '2026-09-01T00:00:00Z' },
+              { key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' },
+            ],
+            folders: [],
+          }
+        : listing,
+    )
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+      capped: false,
+      limit: 200,
+    })
+    // jsdom has no scrollIntoView; install one for the assertion and put the
+    // prototype back so nothing leaks into the next test.
+    const scrolled = vi.fn()
+    const original = Element.prototype.scrollIntoView
+    Element.prototype.scrollIntoView = scrolled
+    onTestFinished(() => { Element.prototype.scrollIntoView = original })
+    await renderDrive('drive')
+
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    await screen.findByTestId('drive-search-hit')
+    await chooseFromMenu(screen.getByTestId('drive-search-more'), 'drive-search-goto')
+
+    const rows = await screen.findAllByTestId('drive-file')
+    const marked = rows.filter((r) => r.getAttribute('data-highlighted') === 'true')
+    expect(marked).toHaveLength(1)
+    expect(marked[0]).toHaveTextContent('report.pdf')
+    expect(scrolled).toHaveBeenCalled()
+    // The menu trigger unmounted with the search view; the row takes focus so
+    // keyboard and assistive-technology users land on the hit, not on <body>.
+    expect(marked[0]).toHaveAttribute('tabindex', '-1')
+    expect(document.activeElement).toBe(marked[0])
+  })
+
+  it('a hit past the first listing page is paged in until its row mounts', async () => {
+    // The marker fires on mount; a row on page two never mounts until Load
+    // more is pressed, so while a marker is pending the pages are pulled in
+    // automatically -- a locator that only works in small folders is not one.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockImplementation(async (_acct, _section, prefix, token) => {
+      if (prefix !== 'docs/deep') return listing
+      return token === 'p2'
+        ? { files: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }], folders: [] }
+        : { files: [{ key: 'docs/deep/first.md', size: 1, modified: '2026-09-01T00:00:00Z' }], folders: [], nextToken: 'p2' }
+    })
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+      capped: false,
+      limit: 200,
+    })
+    await renderDrive('drive')
+
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    await screen.findByTestId('drive-search-hit')
+    await chooseFromMenu(screen.getByTestId('drive-search-more'), 'drive-search-goto')
+
+    // No Load more click: the second page arrives on its own and the hit is marked.
+    await waitFor(() =>
+      expect(awsControlApi.driveList).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'docs/deep', 'p2'),
+    )
+    const rows = await screen.findAllByTestId('drive-file')
+    const marked = rows.filter((r) => r.getAttribute('data-highlighted') === 'true')
+    expect(marked).toHaveLength(1)
+    expect(marked[0]).toHaveTextContent('report.pdf')
+  })
+
+  it('a listing slower than the highlight window still gets the marker and the scroll', async () => {
+    // The window is counted from the moment the ROW appears, not from the
+    // click: the listing behind "Open containing folder" is a CLI round-trip,
+    // and a clock started at the click would run out during a slow load and
+    // land the user unanchored in a folder of hundreds of rows.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    onTestFinished(() => vi.useRealTimers())
+    stubDrivePresent()
+    let releaseListing: (v: DriveListing) => void = () => {}
+    vi.mocked(awsControlApi.driveList).mockImplementation((_acct, _section, prefix) =>
+      prefix === 'docs/deep'
+        ? new Promise<DriveListing>((resolve) => { releaseListing = resolve })
+        : Promise.resolve(listing),
+    )
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+      capped: false,
+      limit: 200,
+    })
+    const scrolled = vi.fn()
+    const original = Element.prototype.scrollIntoView
+    Element.prototype.scrollIntoView = scrolled
+    onTestFinished(() => { Element.prototype.scrollIntoView = original })
+    await renderDrive('drive')
+
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    await screen.findByTestId('drive-search-hit')
+    await chooseFromMenu(screen.getByTestId('drive-search-more'), 'drive-search-goto')
+
+    // Well past the window with the listing still in flight.
+    await vi.advanceTimersByTimeAsync(6000)
+    releaseListing({
+      files: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    const rows = await screen.findAllByTestId('drive-file')
+    expect(rows[0]).toHaveAttribute('data-highlighted', 'true')
+    expect(scrolled).toHaveBeenCalled()
+
+    // And the clock does run once the row is there.
+    await vi.advanceTimersByTimeAsync(4500)
+    await waitFor(() => expect(screen.getByTestId('drive-file')).not.toHaveAttribute('data-highlighted'))
+  })
+
+  it('the search-table editor strips are pinned to the viewport like the folder rows', async () => {
+    // The search table is wider (a path column); on a narrow, horizontally
+    // scrolled viewport an unpinned strip puts Cancel/Rename off-screen.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+      capped: false,
+      limit: 200,
+    })
+    await renderDrive('drive')
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    await screen.findByTestId('drive-search-hit')
+
+    await chooseFromMenu(screen.getByTestId('drive-search-more'), 'drive-search-rename')
+    const strip = (await screen.findByTestId('drive-rename-input')).closest('div')
+    expect(strip?.className).toContain('sticky left-0')
+    expect(strip?.className).toContain('max-w-[calc(100vw-2.5rem)]')
+  })
+
+  it('search hides the folder-scoped write controls and the view toggle along with the crumbs', async () => {
+    // With the crumbs gone, Upload and New folder would write into a folder the
+    // reader cannot see and show nothing; the view toggle would visibly do
+    // nothing because hits are always a table. All three leave with the crumbs
+    // and come back when the search is cleared.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({ results: [], capped: false, limit: 200 })
+    await renderDrive('drive')
+    await screen.findAllByTestId('drive-file')
+    expect(screen.getByTestId('drive-upload-btn')).toBeTruthy()
+    expect(screen.getByTitle('Grid view')).toBeTruthy()
+
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'zzz' } })
+    await screen.findByTestId('drive-search-empty')
+    expect(screen.queryByTestId('drive-upload-btn')).toBeNull()
+    expect(screen.queryByTestId('drive-folder-toggle')).toBeNull()
+    expect(screen.queryByTitle('Grid view')).toBeNull()
+    expect(screen.queryByTestId('drive-crumbs')).toBeNull()
+
+    fireEvent.click(screen.getByTestId('drive-search-clear'))
+    expect(await screen.findByTestId('drive-upload-btn')).toBeTruthy()
+    expect(screen.getByTestId('drive-folder-toggle')).toBeTruthy()
+    expect(screen.getByTitle('Grid view')).toBeTruthy()
+  })
+
+  it('the search box names what it searches: names and paths, never contents', () => {
+    // "Search files…" reads as content search; a reader looking for text
+    // inside a file would take "No files match." as "the file does not exist".
+    // And the match runs over the whole relative key, so a folder segment is
+    // a valid query -- the placeholder says so.
+    expect(i18nT('apps.awsControl.console.search_files')).toBe('Search by file name or path…')
+  })
+
+  it('a file dropped mid-search is swallowed, not uploaded and not navigated to', async () => {
+    // The section is this page's only dragover/drop preventDefault. Removing it
+    // while searching would hand a dropped OS file to the browser, which opens
+    // it and unloads the dashboard; uploading it would land in a hidden folder.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({ results: [], capped: false, limit: 200 })
+    await renderDrive('drive')
+    await screen.findAllByTestId('drive-file')
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'zzz' } })
+    await screen.findByTestId('drive-search-empty')
+
+    const section = screen.getByTestId('drive-section')
+    const file = new File(['x'], 'dropped.txt', { type: 'text/plain' })
+    const dataTransfer = {
+      types: ['Files'], files: [file] as unknown as FileList, getData: () => '', setData: () => {},
+    } as unknown as DataTransfer
+    // fireEvent returns dispatchEvent's verdict: false means preventDefault ran.
+    expect(fireEvent.dragOver(section, { dataTransfer })).toBe(false)
+    expect(fireEvent.drop(section, { dataTransfer })).toBe(false)
+    expect(awsControlApi.driveUpload).not.toHaveBeenCalled()
+    // And no drop-target ring, which would promise an upload that will not come.
+    expect(section.className).not.toContain('ring-accent')
+  })
+
+  it('a refinement keeps the previous hits on screen but says a new search is running', async () => {
+    // `keepPreviousData` shows "rep"'s rows while "report" walks the section;
+    // without a pending signal the stale rows read as the new answer.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    let release: (v: { results: DriveSearchHit[]; capped: boolean; limit: number }) => void = () => {}
+    vi.mocked(awsControlApi.driveSearch)
+      .mockResolvedValueOnce({
+        results: [{ key: 'docs/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+        capped: false,
+        limit: 200,
+      })
+      .mockImplementationOnce(() => new Promise((resolve) => { release = resolve }))
+    await renderDrive('drive')
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'rep' } })
+    await screen.findByTestId('drive-search-hit')
+    expect(screen.queryByTestId('drive-search-pending')).toBeNull()
+
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    await screen.findByTestId('drive-search-pending')
+    // The previous hit is still there, dimmed and marked busy, not blanked.
+    expect(screen.getByTestId('drive-search-hit')).toBeTruthy()
+    expect(screen.getByTestId('drive-search-body')).toHaveAttribute('aria-busy', 'true')
+
+    release({ results: [], capped: false, limit: 200 })
+    await screen.findByTestId('drive-search-empty')
+    expect(screen.queryByTestId('drive-search-pending')).toBeNull()
+    expect(screen.getByTestId('drive-search-body')).not.toHaveAttribute('aria-busy')
+  })
+
+  it('a search hit can be renamed in place, against its own folder', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+      capped: false,
+      limit: 200,
+    })
+    vi.mocked(awsControlApi.driveMove).mockResolvedValue({ moved: true })
+    await renderDrive('drive')
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    await screen.findByTestId('drive-search-hit')
+
+    await chooseFromMenu(screen.getByTestId('drive-search-more'), 'drive-search-rename')
+    const input = await screen.findByTestId('drive-rename-input')
+    expect((input as HTMLInputElement).value).toBe('report.pdf')
+    fireEvent.change(input, { target: { value: 'final.pdf' } })
+    fireEvent.click(screen.getByTestId('drive-rename-save'))
+    // The directory is the HIT's, not the open folder's (which is the root).
+    await waitFor(() =>
+      expect(awsControlApi.driveMove).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'docs/deep/report.pdf', 'docs/deep/final.pdf'),
+    )
+    // The results re-run so the new name (or the hit's disappearance) shows.
+    await waitFor(() => expect(awsControlApi.driveSearch).toHaveBeenCalledTimes(2))
+  })
+
+  it('a search hit can be shared and deleted without leaving the results', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+      capped: false,
+      limit: 200,
+    })
+    vi.mocked(awsControlApi.driveDelete).mockResolvedValue({ deleted: true })
+    await renderDrive('drive')
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    await screen.findByTestId('drive-search-hit')
+
+    await chooseFromMenu(screen.getByTestId('drive-search-more'), 'drive-search-share')
+    expect(await screen.findByTestId('share-dialog')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('share-close'))
+    await waitFor(() => expect(screen.queryByTestId('share-dialog')).toBeNull())
+
+    await chooseFromMenu(screen.getByTestId('drive-search-more'), 'drive-search-delete')
+    // The FULL key: two same-named files from different folders can sit side by side here.
+    expect(await screen.findByTestId('drive-delete-confirm')).toHaveTextContent('docs/deep/report.pdf')
+    fireEvent.click(screen.getByTestId('drive-delete-confirm-action'))
+    await waitFor(() => expect(awsControlApi.driveDelete).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'docs/deep/report.pdf'))
+    // Still in search mode: the results, not the folder view, are what refresh.
+    expect(screen.getByTestId('drive-search-input')).toHaveValue('report')
+    await waitFor(() => expect(awsControlApi.driveSearch).toHaveBeenCalledTimes(2))
+  })
+
+  it('a text preview says when the redactor masked values, so a masked line is not read as the file', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({
+      content: 'key = [REDACTED]',
+      truncated: false,
+      redacted: true,
+    })
+    await renderDrive('drive')
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[1])
+    await screen.findByTestId('drive-preview-text')
+    const notice = screen.getByTestId('drive-preview-redacted')
+    expect(notice).toHaveTextContent(i18nT('apps.awsControl.console.preview_redacted'))
+    // It changes the meaning of every byte below it, so it is not set in the
+    // truncation note's muted small type.
+    expect(notice.className).not.toContain('text-muted')
+    expect(notice.className).toContain('font-medium')
+    expect(screen.queryByTestId('drive-preview-truncated')).toBeNull()
+  })
+
+  it('a preview opened on a nested key shows the folder beside the name', async () => {
+    // Two same-named hits from different folders are indistinguishable once
+    // the dialog is up unless the folder rides along.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'docs/deep/notes.md', size: 20, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({ content: 'x', truncated: false, redacted: false })
+    await renderDrive('drive')
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    await screen.findByTestId('drive-preview-text')
+    expect(screen.getByTestId('drive-preview-dir')).toHaveTextContent('docs/deep/')
+    expect(screen.getByTestId('drive-preview-dialog')).toHaveTextContent('notes.md')
+  })
+
+  it('a root-level preview shows no folder affix', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({ content: 'x', truncated: false, redacted: false })
+    await renderDrive('drive')
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[1])
+    await screen.findByTestId('drive-preview-text')
+    expect(screen.queryByTestId('drive-preview-dir')).toBeNull()
+  })
+
+  it('a download that fails from the preview header is reported inside the dialog', async () => {
+    // The pane's own notice sits behind the dialog's scrim; from the dialog
+    // the only visible outcome would be a tab flashing closed.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({ content: 'hi', truncated: false, redacted: false })
+    vi.mocked(awsControlApi.driveDownload).mockRejectedValue(new Error('AccessDenied'))
+    const fakeTab = { location: { href: '' }, close: vi.fn() } as unknown as Window
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeTab)
+    await renderDrive('drive')
+
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[1])
+    await screen.findByTestId('drive-preview-text')
+    fireEvent.click(screen.getByTestId('drive-preview-download'))
+    await waitFor(() => expect(fakeTab.close).toHaveBeenCalled())
+    const notice = await screen.findByTestId('drive-preview-download-error')
+    expect(notice).toHaveTextContent(i18nT('apps.awsControl.console.download_failed'))
+    // Inside the dialog, not only in the pane behind it.
+    expect(screen.getByTestId('drive-preview-dialog').contains(notice)).toBe(true)
+    openSpy.mockRestore()
+  })
+
+  it("another file's download failure does not appear inside a preview", async () => {
+    // The pane's error is keyed by object: a lingering failure for photo.png
+    // must not read as notes.md's download having failed.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.drivePreview).mockResolvedValue({ content: 'hi', truncated: false, redacted: false })
+    vi.mocked(awsControlApi.driveDownload).mockRejectedValue(new Error('AccessDenied'))
+    const fakeTab = { location: { href: '' }, close: vi.fn() } as unknown as Window
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeTab)
+    await renderDrive('drive')
+
+    // Fail a download from photo.png's row menu (first file row)...
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[0], 'drive-download')
+    expect(await screen.findByTestId('drive-download-error')).toBeTruthy()
+    // ...then preview notes.md: the pane still shows it, the dialog does not.
+    fireEvent.click(screen.getAllByTestId('drive-preview-open')[1])
+    await screen.findByTestId('drive-preview-text')
+    expect(screen.queryByTestId('drive-preview-download-error')).toBeNull()
+    openSpy.mockRestore()
+  })
+
+  it('changing the query closes a rename editor that was open on a hit', async () => {
+    // The hit row unmounts with the old results; a rename left open there
+    // would vanish with the half-typed name and keep suppressing the agent
+    // hand-off on every later notice.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }],
+      capped: false,
+      limit: 200,
+    })
+    await renderDrive('drive')
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    await screen.findByTestId('drive-search-hit')
+    await chooseFromMenu(screen.getByTestId('drive-search-more'), 'drive-search-rename')
+    await screen.findByTestId('drive-rename-input')
+
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'rep' } })
+    await waitFor(() => expect(screen.queryByTestId('drive-rename-input')).toBeNull())
+    // And it stays closed once the new results render.
+    await waitFor(() => expect(awsControlApi.driveSearch).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'rep'))
+    expect(screen.queryByTestId('drive-rename-row')).toBeNull()
+  })
+
+  it('a .pdf served as octet-stream routes to the unsupported fallback instead of a blank frame', async () => {
+    // Objects uploaded before content types were set are served as
+    // octet-stream; the sandboxed iframe (no allow-downloads) renders nothing
+    // and fires no error, so the stored type decides the branch.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'legacy.pdf', size: 2048, modified: '2026-09-01T00:00:00Z' }],
+      folders: [],
+    })
+    vi.mocked(awsControlApi.driveDownload).mockResolvedValue({
+      url: 'https://signed/legacy', expiresSecs: 60, contentType: 'application/octet-stream',
+    })
+    await renderDrive('drive')
+    fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[0])
+    expect(await screen.findByTestId('drive-preview-fallback')).toHaveTextContent(
+      i18nT('apps.awsControl.console.preview_unsupported'),
+    )
+    expect(screen.queryByTestId('drive-preview-pdf')).toBeNull()
+  })
+
+  it('clearing the search restores the folder view without waiting for the debounce', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({ results: [], capped: false, limit: 200 })
+    await renderDrive('drive')
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'zzz' } })
+    await screen.findByTestId('drive-search-empty')
+
+    fireEvent.click(screen.getByTestId('drive-search-clear'))
+    // Synchronous: no 300 ms of stale hits under an empty box.
+    expect(screen.queryByTestId('drive-search-results')).toBeNull()
+    expect(screen.getByTestId('drive-upload-btn')).toBeTruthy()
+  })
+
+  it('a bad name typed into the rename editor gets rename wording, not "rename it and try again"', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    await renderDrive('drive')
+    await chooseFromMenu((await screen.findAllByTestId('drive-more'))[1], 'drive-rename')
+    const input = await screen.findByTestId('drive-rename-input')
+    fireEvent.change(input, { target: { value: 'bad/name.md' } })
+    fireEvent.click(screen.getByTestId('drive-rename-save'))
+    const err = await screen.findByTestId('drive-rename-error')
+    expect(err).toHaveTextContent(i18nT('apps.awsControl.console.rename_bad_name'))
+    expect(err).not.toHaveTextContent(i18nT('apps.awsControl.console.drive_bad_name'))
+    expect(awsControlApi.driveMove).not.toHaveBeenCalled()
+  })
+
+  it('the empty search state echoes the query, like the account search does', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({ results: [], capped: false, limit: 200 })
+    await renderDrive('drive')
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'zzz' } })
+    /* The shared `FilteredEmpty` draws this now, so the sentence is the
+       primitive's ("No Files match “zzz”") rather than this app's own
+       `search_no_results`. What the test pins is unchanged and is the whole
+       point of the state: the query is echoed back, and the way OUT of it is
+       offered right there rather than only in the toolbar. */
+    const empty = await screen.findByTestId('drive-search-empty')
+    expect(empty).toHaveTextContent('zzz')
+    expect(empty).toHaveTextContent(i18nT('components.ui.no_noun_match', {
+      noun: i18nT('apps.awsControl.console.section_files'),
+    }))
+    fireEvent.click(screen.getByTestId('drive-search-empty-clear'))
+    expect((screen.getByTestId('drive-search-input') as HTMLInputElement).value).toBe('')
+  })
+})
+
+describe('DrivePage sections: move without a pointer', () => {
+  const listing = { files: [{ key: 'report.pdf', size: 10, modified: '2026-09-01T00:00:00Z' }], folders: ['docs', 'archive'] }
+
+  it('the row menu offers Move to folder…, and the picker lists the folders a drop could reach', async () => {
+    // Drag is a convention; the menu is the path every reader can reach. The
+    // destinations are exactly the folders on screen: at the top level there
+    // is no "up", so only the two sub-folders are offered.
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    vi.mocked(awsControlApi.driveMove).mockResolvedValue({ moved: true })
+    await renderDrive('drive')
+
+    await chooseFromMenu(await screen.findByTestId('drive-more'), 'drive-move')
+    const dialog = await screen.findByTestId('move-dialog')
+    expect(dialog).toHaveTextContent('report.pdf')
+    expect(within(dialog).queryByTestId('move-root')).toBeNull()
+    expect(within(dialog).queryByTestId('move-up')).toBeNull()
+    const folders = within(dialog).getAllByTestId('move-folder')
+    expect(folders.map((b) => b.getAttribute('data-folder'))).toEqual(['docs', 'archive'])
+
+    fireEvent.click(folders[1])
+    await waitFor(() =>
+      expect(awsControlApi.driveMove).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'report.pdf', 'archive/report.pdf'),
+    )
+    // Success closes the picker.
+    await waitFor(() => expect(screen.queryByTestId('move-dialog')).toBeNull())
+  })
+
+  it('inside a folder the picker offers the top level and the parent, and a refusal keeps it open', async () => {
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'a/b/report.pdf', size: 10, modified: '2026-09-01T00:00:00Z' }], folders: [],
+    })
+    vi.mocked(awsControlApi.driveMove).mockRejectedValue(new AwsControlError('destination_exists', 409))
+    // Land two folders deep the way the listing does: one folder value is
+    // relative to the section root, so opening `a/b` is one click.
+    vi.mocked(awsControlApi.driveList).mockResolvedValueOnce({ files: [], folders: ['a/b'] })
+    await renderDrive('drive')
+    fireEvent.click(await screen.findByTestId('drive-folder-open'))
+    await screen.findByTestId('drive-file')
+
+    await chooseFromMenu(screen.getByTestId('drive-more'), 'drive-move')
+    const dialog = await screen.findByTestId('move-dialog')
+    expect(within(dialog).getByTestId('move-root').getAttribute('data-folder')).toBe('')
+    expect(within(dialog).getByTestId('move-up').getAttribute('data-folder')).toBe('a')
+    expect(within(dialog).getByTestId('move-up')).toHaveTextContent('a')
+
+    fireEvent.click(within(dialog).getByTestId('move-root'))
+    await waitFor(() =>
+      expect(awsControlApi.driveMove).toHaveBeenCalledWith(ACCOUNT_ID, 'drive', 'a/b/report.pdf', 'report.pdf'),
+    )
+    // The conflict is reported IN the dialog, which stays open for another pick;
+    // the page-level move strip does not double it.
+    expect(await within(dialog).findByTestId('move-error')).toHaveTextContent(
+      i18nT('apps.awsControl.console.move_conflict'),
+    )
+    expect(screen.queryByTestId('drive-move-error')).toBeNull()
+  })
+
+  it('a file at the top level with no folders is told there is nowhere to move it', async () => {
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: listing.files, folders: [] })
+    await renderDrive('drive')
+
+    await chooseFromMenu(await screen.findByTestId('drive-more'), 'drive-move')
+    expect(await screen.findByTestId('move-no-folders')).toBeTruthy()
+    expect(screen.queryByTestId('move-options')).toBeNull()
+  })
+
+  it('the source row dims and reports busy while its move is in flight, and only then', async () => {
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    let finish: (v: { moved: boolean }) => void = () => {}
+    vi.mocked(awsControlApi.driveMove).mockReturnValue(
+      new Promise<{ moved: boolean }>((resolve) => { finish = resolve }),
+    )
+    await renderDrive('drive')
+
+    const row = await screen.findByTestId('drive-file')
+    expect(row.getAttribute('aria-busy')).toBeNull()
+    await chooseFromMenu(screen.getByTestId('drive-more'), 'drive-move')
+    fireEvent.click((await screen.findAllByTestId('move-folder'))[0])
+
+    await waitFor(() => expect(screen.getByTestId('drive-file').getAttribute('aria-busy')).toBe('true'))
+    expect(screen.getByTestId('drive-file').className).toContain('opacity-50')
+    expect(screen.getByTestId('move-pending')).toBeTruthy()
+    // Escape mid-move dismisses the picker without cancelling anything: a slow
+    // or hung copy must never trap the reader in a modal. The row stays busy
+    // until the move lands, so the outcome is still visible on the page.
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByTestId('move-dialog')).toBeNull())
+    expect(screen.getByTestId('drive-file').getAttribute('aria-busy')).toBe('true')
+    // ...and not by opacity alone: with the picker gone the row itself says so.
+    expect(within(screen.getByTestId('drive-file')).getByTestId('drive-moving').textContent).toBe('Moving…')
+
+    finish({ moved: true })
+    await waitFor(() => expect(screen.getByTestId('drive-file').getAttribute('aria-busy')).toBeNull())
+    expect(screen.queryByTestId('drive-moving')).toBeNull()
+  })
+
+  it('one move at a time: while a move runs, Move to folder… is disabled and a drop is ignored', async () => {
+    // Serialization is the contract: the busy marker, the refusal, and the
+    // picker's close all belong to the single move in flight, so no second
+    // move may start until it settles.
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [
+        { key: 'first.pdf', size: 10, modified: '2026-09-01T00:00:00Z' },
+        { key: 'second.pdf', size: 10, modified: '2026-09-01T00:00:00Z' },
+      ],
+      folders: ['docs'],
+    })
+    let finish: (v: { moved: boolean }) => void = () => {}
+    vi.mocked(awsControlApi.driveMove).mockReturnValue(
+      new Promise<{ moved: boolean }>((resolve) => { finish = resolve }),
+    )
+    await renderDrive('drive')
+    const rows = await screen.findAllByTestId('drive-file')
+    expect(rows[1].getAttribute('draggable')).toBe('true')
+
+    await chooseFromMenu(within(rows[0]).getByTestId('drive-more'), 'drive-move')
+    fireEvent.click((await screen.findAllByTestId('move-folder'))[0])
+    await waitFor(() => expect(screen.getAllByTestId('drive-file')[0].getAttribute('aria-busy')).toBe('true'))
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByTestId('move-dialog')).toBeNull())
+
+    // The other row can neither be dragged nor sent to the picker.
+    expect(screen.getAllByTestId('drive-file')[1].getAttribute('draggable')).toBe('false')
+    fireEvent.keyDown(within(screen.getAllByTestId('drive-file')[1]).getByTestId('drive-more'), { key: 'Enter' })
+    const item = await screen.findByTestId('drive-move')
+    expect(item.getAttribute('data-disabled')).not.toBeNull()
+    fireEvent.click(item)
+    expect(screen.queryByTestId('move-dialog')).toBeNull()
+    expect(awsControlApi.driveMove).toHaveBeenCalledTimes(1)
+
+    finish({ moved: true })
+    await waitFor(() => expect(screen.getAllByTestId('drive-file')[0].getAttribute('aria-busy')).toBeNull())
+    // The gate reopens with the move.
+    await waitFor(() => expect(screen.getAllByTestId('drive-file')[1].getAttribute('draggable')).toBe('true'))
+  })
+
+  it('a move refused after the picker was dismissed is reported on the page strip instead', async () => {
+    vi.mocked(awsControlApi.driveList).mockResolvedValue(listing)
+    let fail: (e: unknown) => void = () => {}
+    vi.mocked(awsControlApi.driveMove).mockReturnValue(
+      new Promise<{ moved: boolean }>((_resolve, reject) => { fail = reject }),
+    )
+    await renderDrive('drive')
+
+    await chooseFromMenu(await screen.findByTestId('drive-more'), 'drive-move')
+    fireEvent.click((await screen.findAllByTestId('move-folder'))[0])
+    await screen.findByTestId('move-pending')
+    fireEvent.click(screen.getByTestId('move-close'))
+    await waitFor(() => expect(screen.queryByTestId('move-dialog')).toBeNull())
+
+    fail(new AwsControlError('destination_exists', 409))
+    expect(await screen.findByTestId('drive-move-error')).toHaveTextContent(
+      i18nT('apps.awsControl.console.move_conflict'),
+    )
+    // The picker did not come back to report it.
+    expect(screen.queryByTestId('move-dialog')).toBeNull()
+  })
+})
+
+describe('DrivePage sections: keyboard paths and honest copy', () => {
+  it('focus returns to the row menu even when the pointer opened it without focusing it (Safari)', async () => {
+    // Safari does not focus a button on pointer click, so at open time
+    // `document.activeElement` is still whatever had focus before. The opener
+    // must be taken from the trigger's own event, not from the active element.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'report.pdf', size: 2048, modified: '2026-08-20T00:00:00Z' }], folders: [],
+    })
+    await renderDrive('drive')
+
+    const trigger = await screen.findByTestId('drive-more')
+    const elsewhere = screen.getByTestId('drive-folder-toggle')
+    elsewhere.focus()
+    // Pointer open: the button is NOT focused first, exactly as Safari leaves it.
+    fireEvent.pointerDown(trigger, { pointerType: 'mouse', button: 0, ctrlKey: false })
+    fireEvent.click(await screen.findByTestId('drive-share'))
+    await screen.findByTestId('share-dialog')
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByTestId('share-dialog')).toBeNull())
+    expect(document.activeElement).toBe(trigger)
+  })
+
+  it('the share dialog closes on Escape and returns focus to the row menu, but not mid-mint', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'report.pdf', size: 2048, modified: '2026-08-20T00:00:00Z' }], folders: [],
+    })
+    let finish: (v: { url: string; share: Share }) => void = () => {}
+    vi.mocked(awsControlApi.driveShare).mockReturnValue(
+      new Promise<{ url: string; share: Share }>((resolve) => { finish = resolve }),
+    )
+    await renderDrive('drive')
+
+    const trigger = await screen.findByTestId('drive-more')
+    trigger.focus()
+    await chooseFromMenu(trigger, 'drive-share')
+    const dialog = await screen.findByTestId('share-dialog')
+    // The panel is the dialog and holds focus; the scrim is presentational.
+    expect(dialog.getAttribute('role')).toBe('dialog')
+    // `useDialogFocusTrap` moves focus in a passive effect, one tick after the
+    // commit that `findByTestId` resolved on, so "holds focus" is a condition
+    // to wait for, not a property of the first frame the dialog is in the DOM.
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+
+    // Escape while the link is being created is refused.
+    fireEvent.click(screen.getByTestId('share-create'))
+    await waitFor(() =>
+      expect(screen.getByTestId('share-create')).toHaveTextContent(i18nT('apps.awsControl.console.share_creating')),
+    )
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.getByTestId('share-dialog')).toBeTruthy()
+
+    finish({
+      url: 'https://example-presigned/report.pdf?sig=x',
+      share: {
+        id: 's1', account: ACCOUNT_ID, section: 'drive', key: 'report.pdf',
+        createdAt: '2026-08-24T05:00:00Z', expiresAt: '2026-08-24T06:00:00Z', note: '',
+      },
+    })
+    await screen.findByTestId('share-result')
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByTestId('share-dialog')).toBeNull())
+    // Focus went back to where the reader was, not to <body>.
+    expect(document.activeElement).toBe(trigger)
+  })
+
+  it('the deleted-count line is a real plural, not a parenthetical', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: ['one', 'many'] })
+    vi.mocked(awsControlApi.driveFolderDelete)
+      .mockResolvedValueOnce({ deleted: true, path: 'one', objects: 1 })
+      .mockResolvedValueOnce({ deleted: true, path: 'many', objects: 12 })
+    await renderDrive('drive')
+    await screen.findByTestId('drive-listing')
+
+    const deleteFolder = async (index: number) => {
+      const rows = screen.getAllByTestId('drive-folder')
+      fireEvent.keyDown(within(rows[index]).getByTestId('drive-folder-more'), { key: 'Enter' })
+      fireEvent.click(await screen.findByTestId('drive-folder-delete'))
+      fireEvent.click(await screen.findByTestId('drive-folder-delete-action'))
+    }
+    await deleteFolder(0)
+    expect(await screen.findByTestId('drive-folder-deleted')).toHaveTextContent(
+      i18nT('apps.awsControl.console.folder_deleted', { count: 1, name: 'one' }),
+    )
+    expect(screen.getByTestId('drive-folder-deleted').textContent).not.toMatch(/\(s\)/)
+    await deleteFolder(1)
+    await waitFor(() =>
+      expect(screen.getByTestId('drive-folder-deleted')).toHaveTextContent(
+        i18nT('apps.awsControl.console.folder_deleted', { count: 12, name: 'many' }),
+      ),
+    )
+  })
+
+  it('closing the folder disclosure hands focus back to the New folder button', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
+    await renderDrive('drive')
+
+    const toggle = await screen.findByTestId('drive-folder-toggle')
+    toggle.focus()
+    fireEvent.click(toggle)
+    const input = await screen.findByTestId('drive-folder-name')
+    expect(document.activeElement).toBe(input)
+
+    fireEvent.keyDown(input, { key: 'Escape' })
+    // The disclosure unmounted the input and both buttons; focus must not fall
+    // to <body> and force a keyboard reader to re-tab from the page top.
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId('drive-folder-toggle')))
+  })
+
+  it('an EMPTY library says so, distinct from a search that matched nothing', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
+    vi.mocked(awsControlApi.library).mockResolvedValue({ artifacts: [] })
+    await renderDrive('library')
+
+    fireEvent.click(await screen.findByTestId('library-add-open'))
+    await screen.findByTestId('library-add-dialog')
+    // Nothing was searched, so "no artifacts match" would be a lie about a
+    // search that never ran.
+    expect(await screen.findByTestId('library-add-empty')).toHaveTextContent(
+      i18nT('apps.awsControl.console.library_add_empty'),
+    )
+    expect(screen.queryByTestId('library-add-none')).toBeNull()
+    // The cost disclosure reads in body tone, not as the dialog's quietest line.
+    expect(screen.getByTestId('library-add-oneway').className).toContain('text-text')
+    expect(screen.getByTestId('library-add-oneway').className).not.toContain('text-muted')
+  })
+
+  it('the pinned Actions column paints the page surface, not a card, on the borderless drive table', async () => {
+    // `--card` and `--bg` differ in every theme; a `bg-card` pin inside a table
+    // with no card fill is a permanently tinted right-hand stripe.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'report.pdf', size: 10, modified: '2026-09-01T00:00:00Z' }], folders: ['docs'],
+    })
+    await renderDrive('drive')
+
+    const listing = await screen.findByTestId('drive-listing')
+    const pinned = Array.from(listing.querySelectorAll('th, td')).filter((c) => c.className.includes('sticky'))
+    expect(pinned.length).toBe(3)
+    for (const cell of pinned) {
+      expect(cell.className).toContain('bg-bg')
+      expect(cell.className).not.toMatch(/\bbg-card\b/)
+    }
+
+    // The search-results table sits on the same page surface; its pinned
+    // header must not keep the card default the folder table just dropped.
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/report.pdf', size: 10, modified: '2026-09-01T00:00:00Z' }], capped: false, limit: 200,
+    })
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    const table = await screen.findByTestId('drive-search-table')
+    const pinnedHead = Array.from(table.querySelectorAll('th')).filter((c) => c.className.includes('sticky'))
+    expect(pinnedHead.length).toBe(1)
+    expect(pinnedHead[0].className).toContain('bg-bg')
+    expect(pinnedHead[0].className).not.toMatch(/\bbg-card\b/)
+  })
+
+  it('the share dialog opened from a search hit returns focus to that hit\u2019s menu', async () => {
+    // Third ShareDialog opener. Without remembering itself, closing would hand
+    // focus to whichever folder-row trigger was remembered earlier -- or nowhere.
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({
+      files: [{ key: 'report.pdf', size: 2048, modified: '2026-08-20T00:00:00Z' }], folders: [],
+    })
+    vi.mocked(awsControlApi.driveSearch).mockResolvedValue({
+      results: [{ key: 'docs/deep/report.pdf', size: 55, modified: '2026-09-01T00:00:00Z' }], capped: false, limit: 200,
+    })
+    await renderDrive('drive')
+    await screen.findByTestId('drive-file')
+    fireEvent.change(screen.getByTestId('drive-search-input'), { target: { value: 'report' } })
+    const trigger = await screen.findByTestId('drive-search-more')
+
+    fireEvent.pointerDown(trigger, { pointerType: 'mouse', button: 0, ctrlKey: false })
+    fireEvent.click(await screen.findByTestId('drive-search-share'))
+    await screen.findByTestId('share-dialog')
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByTestId('share-dialog')).toBeNull())
+    expect(document.activeElement).toBe(trigger)
   })
 })

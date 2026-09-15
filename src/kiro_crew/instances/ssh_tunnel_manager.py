@@ -65,8 +65,13 @@ from kiro_crew.cloud import ssm as cloud_ssm
 # remote token as the CSP frame-ancestor parent origin so the embedded pane can
 # be framed by this desktop app on whatever KIROCREW_PORT it runs on (no
 # hardcoded port, no wildcard). See server._extra_frame_ancestors.
+from kiro_crew.config import live
 from kiro_crew.config.loader import DASHBOARD_PORT as _LOCAL_DASHBOARD_PORT
 from kiro_crew.deploy.engine import aws_spawn_env
+from kiro_crew.instances.constants import CAPABILITY_REPLY_MAX_BYTES as _CAPABILITY_REPLY_MAX_BYTES
+from kiro_crew.instances.constants import (
+    DEFAULT_CAPABILITY_PROXY_TIMEOUT_SECS as _CAPABILITY_PROXY_TIMEOUT,
+)
 from kiro_crew.instances.constants import (
     DEFAULT_CONNECT_TIMEOUT_SECS as _DEFAULT_CONNECT_TIMEOUT_SECS,
 )
@@ -137,6 +142,25 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 _LOOPBACK = "127.0.0.1"
+
+#: The closed set of peer endpoints :meth:`SshTunnelManager.peer_capability` may
+#: read. Every one is a GET that reports what the peer gateway CAN do — its
+#: version, its agent roster, its model list, its effort levels, its workspaces —
+#: and none of them mutates anything. Keeping the set here (rather than letting
+#: the caller name a path) is what makes the method a carrier instead of a second
+#: proxy: a tainted string cannot reach a peer route that was never listed, and
+#: the ``api/agents`` mutating verbs stay unreachable even though the roster read
+#: lives under the same prefix. Adding a row is a security decision — it grants
+#: the local gateway a new read against every connected peer.
+_PEER_CAPABILITY_PATHS: frozenset[str] = frozenset(
+    {
+        "/api/version",
+        "/api/agents",
+        "/api/models",
+        "/api/effort-levels",
+        "/api/workspaces",
+    }
+)
 # Poll cadence while waiting for the forward to come up.
 _READY_POLL_INTERVAL_SECS = 0.25
 # Bound on retained stderr so a chatty/looping ssh can't grow memory unbounded.
@@ -213,6 +237,51 @@ _BENIGN_SSH_STDERR_MARKERS = (
 )
 
 
+# Classification phrases for _exit_error / _ssm_exit_error, matched against the
+# lowercased noise-stripped stderr. The first hit ALSO anchors the sanitized
+# detail window (see _sanitize_banner) so the classified phrase survives the cap
+# even when arbitrary benign stderr (e.g. LocalCommand output) precedes it.
+_SSH_AUTH_SIGNALS = (
+    "permission denied",
+    "publickey",
+    "authentication failed",
+    "certificate has expired",
+    "certificate expired",
+)
+_SSH_TRANSPORT_DROP_SIGNALS = (
+    "timed out during banner exchange",
+    "session ended unexpectedly",
+    "connection timed out",
+    "connection reset",
+    "closed by remote host",
+    "connection refused",
+)
+_SSH_BIND_SIGNALS = ("address already in use", "cannot listen to port")
+_SSM_CREDENTIAL_SIGNALS = (
+    "expired",
+    "unable to locate credentials",
+    "no credentials",
+    "credentials not found",
+)
+_SSM_DENIAL_SIGNALS = ("accessdenied", "not authorized", "unauthorizedoperation")
+_SSM_PLUGIN_SIGNALS = ("sessionmanagerplugin", "session-manager-plugin")
+_SSM_TARGET_SIGNALS = (
+    "targetnotconnected",
+    "not connected",
+    "invalidinstanceid",
+    "invalidinstanceinformation",
+)
+_SSM_BIND_SIGNALS = ("address already in use", "bind")
+
+
+def _first_hit(low: str, phrases: tuple[str, ...]) -> str | None:
+    """Return the first of *phrases* present in *low* (already lowercased)."""
+    for phrase in phrases:
+        if phrase in low:
+            return phrase
+    return None
+
+
 def _recover_backoff_secs(attempt: int, cap: float = _RECOVER_BACKOFF_MAX_SECS) -> float:
     """Exponential backoff before a self-heal rebuild, capped at *cap*. *attempt* is 1-based."""
     base = _RECOVER_BACKOFF_BASE_SECS * (2 ** max(0, attempt - 1))
@@ -235,15 +304,38 @@ def _strip_benign_ssh_noise(text: str) -> str:
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
-def _sanitize_banner(text: str) -> str:
+_BANNER_DETAIL_MAX_CHARS = 200
+
+
+def _sanitize_banner(text: str, *, anchor: str | None = None) -> str:
     """ANSI-strip + credential/exfil-redact untrusted ssh stderr before it is
-    surfaced in status/logs, capped at 200 chars. The banner is external,
-    proxy-controlled text, so it is a redacted secondary detail only — never a
-    classification signal."""
+    surfaced in status/logs, capped at ``_BANNER_DETAIL_MAX_CHARS``. The banner
+    is external, proxy-controlled text, so it is a redacted secondary detail
+    only -- never a classification signal.
+
+    When *anchor* names the lowercase classification phrase the exit-error
+    classifier matched, the fixed-width window is centered on the first
+    occurrence of that phrase instead of taken from the head, so benign stderr
+    written earlier (e.g. arbitrary ``LocalCommand`` output such as repeated
+    ``tput`` warnings under launchd/systemd where ``TERM`` is unset) cannot
+    consume the budget and truncate the classified reason out of the surfaced
+    detail. Centering on the phrase itself (never on its line, which the
+    proxy-controlled buffer can make arbitrarily long) keeps the phrase inside
+    the window unconditionally. Without an anchor, or when sanitization
+    removed the phrase, the head slice is unchanged.
+    """
     cleaned = _ANSI_CSI_RE.sub("", text)
     cleaned = redact_credentials(cleaned)[0]
     cleaned = redact_exfiltration_urls(cleaned)[0]
-    return cleaned[:200]
+    if len(cleaned) <= _BANNER_DETAIL_MAX_CHARS:
+        return cleaned
+    if anchor:
+        hit = cleaned.lower().find(anchor)
+        if hit >= 0:
+            start = hit + len(anchor) // 2 - _BANNER_DETAIL_MAX_CHARS // 2
+            start = max(0, min(start, len(cleaned) - _BANNER_DETAIL_MAX_CHARS))
+            return cleaned[start : start + _BANNER_DETAIL_MAX_CHARS]
+    return cleaned[:_BANNER_DETAIL_MAX_CHARS]
 
 
 class ProxyRequestError(Exception):
@@ -475,7 +567,7 @@ class _SshTunnel:
         self.status.state = TunnelState.CONNECTING
         self.status.error = ""
         # Built in a worker thread: the SSM branch resolves the aws CLI
-        # absolutely (#4770), which probes the filesystem (PATH scan +
+        # absolutely, which probes the filesystem (PATH scan +
         # well-known install dirs) — synchronous work that must not run on the
         # gateway event loop, where a stalled network mount on PATH would
         # freeze every request and heartbeat.
@@ -509,7 +601,7 @@ class _SshTunnel:
                 # then looks session-manager-plugin up BY NAME on this child's own
                 # PATH, which a GUI-launched gateway hands down as the minimal
                 # launchd one — so the tunnel dies inside a correctly-resolved aws
-                # unless the child's env carries the install dirs (#5392). argv[0]
+                # unless the child's env carries the install dirs. argv[0]
                 # is handed over so the widening is withheld for a bare head: that
                 # bare name IS a provenance refusal, and widening would put the
                 # refused binary back within execvp's reach. None means inherit,
@@ -670,7 +762,9 @@ class _SshTunnel:
         (idle timeout, banner-exchange timeout, reset, refused) is reported as a
         transport drop — never as an auth verdict inferred from banner text. The
         raw banner is ANSI-stripped and credential-redacted before it is
-        surfaced as a secondary detail.
+        surfaced as a secondary detail, with the fixed-width detail window
+        centered on the matched classification phrase so preceding benign
+        noise (e.g. LocalCommand output) cannot truncate the real reason away.
 
         The SSM transport has an entirely different error vocabulary (IAM
         denials, a missing session-manager-plugin, an offline SSM agent), so it
@@ -686,33 +780,23 @@ class _SshTunnel:
         # failure (the loop symptom was this warning hiding "bind: ... in use").
         tail = _strip_benign_ssh_noise(self._stderr_buf)
         low = tail.lower()
-        detail = _sanitize_banner(tail)
         # Genuine ssh auth signals first, so a real auth failure is never masked
         # by a transport phrase that happens to co-occur in the same banner.
-        if (
-            "permission denied" in low
-            or "publickey" in low
-            or "authentication failed" in low
-            or "certificate has expired" in low
-            or "certificate expired" in low
-        ):
-            return f"ssh auth failed (check SSH access): {detail}"
+        hit = _first_hit(low, _SSH_AUTH_SIGNALS)
+        if hit is not None:
+            return f"ssh auth failed (check SSH access): {_sanitize_banner(tail, anchor=hit)}"
         # WSSH / transport session drops — not an auth problem. Worded neutrally
         # because this method is also used for the initial-connect failure path,
         # where no self-heal is armed yet (so it must not promise reconnection).
-        if (
-            "timed out during banner exchange" in low
-            or "session ended unexpectedly" in low
-            or "connection timed out" in low
-            or "connection reset" in low
-            or "closed by remote host" in low
-            or "connection refused" in low
-        ):
-            return f"ssh tunnel transport drop: {detail}"
-        if "address already in use" in low or "cannot listen to port" in low:
+        hit = _first_hit(low, _SSH_TRANSPORT_DROP_SIGNALS)
+        if hit is not None:
+            return f"ssh tunnel transport drop: {_sanitize_banner(tail, anchor=hit)}"
+        hit = _first_hit(low, _SSH_BIND_SIGNALS)
+        if hit is not None:
+            detail = _sanitize_banner(tail, anchor=hit)
             return f"ssh forward bind failed (local port already in use): {detail}"
         if tail:
-            return f"ssh exited {returncode}: {detail}"
+            return f"ssh exited {returncode}: {_sanitize_banner(tail)}"
         return f"ssh exited with code {returncode}"
 
     def _ssm_exit_error(self, returncode: int | None) -> str:
@@ -727,40 +811,37 @@ class _SshTunnel:
         """
         tail = self._stderr_buf.strip()
         low = tail.lower()
-        detail = _sanitize_banner(tail)
         # Credentials first: an expired/absent credential is the most common
         # cause and its message can also contain "not authorized"-adjacent text.
-        if (
-            "expired" in low
-            or "unable to locate credentials" in low
-            or "no credentials" in low
-            or "credentials not found" in low
-        ):
+        hit = _first_hit(low, _SSM_CREDENTIAL_SIGNALS)
+        if hit is not None:
             return (
                 "AWS credentials missing or expired (refresh them, e.g. "
-                f"`aws sso login --profile <name>`): {detail}"
+                f"`aws sso login --profile <name>`): {_sanitize_banner(tail, anchor=hit)}"
             )
-        if "accessdenied" in low or "not authorized" in low or "unauthorizedoperation" in low:
+        hit = _first_hit(low, _SSM_DENIAL_SIGNALS)
+        if hit is not None:
+            detail = _sanitize_banner(tail, anchor=hit)
             return f"IAM denied ssm:StartSession for this target: {detail}"
-        if "sessionmanagerplugin" in low or "session-manager-plugin" in low:
+        hit = _first_hit(low, _SSM_PLUGIN_SIGNALS)
+        if hit is not None:
             return (
                 "session-manager-plugin is not installed locally (install the AWS "
-                f"Session Manager plugin, then reconnect): {detail}"
+                f"Session Manager plugin, then reconnect): {_sanitize_banner(tail, anchor=hit)}"
             )
-        if (
-            "targetnotconnected" in low
-            or "not connected" in low
-            or "invalidinstanceid" in low
-            or "invalidinstanceinformation" in low
-        ):
+        hit = _first_hit(low, _SSM_TARGET_SIGNALS)
+        if hit is not None:
             return (
                 "the SSM target is not a connected managed node (is the instance "
-                f"running with the SSM agent online and an instance profile?): {detail}"
+                f"running with the SSM agent online and an instance profile?): "
+                f"{_sanitize_banner(tail, anchor=hit)}"
             )
-        if "address already in use" in low or "bind" in low:
+        hit = _first_hit(low, _SSM_BIND_SIGNALS)
+        if hit is not None:
+            detail = _sanitize_banner(tail, anchor=hit)
             return f"SSM forward bind failed (local port already in use): {detail}"
         if tail:
-            return f"SSM session exited {returncode}: {detail}"
+            return f"SSM session exited {returncode}: {_sanitize_banner(tail)}"
         return f"SSM session exited with code {returncode}"
 
     async def _capture_stderr(self) -> None:
@@ -1101,6 +1182,44 @@ class SshTunnelManager:
         self._refresh_tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         self._token_minted_at: dict[str, float] = {}
         self._token_ttl_secs: dict[str, int] = {}
+        # The transport tunables above are copies of instances.*, so a config write
+        # reaches them only through apply_config(). Held on self because the watcher
+        # holds the owner weakly. ``fail_closed=False``: the section carries no
+        # authorization, so a degraded document's defaults are the right answer.
+        self._config_sub = live.watch_section(
+            self,
+            "instances",
+            method="apply_config",
+            fail_closed=False,
+            name="SshTunnelManager",
+        )
+
+    def apply_config(self, instances_cfg: object) -> None:
+        """Adopt new ``instances.*`` transport tunables.
+
+        Every value here is consulted per operation -- per connect, per mint, per
+        recovery attempt -- so pushing it onto the manager is a genuine hot apply
+        rather than a value that only matters at construction. The probe threshold
+        is additionally propagated into the tunnels ALREADY running, since each one
+        copied it when it was built and would otherwise keep tearing itself down on
+        the old count.
+
+        ``tunnel_base_port`` is deliberately left alone: the allocator has already
+        handed out ports from the old base and live tunnels hold them, so moving the
+        base mid-flight would only fragment the range. It applies to a manager built
+        after the change.
+        """
+        self._connect_timeout = getattr(instances_cfg, "connect_timeout_secs")
+        self._mint_timeout = getattr(instances_cfg, "mint_timeout_secs")
+        self._ssh_compression = bool(getattr(instances_cfg, "ssh_compression"))
+        self._max_recovery = int(getattr(instances_cfg, "max_recovery_attempts"))
+        self._recover_backoff_max = float(getattr(instances_cfg, "recover_backoff_max_secs"))
+        self._probe_fails = int(getattr(instances_cfg, "probe_failure_threshold"))
+        for tunnel in self._tunnels.values():
+            # Attribute-set on the live tunnel rather than a restart: the threshold
+            # is compared against a running counter, so the new value takes effect on
+            # the next probe without dropping a healthy forward.
+            tunnel._probe_fails = self._probe_fails
 
     async def _persist_hint(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         """Run a registry hint write in a worker thread; return only when it is DONE.
@@ -1133,6 +1252,66 @@ class SshTunnelManager:
         if cancelled is not None:
             raise cancelled
 
+    async def _forwarder_identity_hints(
+        self, instance_id: str, tunnel: _SshTunnel
+    ) -> dict[str, Any]:
+        """Build the registry hints that record *tunnel*'s live forwarder child.
+
+        The recorded identity is ``forwarder_pid`` + ``forwarder_start`` + the
+        ``local_port`` that child is bound to, authenticated by
+        ``forwarder_sig`` — a MAC over all three plus the instance id. Every
+        field is read from the LIVE tunnel, so the set describes one process
+        rather than a mix of one process and another's port: a pid recorded
+        against a port it was not signed with leaves the signature failing
+        verification, and the orphan reclaim then refuses the very child the
+        write exists to record.
+
+        ``was_connected=True`` rides along because a live forwarder is exactly
+        what makes an instance auto-reconnectable, so the flag and the identity
+        of the child it refers to become durable in the same write.
+
+        Two states persist as a deliberate fail-closed miss rather than an
+        error: a start time that cannot be read records as ``""``, and an
+        unreadable signing key leaves ``forwarder_sig`` empty. Either one
+        disables the reclaim for this child — :meth:`_reclaim_orphan_forwarder`
+        requires both — which loses a leaked process at the next hard-kill but
+        can never signal the wrong one.
+
+        Both blocking reads (the platform start-time query and the key read)
+        go off the event loop: every caller holds the manager lock, where a
+        synchronous read would stall unrelated requests and heartbeats.
+
+        Returns the COMPLETE kwarg set for :meth:`_persist_hint`; a caller adds
+        only its own extras. :meth:`connect` and :meth:`_mark_recovered` both
+        write this record, and one builder is what keeps their field sets
+        identical: a field added to the identity here reaches both writes,
+        where two hand-written kwarg lists can carry it in one and omit it in
+        the other — and a record missing the port ``forwarder_sig`` signs over
+        fails its own verification.
+        """
+        forwarder_pid = tunnel.pid or _NO_FORWARDER_PID
+        # The port the forwarder actually bound, which for a rebuild can differ
+        # from the one connect() first allocated (see _recover).
+        local_port = tunnel.status.local_port
+        forwarder_start = ""
+        forwarder_sig = ""
+        if forwarder_pid > 0:
+            started = await asyncio.to_thread(platform_compat.process_start_time, forwarder_pid)
+            forwarder_start = started or ""
+        if forwarder_pid > 0 and forwarder_start:
+            key = await asyncio.to_thread(_reclaim_identity_key)
+            if key is not None:
+                forwarder_sig = _forwarder_identity_sig(
+                    key, instance_id, forwarder_pid, forwarder_start, local_port
+                )
+        return {
+            "local_port": local_port,
+            "forwarder_pid": forwarder_pid,
+            "forwarder_start": forwarder_start,
+            "forwarder_sig": forwarder_sig,
+            "was_connected": True,
+        }
+
     def _reserved_ports(self) -> set[int]:
         """Ports already taken: live tunnels + local_port set on any instance."""
         reserved: set[int] = {t.status.local_port for t in self._tunnels.values()}
@@ -1152,8 +1331,8 @@ class SshTunnelManager:
         is what turns that permanent leak into a reclaim.
 
         Reclamation is keyed on OUR OWN recorded identity, never a
-        process-table match — matching the table by argv pattern is what once
-        SIGTERMed forwards operators had opened themselves (#1972), and no
+        process-table match — matching the table by argv pattern would
+        SIGTERM forwards operators opened themselves, and no
         pattern can distinguish our child from a stranger's. The registry
         itself is agent-writable, so a recorded claim is honored only when it
         AUTHENTICATES: the record must carry the gateway's own MAC over
@@ -1380,7 +1559,9 @@ class SshTunnelManager:
             timeout_secs=self._mint_timeout_for(params.method),
         )
 
-    async def connect(self, instance_id: str) -> TunnelStatus:
+    async def connect(
+        self, instance_id: str, *, rebuild: bool = False, only_if_connected: bool = False
+    ) -> TunnelStatus:
         """Open a tunnel + mint a token for *instance_id*; return its status.
 
         Idempotent: connecting an already-connected instance returns its current
@@ -1388,13 +1569,96 @@ class SshTunnelManager:
         validation / mint / spawn error via the returned status (state ERROR).
         Works for either ``connection_method`` — the transport is resolved by
         :meth:`_resolve_transport`.
+
+        ``rebuild=True`` breaks the idempotence on purpose: a CONNECTED tunnel is
+        torn down first (``keep_intent`` — the user is asking for the crew, not
+        turning it off) and a fresh forwarder is spawned on a DIFFERENT local
+        port: the port just freed is excluded from the allocation, so both a
+        stalled stream on the old forwarder and a cause bound to the old port
+        itself are escaped by one Retry. This is the pane's Retry after a load watchdog
+        fired on a document that DID navigate: the transport is up by every
+        probe the manager runs (``/api/health`` answers, the credential
+        validates), yet one stream inside it stalled and the pane's module
+        graph will wait on it forever. Nothing short of a new TCP path clears
+        that, and the plain connect — which sees CONNECTED and returns — would
+        hand the same stalled tunnel back.
+
+        A teardown that fails (the stop raises) is reported as an ERROR status,
+        the same way every other connect failure is: the live tunnel is left
+        exactly as :meth:`_teardown_locked` leaves it (intact — nothing is
+        removed unless the stop succeeded), the reason is retained for
+        :meth:`last_error`, and the caller gets a 502 with a message instead of
+        a propagated exception turned into an unexplained 500.
+
+        ``only_if_connected=True`` is the opposite restriction: answer a
+        CONNECTED tunnel exactly like the plain connect (its status, its cached
+        token) but, when the tunnel is not up, spawn nothing and touch nothing
+        -- return a DISCONNECTED status and leave ``was_connected`` as the user
+        last set it. This is the viewport's auto-warm, whose job is to pre-mount
+        panes for tunnels that are ALREADY up, never to bring one up. The check
+        runs under the manager lock, the same lock :meth:`disconnect` holds
+        while it stops a tunnel, so an auto-warm racing a disconnect either sees
+        the tunnel still CONNECTED (and warms a pane the disconnect's
+        ``removeWarm`` then drops) or sees it gone and stands down; it can never
+        re-open a tunnel the user just closed, which a probe-then-connect from
+        the browser could.
         """
+        if rebuild and only_if_connected:
+            raise ValueError("rebuild and only_if_connected are mutually exclusive")
         async with self._lock:
             inst = await asyncio.to_thread(self._registry.get, instance_id)
             if inst is None:
                 raise KeyError(f"no instance with id {instance_id!r}")
 
             existing = self._tunnels.get(instance_id)
+            # The port a rebuild tears down. Kept out of the allocation below so
+            # the new forwarder lands on a DIFFERENT local port: the field
+            # evidence has every stall on the first allocated port, so a cause
+            # bound to the port itself (a stale listener, a local firewall or
+            # proxy rule) is a live hypothesis alongside the stalled stream. A
+            # first-free allocator would hand the just-freed port straight back
+            # and Retry could loop on it forever with no in-product escape.
+            rebuild_freed_port: int | None = None
+            if only_if_connected and (
+                existing is None or existing.status.state != TunnelState.CONNECTED
+            ):
+                logger.info(
+                    "Connected-only connect for %s declined: tunnel is %s",
+                    instance_id,
+                    existing.status.state.value if existing is not None else "absent",
+                )
+                return TunnelStatus(
+                    instance_id=inst.id,
+                    state=TunnelState.DISCONNECTED,
+                    local_port=inst.local_port,
+                    remote_port=inst.remote_port,
+                )
+            if rebuild and existing is not None:
+                logger.info(
+                    "Rebuilding tunnel for %s on request (was %s on 127.0.0.1:%s)",
+                    instance_id,
+                    existing.status.state.value,
+                    existing.status.local_port,
+                )
+                try:
+                    await self._teardown_locked(instance_id, keep_intent=True)
+                except Exception as e:  # noqa: BLE001 - reported, not swallowed
+                    logger.warning(
+                        "Rebuild of %s could not stop the old tunnel: %s", instance_id, e
+                    )
+                    return self._error_status(
+                        inst,
+                        f"could not stop the existing tunnel to rebuild it: {e}. "
+                        f"Disconnect and connect again, or retry.",
+                    )
+                if existing.status.local_port:
+                    rebuild_freed_port = existing.status.local_port
+                existing = None
+                # The registry row was just rewritten (local_port reset); re-read
+                # so the allocation below skips nothing stale and records fresh.
+                inst = await asyncio.to_thread(self._registry.get, instance_id)
+                if inst is None:
+                    raise KeyError(f"no instance with id {instance_id!r}")
             if existing is not None and existing.status.state == TunnelState.CONNECTED:
                 return existing.status
             if existing is not None:
@@ -1417,7 +1681,7 @@ class SshTunnelManager:
             # message rather than letting the child exit with a cryptic error.
             #
             # Probed in a worker thread: the probe resolves the plugin through the
-            # deploy engine's shared resolver (#5392), which scans PATH, then the
+            # deploy engine's shared resolver, which scans PATH, then the
             # well-known install dirs, then routes a fallback-dir hit through
             # executable-provenance validation — filesystem work that must not run
             # on the gateway event loop, where a stalled network mount would freeze
@@ -1455,10 +1719,10 @@ class SshTunnelManager:
             # gateway's, so the two differ and the same-origin branch rejects it.
             # Browsers forbid scripts from forging either header.
             #
-            # Mirroring the remote port instead made the shipped defaults
+            # Mirroring the remote port instead would make the shipped defaults
             # self-contradictory: a stock gateway binds the same default port on
-            # both ends, so a stock hub already held the port a stock remote
-            # reported and two stock installs could never connect (#1972).
+            # both ends, so a stock hub would already hold the port a stock remote
+            # reports and two stock installs could never connect.
             #
             # Every instance's recorded port stays reserved, and the allocator
             # probes each candidate, so a port anything still holds — including a
@@ -1471,9 +1735,8 @@ class SshTunnelManager:
             # session to the remote until the OS reaps it. That leak is now
             # reclaimed by ``_reclaim_orphan_forwarder`` above — by the child's
             # RECORDED pid behind a strict exact-argv identity check, never by
-            # scanning the process table. The reaper that scan-based approach
-            # replaced matched argv patterns and could SIGTERM a forward the
-            # operator had opened themselves (#1972); an unrecorded or
+            # scanning the process table. Scanning it by argv pattern could
+            # SIGTERM a forward the operator opened themselves; an unrecorded or
             # unverified process is therefore left alone, and allocation simply
             # skips its port.
             #
@@ -1496,6 +1759,8 @@ class SshTunnelManager:
             # stall unrelated requests and heartbeats. This matches how the rest
             # of the module already reaches the registry (``asyncio.to_thread``).
             reserved = await asyncio.to_thread(self._reserved_ports)
+            if rebuild_freed_port is not None:
+                reserved = set(reserved) | {rebuild_freed_port}
             try:
                 local_port = await asyncio.to_thread(self._allocator.allocate, exclude=reserved)
             except RuntimeError as e:
@@ -1549,46 +1814,30 @@ class SshTunnelManager:
             self._store_token(instance_id, token, inst.ttl)
             self._schedule_token_refresh(instance_id)
 
-            # Persist hints: port assignment, forwarder identity (pid + start
-            # time), was_connected, last-active — ONE
+            # Persist hints: the forwarder identity record built by
+            # _forwarder_identity_hints (port, pid, start time, signature,
+            # was_connected — the same record _mark_recovered writes) plus
+            # last-active, which is this site's alone — ONE
             # read-modify-rewrite of instances.json (fsync), so the set is
             # durable together and the manager lock is held for a single fsync
-            # round-trip. The identity pair is what a later connect uses to
-            # reclaim this child if a gateway hard-kill orphans it; a start
-            # time that cannot be read persists as "" and simply disables the
-            # reclaim for this child (fail closed).
+            # round-trip. The identity is what a later connect uses to
+            # reclaim this child if a gateway hard-kill orphans it.
             # _persist_hint runs it off the loop and does not
             # return — even under cancellation — until the write completes, so
             # the lock cannot release while the worker write is still in
             # flight (a late hint write would race a subsequent disconnect).
-            forwarder_pid = tunnel.pid or _NO_FORWARDER_PID
-            forwarder_start = ""
-            forwarder_sig = ""
-            if forwarder_pid > 0:
-                started = await asyncio.to_thread(platform_compat.process_start_time, forwarder_pid)
-                forwarder_start = started or ""
-            if forwarder_pid > 0 and forwarder_start:
-                key = await asyncio.to_thread(_reclaim_identity_key)
-                if key is not None:
-                    forwarder_sig = _forwarder_identity_sig(
-                        key, instance_id, forwarder_pid, forwarder_start, local_port
-                    )
             await self._persist_hint(
                 self._registry.update,
                 instance_id,
                 mark_last_active=True,
-                local_port=local_port,
-                forwarder_pid=forwarder_pid,
-                forwarder_start=forwarder_start,
-                forwarder_sig=forwarder_sig,
-                was_connected=True,
+                **await self._forwarder_identity_hints(instance_id, tunnel),
             )
             # A successful (re)connect clears any stale give-up counter so the next
             # unexpected drop gets a full fresh recovery budget instead of tripping
             # the cap immediately.
             self._recover_attempts.pop(instance_id, None)
             # Connected cleanly — drop any retained failure reason from a prior
-            # attempt so status() no longer reports a stale error.
+            # attempt so status() does not report a stale error.
             self._last_error.pop(instance_id, None)
             return tunnel.status
 
@@ -1865,11 +2114,23 @@ class SshTunnelManager:
         """Reset the attempt counter and persist the hints, under lock, iff tracked.
 
         A rebuild replaced the tunnel child, so the recorded forwarder
-        identity (``forwarder_pid`` + ``forwarder_start``) must move with
+        identity (``forwarder_pid`` + ``forwarder_start`` + the
+        ``local_port`` that child is bound to) must move with
         ``was_connected`` — a stale identity would point a later hard-kill
-        reclaim at a process that no longer exists (harmless, the identity
+        reclaim at a process that does not exist (harmless, the identity
         check refuses it) while the ACTUAL replacement child leaked
         unrecorded. All hints go in one write.
+
+        The record comes from :meth:`_forwarder_identity_hints`, so this write
+        carries exactly the fields :meth:`connect`'s does and the pair cannot
+        drift apart. ``local_port`` matters twice over here. A rebuild takes
+        its port from the LIVE tunnel (see :meth:`_recover`), which may differ
+        from the recorded one. And ``forwarder_sig`` is a MAC over the port, so
+        recording a pid against a different port than the one it was signed
+        with leaves the signature failing verification — the reclaim then
+        refuses the very child this write exists to record, and every consumer
+        reading the recorded port (the pane URL, :meth:`diagnose`'s fallback)
+        addresses a port nothing is listening on.
 
         The persist stays INSIDE the manager lock so write order equals
         lock-acquisition order: a concurrent :meth:`disconnect`'s
@@ -1886,29 +2147,10 @@ class SshTunnelManager:
             if tunnel is None:
                 return
             self._recover_attempts[instance_id] = 0
-            forwarder_pid = tunnel.pid or _NO_FORWARDER_PID
-            forwarder_start = ""
-            forwarder_sig = ""
-            if forwarder_pid > 0:
-                started = await asyncio.to_thread(platform_compat.process_start_time, forwarder_pid)
-                forwarder_start = started or ""
-            if forwarder_pid > 0 and forwarder_start:
-                key = await asyncio.to_thread(_reclaim_identity_key)
-                if key is not None:
-                    forwarder_sig = _forwarder_identity_sig(
-                        key,
-                        instance_id,
-                        forwarder_pid,
-                        forwarder_start,
-                        tunnel.status.local_port,
-                    )
             await self._persist_hint(
                 self._registry.update,
                 instance_id,
-                was_connected=True,
-                forwarder_pid=forwarder_pid,
-                forwarder_start=forwarder_start,
-                forwarder_sig=forwarder_sig,
+                **await self._forwarder_identity_hints(instance_id, tunnel),
             )
 
     async def _recover(self, instance_id: str) -> None:
@@ -2425,6 +2667,141 @@ class SshTunnelManager:
             "code": "transfer_unauthorized",
         }
 
+    async def peer_capability(self, instance_id: str, path: str) -> tuple[bool, Any]:
+        """GET one of a connected peer's read-only capability endpoints.
+
+        This is deliberately a NARROW CARRIER, not a general proxy. The generic
+        ``/api/instances/{id}/proxy/*`` route forwards a caller-supplied path and
+        is therefore fenced to the ``api/chat`` / ``api/stream`` prefixes; the
+        five paths a local session needs in order to render a peer-bound header
+        (version, agent roster, model list, effort levels, workspaces) sit
+        outside those prefixes. Widening the prefix list would have granted the
+        whole ``api/agents`` surface — including its mutating ``PUT`` — so the
+        capability read gets its own carrier whose target is chosen from a fixed
+        set here rather than by the caller.
+
+        Returns ``(ok, payload)``. On success *payload* is the peer's decoded
+        JSON, which may be a dict (version, workspaces) or a list (agents,
+        models, effort levels) — both shapes are real and returned as-is. On
+        failure *payload* is ``{"error", "code"}`` so a caller can tell a stale
+        credential from a peer too old to answer.
+        """
+        if path not in _PEER_CAPABILITY_PATHS:
+            # A programming error, not a runtime condition: the path set is
+            # closed and every caller passes a literal from it.
+            raise ValueError(f"not a peer capability path: {path!r}")
+        try:
+            url, cookie_name = self._peer_target(instance_id, path)
+        except _PeerUnavailable as e:
+            return False, {
+                "error": e.message,
+                "code": (
+                    "capability_peer_not_connected"
+                    if e.kind == "not_connected"
+                    else "capability_no_credential"
+                ),
+            }
+        timeout = aiohttp.ClientTimeout(total=_CAPABILITY_PROXY_TIMEOUT)
+        reminted = False
+        for _attempt in range(2):
+            try:
+                headers = self._peer_cookie_header(instance_id, cookie_name)
+            except _PeerUnavailable as e:
+                return False, {"error": e.message, "code": "capability_no_credential"}
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        # Same SSRF reasoning as the search carrier: the tunnel
+                        # endpoint is the only legitimate target, so a peer
+                        # answering 30x must not redirect the hub anywhere.
+                        allow_redirects=False,
+                    ) as resp:
+                        if resp.status in (401, 403):
+                            if not reminted and await self.refresh_token(instance_id):
+                                reminted = True
+                                continue  # retry once with the fresh credential
+                            return False, {
+                                "error": "peer rejected the credential",
+                                "code": "capability_unauthorized",
+                            }
+                        if resp.status in (404, 405):
+                            # The peer predates this endpoint. Reported as its own
+                            # code because it is the actionable case (update the
+                            # peer), not a transport fault to retry.
+                            return False, {
+                                "error": f"peer does not serve {path}",
+                                "code": "capability_peer_too_old",
+                            }
+                        if not 200 <= resp.status < 300:
+                            return False, {
+                                "error": f"peer refused the read (HTTP {resp.status})",
+                                "code": "capability_peer_refused",
+                            }
+                        chunks: list[bytes] = []
+                        received = 0
+                        oversized = False
+                        async for chunk in resp.content.iter_chunked(65536):
+                            received += len(chunk)
+                            if received > _CAPABILITY_REPLY_MAX_BYTES:
+                                oversized = True
+                                break
+                            chunks.append(chunk)
+                        if oversized:
+                            return False, {
+                                "error": "peer capability reply exceeds the size cap",
+                                "code": "capability_malformed_reply",
+                            }
+                        try:
+                            payload = json.loads(b"".join(chunks))
+                        except Exception:
+                            return False, {
+                                "error": "peer returned a malformed capability reply",
+                                "code": "capability_malformed_reply",
+                            }
+                        if not isinstance(payload, (dict, list)):
+                            return False, {
+                                "error": "peer returned a malformed capability reply",
+                                "code": "capability_malformed_reply",
+                            }
+                        return True, payload
+            except Exception as e:
+                logger.info(
+                    "Peer capability read %s from %s failed (%s)",
+                    path,
+                    instance_id,
+                    type(e).__name__,  # never the credential
+                )
+                return False, {
+                    "error": f"could not reach the instance ({type(e).__name__})",
+                    "code": "capability_unreachable",
+                }
+        # Both attempts came back unauthorized.
+        return False, {
+            "error": "peer rejected the credential",
+            "code": "capability_unauthorized",
+        }
+
+    async def peer_version(self, instance_id: str) -> tuple[bool, str]:
+        """The peer gateway's ``kiro_crew.__version__``, or ``(False, code)``.
+
+        Used by the version-equality gate that fences remote execution. A peer
+        without ``/api/version`` answers 404 and comes back as
+        ``capability_peer_too_old`` — which the gate must treat exactly like a
+        mismatch, since an unknown version cannot be proven equal.
+        """
+        ok, payload = await self.peer_capability(instance_id, "/api/version")
+        if not ok:
+            code = (
+                payload.get("code", "capability_unreachable") if isinstance(payload, dict) else ""
+            )
+            return False, str(code)
+        version = payload.get("version") if isinstance(payload, dict) else None
+        if not isinstance(version, str) or not version:
+            return False, "capability_malformed_reply"
+        return True, version
+
     async def search_sessions_remote(
         self, instance_id: str, query: str, limit: int
     ) -> tuple[bool, dict]:
@@ -2606,7 +2983,7 @@ class SshTunnelManager:
         try:
             while True:
                 await asyncio.sleep(delay)
-                # A failed re-mint is only terminal once the instance is no longer
+                # A failed re-mint is only terminal once the instance is not
                 # connected (dropped from _tunnels); a transient mint failure
                 # retries on the next cycle at the same interval, since `delay` is
                 # derived from the ttl once, before the loop, and never re-derived.

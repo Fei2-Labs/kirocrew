@@ -1,4 +1,4 @@
-"""Unreachable-gatewayd reclamation (issue #3315).
+"""Unreachable-gatewayd reclamation.
 
 Two layers under test:
 
@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 import pytest
 
+from conftest import host_abs
 from kiro_crew import session_pid as sp
 from kiro_crew.mcp_gateway import gatewayd as gw
 
@@ -259,8 +260,10 @@ class TestIsSweepableOrphanGatewayd:
         for form in ("pair", "equals"):
             cmdline = _gatewayd_cmdline("gw.sock", socket_form=form)
             assert sp._is_sweepable_orphan_gatewayd(cmdline) is False
-        # Control: the same name as an absolute path (nonexistent) matches.
-        cmdline = _gatewayd_cmdline("/nonexistent-dir-3315/gw.sock")
+        # Control: the same name as an absolute path (nonexistent) matches. Spelled
+        # for the host: from Python 3.13 ``ntpath.isabs("/nonexistent-dir/gw.sock")``
+        # is False, which would make this control read as the relative case.
+        cmdline = _gatewayd_cmdline(host_abs("nonexistent-dir-3315", "gw.sock"))
         assert sp._is_sweepable_orphan_gatewayd(cmdline) is True
 
     def test_duplicate_socket_flags_use_the_last_occurrence(
@@ -466,22 +469,28 @@ class TestKillOrphanGatewayd:
         cmdline = _gatewayd_cmdline(gone)
         sent: list[tuple[int, int]] = []
 
-        def fake_kill(pid: int, sig: int) -> None:
+        # The reaper signals and probes through the platform_compat shim, so
+        # the TERM/SIGKILL recording moves onto kill_pid and the liveness
+        # answer onto pid_exists: TERM delivered, daemon gone on the first
+        # poll, never SIGKILLed.
+        def fake_kill_pid(pid: int, sig: int) -> bool:
             sent.append((pid, sig))
-            if sig == 0:
-                raise ProcessLookupError
+            return True
 
         with (
             patch("kiro_crew.session_pid.platform_compat") as pc,
             patch("kiro_crew.session_pid.sys") as mock_sys,
             patch.object(Path, "read_bytes", return_value=cmdline),
-            patch("kiro_crew.session_pid.os.kill", side_effect=fake_kill),
             patch("kiro_crew.session_pid.os.killpg") as killpg,
             patch("kiro_crew.session_pid.os.getpgrp", return_value=1234),
             patch("kiro_crew.session_pid.os.getpid", return_value=1),
             patch("kiro_crew.session_pid._linux_pid_age", return_value=300.0),
         ):
             pc.IS_WINDOWS = False
+            pc.SIGTERM = signal.SIGTERM
+            pc.SIGKILL = signal.SIGKILL
+            pc.kill_pid.side_effect = fake_kill_pid
+            pc.pid_exists.return_value = False
             mock_sys.platform = "linux"
             killed = sp.kill_orphan_mcps([903])
         assert killed == 1

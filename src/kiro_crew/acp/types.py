@@ -26,19 +26,37 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
+    ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INTERNAL_SANDBOX,
-    ACP_BACKENDS_KIRO_IDENTITY_STORE,
+    ACP_BACKENDS_KIRO_DIALECT,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_LOAD_WITHOUT_MODES,
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
     ACP_BACKENDS_MEMBER_DISPATCH,
+    ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_POD_HOME_REMAP,
+    ACP_BACKENDS_REGISTRY_ADAPTERS,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STRUCTURED_REFUSAL,
+    acp_runtime_backends,
+    effort_config_option_id,
     model_registry_namespace,
     selectable_backends,
+)
+
+# Declared per harness rather than listed as a capability set: whether a
+# ``kiro-cli logout`` retires a running child is a fact about how that harness signs
+# in, so it is derived from that harness's declaration. A function and not an
+# ``ACP_BACKENDS_*`` set because it is not vocabulary -- see the projection's own
+# docstring for why neither module is a legal home for the set form.
+from kiro_crew.agent_sdk.host_auth import (  # noqa: E402,F401 - re-exported for importers
+    backends_retired_by_host_logout,
 )
 
 # ── ACP Event Kinds ──
@@ -117,6 +135,11 @@ METHOD_SET_CONFIG_OPTION = "session/set_config_option"
 #: ``configId`` under which KAS exposes the session model. KAS implements no
 #: ``session/set_model``, so this is the only way to switch a model on it.
 MODEL_CONFIG_ID = "model"
+# The reasoning-effort ``configId`` is per harness, so it is resolved through
+# ``effort_config_option_id`` (re-exported above) rather than named by a constant
+# here: codex-acp spells it ``reasoning_effort`` and claude-agent-acp spells it
+# ``effort``, and a single constant beside ``MODEL_CONFIG_ID`` would read as one
+# shared spelling and be written to the wrong adapter.
 
 #: JSON-RPC 2.0 reserved error code for an unrecognized method.
 JSONRPC_METHOD_NOT_FOUND = -32601
@@ -171,24 +194,25 @@ ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER: dict = {
 
 # ── ACP Backend Identifiers ──
 # DEFINED in :mod:`kiro_crew.acp_backends` and re-exported from the import block
-# at the top of this module, so the ~19 existing
-# ``from kiro_crew.acp.types import ACP_BACKEND_*`` call sites are unchanged.
+# at the top of this module, so ``from kiro_crew.acp.types import ACP_BACKEND_*``
+# resolves here for its ~19 call sites.
 #
-# The definitions had to move out of this package: importing anything under
+# The definitions live outside this package: importing anything under
 # ``kiro_crew.acp`` executes its ``__init__`` (client + runtime), so the loader's
-# field metadata and the dashboard's PATCH allowlist could not read them and each
-# kept a literal copy of the selectable list instead. ``acp_backends`` imports
-# nothing from this package, so it can be the single code owner.
+# field metadata and the dashboard's PATCH allowlist cannot read them from here
+# without dragging that in, and would each need a literal copy of the selectable
+# list. ``acp_backends`` imports nothing from this package, so it can be the
+# single code owner.
 #
-# The selectable set is no longer a constant either: it is a REGISTRY an edition
+# The selectable set is not a constant either: it is a REGISTRY an edition
 # extends (``register_selectable_backend``). A frozen ``ACP_BACKENDS_SELECTABLE``
 # snapshot here would be read before boot registration and silently miss it.
 
 # ── Capability membership ──
 # The ``ACP_BACKENDS_*`` capability sets are DEFINED in the leaf module
 # ``kiro_crew.acp_backends`` and re-exported by the import above, so
-# ``from kiro_crew.acp.types import ACP_BACKENDS_STEER`` still resolves. They moved
-# for the same reason the backend identifiers did: a consumer outside this package
+# ``from kiro_crew.acp.types import ACP_BACKENDS_STEER`` resolves. They live there
+# for the same reason the backend identifiers do: a consumer outside this package
 # must be able to ask a capability question without importing ``kiro_crew.acp``,
 # whose ``__init__`` pulls in the client and runtime.
 
@@ -204,8 +228,8 @@ ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER: dict = {
 # Backends whose advertised ``availableModels[].modelId`` ids share a namespace
 # with the ids their own ``session/set_model`` accepts — so an id absent from
 # the advertised list is genuinely unusable and the entitlement pre-flight
-# (``model_is_unusable``) is meaningful. kiro-cli, KAS, copilot, and opencode
-# all satisfy this; the claude seam does NOT (it advertises BARE ids like
+# (``model_is_unusable``) is meaningful. kiro-cli, KAS and copilot
+# satisfy this; the claude seam does NOT (it advertises BARE ids like
 # ``claude-opus-4-8[1m]`` while the configured model is the prefixed provider id
 # ``global.anthropic.claude-opus-4-8[1m]``, so a membership test across those
 # two namespaces would call every legitimate model unusable — harness-parity
@@ -214,8 +238,9 @@ ACP_BACKENDS_MODEL_NAMESPACE = frozenset(
     {
         ACP_BACKEND_KIRO,
         ACP_BACKEND_KAS,
+        # copilot is this build's own; opencode is upstream's and follows
+        # upstream's model handling (no entitlement pre-flight), so it is not here.
         ACP_BACKEND_COPILOT,
-        ACP_BACKEND_OPENCODE,
     }
 )
 
@@ -415,6 +440,12 @@ STOP_REASON_END_TURN = "end_turn"
 # retrying the same prompt hits the same refusal, so chat_runner surfaces an
 # actionable message instead of churning the retry ladder.
 STOP_REASON_REFUSAL = "refusal"
+# The Kiro service's own spelling of a content-filter refusal, as it appears in
+# the ``stopReason`` field of a ``_kiro.dev/metadata`` notification. It is
+# NORMALISED to ``STOP_REASON_REFUSAL`` on the ``EVENT_COMPLETE`` that follows
+# (see ``RefusalInfo``), so no consumer outside ``acp/`` ever compares against
+# it; named here so the parser and its tests share one literal.
+STOP_REASON_CONTENT_FILTERED_WIRE = "CONTENT_FILTERED"
 # Signalled by the ACP layer when a genuinely-wedged (stale) turn was probed via
 # session/cancel and got no ack within the grace window — a confirmed wedge, not
 # a done-but-missing-frame turn (which acks and completes normally). The
@@ -500,6 +531,34 @@ class JsonRpcMessage:
 
     def is_method(self, name: str) -> bool:
         return self.method == name
+
+
+@dataclass
+class RefusalInfo:
+    """Why the model declined a turn -- one shape for every harness.
+
+    A refusal is DETERMINISTIC (the same prompt hits the same filter), so the
+    thing a user needs is not a retry but the reason. Harnesses report that
+    reason very unevenly: the Kiro service sends a category, a canned
+    explanation and sometimes a model that would accept the request
+    (``ACP_BACKENDS_STRUCTURED_REFUSAL``); Anthropic's adapter sends the word
+    ``refusal`` and nothing else; a harness not yet written will send something
+    in between. Rather than a card per harness, every harness fills whatever
+    fields it has and leaves the rest EMPTY -- never a guessed value -- and the
+    single refusal card renders a line per non-empty field.
+
+    Every field is provider text bound for the dashboard: producers redact all
+    of them before they land here. A harness that reports no reason at all
+    (Anthropic's bare ``refusal`` stop reason) produces no instance -- the
+    stop reason alone drives the dashboard branch.
+    """
+
+    #: Provider's refusal class in its own spelling (``CYBER``). Empty = unknown.
+    category: str = ""
+    #: Provider's own words, already redacted. Empty = none given.
+    explanation: str = ""
+    #: A model the provider says would take the request. Empty = none named.
+    recommended_model: str = ""
 
 
 @dataclass
@@ -682,10 +741,26 @@ class AcpEvent:
     text: str = ""
     tool_call_id: str = ""
     title: str = ""
+    #: The backend's OWN ``title`` for a tool_call / tool_call_update frame,
+    #: untouched. ``title`` above is the DISPLAY label ``select_tool_title``
+    #: picks, which prefers a shell call's model-authored ``rawInput.description``
+    #: -- so it is model-controlled and must never feed a security decision.
+    #: This field is what kiro-agent's MCP wrapper stamps as
+    #: ``@<serverName>/<toolName>`` from its own tool config, and it is the only
+    #: title the out-of-band directive claim (``directive_tool_from_call``) reads.
+    #: Empty when the frame carried none.
+    wire_title: str = ""
     tool_kind: str = ""
     tool_purpose: str = ""
     context_usage_pct: float = 0.0
     stop_reason: str = ""
+    #: Set on ``EVENT_COMPLETE`` when the turn ended in a model-side refusal.
+    #: ``stop_reason`` is then always ``STOP_REASON_REFUSAL`` -- the Kiro
+    #: service's ``CONTENT_FILTERED`` metadata is folded onto it here so the
+    #: dashboard has one branch, and the structured fields travel alongside.
+    #: ``None`` on every other terminal, including a plain ``end_turn`` whose
+    #: metadata said nothing about a refusal.
+    refusal: "RefusalInfo | None" = None
     #: True when Kiro Crew fabricated this terminal event because the provider
     #: omitted its result frame. Consumers must not treat it as raw completion
     #: evidence even when compatibility requires ``stop_reason=end_turn``.
@@ -698,19 +773,14 @@ class AcpEvent:
     #: the original bytes never ride this display event.  Approval surfaces use
     #: it to refuse a durable command grant for a value the user could not see.
     tool_input_redacted: bool = False
-    #: The tool's result text, VERBATIM enough that a control marker embedded in
-    #: it still parses. Two consumers read markers out of this string rather than
-    #: out of a structured field: a session directive (``session_directive.peek``,
-    #: which arms/stops a monitor loop) and an MCP App render marker
-    #: (``mcp_apps_render.find_marker``). A builder that serialises an
-    #: unrecognised result envelope with ``json.dumps`` escapes every quote in it,
-    #: which leaves both sentinels intact while destroying the payload behind
-    #: them -- so the frame still looks like it carries a directive and names
-    #: nothing. EVERY builder must therefore run
-    #: ``acp/_dispatch._repair_escaped_marker`` over its joined output before
-    #: redaction and the head cut; a new provider's builder is pinned to that by
-    #: ``test_session_directive_transport.py``. See
-    #: docs/system-specs/features/agent-host-contract.md §9.
+    #: The tool's result text. One consumer reads a control marker out of this
+    #: string rather than out of a structured field: the MCP App render marker
+    #: (``mcp_apps_render.find_marker``). A session directive is NOT selected
+    #: from here: its marker is display-only and the parked record is claimed by
+    #: the tool CALL's input digest (``session_directive.call_input_digest``),
+    #: so a backend that re-serialises, duplicates or caps the result body
+    #: cannot lose the directive. See
+    #: docs/system-specs/modules/agent-host-contract.md §9.
     tool_output: str = ""
     tool_final: bool = False  # True when this tool_result is the final (status=completed) update
     usage: TurnUsage = field(default_factory=TurnUsage)
@@ -833,9 +903,9 @@ class AcpEvent:
         - Structured AWS CLI (kiro-cli ``use_aws``): ``service_name`` +
           ``operation_name`` (+ ``parameters``/``positional_args``). kiro-cli
           reports ``use_aws`` with the shell tool kind, so without this shape
-          the deny-by-default backstop in ``HookManager.on_tool_call`` rejected
-          EVERY ``use_aws`` call ("shell command could not be verified") — the
-          v3.3.x regression that fully broke SSM for kiro-backend users. The
+          the deny-by-default backstop in ``HookManager.on_tool_call`` rejects
+          EVERY ``use_aws`` call ("shell command could not be verified"), which
+          breaks SSM outright for kiro-backend users. The
           structured fields are the ground truth of what executes (kiro-cli
           builds the CLI invocation from them, never from the display title),
           so synthesizing ``aws <service> <operation> …`` gives the gate real
@@ -901,32 +971,45 @@ class AcpEvent:
         stays empty and every such child permission request is low-fidelity —
         yet the ``_meta.kiro`` server/tool identity from that same frame DID
         reach the caches and is non-model-authored. This property isolates that
-        verified-identity half so UNCONDITIONAL grant paths — ones whose approve
-        decision consumes no agent-authored event data (session trust-all,
-        global YOLO, ``parent_policy=auto``, per-source auto-approve) — can
-        honor the grant, while every content-matching path (trusted patterns,
-        trust-reads, title-keyed ``auto_approve_tools``) stays gated on the
-        composite ``child_low_fidelity``: for those the agent-authored title or
-        inline params ARE the matched input, and a forged title must never
-        satisfy them.
+        verified-identity half so two kinds of grant can honor it: UNCONDITIONAL
+        grant paths — ones whose approve decision consumes no agent-authored
+        event data (session trust-all, global YOLO, ``parent_policy=auto``,
+        per-source auto-approve) — and IDENTITY-KEYED matching paths, whose
+        matched input is this same verified identity and nothing else (the
+        TrustDropdown's non-shell grant via ``approval_command``, the hook
+        gate's app-own-server grant, and an ``auto_approve_tools`` pattern
+        matched against ``@server/tool`` — the hook reports these with
+        ``ToolHookResult.identity_grant``). Every matching path whose input the
+        agent CAN author — the title, the payload's ``kind``, inline params,
+        trust-reads over a command — stays gated on the composite
+        ``child_low_fidelity``: a forged title must never satisfy them.
 
         Requirements, each fail-closed on its cache: a child origin
-        (``sub_session_id``), a RESOLVED non-shell classification
-        (``shell_classified`` and not ``is_shell`` — an unclassified event
-        defaults to non-shell and must not pass as one; a shell tool's deny
-        gates need the command bytes this event lacks), the canonical
+        (``sub_session_id``), no RESOLVED shell classification to the contrary
+        (``not is_shell`` — a frame whose ``kind`` resolved to execute cached
+        True, and its deny gates need the command bytes this event lacks; the
+        transport identity must never waive that), the canonical
         ``mcp_server_name`` + ``tool_name`` pair recovered from the tool_call
         cache (empty on a miss, and populated only for genuinely MCP-served
         tools — a host shell/builtin can never carry a server name), and the
         explicit ``mcp_identity_trusted`` provenance flag set by the trusted
         population sites — non-emptiness alone is NOT proof of provenance, so
         an identity pair written by any future inline/agent-authored fallback
-        stays untrusted until that site earns the flag. A
-        non-child event returns False: parents never need the split.
+        stays untrusted until that site earns the flag.
+
+        ``shell_classified`` is deliberately NOT required: a backend may omit
+        ``kind`` on its MCP tool_call frames, leaving the shell cache
+        unwritten. The trusted transport identity is itself proof the call is
+        MCP-served and therefore not a host shell command — but that proof
+        stays confined to THIS identity-only property. Minting a resolved
+        ``shell_classified`` from it instead would flip ``child_low_fidelity``
+        to False and un-gate the content-matching auto-approve paths, letting
+        a kindless mutating call with a read-looking, agent-authored title
+        auto-approve without a prompt. A non-child event returns False:
+        parents never need the split.
         """
         return bool(
             self.sub_session_id
-            and self.shell_classified
             and not self.is_shell
             and self.mcp_identity_trusted
             and self.mcp_server_name
@@ -945,12 +1028,15 @@ class AcpEvent:
         verified (``child_mcp_identity_trusted``) — for the latter only the
         ARGUMENTS remain unverified, which the grant never reads (the same
         blindness the interactive card has; the identity split changes WHO
-        approves, not what any gate can scan). Content-MATCHING paths —
-        trusted patterns, trust-reads, title-keyed ``auto_approve_tools``, the
-        'reads' classification — must stay gated on the composite
-        ``child_low_fidelity`` instead: the agent-authored title or inline
-        params ARE their matched input, and a forged title must never satisfy
-        them. Non-child events are always eligible (never low-fidelity).
+        approves, not what any gate can scan). Matching paths whose input the
+        agent can author — the title, the payload's ``kind``, inline params,
+        trust-reads over a command, the 'reads' classification — must stay
+        gated on the composite ``child_low_fidelity`` instead: a forged title
+        must never satisfy them. A matching path keyed on the verified identity
+        alone (see ``child_mcp_identity_trusted``) may read this property too:
+        the dashboard's TrustDropdown match gates on it, because its key is that
+        identity and the admission condition is this same boolean. Non-child
+        events are always eligible (never low-fidelity).
         """
         return not self.child_low_fidelity or self.child_mcp_identity_trusted
 
@@ -1014,6 +1100,14 @@ class AcpPromptStats:
     # first sees a session that just hit its context ceiling as brand new.
     # Cleared the moment a real percentage or usage_update lands.
     context_pct_unknown: bool = False
+    # The structured refusal this turn's metadata reported, if any. Written by
+    # the ``_kiro.dev/metadata`` tracker when the notification carries a
+    # ``refusal`` payload (``ACP_BACKENDS_STRUCTURED_REFUSAL``), read by the
+    # ``EVENT_COMPLETE`` builder to fold onto the terminal. PER-TURN: the
+    # notification precedes the terminal by milliseconds and describes only
+    # this turn, so ``carry_over()`` drops it -- a refusal that survived into
+    # the next turn would brand an ordinary answer as declined.
+    refusal: "RefusalInfo | None" = None
 
     def carry_over(self) -> "AcpPromptStats":
         """Return fresh per-turn stats carrying this turn's context state.
@@ -1041,8 +1135,7 @@ class AcpPromptStats:
         context fields because they describe the SESSION — which is exactly why
         they must NOT survive a warm-pool handoff, where the runtime outlives
         whatever it did before the re-bind. Stale stats handed to a new chat
-        make ``check_context_usage`` fire compaction on an empty conversation
-        (issue #2932).
+        make ``check_context_usage`` fire compaction on an empty conversation.
 
         Everything returns to dataclass defaults, window included: a handoff
         may re-apply a different model post-claim, and a window measured before
@@ -1075,6 +1168,23 @@ class AcpPromptStats:
         what the compacted transcript actually costs.
         """
         self.context_pct_unknown = False
+
+    def terminal_refusal(self, stop_reason: str) -> tuple[str, "RefusalInfo | None"]:
+        """Fold this turn's refusal evidence onto a terminal's stop reason.
+
+        A structured refusal recorded from metadata wins: the terminal's own
+        reason is unreliable there (Kiro reports ``end_turn`` after streaming
+        the canned explanation as text), so the reason is rewritten to
+        ``STOP_REASON_REFUSAL`` and the payload attached. Every other reason --
+        including a bare ``refusal`` (Anthropic's spelling, passed through by
+        every harness) -- is returned untouched with ``None``: the dashboard's
+        refusal branch keys on the stop reason, and its card renders ``None``
+        as the field-less card, so a payload with nothing in it would add
+        nothing.
+        """
+        if self.refusal is not None:
+            return STOP_REASON_REFUSAL, self.refusal
+        return stop_reason, None
 
     def apply_cost_cumulative(self, cumulative: float) -> None:
         """Fold a session-cumulative cost reading into the per-turn delta.
@@ -1161,8 +1271,8 @@ class AcpPromptStats:
 
         kiro-cli 2.10+ metadata and KAS ``context_usage`` both give a percentage
         with no ``usage_update {used, size}``. Shared by the AcpClient and
-        AcpSessionHandle paths (previously two verbatim copies) so both report
-        the same context-meter token counts. No-op once a real usage_update has
+        AcpSessionHandle paths so both report the same context-meter token
+        counts. No-op once a real usage_update has
         set authoritative counts. ``model_id`` is the caller's resolved id (the
         kiro-agent ``currentModelId``, else the user-picked alias). Resolves the
         window through ``model_registry.model_window`` (kiro-list cache >

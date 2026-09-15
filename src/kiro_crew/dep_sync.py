@@ -77,6 +77,7 @@ from __future__ import annotations
 import configparser
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -105,6 +106,66 @@ _NAME_END = re.compile(r"[\s<>=!~;\[(]")
 #: through, so it is the one whose staleness has to be reported rather than
 #: silently tolerated.
 _SCRIPT = "kirocrew"
+
+
+def console_script_path(target_py: Path) -> Path:
+    """The console-script file *target_py*'s venv would install for ``kirocrew``.
+
+    Platform-aware, matching the same ``sys.platform`` split ``locked_console_scripts``
+    uses: on Windows the entry point is ``Scripts\\kirocrew.exe`` beside the
+    interpreter; on POSIX it is ``bin/kirocrew``. ``Path.with_name`` keeps it in the
+    interpreter's own directory (``bin`` or ``Scripts``) without hardcoding either.
+    A pure path computation -- no filesystem or subprocess -- so callers can stat it
+    cheaply. Avoids the POSIX-only ``bin/kirocrew`` assumption in a module that
+    exists precisely for the Windows locked-``Scripts\\kirocrew.exe`` case.
+    """
+
+    if sys.platform == "win32":
+        return Path(target_py).with_name(f"{_SCRIPT}.exe")
+    return Path(target_py).with_name(_SCRIPT)
+
+
+def project_venv_python(repo: Path) -> Path:
+    """The interpreter path for this project's managed ``.venv``.
+
+    Keep the gateway repair target and the dependency sync's ownership exception
+    on one platform-aware calculation. The exception is safe only for this exact
+    lexical path; resolving it would erase a POSIX venv's symlink identity.
+    """
+    if sys.platform == "win32":
+        return Path(repo) / ".venv" / "Scripts" / "python.exe"
+    return Path(repo) / ".venv" / "bin" / "python"
+
+
+def _is_redirecting_directory(path: Path) -> bool:
+    """Return whether *path* redirects writes outside its lexical directory."""
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        return bool(is_junction and is_junction())
+    except OSError:
+        # An ownership exception must fail closed when its layout cannot be read.
+        return True
+
+
+def _is_owned_project_venv_target(repo: Path, target_py: Path) -> bool:
+    """Verify the narrow filesystem target eligible for missing-package repair.
+
+    The final interpreter is deliberately allowed to be a symlink: POSIX
+    ``python -m venv`` commonly creates it that way. The directories that contain
+    pip's writes are not; redirecting either ``.venv`` or ``bin``/``Scripts``
+    would turn the lexical path equality below into authority over another tree.
+    """
+    target = os.path.normcase(os.path.abspath(target_py))
+    expected_py = project_venv_python(repo)
+    expected = os.path.normcase(os.path.abspath(expected_py))
+    if target != expected:
+        return False
+    return not any(
+        _is_redirecting_directory(path) for path in (Path(repo) / ".venv", expected_py.parent)
+    )
+
 
 #: This project's own distribution name, normalized. Asking pip for it is the one
 #: request that would rewrite the locked console script.
@@ -338,9 +399,24 @@ def requires_python(repo: Path) -> str | None:
     sentinel: "no floor declared" and "the floor could not be read" both mean the
     same thing to the caller, which is that this gate does not fire.
     """
-    text = read_text(repo, "pyproject.toml")
-    if text is not None:
-        table = project_table(repo)
+    return requires_python_from_texts(
+        read_text(repo, "pyproject.toml"), read_text(repo, "setup.cfg")
+    )
+
+
+def requires_python_from_texts(pyproject: str | None, setup_cfg: str | None) -> str | None:
+    """The interpreter floor declared by these two file bodies, or ``None``.
+
+    The text-taking core of :func:`requires_python`, with the same precedence:
+    a static ``[project].requires-python`` is the whole answer whenever a
+    ``[project]`` table exists, and ``setup.cfg``'s ``python_requires`` is read
+    only when it does not (or declares the field dynamic). Taking texts rather
+    than a checkout lets the same rule judge a revision that has NOT been
+    checked out yet -- the fetched commit an update is about to apply -- so the
+    floor can refuse the update before the tree is moved, not after.
+    """
+    if pyproject is not None:
+        table = project_table_from_text(pyproject)
         if table is not None:
             if "requires-python" not in _as_str_list(table.get("dynamic")):
                 spec = table.get("requires-python")
@@ -348,7 +424,7 @@ def requires_python(repo: Path) -> str | None:
                     return spec.strip()
                 return None
         else:
-            project = _section(text, "[project]")
+            project = _section(pyproject, "[project]")
             if "requires-python" not in _dynamic_fields(project):
                 match = re.search(
                     r"^\s*requires-python\s*=\s*[\"'](?P<spec>[^\"']+)[\"']",
@@ -357,17 +433,164 @@ def requires_python(repo: Path) -> str | None:
                 )
                 if match:
                     return match.group("spec").strip() or None
-    text = read_text(repo, "setup.cfg")
-    if text is None:
+    if setup_cfg is None:
         return None
     cfg = configparser.ConfigParser()
     try:
-        cfg.read_string(text)
+        cfg.read_string(setup_cfg)
     except configparser.Error:
         return None
     if not cfg.has_option("options", "python_requires"):
         return None
     return cfg.get("options", "python_requires").strip() or None
+
+
+class IncomingFloorUnreadable(Exception):
+    """Git could not say what interpreter floor the incoming revision declares.
+
+    Raised by :func:`incoming_python_floor_breach` when reading a floor file
+    out of the revision fails for any reason OTHER than the file not existing
+    there: an unresolvable ref, a git that will not start, a timeout. The
+    distinction matters because the gate exists to keep a revision the venv
+    cannot import out of the working tree. A file that is genuinely absent
+    declares no floor and there is nothing to enforce; a read that failed says
+    nothing about the floor at all, and treating it as "no floor" would let
+    exactly the update the gate refuses go through whenever git hiccups.
+    """
+
+
+# git's two spellings for "that path is not in this revision" -- one when the
+# path exists nowhere, one when it exists in the working tree but not at the
+# ref. Both are a plain absence; every other failure is a read that did not
+# happen.
+_GIT_PATH_ABSENT = (b"does not exist in", b"exists on disk, but not in")
+
+
+def _git_blob_text(
+    repo: Path,
+    ref: str,
+    name: str,
+    *,
+    git_bin: str = "git",
+    env: dict[str, str] | None = None,
+    timeout: float | None = 10.0,
+) -> str | None:
+    """``<name>`` as committed at git *ref* in *repo*, or ``None`` when absent.
+
+    ``None`` means git resolved the revision and reported the path missing
+    from it -- the file was not there, which is an answer. Every other way of
+    not getting the text (an unresolvable ref, git failing to start, a
+    timeout) raises :class:`IncomingFloorUnreadable`, because it is not an
+    answer, and the caller enforcing an interpreter floor must not read a
+    failed lookup as "no floor declared".
+
+    ``env`` is the environment the calling update path gives its OWN git
+    commands. The unattended path builds one that strips ``GIT_DIR`` and its
+    siblings so an inherited redirection cannot point a command at another
+    repository; a read here that inherited the process environment instead
+    would answer for that other repository (or fail, and so not fire) while
+    the reset that follows it operates on this one.
+    """
+    try:
+        proc = subprocess.run(
+            [git_bin, "show", f"{ref}:{name}"],
+            capture_output=True,
+            cwd=str(repo),
+            env=env,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise IncomingFloorUnreadable(f"git show {ref}:{name} timed out") from exc
+    except OSError as exc:
+        raise IncomingFloorUnreadable(f"git show {ref}:{name} could not run: {exc}") from exc
+    if proc.returncode != 0:
+        if any(marker in proc.stderr for marker in _GIT_PATH_ABSENT):
+            return None
+        detail = proc.stderr.decode("utf-8", errors="replace").strip() or f"exit {proc.returncode}"
+        raise IncomingFloorUnreadable(f"git show {ref}:{name} failed: {detail}")
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
+def _highest_floor(spec: str) -> tuple[int, int] | None:
+    """``(major, minor)`` of the highest floor *spec* declares, or ``None``."""
+    highest: tuple[int, int] | None = None
+    for match in _PY_FLOOR.finditer(spec):
+        floor = (int(match.group("major")), int(match.group("minor")))
+        if highest is None or floor > highest:
+            highest = floor
+    return highest
+
+
+def incoming_python_floor_breach(
+    repo: Path,
+    ref: str,
+    target_py: Path,
+    *,
+    git_bin: str = "git",
+    env: dict[str, str] | None = None,
+    timeout: float | None = 10.0,
+) -> str | None:
+    """Why the revision at git *ref* cannot be installed into *target_py*'s venv.
+
+    ``None`` means it can (or nothing proves it cannot). Otherwise a
+    human-readable reason naming the floor the incoming revision declares and
+    the interpreter version the venv actually runs.
+
+    This is the SAME gate :func:`sync_or_reinstall` applies -- and pip applies
+    on its own with ``Requires-Python`` -- moved to BEFORE the tree is changed.
+    Applied after the pull it is only a good error message: the checkout has
+    already moved to a revision the venv can never import, the running gateway
+    keeps serving the old code out of memory, every lazy import from then on
+    reads a file from the new revision, and every later update attempt repeats
+    the pull and the refusal. Applied here, a floor the venv does not meet is a
+    refusal that leaves the checkout where it was, with a reason the operator
+    can act on (rebuild the venv on a newer interpreter).
+
+    The floor is read from the commit itself (``git show <ref>:pyproject.toml``,
+    then ``setup.cfg``), never from the working tree, because the working tree
+    is the OLD revision at this point. A revision that declares no floor, or an
+    interpreter that cannot be probed, does not fire: the gate refuses only on
+    a breach it can prove, and pip remains the backstop for everything else.
+    A floor file git could not READ is different: that is
+    :class:`IncomingFloorUnreadable`, which the caller must treat as a refusal
+    of its own, because on a pinned revision "could not read" is the one way
+    left for the stranded pull-then-pip-refuses state to be re-admitted.
+    """
+    spec = requires_python_from_texts(
+        _git_blob_text(repo, ref, "pyproject.toml", git_bin=git_bin, env=env, timeout=timeout),
+        _git_blob_text(repo, ref, "setup.cfg", git_bin=git_bin, env=env, timeout=timeout),
+    )
+    if not spec:
+        return None
+    try:
+        version = interpreter_version(target_py, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if version is None:
+        return None
+    breach = python_floor_breach(spec, version)
+    if not breach:
+        return None
+    # The venv root is two levels above the interpreter on both layouts
+    # (`<venv>/bin/python`, `<venv>/Scripts/python.exe`); name it rather than
+    # leaving a placeholder the operator has to fill in with a value the
+    # system already holds. The reinstall command names the interpreter path
+    # as probed, so it is layout-correct wherever it is pasted. The
+    # interpreter the remedy asks for is the floor the revision declares, not
+    # a constant that would go stale the next time the floor moves; the paths
+    # are shell-quoted because the remedy is written to be pasted.
+    interpreter = Path(os.path.abspath(target_py))
+    venv = interpreter.parent.parent
+    floor = _highest_floor(spec)
+    wanted = f"{floor[0]}.{floor[1]}" if floor else breach
+    return (
+        f"the incoming revision requires Python {spec} but this install's venv "
+        f"({venv}) runs {version[0]}.{version[1]}.{version[2]}, so it cannot be "
+        "installed there. Rebuild that venv on a supported interpreter "
+        f"(e.g. `uv venv --python {wanted} --seed {shlex.quote(str(venv))}` then "
+        f"`{shlex.quote(str(interpreter))} -m pip install -e {shlex.quote(str(repo))}`), "
+        "then update again."
+    )
 
 
 def _probe_interpreter(
@@ -423,9 +646,13 @@ def _probe_interpreter(
     )
 
 
-def interpreter_version(target_py: Path) -> tuple[int, int, int] | None:
+def interpreter_version(
+    target_py: Path, timeout: float | None = None
+) -> tuple[int, int, int] | None:
     """``(major, minor, micro)`` of *target_py*, or ``None`` if it cannot be asked."""
-    proc = _probe_interpreter(target_py, "import sys;print('%d.%d.%d' % sys.version_info[:3])")
+    proc = _probe_interpreter(
+        target_py, "import sys;print('%d.%d.%d' % sys.version_info[:3])", timeout=timeout
+    )
     if proc.returncode != 0:
         return None
     try:
@@ -552,10 +779,20 @@ def project_table(repo: Path) -> dict[str, Any] | None:
     ``tomli``), and each caller then falls back to its text reader, which is
     best-effort by nature; that residual is stated in the PR rather than hidden.
     """
-    if _toml is None:
-        return None
     text = read_text(repo, "pyproject.toml")
     if text is None:
+        return None
+    return project_table_from_text(text)
+
+
+def project_table_from_text(text: str) -> dict[str, Any] | None:
+    """``[project]`` parsed from pyproject *text*, or ``None`` when no parser can.
+
+    The text-taking half of :func:`project_table`, so a caller holding a
+    pyproject that is NOT the working tree's (a fetched revision read out of a
+    git blob) gets the same parser-backed answer instead of a second reader.
+    """
+    if _toml is None:
         return None
     try:
         parsed = _toml.loads(text)
@@ -889,6 +1126,8 @@ def sync_or_reinstall(
     target_py: Path,
     emit: Emit = _print_emit,
     timeout: float | None = None,
+    *,
+    allow_missing_package_repair: bool = False,
 ) -> int:
     """Bring ``target_py``'s venv up to date with ``repo``. 0 when it succeeded.
 
@@ -913,6 +1152,13 @@ def sync_or_reinstall(
     anywhere a user can see -- a dashboard progress feed, a log -- owns redacting
     it first: pip echoes index URLs, which carry credentials when the operator
     configured an authenticated index.
+
+    ``allow_missing_package_repair`` is the gateway's narrow recovery contract for
+    an interrupted rebuild: the package may be absent only when ``target_py`` is
+    exactly ``<repo>/.venv``'s platform interpreter and that interpreter can run.
+    A foreign origin is never allowed, and an absent package at any other target
+    remains unproven and refused. This keeps the general ownership guard fail-closed
+    while allowing the half-built state this repair path exists to recover.
     """
     # Establish that the venv about to be written to serves THIS checkout BEFORE
     # the branch, so both paths are covered. `sync()` asks the same question again
@@ -923,9 +1169,22 @@ def sync_or_reinstall(
     #
     # Without this, the reinstall branch would repeat the exact asymmetry this
     # change fixes at the Dev Fleet endpoint -- a guarded substitute beside an
-    # unguarded reinstall -- and three of this function's four callers take the
-    # checkout from configuration, so a repointed venv is reachable on all three.
-    foreign = venv_not_mapped_to(installed_package_origin(target_py), repo)
+    # unguarded reinstall -- and four of this function's five callers take the
+    # checkout from configuration, so a repointed venv is reachable on all four.
+    origin = installed_package_origin(target_py)
+    repairing_missing_package = False
+    if (
+        allow_missing_package_repair
+        and origin is None
+        and _is_owned_project_venv_target(repo, target_py)
+    ):
+        try:
+            repairing_missing_package = interpreter_version(target_py, timeout=timeout) is not None
+        except (OSError, subprocess.TimeoutExpired):
+            # ``None`` can also mean the interpreter vanished or wedged. That
+            # is not the absent-package state this exception is allowed for.
+            repairing_missing_package = False
+    foreign = None if repairing_missing_package else venv_not_mapped_to(origin, repo)
     if foreign:
         return _refuse(
             emit,
@@ -988,13 +1247,49 @@ def sync_or_reinstall(
         # 1, not pip's own code, for the same reason as the substitute branch:
         # pip's 2 (UNKNOWN_ERROR) is REFUSED's value, and this install ran.
         return 1
+    # A full editable reinstall has one success contract: pip returned 0 AND the
+    # artifacts it promises actually landed. The locked-script branch returned
+    # through ``sync`` above, so this postcondition never asks a dependency-only
+    # substitute to rewrite the wrapper it deliberately leaves alone. Keeping the
+    # check here closes every full-reinstall caller, including auto-update -- the
+    # path whose interruption can create the half-built venv this guard repairs.
+    script = console_script_path(target_py)
+    if not os.access(script, os.X_OK):
+        emit(
+            f"dep-sync: pip install -e returned 0 but the {_SCRIPT!r} console "
+            f"script at {script} is missing or not executable",
+            True,
+        )
+        return 1
+    try:
+        importable = _probe_interpreter(target_py, "import kiro_crew", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        emit("dep-sync: kiro_crew import check timed out after the pip install", True)
+        return 1
+    if importable.returncode != 0:
+        emit(
+            "dep-sync: pip install -e returned 0 but kiro_crew is not importable "
+            "in the target venv",
+            True,
+        )
+        return 1
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) == 3 and args[0] == "--repair-missing-package":
+        return sync_or_reinstall(
+            Path(args[1]),
+            Path(args[2]),
+            allow_missing_package_repair=True,
+        )
     if len(args) != 2:
-        print("usage: dep_sync <repo> <target-python>", file=sys.stderr)
+        print(
+            "usage: dep_sync <repo> <target-python> | "
+            "dep_sync --repair-missing-package <repo> <target-python>",
+            file=sys.stderr,
+        )
         return REFUSED
     return sync(Path(args[0]), Path(args[1]))
 

@@ -34,4 +34,10 @@ describe('AgentCfgTab', () => {
       expect(api.saveAgentConfig).toHaveBeenCalled()
     })
   })
+
+  it('puts the config editor directly under the card title', () => {
+    render(<AgentCfgTab />, { wrapper: Wrapper })
+    const title = screen.getByRole('heading', { level: 3 })
+    expect(title.nextElementSibling).toBe(screen.getByLabelText('Agent config JSON'))
+  })
 })

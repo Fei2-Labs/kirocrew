@@ -45,6 +45,32 @@ describe('/side slash command interception', () => {
     expect(mockSendChat).not.toHaveBeenCalled()
   })
 
+  // `/btw` is a pure alias of `/side` — same regex, same handling. Pinned as its
+  // own cases so a future SIDE_RE edit cannot silently drop the alias.
+  it('intercepts "/btw" exactly like "/side"', async () => {
+    const result = await interceptSlashCommand('/btw', SLOT, store.dispatch)
+    expect(result.intercepted).toBe(true)
+    expect(mockSideOpen).toHaveBeenCalledWith(SLOT)
+    expect(mockSideTurn).not.toHaveBeenCalled()
+    expect(mockSendChat).not.toHaveBeenCalled()
+    expect(store.getState().chat.activityTab).toBe('side')
+  })
+
+  it('intercepts "/btw <message>" and forwards body to sideTurn', async () => {
+    const result = await interceptSlashCommand('/btw is this cached', SLOT, store.dispatch)
+    expect(result.intercepted).toBe(true)
+    expect(mockSideTurn).toHaveBeenCalledWith(SLOT, 'is this cached')
+    expect(mockSendChat).not.toHaveBeenCalled()
+  })
+
+  it('does not intercept prefix look-alikes ("/btwx", "/sidebar")', async () => {
+    for (const text of ['/btwx', '/btwx q', '/sidebar', '/sidebar q']) {
+      const result = await interceptSlashCommand(text, SLOT, store.dispatch)
+      expect(result).toEqual({ intercepted: false })
+    }
+    expect(mockSideOpen).not.toHaveBeenCalled()
+  })
+
   it('does not intercept regular messages', async () => {
     const result = await interceptSlashCommand('hello world', SLOT, store.dispatch)
     expect(result.intercepted).toBe(false)
@@ -80,19 +106,20 @@ describe('/side slash command interception', () => {
 
   it('reports failed when there is no active slot', async () => {
     const result = await interceptSlashCommand('/side', null, store.dispatch)
-    expect(result).toEqual({ intercepted: true, failed: true })
+    expect(result).toEqual({ intercepted: true, failed: true, stage: 'open' })
   })
 
-  it('reports failed when sideOpen rejects', async () => {
+  it('reports failed when sideOpen rejects, carrying the reason for the caller to render', async () => {
     mockSideOpen.mockRejectedValueOnce(new Error('boom'))
     const result = await interceptSlashCommand('/side', SLOT, store.dispatch)
-    expect(result).toEqual({ intercepted: true, failed: true })
+    expect(result).toEqual({ intercepted: true, failed: true, error: 'boom', stage: 'open' })
   })
 
   it('reports failed when sideTurn rejects (e.g. 409 turn in flight)', async () => {
     mockSideTurn.mockRejectedValueOnce(new Error('409: side turn already in flight'))
     const result = await interceptSlashCommand('/side my question', SLOT, store.dispatch)
-    expect(result).toEqual({ intercepted: true, failed: true })
+    // `stage: 'turn'` because the panel DID open — the caller's title must not say otherwise.
+    expect(result).toEqual({ intercepted: true, failed: true, error: '409: side turn already in flight', stage: 'turn' })
     // The panel still opened — only the turn was rejected.
     expect(store.getState().chat.activityTab).toBe('side')
   })

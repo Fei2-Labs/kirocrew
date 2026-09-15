@@ -8,6 +8,8 @@ that the final is a decode of everything rather than the partials pasted togethe
 
 from __future__ import annotations
 
+import asyncio
+
 import numpy as np
 import pytest
 
@@ -63,6 +65,10 @@ class _FakeEngine:
         #: model prepared for it rather than one another session swapped in.
         self.loaded_key = engine_mod.LoadedKey("/stub/ggml-base.bin", "en", 4)
         self.expected: list[object] = []
+        #: Set to a `DecodeFailed` to make every decode fail. Assigned per test rather
+        #: than fixed at construction because the interesting cases are transitions:
+        #: a session that keeps working after a failed partial, and one that recovers.
+        self.fail_with: Exception | None = None
 
     async def ensure_loaded(self, model_name: str, language: str):
         self.loaded_with.append((model_name, language))
@@ -70,9 +76,11 @@ class _FakeEngine:
             return engine_mod.Availability(True)
         return engine_mod.Availability(False, engine_mod.CODE_EXTRA_MISSING, "no recogniser")
 
-    async def decode(self, pcm, *, superseding: bool = False, expect=None) -> str:
+    async def decode(self, pcm, *, superseding: bool = False, expect=None, abort_if=None) -> str:
         self.decodes.append((len(pcm), superseding))
         self.expected.append(expect)
+        if self.fail_with is not None:
+            raise self.fail_with
         return self._text
 
     async def maybe_evict(self) -> bool:
@@ -85,7 +93,8 @@ def fake(monkeypatch, tmp_path):
     """A session wired to a fake engine, with the configured model present on disk."""
     monkeypatch.setattr(models, "models_dir", lambda: tmp_path)
     model = models.resolve(models.DEFAULT_MODEL)
-    (tmp_path / model.filename).write_bytes(b"x" * model.size_bytes)
+    with (tmp_path / model.filename).open("wb") as weights:
+        weights.truncate(model.size_bytes)
     eng = _FakeEngine()
     monkeypatch.setattr(engine_mod, "shared_engine", lambda **_kw: eng)
     return eng
@@ -171,10 +180,61 @@ async def test_nothing_is_pending_once_the_model_is_on_disk(fake):
 
 
 @pytest.mark.asyncio
+async def test_a_present_but_unresident_model_reports_a_pending_load(fake):
+    """The load prepare() will block on, so a transport can announce it.
+
+    The `fake` fixture puts the model on disk but leaves the engine resident for a
+    DIFFERENT key (the stub `/stub/ggml-base.bin`), which is exactly the first-session
+    state: weights present, nothing loaded for them yet. That load is silent, so the
+    transport has to know it is coming.
+    """
+    assert _session().pending_download() is None
+    assert _session().pending_load() is True
+
+
+@pytest.mark.asyncio
+async def test_no_pending_load_once_the_model_is_resident(monkeypatch, tmp_path):
+    """A resident model loads nothing, so nothing needs announcing.
+
+    ``pending_load`` compares the engine's resident key against the one this session
+    would build; when they match, prepare() returns without loading and the transport
+    skips the ``preparing`` frame.
+    """
+    monkeypatch.setattr(models, "models_dir", lambda: tmp_path)
+    model = models.resolve(models.DEFAULT_MODEL)
+    with (tmp_path / model.filename).open("wb") as weights:
+        weights.truncate(model.size_bytes)
+    eng = _FakeEngine()
+    # Make the engine resident for exactly the key this session builds.
+    eng.loaded_key = engine_mod.LoadedKey(
+        str(models.model_path(model)), "en", engine_mod.thread_count()
+    )
+    monkeypatch.setattr(engine_mod, "shared_engine", lambda **_kw: eng)
+    assert _session().pending_load() is False
+
+
+@pytest.mark.asyncio
+async def test_no_pending_load_when_the_model_is_absent(monkeypatch, tmp_path):
+    """An absent model is a pending DOWNLOAD, not a pending load.
+
+    The two are distinct: the download path already announces itself, and the load
+    only happens after the weights are on disk. Reporting a load while the file is
+    missing would send a ``preparing`` frame the download refusal immediately
+    contradicts.
+    """
+    monkeypatch.setattr(models, "models_dir", lambda: tmp_path)
+    monkeypatch.setattr(engine_mod, "shared_engine", lambda **_kw: _FakeEngine())
+    session = _session()
+    assert session.pending_download() is not None
+    assert session.pending_load() is False
+
+
+@pytest.mark.asyncio
 async def test_prepare_surfaces_an_unavailable_recogniser_with_its_code(monkeypatch, tmp_path):
     monkeypatch.setattr(models, "models_dir", lambda: tmp_path)
     model = models.resolve(models.DEFAULT_MODEL)
-    (tmp_path / model.filename).write_bytes(b"x" * model.size_bytes)
+    with (tmp_path / model.filename).open("wb") as weights:
+        weights.truncate(model.size_bytes)
     monkeypatch.setattr(engine_mod, "shared_engine", lambda **_kw: _FakeEngine(available=False))
     events = await _session().prepare()
     assert [e.kind for e in events] == [session_mod.KIND_ERROR]
@@ -241,6 +301,81 @@ async def test_the_partial_cadence_bounds_how_often_a_decode_runs(fake, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_a_failed_final_decode_becomes_an_error_event_not_an_empty_final(fake):
+    """The transport DROPS an empty final, so returning one loses the utterance.
+
+    This is the whole failure: whisper.cpp reported a failed encode, the engine
+    answered "", the session called that silence, the empty final was dropped, and the
+    dictation the user had just finished speaking vanished with nothing on screen.
+    """
+    session = await _started()
+    fake.fail_with = engine_mod.DecodeFailed("whisper.cpp decode returned -6")
+    await session.feed(_int16(1.5))
+    event = await session.finish()
+    assert event.kind == session_mod.KIND_ERROR
+    assert event.code == engine_mod.CODE_DECODE_FAILED
+    assert event.text, "an error event with no advisory text is untranslatable and blank"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_partial_decode_keeps_the_session_alive(fake):
+    """One bad partial must not end a session the speaker is still talking into.
+
+    A partial is cosmetic and the next one is moments away, so the trade runs the
+    other way from the final's: skip it, log it, keep listening. Ending the session
+    here would stop transcribing mid-sentence over a decode nobody would have kept.
+    """
+    session = await _started()
+    fake.fail_with = engine_mod.DecodeFailed("whisper.cpp decode returned -6")
+    events = await _feed(session, _int16(1.5))
+    assert fake.decodes, "no partial decode was attempted, so nothing was skipped"
+    assert events == [], "a failed partial was surfaced instead of skipped"
+    assert not session.ended
+
+    # And the session still delivers once decoding recovers.
+    fake.fail_with = None
+    final = await session.finish()
+    assert final.kind == session_mod.KIND_FINAL
+    assert final.text == "spoken words"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_phrase_commit_loses_no_text_from_the_final(fake, monkeypatch):
+    """Committed text is display-only, so a failed commit is skipped, not surfaced.
+
+    The phrase audio stays in the full buffer either way, so the final still decodes
+    everything that was said.
+    """
+    monkeypatch.setattr(session_mod, "MIN_COMMIT_SECS", 0.2)
+    session = await _started()
+    fake.fail_with = engine_mod.DecodeFailed("whisper.cpp decode returned -6")
+    await _feed(session, _int16(1.0) + _silence_int16(0.2) + _int16(0.5))
+    assert fake.decodes, "no commit decode was attempted, so nothing was skipped"
+    assert not session.ended
+    fake.fail_with = None
+    final = await session.finish()
+    assert final.kind == session_mod.KIND_FINAL
+    assert final.text == "spoken words"
+    # The whole utterance, not just the phrase that survived: the commit's audio was
+    # never removed from the full buffer.
+    assert fake.decodes[-1][0] >= int(1.5 * SR)
+
+
+@pytest.mark.asyncio
+async def test_the_batch_path_reports_a_failed_decode_as_unavailable(fake):
+    """`transcribe_pcm` answers an Availability, and its caller already reads it.
+
+    Raising out of it would take a Slack voice memo's whole message with it, while
+    returning ("", ok) would report a memo the recogniser could not hear.
+    """
+    fake.fail_with = engine_mod.DecodeFailed("whisper.cpp decode returned -6")
+    text, result = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
+    assert text == ""
+    assert not result.ok
+    assert result.code == engine_mod.CODE_DECODE_FAILED
+
+
+@pytest.mark.asyncio
 async def test_an_empty_decode_does_not_blank_the_textbox(fake, monkeypatch):
     """An empty partial means superseded, not silence."""
     session = await _started()
@@ -264,6 +399,9 @@ async def test_committed_text_prefixes_later_partials(fake, monkeypatch):
     assert partials, "speech after a commit must still produce partials"
     assert partials[-1].text.startswith(committed), "committed text must never be lost"
     assert len(partials[-1].text) > len(committed)
+    assert all(event.audio_end_sample == 0 for event in events)
+    final = await session.finish()
+    assert final.audio_end_sample == int(3.6 * SR), "phrase commits must not advance final ack"
 
 
 # ── endpointing ──
@@ -413,6 +551,7 @@ async def test_the_audio_ceiling_finalises_the_session(fake, monkeypatch):
     events = await session.feed(_int16(1.5))
     assert [e.kind for e in events] == [session_mod.KIND_FINAL]
     assert session.ended
+    assert events[0].audio_end_sample == len(_room_tone()) // 2
 
 
 # ── silence and cancellation ──
@@ -427,6 +566,7 @@ async def test_a_silent_recording_is_not_decoded_at_all(fake):
     event = await session.finish()
     assert event.kind == session_mod.KIND_FINAL
     assert event.text == ""
+    assert event.audio_end_sample == 2 * SR
     assert fake.decodes == []
 
 
@@ -512,7 +652,7 @@ async def test_the_engine_is_offered_for_eviction_after_a_final(fake):
 @pytest.mark.asyncio
 async def test_the_batch_path_shares_the_resident_model(fake):
     text, availability = await session_mod.transcribe_pcm(
-        np.zeros(SR, dtype=np.float32), model_name="base", language="en"
+        engine_mod.pcm_from_int16(_int16(1.0)), model_name="base", language="en"
     )
     assert availability.ok
     assert text == "spoken words"
@@ -523,7 +663,7 @@ async def test_the_batch_path_shares_the_resident_model(fake):
 async def test_the_batch_path_reports_an_unavailable_engine(monkeypatch, tmp_path):
     monkeypatch.setattr(models, "models_dir", lambda: tmp_path)
     monkeypatch.setattr(engine_mod, "shared_engine", lambda **_kw: _FakeEngine(available=False))
-    text, availability = await session_mod.transcribe_pcm(np.zeros(SR, dtype=np.float32))
+    text, availability = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
     assert text == ""
     assert availability.code == engine_mod.CODE_EXTRA_MISSING
 
@@ -531,7 +671,7 @@ async def test_the_batch_path_reports_an_unavailable_engine(monkeypatch, tmp_pat
 @pytest.mark.asyncio
 async def test_the_batch_path_filters_hallucinations(fake, monkeypatch):
     monkeypatch.setattr(fake, "_text", "Subtitles by the Amara.org community")
-    text, _ = await session_mod.transcribe_pcm(np.zeros(SR, dtype=np.float32))
+    text, _ = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
     assert text == ""
 
 
@@ -557,6 +697,7 @@ async def test_a_refused_decode_is_reprepared_rather_than_reported_as_silence(fa
     async def _refuse_once(pcm, **kw):
         calls.append("decode")
         if calls.count("decode") == 1:
+            fake.loaded_key = engine_mod.LoadedKey("/stub/swapped.bin", "fr", 4)
             return ""  # the key check refused
         return await real_decode(pcm, **kw)
 
@@ -590,6 +731,7 @@ async def test_the_reprepare_retry_is_bounded_to_one_attempt(fake):
     async def _always_refuse(pcm, **kw):
         nonlocal decodes
         decodes += 1
+        fake.loaded_key = engine_mod.LoadedKey(f"/stub/swapped-{decodes}.bin", "fr", 4)
         return ""
 
     session._engine.decode = _always_refuse  # type: ignore[method-assign]
@@ -599,3 +741,146 @@ async def test_the_reprepare_retry_is_bounded_to_one_attempt(fake):
         session._engine.decode = real_decode  # type: ignore[method-assign]
     assert decodes == 2, f"expected exactly one retry, got {decodes} decodes"
     assert final.text == ""
+
+
+@pytest.mark.asyncio
+async def test_backlogged_audio_skips_partials_but_preserves_the_complete_final(fake):
+    session = await _started()
+    audio = _int16(2.0)
+    step = SR // 5
+    for offset in range(0, len(audio), step):
+        assert await session.feed(audio[offset : offset + step], allow_partial=False) == []
+    assert fake.decodes == [], "queued audio spent inference on obsolete text"
+    final = await session.finish()
+    assert final.text == "spoken words"
+    assert fake.decodes == [((len(audio) + len(_room_tone())) // 2, False)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["spoken words", ""])
+async def test_one_large_frame_finalises_every_utterance_without_losing_audio(fake, text):
+    fake._text = text
+    session = await _started(silence_ms=300)
+    phrase = _int16(1.0) + _silence_int16(0.5)
+    audio = phrase + phrase + _int16(0.4)
+    events = await session.feed(audio, allow_partial=False)
+    assert [event.kind for event in events] == [session_mod.KIND_FINAL] * 2
+    assert session.has_pending_audio
+    assert [event.audio_end_sample for event in events] == [
+        fake.decodes[0][0],
+        sum(samples for samples, _ in fake.decodes),
+    ]
+    assert (
+        sum(samples for samples, _ in fake.decodes) + session._buffers.total_samples
+        == (len(audio) + len(_room_tone())) // 2
+    )
+    final = await session.finish()
+    assert final.text == text
+    assert final.audio_end_sample == (len(audio) + len(_room_tone())) // 2
+
+
+@pytest.mark.asyncio
+async def test_max_duration_finals_acknowledge_only_their_audio(fake, monkeypatch):
+    monkeypatch.setattr(
+        session_mod, "Endpointer", lambda **kw: vad.Endpointer(max_utterance_ms=1000, **kw)
+    )
+    session = await _started(silence_ms=5000)
+    events = await session.feed(_int16(2.2), allow_partial=False)
+    assert [event.audio_end_sample for event in events] == [SR, 2 * SR]
+    assert (await session.finish()).audio_end_sample == int(2.5 * SR)
+
+
+@pytest.mark.asyncio
+async def test_a_syllable_gap_keeps_phrase_context_until_a_sustained_pause(fake):
+    session = await _started(silence_ms=900)
+    await session.feed(_int16(1.2))
+    await session.feed(_silence_int16(0.02))
+    assert session._committed == "", "a 20 ms consonant gap cut the phrase"
+    await session.feed(_silence_int16(session_mod.PHRASE_SILENCE_MS / 1000))
+    assert session._committed == "spoken words"
+
+
+@pytest.mark.asyncio
+async def test_slow_partial_waits_after_completion_before_decoding_again(fake, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(session_mod.time, "monotonic", clock)
+    session = await _started(partial_interval_ms=400, silence_ms=900)
+    original_decode = fake.decode
+
+    async def slow_decode(pcm, **kwargs):
+        clock.now += 2.0
+        return await original_decode(pcm, **kwargs)
+
+    monkeypatch.setattr(fake, "decode", slow_decode)
+    await session.feed(_int16(0.6))
+    before = list(fake.decodes)
+    clock.now += 0.1
+    assert await session.feed(_int16(0.1)) == []
+    assert fake.decodes == before
+
+
+@pytest.mark.asyncio
+async def test_empty_recognition_is_not_decoded_twice_without_a_model_change(fake):
+    session = await _started()
+    await session.feed(_int16(1.0), allow_partial=False)
+    fake._text = ""
+    assert (await session.finish()).text == ""
+    assert len(fake.decodes) == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_digital_silence_never_loads_or_decodes_a_model(fake):
+    text, availability = await session_mod.transcribe_pcm(np.zeros(SR, dtype=np.float32))
+    assert availability.ok and text == ""
+    assert fake.loaded_with == []
+    assert fake.decodes == []
+
+
+@pytest.mark.asyncio
+async def test_empty_batch_recognition_is_not_decoded_twice(fake):
+    fake._text = ""
+    text, availability = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
+    assert availability.ok and text == ""
+    assert len(fake.decodes) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_empty_phrase_commit_keeps_the_session_alive(fake):
+    fake._text = ""
+    session = await _started(silence_ms=900)
+    await session.feed(_int16(1.0))
+    assert await session.feed(_silence_int16(0.2)) == []
+    assert not session.ended
+
+
+@pytest.mark.asyncio
+async def test_stop_aborts_an_inflight_partial_and_preserves_audio_for_the_final(fake, monkeypatch):
+    session = await _started()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original_decode = fake.decode
+    predicates = []
+
+    async def partial_decode(pcm, **kwargs):
+        predicates.append(kwargs["abort_if"])
+        started.set()
+        await asyncio.wait_for(release.wait(), timeout=5)
+        return "" if kwargs["abort_if"]() else await original_decode(pcm, **kwargs)
+
+    monkeypatch.setattr(fake, "decode", partial_decode)
+    task = asyncio.create_task(session.feed(_int16(0.6)))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        assert not predicates[0]()
+        session.stop_partials()
+        assert predicates[0](), "stop did not invalidate the active native partial"
+        release.set()
+        assert await asyncio.wait_for(task, timeout=5) == []
+        monkeypatch.setattr(fake, "decode", original_decode)
+        assert await session.feed(_int16(0.4)) == []
+        assert (await session.finish()).text == "spoken words"
+        assert fake.decodes == [(int(1.3 * SR), False)]
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

@@ -14,7 +14,10 @@ from kiro_crew.auth.login.device import DeviceAuthError
 from kiro_crew.auth.service import (
     InvalidRegionError,
     KasLoginService,
+    LoopbackUnavailableError,
     MissingStartUrlError,
+    SignedOutDuringLoginError,
+    UnknownIdentityError,
     UnknownLoginError,
 )
 from kiro_crew.auth.store import TokenStore, TokenStoreError
@@ -135,12 +138,32 @@ async def api_kas_login_begin_device(request: web.Request) -> web.Response:
     provider = str((body or {}).get("provider") or "")
     start_url = str((body or {}).get("start_url") or "")
     region = str((body or {}).get("region") or "")
+    # The identity slot a signed-in user is switching away from; removed by the
+    # service once THIS login's credential has landed, never before.
+    replaces = str((body or {}).get("replaces") or "")
     if not provider:
         return web.json_response(
             {"error": "Missing 'provider'.", "code": "invalid_provider"}, status=400
         )
     try:
-        result = await service.begin_device(provider, start_url=start_url, region=region)
+        result = await service.begin_device(
+            provider, start_url=start_url, region=region, replaces=replaces
+        )
+    except UnknownIdentityError:
+        return web.json_response(
+            {"error": f"Unknown identity: {replaces}", "code": "invalid_identity"},
+            status=400,
+        )
+    except SignedOutDuringLoginError:
+        # The user signed out while this begin was in flight; the login was never
+        # registered, so the card should start over from the signed-out chooser.
+        return web.json_response(
+            {
+                "error": "Signed out while the sign-in was starting.",
+                "code": "signed_out_during_login",
+            },
+            status=409,
+        )
     except ValueError:
         return web.json_response(
             {"error": f"Unknown provider: {provider}", "code": "invalid_provider"},
@@ -208,7 +231,7 @@ async def api_kas_login_poll(request: web.Request) -> web.Response:
 
 
 async def api_kas_login_logout(request: web.Request) -> web.Response:
-    """POST /api/kas-login/logout {identity} — delete one identity's stored token."""
+    """POST /api/kas-login/logout {identity} — sign out: delete that slot and every other stored one."""
     denied = await _require_owner(request, "kas_login_logout")
     if denied is not None:
         return denied
@@ -232,4 +255,120 @@ async def api_kas_login_logout(request: web.Request) -> web.Response:
             status=500,
         )
     await _audit(request, "kas_login_logout", "success")
+    await _retire_runtimes_after_sign_out(request)
+    return web.json_response({"ok": True})
+
+
+async def _retire_runtimes_after_sign_out(request: web.Request) -> None:
+    """Recycle running agent processes once a Crew sign-out has removed the vault entry.
+
+    A KAS process spawned with Crew as its auth owner holds the access token it was
+    last handed in memory and keeps serving turns on it until the engine's next
+    refresh -- up to the token's remaining lifetime -- even though the vault it came
+    from is now empty. Deleting the entry alone therefore leaves the account live for
+    that long. This is the same shape as an external ``kiro-cli logout`` against a
+    running kiro-backed child, and it takes the same remedy: the identity-change
+    sweep, which retires every idle member of ``backends_retired_by_host_logout()``
+    (KAS included) and marks busy ones for retirement at their next turn. The
+    replacement processes re-probe the vault and, finding nothing, spawn kiro-cli-
+    owned. Kiro-backed children are recycled too: they never read the vault, so for
+    them this is one idle respawn, which is the conservative side of the trade.
+
+    Best-effort HERE, complete overall. This call is the prompt retirement of idle
+    processes; it is not the only line of defence. The Crew vault participates in the
+    gateway's identity fingerprint (``kiro_prerequisite._combine_identity_fingerprints``),
+    so after the delete the fingerprint differs from the one the running children were
+    reconciled against, and the pre-turn identity-change check
+    (``chat_runner._retire_sessions_on_identity_change``) re-runs this same sweep
+    before a child takes its next turn -- and keeps doing so until a sweep completes,
+    because the baseline advances only on a complete one. A busy session marked
+    ``retire_on_identity_change`` is evicted at its next turn boundary; a sweep that
+    raised or came back incomplete is therefore retried, not forgotten. A failure here
+    must not turn a true logout into a reported failure: the credential is already
+    gone, so it is logged and left to that retry.
+    """
+    state = request.app.get("state")
+    sessions = getattr(state, "sessions", None)
+    retire = getattr(sessions, "retire_kiro_identity_sessions", None)
+    if retire is None:
+        return
+    try:
+        retired, complete = await retire()
+    except Exception:
+        logger.warning("post-sign-out runtime retirement failed", exc_info=True)
+        return
+    logger.info("post-sign-out runtime retirement: retired=%d complete=%s", len(retired), complete)
+
+
+async def api_kas_login_begin_loopback(request: web.Request) -> web.Response:
+    """POST /api/kas-login/loopback {provider} — start a loopback (PKCE) sign-in.
+
+    Returns the portal URL for the dashboard to open plus the polling handle. A
+    coded 409 ``loopback_unavailable`` means "start the device flow instead": the
+    install shape does not support loopback or every allowlisted port is busy.
+    """
+    denied = await _require_owner(request, "kas_login_begin_loopback")
+    if denied is not None:
+        return denied
+    service = _service(request)
+    if service is None:
+        return _unavailable()
+    body = await _read_json(request)
+    provider = str((body or {}).get("provider") or "")
+    replaces = str((body or {}).get("replaces") or "")
+    if not provider:
+        return web.json_response(
+            {"error": "Missing 'provider'.", "code": "invalid_provider"}, status=400
+        )
+    try:
+        result = await service.begin_loopback(provider, replaces=replaces)
+    except UnknownIdentityError:
+        return web.json_response(
+            {"error": f"Unknown identity: {replaces}", "code": "invalid_identity"},
+            status=400,
+        )
+    except SignedOutDuringLoginError:
+        # The user signed out while this begin was in flight; the login was never
+        # registered, so the card should start over from the signed-out chooser.
+        return web.json_response(
+            {
+                "error": "Signed out while the sign-in was starting.",
+                "code": "signed_out_during_login",
+            },
+            status=409,
+        )
+    except ValueError:
+        return web.json_response(
+            {"error": f"Unknown provider: {provider}", "code": "invalid_provider"},
+            status=400,
+        )
+    except LoopbackUnavailableError as err:
+        await _audit(request, "kas_login_begin_loopback", "failed", error=str(err))
+        return web.json_response(
+            {"error": "Loopback sign-in is not available here.", "code": "loopback_unavailable"},
+            status=409,
+        )
+    await _audit(request, "kas_login_begin_loopback", "success")
+    return web.json_response(result)
+
+
+async def api_kas_login_cancel(request: web.Request) -> web.Response:
+    """POST /api/kas-login/cancel {login_id} — abandon a pending sign-in.
+
+    Releases a loopback listener's callback port immediately instead of at its
+    deadline. Idempotent, so the dashboard can call it on every start-over path.
+    """
+    denied = await _require_owner(request, "kas_login_cancel")
+    if denied is not None:
+        return denied
+    service = _service(request)
+    if service is None:
+        return _unavailable()
+    body = await _read_json(request)
+    login_id = str((body or {}).get("login_id") or "")
+    if not login_id:
+        return web.json_response(
+            {"error": "Missing 'login_id'.", "code": "missing_login_id"}, status=400
+        )
+    await service.cancel(login_id)
     return web.json_response({"ok": True})

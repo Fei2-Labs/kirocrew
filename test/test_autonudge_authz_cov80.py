@@ -25,7 +25,9 @@ from kiro_crew.autonudge_authz import (
     MAX_RUNTIME_SECS_CEILING,
     authorize_and_add_nudge,
     authorize_and_update_nudge,
+    normalize_banner,
 )
+from kiro_crew.constants import MAX_BANNER_CHARS
 from kiro_crew.monitoring.models import MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS, MonitorState
 
 pytestmark = pytest.mark.asyncio
@@ -169,7 +171,7 @@ async def test_add_requires_both_slot_key_and_message(audits: list[dict]) -> Non
     svc = RecordingSvc()
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
-        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
         slot_key="chat-1-1",
         message="   ",
         source="dashboard",
@@ -183,7 +185,9 @@ async def test_add_rejects_dashboard_modes_without_direct_turn_ingress(
     audits: list[dict], mode: str
 ) -> None:
     svc = RecordingSvc()
-    slot = SimpleNamespace(workspace="default", mode=mode, memory_mode="persistent")
+    slot = SimpleNamespace(
+        workspace="default", mode=mode, memory_mode="persistent", is_closing=False
+    )
 
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
@@ -203,7 +207,7 @@ async def test_add_rejects_restricted_dashboard_sessions(
     audits: list[dict], memory_mode: str
 ) -> None:
     svc = RecordingSvc()
-    slot = SimpleNamespace(workspace="default", mode="", memory_mode=memory_mode)
+    slot = SimpleNamespace(workspace="default", mode="", memory_mode=memory_mode, is_closing=False)
 
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
@@ -222,7 +226,7 @@ async def test_dashboard_admission_rechecks_mode_and_memory_boundary(
     audits: list[dict], tmp_path: Path
 ) -> None:
     svc = RecordingSvc()
-    slot = SimpleNamespace(workspace="default", mode="", memory_mode="persistent")
+    slot = SimpleNamespace(workspace="default", mode="", memory_mode="persistent", is_closing=False)
     state = _state(slots={"chat-1-1": slot})
 
     loop, error, status = await authorize_and_add_nudge(
@@ -248,7 +252,7 @@ async def test_add_rejects_a_non_integer_runtime_budget(audits: list[dict]) -> N
     svc = RecordingSvc()
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
-        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
         slot_key="chat-1-1",
         message="watch",
         max_runtime_secs="not-a-number",  # type: ignore[arg-type]
@@ -488,7 +492,7 @@ async def test_add_rejects_a_sensitive_stop_sentinel_path(audits: list[dict]) ->
     svc = RecordingSvc()
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
-        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
         slot_key="chat-1-1",
         message="watch",
         stop_sentinel_path=str(Path.home() / ".ssh" / "id_rsa"),
@@ -527,7 +531,9 @@ async def test_add_audits_then_reraises_a_service_failure(audits: list[dict]) ->
     with pytest.raises(OSError, match="store wedged"):
         await authorize_and_add_nudge(
             svc=svc,
-            state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+            state=_state(
+                slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}
+            ),
             slot_key="chat-1-1",
             message="watch",
             stop_sentinel_path=str(Path.home() / "nonsense-sentinel-xyz"),
@@ -547,7 +553,7 @@ async def test_add_monitor_returns_conflict_when_a_wake_is_inflight(
 
     loop, error, status = await authorize_and_add_nudge(
         svc=ConflictingSvc(),
-        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
         slot_key="chat-1-1",
         message="watch",
         source="dashboard",
@@ -568,6 +574,12 @@ async def test_update_monitor_conflict_records_a_denied_audit(
     audits: list[dict],
 ) -> None:
     class ConflictingSvc:
+        def get_by_id(self, _loop_id: str) -> None:
+            return None
+
+        async def rollback_monitor_update(self, *_args: Any) -> bool:
+            return True
+
         async def update_monitor(self, *_args: Any, **_kwargs: Any) -> Any:
             raise MonitorUpdateConflict("existing monitor wake is in flight")
 
@@ -670,7 +682,7 @@ async def test_add_monitor_rejects_redaction_expansion_over_limit(
 
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
-        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
         slot_key="chat-1-1",
         message="watch",
         source="dashboard",
@@ -709,7 +721,7 @@ async def test_add_monitor_conflict_preserves_existing_legacy_stop_sentinel(
 
     loop, error, status = await authorize_and_add_nudge(
         svc=ConflictingSvc(),
-        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
         slot_key="chat-1-1",
         message="watch",
         source="dashboard",
@@ -740,7 +752,7 @@ async def test_add_monitor_forwards_conditional_restart_identity(
 
     loop, error, status = await authorize_and_add_nudge(
         svc=RecordingMonitorSvc(),
-        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
         slot_key="chat-1-1",
         message="watch",
         source="dashboard",
@@ -774,7 +786,7 @@ async def test_legacy_add_cannot_replace_a_structured_wake_in_flight(
 
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
-        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
         slot_key="chat-1-1",
         message="legacy replacement",
         source="dashboard",
@@ -791,7 +803,7 @@ async def test_legacy_create_only_reaches_the_service_lock(audits: list[dict]) -
 
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
-        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
         slot_key="chat-1-1",
         message="legacy fallback",
         source="dashboard",
@@ -931,3 +943,36 @@ class TestResolveStopSentinel:
 
         assert out.parent == tmp_path
         assert out.name == ".stop-slack_C1_x"
+
+
+# ── normalize_banner(truncate=True): the /goal path must redact BEFORE it cuts ──
+
+
+class TestNormalizeBannerTruncate:
+    """``truncate=True`` exists for ``/goal``, whose banner is derived from an
+    arbitrarily long objective it does not control. The cut must land AFTER
+    redaction so a credential straddling the cap boundary is masked whole, never
+    sliced into a raw prefix that defeats full-token detection."""
+
+    def test_a_credential_straddling_the_cap_is_masked_not_sliced(self) -> None:
+        # 20-char key starts 10 chars before the cap and runs past it: a
+        # slice-before-redact (the old ``objective[:cap]``) would keep the raw
+        # 10-char prefix ``AKIAIOSFOD`` because the truncated token does not
+        # match the scanner.
+        straddling = "x" * (MAX_BANNER_CHARS - 10) + "AKIAIOSFODNN7EXAMPLE" + " tail"
+        value, error = normalize_banner(straddling, absent_ok=True, truncate=True)
+        assert error is None
+        assert len(value) <= MAX_BANNER_CHARS
+        assert "AKIA" not in value, "a raw credential prefix survived the cap cut"
+
+    def test_a_long_credential_free_objective_truncates_instead_of_dropping(self) -> None:
+        value, error = normalize_banner(
+            "a" * (MAX_BANNER_CHARS + 100), absent_ok=True, truncate=True
+        )
+        assert error is None and len(value) == MAX_BANNER_CHARS
+
+    def test_without_truncate_an_over_cap_banner_is_still_rejected(self) -> None:
+        """The API/MCP callers keep the rejecting behaviour — a user typed it and
+        can shorten it, so silently truncating would hide their input."""
+        value, error = normalize_banner("a" * (MAX_BANNER_CHARS + 1), absent_ok=True)
+        assert value == "" and error and "too long" in error

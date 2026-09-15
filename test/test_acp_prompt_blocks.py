@@ -302,7 +302,7 @@ class TestUncProbeGate:
         if os.name == "nt":
             assert hooks.unc_probe_allowed(r"\\fileserver\other\x.png") is False
 
-    # --- kiro agents dir as a trusted UNC root (#6721) ----------------------
+    # --- kiro agents dir as a trusted UNC root ----------------------
     #
     # Forward-slash UNC spellings are used for every assertion that must hold
     # on the Linux CI box: ``normcase``/``normpath`` leave a ``//host/share``
@@ -318,7 +318,7 @@ class TestUncProbeGate:
         monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", lambda: agents_dir)
 
     def test_unc_kiro_agents_dir_is_allowed(self, monkeypatch, tmp_path):
-        """Headline #6721: on a roaming-profile (UNC) home, a spec under the
+        """On a roaming-profile (UNC) home, a spec under the
         kiro agents dir passes the gate. The data home is patched LOCAL so the
         admission can only come from the new agents root."""
         self._patch_roots(monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/agents"))
@@ -370,7 +370,7 @@ class TestUncProbeGate:
         assert hooks.unc_probe_allowed("//evil/share/x.png") is False
 
     def test_agents_root_is_resolved_once_per_configuration(self, monkeypatch, tmp_path):
-        """Review finding (#6728 round 2): ``kiro_agents_dir()`` resolves
+        """``kiro_agents_dir()`` resolves
         ``KIRO_HOME`` (``Path.resolve()`` -- filesystem I/O, SMB on a UNC
         override), so the gate must NOT consult it per check. The root is
         memoized on the raw ``KIRO_HOME`` + accessor identity; repeated gate
@@ -457,7 +457,7 @@ class TestUncProbeGate:
         "the outbound SMB probe the gate exists to prevent",
     )
     def test_read_agent_spec_under_unc_agents_dir(self, monkeypatch, tmp_path):
-        """End-to-end #6721 symptom: a spec under a UNC-shaped kiro agents dir
+        """A spec under a UNC-shaped kiro agents dir
         parses instead of silently reading as absent (``None``).
 
         Windows-resolver simulation, stated per the task spec: hooks' view of
@@ -488,6 +488,11 @@ class TestUncProbeGate:
 
         self._patch_roots(monkeypatch, tmp_path, Path(unc_agents))
         monkeypatch.setattr(hooks, "os", self._NtOs())
+        # The real Windows descriptor witness keeps this as a UNC path. Linux's
+        # /proc witness canonicalizes the openable ``//tmp`` stand-in to
+        # ``/tmp``; model the Windows result so this cross-platform fixture
+        # exercises the intended validated-path/opened-path equality.
+        monkeypatch.setattr(hooks, "_fd_real_path", lambda _fd: unc_spec)
         assert _read_agent_spec(_WindowsResolvedPath()) == {"name": "foo", "model": "m1"}
 
     def test_untrusted_unc_text_is_never_stat_probed_on_windows(self, monkeypatch):
@@ -782,7 +787,7 @@ class TestImageEncodedBudget:
 
 
 class TestSummarizePromptStructure:
-    """Content-free outbound-request STRUCTURE diagnostics (issue #6022).
+    """Content-free outbound-request STRUCTURE diagnostics.
 
     The summary lets an operator tell a stale/invalid model id apart from a
     structurally malformed payload the next time a turn is rejected as
@@ -853,7 +858,7 @@ class TestSummarizePromptStructure:
         assert out["total_bytes"] > 0
 
     def test_summary_contains_no_message_content(self):
-        """The #6022 hard requirement: a content sentinel placed in a block's
+        """A content sentinel placed in a block's
         text must not appear anywhere in repr() of the summary."""
         sentinel = "SENTINEL_SECRET_TOKEN_ghp_deadbeef"
         blocks = [
@@ -934,3 +939,80 @@ class TestSummarizePromptStructure:
             out = summarize_prompt_structure(bad)
             assert out["block_count"] == 0
             assert out["total_bytes"] == empty_bytes
+
+
+class TestLinkedAncestorGate:
+    """On Windows, a candidate beneath a linked ANCESTOR must be refused
+    BEFORE the first filesystem probe -- ``is_file()`` resolves every
+    ancestor, so the probe itself would traverse the link and open the SMB
+    connection the lexical UNC screen exists to prevent.
+
+    NOTE: under the module-local os patch, ``_PATH_RE`` keeps the grammar
+    chosen at import time, so candidates here stay host-native; the Windows
+    CI shard exercises real backslash shapes via ``tmp_path`` (see
+    ``test_natively_produced_path_is_inlined_on_this_host``)."""
+
+    def _windows(self, monkeypatch):
+        import types
+
+        # Patch ONLY prompt_blocks' view of os (its sole runtime use is the
+        # two gates' os.name checks; _PATH_RE was chosen at import time) --
+        # patching the global os.name would make pathlib dispatch WindowsPath
+        # everywhere on a POSIX test host.
+        monkeypatch.setattr(prompt_blocks, "os", types.SimpleNamespace(name="nt"))
+
+    def test_linked_ancestor_candidate_is_refused_before_any_probe(self, tmp_path, monkeypatch):
+        """Ordering IS the property: the leaf probe is wired to explode, so a
+        regression that probes first fails loudly instead of silently."""
+        p = _png(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", lambda _p: str(tmp_path))
+
+        def _boom(self):  # type: ignore[no-untyped-def]  # pragma: no cover
+            raise AssertionError("is_file ran before the ancestor walk")
+
+        monkeypatch.setattr(Path, "is_file", _boom)
+        blocks = build_prompt_blocks(f"see {p}")
+        # The candidate is skipped, not inlined; the text keeps the path so
+        # the turn still carries a usable reference.
+        assert [b["type"] for b in blocks] == ["text"]
+        assert str(p) in blocks[0]["text"]
+
+    def test_bypassing_the_guard_restores_the_probe(self, tmp_path, monkeypatch):
+        """Mutation check: with the walk reporting no link, the same candidate
+        is probed and inlined again -- so the refusal above is attributable to
+        the guard, not to some other screen."""
+        p = _png(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", lambda _p: None)
+        blocks = build_prompt_blocks(f"see {p}")
+        assert [b["type"] for b in blocks] == ["text", "image"]
+
+    def test_the_walk_is_not_consulted_on_posix(self, tmp_path, monkeypatch):
+        """macOS /tmp and /var are symlinks to /private/*; an unconditional
+        walk would refuse every image staged in a temp dir there."""
+        if os.name == "nt":
+            pytest.skip("gate is active on Windows by design")
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("ancestor walk ran on POSIX")
+
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", _boom)
+        p = _png(tmp_path)
+        blocks = build_prompt_blocks(f"see {p}")
+        assert [b["type"] for b in blocks] == ["text", "image"]
+
+    def test_a_leaf_link_is_refused_before_the_probe(self, tmp_path, monkeypatch):
+        """The walk deliberately excludes the leaf, so the leaf gets its own
+        junction-aware check -- is_file() FOLLOWS a final-component link."""
+        p = _png(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(prompt_blocks, "is_link_or_junction", lambda _p: True)
+
+        def _boom(self):  # type: ignore[no-untyped-def]  # pragma: no cover
+            raise AssertionError("is_file ran before the leaf link check")
+
+        monkeypatch.setattr(Path, "is_file", _boom)
+        blocks = build_prompt_blocks(f"see {p}")
+        assert [b["type"] for b in blocks] == ["text"]

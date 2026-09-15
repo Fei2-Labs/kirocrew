@@ -95,6 +95,16 @@ export function useLongPressReorder(): { itemProps: LongPressReorderItemProps; d
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     clearPending()
     if (e.pointerType !== 'touch') {
+      // A precise pointer starts the drag on press — but only the primary
+      // button. Arming a reorder on button 1 or 2 is meaningless: there is no
+      // middle- or right-drag gesture, so a non-primary press has nothing to
+      // reorder and must fall through untouched. This was also a suspect for
+      // the side-panel middle-click-to-close report — the theory being that
+      // starting the drag here swallowed the chip's auxclick — but a real-
+      // browser test ruled that out: with this guard removed, a middle-click
+      // (clean and past the pan threshold) still closed the tab. The guard is
+      // a correctness fix on its own, not a fix for that symptom.
+      if (e.button !== 0) return
       setDragging(true)
       dragControls.start(e)
       return

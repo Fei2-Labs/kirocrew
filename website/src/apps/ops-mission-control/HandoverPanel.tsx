@@ -35,6 +35,8 @@ import {
   UserCheck,
 } from 'lucide-react'
 import { Badge, Btn, Card, CardTitle, EmptyState } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
+import { copyToClipboard } from '../../utils/clipboard'
 import {
   blockedLabel,
   describeSourceHealth,
@@ -138,13 +140,11 @@ export default function HandoverPanel() {
   const patterns = digest?.recurring_patterns ?? []
 
   const copy = async () => {
-    if (!digest?.text || typeof navigator === 'undefined' || !navigator.clipboard) return
-    try {
-      await navigator.clipboard.writeText(digest.text)
+    if (!digest?.text) return
+    const ok = await copyToClipboard(digest.text)
+    if (ok) {
       setCopied(true)
       window.setTimeout(() => setCopied(false), 2000)
-    } catch {
-      /* clipboard blocked (permissions, insecure context) — the text is on screen */
     }
   }
 
@@ -158,7 +158,7 @@ export default function HandoverPanel() {
   if (query.isError) {
     return (
       <Card>
-        <p className="text-[13px] text-danger">{(query.error as Error).message}</p>
+        <ErrorNotice message={(query.error as Error).message} askAgent />
       </Card>
     )
   }

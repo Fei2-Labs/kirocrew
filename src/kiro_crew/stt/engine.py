@@ -1,10 +1,9 @@
 """A resident whisper.cpp recogniser, loaded once and reused.
 
-The cost that made local speech-to-text feel broken was never the decode. It was
-that every utterance paid for a fresh process, a fresh interpreter and a fresh
-model load before any audio was looked at. Holding one loaded model in the
-gateway removes all three: measured on a 4.2 s clip, a warm decode is 30-48 ms
-against a real-time factor of ~0.01, and a 0.9 s push-to-talk utterance is 27 ms.
+Holding one loaded model in the gateway removes repeated process, interpreter
+and model-load costs. Inference latency still depends on the model, hardware and
+the acceleration compiled into the runtime: a large model on a CPU-only wheel
+can remain slower than real time after warming, even on a host with a GPU.
 
 Three properties make it safe to do this in the gateway process rather than in a
 worker of its own:
@@ -52,14 +51,18 @@ import os
 import platform
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
 from kiro_crew import extras
 from kiro_crew.executors import stt_executor
 from kiro_crew.stt import models
-from kiro_crew.stt.limits import DEFAULT_IDLE_EVICT_SECS, DEFAULT_TIMEOUT_SECS
+from kiro_crew.stt.limits import (
+    DECODE_ABORT_GRACE_SECS,
+    DEFAULT_IDLE_EVICT_SECS,
+    DEFAULT_TIMEOUT_SECS,
+)
 from kiro_crew.stt.vad import SAMPLE_RATE_HZ
 
 logger = logging.getLogger(__name__)
@@ -84,13 +87,19 @@ _PREWARM_SECS = 1.0
 #: loop, so a cooperating call returns in well under a second; this only bounds the
 #: pathological case where it does not, since holding the lock forever would wedge
 #: every later decode instead of just this one.
-_ABORT_GRACE_SECS = 5.0
+_ABORT_GRACE_SECS = DECODE_ABORT_GRACE_SECS
 
 #: How long a timed-out LOAD is waited on before its lock is released. Longer than the
 #: decode grace because a load has no abort callback at all: nothing can ask it to stop,
 #: so this is purely "give the allocation a chance to finish while still holding the
 #: lock", and finishing is the good outcome (the context is adopted).
 _LOAD_GRACE_SECS = 30.0
+
+
+def _consume_future_exception(future: asyncio.Future) -> None:
+    """Retrieve a retired worker's result after its caller has gone away."""
+    if not future.cancelled():
+        future.exception()
 
 
 def available_cpus() -> int:
@@ -142,6 +151,102 @@ CODE_EXTRA_MISSING = "stt_extra_missing"
 CODE_NO_WHEEL = "stt_no_wheel_for_platform"
 CODE_IMPORT_FAILED = "stt_import_failed"
 CODE_MODEL_MISSING = "stt_model_missing"
+#: A decode that RAN AND FAILED, as opposed to one that heard nothing. Its own code
+#: because collapsing the two is what made the failure invisible: a failed decode
+#: answered ``""``, the session read that as silence, the transport dropped the empty
+#: final, and the user's dictation disappeared with nothing on screen to say why.
+CODE_DECODE_FAILED = "stt_decode_failed"
+
+
+class DecodeFailed(RuntimeError):
+    """A decode did not finish, so its silence carries no information.
+
+    Raised rather than returned because an empty transcript is a legitimate
+    outcome of this API -- a muted microphone, a pause, a hallucination filtered
+    away -- and a caller cannot tell that apart from a failure by looking at the
+    string. Whoever holds the user's surface decides what to do with it: the
+    session turns a FINAL failure into an ``error`` event, and drops a partial's.
+
+    ``code`` travels to the browser as the machine-readable half of an ``error``
+    frame; ``detail`` is advisory English for the log and for a client with no
+    catalog entry for the code.
+    """
+
+    def __init__(self, detail: str, *, code: str = CODE_DECODE_FAILED) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+#: ``whisper_full``'s success status. Every other value is a failure, and which one
+#: it is does not change the answer for a caller, so it is reported rather than
+#: mapped.
+_WHISPER_OK = 0
+
+
+def _whisper_binding() -> Any | None:
+    """The recogniser's low-level extension module, or ``None`` if it is unusable.
+
+    ``None`` is a real answer rather than an error: :func:`_decode_segments` uses
+    the binding only to read a status the library discards, so a host where it
+    cannot be reached still decodes -- it just cannot distinguish a failed encode
+    from silence.
+    """
+    try:
+        import _pywhispercpp as binding
+    except Exception:  # pragma: no cover (host-specific loader failures)
+        return None
+    return binding
+
+
+def _decode_segments(
+    model: Any,
+    pcm: np.ndarray,
+    should_abort: Callable[[], bool],
+) -> list[Any]:
+    """Run one whisper.cpp decode, raising :class:`DecodeFailed` on a native failure.
+
+    Blocking; runs in a worker thread.
+
+    **pywhispercpp throws the failure away.** ``Model.transcribe`` forwards to
+    ``Model._transcribe``, which calls ``whisper_full`` as a bare statement and never
+    looks at its return value; it then reads ``whisper_full_n_segments``, which is 0
+    after a failed encode, and hands back the empty list ``_get_segments`` built from
+    it. So ``transcribe`` answers ``[]`` for a failure and ``[]`` for a silent
+    recording, byte for byte, and the only trace of the difference is a line
+    whisper.cpp writes to its own stderr (``whisper_full_with_state: failed to
+    encode``, the ``-6`` path, which is how this was seen in production losing a
+    whole utterance). Nothing in the public API exposes the code afterwards, because
+    nothing retains it. The status is therefore read here, from the same extension
+    module the library itself calls.
+
+    A non-zero status does NOT by itself mean something went wrong: an abort granted
+    through ``abort_callback`` unwinds the encoder, which reports the same ``-6``. So
+    the predicate that would have asked for the abort is what separates the two, and
+    an aborted decode returns ``[]`` like the non-event it is.
+
+    Falls back to ``Model.transcribe`` when the private surface is not shaped as
+    expected -- a renamed member in a later release, or an unreachable extension
+    module. That path loses only the status; the failures :meth:`WhisperEngine.decode`
+    raises on regardless (an exception out of the call, and a timeout) are unaffected.
+    """
+    ctx = getattr(model, "_ctx", None)
+    params = getattr(model, "_params", None)
+    get_segments = getattr(type(model), "_get_segments", None)
+    binding = _whisper_binding()
+    if ctx is None or params is None or get_segments is None or binding is None:
+        return list(model.transcribe(pcm, abort_callback=should_abort))
+    # Both callbacks are assigned exactly as `Model.transcribe` assigns them, and
+    # they live on the params object rather than on the call, so a stale
+    # new-segment callback from some other caller would otherwise still fire.
+    binding.assign_new_segment_callback(params, None)
+    binding.assign_abort_callback(params, should_abort)
+    status = binding.whisper_full(ctx, params, pcm, pcm.size)
+    if status != _WHISPER_OK:
+        if should_abort():
+            return []
+        raise DecodeFailed(f"whisper.cpp decode returned {status}")
+    return list(get_segments(ctx, 0, binding.whisper_full_n_segments(ctx)))
 
 
 @dataclass(frozen=True)
@@ -273,6 +378,7 @@ class WhisperEngine:
         self._timeout_secs = timeout_secs
         self._model: Any | None = None
         self._key: LoadedKey | None = None
+        self._warmed_key: LoadedKey | None = None
         self._last_used = 0.0
         # Both created lazily inside the running loop: an asyncio.Lock built at
         # import time belongs to whichever loop first awaits it, which breaks a
@@ -287,6 +393,9 @@ class WhisperEngine:
         #: 148 MB at the default and 1.6 GB at the largest, so two at once is what
         #: exhausts a host sized for one.
         self._load_future: "asyncio.Future[Any] | None" = None
+        # A native call can outlive its abort grace. Keep its future so retries
+        # cannot allocate another large model while the retired one still runs.
+        self._retired_decode: asyncio.Future | None = None
 
     @property
     def loaded(self) -> bool:
@@ -345,6 +454,10 @@ class WhisperEngine:
         # Lock order is load-then-decode here, in `maybe_evict`, and nowhere the
         # reverse -- `decode` takes only the decode lock -- so the pair cannot deadlock.
         async with load_lock:
+            if self._retired_decode is not None and not self._retired_decode.done():
+                return Availability(
+                    False, CODE_DECODE_FAILED, "the previous decode is still stopping"
+                )
             if self._key == key and self._model is not None:
                 # Read WITHOUT the decode lock, deliberately. `decode` can retire the
                 # context holding only that lock, but this condition is a single
@@ -372,10 +485,14 @@ class WhisperEngine:
                 return Availability(False, CODE_IMPORT_FAILED, "a model load is already running")
             # BOTH locks from here, for the same reason `maybe_evict` takes both:
             # replacing the resident context while a decode is running on it leaves
-            # the old one alive (the decode holds its own reference through the bound
-            # `model.transcribe`) while the replacement allocates, so a host sized for
+            # the old one alive (the decode holds its own reference to the model
+            # object) while the replacement allocates, so a host sized for
             # one model briefly has two.
             async with decode_lock:
+                if self._retired_decode is not None and not self._retired_decode.done():
+                    return Availability(
+                        False, CODE_DECODE_FAILED, "the previous decode is still stopping"
+                    )
                 if self._model is not None:
                     # A model change means the resident context is for the wrong
                     # weights; drop it before loading, so peak memory is one model
@@ -483,6 +600,7 @@ class WhisperEngine:
         *,
         superseding: bool = False,
         expect: LoadedKey | None = None,
+        abort_if: Callable[[], bool] | None = None,
     ) -> str:
         """Transcribe mono float32 16 kHz audio, returning cleaned text.
 
@@ -491,6 +609,10 @@ class WhisperEngine:
         request arrives, so a slow partial can never delay the final decode
         behind it.
 
+        ``abort_if`` lets a session invalidate its own cosmetic decode when the
+        client stops or disconnects. Only superseding decodes honor it; final
+        recognition always keeps the queued audio and completes independently.
+
         ``expect`` is the key the caller prepared, and passing it is how a caller
         avoids silently transcribing with someone else's model. This engine is a
         process singleton, so a second session whose configuration names a
@@ -498,6 +620,12 @@ class WhisperEngine:
         that did not check would return text from the wrong weights or the wrong
         language with nothing to show it had happened. On a mismatch the decode
         refuses and says so, which the caller answers by preparing again.
+
+        Raises :class:`DecodeFailed` when the decode FAILED: the native call raised,
+        the native call reported a non-zero status, or the wait expired and the work
+        was aborted. Returns ``""`` only for the three protocol non-events a caller
+        already handles -- no resident model, a superseded partial, and an ``expect``
+        mismatch -- so an empty string means "nothing was heard" and nothing else.
         """
         if self._model is None:
             return ""
@@ -510,7 +638,10 @@ class WhisperEngine:
         expired = False
 
         def should_abort() -> bool:
-            return expired or (superseding and self._generation != my_generation)
+            return expired or (
+                superseding
+                and (self._generation != my_generation or (abort_if is not None and abort_if()))
+            )
 
         async with decode_lock:
             if should_abort():
@@ -529,7 +660,7 @@ class WhisperEngine:
             loop = asyncio.get_running_loop()
             future = loop.run_in_executor(
                 stt_executor(),
-                functools.partial(model.transcribe, pcm, abort_callback=should_abort),
+                functools.partial(_decode_segments, model, pcm, should_abort),
             )
             # `asyncio.wait` rather than `wait_for`, because a timeout here must NOT
             # abandon the future: `wait_for` cancels the wrapper and leaves the
@@ -537,7 +668,21 @@ class WhisperEngine:
             # releases the decode lock under it. The context is single-entry, so the
             # next decode would enter `whisper_full` on a context this one is still
             # executing on -- the exact corruption the lock exists to prevent.
-            done, _pending = await asyncio.wait({future}, timeout=self._timeout_secs)
+            try:
+                done, _pending = await asyncio.wait({future}, timeout=self._timeout_secs)
+            except asyncio.CancelledError:
+                # Cancelling an asyncio waiter does not stop the native worker.
+                # Keep exclusive ownership until it aborts, or retire the context
+                # before another caller can enter it.
+                expired = True
+                try:
+                    await asyncio.wait({future}, timeout=_ABORT_GRACE_SECS)
+                finally:
+                    if future.done():
+                        _consume_future_exception(future)
+                    else:
+                        self._retire_decode(future)
+                raise
             if not done:
                 expired = True
                 logger.error(
@@ -548,17 +693,26 @@ class WhisperEngine:
                 # whisper.cpp polls the abort callback inside the decode loop, so the
                 # native call unwinds once `expired` is set -- promptly, but not
                 # atomically. Keep holding the lock until it has actually returned.
-                settled, _still_running = await asyncio.wait({future}, timeout=_ABORT_GRACE_SECS)
+                try:
+                    settled, _still_running = await asyncio.wait(
+                        {future}, timeout=_ABORT_GRACE_SECS
+                    )
+                except asyncio.CancelledError:
+                    if future.done():
+                        _consume_future_exception(future)
+                    else:
+                        self._retire_decode(future)
+                    raise
                 if not settled:
                     # The call is not unwinding, and holding the lock forever would
                     # wedge every later decode instead of just this one. So release it
                     # -- but RETIRE the context first, so the next decode cannot enter
-                    # a context this call is still executing on. It finds no model,
-                    # returns "", and the caller's re-prepare loads a fresh one.
+                    # a context this call is still executing on. The next request
+                    # finds no model and its re-prepare loads a fresh one.
                     #
                     # Dropping the reference here does not free the context under the
                     # running call: the worker holds its own reference through the
-                    # bound `model.transcribe`, so `whisper_free` runs only once that
+                    # `model` it was handed, so `whisper_free` runs only once that
                     # returns.
                     logger.error(
                         "Whisper decode did not honour the abort within %.0fs; retiring "
@@ -566,18 +720,38 @@ class WhisperEngine:
                         "next request",
                         _ABORT_GRACE_SECS,
                     )
-                    self._model = None
-                    self._key = None
-                return ""
+                    self._retire_decode(future)
+                    raise DecodeFailed(f"decode exceeded {self._timeout_secs}s and did not abort")
+                # A timeout is a failure even when the abort landed cleanly. The audio
+                # was heard and no transcript exists for it, so answering "" here is
+                # what let a whole utterance disappear behind an empty final.
+                _consume_future_exception(future)
+                raise DecodeFailed(f"decode exceeded {self._timeout_secs}s")
             try:
                 segments = future.result()
-            except Exception:
+            except DecodeFailed:
+                # Already carries its own reason (a non-zero native status), and
+                # re-wrapping it would bury that behind this frame's generic text.
                 logger.warning("Whisper decode failed", exc_info=True)
-                return ""
+                raise
+            except Exception as exc:
+                logger.warning("Whisper decode failed", exc_info=True)
+                raise DecodeFailed(f"decode failed: {exc}") from exc
             self._last_used = time.monotonic()
+            self._warmed_key = self._key
+            if should_abort():
+                return ""
 
         parts = [str(getattr(seg, "text", "")).strip() for seg in segments]
         return " ".join(p for p in parts if p).strip()
+
+    def _retire_decode(self, future: asyncio.Future) -> None:
+        """Detach a non-cooperating context without allocating a second one."""
+        self._model = None
+        self._key = None
+        self._warmed_key = None
+        self._retired_decode = future
+        future.add_done_callback(_consume_future_exception)
 
     async def prewarm(self, model_name: str, language: str) -> Availability:
         """Load the model and run one throwaway decode.
@@ -590,8 +764,17 @@ class WhisperEngine:
         result = await self.ensure_loaded(model_name, language)
         if not result.ok:
             return result
-        silence = np.zeros(int(_PREWARM_SECS * SAMPLE_RATE_HZ), dtype=np.float32)
-        await self.decode(silence)
+        if self._warmed_key == self._key:
+            return result
+        silence: np.ndarray = np.zeros(int(_PREWARM_SECS * SAMPLE_RATE_HZ), dtype=np.float32)
+        try:
+            await self.decode(silence, superseding=True)
+        except DecodeFailed:
+            # The throwaway decode is an optimisation, and the model IS loaded, which
+            # is what this function reports on. Failing the prewarm would refuse a
+            # session the user could still dictate into, and the real decode that
+            # follows raises on its own behalf if the fault persists.
+            logger.warning("Whisper prewarm decode failed", exc_info=True)
         return result
 
     async def maybe_evict(self) -> bool:
@@ -608,8 +791,8 @@ class WhisperEngine:
 
         Holds BOTH locks, and the decode lock is the one that matters. Unloading on the
         load lock alone could retire the context while a decode was running on it: the
-        decode survives (it holds its own reference through the bound
-        ``model.transcribe``), but the engine then looks unloaded, so a concurrent
+        decode survives (it holds its own reference to the model object), but the
+        engine then looks unloaded, so a concurrent
         request builds a SECOND context and a host sized for one model has two. Taking
         the decode lock makes eviction and decoding mutually exclusive instead.
 
@@ -651,6 +834,7 @@ class WhisperEngine:
         """
         self._model = None
         self._key = None
+        self._warmed_key = None
 
 
 _engine: WhisperEngine | None = None
@@ -668,10 +852,10 @@ def shared_engine(
     load this replaced.
 
     Both bounds default to ``None`` meaning "leave whatever is set", NOT to the
-    module defaults. They used to default to the constants, which made every
-    zero-argument caller silently a WRITER: :func:`prewarm` and :func:`close` ask
-    for the engine without opinions about its configuration, and each call reset
-    an operator's configured window back to 600 s.
+    module defaults: defaulting to the constants would make every zero-argument
+    caller silently a WRITER -- :func:`prewarm` and :func:`close` ask for the
+    engine without opinions about its configuration, and would reset an operator's
+    configured window back to 600 s.
     """
     global _engine
     if _engine is None:

@@ -1,6 +1,6 @@
 """Auth refresh endpoints: ``GET /api/auth/me`` and ``POST /api/auth/refresh``.
 
-Spec: ``docs/system-specs/features/dashboard-token-auth.md``.
+Spec: ``docs/system-specs/modules/dashboard-token-auth.md``.
 
 Both endpoints handle their own auth (the standard ``token_auth_middleware``
 exempts ``/api/auth/refresh`` so an expired access cookie does not block
@@ -73,7 +73,7 @@ _REFRESH_RATE_MAX_CALLS = 60
 # map. A hard cap (``_REFRESH_RATE_MAX_BUCKETS``) then fails CLOSED: once the
 # map is full, previously-unseen source IPs are rate-limited outright rather
 # than admitted by evicting an existing bucket. We deliberately do NOT evict a
-# live bucket to make room — evicting the "least-recently-active" victim was
+# live bucket to make room — evicting the "least-recently-active" victim is
 # abusable (see ``_rate_limited``): a saturated attacker never appends a
 # timestamp on denied calls, so their bucket freezes at exhaustion time and
 # becomes the eviction target under an XFF/botnet pump, letting them drop their
@@ -157,9 +157,9 @@ def _rate_limited(client_ip: str, now: float | None = None) -> bool:
         if bucket is None:
             # New source IP. Enforce the hard cap by failing CLOSED: once the
             # map is full, reject previously-unseen IPs rather than evicting a
-            # live bucket to admit them. Eviction-to-admit was abusable — a
+            # live bucket to admit them. Eviction-to-admit is abusable — a
             # saturated attacker's bucket freezes at exhaustion (denied calls
-            # append no timestamp), so under an XFF/botnet pump it became the
+            # append no timestamp), so under an XFF/botnet pump it becomes the
             # "least-recently-active" eviction victim, letting the attacker
             # drop their own exhausted bucket and re-create a fresh full
             # allowance. Rejecting unseen IPs at the cap removes that reset
@@ -347,19 +347,18 @@ async def api_auth_me(request: web.Request) -> web.Response:
 
     # Read the credential the MIDDLEWARE VALIDATED, published as
     # ``request["auth_token"]`` — the same contract ``_caller_bounds`` and the
-    # frame-ancestors reader follow. Re-extracting the cookie here was only ever
-    # correct because extraction order was guaranteed to match the middleware's;
-    # it does not hold when a valid ``?token=`` won (pre-existing) and, now that
-    # an invalid query token falls back to the cookie, the order is not fixed at
-    # all. Reading the wrong credential mis-reports ``session_exp``, which is
-    # what drives the frontend's proactive-refresh scheduler.
+    # frame-ancestors reader follow. Re-extracting the cookie here is correct only
+    # while extraction order matches the middleware's, and it does not: a valid
+    # ``?token=`` wins, and an invalid query token falls back to the cookie, so
+    # the order is not fixed at all. Reading the wrong credential mis-reports
+    # ``session_exp``, which is what drives the frontend's proactive-refresh
+    # scheduler.
     #
     # The re-extraction stays as a FALLBACK rather than being deleted. On the
     # first request of a link exchange the published credential is the link
     # token, whose nonce this very request added to the cookie denylist, so the
-    # numeric read yields nothing — exactly the case where the old path already
-    # reported 0.0. Falling back keeps this strictly better than before instead
-    # of trading one blind spot for another.
+    # numeric read yields nothing — the one case where the fallback also reports
+    # 0.0, so keeping it trades no blind spot for another.
     port = request.app.get("port", 7777)
     cookie_name = f"mc_token_{_cookie_port_from_host(request, port)}"
     published = request.get("auth_token", "")
@@ -401,6 +400,14 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     Implements the rotation-on-use semantics: each call consumes the
     presented refresh ``jti`` and issues a NEW one with the same ``chain_id``.
     Reuse outside the multi-tab grace window auto-revokes the chain.
+
+    A chain opened by a daemon-verified tailnet peer may only be rotated FOR
+    THAT PEER. The binding is read from two independent
+    authorities -- the HMAC-signed ``peer_key`` claim on the presented token and
+    the server-side record in ``refresh_chains.json`` -- and the request must
+    satisfy every key either of them names. A chain with neither is unbound,
+    which is every chain that predates the record and every session opened with
+    no verified peer.
     """
     # Defense-in-depth CSRF check. SameSite=Lax already blocks the
     # canonical cross-site POST attack, but a malicious origin loaded
@@ -444,13 +451,17 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
 
     state = _get_state()
 
-    # An identity-bound chain (the persistent QR session shape) may only be USED
-    # while a daemon-verified tailnet peer can be established. Placed here, ahead
+    # An identity-bound chain may only be USED while a daemon-verified tailnet
+    # peer can be established -- and while it matches the one that OPENED the
+    # chain. Two shapes are bound: the persistent QR session, whose credential is
+    # bounded by identity rather than by this process's lifetime, and any
+    # ordinary Phase-3 session whose chain was opened by a verified peer.
+    # Placed here, ahead
     # of BOTH the reuse branch and the mint, because every path below this line
     # hands the caller a live credential: the grace-replay branch re-serves the
     # cached pair and re-sets both cookies without minting anything, so a check
     # sited at the mint leaves a 60-second window in which a replayed token is
-    # honoured with no identity check at all. That window was the review finding.
+    # honoured with no identity check at all.
     #
     # Ordering it BEFORE reuse detection is deliberate, not incidental. Reuse
     # detection revokes the chain, so letting it run first would let any
@@ -468,11 +479,31 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     # address pin would read as a pin while excluding nobody.
     carried_require_peer = refresh_token_requires_peer(refresh_token)
     carried_peer_key = refresh_token_peer_key(refresh_token) if carried_require_peer else ""
+    # Second authority: the server-side chain record in refresh_chains.json
+    # The signed claim above cannot be forged, but it only binds a chain whose
+    # MINT path remembered to set it. A record the presented token cannot
+    # influence is what makes a forgetful mint path fail closed rather than
+    # silently unbound.
+    #
+    # Absent means unbound, which is both "this chain had no verified peer" and
+    # "this chain predates the record" -- the migration rule: an upgrade must not
+    # invalidate the outstanding 30-day window.
+    recorded_peer_key = state.chain_peer(chain_id)
+    require_peer = carried_require_peer or bool(recorded_peer_key)
+    # Tightest-wins. When both authorities name a key they agree, because every
+    # rotation re-stamps the record from the same value it signs. If they ever
+    # DISAGREE that is our own state contradicting itself, so neither is trusted
+    # over the other: the request must satisfy both, and a mismatch is refused.
+    expected_peer_keys = {key for key in (carried_peer_key, recorded_peer_key) if key}
     verified_peer_key = (
-        await _verified_peer_key(request, carried_peer_key) if carried_require_peer else ""
+        await _verified_peer_key(request, carried_peer_key or recorded_peer_key)
+        if require_peer
+        else ""
     )
-    if carried_require_peer and (
-        not verified_peer_key or not carried_peer_key or verified_peer_key != carried_peer_key
+    if require_peer and (
+        not verified_peer_key
+        or not expected_peer_keys
+        or any(key != verified_peer_key for key in expected_peer_keys)
     ):
         if not verified_peer_key:
             outcome = "peer_unverified"
@@ -481,7 +512,7 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
                 "This device could not be verified on the tailnet, so the session "
                 "cannot be renewed. Reconnect to the tailnet and try again."
             )
-        elif not carried_peer_key:
+        elif not expected_peer_keys:
             outcome = "peer_binding_missing"
             code = "peer_binding_missing"
             message = (
@@ -565,17 +596,25 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     _carried_claims: dict[str, str] = {}
     if carried_boot:
         _carried_claims["boot"] = carried_boot
-    if carried_require_peer:
+    # The key the checks above proved this request satisfies. Taken from the
+    # presented credential rather than re-derived from the resolved peer, for the
+    # same reason ``carried_boot`` is: the rotated pair then says what the
+    # credential said, so a future change that admits a partially-validated token
+    # degrades to unbound instead of silently minting a live binding for it. The
+    # record is the fallback, so a claimless-but-recorded chain rotates FORWARD
+    # into a properly claimed one rather than staying claimless.
+    bound_peer_key = carried_peer_key or recorded_peer_key
+    if require_peer:
         # Carried onto BOTH halves of the rotated pair. Dropping it on either one
         # would make the FIRST rotation silently downgrade an identity-bound
-        # session to an ordinary one — the same shape of defect as the review
-        # finding this check answers, one rotation later.
+        # session to an ordinary one — the same defect this check prevents,
+        # arriving one rotation later.
         _carried_claims["require_peer"] = "1"
     new_access_token = generate_token(
         user_id,
         ttl_seconds=MAX_SESSION_TTL_SECS,
         register_nonce=False,
-        peer_key=carried_peer_key,
+        peer_key=bound_peer_key,
         extra=_carried_claims or None,
     )
     new_session_exp = now + MAX_SESSION_TTL_SECS
@@ -583,8 +622,8 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
         user_id,
         chain_id=chain_id,
         boot=carried_boot,
-        require_peer=carried_require_peer,
-        peer_key=carried_peer_key,
+        require_peer=require_peer,
+        peer_key=bound_peer_key,
     )
 
     public_payload = {
@@ -611,13 +650,19 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
         exp=now + MAX_REFRESH_TTL_SECS,
         ip=client_ip,
         replacement=json.dumps(grace_payload, separators=(",", ":")),
+        # Re-stamped in the SAME write as the consumption, so a rotation can
+        # never record that the old jti is spent while losing the binding that
+        # decides who may spend the new one. Empty for an unbound chain, which
+        # ``mark_consumed`` treats as "leave it alone" rather than storing a
+        # blank -- absent must stay distinguishable from bound-but-lost.
+        peer_key=bound_peer_key,
     )
 
-    if carried_require_peer:
+    if require_peer:
         # The signed claim, not a second whois result, is authoritative. The
         # request already proved it matches ``verified_peer_key`` above; mirror
         # that exact key into the hot in-memory map for posture/reporting.
-        bind_token_peer(new_access_token, carried_peer_key, new_session_exp)
+        bind_token_peer(new_access_token, bound_peer_key, new_session_exp)
     else:
         await _rebind_rotated_token_to_peer(
             request, new_access_token, new_session_exp, boot_bound=bool(carried_boot)
@@ -664,18 +709,16 @@ async def _rebind_rotated_token_to_peer(
     node-scoped identity pin into an any-peer token. When the refresh request
     itself resolves a verified peer, the fresh token is pinned to that peer's
     key; when no peer resolves (non-tailnet setups or daemon down) the
-    token stays unbound, which is byte-for-byte the pre-identity behaviour.
+    token stays unbound.
     The middleware's early allowlist deny already covers this route (it runs
     before the bypass list), so a verified-but-unallowlisted peer never
     reaches this mint in the first place.
 
     ``boot_bound`` additionally preserves the ADDRESS pin when tailnet identity
-    trust is off. That case previously could not arise for the session type that
-    needs it most: a phone-access QR session was minted ``no_refresh``, so it
-    never rotated and the ``ip:`` pin the middleware set at the exchange held for
-    its whole life. Letting such a session rotate without this would drop the pin
-    on the first rotation, so a stolen rotated cookie would authenticate from any
-    reachable peer — a real regression, not a theoretical one.
+    trust is off. The session type that needs it most is a phone-access QR
+    session, whose ``ip:`` pin the middleware sets at the exchange: letting such
+    a session rotate without this drops the pin on the first rotation, so a
+    stolen rotated cookie authenticates from any reachable peer.
 
     Scoped to boot-bound sessions on purpose. Pinning EVERY rotation would change
     roaming behaviour for ordinary browser sessions, which today survive an

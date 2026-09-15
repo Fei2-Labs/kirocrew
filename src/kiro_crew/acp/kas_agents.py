@@ -16,22 +16,22 @@ Two properties of KAS's schema drive the mapping and are easy to get wrong:
   ambiguous spec fails closed rather than guessing ``*``.
 
 ``mcpServers`` IS projected, minus the names that arrive as session-level broker
-stubs. It was previously omitted on the reasoning that ``@server`` entries in
-``tools`` resolve wherever the server was declared and that carrying the servers
-twice risks a double registration. The first half is true; the second described a
-case that only arises for a STUBBED server, and stubs are opt-in per server
+stubs. ``@server`` entries in ``tools`` do resolve wherever the server was
+declared, so carrying the servers twice would risk a double registration — but
+that only arises for a STUBBED server, and stubs are opt-in per server
 (``mcp_gateway.stub_servers``, empty by default). With nothing stubbed the
-session-level param is an empty array, so omitting the block left a KAS session
+session-level param is an empty array, so omitting the block leaves a KAS session
 holding ``tools: ["@kirocrew-core", ...]`` and no definition of what
 ``kirocrew-core`` is — refs naming nothing, and every Crew tool silently absent.
-kiro-cli never had this: it reads the spec off disk itself via ``--agent``.
+kiro-cli does not have this problem: it reads the spec off disk itself via
+``--agent``.
 
-Filtering by the stub set keeps the original reason intact (a stubbed server is
-still declared exactly once, by the injection that outranks this block) while
-removing the case where the omission left the session with nothing. Two fields
-are dropped on the way through — see :func:`_project_mcp_servers`.
+Filtering by the stub set keeps the no-double-registration guarantee (a stubbed
+server is still declared exactly once, by the injection that outranks this block)
+while never leaving the session with nothing. Two fields are dropped on the way
+through — see :func:`_project_mcp_servers`.
 
-``model`` is still deliberately NOT projected: the model is set through its own
+``model`` is deliberately NOT projected: the model is set through its own
 protocol verb, so it has exactly one owner rather than being pinned in two places
 that can disagree.
 
@@ -332,7 +332,7 @@ def _project_mcp_servers(
 
     * **stubbed names** — those arrive as the session-level ``mcpServers`` param,
       which outranks an agent-declared entry. Emitting both is the double
-      registration this block was originally omitted to avoid.
+      registration this block exists to avoid.
     * **``autoApprove``** — an auto-approved MCP tool is approved by the host and
       emits no permission request, so ``hooks.on_tool_call`` (the always-on deny
       floor, the sensitive-path check, the governance ceiling) never runs for it.
@@ -563,6 +563,7 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
 def build_kas_custom_agents(
     agents_dir: Path,
     agent_id: str,
+    spec: dict[str, Any],
     *,
     stub_server_names: frozenset[str] = frozenset(),
     member_dispatch: bool = False,
@@ -581,8 +582,17 @@ def build_kas_custom_agents(
     *stub_server_names* is forwarded to :func:`_project_mcp_servers`; the caller
     holds the gateway overlay this session will inject from, so it is the only
     layer that can answer which names are stubbed.
+
+    *spec* is REQUIRED and positional, and this function performs no read of its
+    own. Its answer becomes the session's whole tool surface, so it has to be
+    built from the spec the caller verified under the freshness gate -- reading the
+    file here would be a SECOND read, milliseconds later, and a revocation landing
+    in between would be projected as though it had been checked. A defaulted
+    parameter that fell back to :func:`load_agent_spec` would restore exactly that
+    hole for any caller that forgot to pass one, which is why there is no default.
+    *agents_dir* stays for :func:`resolve_prompt`, which anchors a ``file://``
+    prompt URI and reads a different artifact than the spec.
     """
-    spec = load_agent_spec(agents_dir, agent_id)
     prompt = resolve_prompt(spec, agent_id=agent_id, agents_dir=agents_dir)
     return [
         to_client_custom_agent(

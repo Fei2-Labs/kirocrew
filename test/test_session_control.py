@@ -14,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import re
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -613,14 +615,41 @@ def test_scheduled_target_is_refused(tmp_path):
     assert "unattended" in exc.value.message
 
 
-def test_scheduled_caller_cannot_control_anyone(tmp_path):
+def test_scheduled_caller_cannot_control_a_session_it_did_not_create(tmp_path):
+    """A cron caller is admitted but fenced to its own children.
+
+    The ``created_by`` fence refuses the case that matters -- a scheduled job
+    reaching the user's own conversation -- while letting it drive the sessions
+    it dispatched. The positive half, and a cron's other gates, are in
+    ``test_cron_session_control.py``.
+    """
     state = _make_state(tmp_path)
     caller = _slot(state, "cron-abc123")
+    # Ownership is read from the JOB, and an unfindable one fails closed, so the
+    # fence is only reached once the registry can produce a non-app owner.
+    state.crons.list_jobs.return_value = [SimpleNamespace(id="abc123", created_by="U0123ABCD")]
     _slot(state, "chat-2")
     with pytest.raises(sc.SessionControlError) as exc:
         sc.authorize_target(
             state, caller_session_key=_key(caller), target="chat-2", operation="read"
         )
+    assert exc.value.code == "not_creator"
+
+
+def test_workflow_caller_cannot_control_anyone(tmp_path):
+    """The unattended refusal still stands for the caller class with no fence.
+
+    A ``workflow-<run_id>`` slot is minted only once its originating tab is gone,
+    so there is no owning session to bound it to.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "workflow-run7")
+    _slot(state, "chat-2")
+    with pytest.raises(sc.SessionControlError) as exc:
+        sc.authorize_target(
+            state, caller_session_key=_key(caller), target="chat-2", operation="read"
+        )
+    assert exc.value.code == "unattended_caller"
     assert "cannot control other sessions" in exc.value.message
 
 
@@ -1067,14 +1096,14 @@ def test_a_credential_at_the_truncation_boundary_is_still_redacted(tmp_path):
     """Redaction runs over the whole message, then the slice happens.
 
     Mutation guard: truncating first cuts the secret into a prefix the scanner
-    no longer matches, and that fragment ships to the caller.
+    does not match, and that fragment ships to the caller.
     """
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
     target = _peer_target(state, "chat-2", caller)
     secret = "ghp_" + "B" * 36
     # Straddle the boundary: only the first 10 chars of the secret survive a
-    # naive slice, and a 10-char fragment no longer matches the credential
+    # naive slice, and a 10-char fragment does not match the credential
     # scanner — so it is exactly what leaks when the order is wrong.
     filler = "x" * (sc.MAX_READ_CONTENT_CHARS - 10)
     surviving_fragment = secret[:10]
@@ -1214,7 +1243,7 @@ def test_the_read_cursor_is_absolute_across_a_trimmed_window(tmp_path):
     """Window length freezes at the retention cap; `total` and the indexes must not.
 
     Mutation guard: deriving `total` from `len(slot.messages)` makes it freeze at
-    the cap, so a caller can no longer tell how much history exists. Basing it on
+    the cap, so a caller cannot tell how much history exists. Basing it on
     `_disk_older_count` instead of the durable counter shifts every position by
     the transient rows that were trimmed (here: 20), which this pins.
     """
@@ -1591,7 +1620,7 @@ def test_stop_is_refused_for_a_session_out_of_bounds(tmp_path):
         asyncio.run(sc.stop_target(state, caller_session_key=_key(caller), target="chat-hidden"))
 
 
-# ── session_stop is safe to re-send (#5074) ──────────────────────────────────
+# ── session_stop is safe to re-send ──────────────────────────────────
 
 
 def _stoppable(state, slot):
@@ -1697,7 +1726,7 @@ def test_a_stop_after_the_window_still_escalates(tmp_path, monkeypatch):
 
 
 def test_a_withheld_escalation_is_recorded(tmp_path, monkeypatch):
-    """#5074 read from the other side: the absorbed retry must be visible too.
+    """Read from the other side: the absorbed retry must be visible too.
 
     The issue's complaint is that queued messages went "with no record that a
     retry rather than a decision caused it". Suppressing the kill silently would
@@ -1975,6 +2004,39 @@ def test_send_to_a_busy_target_queues_instead_of_racing(tmp_path):
     assert any("queued message" in q.get("content", "") for q in target._queue)
 
 
+def test_send_to_a_remote_bound_target_is_refused_not_run_locally(tmp_path, monkeypatch):
+    """A crew-bound target executes on the peer; session_send must not run its
+    turn on THIS machine.
+
+    ``send_to_target`` hands ``_run_chat`` to ``enqueue_or_run_prompt``, which has
+    no remote/executor branch — so a bound target would run the crew's work here
+    and diverge the local and peer transcripts. It is refused with a
+    409 before any dispatch, and nothing is queued.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _peer_target(state, "chat-2", caller)
+    target.executor = "remote"  # bound to a peer crew for execution
+
+    ran: dict[str, str] = {}
+
+    async def _fake_run_chat(_state, slot, prompt):
+        ran["slot"] = slot.key
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner._run_chat", _fake_run_chat)
+
+    with pytest.raises(sc.SessionControlError) as err:
+        asyncio.run(
+            sc.send_to_target(
+                state, caller_session_key=_key(caller), target="chat-2", message="do it there"
+            )
+        )
+    assert err.value.code == "remote_target_unsupported"
+    # Refused before dispatch: no local turn ran and nothing was queued.
+    assert ran == {}
+    assert target._queue == []
+
+
 def test_send_is_refused_for_a_session_out_of_bounds(tmp_path):
     """The same deny-by-default guard the other verbs share gates send too."""
     state = _make_state(tmp_path)
@@ -2147,7 +2209,179 @@ def test_created_session_gets_its_workspace_project_dir(tmp_path):
     assert child.project == loader.default_project_dir(child.workspace)
 
 
-# ── session_create: filing at birth (#6118) ─────────────────────────────────
+# ── session_create: the creator's trust grant ───────────────────────────────
+
+
+def test_created_session_inherits_the_callers_trust(tmp_path):
+    """A trusted creator's worker starts trusted, or dispatch stalls on a prompt.
+
+    The whole point of dispatching a session is that the work proceeds without the
+    operator sitting on it, and `spawn_run` subagents already start auto-approved
+    off the parent's policy (`parent_trusted`). A child born interactive blocks on
+    the first tool call with nobody watching -- the same failure, one layer up.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = True
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child is not None
+    assert child._trust is True, "the creator's posture must follow the work"
+
+
+def test_command_grants_never_transfer_even_under_full_trust(tmp_path):
+    """`_trusted_patterns` are per-command grants, not a posture, so they stay put.
+
+    A pattern is judged against the session the operator was LOOKING at, while a
+    dispatched worker runs model-authored work they have not seen -- so the same
+    glob can admit a command the grant was never asked about. Inheriting them also
+    buys nothing where it would be safe: with `_trust` set the child already
+    auto-approves through `_slot_is_trusted`, so the list is dead weight here and
+    changes the outcome only in the case that must keep asking (see the sibling
+    test below).
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = True
+    caller._trusted_patterns = {"npm test", "git status"}
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trusted_patterns == set(), "command grants must not be delegated"
+    # And nothing was aliased on the way past: the caller keeps its own grants.
+    assert caller._trusted_patterns == {"npm test", "git status"}
+
+
+def test_a_pattern_only_creator_produces_a_child_that_still_asks(tmp_path):
+    """The case the exclusion exists for: grants without session trust.
+
+    An operator who approved single commands and deliberately did NOT click trust
+    has said "ask me". `chat_runner` matches `_trusted_patterns` independently of
+    `_trust` (so an inherited pattern would auto-approve on its own), which is why
+    a child of such a caller must be born with nothing.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = False
+    caller._trusted_patterns = {"npm test"}
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trust is False
+    assert child._trusted_patterns == set(), "a withheld posture must not leak as a grant"
+
+
+def test_created_session_inherits_trust_reads(tmp_path):
+    """`trust_reads` is a grant too, and it is the narrower one.
+
+    Inheriting only the full grant would leave the read-only mode -- the setting a
+    cautious operator picks -- as the one that still stalls its own workers.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = False
+    caller._trust_reads = True
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trust_reads is True
+    assert child._trust is False, "the narrow grant must not widen on the way down"
+
+
+def test_an_untrusted_creator_makes_an_untrusted_child(tmp_path):
+    """Negative control: nothing is granted that the creator did not hold.
+
+    Without this the inheritance could be a constant `True` and every test above
+    would still pass.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trust is False
+    assert child._trust_reads is False
+    assert child._trusted_patterns == set()
+
+
+def test_the_scoped_safety_override_grant_is_never_inherited(tmp_path):
+    """`_trust_scope` is a revocable credential, not a setting to copy.
+
+    Its entire value is being re-checked on every approval against a TTL-bounded,
+    SEL-audited `SafetyOverride` scope. Forking the key hands a second session a
+    grant whose revocation the create path cannot observe -- and the child would
+    keep auto-approving after the scope that justified it is gone.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust_scope = "app:worker:abc123"
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trust_scope == "", "a scoped grant must not fork onto the child"
+    assert child._trust is False, "nor may it be laundered into the durable flag"
+
+
+def test_trust_revoked_mid_create_is_not_inherited(tmp_path, monkeypatch):
+    """The grant that transfers is the one held at ALLOCATION, not at entry.
+
+    `create_session` suspends several times before the slot exists (project dir,
+    config load, folder confirmation), and the operator can pick `normal` in any
+    of those windows. Reading the entry-time slot would hand the child a grant
+    that has been revoked. Simulated by revoking inside the project-dir
+    resolution, the same interleaving the folder-delete test uses.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = True
+
+    def _revoke_then_resolve(_workspace):
+        caller._trust = False
+        caller._trust_reads = False
+        return str(tmp_path)
+
+    monkeypatch.setattr(sc, "default_project_dir", _revoke_then_resolve)
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    assert child._trust is False, "a revoked grant must not be resurrected by a create"
+    assert child._trust_reads is False
+
+
+def test_the_create_audit_records_what_the_child_was_born_with(tmp_path):
+    """An auto-approval in the child must be traceable to the creator's grant.
+
+    Without it, the SEL shows a session whose tools approve themselves and no
+    record of where that authority came from. Recorded on both outcomes, so
+    "false" is positive evidence the grant did not transfer.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller._trust = True
+
+    seen: dict[str, object] = {}
+
+    def _capture(**kwargs):
+        seen.update(kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sc, "_audit", _capture)
+        asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+
+    detail = seen["detail"]
+    assert detail["inherited_trust"] == "true"
+    assert detail["inherited_trust_reads"] == "false"
+
+
+# ── session_create: filing at birth ─────────────────────────────────
 
 
 def test_create_schema_bounds_the_folder_reference():
@@ -2458,6 +2692,28 @@ def test_the_empty_window_merge_mirrors_the_full_saves_slot_owned_fields(tmp_pat
         "app",
         "forked_from",
         "linked_session_key",
+        # The remote-execution binding, written all-three-or-none by both the
+        # full save and the merge. A plain local newborn carries none of it; the
+        # bound case is covered by
+        # test_remote_crew_execution.py::test_the_empty_window_merge_persists_a_complete_binding.
+        "executor",
+        "instance_id",
+        "remote_slot",
+        # In-flight relay marker: written ONLY while a relay is running and
+        # omitted once the turn ends (absence = "not in flight"), so a plain
+        # newborn never carries it. Its clear-on-completion behaviour is covered by
+        # test_remote_crew_execution.py::
+        # test_the_marker_is_cleared_on_disk_when_a_relay_completes.
+        "relay_in_flight",
+        # Written only for a NON-DEFAULT memory store, because absence is what
+        # means "the global store" -- so a newborn on the default store must NOT
+        # carry it, and writing "default" here would make a session that predates
+        # per-agent memory stores read differently from one saved today. The
+        # named-store half is pinned by the next test, which is the direction that
+        # can lose data: the key is slot-owned, so a merge that failed to write it
+        # would drop the binding and silently return that session to the global
+        # store.
+        "memory_store",
     }
     for key in sorted(SLOT_OWNED_META_KEYS - excluded):
         assert key in meta, f"slot-owned field {key!r} missing after an empty-window forced save"
@@ -2466,6 +2722,45 @@ def test_the_empty_window_merge_mirrors_the_full_saves_slot_owned_fields(tmp_pat
     assert meta.get("color_index") == 3
     assert meta.get("title") == "Pinned title"
     assert meta.get("title_origin") == "user"
+    from kiro_crew.context import store_of_session
+
+    assert (
+        store_of_session(state.conversation_log, slot_history_key(child)) == ""
+    ), "a newborn on the default store names no silo"
+
+
+def test_the_empty_window_merge_keeps_a_named_memory_store(tmp_path):
+    """A crew's silo must survive the merge, and the default must stay absent.
+
+    ``memory_store`` is slot-owned, so ``carry_unowned_metadata`` will NOT
+    preserve it from the previous record -- the merge has to write it or the key
+    is gone. Losing it does not fail loudly: the session simply consolidates into
+    the operator's global memory from then on, which is the one outcome per-crew
+    isolation exists to prevent. Asserted in both directions, because the retract
+    path (rebinding a crew back to the default store) depends on absence.
+    """
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    child.memory_store = "coding"
+    asyncio.run(save_slot_off_loop(state, child, force=True))
+    meta = state.conversation_log.get_metadata(slot_history_key(child))
+    assert meta.get("memory_store") == "coding"
+
+    # Rebinding to the default RETRACTS it. The merge cannot delete a key, so the
+    # cleared form is a falsy value; what must hold is that the consolidator
+    # resolves it to the global store again.
+    from kiro_crew.context import store_of_session
+
+    child.memory_store = "default"
+    asyncio.run(save_slot_off_loop(state, child, force=True))
+    meta = state.conversation_log.get_metadata(slot_history_key(child))
+    assert not meta.get("memory_store"), meta.get("memory_store")
+    assert store_of_session(state.conversation_log, slot_history_key(child)) == ""
 
 
 def test_the_empty_window_merge_reads_slot_state_at_write_time(tmp_path):
@@ -2729,6 +3024,51 @@ def test_the_binding_is_resolved_with_the_childs_project_dir(tmp_path, monkeypat
     assert seen["project_dir"] == loader.default_project_dir(caller.workspace)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["usable", "unavailable", "caller_closed"])
+async def test_agent_binding_resolution_is_off_loop_and_precedes_allocation(
+    tmp_path, monkeypatch, outcome
+):
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    before = set(state._slots)
+    allocate = MagicMock(wraps=state.get_or_create_slot)
+    monkeypatch.setattr(state, "get_or_create_slot", allocate)
+    real_resolve = sc.resolve_agent_bindings
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    lookup_threads = []
+
+    def resolve(*args, **kwargs):
+        lookup_threads.append(threading.get_ident())
+        if outcome == "unavailable":
+            raise UnknownMemoryStore("member memory cannot be read")
+        bindings = real_resolve(*args, **kwargs)
+        if outcome == "caller_closed":
+            loop.call_soon_threadsafe(state._slots.pop, caller.key, None)
+        return bindings
+
+    monkeypatch.setattr(sc, "resolve_agent_bindings", resolve)
+
+    if outcome == "usable":
+        created = await sc.create_session(state, caller_session_key=_key(caller))
+        allocate.assert_called_once()
+        child = state.get_slot(created["target"])
+        assert child is not None and child.workspace == caller.workspace
+    else:
+        with pytest.raises(sc.SessionControlError) as error:
+            await sc.create_session(state, caller_session_key=_key(caller))
+        assert error.value.code == (
+            "agent_unverifiable" if outcome == "unavailable" else "caller_not_open"
+        )
+        allocate.assert_not_called()
+        assert not set(state._slots) - before
+    assert len(lookup_threads) == 1
+    assert lookup_threads[0] != loop_thread
+
+
 def test_a_caller_that_closes_during_the_await_cannot_still_create(tmp_path, monkeypatch):
     """A removed slot stays usable as an object, so presence must be re-read.
 
@@ -2762,7 +3102,7 @@ def test_a_caller_that_moves_workspace_during_the_await_is_refused(tmp_path, mon
     """The workspace fed the agent-binding decision, so a move invalidates it.
 
     Mutation guard: carrying the pre-await workspace forward puts the child on a
-    boundary its creator no longer sits behind.
+    boundary its creator does not sit behind.
     """
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
@@ -3007,7 +3347,7 @@ def test_nothing_suspends_while_the_created_slot_is_half_configured():
     )
     # And the filing itself happens inside the synchronous configuration window,
     # so no caller ever observes the published slot unfiled -- the atomicity
-    # #6118 exists for.
+    # this test requires.
     filed = src.index("slot.folder_id = folder_id")
     assert publish < filed < configured, (
         "the folder must be assigned between publishing the slot and the end of "
@@ -3336,8 +3676,9 @@ def test_the_audit_write_does_not_run_on_the_event_loop(tmp_path, monkeypatch):
     """Constructing the SEL must not happen on the loop.
 
     `log_tool_invocation` only enqueues, but the FIRST `sel()` of a process
-    constructs the log -- trust-dir creation, key validation, and on Windows an
-    `icacls` subprocess. This can genuinely be that first call, because
+    constructs the log -- trust-dir creation, key validation, and on Windows a
+    DACL write that can block on a network volume round-trip. This can genuinely
+    be that first call, because
     `sel_audit_middleware` logs AFTER `await handler(...)`: on a fresh gateway the
     first authenticated request constructs the log inside whatever handler runs
     first.
@@ -3482,11 +3823,10 @@ def test_the_denial_audit_does_not_persist_caller_supplied_credentials(tmp_path,
 def test_slot_cap_has_one_owning_constant() -> None:
     """Every slot-creating path reads the SAME owning ceiling constant.
 
-    The live-slot ceiling used to be declared independently as ``= 500`` in
-    three modules (session create, chat fork, session import); raising it then
-    took three edits and the effective limit depended on which door the caller
-    came through. It now has one home -- ``state.MAX_LIVE_SLOTS`` in the module
-    that owns ``live_slot_count()`` -- and each door imports that one name. This
+    The live-slot ceiling has one home -- ``state.MAX_LIVE_SLOTS`` in the module
+    that owns ``live_slot_count()`` -- and each slot-creating door (session
+    create, chat fork, session import) imports that one name, so the effective
+    limit cannot diverge by which door the caller came through. This
     pins that no door has re-introduced its own literal: all three modules must
     expose the identical owning object.
     """
@@ -3661,6 +4001,7 @@ def test_close_slot_pre_pop_abort_rolls_back_and_does_not_pop(tmp_path):
 
     assert exc.value.code == "mirrored_target"
     assert slot.key in state._slots  # not popped
+    assert slot.is_closing is False  # failed close must not fence future monitor admission
     state.sessions.remove.assert_not_awaited()  # teardown never ran
 
 

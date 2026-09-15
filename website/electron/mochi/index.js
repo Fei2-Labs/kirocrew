@@ -72,12 +72,22 @@ let glog = () => {};
  * Everything is best-effort: any failure (no token, gateway slow, app absent)
  * just means no pet this launch. The dashboard must never be held up by it.
  */
-// Logged once per distinct outcome so a 5s poll cannot spam the log, while a
-// state change (or a newly-broken gateway) still shows up.
-let lastMochiProbe = "";
+// Logged once per outcome per minute so alternating 403/disabled polls cannot
+// defeat deduplication. A real enabled-state change is still logged promptly.
+const MOCHI_PROBE_LOG_REPEAT_MS = 60_000;
+const recentMochiProbes = new Map();
+let lastMochiProbeState = "";
 function probeLog(outcome) {
-  if (outcome === lastMochiProbe) return;
-  lastMochiProbe = outcome;
+  const now = Date.now();
+  for (const [message, loggedAt] of recentMochiProbes) {
+    if (now - loggedAt >= MOCHI_PROBE_LOG_REPEAT_MS) recentMochiProbes.delete(message);
+  }
+  const knownState = outcome === "mochi installed but disabled" ||
+    outcome === "mochi enabled — opening pet" || outcome.startsWith("mochi not among ");
+  const stateChanged = knownState && outcome !== lastMochiProbeState;
+  if (knownState) lastMochiProbeState = outcome;
+  if (!stateChanged && recentMochiProbes.has(outcome)) return;
+  recentMochiProbes.set(outcome, now);
   console.log("Mochi pet probe:", outcome);
 }
 
@@ -1092,6 +1102,7 @@ function startMochiWatcher() {
     const fs = require("fs");
     const path = require("path");
     const { shell } = require("electron");
+    const { openPathHardened } = require("../open-path");
     const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"]);
     try {
       // realpath BEFORE the extension test: a `.png` symlink to a key file must
@@ -1100,7 +1111,7 @@ function startMochiWatcher() {
       if (!IMAGE_EXTS.has(path.extname(real).toLowerCase())) return false;
       if (!fs.statSync(real).isFile()) return false;
       // Non-empty return value means the OS refused to open it.
-      const err = await shell.openPath(real);
+      const err = await openPathHardened(shell, real);
       return err === "";
     } catch (err) {
       glog(`Mochi open-image refused: ${err && err.message}`);

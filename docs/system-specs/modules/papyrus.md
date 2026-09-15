@@ -154,7 +154,7 @@ and a `.tex` here is untrusted by construction (the agent writes it; a cloned re
 supplies it wholesale). Tectonic keeps shell escape off unless `-Z shell-escape`
 is passed, and we never pass it. The document is passed after `--` so a
 dash-leading filename cannot become an option. Pinned by
-`test_latex.py::TestCompilerArgv`.
+`test_papyrus_latex.py::TestCompilerArgv`.
 
 ### Spawn discipline
 
@@ -216,7 +216,7 @@ app was a stdlib `ThreadingHTTPServer` on its own port using blocking
   shape;
 - the compiler download itself runs on a daemon thread, not the loop and not a
   pooled executor (see Managed compiler). Pinned by
-  `test_tectonic.py::TestEventLoopDiscipline` and
+  `test_papyrus_tectonic.py::TestEventLoopDiscipline` and
   `test_routes.py::TestProvisionCompiler::test_the_handler_never_blocks_the_event_loop`.
 
 ### Offloading the gate without weakening it
@@ -265,7 +265,7 @@ a refused name never reaches `gitops` or the compiler.
    process-wide, including the negative result, so a successful provision MUST call
    `reset_compiler_cache()` or the stale "no compiler" answer sticks (it does, from
    the provisioning job's completion). Pinned by
-   `test_tectonic.py::TestResolutionOrder`.
+   `test_papyrus_tectonic.py::TestResolutionOrder`.
 3. Extend `BSTINPUTS`/`BIBINPUTS` with **every** project subdirectory holding a
    `.bst`/`.bib`. Conference templates stash `acl_natbib.bst` under
    `templates/<conf>/`, and without this bibtex fails with "I couldn't open style
@@ -296,7 +296,7 @@ a refused name never reaches `gitops` or the compiler.
 is bounded to the text before the next `^!`; without that bound the second error
 inherits the first's line and the editor jumps somewhere wrong while looking
 authoritative. Carried over from upstream and pinned by
-`test_latex.py::test_two_bangs_do_not_share_a_line`.
+`test_papyrus_latex.py::test_two_bangs_do_not_share_a_line`.
 
 ## Managed compiler
 
@@ -399,7 +399,7 @@ empty names. Beyond names:
 - Both cap a member at `_MAX_MEMBER_BYTES` (256MB), bounding a decompression bomb
   even though the digest pin already means the archive can only be the named one.
 
-Pinned by `test_tectonic.py::TestSafeTarExtraction` / `TestSafeZipExtraction`,
+Pinned by `test_papyrus_tectonic.py::TestSafeTarExtraction` / `TestSafeZipExtraction`,
 including that a refused archive leaves the destination empty and writes nothing
 outside it.
 
@@ -442,7 +442,7 @@ half-written file can never read as a usable compiler.
   exactly as it was. **If the stash pop itself conflicts the stash is deliberately
   KEPT** and reported (409) — silently discarding the user's edits to let the
   operation "succeed" is the worse outcome. Pinned by
-  `test_gitops.py::test_a_failed_pop_keeps_the_stash`.
+  `test_papyrus_gitops.py::test_a_failed_pop_keeps_the_stash`.
 
   **Every** post-stash failure path restores the stash, including the ones that
   raise from inside `_git` rather than returning a non-zero code — a pull that
@@ -621,12 +621,21 @@ session working", rather than a private `chat_done` subscription.
 
 ## Skill
 
-`src/kiro_crew/builtin_skills/papyrus-writing/SKILL.md` — bundled (NOT the
-repo-only top-level `skills/`), so every `pip`/DMG install receives it, per the
-skill-bundling rule in `AGENTS.md`. It carries the project path, the compile
-workflow, an error→cause table, the venue/style rules, and the figure/table/
-equation/citation patterns. It is trigger-loaded on LaTeX vocabulary rather than
-`always: true`, so it costs nothing in unrelated sessions.
+Five bundled skills under `src/kiro_crew/builtin_skills/papyrus-*/` (NOT the
+repo-only top-level `skills/`), so every `pip`/DMG install receives them, per the
+skill-bundling rule in `AGENTS.md`:
+
+- `papyrus-writing` — the base skill, loaded first: conduct, the paper-quality
+  principles, the LaTeX house style, the project path, and the compile workflow.
+- `papyrus-make-fluent` — polish English as tracked suggestions.
+- `papyrus-latex-comments` — the comment layer (`\aicomment` margin notes).
+- `papyrus-latex-suggestions` — inline tracked edits (`\aisuggest` old→new).
+- `papyrus-diagnose-compilation` — locate and fix a build failure (the error→cause
+  table lives here, not in the base skill).
+
+`companionPrompt.ts` injects the load order: the base skill first, then the task
+skill matching the request. Each is trigger-loaded on LaTeX vocabulary rather than
+`always: true`, so they cost nothing in unrelated sessions.
 
 The manifest deliberately declares **no** `skills` entry: a builtin app's
 directory receives only `app.json` at registration, so a manifest-declared path
@@ -658,8 +667,10 @@ no bare `fcntl`/`os.killpg`/`signal.SIGKILL`, `start_new_session=IS_POSIX`
   422 `compiler_sandbox_unavailable`, and `gitops` raises
   `GitSandboxUnavailable` (a `GitError` subclass, so existing handlers keep
   working) → 422 `git_sandbox_unavailable`. Both carry the sandbox layer's own
-  remedy text, which names the `agent.sandbox_allow_unsandboxed_exec` opt-in that
-  `docs/guides/windows-install.md` documents for this host. Bypassing the wrap was
+  remedy text, which names the `agent.sandbox_allow_unsandboxed_exec` setting that
+  `docs/guides/windows-install.md` documents for this host. On Windows these 422s
+  are reached only where that key is declared `false` or a governance
+  `sandbox.min_level` floor is pinned, since the platform default permits the spawn. Bypassing the wrap was
   rejected: `strict` mode is what stops `\input{../../.aws/credentials}` from
   typesetting the operator's keys into the PDF, and `gitops` runs `standard`
   precisely so an SSH push can see the key.
@@ -715,7 +726,11 @@ that host reports `supported: false` and keeps the manual install path.
 | `.../papyrus/backend/tectonic.py` | The managed, digest-pinned Tectonic install (pins, safe extract, provisioning job) |
 | `.../papyrus/backend/gitops.py` | Clone/status/commit/push/pull, **and** the repo-config RCE denylist (19 `-c` overrides + the attributes pin + pack-program flags + `GIT_PROXY_COMMAND`) |
 | `.../papyrus/backend/routes.py` | aiohttp handlers + `register_routes` |
-| `src/kiro_crew/builtin_skills/papyrus-writing/SKILL.md` | The co-author's LaTeX skill |
+| `src/kiro_crew/builtin_skills/papyrus-writing/SKILL.md` | Base skill: conduct, paper-quality principles, LaTeX house style, project path, compile workflow |
+| `.../builtin_skills/papyrus-make-fluent/SKILL.md` | Polish English as tracked suggestions |
+| `.../builtin_skills/papyrus-latex-comments/SKILL.md` | Comment layer — `\aicomment` margin notes |
+| `.../builtin_skills/papyrus-latex-suggestions/SKILL.md` | Inline tracked edits — `\aisuggest` old→new |
+| `.../builtin_skills/papyrus-diagnose-compilation/SKILL.md` | Locate and fix a build failure (error→cause table) |
 | `website/src/apps/papyrus/PapyrusPage.tsx` | Route entry; project list vs. workspace |
 | `website/src/apps/papyrus/ProjectList.tsx` | Landing view (standard page layout) |
 | `website/src/apps/papyrus/PapyrusEditor.tsx` | Monaco source pane + marker push |

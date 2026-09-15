@@ -830,6 +830,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.compact-empty-folders",
+    "label": "Compact Empty Folders",
+    "labelKey": "pages.settings.chatPanel.compact_empty_folders",
+    "description": "A folder with no chats takes one row instead of two, and its New chat button moves onto the folder's own row",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.completion-event-characters",
     "label": "Completion Event Characters",
     "labelKey": "pages.settings.chatPanel.completion_event_characters",
@@ -863,6 +872,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "buttonGroup",
     "occurrence": 1
+  },
+  {
+    "id": "chat.default-memory-mode",
+    "label": "Default Memory Mode",
+    "labelKey": "settings.chat.defaultMemoryMode.label",
+    "description": "Persistent uses what it knows and saves new memory. Incognito uses what it knows but saves no new memory. Temporary starts blank and saves no new memory. Every chat still appears in History. You can change the mode for any chat.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "dashboard.default_memory_mode"
   },
   {
     "id": "chat.default-model",
@@ -990,6 +1009,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.plain-diffs",
+    "label": "Plain diffs",
+    "labelKey": "settings.chat.plainDiff.label",
+    "description": "Render diffs as plain unified-diff text instead of syntax-highlighted colour. Uses less memory on large diffs.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.pr-and-issue-chips-on-session-cards",
     "label": "PR and Issue Chips on Session Cards",
     "labelKey": "pages.settings.chatPanel.session_card_source_links",
@@ -1042,6 +1070,17 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "select",
     "occurrence": 1
+  },
+  {
+    "id": "chat.selectable-models",
+    "label": "Selectable Models",
+    "labelKey": "pages.settings.chatPanel.selectable_models",
+    "description": "Choose which advertised models appear in Chat model pickers. Auto and an active session model always remain visible.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "dashboard.model_picker_hidden_models",
+    "settingId": "chat.selectable-models"
   },
   {
     "id": "chat.send-shortcut",
@@ -1114,6 +1153,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.split-side-by-side-diffs",
+    "label": "Split (side-by-side) diffs",
+    "labelKey": "settings.chat.diffLayout.label",
+    "description": "Show old and new code in two columns; off shows one unified column. Changing it here or on any diff sets it everywhere.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.split-view-session-grid",
     "label": "Split View (Session Grid)",
     "labelKey": "pages.settings.chatPanel.split_view_session_grid",
@@ -1156,10 +1204,27 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.text-link-patterns",
+    "label": "Text Link Patterns",
+    "labelKey": "pages.settings.chatPanel.link_patterns",
+    "tab": "chat",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "dashboard.link_patterns"
+  },
+  {
     "id": "chat.text-streaming-style",
     "label": "Text Streaming Style",
     "labelKey": "pages.settings.chatPanel.text_streaming_style",
     "description": "Immediate mode shows raw chunks as they arrive. Smooth mode buffers and fades text in at a steady pace.",
+    "tab": "chat",
+    "type": "buttonGroup",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.what-enter-does-while-the-agent-is-working",
+    "label": "What Enter does while the agent is working",
+    "labelKey": "pages.settings.chatPanel.what_enter_does_while_the_agent_is_working",
     "tab": "chat",
     "type": "buttonGroup",
     "occurrence": 1
@@ -1228,10 +1293,37 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "developer.chat-on-a-crew",
+    "label": "Chat on a crew",
+    "labelKey": "pages.developer.featurePreviewsTab.chat_on_a_crew",
+    "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote instance — another machine you have connected under Settings > Remote Instances. Unfinished: the session opens in that instance’s own pane and is not listed in this dashboard’s sessions yet, so to return to it later, switch to that instance’s pane.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.crew-members",
+    "label": "Crew Members",
+    "labelKey": "pages.developer.featurePreviewsTab.crew_members",
+    "description": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "developer.developer-mode",
     "label": "Developer Mode",
     "labelKey": "pages.settings.developerPanel.developer_mode",
     "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.remote-instance-sessions",
+    "label": "Remote instance sessions",
+    "labelKey": "pages.developer.featurePreviewsTab.remote_instance_sessions",
+    "description": "Merge a connected remote instance's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -1244,6 +1336,25 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
+  },
+  {
+    "id": "developer.webhooks",
+    "label": "Webhooks",
+    "labelKey": "pages.developer.featurePreviewsTab.webhooks",
+    "description": "Inbound webhook tokens, registered contexts, and run history. The API works; the page is not finished.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "display.command-completion",
+    "label": "Command completion",
+    "labelKey": "pages.settings.displayPanel.terminal_completion",
+    "description": "Show the completion popup while typing in the Terminal. Enter runs the line you typed; to take a suggestion, press ↑/↓ then Enter, or Tab. Off hides the popup; your shell's own Tab completion still works.",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "dashboard.terminal.completion.enabled"
   },
   {
     "id": "display.default-for-new-sessions",
@@ -1435,6 +1546,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Heartbeat task results"
   },
   {
+    "id": "notifications.notify-when-a-background-chat-finishes",
+    "label": "Notify when a background chat finishes",
+    "labelKey": "pages.settings.notificationsPanel.notify_when_a_background_chat_finishes",
+    "description": "Shows a system notification naming the chat that finished, but only while this window is minimized or behind another app.",
+    "tab": "notifications",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "notifications.play-sound-on-new-notifications",
     "label": "Play sound on new notifications",
     "labelKey": "pages.settings.notificationsPanel.play_sound_on_new_notifications",
@@ -1522,6 +1642,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "type": "toggle",
     "occurrence": 1,
     "configKey": "telemetry.beacon_enabled"
+  },
+  {
+    "id": "secrets.jira-api-token",
+    "labelKey": "settings.secrets.jira_api_token_label",
+    "tab": "secrets",
+    "type": "input",
+    "occurrence": 1,
+    "label": "Jira API token",
+    "description": "Authenticates Jira issue lookups for the configured instance."
+  },
+  {
+    "id": "secrets.wakatime-api-key",
+    "labelKey": "settings.secrets.wakatime_api_key_label",
+    "tab": "secrets",
+    "type": "input",
+    "occurrence": 1,
+    "label": "WakaTime API key",
+    "description": "Authenticates coding-activity sync when WakaTime is enabled."
   },
   {
     "id": "security.denied-commands",
@@ -1762,7 +1900,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.sttSettings.language",
     "tab": "voice",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.language_code"
   },
   {
     "id": "voice.live-transcript-refresh-ms",
@@ -1807,7 +1946,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.piper-binary",
     "label": "Piper Binary",
     "labelKey": "pages.settings.voicePanel.piper_binary",
-    "description": "Path to the piper executable. Leave blank to auto-detect on PATH or ~/piper-venv/bin/piper",
+    "description": "Path to the piper executable. Leave blank to auto-detect on PATH or in a ~/piper-venv install",
     "tab": "voice",
     "type": "input",
     "occurrence": 1
@@ -1816,7 +1955,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.piper-model",
     "label": "Piper Model",
     "labelKey": "pages.settings.voicePanel.piper_model",
-    "description": "Path to the Piper voice model (.onnx). Required — download from github.com/rhasspy/piper",
+    "description": "Path to the Piper voice model (.onnx). Required — download from huggingface.co/rhasspy/piper-voices",
     "tab": "voice",
     "type": "input",
     "occurrence": 1
@@ -1835,10 +1974,11 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.provider-2",
     "label": "Provider",
     "labelKey": "pages.settings.voicePanel.provider",
-    "description": "Piper runs locally and offline; Amazon Polly uses AWS credentials + network",
+    "description": "The built-in engine needs no setup; Piper is offline with better quality; Amazon Polly uses AWS credentials + network",
     "tab": "voice",
     "type": "select",
-    "occurrence": 2
+    "occurrence": 2,
+    "settingId": "voice.provider-2"
   },
   {
     "id": "voice.shortcut-key",
@@ -1852,7 +1992,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.speed",
     "label": "Speed",
     "labelKey": "pages.settings.voicePanel.speed",
-    "description": "Speech rate",
+    "description": "Speech rate for spoken replies (built-in engine)",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
@@ -1861,10 +2001,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.speed-2",
     "label": "Speed",
     "labelKey": "pages.settings.voicePanel.speed",
-    "description": "Piper speech speed (length scale)",
+    "description": "Speech rate for spoken replies (Amazon Polly)",
     "tab": "voice",
     "type": "select",
     "occurrence": 2
+  },
+  {
+    "id": "voice.speed-3",
+    "label": "Speed",
+    "labelKey": "pages.settings.voicePanel.speed",
+    "description": "Piper speech speed (length scale)",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 3
   },
   {
     "id": "voice.streaming",
@@ -1889,9 +2038,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.voice",
     "label": "Voice",
     "labelKey": "pages.settings.voicePanel.voice",
-    "description": "Amazon Polly voice for TTS",
+    "description": "Voice from the host's built-in speech engine",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
+  },
+  {
+    "id": "voice.voice-2",
+    "label": "Voice",
+    "labelKey": "pages.settings.voicePanel.voice",
+    "description": "Amazon Polly voice for TTS",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 2
   }
 ]

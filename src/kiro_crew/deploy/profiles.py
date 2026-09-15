@@ -80,10 +80,10 @@ _NOTE_MAX = 256
 
 # Same shapes handlers.py enforces for the legacy single-profile config — these
 # values flow into subprocess argv (--profile/--region) on every aws call.
-# The profile shape ('+' admitted for IAM Identity Center derived names, #6051;
+# The profile shape ('+' admitted for IAM Identity Center derived names;
 # first char excludes '-' so a name is never option-shaped; \Z rejects trailing
-# newlines) is constants.AWS_PROFILE_NAME_RE — the single source of truth
-# (#6063) — aliased rather than re-spelled here. Also used by
+# newlines) is constants.AWS_PROFILE_NAME_RE — the single source of truth,
+# aliased rather than re-spelled here. Also used by
 # discover_aws_profiles() to filter `aws configure list-profiles` lines
 # (stripped before matching, so the anchor is behavior-neutral there).
 _PROFILE_RE = AWS_PROFILE_NAME_RE
@@ -124,7 +124,12 @@ def locked_registry() -> Generator[dict[str, Any], None, None]:
     # required=True: a lost profile write is silent data loss, so refuse to
     # proceed without cross-process exclusion. flock_compat is a Windows no-op,
     # so this uses platform_compat's real msvcrt lock.
-    with open(lock_path, "w") as fd:
+    # touch + "r+": writable (msvcrt.locking needs it) but NON-TRUNCATING — a
+    # truncating "w" open of a lock file whose first byte another holder already
+    # locked raises a sharing violation on Windows instead of waiting. Full
+    # rationale: work_ledger._open_lock.
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with file_lock(fd.fileno(), exclusive=True, required=True):
             reg = load_registry()
             yield reg
@@ -164,7 +169,7 @@ def load_registry() -> dict[str, Any]:
 
     Valid JSON of the WRONG SHAPE degrades exactly like unparseable JSON. This
     file is agent-writable, so ``[]``, ``"x"`` or ``{"profiles": 5}`` are all
-    reachable contents, and each of them used to escape as an ``AttributeError``
+    reachable contents, and each of them would otherwise escape as an ``AttributeError``
     or ``TypeError`` from ``raw.get`` / the comprehension -- past the caller and
     out as an HTTP 500 on every route that reads the registry. Catching them
     here routes a mis-shaped file into the fallback chain the function already
@@ -218,7 +223,10 @@ def load_registry() -> dict[str, Any]:
 def save_registry(reg: dict[str, Any]) -> dict[str, Any]:
     _data_dir().mkdir(parents=True, exist_ok=True)
     lock_path = _registry_path().with_suffix(".lock")
-    with open(lock_path, "w") as fd:
+    # touch + "r+": writable but non-truncating; see locked_registry above and
+    # work_ledger._open_lock for the Windows sharing-violation rationale.
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with file_lock(fd.fileno(), exclusive=True, required=True):
             tmp_fd = tempfile.NamedTemporaryFile(
                 mode="w", dir=str(_data_dir()), suffix=".json.tmp",
@@ -266,22 +274,34 @@ def resolve_profile(requested: str = "") -> tuple[str, str] | None:
 
 # --- discovery (read-only, names only) --------------------------------------
 
-def discover_aws_profiles() -> list[str]:
+def discover_aws_profiles() -> list[str] | None:
     """Profile names known to the AWS CLI (``aws configure list-profiles``).
 
     Names only — the CLI enumerates sections itself; we never read the files.
 
-    On native Windows the sandboxed subprocess backend is unavailable (deploy
-    features are POSIX-only, fail-loud policy) — degrade to an empty list
-    instead of surfacing a sandbox error through the profiles endpoint.
+    ``None`` means could not ask, and it is deliberately not ``[]``. "Asked, and
+    there are none" is a fact about the machine, "could not ask" is a fact about
+    this process, and a caller handed the same empty list for both reports the
+    second as the first. That is not a corner case: ``configure list-profiles``
+    arrived in AWS CLI v2 and exits non-zero on v1, so an ordinary host with
+    profiles configured takes the failing branch, and a route that compares a
+    requested name against an empty set then answers that the operator's own
+    profiles are not on this machine. ``cli_doctor._aws_profile_names`` draws the
+    same line for the doctor report, for the same reason.
+
+    Windows is the other ``None``: the sandboxed subprocess backend deploy needs
+    is POSIX-only (fail-loud policy), so discovery cannot run there rather than
+    running and finding nothing. A caller with something more useful to say about
+    the platform than about the failure branches on ``os.name`` itself, which is
+    how the aws-control listing gets to name WSL.
     """
     if os.name == "nt":
         logger.debug("deploy-web: profile discovery unsupported on Windows")
-        return []
+        return None
     rc, out, err = engine.run_aws(["configure", "list-profiles"], "")
     if rc != 0:
         logger.debug("deploy-web: list-profiles failed: %s", (err or "")[:200])
-        return []
+        return None
     names: list[str] = []
     for line in (out or "").splitlines():
         line = line.strip()
@@ -353,8 +373,8 @@ def create_aws_profile(name: str, region: str, *, account: str = "",
                 "or environment variables."
             )
         python_bin = sys.executable or "python3"
-        # Deliberately a bare "aws" (NOT the deploy engine's absolute resolver,
-        # #4770): this command is persisted into ~/.aws/config and later run by
+        # Deliberately a bare "aws" (NOT the deploy engine's absolute resolver):
+        # this command is persisted into ~/.aws/config and later run by
         # whichever AWS CLI/SDK reads that profile — possibly a different user
         # shell, possibly long after the CLI was reinstalled elsewhere. An
         # absolute path resolved in the gateway's environment today can be

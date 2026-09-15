@@ -183,7 +183,7 @@ _REFERENCE_MARKER = "<!-- cron-ref -->"
 #: threshold sits well above break-even rather than at it: a 100-char message
 #: repeated across a full 200-row window costs ~20KB against a 10MB rotation
 #: budget, which is not worth trading the text for. The saving only becomes worth
-#: the indirection at the kilobyte-prompt scale this change exists for.
+#: the indirection at the kilobyte-prompt scale.
 _MIN_PROMPT_CHARS_TO_REFERENCE = 500
 
 #: How far back a reference may reach for its antecedent, in ROWS of the tab.
@@ -358,6 +358,62 @@ def _prompt_already_recorded(slot: Any, prompt_body: str, own_marker: str) -> bo
     return False
 
 
+def _safe_job_name(job: "CronJob") -> str:
+    """The display form of ``job.name``: URL pass first, credential pass over
+    its output — the ORDER is part of the contract (the sibling test module
+    mirrors it byte-for-byte), so it lives in one place for the slot title and
+    the run headers alike."""
+    safe_name, _ = redact_exfiltration_urls(job.name)
+    safe_name, _ = redact_credentials(safe_name)
+    return safe_name
+
+
+def _bind_cron_slot(
+    state: DashboardState,
+    job: "CronJob",
+    history: list[dict[str, Any]] | None,
+) -> Any:
+    """Create-or-find the job's dashboard slot, bind its identity, publish it.
+
+    The single shared core for BOTH creator paths — the result injection below
+    and the run-start pre-create (:func:`ensure_cron_slot`) — so the two can
+    never diverge on the link/hydration invariant: ``linked_session_key`` and
+    the hydration from the ``cron:{id}`` transcript move TOGETHER. A slot
+    linked without hydration hands a follow-up turn no memory of prior runs; a
+    hydration without the link would re-run on every bind. Keeping both under
+    the one unlink guard makes every caller after the first an idempotent
+    no-op, which is what lets the injection run unchanged after a pre-create.
+    """
+    slot = state.get_or_create_slot(
+        name=f"cron-{job.id}",
+        agent=job.member_id or job.agent_id or "",
+        # A cron result is the job's output, not something the person typed.
+        # A USER label would expose it to any app holding `slots:user`.
+        origin=SlotOrigin.CRON,
+    )
+    slot.title = f"Cron: {_safe_job_name(job)}"
+    # A provider-template alias on a legacy V1 job cannot authorize a private
+    # member. Private cron dispatch publishes its protected session binding;
+    # follow-up turns must use that binding instead of minting one from agent_id.
+    slot._memory_assignment_from_history = True
+    if job.memory_store:
+        slot.memory_store = job.memory_store
+    if not slot.linked_session_key:
+        slot.linked_session_key = f"cron:{job.id}"
+        hydrate_slot_from_history(slot, history or [])
+    # Publish the (possibly just-created) tab to the dashboard-surface registry
+    # BEFORE anything routes against it. Every gate that asks "does this session
+    # have a tab?" — dashboard_slot_key for sub-agent event routing and
+    # completion injection, widget/question/approval delivery — reads that
+    # registry, and a created-but-unpublished slot silently fails those gates
+    # until some unrelated slot change happens to republish. (Same invariant as
+    # channel_slots.reconcile — see the comment there.)
+    from kiro_crew.dashboard.chat_utils import _sync_dashboard_slots
+
+    _sync_dashboard_slots(state)
+    return slot
+
+
 def inject_cron_result_to_dashboard(
     state: DashboardState,
     job: "CronJob",
@@ -372,25 +428,27 @@ def inject_cron_result_to_dashboard(
     ``history`` is the ``cron:{id}`` transcript, hydrated into the slot the first
     time this binds one. It is REQUIRED and has no default on purpose: this
     function is synchronous and every caller is async, so a default would let a
-    caller silently hand the whole-transcript parse back to the event loop --
-    the defect issue #7408 fixed at five sites, four of which were exactly that
-    omission. Without a default, forgetting it is a ``TypeError`` at the call,
-    not a stall in production. Async callers get the value from
+    caller silently hand the whole-transcript parse back to the event loop.
+    Without a default, forgetting it is a ``TypeError`` at the call, not a stall
+    in production. Async callers get the value from
     :func:`prefetch_cron_history`; a sync caller must read it itself and own the
     blocking cost.
 
     ``None`` is legal and means "the injection will not need it" -- the state
     :func:`prefetch_cron_history` skips its read in. It cannot mean a lost
     hydration, because the only state that consumes ``history`` is an unlinked
-    slot, and the sole writer of ``linked_session_key`` for a cron slot is the
-    line below, which runs in this same synchronous block.
+    slot, and the only writer of ``linked_session_key`` for a cron slot is
+    :func:`_bind_cron_slot` — shared by this function and the run-start
+    pre-create (:func:`ensure_cron_slot`), both of which hydrate in the same
+    step that links. A slot that is already linked was hydrated when it was
+    linked, whichever path did it.
 
     Writes the run as a PAIR: the job's own prompt as a ``user`` row, then the
     result as an ``assistant`` row, both headed by :func:`run_stamp`. The
     executor streams the prompt straight to the provider and never persists it,
-    so a follow-up turn used to replay a stack of results with nothing saying
-    what any of them had been asked -- it could not tell which run the person in
-    front of it was answering. The pair is written only when the run produced a
+    so without the user row a follow-up turn replays a stack of results with
+    nothing saying what any of them was asked -- it cannot tell which run the
+    person in front of it is answering. The pair is written only when the run produced a
     result, so neither row can appear without its counterpart.
 
     ``include_prompt`` is False for a caller that is RE-SURFACING an older
@@ -410,30 +468,8 @@ def inject_cron_result_to_dashboard(
     replay path, or a run that measured nothing) records nothing and keeps
     whatever snapshot an earlier run stored.
     """
-    slot_name = f"cron-{job.id}"
-    slot = state.get_or_create_slot(
-        name=slot_name,
-        agent=job.agent_id or "",
-        # A cron result is the job's output, not something the person typed.
-        # A USER label would expose it to any app holding `slots:user`.
-        origin=SlotOrigin.CRON,
-    )
-    safe_name, _ = redact_exfiltration_urls(job.name)
-    safe_name, _ = redact_credentials(safe_name)
-    slot.title = f"Cron: {safe_name}"
-    if not slot.linked_session_key:
-        slot.linked_session_key = f"cron:{job.id}"
-        hydrate_slot_from_history(slot, history or [])
-    # Publish the (possibly just-created) tab to the dashboard-surface registry
-    # BEFORE anything routes against it. Every gate that asks "does this session
-    # have a tab?" — dashboard_slot_key for sub-agent event routing and
-    # completion injection, widget/question/approval delivery — reads that
-    # registry, and a created-but-unpublished slot silently fails those gates
-    # until some unrelated slot change happens to republish. (Same invariant as
-    # channel_slots.reconcile — see the comment there.)
-    from kiro_crew.dashboard.chat_utils import _sync_dashboard_slots
-
-    _sync_dashboard_slots(state)
+    slot = _bind_cron_slot(state, job, history)
+    safe_name = _safe_job_name(job)
 
     # Rows this call owes the durable transcript, in the order they happened.
     # Collected rather than written per row: the pair is flushed once, below,
@@ -579,6 +615,42 @@ async def prefetch_cron_history(state: DashboardState, job_id: str) -> list[dict
     if slot is not None and slot.linked_session_key:
         return None
     return await asyncio.to_thread(state.conversation_log.read_messages, f"cron:{job_id}")
+
+
+async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
+    """Make an eligible job's tab exist — and carry its identity — at run START.
+
+    :func:`inject_cron_result_to_dashboard` is the other creator site for a
+    ``cron-{job.id}`` slot, and it runs only after the turn finishes — too late
+    for a brand-new job's FIRST run: session-control caller identity resolves
+    through the live slot table (``caller_slot_key`` matches the presented
+    ``cron:{job_id}`` against each slot's link), so without this pre-create every
+    verb a first run calls refuses with ``caller_unidentified`` — on exactly the
+    run a person watches after creating the job. The dashboard-surface registry
+    has the same first-run dependency for sub-agent event routing, completion
+    injection, and widget/question/approval delivery. From the second run onward
+    the previous delivery's slot covers all of it.
+
+    Eligibility lives HERE, not at call sites: only a job that will get this
+    tab at delivery anyway (``job.persistent_session and not
+    job.hide_in_chat``) is pre-created. For everything else,
+    no-tab / no-identity / no-dispatch stays the deliberate fail-closed
+    contract — an ineligible job is untouched by this call.
+
+    Cheap on every run after the first: an existing linked slot returns before
+    any transcript I/O. The first bind reads the ``cron:{id}`` history via
+    :func:`prefetch_cron_history` (off-loop) BEFORE linking, because the link
+    and the hydration must move together — see :func:`_bind_cron_slot`. The
+    injection's own unlink guard then no-ops, so delivery behaves identically
+    whether or not the tab was pre-created.
+    """
+    if not (job.persistent_session and not job.hide_in_chat):
+        return
+    slot = state.get_slot(f"cron-{job.id}")
+    if slot is not None and slot.linked_session_key:
+        return
+    history = await prefetch_cron_history(state, job.id)
+    _bind_cron_slot(state, job, history)
 
 
 def hydrate_slot_from_history(slot: Any, messages: list[dict[str, Any]]) -> None:

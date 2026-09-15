@@ -69,6 +69,15 @@ def _default_dir() -> Path:
     import first loads this module. Resolving on each call is cheap: the first
     ``config_dir()`` of the process caches the resolved home.
     """
+    from kiro_crew.config.paths import private_runtime_log_dir
+
+    private_logs = private_runtime_log_dir()
+    if private_logs is not None:
+        # A separate process-local diagnostic chain never appends to, nor
+        # supplies authority for, the gateway's global audit chain.
+        directory = private_logs / f"audit-{os.getpid()}"
+        platform_compat.make_owner_only_dir(directory)
+        return directory
     return config_dir()
 
 
@@ -230,14 +239,14 @@ _RETENTION_DAYS = 365
 # ── Size rotation ──
 # The live log is closed (renamed into _SEGMENT_SUBDIR) once an append would
 # push it past _SEGMENT_MAX_BYTES, and at most _SEGMENT_KEEP closed segments are
-# retained, oldest deleted first. Without this the log grew without bound: a
-# long-running install reached 4.09 GB, at which point the sanctioned reader was
-# impractical and every append/read paid the size (issue #4843). The ceiling is
+# retained, oldest deleted first. Without this the log grows without bound: a
+# long-running install reached 4.09 GB, at which point the sanctioned reader is
+# impractical and every append/read pays the size. The ceiling is
 # _SEGMENT_MAX_BYTES * (_SEGMENT_KEEP + 1) -- ~256 MiB, roughly 500k events at
 # the ~513 bytes/event measured on a real log. Age-based retention
-# (_RETENTION_DAYS, swept by prune()) still applies on top and is unchanged;
+# (_RETENTION_DAYS, swept by prune()) still applies on top;
 # size rotation is what bounds the log BETWEEN those daily sweeps, which is the
-# window the 4.09 GB was accumulated in.
+# window that 4.09 GB accumulated in.
 # Closed segment: security_events-<6-digit sequence>-<UTC stamp>.jsonl. The
 # SEQUENCE, not the timestamp, orders segments: it is derived from the highest
 # one still on disk plus one, so it keeps increasing across retention deletions
@@ -1165,9 +1174,9 @@ class SecurityEventLog:
         # helper here therefore means first deciding what a non-local volume
         # gets, the way ``write_config_atomically`` gates its own lockdown on
         # ``windows_acl.volume_is_local``; until that is settled the log keeps
-        # whatever DACL it inherits on Windows. Tracked in #6359.
+        # whatever DACL it inherits on Windows.
         try:
-            os.chmod(self._path, 0o600)  # lockdown-ok: #5228 -- unbounded SMB round-trip on the loop
+            os.chmod(self._path, 0o600)  # lockdown-ok: unbounded SMB round-trip on the loop
         except OSError:
             logger.warning("Failed to enforce 0o600 permissions on SEL audit log %s", self._path, exc_info=True)
         self._live_seen = (written.st_dev, written.st_ino, written.st_size)
@@ -1403,15 +1412,15 @@ class SecurityEventLog:
         # the key file visible only once it is complete.
         #
         # ``restrict_to_owner=True`` locks the temp file down BEFORE the key
-        # bytes reach it — the previous post-rename lockdown left a brand-new
+        # bytes reach it — a post-rename lockdown would leave a brand-new
         # key readable under the inherited DACL on Windows for the write
-        # window (issue #5285) — and implies 0o600 on POSIX.
+        # window — and implies 0o600 on POSIX.
         # ``restrict_on_error="warn"`` keeps this site's fail-SOFT policy: a
         # read-only FS / chmod failure must not crash SecurityEventLog init
         # (see test_chmod_failure_is_swallowed). The linked-parent refusal
         # implied by ``restrict_to_owner=True`` raises unconditionally, which
         # is the right behavior for the key that signs the audit chain: a
-        # pre-planted link under the trust dir is hostile (#4381).
+        # pre-planted link under the trust dir is hostile.
         atomic_write(key_path, key, restrict_to_owner=True, restrict_on_error="warn")
         return key
 
@@ -1448,11 +1457,11 @@ class SecurityEventLog:
         tip, which is the reason the lock spans the append at all: the contended
         path re-checks the live log's identity and re-anchors the tip immediately
         before the caller chains (see :meth:`_reanchor_if_replaced`). A rotation
-        that lands between that check and the append is the residual, and it is
-        the pre-existing cross-process interleaving race rather than an
-        escalation of it -- closing THAT means holding a cross-process lock
+        that lands between that check and the append is the residual, a
+        cross-process interleaving race -- closing THAT means holding a
+        cross-process lock
         across every audit write, which is both the event-loop hazard above and
-        the hot-path cost #4247 is about.
+        a hot-path cost.
 
         Every failure -- an uncreatable/planted segment dir, a planted or
         unopenable lock file -- yields WITHOUT rotating so the audit record still
@@ -1596,10 +1605,10 @@ class SecurityEventLog:
         reports it (a fresh file gets a new inode), and is skipped when either
         side reports 0 — some Windows filesystems do not supply a file index.
 
-        The residual after this is the pre-existing one: a rotation landing
+        The residual after this is a rotation landing
         between this stat and our append. Closing THAT means holding a
-        cross-process lock across every audit write, which is the hot-path cost
-        #4247 is about, so it stays measured rather than paid for here.
+        cross-process lock across every audit write, a hot-path cost,
+        so it stays measured rather than paid for here.
         """
         identity = self._live_identity()
         previous = self._live_seen
@@ -1864,7 +1873,7 @@ class SecurityEventLog:
         works with what it has: rotation then simply does not find the segments
         beyond it, which leaves the log over budget rather than blocking a write.
 
-        *pin* is the read-side directory pin (#4999). The walk itself stays
+        *pin* is the read-side directory pin. The walk itself stays
         the same bounded, BY-NAME scan on every platform — the cap above is
         the memory bound, and materializing an unbounded listing first (as an
         fd-relative ``os.listdir`` would) would spend unbounded memory just to
@@ -2140,7 +2149,11 @@ class SecurityEventLog:
         The HMAC chain (prev_hash/entry_hash) is computed in the writer thread
         in enqueue order, so callers never pay the hash + file-append cost on
         the hot path. If the writer can't be started (unexpected), fall back to
-        a synchronous write so an event is never silently dropped.
+        a synchronous write off the event loop; ON the loop the non-critical
+        event is dropped with a warning instead, because the inline write's
+        filesystem work would freeze every task the loop serves
+        (no-blocking-call-on-event-loop) — best-effort audit loss is the
+        survivable direction.
 
         When ``critical=True`` the event is written SYNCHRONOUSLY and a
         filesystem failure is re-raised, so a fail-closed caller (e.g. safety
@@ -2179,13 +2192,33 @@ class SecurityEventLog:
                 self.flush()
             self._flush_batch([event], raise_on_error=True)
             return
+        incremented = False
         try:
             self._ensure_writer()
             with self._pending_cond:
                 self._pending += 1
+            incremented = True
             self._queue.put(event)
         except Exception:
-            # Writer unavailable — write synchronously so the audit entry lands.
+            # The event never reached the queue, so return its pending credit —
+            # otherwise flush() waits its full timeout on a count nothing will
+            # ever decrement (the writer only credits batches it dequeues).
+            if incremented:
+                self._decr_pending(1)
+            # Writer unavailable. Off the loop, write synchronously so the
+            # audit entry lands. ON the loop, drop it instead: `_flush_batch`
+            # is redaction + chain lock + open/write/flush on the caller's
+            # thread, and a non-critical audit is best-effort by contract —
+            # losing one event is survivable, freezing every session's turn
+            # and the liveness heartbeat is not (no-blocking-call-on-event-loop).
+            # Critical writes never take this branch; they fail closed above.
+            if _on_event_loop():
+                logger.warning(
+                    "SEL writer enqueue failed on the event loop; "
+                    "dropping non-critical event",
+                    exc_info=True,
+                )
+                return
             logger.warning("SEL writer enqueue failed; writing synchronously", exc_info=True)
             self._flush_batch([event])
 
@@ -2367,6 +2400,18 @@ class SecurityEventLog:
         Pass ``critical=True`` for fail-closed audits (e.g. safety-override
         activation): the event is written synchronously and a filesystem
         failure is re-raised so the caller can refuse the audited action.
+
+        ``outcome`` is redacted and clipped like ``resources`` and ``error``,
+        even though it reads as a constrained vocabulary. It is not one at this
+        boundary: an installed app reaches this helper through ``ctx.audit``, so
+        the value can be caller text rather than an in-tree constant, and this
+        log is append-only and served over ``/api/sel/events`` -- a secret that
+        lands here has no recovery path. The pass is the identity function on
+        every spelling in-tree code writes (``ok``, ``denied``, ``completed``,
+        ``rejected``, ``allowed``), so no existing row changes; it is applied
+        here rather than in each caller so a new filler cannot miss it. The
+        writer's own pass is not the backstop: ``_REDACTED_TEXT_FIELDS`` omits
+        ``outcome`` because identity-shaped fields stay verbatim there.
         """
         self.log(
             SecurityEvent(
@@ -2377,7 +2422,7 @@ class SecurityEventLog:
                 agent="",
                 source=source,
                 operation=operation,
-                outcome=outcome,
+                outcome=_redact_and_clip(outcome) if outcome else "",
                 resources=_redact_and_clip(resources) if resources else "",
                 error=_redact_and_clip(error) if error else "",
             ),
@@ -2407,14 +2452,14 @@ class SecurityEventLog:
         serializing every append, and why a check that can fire on a benign cause
         is worse than no check.
 
-        Segments are enumerated under a read-side directory pin (#4999): the
+        Segments are enumerated under a read-side directory pin: the
         segment dir that refused to pin (a planted link, or not a directory)
         contributes NOTHING here rather than being walked by name — which is
         what makes a swapped ``security_events.d`` fail closed instead of
         inflating ``total`` with another tree's files (a false tamper alarm).
 
-        ``detailed=True`` adds the third outcome that refusal needs (#5051
-        review): ``history_verifiable=False`` with a ``reason`` when the
+        ``detailed=True`` adds the third outcome that refusal needs:
+        ``history_verifiable=False`` with a ``reason`` when the
         directory refused to pin or was replaced mid-verification, because
         the rotated segments were not checked and "intact over the live log
         alone" must not be able to hide that. A directory that simply does
@@ -2486,7 +2531,7 @@ class SecurityEventLog:
         clean ``(0, 0)``. Rotated segments ARE enumerated, attacker-nameable
         entries, and take the descriptor-validating funnel
         (:func:`_open_segment`), which resolves them relative to *pin* when
-        the read holds one (#4999) — a segment dir swapped after the pin
+        the read holds one — a segment dir swapped after the pin
         cannot redirect the open.
         """
         if path == self._path:
@@ -2573,7 +2618,7 @@ class SecurityEventLog:
         # Newest first: the live log, then rotated segments newest to oldest.
         # Segments are discovered LAZILY (only if the live log has not already
         # satisfied the request), so the common tail read touches one file.
-        # The segment dir is PINNED for the whole walk (#4999) so a directory
+        # The segment dir is PINNED for the whole walk so a directory
         # swapped mid-read cannot redirect later opens; the early returns below
         # all unwind through the finally that releases the pin.
         pin, _absent = _open_segment_dir(self._segment_dir)
@@ -2629,7 +2674,7 @@ class SecurityEventLog:
         A generator so segments are neither listed nor opened when the live log
         already answered the caller.
 
-        *pin* is the caller's read-side directory pin (#4999), owned and
+        *pin* is the caller's read-side directory pin, owned and
         released by the caller. ``None`` means the directory refused to pin —
         a planted link, or not a directory — and the response is to offer NO
         segment sources rather than fall back to a by-name walk, which is
@@ -2699,7 +2744,7 @@ class SecurityEventLog:
         planted under a segment name yields nothing here instead of being
         followed (or, for a FIFO, blocking the reader inside ``open``); the
         live log itself opens ordinarily, matching its writer. A read holding
-        a directory pin resolves segments relative to it (#4999).
+        a directory pin resolves segments relative to it.
         """
         handle = self._reader_handle(path, binary=True, pin=pin)
         if handle is None:
@@ -2919,7 +2964,7 @@ def _open_segment(path: Path, *, pin: _SegmentDirPin | None = None) -> int | Non
     its writer follows an operator's symlink, so its readers must too
     (:meth:`SecurityEventLog._reader_handle` owns that split).
 
-    With a *pin* (#4999) the final DIRECTORY hop is pinned too: the open (and
+    With a *pin* the final DIRECTORY hop is pinned too: the open (and
     the identity check below) resolve RELATIVE to the pinned descriptor where
     the platform has directory descriptors, so a ``security_events.d`` swapped
     after the pin cannot redirect the open into another tree; where it does
@@ -3047,7 +3092,7 @@ _PIN_BY_FD_SUPPORTED = (
 
 @dataclass
 class _SegmentDirPin:
-    """A read-side pin on the segment directory (#4999).
+    """A read-side pin on the segment directory.
 
     ``fd`` is the strong form — an open directory descriptor nothing can swap
     afterwards — and every per-file OPEN held by the read resolves RELATIVE
@@ -3082,7 +3127,7 @@ class _SegmentDirPin:
 
 
 def _open_segment_dir(path: Path) -> tuple[_SegmentDirPin | None, bool]:
-    """Pin the segment DIRECTORY a read is about to walk (#4999).
+    """Pin the segment DIRECTORY a read is about to walk.
 
     The directory-level analog of :func:`_open_segment`: that function pins
     the final component, this one pins the hop above it. Without it, a
@@ -3096,10 +3141,10 @@ def _open_segment_dir(path: Path) -> tuple[_SegmentDirPin | None, bool]:
     walking the path anyway is exactly what a swapped directory exploits.
     *absent* is CONFIRMED absence (ENOENT) as the pin itself observed it —
     the one benign shape, a fresh install, which yields the same empty
-    outcome the unpinned scan always produced. A caller reporting on the
+    outcome an unpinned scan produces. A caller reporting on the
     read must keep THAT classification instead of re-stating the path: a
     concurrent repair can remove a refused link before anyone looks again,
-    and the refusal would silently reclassify as absence (#5051 review).
+    and the refusal would silently reclassify as absence.
     Judged, in the same three-layer spirit:
 
     - ``lstat`` + ``is_link_or_junction`` (junction-aware on Windows) refuses
@@ -3184,7 +3229,7 @@ def _open_segment_dir(path: Path) -> tuple[_SegmentDirPin | None, bool]:
 
 
 class SelVerification(NamedTuple):
-    """``verify_integrity(detailed=True)``'s result (#5051 review).
+    """``verify_integrity(detailed=True)``'s result.
 
     ``total``/``valid`` keep the plain two-number contract; the added pair
     states whether the audit HISTORY was verifiable at all. A segment
@@ -3237,13 +3282,22 @@ def _infer_source(session_key: str) -> str:
     governance check that is not driven by any user-facing surface (app
     activation, Slack workspace admission).  It gives operators a stable,
     honest bind target (``bind: {type: surface, id: host}``) instead of the
-    accidental ``slack`` an empty key used to classify to.
+    accidental ``slack`` an empty key would otherwise classify to.
     """
     if not session_key:
         return "unknown"
     if session_key == "_host":
         return "host"
     if session_key.startswith("dashboard:"):
+        return "dashboard"
+    # The side chat (``dashboard/handlers/side.py``) runs its isolated LLM
+    # session under ``side:<slot>``. That IS a dashboard surface — the slot's
+    # own side panel — keyed apart from ``dashboard:<slot>`` only so the ACP
+    # session and its SEL rows stay separate from the parent slot's. Classifying
+    # it here keeps every consumer in step: a dashboard-bound governance profile
+    # (``governance_profiles.resolve_active_scope``) binds a side turn exactly as
+    # it binds the parent slot, and the ``slack`` fallback below never claims it.
+    if session_key.startswith("side:"):
         return "dashboard"
     if session_key.startswith("cron:"):
         return "cron"
@@ -3260,9 +3314,9 @@ def _infer_source(session_key: str) -> str:
     # Namespaced messaging channels carry their transport as the first key
     # segment (``{channel}:{agent}:...`` per messaging/link.build_dm_session_key,
     # or a ``{channel}_`` prefix). Match the SAME set context._runtime_display_name
-    # uses (#979) so SEL attribution and the display name stay in lockstep.
+    # uses so SEL attribution and the display name stay in lockstep.
     # Bare/legacy Slack keys (thread timestamps like ``C08...:thread``) have no
-    # namespace prefix and correctly retain the historical ``slack`` fallback.
+    # namespace prefix and correctly retain the legacy ``slack`` fallback.
     lowered_key = session_key.lower()
     for namespace in (
         "discord",
@@ -3322,6 +3376,60 @@ def sel() -> SecurityEventLog:
     return SecurityEventLog()
 
 
+async def warm_sel_singleton() -> None:
+    """Prime the SecurityEventLog singleton OFF the event loop at startup.
+
+    The first ``sel()`` of a process runs ``_init_locked`` — blocking file I/O
+    (trust-dir creation, HMAC key load/create, a tail read of the live log) —
+    on whatever thread touches it first. Without this warm, every
+    handler that could plausibly be a fresh gateway's first SEL touch needs
+    its own ``asyncio.to_thread`` wrapper, and the 250+ other
+    ``log_api_access`` call sites stay candidate first-touch stalls.
+    Warming once here, before the server accepts traffic, closes the
+    class: a post-init ``log_api_access`` only enqueues to the writer thread
+    (after the writer's one-time daemon-thread start on first ``log()``), so
+    call sites need no thread hop.
+
+    Both async startup paths (``start_dashboard`` / ``start_api_server``)
+    ``await`` this before building the middleware chain — the same pattern as
+    ``token_auth.warm_auth_singletons``. The cost does not scale with user
+    data: one key-file read (or create), one backward tail read of the live
+    log (a single 4 KiB chunk on a healthy log; worst case a full backward
+    scan of the live log, bounded by rotation's ``_SEGMENT_MAX_BYTES``, when
+    its tail holds no parseable record), and a ``stat``.
+
+    Best-effort by design: construction can raise (e.g. a trust root too
+    short to sign the chain), and an SEL init failure must not keep the
+    gateway from becoming ready — audit degradation is survivable, a boot
+    loop is not. On a failed warm the first later touch retries init on its
+    caller's thread, as every call site did before the per-site hops existed;
+    every ``critical=True`` audit still fails closed at its own site.
+    """
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:
+        logger.warning(
+            "SEL startup warm failed; the first audit write will retry init",
+            exc_info=True,
+        )
+
+
+def sel_is_warm() -> bool:
+    """Is the singleton constructed, so that ``sel()`` is a plain attribute read?
+
+    The complement to :func:`warm_sel_singleton`'s best-effort contract. A
+    failed warm leaves ``_instance`` allocated but ``_initialized`` False, and
+    the next ``sel()`` retries ``_init_locked`` -- blocking file I/O -- on the
+    caller's thread. A call site that must never block the event loop (a
+    middleware deny path is the one every request can hit) asks this first and
+    takes a thread hop ONLY when the answer is no; on the healthy path (the
+    warm succeeded, which is every normal start) it keeps the direct enqueue.
+    Cheap and lock-free: two attribute reads.
+    """
+    inst = SecurityEventLog._instance
+    return inst is not None and bool(getattr(inst, "_initialized", False))
+
+
 def _trust_root_key_loads(path: Path) -> bool:
     """True when *path* is a regular file currently holding a usable key.
 
@@ -3360,7 +3468,7 @@ def sel_hmac_key_path() -> Path:
     that migration deletes the file this process is still naming. Without
     re-resolution every dependent protocol inherits that dead path and has to
     grow its own recovery, which is one fallback per caller instead of the class
-    being closed (the shape ``session_pid_sig`` was left in by #2574).
+    being closed (the shape ``session_pid_sig`` would be left in).
 
     What re-resolution does NOT touch is the audit chain. The chain is signed
     and verified with ``self._hmac_key``, the BYTES read once at init, and no
@@ -3428,7 +3536,7 @@ def _sel_hmac_key_bytes() -> bytes | None:
     file moving, being deleted, losing read permission, or being truncated
     afterwards. The dependent protocol that re-reads the file on every use is
     not. ``sel_hmac_key_path`` re-resolves a relocation whose bytes match this
-    anchor (#2588), so what reaches here is the residue it cannot resolve — a
+    anchor, so what reaches here is the residue it cannot resolve — a
     key deleted, unreadable, truncated, or replaced by bytes that are not the
     anchor — which is how a gateway would otherwise end up publishing unsigned
     identities forever while its audit chain still looks healthy. These are the
