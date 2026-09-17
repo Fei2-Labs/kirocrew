@@ -328,6 +328,28 @@ class TestSessionCallbackEnv:
         assert env["KIROCREW_BOUND_PORT"] == "18789"
         assert "KIROCREW_CHANNEL_ID" not in env
 
+    def test_pin_leaves_remote_transport_shape_untouched(self) -> None:
+        entries = spec_servers.pin_session_callback_env(
+            [
+                {
+                    "name": "remote",
+                    "type": "http",
+                    "url": "https://example.invalid/mcp",
+                    "headers": [],
+                }
+            ],
+            session_key="session-1",
+            bound_port="18789",
+        )
+        assert entries == [
+            {
+                "name": "remote",
+                "type": "http",
+                "url": "https://example.invalid/mcp",
+                "headers": [],
+            }
+        ]
+
     def test_pin_overwrites_a_stale_port_and_keeps_other_keys(self) -> None:
         entries = spec_servers.pin_session_callback_env(
             [

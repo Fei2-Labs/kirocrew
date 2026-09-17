@@ -385,9 +385,13 @@ verdict is anything but ROUTED — INDETERMINATE included — refuses unless
 `agent.acp_backend_allow_ungated_tools` is set. Crew MCP is
 delivered only when routing is established before `session/new`: OpenCode and pi
 receive it; goose does not because its `approve` pin is acknowledged only after
-the session exists. Codex remains withheld even though its post-session
-`mode=read-only` acknowledgement is enforced on direct integration paths: the
-mode does not route passive reads through Kiro Crew's sensitive-path gate.
+the session exists. OpenCode's mirror owns final array composition because its
+ACP union supports stdio, HTTP and SSE; remote entries retain `type`, `url` and
+`headers` and never pass through the stdio-only reducer, while callback identity
+is pinned only on stdio children. Codex remains withheld even though its
+post-session `mode=read-only` acknowledgement is enforced on direct integration
+paths: the mode does not route passive reads through Kiro Crew's sensitive-path
+gate.
 Adapter resolution honours Windows
 `PATHEXT`; native adapters must resolve to a platform-runnable file, while Node
 entry scripts may be paired with a supported Node runtime. OpenCode is seeded in

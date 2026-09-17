@@ -27,6 +27,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
 )
 
@@ -223,6 +224,44 @@ class TestTheArrayHasOneOwner:
         assert len(names) == len(set(names)), f"duplicate server names: {names}"
         assert "stub" in names
         assert "kirocrew-core" in names
+
+    @pytest.mark.asyncio
+    async def test_opencode_keeps_remote_transports_on_final_wire_array(self, tmp_path) -> None:
+        """OpenCode's HTTP/SSE union must survive final composition.
+
+        ``spec_servers.merge_session_servers`` is intentionally stdio-only for
+        adapters whose schema accepts only ``name``, ``command``, ``args`` and
+        ``env``. Applying it to OpenCode's mirror output drops ``type``, ``url``
+        and ``headers``, producing an invalid union member and ``-32602`` from
+        ``session/new``.
+        """
+        client = _client(ACP_BACKEND_OPENCODE, tmp_path)
+        client._session_mcp_cache = [
+            {
+                "name": "remote",
+                "type": "http",
+                "url": "https://example.invalid/mcp",
+                "headers": [],
+            }
+        ]
+        with (
+            patch.object(client, "_pooled_mcp_servers", return_value=[]),
+            patch.object(
+                client,
+                "_spec_session_mcp_delivery",
+                return_value=(True, [{"name": "kirocrew-core", "command": "core"}]),
+            ),
+        ):
+            out = await client._gated_session_mcp_servers()
+
+        remote = next(entry for entry in out if entry["name"] == "remote")
+        assert remote == {
+            "name": "remote",
+            "type": "http",
+            "url": "https://example.invalid/mcp",
+            "headers": [],
+        }
+        assert "env" not in remote
 
     @pytest.mark.asyncio
     async def test_spec_delivery_resolution_runs_off_the_event_loop(self, tmp_path) -> None:

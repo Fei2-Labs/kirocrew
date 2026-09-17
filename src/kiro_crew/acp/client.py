@@ -5112,14 +5112,22 @@ class AcpClient:
 
         from kiro_crew.acp import spec_servers
 
-        # COMPOSE, do not duplicate: for a harness in
-        # ``ACP_BACKENDS_SESSION_MCP_ARRAY`` the translated agent-spec array
-        # (upstream's ``_session_mcp_servers``, cache-backed and in-memory) is
-        # the source of the user-facing entries, while ``managed`` supplies
-        # Crew's own control-plane servers. Managed goes second so it wins a
-        # name clash with the translation of the same server.
-        managed = spec_servers.merge_session_servers(self._session_mcp_servers(), managed)
-        merged = spec_servers.merge_session_servers(managed, pooled)
+        # COMPOSE, do not duplicate. OpenCode's mirror owns both halves of its
+        # array: it preserves HTTP/SSE entries and places pooled stubs under the
+        # same allowlist and withhold rules as translated entries. Passing that
+        # result through ``merge_session_servers`` would reduce every remote
+        # entry to the stdio-only key set and turn it into an invalid ACP union
+        # member (missing ``type``, ``url`` and ``headers``). The mirror already
+        # includes Crew's managed servers, so its result is complete.
+        if self._is_opencode:
+            merged = self._session_mcp_servers()
+        else:
+            # For non-mirrored spec adapters, the translated agent-spec array
+            # supplies user-facing entries and ``managed`` supplies Crew's own
+            # control-plane servers. Managed goes second so it wins a name clash
+            # with the translation of the same server; pooled stubs win both.
+            managed = spec_servers.merge_session_servers(self._session_mcp_servers(), managed)
+            merged = spec_servers.merge_session_servers(managed, pooled)
         # Adapter-spawned MCP children often inherit only the declared env.
         # Session identity and the bound gateway port have to ride that list
         # or workflow / follow-up tools resolve the wrong loopback.

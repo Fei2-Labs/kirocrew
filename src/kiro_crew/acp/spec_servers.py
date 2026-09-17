@@ -221,6 +221,13 @@ def pin_session_callback_env(
     overwrite = {key for key, _ in extras}
     pinned: list[dict] = []
     for entry in entries:
+        # HTTP/SSE entries have ``headers`` rather than stdio ``env``. OpenCode
+        # preserves those transport unions through final composition, so adding
+        # an unrelated ``env`` key would make its remote entry invalid. Callback
+        # identity belongs only on children the adapter launches itself.
+        if not isinstance(entry.get("command"), str) or not entry["command"]:
+            pinned.append(entry)
+            continue
         raw_env = entry.get("env")
         kept: list[dict] = []
         if isinstance(raw_env, list):

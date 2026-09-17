@@ -27,7 +27,7 @@ tree, which rode eight of the eleven. Converted sites:
 | Keyed on | Behaviour |
 |---|---|
 | `_is_kiro` | `session/set_mode` (the only site that hard-raises), the kiro session-file `_meta`, the transcript JSONL seek, advertised-model entitlement pre-checks, the `cli.json` effort and Tool Search overlays |
-| `_is_spec_adapter` | integer `protocolVersion`, model via `set_config_option`, `mcpServers` carried in session params, the reduced stdio key set, the spec-adapter capability set |
+| `_is_spec_adapter` | integer `protocolVersion`, model via `set_config_option`, `mcpServers` carried in session params, backend-specific MCP entry shaping (stdio-only reduction for adapters with that schema; OpenCode preserves HTTP/SSE unions), the spec-adapter capability set |
 | `CAP_SESSION_SHARING` | `AcpProvider.start()`'s runtime-vs-client arm AND `is_session_sharing_eligible` — `start()` reads the property so the two cannot disagree; `AcpRuntime.spawn()` raises for a backend without the capability |
 | `CAP_MID_TURN_STEER` | `supports_steer` — members are kiro-cli and KAS. `steer()` returns False without sending `_session/steer` on any other harness. `steer_run` then queues follow-up and names the harness rather than hanging. |
 | backend id | `wrap_argv(is_kiro_cli=...)` — names the BINARY, not the dialect: the flag drives macOS delegation to kiro-cli's own internal sandbox, and KAS speaks kiro's dialect but is a Node process with no such sandbox to defer to |
@@ -503,9 +503,14 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
     (`ask_question`, `suggest_followup`). A shell `kind=execute` whose title
     forges that prefix is ignored. `_session_mcp_servers()` remains the one
     entry point every builder calls (`_new_session_following_substitution`,
-    `_initialize_session`); it delegates the shaping to `spec_servers.py`
+    `_initialize_session`); it delegates shaping to the backend mirror and
+    `spec_servers.py`. Stdio-only adapters use
     (`managed_spec_servers`, `merge_session_servers`,
-    `pin_session_callback_env`) so the pooled-stub-outranks-spec-entry and
+    `pin_session_callback_env`); OpenCode's mirror owns complete composition so
+    its HTTP/SSE entries retain `type`, `url` and `headers` instead of passing
+    through the stdio-only reducer. Callback identity pinning applies only to
+    stdio children; remote entries retain their HTTP/SSE shape without an
+    unrelated `env` field. The pooled-stub-outranks-spec-entry and
     fail-soft-on-malformed-spec guarantees the fork's own MCP injection work
     established stay true under the new module split.
   - **claude-agent-acp**: does NOT read any config file or `--agent` flag, so
@@ -513,14 +518,16 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
     `mcpServers` param. `_session_mcp_servers()` — gated on
     `backend in ACP_BACKENDS_SESSION_MCP_ARRAY` (`acp_backends.py`) rather than on
     the harness's identity, so the next adapter that reads no agent spec joins the
-    set instead of adding a branch — delegates to
-    `acp/session_mcp.py:session_mcp_servers`, which reads the SAME
+    set instead of adding a branch — delegates to the selected backend mirror,
+    which uses `acp/session_mcp.py:session_mcp_servers` and reads the SAME
     materialized kiro agent spec (there is no CC-shaped second registry to keep in
     sync) and reshapes it to the ACP array (stdio →
     `{name,command,args,env:[{name,value}],type:"stdio"}`; url →
     `{name,type:"http"|"sse",url,headers:[{name,value}]}` — `env`/`headers` are
     required arrays, emitted even when empty, and the transport `type` is always
-    explicit). The spec's `tools` references gate what mounts, so an entry kiro-cli
+    explicit). OpenCode keeps HTTP/SSE entries in that remote shape through final
+    session composition; callback identity is pinned only onto stdio entries. The
+    spec's `tools` references gate what mounts, so an entry kiro-cli
     declares but does not mount stays unmounted here too; `type:"registry"`
     catalog pointers are withheld; `timeout`, `disabledTools` and `autoApprove` are
     kiro-only and dropped (`autoApprove` deliberately — its CC equivalent would
