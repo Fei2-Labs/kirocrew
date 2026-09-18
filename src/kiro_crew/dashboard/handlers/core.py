@@ -1748,28 +1748,30 @@ def _active_advertised_ids(request: web.Request) -> list[str] | None:
 
 
 def _validate_role_model(
-    value: str, request: web.Request, provider: str | None = None
+    value: str, request: web.Request, provider: str | None = None, backend: str | None = None
 ) -> str | None:
     """Reject a per-role model pin the account cannot use; ``None`` = allow.
 
     ``""`` / ``"auto"`` always allow (they defer to the chat default). Otherwise
-    reuse the per-session provider guard (rejects display-only canonical keys for
-    the active provider), then — when a live advertised set is known — apply the
-    SAME entitlement predicate the session-init withhold uses
-    (:func:`model_is_unusable`) so the picker and the wire cannot disagree.
-    No advertised set => accept (entitlement unknowable; don't accuse on no
-    evidence), matching that predicate's own conservative default.
+    reuse the per-session harness guard (rejects display-only canonical keys on
+    the backend whose namespace they are display-only IN), then — when a live
+    advertised set is known — apply the SAME entitlement predicate the
+    session-init withhold uses (:func:`model_is_unusable`) so the picker and the
+    wire cannot disagree. No advertised set => accept (entitlement unknowable;
+    don't accuse on no evidence), matching that predicate's own conservative
+    default.
 
-    *provider* is forwarded to :func:`_model_rejected_reason` so a caller holding
-    an already-loaded config does not pay a second synchronous config read; the
-    remaining work is in-memory. Omit it and the provider is resolved there.
+    *provider* and *backend* are forwarded to :func:`_model_rejected_reason` so a
+    caller holding an already-loaded config does not pay a second synchronous
+    config read; the remaining work is in-memory. Omit them and the config is
+    read there.
     """
     if not value or value == "auto":
         return None
     from kiro_crew.acp.client import model_is_unusable
     from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
 
-    reason = _model_rejected_reason(value, provider=provider)
+    reason = _model_rejected_reason(value, provider=provider, backend=backend)
     if reason:
         return reason
     advertised = _active_advertised_ids(request)

@@ -92,6 +92,34 @@ the cheaper model's output as the one they asked for.
   id being tested, and callers gate on that. Comparing ids across two harnesses'
   namespaces calls every legitimate model unusable (harness-parity invariant `H12`).
 
+## A display-only id is display-only in ONE namespace
+
+A canonical registry key (`fable-5-1m`, `opus-4.8-1m`) is a display name in the `acp`
+namespace and the WIRE FORMAT in every other one. So "is this id display-only?" is a
+question about the **backend**, and `chat_handlers._model_rejected_reason` keys on
+`capabilities_for(agent.acp_backend).model_id_namespace` — the same field
+`_wire_model_id` translates through, so the guard and the translator cannot disagree
+about one value.
+
+**Never key it on `agent.provider`.** The config schema pins that field to
+`enum=["acp"]`, so every harness this fork selects reads as the same provider and a
+guard asking it cannot tell them apart. Keyed there, the guard refused canonical keys
+on *every* backend — claude-agent-acp included, where `_wire_model_id` translates them
+into the served id — so `_cc_models` offered a model in the picker and the save path
+rejected it as "display-only", naming a provider that was not the reason. This is the
+negative-identity trap in `AGENTS.md` § Harness parity wearing a different hat: the
+guard read a seam as if it were a harness id.
+
+Two consequences for a caller:
+
+- `_model_rejected_reason`, `_validate_role_model` and `_model_pin_rejected` all take
+  `backend=` beside `provider=`. A caller holding a loaded config passes
+  `cfg.agent.acp_backend`; omitting it costs one `KiroCrewConfig.load()`.
+- That load is reached **only for a value that is a canonical key**, which is the sole
+  case whose verdict depends on the harness. Every other pick — a wire id, an
+  advertised id, a `provider/model` pair — answers from memory, so the ordinary path
+  pays no read whether or not a caller supplied anything.
+
 ## The one allowed concrete fallback
 
 The `claude_code` seam's `cc_model` (`_BACKGROUND_CC_MODEL` in `agent.py`) is the one

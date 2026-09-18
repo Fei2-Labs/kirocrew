@@ -4426,7 +4426,9 @@ def _crew_memory_store_rejected(raw: object) -> str | None:
     )
 
 
-def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str | None:
+def _model_pin_rejected(
+    model: str, request: web.Request, provider: str, backend: str | None = None
+) -> str | None:
     """Reason a crew's model pin is unusable, or ``None`` to allow it.
 
     An agent's ``model`` is read by kiro-cli when the child starts, so a pin the
@@ -4435,11 +4437,13 @@ def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str 
     the one moment a human is looking at the value — turns that into a single
     message on the surface that authored it.
 
-    *provider* is passed in rather than resolved here so this whole path adds no
-    config read of its own: every caller already holds a loaded config, and
-    ``KiroCrewConfig.load()`` deep-copies the validated dict even on a cache
-    hit — work that must not land on the event loop while the config lock is
-    held. It is forwarded to the validator for the same reason.
+    *provider* and *backend* are passed in rather than resolved here so this
+    whole path adds no config read of its own: every caller already holds a
+    loaded config, and ``KiroCrewConfig.load()`` deep-copies the validated dict
+    even on a cache hit — work that must not land on the event loop while the
+    config lock is held. Both are forwarded to the validator for the same
+    reason, and the backend is what decides whether a canonical registry key is
+    a display-only spelling at all (see ``_model_rejected_reason``).
 
     A known wrong-flavour registry spelling is reported before entitlement: a
     live advertised set would otherwise replace the actionable ACP-id mapping
@@ -4481,7 +4485,7 @@ def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str 
     # so importing it at module scope would close the cycle.
     from kiro_crew.dashboard.handlers.core import _validate_role_model
 
-    return _validate_role_model(model, request, provider=provider)
+    return _validate_role_model(model, request, provider=provider, backend=backend)
 
 
 async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
@@ -4646,7 +4650,9 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
         cfg = KiroCrewConfig.load()
         if name in cfg.agents:
             return web.json_response({"error": f"Agent '{name}' already exists"}, status=409)
-        model_reason = _model_pin_rejected(model, request, cfg.agent.provider)
+        model_reason = _model_pin_rejected(
+            model, request, cfg.agent.provider, backend=cfg.agent.acp_backend
+        )
         if model_reason:
             return web.json_response({"error": model_reason, "code": "invalid_model"}, status=400)
         # Checked INSIDE the config lock, immediately before the binding is
@@ -4925,7 +4931,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         if "model" in body:
             # Validated before the write, reusing the config loaded just above so
             # this costs no extra read.
-            model_reason = _model_pin_rejected(pending_model, request, cfg.agent.provider)
+            model_reason = _model_pin_rejected(
+                pending_model, request, cfg.agent.provider, backend=cfg.agent.acp_backend
+            )
             if model_reason:
                 return web.json_response(
                     {"error": model_reason, "code": "invalid_model"}, status=400
