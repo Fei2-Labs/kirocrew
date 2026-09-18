@@ -253,7 +253,75 @@ conflict_policy:
       extra captures its later work needed. Diff the two before assuming it:
       take upstream, then port any capture the fork has and upstream lacks.
 
+  # ── the model catalog: upstream owns it, and the fork must not fork it ──
+  - glob: "src/kiro_crew/model_registry.json"
+    policy: upstream_wins
+    note: |
+      NEVER hand-add a model entry here to make a newly served model look right.
+      The catalog is upstream's, both sides would edit the same JSON, and a
+      fork-side entry turns every future model upstream adds into a conflict —
+      for a DISPLAY NAME, which is all such an entry buys: `model_registry.window`
+      already resolves an unlisted id through the `[1m]` heuristic, and
+      `_cc_models` appends any advertised id the catalog does not list
+      (forward-compat), so a model newer than this build is fully USABLE with no
+      entry at all. Measured 2026-09-18: an account served `claude-fable-5-1[1m]`
+      (a model absent from the catalog) resolves window=1000000 source=heuristic
+      and is selectable. Take upstream's file whole; if a model is genuinely
+      missing there, the fix is an upstream PR, not a fork edit.
+
+  # ── model-picker handlers: fork carries two UPSTREAM bugfixes, pending PRs ──
+  - glob: "src/kiro_crew/dashboard/@(chat_handlers.py|handlers/core.py|handlers/agents.py)"
+    policy: union
+    note: |
+      These carry the `model-picker-upstream-bugfixes` divergence: two fixes to
+      bugs that exist in upstream's own copy, held here only until upstream
+      merges them. Take upstream's structure and RE-APPLY the two hunks; do not
+      let a merge restore `is_claude_code(provider)` as the display-only test, or
+      `_advertised_cc_models`'s bare `return []`. Once upstream carries both,
+      DELETE this rule and the divergence entry rather than keeping a rule that
+      guards nothing.
+
 divergences:
+  - id: model-picker-upstream-bugfixes
+    what: |
+      Two fixes in the model picker's save and list paths that upstream's own
+      copy still carries the bugs for. TEMPORARY: both are being submitted
+      upstream, and this entry plus its conflict rule are deleted once upstream
+      carries them.
+
+      (1) `chat_handlers._model_rejected_reason` keys the display-only-key
+      refusal on `capabilities_for(agent.acp_backend).model_id_namespace` --
+      the same field `_wire_model_id` translates through -- instead of on
+      `agent.provider`. `_validate_role_model` and `_model_pin_rejected` take
+      `backend=` beside `provider=` to carry it without a second config read.
+      The `is_canonical_key` test moves AHEAD of the config resolution, so only
+      a canonical key ever costs a load.
+
+      (2) `_advertised_cc_models` falls back to
+      `model_registry.advertised_models(namespace)` -- the cross-session sidecar
+      -- instead of answering `[]` when no session of that namespace is live.
+      BOTH exits change: the `request.app["state"]` early return and the loop's
+      fall-out.
+    why: |
+      (1) The config schema pins `agent.provider` to `enum=["acp"]` -- upstream's
+      too (`config/sections.py`) -- so `is_claude_code(provider)` is a branch
+      that can never be taken and every harness reads as the same provider. The
+      guard therefore rejected canonical registry keys on EVERY backend,
+      including claude-agent-acp, where they ARE the wire format and
+      `_wire_model_id` translates them. Measured: a picker offering
+      "Fable 5 (1M context)" whose save path refused it as "display-only",
+      naming a provider that was not the reason.
+
+      (2) "No live session" is not "nothing advertised". Answering `[]` sent
+      `_cc_models` down its entitlement-unknown branch, which shows the static
+      catalog UNFILTERED -- so a cold dashboard offered models the account
+      cannot run and HID the ones it can, because an id the catalog does not
+      list reaches the picker only through the advertised half. Measured on an
+      account served `claude-fable-5-1[1m]`: the cold picker showed Fable 5
+      (unentitled) and never showed Fable 5.1 (served).
+    pinned_by: "test/test_agent_model_pin_validation.py::TestNoRedundantConfigLoad, test/test_cc_models_endpoint.py::TestTheColdPickerFallsBackToThePersistedSnapshot"
+    decided: 2026-09-18
+
   - id: fork-version-identity
     what: |
       `__version__` stays UPSTREAM's bare literal. The fork half rides a PEP 440
