@@ -1785,7 +1785,7 @@ class TestTrustEndpointAuthorization:
         monkeypatch.setattr(prompts, "_sel", lambda: audit)
         request = SimpleNamespace(get=lambda key, default=None: {"user": "owner"}.get(key, default))
 
-        assert prompts._deny_non_owner_skill_trust(request, "skill_trust_read") is None
+        assert prompts._deny_non_owner_skill_operation(request, "skill_trust_read") is None
         assert audit.log_api_access.call_args.kwargs == {
             "caller": "owner",
             "operation": "skill_trust_read",
@@ -2339,8 +2339,11 @@ class TestProjectSkillsIndexConfinement:
 
         context = loader.get_context(budget=budget, project_dir=project)
 
-        assert "CONFINED RELEASE BODY" in context
+        assert ("CONFINED RELEASE BODY" in context) is (budget is None)
         assert str(skill_file) not in context
+        assert "CONFINED RELEASE BODY" in (
+            loader.read_scoped_skill("release", project_dir=project) or ""
+        )
 
     def test_project_bodies_stop_at_the_skills_section_budget(self, project, tmp_path):
         """Many large confined bodies must not be accumulated before truncation."""

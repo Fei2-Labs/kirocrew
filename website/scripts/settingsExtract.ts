@@ -82,9 +82,9 @@ export function __resetCatalogCache(): void {
 /** Panel file → tab key mapping (derived from SettingsPage.tsx switch).
  *  Only panels that actually render inside a Settings tab are mapped — the
  *  fork is KiroACP-only and de-Amazoned, so upstream's Provider / Secretary /
- *  Sync / TaskKeeper panels are absent, and SharedMcpGatewayToggle /
- *  McpPoolableServers live on the standalone Developer page (not a Settings
- *  tab), so they are intentionally excluded to avoid dead deep-links.
+ *  Sync / TaskKeeper panels are absent, and controls that live on the
+ *  standalone Developer page rather than a Settings tab (e.g. McpManagement)
+ *  are intentionally excluded to avoid dead deep-links.
  *
  *  Entries may carry `params` — extra query params the deep link needs for
  *  the panel to actually mount (the Channels tab is a list-detail view, so
@@ -113,6 +113,7 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'ComputerUsePanel.tsx': 'computer-use',
   'InstancesPanel.tsx': 'instances',
   'SecurityPanel.tsx': 'security',
+  'ConnectionsPanel.tsx': 'connections',
   'SecretsPanel.tsx': 'secrets',
   'NotificationsPanel.tsx': 'notifications',
   'ShortcutsPanel.tsx': 'shortcuts',

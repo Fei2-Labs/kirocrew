@@ -123,7 +123,7 @@ interface Props {
 export function AcpBackendCard({ onSave }: Props) {
   const { data, error, isError, refetch } = useQuery<AcpBackendsPayload>({
     queryKey: ['acp-backends', { probe: true }],
-    queryFn: () => api.acpBackends({ probe: true }) as Promise<AcpBackendsPayload>,
+    queryFn: () => api.acpBackends({ probe: true }) as unknown as Promise<AcpBackendsPayload>,
   })
   const [expanded, setExpanded] = useState<string | null>(null)
   const [pending, setPending] = useState<AcpBackendRow | null>(null)

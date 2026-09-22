@@ -97,9 +97,27 @@ Search for the marker words an internal build uses (`[Internal]`, a fleet name, 
 codename you do not recognise) before committing, and do not rely on
 `internal-content-scan`: it cannot know a codename it has never seen.
 
+`scripts/check_acp_frame_host_data.py` holds the part of that review a machine can:
+twelve marker patterns over every fixture, shrink-only, and baselined per FILE and per
+MARKER CLASS so a new fixture cannot inherit an exemption and an old one cannot acquire
+a second. It is a floor under the hand review, not a replacement for it — it knows the
+markers it was given and nothing about a codename it has never seen either.
+
 Prefer re-recording against throwaway data over editing a capture down: an
 edited frame is no longer evidence of what the wire carried, and the `_meta`
 header claims it is.
+
+Two of the marker classes cannot be re-recorded away, because the value is minted
+by the agent rather than read from the host: a session or request uuid, and a
+scratch run id. The sanctioned remedy for those is normalization AT CAPTURE, in the
+capture script's own reduction step -- the id is replaced with a fixed synthetic
+value (`goose-session-1`, `perm-1`) before the frame is written, the way the goose
+corpus does it, and the `_meta.note` records that the ids are synthetic. A frame
+reduced that way is still evidence: the id was never the fact the fixture pins.
+Until a pre-gate corpus is re-captured through such a step, its uuid and run-id
+entries are an accepted debt, held in the baseline and pinned entry by entry in
+`test_acp_frame_host_data.py`, and paying one down means re-capturing the file,
+not editing the id in place.
 
 ## What the corpus does not pin
 
@@ -135,11 +153,16 @@ than by prose; see `docs/system-specs/modules/agent-host-contract.md`.
 
 ## Provenance of what is committed today
 
-Four of the five backends carry a live capture reaching all seven required
+Five of the six backends carry a live capture reaching all seven required
+Four of the six backends carry a live capture reaching all seven required
 classes. `codex/` carries a live capture of four of them beside a synthesized
 file holding the other three, because a corpus is judged per directory and a
 four-class file cannot satisfy the seven-class gate on its own; its row says what
-stopped the rest. Stated plainly because it
+stopped the rest. `deepseek/` carries live captures reaching six beside a
+synthesized `session/request_permission`, because that harness produced no such
+frame in any capture -- a fact about the harness, recorded in
+`deepseek/README.md` and in the host contract, not a gap in the recording.
+Stated plainly because it
 bounds what the corpus proves: a synthesized fixture locks the dispatch layer's
 behaviour against refactoring, which is what it was built for, and it does
 **not** prove that the backend really emits those shapes. Only a live file
@@ -200,6 +223,8 @@ has never seen, so it is not a safety net — the review step below is.
 | `claude/` | `claude` | **live** | `session.jsonl`: a slice of one `@agentclientprotocol/claude-agent-acp` 0.76.0 turn reaching all seven classes, the adapter delegating to the host `claude` executable. Two shapes here differ from what was assumed: it advertises `loadSession: true`, and its `session/request_permission` params carry no `sessionId` and name the tool under `name`. |
 | `codex/` | `codex` | **live** + synthesized | `session-live.jsonl` is a capture off `codex-acp` 1.11.0 reaching four classes: the initialize response with `agentInfo.version`, the `session/new` response with a `sessionId` and its `configOptions`, `agent_message_chunk`, and the `stopReason` response, plus the `_auth/status_update` the adapter sends before `session/new` and the `session_info_update` frames carrying `_meta.codex`. The three tool classes (`tool_call`, `tool_call_update`, `session/request_permission`) stay in the synthesized `session.jsonl`, because reaching them needs a model that emits a tool call and this host has none it can drive. Its configured provider is `amazon-bedrock` reading a host AWS profile, and that turn ends `stream disconnected before completion: failed to load AWS credentials: the credentials provider was not properly configured` — the recording shell cannot read `~/.aws`, and the Codex wrapper cannot mint a config either (`failed to create temporary file for AWS config: Permission denied (os error 13)`). Repointed at the built-in `ollama` provider it authenticates and runs a full turn against a local 3B model, and that model answers a shell request in prose: it writes a `Preamble:` and a fabricated `Command Output:` block containing the expected text instead of calling a tool. So the three tool shapes follow the parsers in `src/kiro_crew/acp/_dispatch.py`. |
 | `opencode/` | `opencode` | **live** | Five captures off `opencode acp` 1.18.30 driving a local Ollama model, all seven required classes reached live, plus a `session/load` result (`session-load-live.jsonl`: replayed conversation, `configOptions`, no `modes`). `session-live.jsonl`: the initialize response, the `session/new` response, an `agent_message_chunk` turn, a `usage_update` and the `stopReason` response, verbatim and in order. `tool-call-live.jsonl`: a `tool_call` and two `tool_call_update` frames from a call the harness rejected against its own argument schema. `permission-request-live.jsonl`: `tool_call`, the `session/request_permission` frame OpenCode sent with `permission: ask` in force, and the `tool_call_update` frames through `completed` with the command's real output. `mcp-directive-call-live.jsonl`: an MCP tool call -- a `kirocrew-core` stdio element on the `session/new` array exposing `monitor_start` -- carrying opencode's own tool naming (`title` = `kirocrew-core_monitor_start`, ONE underscore, no `_meta.kiro`), `rawInput` empty on the `tool_call` and complete on the refinement, and the tool's result text with its directive marker intact. Slices of longer turns, with the home directory redacted to `~`. |
+| `pi/` | `pi` | **live** | Three captures off `pi-acp` 0.0.33 spawning `pi` 0.85.1 driving a local Ollama model, all seven required classes reached live. `session-live.jsonl`: initialize, `session/new` (a `model` select of `provider/model` ids, a `thought_level` select, `modes`), `available_commands_update`, a `tool_call` + two `tool_call_update` frames for a read pi rejected against its own schema, the chunk and the `stopReason` result. `permission-request-live.jsonl`: the `session/request_permission` pi-acp forwards from Kiro Crew's gate extension (pi has no gate of its own; the frame's `toolCall` describes the confirm DIALOG and the real call rides in its message as a JSON envelope), then the updates through `completed`. `session-load-live.jsonl`: a `session/load` from a second process, replayed conversation, and a result that carries `modes`. |
+| `deepseek/` | `deepseek` | **live**, except one frame | Four captures off `dsh --profile acp` 0.0.1 driving a locally served model. `handshake-live.jsonl`: the initialize response, a `session/new` response, the `session/load` **rejection** (`-32601`, the observation `ACP_BACKENDS_RESUME_WITHOUT_LOAD` rests on) and the `session/list` result. `turn-live.jsonl`: one real turn end to end -- `usage_update`, `tool_call`, `tool_call_update`, `agent_message_chunk` and the `stopReason` response. `mcp-stdio-mount-live.jsonl`: a stdio MCP mount completing a ROUND TRIP -- a broker-stub-shaped element pointing at a real server, then the `tool_call` and result for `mcp__crew-probe__crew_probe_echo` -- which is the observation `ACP_BACKENDS_SESSION_MCP_ARRAY` membership rests on. `mcp-stdio-rollback-live.jsonl`: the same element with an unstartable command, which fails `session/new` WHOLE rather than being dropped. `permission-request-synthesized.jsonl` is the exception and is labelled `synthesized`: four live captures across this harness's confined and read-only postures produced no permission request, because its sandbox decides a tool call itself and the permission frame carries only a model-initiated escalation. Host data pruned under a sweep that refuses to finish if any survives; see `deepseek/README.md`. |
 
 Replacing any row with a live capture is a strict improvement and needs no
 change to the test. Record it, set `recorded` to `live`, fill in the real

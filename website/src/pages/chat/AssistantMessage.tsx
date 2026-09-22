@@ -11,9 +11,11 @@ import MarkdownRenderer from '../../components/MarkdownRenderer'
 import MessageErrorBoundary from '../../components/MessageErrorBoundary'
 import SelectionToolbar, { useSelectionActions } from '../../components/SelectionToolbar'
 import { useSearchHighlight, useCurrentOcc } from '../../hooks/SearchHighlightContext'
-import { applySearchHighlights } from '../../utils/domHighlight'
+import { applySearchHighlights, clearSearchHighlights } from '../../utils/domHighlight'
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
 import FileChangeChips, { type FileChangeEntry } from '../../components/FileChangeChips'
+import DecisionStrip from './DecisionStrip'
+import { readDecisionStrip } from './decisionRecord'
 import type { FileChipStyle } from './ChatSettings'
 import { loadChatConfig } from './ChatSettings'
 import { useSmoothStream } from '../../hooks/useSmoothStream'
@@ -95,7 +97,7 @@ const LazyShareMessageModal = lazy(() => import('./share/ShareMessageModal'))
     unavailable fork affordance that sits outside it. */
 const ACTIONS_REVEAL_CLS = `flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${ICON_ACTION_ROW_CLS}`
 
-const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, planTaskId, onApplyPlan, slotRunning, onSpeak, timestamp, timestampTitle, showFooter = true, revealActions = false, onRegenerate, variants, variantIdx, onSwitchVariant, isRegenerating, onFork, onPlanFromHere, forkIndex, forkMessageId, onLoadEarlier, loadingOlder, earlierRemaining, onQuote, onAsk, messageTs, slotKey, slotTitle, mode, fileChanges, onOpenDiff, fileChipStyle, artifactPaths, turnStats, linkPreviews, pinned, onTogglePin, suppressSteerAck, prevUserText, shareEnabled = false }: { content: string; isStreaming: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; planTaskId?: string; onApplyPlan?: (steps: PlanStepInput[]) => Promise<boolean>; slotRunning?: boolean; onSpeak?: (content: string) => void; timestamp?: string; timestampTitle?: string; showFooter?: boolean; revealActions?: boolean; onRegenerate?: () => void; variants?: { content: string; ts?: string }[]; variantIdx?: number; onSwitchVariant?: (index: number) => void; isRegenerating?: boolean; onFork?: (index: number, messageId?: string) => void | Promise<void>; onPlanFromHere?: (index: number, messageId?: string) => void | Promise<void>; forkIndex?: number; forkMessageId?: string; onLoadEarlier?: () => void; loadingOlder?: boolean; earlierRemaining?: number; onQuote?: (text: string, rect: DOMRect) => void; onAsk?: (text: string, rect: DOMRect) => void; messageTs?: string; slotKey?: string; slotTitle?: string; mode?: string; fileChanges?: FileChangeEntry[]; onOpenDiff?: (path: string, modified: string, original: string) => void; fileChipStyle?: FileChipStyle; artifactPaths?: Set<string>; turnStats?: TurnStats; linkPreviews?: boolean; pinned?: boolean; onTogglePin?: () => void; /** Drop the steer chip: this turn's steer was a system policy notice, not the user's. */ suppressSteerAck?: boolean; /** The user question this reply answered — enables the share card's Q&A pairing. */ prevUserText?: string; /** Governance answer from `/api/dashboard/config` (`social_share_enabled`). The host passes it explicitly; an absent prop hides Share, so a forgotten wire fails closed. */ shareEnabled?: boolean }) {
+const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, planTaskId, onApplyPlan, slotRunning, onSpeak, timestamp, timestampTitle, showFooter = true, revealActions = false, onRegenerate, variants, variantIdx, onSwitchVariant, isRegenerating, onFork, onPlanFromHere, forkIndex, forkMessageId, onLoadEarlier, loadingOlder, earlierRemaining, onQuote, onAsk, messageTs, slotKey, slotTitle, mode, fileChanges, onOpenDiff, fileChipStyle, artifactPaths, turnStats, decisionsStrip, linkPreviews, pinned, onTogglePin, suppressSteerAck, prevUserText, shareEnabled = false }: { content: string; isStreaming: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; planTaskId?: string; onApplyPlan?: (steps: PlanStepInput[]) => Promise<boolean>; slotRunning?: boolean; onSpeak?: (content: string) => void; timestamp?: string; timestampTitle?: string; showFooter?: boolean; revealActions?: boolean; onRegenerate?: () => void; variants?: { content: string; ts?: string }[]; variantIdx?: number; onSwitchVariant?: (index: number) => void; isRegenerating?: boolean; onFork?: (index: number, messageId?: string) => void | Promise<void>; onPlanFromHere?: (index: number, messageId?: string) => void | Promise<void>; forkIndex?: number; forkMessageId?: string; onLoadEarlier?: () => void; loadingOlder?: boolean; earlierRemaining?: number; onQuote?: (text: string, rect: DOMRect) => void; onAsk?: (text: string, rect: DOMRect) => void; messageTs?: string; slotKey?: string; slotTitle?: string; mode?: string; fileChanges?: FileChangeEntry[]; onOpenDiff?: (path: string, modified: string, original: string) => void; fileChipStyle?: FileChipStyle; artifactPaths?: Set<string>; turnStats?: TurnStats; /** Raw `decisions_strip` record off the message, validated here. Absent renders nothing. */ decisionsStrip?: unknown; linkPreviews?: boolean; pinned?: boolean; onTogglePin?: () => void; /** Drop the steer chip: this turn's steer was a system policy notice, not the user's. */ suppressSteerAck?: boolean; /** The user question this reply answered — enables the share card's Q&A pairing. */ prevUserText?: string; /** Governance answer from `/api/dashboard/config` (`social_share_enabled`). The host passes it explicitly; an absent prop hides Share, so a forgotten wire fails closed. */ shareEnabled?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [applied, setApplied] = useState(false)
   // Successful Copy / Copy-link presses flash on the icon for 1.5s. Text-copy
@@ -276,22 +278,25 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
     // otherwise rapid navigation piles up concurrent loops + window listeners.
     const cancelScroll = currentOcc >= 0 ? scrollCurrentMatchIntoView(el) : undefined
 
+    // The highlights are Ranges registered on a page-wide CSS.highlights entry
+    // (see domHighlight), so this bubble's ranges MUST be withdrawn when it
+    // unmounts: a virtualized row that scrolls away would otherwise stay alive
+    // through the ranges pointing into its detached subtree.
+    const withdraw = () => clearSearchHighlights(el)
+
     // Code blocks use dangerouslySetInnerHTML — hljs runs in a child
-    // useEffect and sets innerHTML asynchronously after this effect.
-    // A MutationObserver catches those deferred DOM updates and re-runs
-    // the TreeWalker so code block content gets highlighted too.
-    //
-    // The observer also fires when our own applySearchHighlights mutates
-    // the DOM (inserting <mark> elements). To prevent an infinite loop:
-    // 1. Disconnect the observer before running the TreeWalker
-    // 2. Re-observe after the TreeWalker finishes
-    // 3. Batch rapid mutations via requestAnimationFrame + a scheduled flag
+    // useEffect and sets innerHTML asynchronously after this effect — and a
+    // streaming message re-parses on every token. Either replaces text nodes
+    // the ranges point into, which collapses them (they paint nothing, and
+    // React is untouched). A MutationObserver re-runs the TreeWalker so the
+    // fresh nodes are painted, batched per animation frame because a token
+    // burst fires many mutation records for one visual update. Registering a
+    // Range mutates no DOM, so the walk cannot trigger the observer itself.
     //
     // Performance: the observer fires on any subtree mutation (React
-    // re-renders, hljs updates, our own marks). Each firing runs one
-    // TreeWalker pass which is sub-millisecond even for long messages,
-    // so the extra runs are negligible.
-    if (!term) return () => cancelScroll?.()
+    // re-renders, hljs updates). Each firing runs one TreeWalker pass which is
+    // sub-millisecond even for long messages, so the extra runs are negligible.
+    if (!term) return () => { cancelScroll?.(); withdraw() }
     let disposed = false
     let scheduled = false
     const observer = new MutationObserver(() => {
@@ -300,13 +305,11 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
       requestAnimationFrame(() => {
         scheduled = false
         if (disposed) return
-        observer.disconnect()
         run()
-        observer.observe(el, { childList: true, subtree: true, characterData: true })
       })
     })
     observer.observe(el, { childList: true, subtree: true, characterData: true })
-    return () => { disposed = true; observer.disconnect(); cancelScroll?.() }
+    return () => { disposed = true; observer.disconnect(); cancelScroll?.(); withdraw() }
   }, [term, caseSensitive, currentOcc, effectiveContent, rawMode])
 
   // Four whole-sentence keys, one per combination of the two optional clauses,
@@ -315,6 +318,9 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
   // and the cost parenthetical bind to different parts of the sentence in other
   // languages, and several put the duration last. Interpolated values are
   // already locale-formatted by the `format.ts` seam.
+  // Validated here rather than at the host, so the strip mounts only for a row
+  // that really carries one and the hosts stay a one-property read.
+  const decisionRecord = useMemo(() => readDecisionStrip(decisionsStrip), [decisionsStrip])
   const turnStatsTitle = (() => {
     if (!turnStats) return undefined
     const elapsed = fmtTurnElapsed(turnStats.elapsed_ms)
@@ -530,6 +536,14 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
           to show. */}
       {selectionActions.length > 0 && <SelectionToolbar containerRef={contentRef} actions={selectionActions} />}
     </div>
+    {/* Directly under the bubble, above the file chips: the strip says how THIS
+        reply's skills were chosen, and a long chip list between the two would
+        read as a receipt for something else. Not gated on `isStreaming` — unlike
+        the end-of-turn summaries below it, the record is stamped whole or not at
+        all, so there is no partial form to withhold. */}
+    {decisionRecord && (
+      <DecisionStrip record={decisionRecord} disclosureKey={messageTs ? `dstrip-${messageTs}` : undefined} />
+    )}
     {fileChanges && fileChanges.length > 0 && !isStreaming && (
       /* Pass `onFileOpen` by IDENTITY — a `(p) => onFileOpen(p)` wrapper here is
          a new function every render, which busts FileChangeChips' memo and

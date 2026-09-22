@@ -47,11 +47,74 @@ function MyPage() {
 }
 ```
 
-`useAppApi()` returns a client whose methods (`get`, `post`, `put`, `patch`,
-`del`) call the Gateway endpoints listed below, scoped to the `permissions.api`
-paths your `app.json` declares. The host injects auth automatically.
+`useAppApi()` returns a client whose methods (`raw`, `request`, `get`, `post`,
+`put`, `patch`, `del`) call the Gateway endpoints listed below, scoped to the
+`permissions.api` paths your `app.json` declares. JSON methods parse a JSON
+response; an empty successful response returns `undefined`.
+
+- `raw(path, init?)` returns a successful `Response` without consuming its body.
+  Use it for binary downloads, text or streamed responses and response headers.
+  Non-success responses still throw `AppApiError`. Supply an `AbortSignal` for
+  long-lived streams and abort or cancel the reader when the component unmounts;
+  the method does not implement EventSource reconnect or SSE parsing.
+
+- `request<T>(path, init?)` accepts `RequestInit`, including raw bodies such as
+  `FormData`, headers and an abort signal. It does not set a content type for you.
+- `get<T>(path, init?)` and `del<T>(path, init?)` fix the HTTP method.
+- `post<T>(path, body?, init?)`, `put<T>(path, body?, init?)` and
+  `patch<T>(path, body?, init?)` serialize the body argument as JSON. Their method
+  and body arguments take precedence over `init.method` and `init.body`. Headers
+  are merged with a default `Content-Type: application/json` unless you specify
+  another media type.
+
+The host owns `X-Session-Key`: chat surfaces use their bound session and routed
+app pages use the core dashboard-page identity, `dashboard:ui`. A host-provided
+key overrides a caller-supplied one. If a host has no binding, supplying that
+header is rejected before a request is sent; callers of this scoped client
+cannot choose a session. This is a frontend guardrail, not isolation from other
+JavaScript in the dashboard document; backend authorization remains authoritative.
+The path check applies to the initial URL. Browser redirect behavior remains
+controlled by `RequestInit.redirect` (default `follow`); use `redirect: 'error'`
+when the call must not follow redirects. Redirect targets are not rechecked by
+this client.
+
+HTTP failures remain `Error` objects with the message `API <status>: <body>` and
+now also carry `name: 'AppApiError'`, numeric `status` and string `body`. Import
+`AppApiError` as a **type**, not a runtime constructor. The body is unparsed, so
+parse it only when the endpoint promises JSON (for example, a conflict response).
+Network, abort and successful-response JSON parsing failures retain their original
+error types. Stale-owner reauthentication signaling still runs before an HTTP
+failure is thrown.
+
+The path matcher uses the backend's declared-pattern semantics: `/api/example`
+matches itself and slash-delimited children; `/api/example/*` also includes the
+base path; `/api/example*` includes any string prefix match. Blank entries match
+nothing, surrounding whitespace is stripped, and request paths are normalized
+before matching. A bare trailing slash is literal, not shorthand for `/*`.
+
+An explicit authentication-expiry response (`403`, `X-Auth-Required: true`)
+notifies the dashboard's existing recovery handler. It does not turn ordinary
+permission denials into refresh attempts or automatically replay writes.
 
 For the full hook list see [getting-started.md](getting-started.md#app-sdk-hooks).
+
+## Embedded Chat
+
+`ChatEmbed` mounts Kiro Crew's native transcript and compact composer for an
+existing session. The required `slotKey` selects the session. Existing props such
+as `agent`, `placeholder`, `frameless`, `startAtBottom`, `onSend`, and
+`aboveComposer` keep their current contracts.
+
+```tsx
+import { ChatEmbed } from '@kirocrew/app-sdk'
+
+<ChatEmbed slotKey="coder-abc123" />
+```
+
+The composer accepts multiple lines. `Enter` sends the draft, `Shift+Enter`
+inserts a line break, and an Enter used to commit an input method editor (IME)
+candidate does not send. The box grows with the draft up to 240 pixels, then
+keeps its height and scrolls vertically.
 
 ## Native Chat Panel
 
@@ -405,8 +468,8 @@ class DeployProbe(Probe):
             ])
         obs = []
         if status.rolled_back:
-            # Nothing improves by waiting -> NMI bypasses coalescing.
-            obs.append(Observation("rollback", Severity.NMI,
+            # Nothing improves by waiting -> IMMEDIATE bypasses coalescing.
+            obs.append(Observation("rollback", Severity.IMMEDIATE,
                                    f"{self.env} rolled back."))
         for stage in status.failed_stages:
             obs.append(Observation(f"stage:{stage}", Severity.WAKE,
@@ -431,8 +494,8 @@ Rules:
   It is the only place a verdict is raised.
 - A failed observation returns `Tick(fetch_ok=False)`, never an empty `Tick` —
   an empty tick reads as "nothing is wrong".
-- Use `Severity.NMI` only for what genuinely cannot improve by waiting. Using
-  it to mean "important" defeats coalescing.
+- Use `Severity.IMMEDIATE` only for what genuinely cannot improve by waiting.
+  Using it to mean "important" defeats coalescing.
 - Supply an `epoch` when the subject has an identity token. Without one there
   are no resets, so a re-triggered subject inherits the previous run's masks.
 - Filter out conditions the operator already knows about (a check red on the

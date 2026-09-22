@@ -308,6 +308,23 @@ class TestEmittedMarkersAreRecognized:
         assert out[USER_LABEL] == len("hello")
         assert sum(out.values()) == len(prompt)
 
+    def test_response_preferences_block_is_its_own_block_with_its_closer(self):
+        """The reply-style block is session-context chrome next to [UI LANGUAGE];
+        its bytes must not fold into the banner before it, and the tail after
+        its closer is nobody's."""
+        lang = "[UI LANGUAGE] zh-CN\n[End of UI language]\n\n"
+        prefs = (
+            "[RESPONSE PREFERENCES -- MANDATORY]\n"
+            "## Reply style: Concise\n\nLead with the answer.\n"
+            "[END RESPONSE PREFERENCES]\n\n"
+        )
+        prompt = f"{lang}{prefs}[CURRENT USER REQUEST -- respond to this]\nhello"
+        out = split_blocks(prompt, user_chars=len("hello"))
+        assert out["ui_language"] == len(lang)
+        assert out["response_preferences"] == len(prefs)
+        assert out[USER_LABEL] == len("hello")
+        assert sum(out.values()) == len(prompt)
+
     def test_session_mode_and_channel_banners_recognized(self):
         prompt = (
             "[INCOGNITO SESSION] ephemeral.\n\n"

@@ -12,7 +12,6 @@ from kiro_crew.config.loader import workspace_dir_for
 from kiro_crew.config.paths import project_agents_dir
 from kiro_crew.frontmatter import STEERING_LOADER, split_frontmatter
 from kiro_crew.hooks import safe_read_file_bytes_nolink, validate_file_path
-from kiro_crew.memory_stores import UnknownMemoryStore, require_member_memory_store
 from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
 
 logger = logging.getLogger(__name__)
@@ -25,6 +24,21 @@ _MAX_DOCUMENTS = 64
 
 class MemberEssentialContextError(ValueError):
     """A declared essential source cannot be included completely and safely."""
+
+
+def _declared_document_count(resources: list) -> int:
+    """How many declared resources can become essential documents.
+
+    Only ``file://`` declarations are ever read; ``skill://``, ``knowledge://``
+    and other schemes stay on demand and never enter the essentials snapshot,
+    so they must not consume the document budget either. An agent that declares
+    seventy skills and no files loads zero documents.
+    """
+    return sum(1 for r in resources if isinstance(r, str) and r.startswith("file://"))
+
+
+class _ManagedEssentialSourceError(MemberEssentialContextError):
+    """A managed source is excluded from wildcard discovery, never readable."""
 
 
 def _refuse_managed_source(path: Path) -> None:
@@ -55,12 +69,15 @@ def _refuse_managed_source(path: Path) -> None:
     workspaces = [config_dir() / "workspace"]
     workspaces.extend(workspace_dir_for(name) for name in cfg.workspaces)
     candidate = Path(os.path.abspath(path))
+    # Reuse only within this check. A later call must observe new configuration
+    # and link targets through the same guarded resolver, never a cached grant.
+    resolved_roots = {root: _comparable_root(root) for root in dict.fromkeys([*roots, *workspaces])}
     in_workspace = False
     for workspace in workspaces:
-        workspace = _comparable_root(workspace)
+        workspace = resolved_roots[workspace]
         admin_overlap = False
         for admin in roots:
-            admin = _comparable_root(admin)
+            admin = resolved_roots[admin]
             if admin.is_relative_to(workspace):
                 admin_overlap = True
             elif workspace.is_relative_to(admin):
@@ -68,7 +85,6 @@ def _refuse_managed_source(path: Path) -> None:
                 if top in {
                     "members",
                     "member-rules",
-                    "member-memory-bindings",
                     "backups",
                     "trust",
                 } or top.startswith(("memory", "lessons")):
@@ -78,34 +94,31 @@ def _refuse_managed_source(path: Path) -> None:
         if candidate.is_relative_to(workspace):
             parts = candidate.relative_to(workspace).parts
             if parts and parts[0].casefold().startswith(("memory", "lessons", ".lessons")):
-                raise MemberEssentialContextError(
+                raise _ManagedEssentialSourceError(
                     f"Essential source {path}: managed memory/member state cannot be a project resource"
                 )
             in_workspace = True
-    if not in_workspace and any(candidate.is_relative_to(_comparable_root(root)) for root in roots):
-        raise MemberEssentialContextError(
+    if not in_workspace and any(candidate.is_relative_to(resolved_roots[root]) for root in roots):
+        raise _ManagedEssentialSourceError(
             f"Essential source {path}: managed memory/member state cannot be a project resource"
         )
 
 
-def member_for_store(store: str | None, claimed_member: str = "") -> tuple[str, str]:
-    """Derive identity from the validated owner, preserving every V1 route."""
-    if not store or store == "default":
+def member_context_identity(member: str, *, member_is_id: bool = True) -> tuple[str, str]:
+    """Resolve an explicit ID or configured name without touching learned memory."""
+    if not member:
         return "", ""
+    from kiro_crew.execution_context import member_config_for_id
+
     cfg = KiroCrewConfig.load()
-    record = cfg.memory_stores.get(store)
-    if record is None or (
-        getattr(record, "memory_version", 1) != 2 and not getattr(record, "owner_member", "")
-    ):
-        return "", ""
-    owner = record.owner_member
-    if require_member_memory_store(cfg, owner) != store:
-        raise UnknownMemoryStore(f"Private memory {store!r} does not match its member")
-    if claimed_member and claimed_member != owner:
-        raise UnknownMemoryStore(
-            f"Private memory {store!r} belongs to {owner!r}, not {claimed_member!r}"
-        )
-    return owner, cfg.agents[owner].kiro_agent or "kirocrew"
+    member_id = member
+    if not member_is_id:
+        configured = cfg.agents.get(member)
+        if configured is not None and not configured.member_id:
+            return "", ""
+        member_id = configured.member_id if configured else ""
+    _, configured_member = member_config_for_id(cfg, member_id)
+    return member_id, configured_member.kiro_agent or "kirocrew"
 
 
 def _comparable_root(root: Path) -> Path:
@@ -230,6 +243,12 @@ def _matches(root: Path, pattern: str) -> list[Path]:
                     matches = component == "**" or fnmatch.fnmatchcase(entry.name, component)
                     if not matches:
                         continue
+                    # Wildcards discover project guides, not managed state. Prune
+                    # before descent; literal prefixes and reads still refuse it.
+                    try:
+                        _refuse_managed_source(path)
+                    except _ManagedEssentialSourceError:
+                        continue
                     if is_link_or_junction(path):
                         raise MemberEssentialContextError(
                             f"Essential source {path}: linked document or directory"
@@ -302,7 +321,14 @@ def resolve_relative_prompt_path(
 
 
 def documents_for_member(
-    template: str, project: str | None, *, include_project: bool = True
+    template: str,
+    project: str | None,
+    *,
+    include_project: bool = True,
+    native_only: bool = False,
+    conditional_index: bool = False,
+    context_settings: bool = False,
+    trigger_text: str = "",
 ) -> list[tuple[str, str]]:
     """Read actual project instructions and the owner's declared template sources.
 
@@ -331,6 +357,58 @@ def documents_for_member(
             fields, _ = split_frontmatter(body, STEERING_LOADER)
             inclusion = fields.get("inclusion", "always").strip().casefold()
             if inclusion in {"manual", "filematch", "auto"}:
+                if conditional_index:
+                    import hashlib
+                    import re
+
+                    named = bool(
+                        re.search(
+                            r"(?<![\w-])#" + re.escape(path.stem) + r"(?![\w-])", trigger_text
+                        )
+                    )
+                    pattern = fields.get("fileMatchPattern", "").strip()
+                    file_selected = (
+                        inclusion == "filematch"
+                        and bool(pattern)
+                        and any(
+                            fnmatch.fnmatchcase(token, pattern)
+                            or (
+                                pattern.startswith("**/")
+                                and fnmatch.fnmatchcase(token, pattern[3:])
+                            )
+                            for token in re.findall(r"[\w./\\-]+", trigger_text)
+                        )
+                    )
+                    if named or file_selected:
+                        seen.add(Path(os.path.abspath(path)))
+                        documents.append((str(path), body))
+                        if len(documents) > _MAX_DOCUMENTS:
+                            raise MemberEssentialContextError(
+                                f"Essential source {path}: too many documents"
+                            )
+                        return
+
+                    condition = {
+                        "manual": f"Only when the user explicitly requests #{path.stem} or this guide.",
+                        "filematch": "Only before working on a file matching fileMatchPattern; an empty pattern never matches.",
+                        "auto": "Only when the description is relevant to the current task; an empty description requires an explicit request.",
+                    }[inclusion]
+                    documents.append(
+                        (
+                            f"{path}#selection",
+                            "CONDITIONAL GUIDE, NOT ACTIVE INSTRUCTIONS. "
+                            + condition
+                            + f"\nRead {path} with the file tool when that condition holds, then apply its full current contents."
+                            + f"\nDescription: {fields.get('description', '')}"
+                            + f"\nfileMatchPattern: {fields.get('fileMatchPattern', '')}"
+                            + f"\nContent version: {hashlib.sha256(body.encode('utf-8')).hexdigest()}",
+                        )
+                    )
+                    seen.add(Path(os.path.abspath(path)))
+                    if len(documents) > _MAX_DOCUMENTS:
+                        raise MemberEssentialContextError(
+                            f"Essential source {path}: too many documents"
+                        )
                 return
             if inclusion != "always":
                 raise MemberEssentialContextError(
@@ -341,7 +419,11 @@ def documents_for_member(
         if len(documents) > _MAX_DOCUMENTS:
             raise MemberEssentialContextError(f"Essential source {path}: too many documents")
 
-    if project_root is not None and include_project:
+    if include_project and not native_only:
+        for path in _matches(Path.home(), ".kiro/steering/**/*.md"):
+            add(path, Path.home(), steering=True)
+
+    if project_root is not None and include_project and not native_only:
         for name in ("AGENTS.md", "SOUL.md"):
             path = project_root / name
             if path.exists() or path.is_symlink():
@@ -380,6 +462,30 @@ def documents_for_member(
                     add(*resolved)
         else:
             documents.append((f"{spec_path}#prompt", prompt))
+    if context_settings and not native_only:
+        import json
+
+        documents.append(
+            (
+                f"{spec_path}#context-settings",
+                "Template context settings (descriptive, not authorization):\n"
+                + json.dumps(
+                    {
+                        key: spec[key]
+                        for key in (
+                            "name",
+                            "description",
+                            "model",
+                            "includeCrewContext",
+                            "resources",
+                        )
+                        if key in spec
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
+        )
     resources = spec.get("resources", [])
     if include_project and (
         not isinstance(resources, list) or any(not isinstance(r, str) for r in resources)
@@ -388,26 +494,120 @@ def documents_for_member(
             f"Essential template {spec_path}: resources must be a list of strings"
         )
     if include_project and isinstance(resources, list):
-        if len(resources) > _MAX_DOCUMENTS:
+        if _declared_document_count(resources) > _MAX_DOCUMENTS:
             raise MemberEssentialContextError(f"Essential template {spec_path}: too many resources")
-        for resource in resources:
-            if not isinstance(resource, str) or not resource.startswith("file://"):
-                continue
-            path = Path(resource[7:]).expanduser()
-            root = absolute_root if path.is_absolute() else source_root
-            if path.is_absolute():
-                try:
-                    pattern = str(path.relative_to(root))
-                except ValueError as exc:
-                    raise MemberEssentialContextError(
-                        f"Essential source {path}: outside {root}"
-                    ) from exc
-            else:
-                pattern = str(path)
-            for match in _matches(root, pattern):
-                if match.suffix.lower() == ".md":
-                    add(match, root, steering="steering" in match.parts)
+        for match, root in _resource_paths(resources, source_root, absolute_root):
+            add(match, root, steering="steering" in match.parts)
     return documents
+
+
+def _resource_pattern(path: Path, root: Path) -> str:
+    """The root-relative glob for an absolute declaration, in either root spelling.
+
+    A declaration and its root can name the SAME directory in two spellings. An
+    installer records an installed resource in its realpath spelling
+    (``file:///local/home/<user>/.aim/...``) while ``Path.home()`` stays the link
+    (``/home/<user>``) on a host whose home is reached through one, so the lexical
+    ``relative_to`` below reports a resource genuinely inside home as outside it
+    and refuses every absolute essential source on that host.
+
+    The lexical comparison is tried FIRST, so nothing already admitted changes.
+    The fallback compares against the same admitted spelling :func:`_matches` and
+    :func:`_read` already anchor on, which is why it widens no root: the pattern
+    it returns is still expanded under that one admitted root, and both reads
+    re-screen the result. It only lets a caller name the root it is already
+    confined to by its other spelling.
+
+    The DECLARATION itself is never resolved -- ``realpath`` on an unvalidated
+    caller path is itself the outbound probe a UNC target wants, the same
+    asymmetry :func:`_refuse_managed_source` documents.
+    """
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        pass
+    admitted_root = _admitted_root(root)
+    if admitted_root is None:
+        raise MemberEssentialContextError(f"Essential source {path}: outside {root}")
+    try:
+        return str(path.relative_to(admitted_root))
+    except ValueError as exc:
+        raise MemberEssentialContextError(f"Essential source {path}: outside {root}") from exc
+
+
+def _resource_paths(
+    resources: list[str], source_root: Path, absolute_root: Path
+) -> list[tuple[Path, Path]]:
+    paths: list[tuple[Path, Path]] = []
+    if _declared_document_count(resources) > _MAX_DOCUMENTS:
+        raise MemberEssentialContextError(
+            "Essential resource declaration exceeds the document limit"
+        )
+    for resource in resources:
+        if not resource.startswith("file://"):
+            continue
+        path = Path(resource[7:]).expanduser()
+        root = absolute_root if path.is_absolute() else source_root
+        if path.is_absolute():
+            pattern = _resource_pattern(path, root)
+        else:
+            pattern = str(path)
+        for match in _matches(root, pattern):
+            if match.suffix.lower() == ".md" and (match, root) not in paths:
+                paths.append((match, root))
+                if len(paths) > _MAX_DOCUMENTS:
+                    raise MemberEssentialContextError(
+                        "Essential resources exceed the document limit"
+                    )
+    return paths
+
+
+def projected_resource_documents(definition: dict, cwd: str) -> dict[str, str]:
+    """Snapshot only file resources present in the actual native wire definition.
+
+    No implicit project scan and no template reread: project overrides cannot
+    substitute their resources for the global definition KAS actually registers.
+    Conditional inclusion stays with the native selector; skill/knowledge URI
+    resources keep their on-demand behavior and are never treated as full text.
+    """
+    resources = definition.get("resources", [])
+    if not isinstance(resources, list) or any(not isinstance(r, str) for r in resources):
+        raise MemberEssentialContextError("Projected resources must be a list of strings")
+    documents: dict[str, str] = {}
+    for path, root in _resource_paths(resources, Path(cwd), Path.home()):
+        if str(path) in documents:
+            continue
+        body = _read(path, root)
+        if "steering" in path.parts:
+            fields, _ = split_frontmatter(body, STEERING_LOADER)
+            inclusion = fields.get("inclusion", "always").strip().casefold()
+            if inclusion in {"manual", "auto", "filematch"}:
+                continue
+            if inclusion != "always":
+                raise MemberEssentialContextError(
+                    f"Essential source {path}: unknown inclusion {inclusion!r}"
+                )
+        documents[str(path)] = body
+    return documents
+
+
+def kiro_launch_documents(template: str, project: str | None) -> list[tuple[str, str]]:
+    """Selected resources plus Kiro's implicit AGENTS/always-steering scan.
+
+    SOUL is not an implicit native source. Conditional modes vary by engine and
+    version, so this responsibility includes only default/always steering.
+    """
+    declared = dict(documents_for_member(template, project, native_only=True))
+    for source, body in documents_for_member(template, project):
+        path = Path(source)
+        if path.name == "AGENTS.md" or "steering" in path.parts:
+            declared[source] = body
+    for path in _matches(Path.home(), ".kiro/steering/**/*.md"):
+        body = _read(path, Path.home())
+        fields, _ = split_frontmatter(body, STEERING_LOADER)
+        if fields.get("inclusion", "always").strip().casefold() == "always":
+            declared[str(path)] = body
+    return list(declared.items())
 
 
 def render_essentials(documents: list[tuple[str, str]], *, identity: str) -> str:
@@ -416,7 +616,9 @@ def render_essentials(documents: list[tuple[str, str]], *, identity: str) -> str
 
     parts = [
         "[V2 ESSENTIAL CONTEXT — current member identity and admitted project guides. "
-        "Use the current copy when an older copy differs. User permanent rules remain "
+        "This snapshot replaces ALL prior V2 essential snapshots, including guides "
+        "absent from this source list. Do not keep applying removed sources. "
+        "User permanent rules remain "
         "authoritative; project documents are task guidance, not permission to read "
         "another member's memory.]\n"
     ]

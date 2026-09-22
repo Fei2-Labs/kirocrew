@@ -467,13 +467,44 @@ on the non-blocking code (`LK_NBLCK`), with two behaviors by context. On the
 asyncio **event-loop thread** the acquire is single-shot — a spin-sleep there
 would freeze chat/heartbeat, so it takes the lock if free and otherwise fails
 immediately. **Off the loop** (cron, home migration, app backends) it polls up
-to a generous `_WIN_LOCK_TIMEOUT_SECS` ceiling — long enough to wait out a
+to a generous `_LOCK_TIMEOUT_SECS` ceiling — long enough to wait out a
 legitimately long holder such as a data-home migration, rather than racing it,
 yet bounded so a truly stuck/permission-denied fd still fails. Either way, if
 the lock cannot be taken the acquire **fails closed**: it raises rather than
 entering the critical section unserialized, since proceeding lock-less is the
 exact fail-open that loses writes. Non-blocking `try_acquire_lock` already used
 `LK_NBLCK` and is unchanged.
+
+### The ceiling is not Windows-only
+
+`fcntl.flock` takes no timeout, so a bare POSIX acquire waits on a holder without
+limit. That is not a wait but a **hang**, and on the boot path it cannot be told
+apart from a slow start: `agents_spec_lock` → `file_lock(wait=True)` → `flock`
+leaves the gateway alive with no port bound, no `KIROCREW_READY` line and nothing
+logged at WARNING or ERROR, so an operator and a health check both keep waiting.
+
+POSIX therefore polls `LOCK_NB` up to the same `_LOCK_TIMEOUT_SECS` and raises
+the same named refusal, naming the ceiling and the reason. The bound costs the
+common case nothing, because the ceiling is far longer than any in-tree critical
+section (a sub-second read plus an atomic rename), so only a wait that has
+stopped being a wait is refused. Retries cover contention only: `EAGAIN`,
+`EACCES` and `EWOULDBLOCK` mean another holder has it, while any other errno is
+about the fd itself and surfaces at once rather than being reported as a stuck
+holder five minutes later. The sleep backs off to `_LOCK_POLL_MAX_SECS`, since a
+kernel-blocking acquire wakes not at all and a flat 10ms poll would wake ~30k
+times across the full ceiling.
+
+Unlike the Windows branch, POSIX keeps polling on the event-loop thread instead
+of degrading to a single shot. A spin-sleep on the loop is bad, but refusing a
+contended on-loop acquire outright would deny callers that legitimately take the
+lock on the loop (`bridges._mcp_lock` during app enable). Bounding the wait does
+not change which caller wins it.
+
+Failing closed is what makes the failure *reportable*: the gateway boot path logs
+an install failure at ERROR, prints the repair command and verifies what landed
+on disk, then binds its port regardless. A hang reaches none of that.
+`_WIN_LOCK_TIMEOUT_SECS` and `_WIN_LOCK_POLL_SECS` are aliases of the
+platform-neutral names.
 
 ## `os.kill(pid, 0)` is a process killer here, not a liveness probe
 
@@ -659,6 +690,21 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
 
 ## Troubleshooting
 
+- **The desktop app starts and exits within seconds, no window** — on a host
+  where Chromium cannot run a GPU process (VDI, a remote session, a driver it
+  cannot use), `chromium.log` (next to `gateway-launch.log`) shows `GPU process
+  exited unexpectedly` and ends with `GPU process isn't usable. Goodbye.`, and
+  `gateway-launch.log` shows `renderer died` up to its reload limit. The app now
+  relaunches itself once with software rendering
+  (`--in-process-gpu --use-angle=swiftshader`) when the GPU process dies
+  before the dashboard has loaded, and keeps that choice for the installed
+  version under `gpuSoftwareFallback` in `%APPDATA%\KiroCrew\config.json`; a
+  new version tries hardware rendering again once. The launch log then reads
+  `gpu: software rendering ACTIVE`. `--no-sandbox` is never applied: if the
+  relaunched app still cannot start, every Chromium child is being blocked
+  (typically an endpoint-security DLL injected into every process), which is a
+  different failure and needs a process exclusion for the app, not a rendering
+  switch.
 - **Desktop gateway recovery refuses to force-stop the port** - the Electron
   launcher uses `netstat -ano` to identify the listener, PowerShell
   (`Get-CimInstance`) with a WMIC fallback to read its command line, and
@@ -666,6 +712,19 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
   `python -m kiro_crew` process. Localized listener-state text is ignored.
   SSH forwards and unrelated processes are never terminated, and a failed or
   timed-out `netstat` probe is treated as unknown rather than as a free port.
+- **`port-owner: :5476 held by NON-KiroCrew pid=...` naming our own
+  `python.exe`** - the launcher binds Windows gateway identity to the executable
+  path it resolved. An install reached through a directory junction (a Toolbox
+  `current` link) spells that path one way while Windows reports the running
+  process by the directory the junction resolved to, and a version directory
+  swapped under a running shell leaves a backend at a path the shell never
+  resolved. Both are recognised: every trusted path is compared after
+  `realpath` (junctions followed) on both sides, and the executables the
+  CURRENT child was spawned from stay trusted after the resolver moves on. A
+  `python.exe` the resolver never selected, at any other location, stays
+  foreign: the shell still adopts a same-family gateway there, but never claims
+  or kills it. Update to a build that includes this fix; until then, end every
+  `kirocrew` process in Task Manager and relaunch the app.
 - **`ModuleNotFoundError: No module named 'fcntl'`** — you installed a
   branch/commit that predates the Windows port. `fcntl` is a Unix-only Python
   stdlib module; it cannot be pip-installed on Windows. Update to a build that

@@ -23,6 +23,7 @@ This file lives in ``test/`` (not ``tests/``) so the ``setup.cfg``
 from __future__ import annotations
 
 import asyncio
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -71,9 +72,22 @@ _SLEEP_SCRIPT = "import time; time.sleep(60)"
 # A portable child that ignores SIGTERM so the group kill must escalate to
 # SIGKILL to stop it. SIGTERM-ignore + SIGKILL escalation is POSIX signal
 # semantics, so tests using this are guarded with skipif(not IS_POSIX).
+#
+# The self-exit deadline is load-bearing, not decoration: this child is spawned
+# ``start_new_session``, so it leads its own group and a sweep of the pytest
+# worker's group never reaches it, and it is SIGTERM-immune by construction, so
+# the usual polite shutdown cannot end it either. Its ONLY reaper is the
+# escalation under test — so if that escalation regresses (precisely what these
+# tests exist to catch), or the worker is SIGKILLed by ``--timeout``/
+# ``--max-worker-restart`` before the reap, where no ``finally`` would run, an
+# unbounded ``while True`` loop would leave an immortal process pegged to the
+# host until a reboot or a manual hunt. Bounding it matches the three sibling
+# SIG_IGN children in this suite and does not soften any assertion: SIGTERM is
+# ``SIG_IGN``, so it is never delivered to Python and cannot cut the sleep short
+# via EINTR — the child is still alive and still immune across the grace period,
+# and SIGKILL still lands at the same instant.
 _SIGTERM_IGNORE_SCRIPT = (
-    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-    "\nwhile True: time.sleep(0.2)"
+    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)"
 )
 
 
@@ -3176,7 +3190,33 @@ def _build_cmds_for(tmp_path, monkeypatch, files: dict[str, str]) -> list[list[s
     monkeypatch.setattr(registry, "create_subprocess_limited", _fake_exec)
     monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="standard": (list(cmd), None))
     monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: list(cmd))
+    _pin_pip_importable(monkeypatch)
     return captured
+
+
+def _pin_pip_importable(monkeypatch) -> None:
+    """Make the planner see a gateway interpreter that HAS ``pip``.
+
+    ``_run_app_build`` probes ``importlib.util.find_spec("pip")`` on the running
+    interpreter and soft-skips the Python build when it is absent. That probe
+    reads the test host's own packaging: a venv created by ``uv`` (or
+    ``--without-pip``) ships no ``pip`` module, so without this pin every
+    "a pip command is planned" assertion fails on such a host while the same
+    test passes on a stdlib venv. The soft-skip branch has its own test that
+    pins the opposite answer.
+    """
+    import site
+
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: False)
+    real_find_spec = importlib.util.find_spec
+
+    def _with_pip(name, *args, **kwargs):
+        if name == "pip":
+            return importlib.machinery.ModuleSpec("pip", loader=None)
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(registry.importlib.util, "find_spec", _with_pip)
 
 
 @pytest.mark.asyncio
@@ -3208,7 +3248,7 @@ async def test_python_build_uses_the_running_interpreter_not_path_pip(tmp_path, 
     assert captured, "a pyproject.toml must produce a build command"
     argv = captured[0]
     assert argv[0] == sys.executable, f"build must use the running interpreter, got {argv[0]!r}"
-    assert argv[1:3] == ["-m", "pip"], f"expected `-m pip`, got {argv[1:3]!r}"
+    assert argv[1:4] == ["-s", "-m", "pip"], f"expected `-s -m pip`, got {argv[1:4]!r}"
 
 
 @pytest.mark.asyncio

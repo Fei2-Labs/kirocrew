@@ -1851,16 +1851,24 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
         slot = _FakeSlot()
         ran: list[str] = []
         origins: list[bool | None] = []
+        actors: list[str | None] = []
 
+        # ``**_rest`` on purpose: this double stands in for ``_run_chat``, whose
+        # keyword surface grows, and a double that enumerates it fails on the next
+        # argument added rather than on anything this test is about. The two
+        # keywords it DOES name are the two it asserts on.
         async def _turn(
             _state: Any,
             _slot: Any,
             prompt: str,
             *,
             _directive_user_origin: bool | None = None,
+            _turn_actor: str | None = None,
+            **_rest: Any,
         ) -> None:
             ran.append(prompt)
             origins.append(_directive_user_origin)
+            actors.append(_turn_actor)
 
         with mock.patch.object(cr, "_run_chat", _turn):
             self.assertTrue(cr.dispatch_crew_turn(state, slot, "advance one item"))
@@ -1868,6 +1876,9 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.capped, [slot.key])
         self.assertEqual(ran, ["advance one item"])
         self.assertEqual(origins, [False])
+        # A crew-composed prompt is not a person typing, and the session ledger
+        # records who caused a turn as fact.
+        self.assertEqual(actors, ["crew"])
 
     async def test_a_turn_that_never_got_a_permit_says_so_in_the_transcript(self):
         """A refused turn and a finished one must not look the same.
@@ -1886,6 +1897,7 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
             prompt: str,
             *,
             _directive_user_origin: bool | None = None,
+            **_rest: Any,
         ) -> None:
             raise AssertionError("the turn must not run without a permit")
 
@@ -1903,6 +1915,41 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
             cr.dispatch_crew_turn(state, slot, "advance one item")
             await slot.runners[-1](state, slot, slot.prompts[-1])
         self.assertEqual([m for m in slot.messages if m["role"] == "error"], [])
+
+    async def test_a_dispatch_between_a_plans_stages_queues(self):
+        """``dispatch_crew_turn`` relies on the admission point, so the gate is the gate.
+
+        Its own docstring states the reliance -- "``enqueue_or_run_prompt`` queues
+        instead of racing when the crew is mid-turn" -- and it carries no mid-plan
+        check of its own. Between a plan's stages ``slot.running`` reads False while
+        the plan is still live, so gating on ``running`` alone would put a crew turn
+        alongside the plan, with no recovery once two turns own one slot.
+
+        Driven through a REAL ``_ChatSlot``, not this module's ``_FakeSlot``: the
+        fake implements its own admission, so a test through it would pass on the
+        double's rule rather than on the product's.
+
+        Mutation guard: drop ``or self._in_stage_execution`` from the gate and this
+        starts a turn.
+        """
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        slot = _ChatSlot(key="chat-1")
+        # The inter-stage shape: nothing in flight, plan still executing.
+        slot.task = None
+        slot._in_stage_execution = True
+        state = mock.MagicMock()
+        state._background_tasks = set()
+
+        started = cr.dispatch_crew_turn(state, slot, "advance one item")
+
+        self.assertFalse(started, "a mid-plan crew dispatch must be queued")
+        self.assertIsNone(slot.task, "and must not open a turn alongside the plan")
+        self.assertEqual(
+            [q["content"] for q in slot._queue],
+            ["advance one item"],
+            "the prompt is held for the plan's own drain",
+        )
 
 
 # ── unblock signal detection (pure) ─────────────────────────────────────────

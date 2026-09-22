@@ -232,6 +232,7 @@ class SlotProjection:
             "key": slot.key,
             "title": redact(slot.display_title),
             "agent": slot.agent,
+            "agent_kind": getattr(slot, "agent_kind", ""),
             "effective_agent": resolve_effective_agent(slot.agent, slot.project or None),
             "model": slot.model,
             # The backend's own withhold verdict for `model`: true = the account

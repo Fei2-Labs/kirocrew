@@ -1402,7 +1402,7 @@ async def add_source(request: web.Request) -> web.Response:
         pipeline = request.app.get("knowledge_pipeline")
         if pipeline:
             task = asyncio.create_task(_ingest_local_file_task(pipeline, store, uri, sid))
-            app_tasks = request.app.setdefault("_bg_tasks", set())
+            app_tasks = _task_registry(request.app, "_bg_tasks")
             app_tasks.add(task)
             task.add_done_callback(app_tasks.discard)
 
@@ -1520,7 +1520,7 @@ async def _hand_off_under_gate(  # type: ignore[no-untyped-def]
         # The task takes its own hold for its ingest, so it must not inherit
         # this one through the copied context (it would read as nested).
         task = asyncio.create_task(make_task(settled), context=handoff_gate_context())
-        app_tasks = request.app.setdefault("_bg_tasks", set())
+        app_tasks = _task_registry(request.app, "_bg_tasks")
         app_tasks.add(task)
         task.add_done_callback(app_tasks.discard)
         await settled.wait()
@@ -1790,9 +1790,26 @@ def _pause_source_row(store, source_id: str) -> bool:
     return True
 
 
+def _task_registry(app: web.Application, key: str) -> set:  # type: ignore[type-arg]
+    """The strong-reference set that keeps detached tasks alive under *key*.
+
+    ``setup_knowledge_routes`` seeds both registries while the app is still
+    mutable, so on a running server this is a plain read. The create branch
+    exists for an ``Application`` that skipped registration (a handler driven
+    directly, before any runner froze it); on a frozen app it would be the
+    deprecated post-start write, which is exactly what seeding at registration
+    avoids.
+    """
+    tasks = app.get(key)
+    if tasks is None:
+        tasks = set()
+        app[key] = tasks
+    return tasks
+
+
 def _track_scan_task(app: web.Application, task: asyncio.Task) -> None:  # type: ignore[type-arg]
     """Keep strong reference to scan task and log exceptions."""
-    tasks = app.setdefault("_scan_tasks", set())
+    tasks = _task_registry(app, "_scan_tasks")
     tasks.add(task)
     task.add_done_callback(tasks.discard)
     task.add_done_callback(lambda t: logger.exception("scan_source failed", exc_info=t.exception()) if not t.cancelled() and t.exception() else None)
@@ -2676,7 +2693,7 @@ async def batch_embed_items(request: web.Request) -> web.Response:
             )
         task = asyncio.create_task(
             _rebuild_embeddings_job(request.app, store, embedder, job_id, force=force))
-        app_tasks = request.app.setdefault("_bg_tasks", set())
+        app_tasks = _task_registry(request.app, "_bg_tasks")
         app_tasks.add(task)
         task.add_done_callback(app_tasks.discard)
         return web.json_response({"job_id": job_id, "status": "processing"})
@@ -2856,6 +2873,14 @@ async def _shutdown_knowledge_pools(app: web.Application) -> None:
 
 
 def setup_knowledge_routes(app: web.Application) -> None:
+    # The detached-task registries are created here, while the app is still
+    # mutable: aiohttp freezes the application when its runner starts, and a
+    # first-use ``setdefault`` from a request handler is then a write to a
+    # frozen app (deprecated today, an error in a later aiohttp). Other route
+    # sets on the same app share ``_bg_tasks``, hence setdefault rather than
+    # assignment.
+    app.setdefault("_bg_tasks", set())
+    app.setdefault("_scan_tasks", set())
     # Initialize pipeline and sync scheduler if not already set
     if "knowledge_pipeline" not in app:
         store = app["state"].knowledge_store

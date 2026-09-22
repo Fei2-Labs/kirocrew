@@ -23,10 +23,11 @@ from chat_test_helpers import (
     _make_ready_kiro_prerequisite,
     _make_state,
 )
-from member_memory_helpers import patch_private_memory_supported
+from dashboard_owner_helpers import as_owner
 
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_KIRO, TurnUsage
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO, TurnUsage
 from kiro_crew.agent_sdk.capabilities import capabilities_for
+from kiro_crew.config.loader import KiroCrewConfig, ResolvedBindings
 from kiro_crew.dashboard.chat_runner import _tool_call_ws_payload
 from kiro_crew.dashboard.state import (
     _MAX_SLOT_MESSAGES,
@@ -35,6 +36,29 @@ from kiro_crew.dashboard.state import (
     _ChatSlot,
 )
 from kiro_crew.history import ConversationLog
+
+
+def _provider_mock() -> AsyncMock:
+    """A stand-in for the ACP session provider a chat turn drives.
+
+    The turn surface (``stream``, ``shutdown``, ``approve_tool`` ...) is async,
+    so the double is an ``AsyncMock``. The telemetry accessors the runner reads
+    after every turn -- ``context_usage_pct``, ``context_window_tokens``,
+    ``context_used_tokens``, ``mcp_session_report``, ``available_models``, and the
+    inner client's ``pop_pending_oauth_requests`` -- are SYNCHRONOUS on the real
+    provider and are called without ``await``. Left as
+    ``AsyncMock`` children each call would hand back a coroutine nobody awaits,
+    which the interpreter reports at garbage collection against whichever later
+    test happens to trigger it. Tests override any accessor they assert on.
+    """
+    client = AsyncMock()
+    client.context_usage_pct = MagicMock(return_value=0.0)
+    client.context_window_tokens = MagicMock(return_value=0)
+    client.context_used_tokens = MagicMock(return_value=0)
+    client.mcp_session_report = MagicMock(return_value=None)
+    client.available_models = MagicMock(return_value=[])
+    client.client.pop_pending_oauth_requests = MagicMock(return_value=[])
+    return client
 
 
 def test_tool_call_ws_payload_preserves_shell_capability_signal():
@@ -197,22 +221,6 @@ class TestChatSlot:
         assert d["messages"] == 1
         assert d["running"] is False
         assert d["pending_approval"] is False
-
-    def test_state_serialization_includes_actual_provider_label(self, tmp_path):
-        state = _make_state(tmp_path)
-        state.sessions.provider_label_for.return_value = "opencode"
-        slot = _ChatSlot("s1")
-
-        payload = state.serialize_slot(slot)
-
-        assert payload["provider_label"] == "opencode"
-        state.sessions.provider_label_for.assert_called_once_with("dashboard:s1")
-
-    def test_state_serialization_omits_provider_for_partial_state(self):
-        state = DashboardState.__new__(DashboardState)
-        state._slot_links = MagicMock(return_value=([], False, "", ""))
-
-        assert state.serialize_slot(_ChatSlot("s1"))["provider_label"] == ""
 
     def test_issue_links_do_not_crowd_out_pr_chips(self):
         """Each kind gets its own chip budget, so a PR chip is never starved.
@@ -5426,7 +5434,7 @@ class TestRunChatSegmentFlush:
     @staticmethod
     def _make_mock_client(events):
         """Create a mock ACP client that yields the given LLMEvent list."""
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
 
         async def _stream(msg):
@@ -5883,7 +5891,7 @@ class TestRunChatNativeSubagentAttribution:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
 
         async def _stream(msg):
@@ -6014,7 +6022,7 @@ class TestRunChatCompactDeferredWait:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.context_window_tokens = MagicMock(return_value=0)
         client.context_used_tokens = MagicMock(return_value=0)
@@ -6064,6 +6072,7 @@ class TestRunChatCompactDeferredWait:
         await _run_chat(state, slot, "/compact")
 
         client.wait_for_compaction.assert_not_called()
+        state.sessions.mark_needs_reinjection.assert_called_once_with("dashboard:s1")
         assistant_msgs = [m for m in slot.messages if m.get("role") == "assistant"]
         assert any("Conversation compacted" in m["content"] for m in assistant_msgs)
         assert not any("timed out" in m["content"] for m in assistant_msgs)
@@ -6114,6 +6123,7 @@ class TestRunChatCompactDeferredWait:
         await _run_chat(state, slot, "/compact")
 
         client.wait_for_compaction.assert_awaited_once()
+        state.sessions.mark_needs_reinjection.assert_called_once_with("dashboard:s1")
         assistant_msgs = [m for m in slot.messages if m.get("role") == "assistant"]
         assert any("summary text" in m["content"] for m in assistant_msgs)
         # A completed deferred compaction must send the `reset` form — the
@@ -6129,6 +6139,27 @@ class TestRunChatCompactDeferredWait:
         compaction_msgs = [m for m in assistant_msgs if "summary text" in m["content"]]
         assert compaction_msgs
         assert all(m.get("meta", {}).get("kind") == "compaction" for m in compaction_msgs)
+
+    @pytest.mark.asyncio
+    async def test_completed_status_arms_skills_context_reinjection(self, tmp_path, monkeypatch):
+        """A provider-native completed status restores skills context once."""
+        from kiro_crew.providers.base import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, LLMEvent
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client(
+            [
+                LLMEvent(kind=EVENT_COMPACTION_STATUS, text="completed"),
+                LLMEvent(kind=EVENT_COMPLETE),
+            ]
+        )
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "continue after provider compaction")
+
+        state.sessions.mark_needs_reinjection.assert_called_once_with("dashboard:s1")
 
     @pytest.mark.asyncio
     async def test_kiro_backend_broadcasts_real_post_compaction_usage(self, tmp_path, monkeypatch):
@@ -6156,6 +6187,7 @@ class TestRunChatCompactDeferredWait:
 
         await _run_chat(state, slot, "/compact")
 
+        state.sessions.mark_needs_reinjection.assert_called_once_with("dashboard:s1")
         usage_calls = [
             c for c in state.broadcast_ws.call_args_list if c.args and c.args[0] == "context_usage"
         ]
@@ -6193,6 +6225,7 @@ class TestRunChatCompactDeferredWait:
 
         await _run_chat(state, slot, "/compact")
 
+        state.sessions.mark_needs_reinjection.assert_not_called()
         usage_calls = [
             c for c in state.broadcast_ws.call_args_list if c.args and c.args[0] == "context_usage"
         ]
@@ -6313,7 +6346,7 @@ class TestTokenPersistenceBackfill:
         """Mock provider that exposes a nested client._model attribute,
         mirroring AcpClient/CcClient layout (provider.client._model).
         """
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         # Expose `client.client._model` like the real provider wrappers
         inner = MagicMock()
@@ -6595,10 +6628,10 @@ class TestTokenPersistenceBackfill:
         slot = state.get_or_create_slot("s1")
         slot.model = ""  # CC has not yet emitted init when _run_chat begins
 
-        # This simulates a Claude ACP adapter session, so the backfill must run
-        # under the claude provider identity for canonicalize_for_provider to map
-        # 'opus' -> 'opus-4.8-1m'. Under the acp label the backfill (correctly)
-        # leaves a kiro/acp model unchanged.
+        # This simulates a claude_code session, so the backfill must run under
+        # provider=claude_code for canonicalize_for_provider to map 'opus' ->
+        # 'opus-4.8-1m'. Under the acp label the backfill (correctly) leaves a
+        # kiro/acp model unchanged.
         #
         # The provider label is resolved from the LIVE CLIENT's
         # ``SessionCapabilities.provider_seam``, not from cfg.agent.provider: that
@@ -6607,9 +6640,7 @@ class TestTokenPersistenceBackfill:
         # branch was unreachable in production while the test mocked it green. The
         # client here is a bare AsyncMock, so it is given the claude backend's
         # record below -- a real CC session's client resolves the same one.
-        _cc_cfg = MagicMock()
-        _cc_cfg.agent.provider = "acp"
-        _cc_cfg.agent.acp_backend = ACP_BACKEND_CLAUDE
+        _cc_cfg = KiroCrewConfig()
         _cc_cfg.dashboard.merge_queued_messages = False
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", lambda: _cc_cfg)
 
@@ -6617,7 +6648,7 @@ class TestTokenPersistenceBackfill:
         # branch (chat_runner.py:471-476) finds nothing and leaves slot.model
         # blank. Then mutate inner._model mid-stream — just before yielding
         # EVENT_COMPLETE — so only the late backfill branch can populate it.
-        client = AsyncMock()
+        client = _provider_mock()
         client.capabilities = capabilities_for(ACP_BACKEND_CLAUDE)
         client.context_usage_pct = MagicMock(return_value=10.0)
         inner = MagicMock()
@@ -6954,7 +6985,7 @@ class TestKiroBackfillProfileGuard:
         slot.model = ""  # user picked nothing explicit on this turn
 
         # Default test config provider is acp/kiro — exercise that path.
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         inner = MagicMock()
         inner._model = ""  # empty at create; kiro learns the profile mid-turn
@@ -7301,7 +7332,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = "claude-opus-5"  # pinned before the plan downgrade
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # The live session advertises the free tier only.
@@ -7384,7 +7415,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = ""  # inheriting: no pin
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.is_claude_backend = False
         client.available_models = MagicMock(
@@ -7443,7 +7474,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = "claude-opus-4.6-1m"  # deprecated spelling: absent from GET /api/models
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # The session serves the replacement the pin normalizes to.
@@ -7501,7 +7532,7 @@ class TestPinnedModelWithheld:
         slot.model = "claude-opus-5"
         slot.record_model_withheld(True)  # the PREVIOUS session withheld this pin
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[])  # advertises nothing
@@ -7574,7 +7605,7 @@ class TestPinnedModelWithheld:
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", load_then_break)
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-5"}])
@@ -7618,7 +7649,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = "claude-opus-5"
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # This account CAN run the pin, so nothing is withheld.
@@ -7673,7 +7704,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = "claude-opus-5"
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-5"}])
@@ -7730,7 +7761,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = "claude-sonnet-5"
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(
@@ -7843,7 +7874,13 @@ class TestRuntimeWiring:
         mock_cfg.memory_stores = {"oncall-mem": MagicMock()}
         mock_cfg.memory = MagicMock()
 
-        mock_bindings = MagicMock()
+        mock_bindings = ResolvedBindings(
+            workspace_dir=tmp_path,
+            memory_store_name="",
+            effective_memory_config={},
+            kiro_agent="kirocrew",
+            selection_kind="template",
+        )
         mock_bindings.workspace_dir = Path("/tmp/oncall")
         mock_bindings.memory_store_name = "oncall-mem"
         mock_bindings.model = ""
@@ -7854,11 +7891,11 @@ class TestRuntimeWiring:
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat._workspace_name_for_dir",
@@ -7869,7 +7906,7 @@ class TestRuntimeWiring:
             lambda cfg, ws_dir: "oncall-ws",
         )
 
-        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "oncall"})
             data = await resp.json()
             assert resp.status == 200
@@ -7903,7 +7940,7 @@ class TestRuntimeWiring:
         monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", _boom)
         monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom)
 
-        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "oncall"})
             data = await resp.json()
             assert resp.status == 200
@@ -7954,7 +7991,13 @@ class TestRuntimeWiring:
         mock_cfg.default_memory_store = "default"
         mock_cfg.memory_stores = {}
         mock_cfg.memory = MagicMock()
-        mock_bindings = MagicMock()
+        mock_bindings = ResolvedBindings(
+            workspace_dir=tmp_path,
+            memory_store_name="",
+            effective_memory_config={},
+            kiro_agent="kirocrew",
+            selection_kind="template",
+        )
         mock_bindings.workspace_dir = Path("/tmp/research")
         mock_bindings.memory_store_name = "default"
         mock_bindings.model = ""
@@ -7964,11 +8007,11 @@ class TestRuntimeWiring:
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat._workspace_name_for_dir",
@@ -7979,7 +8022,7 @@ class TestRuntimeWiring:
             lambda cfg, ws_dir: "research-ws",
         )
 
-        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
             data = await resp.json()
             # Success with a warning — the switch happened; only the old
@@ -8035,7 +8078,13 @@ class TestRuntimeWiring:
         mock_cfg.default_memory_store = "default"
         mock_cfg.memory_stores = {}
         mock_cfg.memory = MagicMock()
-        mock_bindings = MagicMock()
+        mock_bindings = ResolvedBindings(
+            workspace_dir=tmp_path,
+            memory_store_name="",
+            effective_memory_config={},
+            kiro_agent="kirocrew",
+            selection_kind="template",
+        )
         mock_bindings.workspace_dir = Path("/tmp/research")
         mock_bindings.memory_store_name = "default"
         mock_bindings.model = ""
@@ -8045,11 +8094,11 @@ class TestRuntimeWiring:
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat._workspace_name_for_dir",
@@ -8078,7 +8127,13 @@ class TestRuntimeWiring:
         mock_cfg.default_memory_store = "default"
         mock_cfg.memory_stores = {}
         mock_cfg.memory = MagicMock()
-        mock_bindings = MagicMock()
+        mock_bindings = ResolvedBindings(
+            workspace_dir=Path("/tmp/research"),
+            memory_store_name="",
+            effective_memory_config={},
+            kiro_agent="kirocrew",
+            selection_kind="template",
+        )
         mock_bindings.workspace_dir = Path("/tmp/research")
         mock_bindings.memory_store_name = "default"
         mock_bindings.model = ""
@@ -8088,11 +8143,11 @@ class TestRuntimeWiring:
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat._workspace_name_for_dir",
@@ -8216,7 +8271,13 @@ class TestRuntimeWiring:
         mock_cfg.default_memory_store = "default"
         mock_cfg.memory_stores = {}
         mock_cfg.memory = MagicMock()
-        mock_bindings = MagicMock()
+        mock_bindings = ResolvedBindings(
+            workspace_dir=tmp_path,
+            memory_store_name="",
+            effective_memory_config={},
+            kiro_agent="kirocrew",
+            selection_kind="template",
+        )
         mock_bindings.workspace_dir = Path("/tmp/research")
         mock_bindings.memory_store_name = "default"
         mock_bindings.model = ""
@@ -8226,11 +8287,11 @@ class TestRuntimeWiring:
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat._workspace_name_for_dir",
@@ -8241,7 +8302,7 @@ class TestRuntimeWiring:
             lambda cfg, ws_dir: "research-ws",
         )
 
-        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
             data = await resp.json()
             assert resp.status == 200
@@ -8289,7 +8350,7 @@ class TestRuntimeWiring:
         monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", _boom)
         monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom)
 
-        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
             assert resp.status == 200
             assert seen_during_reset == ["research"]
@@ -8331,7 +8392,7 @@ class TestRuntimeWiring:
         conv.update_metadata = MagicMock(side_effect=_pick_lands_during_persist)
         state.conversation_log = conv
 
-        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
             data = await resp.json()
             assert resp.status == 200
@@ -8360,7 +8421,13 @@ class TestRuntimeWiring:
         mock_cfg.memory_stores = {"default": MagicMock()}
         mock_cfg.memory = MagicMock()
 
-        mock_bindings = MagicMock()
+        mock_bindings = ResolvedBindings(
+            workspace_dir=tmp_path,
+            memory_store_name="",
+            effective_memory_config={},
+            kiro_agent="kirocrew",
+            selection_kind="template",
+        )
         mock_bindings.workspace_dir = Path("/workspace/dev")
         mock_bindings.memory_store_name = "default"
         mock_bindings.model = ""
@@ -8371,11 +8438,11 @@ class TestRuntimeWiring:
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat._workspace_name_for_dir",
@@ -8390,7 +8457,7 @@ class TestRuntimeWiring:
             lambda ws: "/workspace/dev",
         )
 
-        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "dev"})
             assert resp.status == 200
             assert slot.project == "/workspace/dev"
@@ -8413,7 +8480,13 @@ class TestRuntimeWiring:
         mock_cfg = MagicMock()
         mock_cfg.agents = {}  # not an alias — resolvable only via the project scope
 
-        mock_bindings = MagicMock()
+        mock_bindings = ResolvedBindings(
+            workspace_dir=tmp_path,
+            memory_store_name="",
+            effective_memory_config={},
+            kiro_agent="kirocrew",
+            selection_kind="template",
+        )
         mock_bindings.workspace_dir = Path("/workspace/default")
         mock_bindings.requested_resolved = True
 
@@ -8422,7 +8495,7 @@ class TestRuntimeWiring:
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers._workspace_name_for_dir",
@@ -8495,7 +8568,7 @@ class TestRuntimeWiring:
         mock_cfg.agents = {}
         monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", lambda: mock_cfg)
 
-        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "new-agent"})
             assert resp.status == 200
             data = await resp.json()
@@ -8524,7 +8597,13 @@ class TestRuntimeWiring:
         mock_cfg.memory_stores = {}
         mock_cfg.memory = MagicMock()
 
-        mock_bindings = MagicMock()
+        mock_bindings = ResolvedBindings(
+            workspace_dir=tmp_path,
+            memory_store_name="",
+            effective_memory_config={},
+            kiro_agent="kirocrew",
+            selection_kind="template",
+        )
         mock_bindings.workspace_dir = Path("/tmp/research")
         mock_bindings.memory_store_name = "default"
         mock_bindings.model = ""
@@ -8535,11 +8614,11 @@ class TestRuntimeWiring:
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat._workspace_name_for_dir",
@@ -8616,17 +8695,16 @@ class TestRuntimeWiring:
         mock_bindings = resolve_agent_bindings(mock_cfg, "oncall")
         # The provider and context are doubles; model a supported runtime while
         # keeping member ownership and persisted conversation metadata real.
-        patch_private_memory_supported(monkeypatch)
 
         monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", lambda: mock_cfg)
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", lambda: mock_cfg)
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_runner.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: mock_bindings,
+            lambda cfg, name, project_dir=None, **kwargs: mock_bindings,
         )
 
         # Create a context builder with mocked build_message
@@ -8650,9 +8728,14 @@ class TestRuntimeWiring:
         # Create a slot with retained history, then verify a cold start replays it.
         slot = state.get_or_create_slot("mem-test", agent="oncall")
         if binding_change == "none":
-            from kiro_crew.member_memory_auth import bind_private_session_store
+            from kiro_crew.execution_context import bind_session_execution, resolve_member_execution
 
-            await asyncio.to_thread(bind_private_session_store, "dashboard:mem-test", private_store)
+            captured_execution = await asyncio.to_thread(
+                resolve_member_execution, mock_cfg, "oncall"
+            )
+            await asyncio.to_thread(
+                bind_session_execution, "dashboard:mem-test", captured_execution
+            )
         conversation_log = ConversationLog(base_dir=tmp_path / "sessions")
         conversation_log.init()
         await asyncio.to_thread(
@@ -8690,15 +8773,16 @@ class TestRuntimeWiring:
         loop = asyncio.get_running_loop()
         binding_reads = []
 
-        def checked_bindings(cfg, name, project_dir=None):
+        def checked_bindings(cfg, name, project_dir=None, **kwargs):
             from kiro_crew.memory_stores import UnknownMemoryStore
 
             with pytest.raises(RuntimeError, match="no running event loop"):
                 asyncio.get_running_loop()
+            assert kwargs["validate_memory_files"] is False
             binding_reads.append((name, project_dir))
             if binding_change == "unavailable":
                 raise UnknownMemoryStore("member identity offline")
-            resolved = resolve_agent_bindings(cfg, name, project_dir)
+            resolved = resolve_agent_bindings(cfg, name, project_dir, **kwargs)
             if binding_change == "project":
                 loop.call_soon_threadsafe(setattr, slot, "project", str(tmp_path / "new-project"))
             elif binding_change == "replacement":
@@ -8739,6 +8823,12 @@ class TestRuntimeWiring:
         metadata = conversation_log.get_metadata("dashboard:mem-test")
         assert metadata["memory_store"] == private_store
         assert metadata["agent"] == "oncall"
+        from kiro_crew.execution_context import read_session_execution
+
+        retained_execution = read_session_execution("dashboard:mem-test")
+        assert retained_execution.member_id == captured_execution.member_id
+        assert retained_execution.store == captured_execution.store
+        assert retained_execution.template_id == captured_execution.template_id
         replay = build_message_calls[0]["kwargs"].get("compressed_history")
         assert "frozen retained question" in replay
         assert "frozen retained answer" in replay
@@ -9212,7 +9302,7 @@ class TestRunChatToolBoundarySegments:
             LLMEvent(kind="complete"),
         ]
 
-        fake_client = AsyncMock()
+        fake_client = _provider_mock()
 
         async def _stream(msg):
             for e in events:
@@ -9258,7 +9348,7 @@ class TestRunChatToolBoundarySegments:
             LLMEvent(kind="complete"),
         ]
 
-        fake_client = AsyncMock()
+        fake_client = _provider_mock()
 
         async def _stream(msg):
             for e in events:
@@ -9290,7 +9380,7 @@ class TestRunChatToolCallUpdate:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
 
         async def _stream(msg):
@@ -9911,7 +10001,7 @@ class TestRunChatModelRefusal:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
 
         async def _stream(msg):
@@ -9993,6 +10083,1560 @@ class TestRunChatModelRefusal:
         # is untouched.
         assert not slot._queue
         assert slot._empty_response_retries == 0
+
+
+class TestRunChatRefusalFallback:
+    """agent.refusal_fallback_model: one single-message retry on a DIFFERENT
+    model after a content-filter refusal, then restore the primary.
+
+    A refusal is deterministic for the model that issued it, but not across
+    model families — the whole point of the retry. The feature ships OFF
+    (empty default); every test here pins the seam explicitly."""
+
+    _make_state_for_run_chat = staticmethod(TestRunChatModelRefusal._make_state_for_run_chat)
+
+    @staticmethod
+    def _make_refusing_client(events):
+        client = TestRunChatModelRefusal._make_mock_client(events)
+        # provider_active_model / provider_raw_model read `served_model` first;
+        # the witness needs set_model to observably move it.
+        client.served_model = "fable-5"
+        # Real-int epoch: a bare MagicMock auto-attribute here would compare
+        # unequal to the slot's integer snapshot and trip the alias-pick guard.
+        client._explicit_pick_epoch = 0
+
+        def _apply(mid: str) -> None:
+            client.served_model = mid
+
+        client.set_model = AsyncMock(side_effect=_apply)
+        return client
+
+    @staticmethod
+    def _refusal_events(**refusal_kwargs):
+        from kiro_crew.acp.types import STOP_REASON_REFUSAL, RefusalInfo
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        refusal = RefusalInfo(**refusal_kwargs) if refusal_kwargs else None
+        return [LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_REFUSAL, refusal=refusal)]
+
+    @pytest.mark.asyncio
+    async def test_refusal_retries_once_on_configured_model_then_terminal(
+        self, tmp_path, monkeypatch
+    ):
+        """First refusal swaps + replays the SAME message; a second refusal
+        (from the fallback) is terminal and says the fallback also declined."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        events = self._refusal_events(category="CYBER")
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        # Turn 1: the swap landed, the retry notice (not the terminal card)
+        # rendered, and the one-per-user-message allowance is spent.
+        client.set_model.assert_awaited_once_with("opus-test")
+        notices = [
+            m
+            for m in slot.messages
+            if m.get("role") == "error" and "retrying once on 'opus-test'" in m.get("content", "")
+        ]
+        assert len(notices) == 1, f"expected exactly one retry notice, got {slot.messages}"
+        # The notice stays plain-language: the raw classifier category
+        # ("cyber") is jargon and never reaches the user.
+        assert "(cyber)" not in notices[0]["content"]
+        assert slot._refusal_fallback_attempted is True
+        assert slot._refusal_fallback_primary == "fable-5"
+        assert not any(
+            "Response declined by the model." in m.get("content", "")
+            for m in slot.messages
+            if m.get("role") == "error"
+        ), "terminal card must not render on the retried turn"
+
+        # The replay was dispatched as a background task; run it. The mock
+        # stream refuses again — the fallback also declined.
+        assert slot.task is not None, "queued replay was not dispatched"
+        await slot.task
+
+        cards = [
+            m
+            for m in slot.messages
+            if m.get("role") == "error"
+            and "Response declined by the model." in m.get("content", "")
+        ]
+        assert len(cards) == 1
+        assert (
+            "The configured fallback model ('opus-test') also declined this request."
+            in cards[0]["content"]
+        )
+        # Still exactly one swap (no retry loop), replay record consumed.
+        client.set_model.assert_awaited_once_with("opus-test")
+        assert slot._refusal_retry_text == ""
+        assert not slot._queue
+
+    @pytest.mark.asyncio
+    async def test_primary_restored_on_next_genuine_turn(self, tmp_path, monkeypatch):
+        """The swap is single-message: the first turn that is not the replay
+        moves the session back to the primary before dispatching."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+        assert slot.task is not None
+        await slot.task  # the retry turn (fallback also refuses; terminal)
+        assert slot._refusal_fallback_primary == "fable-5"
+
+        # Next GENUINE message completes normally; restore precedes dispatch.
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        async def _ok_stream(msg):
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _ok_stream
+        client.stream_command = _ok_stream
+        await _run_chat(state, slot, "a fresh question")
+
+        assert [c.args[0] for c in client.set_model.await_args_list] == ["opus-test", "fable-5"]
+        assert slot._refusal_fallback_primary == ""
+        assert slot._refusal_fallback_candidate == ""
+        # The fresh message also re-armed the one-retry allowance.
+        assert slot._refusal_fallback_attempted is False
+
+    @pytest.mark.asyncio
+    async def test_disabled_seam_keeps_terminal_card_and_never_swaps(self, tmp_path, monkeypatch):
+        """Empty config (the default) is byte-for-byte the pre-feature path."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        client.set_model.assert_not_awaited()
+        assert not slot._queue
+        error_msgs = [m for m in slot.messages if m.get("role") == "error"]
+        assert any("Response declined by the model." in m.get("content", "") for m in error_msgs)
+        # No fallback ran, so the card must NOT claim one declined.
+        assert not any("fallback model also declined" in m.get("content", "") for m in error_msgs)
+
+    @pytest.mark.asyncio
+    async def test_auto_uses_provider_recommended_model(self, tmp_path, monkeypatch):
+        """'auto' defers to the refusal envelope's recommended_model."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "auto",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(
+            self._refusal_events(category="CYBER", recommended_model="rec-model-1")
+        )
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        client.set_model.assert_awaited_once_with("rec-model-1")
+        assert slot._refusal_fallback_candidate == "rec-model-1"
+
+    @pytest.mark.asyncio
+    async def test_auto_without_recommendation_is_terminal(self, tmp_path, monkeypatch):
+        """'auto' with no recommended_model has nothing to retry on."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "auto",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        client.set_model.assert_not_awaited()
+        assert not slot._queue
+        assert any(
+            "Response declined by the model." in m.get("content", "")
+            for m in slot.messages
+            if m.get("role") == "error"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_swap_falls_back_to_terminal_card(self, tmp_path, monkeypatch):
+        """A set_model failure surfaces the ordinary card — never a dead retry."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        client.set_model = AsyncMock(side_effect=RuntimeError("model unavailable"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        assert not slot._queue
+        assert slot._refusal_fallback_attempted is False
+        assert any(
+            "Response declined by the model." in m.get("content", "")
+            for m in slot.messages
+            if m.get("role") == "error"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_retry_after_tool_dispatch(self, tmp_path, monkeypatch):
+        """A refusal terminal arriving AFTER the turn dispatched a tool is
+        terminal: replaying the whole user message would run the side effect
+        a second time."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        from kiro_crew.providers.base import EVENT_TOOL_CALL, LLMEvent
+
+        events = [
+            LLMEvent(kind=EVENT_TOOL_CALL, title="write_file", tool_kind="write"),
+            *self._refusal_events(category="CYBER"),
+        ]
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        client.set_model.assert_not_awaited()
+        assert slot._refusal_fallback_attempted is False
+        assert not slot._queue
+        assert any(
+            "Response declined by the model." in m.get("content", "")
+            for m in slot.messages
+            if m.get("role") == "error"
+        ), "terminal card must render when the retry is refused for tool side effects"
+
+    @pytest.mark.asyncio
+    async def test_replay_turn_does_not_pin_unpinned_slot(self, tmp_path, monkeypatch):
+        """The replay turn runs with the candidate active while
+        ``_active_fallback_model`` is empty — the slot.model backfill must not
+        persist the temporary candidate into the (durable) pin."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        # Simulate the real provider contract the backfill documents: the
+        # resolved model readable off the client IS the currently served one.
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._backfill_canonical_model",
+            lambda client, provider_name: getattr(client, "served_model", "") or "",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        assert not slot.model, "precondition: slot starts unpinned"
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+        # Turn 1 backfilled the PRIMARY (legitimate). Clear it to model the
+        # documented CC case — the canonical id is unresolvable until a later
+        # turn — so the replay turn runs against a genuinely unpinned slot.
+        slot.model = ""
+        assert slot.task is not None
+        await slot.task  # the replay turn — candidate active, throttle state empty
+
+        assert (
+            not slot.model
+        ), f"replay turn persisted the temporary candidate into slot.model: {slot.model!r}"
+
+    @pytest.mark.asyncio
+    async def test_synthetic_recovery_does_not_restore(self, tmp_path, monkeypatch):
+        """A synthetic recovery turn after the replay keeps the fallback
+        active; only a genuine turn restores the primary."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+        assert slot.task is not None
+        await slot.task
+        assert slot._refusal_fallback_primary == "fable-5"
+
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.dashboard.chat_utils import _SYNTHETIC_RECOVERY_MSGS
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        async def _ok_stream(msg):
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _ok_stream
+        client.stream_command = _ok_stream
+
+        # A runner-authored continuation must finish on the model that
+        # produced the work it continues — no restore.
+        await _run_chat(state, slot, _SYNTHETIC_RECOVERY_MSGS[0])
+        assert slot._refusal_fallback_primary == "fable-5"
+        assert [c.args[0] for c in client.set_model.await_args_list] == ["opus-test"]
+
+        # The next genuine turn restores.
+        await _run_chat(state, slot, "a fresh question")
+        assert slot._refusal_fallback_primary == ""
+        assert [c.args[0] for c in client.set_model.await_args_list] == [
+            "opus-test",
+            "fable-5",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_restore_keeps_record_on_silent_noop(self, tmp_path, monkeypatch):
+        """A non-raising ``set_model`` that does not move the model must NOT
+        clear the restore record — the next turn retries instead of stranding
+        the session on the fallback with nothing left to restore from."""
+        from kiro_crew.dashboard.chat_runner import _restore_refusal_fallback
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        client.served_model = "opus-test"  # fallback currently active
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        client.set_model = AsyncMock()  # silent no-op: served_model unchanged
+
+        await _restore_refusal_fallback(slot, client)
+        client.set_model.assert_awaited_once_with("fable-5")
+        assert (
+            slot._refusal_fallback_primary == "fable-5"
+        ), "restore record cleared on a silent set_model no-op"
+
+        # A working set_model on the next attempt restores and clears.
+        def _apply(mid: str) -> None:
+            client.served_model = mid
+
+        client.set_model = AsyncMock(side_effect=_apply)
+        await _restore_refusal_fallback(slot, client)
+        assert slot._refusal_fallback_primary == ""
+        assert client.served_model == "fable-5"
+
+    @pytest.mark.asyncio
+    async def test_explicit_pick_after_retry_wins_over_restore(self, tmp_path, monkeypatch):
+        """An explicit model pick landing between the replay and the next
+        genuine turn drops the restore record without touching the model —
+        even a pick of the fallback candidate itself, which current-model
+        equality alone cannot distinguish from the automatic swap."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+        assert slot.task is not None
+        await slot.task
+        assert slot._refusal_fallback_primary == "fable-5"
+
+        # An explicit pick moves the generation (api_chat_slot_model's seam).
+        slot._model_pick_gen += 1
+
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        async def _ok_stream(msg):
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _ok_stream
+        client.stream_command = _ok_stream
+        await _run_chat(state, slot, "a fresh question")
+
+        # No restore call — only the original swap — and the record is gone.
+        assert [c.args[0] for c in client.set_model.await_args_list] == ["opus-test"]
+        assert slot._refusal_fallback_primary == ""
+        assert slot._refusal_fallback_candidate == ""
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_follow_up_queued(self, tmp_path, monkeypatch):
+        """A queued follow-up is the user's next intent — often a correction
+        of the refused message. The replay inserts at queue index 0, so it
+        would run BEFORE that correction; the retry must refuse instead and
+        leave the queue untouched."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        slot.queue_append("actually, drop that request")
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        client.set_model.assert_not_awaited()
+        assert slot._refusal_fallback_attempted is False
+        assert slot._refusal_fallback_primary == ""
+        cards = [
+            i
+            for i, m in enumerate(slot.messages)
+            if m.get("role") == "error"
+            and "Response declined by the model." in m.get("content", "")
+        ]
+        assert len(cards) == 1, "the terminal card must render when the retry is refused"
+        # No replay was recorded or announced — the follow-up owns the next
+        # turn instead of being jumped by a re-send of the refused message.
+        assert slot._refusal_retry_text == ""
+        assert not any("retrying once on" in m.get("content", "") for m in slot.messages)
+
+    @pytest.mark.asyncio
+    async def test_swap_unwound_when_follow_up_arrives_during_swap(self, tmp_path, monkeypatch):
+        """A follow-up landing while set_model is in flight changes intent
+        under the swap: the swap is unwound (witnessed restore), the refusal
+        surfaces, and nothing is queued ahead of the follow-up."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+
+        def _apply_and_interrupt(mid: str) -> None:
+            client.served_model = mid
+            if mid == "opus-test":
+                slot.queue_append("wait — different plan")
+
+        client.set_model = AsyncMock(side_effect=_apply_and_interrupt)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        # Swap then unwind: candidate first, primary back, record cleared.
+        assert [c.args[0] for c in client.set_model.await_args_list] == ["opus-test", "fable-5"]
+        assert client.served_model == "fable-5"
+        assert slot._refusal_fallback_primary == ""
+        assert slot._refusal_fallback_attempted is False
+        assert any(
+            m.get("role") == "error" and "Response declined by the model." in m.get("content", "")
+            for m in slot.messages
+        )
+        # No replay was recorded or announced ahead of the follow-up.
+        assert slot._refusal_retry_text == ""
+        assert not any("retrying once on" in m.get("content", "") for m in slot.messages)
+
+    @pytest.mark.asyncio
+    async def test_swap_unwound_when_stop_completes_during_swap(self, tmp_path, monkeypatch):
+        """A Stop that presses AND resolves back to idle while set_model is in
+        flight leaves ``_stop_state == "idle"``, so the state check alone
+        misses it. The monotonic stop generation still moved: the swap must
+        unwind and nothing may be queued — otherwise the stopped request
+        replays, and the enqueue snapshot would bake the moved counter in so
+        the drain purge could never catch it either."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+
+        def _apply_and_stop(mid: str) -> None:
+            client.served_model = mid
+            if mid == "opus-test":
+                # Stop pressed and fully resolved during the swap await:
+                # the counter moved, the state is back to idle.
+                slot._stop_generation = getattr(slot, "_stop_generation", 0) + 1
+                slot._stop_state = "idle"
+
+        client.set_model = AsyncMock(side_effect=_apply_and_stop)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        # Swap then unwind: candidate first, primary back, record cleared.
+        assert [c.args[0] for c in client.set_model.await_args_list] == ["opus-test", "fable-5"]
+        assert client.served_model == "fable-5"
+        assert slot._refusal_fallback_primary == ""
+        assert slot._refusal_fallback_attempted is False
+        # No replay recorded or announced: the stopped request must not rerun.
+        assert slot._refusal_retry_text == ""
+        assert not any("retrying once on" in m.get("content", "") for m in slot.messages)
+
+    @pytest.mark.asyncio
+    async def test_chained_swap_preserves_original_primary(self, tmp_path, monkeypatch):
+        """A second swap while the restore record is still live must NOT
+        overwrite the recorded primary. After a failed/no-op restore the
+        session is stranded on fallback A with the record still naming the
+        TRUE primary P; a second refusal's swap A->B reads A as "active" —
+        recording A would lose P permanently (restore would return to A,
+        never to P)."""
+        from kiro_crew.dashboard.chat_runner import (
+            _refusal_fallback_swap,
+            _restore_refusal_fallback,
+        )
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        # Stranded state: restore to fable-5 failed last turn, record kept.
+        client.served_model = "opus-test"
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+
+        def _apply(mid: str) -> None:
+            client.served_model = mid
+
+        client.set_model = AsyncMock(side_effect=_apply)
+
+        # Second refusal on the fallback: auto recommends a different model.
+        returned = await _refusal_fallback_swap(slot, client, "sonnet-test")
+
+        assert returned == "opus-test", "the notice names the model that refused"
+        assert client.served_model == "sonnet-test"
+        assert (
+            slot._refusal_fallback_primary == "fable-5"
+        ), "chained swap overwrote the true primary with the stale fallback"
+        assert slot._refusal_fallback_candidate == "sonnet-test"
+
+        # The restore returns the session to the TRUE primary directly.
+        await _restore_refusal_fallback(slot, client)
+        assert client.served_model == "fable-5"
+        assert slot._refusal_fallback_primary == ""
+
+    @pytest.mark.asyncio
+    async def test_swap_skipped_when_auto_primary_has_no_provable_restore(
+        self, tmp_path, monkeypatch
+    ):
+        """Unpinned session (the "auto" sentinel): the restore leg must
+        set_model("auto"), which partitions that do not advertise the
+        sentinel refuse — the restore then fails every turn and the session
+        stays stranded on the candidate. The swap must not run when the
+        return leg is unprovable."""
+        from kiro_crew.dashboard.chat_runner import _refusal_fallback_swap
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        client.served_model = "auto"  # provider_active_model() -> ""
+        client.available_models = lambda: [
+            {"modelId": "fable-5"},
+            {"modelId": "opus-test"},
+        ]  # no "auto" advertised: the restore target is unprovable
+
+        set_model = AsyncMock()
+        client.set_model = set_model
+
+        returned = await _refusal_fallback_swap(slot, client, "opus-test")
+
+        assert returned is None, "swap must be skipped when the restore leg is unprovable"
+        set_model.assert_not_awaited()
+        assert getattr(slot, "_refusal_fallback_primary", "") in ("", None)
+
+    @pytest.mark.asyncio
+    async def test_swap_proceeds_when_auto_is_advertised(self, tmp_path, monkeypatch):
+        """When the backend advertises the "auto" sentinel as a target the
+        round trip is provable: the swap runs and records "auto" as the
+        primary for the restore."""
+        from kiro_crew.dashboard.chat_runner import _refusal_fallback_swap
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        client.served_model = "auto"
+        client.available_models = lambda: [
+            {"modelId": "auto"},
+            {"modelId": "opus-test"},
+        ]
+
+        def _apply(mid: str) -> None:
+            client.served_model = mid
+
+        client.set_model = AsyncMock(side_effect=_apply)
+
+        returned = await _refusal_fallback_swap(slot, client, "opus-test")
+
+        assert returned == "auto"
+        assert client.served_model == "opus-test"
+        assert slot._refusal_fallback_primary == "auto"
+        assert slot._refusal_fallback_candidate == "opus-test"
+
+    @pytest.mark.asyncio
+    async def test_orchestration_queue_entry_does_not_suppress_retry(self, tmp_path, monkeypatch):
+        """A queued cron notification is orchestration, not a user correction:
+        it must not suppress the configured retry. Only USER-authored queue
+        entries express superseding intent (`_has_user_queued_followup`)."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat_utils import CRON_NOTIFICATION_KIND
+
+        slot.queue_append(
+            '[Cron notification from "scanner"]\nno new items', kind=CRON_NOTIFICATION_KIND
+        )
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        # The retry proceeded despite the queued orchestration entry.
+        client.set_model.assert_awaited_once_with("opus-test")
+        assert slot._refusal_fallback_attempted is True
+        assert any(
+            "retrying once on 'opus-test'" in m.get("content", "")
+            for m in slot.messages
+            if m.get("role") == "error"
+        ), "retry notice missing — the cron entry suppressed the retry"
+
+    @pytest.mark.asyncio
+    async def test_unattended_actor_keeps_terminal_refusal(self, tmp_path, monkeypatch):
+        """A cron/autonudge/sub-agent wake keeps the terminal refusal: nobody
+        attends the announced swap, and an unattended replay doubles whatever
+        the wake was about. The gate reads the turn's ledger actor."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "nightly scan wake", _turn_actor="subagent")
+
+        client.set_model.assert_not_awaited()
+        assert slot._refusal_fallback_attempted is False
+        assert slot._refusal_fallback_primary == ""
+        assert slot._refusal_retry_text == ""
+        assert any(
+            m.get("role") == "error" and "Response declined by the model." in m.get("content", "")
+            for m in slot.messages
+        ), "the unattended turn must surface the ordinary terminal card"
+        assert not any("retrying once on" in m.get("content", "") for m in slot.messages)
+
+    @pytest.mark.asyncio
+    async def test_throttle_walk_divergence_redirects_walk_restore_target(
+        self, tmp_path, monkeypatch
+    ):
+        """A throttle walk advancing OFF the refusal candidate mid-retry must
+        not cost the true primary: the walk's restore target is rewritten to
+        the refusal primary and the refusal record hands over, with the wire
+        model left on the walk's live choice."""
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        client.served_model = "haiku-test"  # the walk's live choice
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        slot._refusal_pick_gen = slot._model_pick_gen
+        slot._active_fallback_model = "haiku-test"
+        slot._fallback_primary_model = "opus-test"  # walk departed FROM our candidate
+
+        from kiro_crew.dashboard.chat_runner import _restore_refusal_fallback
+
+        await _restore_refusal_fallback(slot, client)
+
+        assert (
+            slot._fallback_primary_model == "fable-5"
+        ), "walk restore target must become the refusal primary"
+        assert slot._refusal_fallback_primary == ""
+        assert slot._refusal_fallback_candidate == ""
+        client.set_model.assert_not_awaited()
+        assert client.served_model == "haiku-test", "the walk's live model must not be touched"
+
+    @pytest.mark.asyncio
+    async def test_alias_pick_epoch_blocks_restore(self, tmp_path, monkeypatch):
+        """An explicit pick through a session ALIAS bumps the shared client's
+        pick epoch without touching this slot's generation; the restore must
+        drop its record without moving the model — otherwise it silently
+        overrides the pick the user made through the other slot. Cross-layer
+        on purpose: the pick handler stamps the INNER wrapped client while
+        this restore holds the provider WRAPPER, so both ends must resolve
+        the same epoch host."""
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        client.served_model = "opus-test"  # still on the candidate
+
+        class _InnerClient:
+            """Non-callable inner wrapped client, as pick_epoch_host resolves."""
+
+        inner = _InnerClient()
+        client.client = inner  # the wrapper's .client, like AcpProvider.client
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        slot._refusal_pick_gen = slot._model_pick_gen  # THIS slot saw no pick
+        slot._refusal_client_pick_epoch = 0
+        # The alias's live-switch pick stamps the INNER client (the handler's
+        # side of pick_epoch_host) — even a pick of exactly the candidate,
+        # which model equality alone cannot see.
+        inner._explicit_pick_epoch = 1
+
+        from kiro_crew.dashboard.chat_runner import _restore_refusal_fallback
+
+        await _restore_refusal_fallback(slot, client)
+
+        client.set_model.assert_not_awaited()
+        assert client.served_model == "opus-test", "the alias's pick must stand"
+        assert slot._refusal_fallback_primary == ""
+        assert slot._refusal_fallback_candidate == ""
+
+    @pytest.mark.asyncio
+    async def test_pick_during_restore_set_model_await_is_not_overwritten(
+        self, tmp_path, monkeypatch
+    ):
+        """A pick landing INSIDE the restore's ``set_model`` await must win.
+
+        The epoch snapshot is read once before the await, so without
+        serialization an alias pick that lands while the restore's RPC is in
+        flight is applied first and then silently overwritten when the
+        restore's ``set_model(primary)`` completes LAST. The restore now
+        holds the session-scoped switch lock across the whole
+        check-and-restore, so the pick (which takes the same lock) is
+        strictly ordered after it and its choice stands.
+        """
+        import asyncio as _asyncio
+
+        from kiro_crew.dashboard.chat_runner import _restore_refusal_fallback
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+        from kiro_crew.llm_helpers import pick_epoch_host, slot_switch_session_lock
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        client.served_model = "opus-test"  # wire is on the candidate
+
+        # Gate set_model so the RPC "lands" only on release — modelling the
+        # in-flight window the finding names: the model applies when the
+        # await COMPLETES, so an unserialized concurrent pick applies first
+        # and the restore's write lands last.
+        restore_entered = _asyncio.Event()
+        release_restore = _asyncio.Event()
+
+        async def _gated_set_model(model: str) -> None:
+            restore_entered.set()
+            await release_restore.wait()
+            client.served_model = model
+
+        client.set_model = AsyncMock(side_effect=_gated_set_model)
+
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        slot._refusal_pick_gen = slot._model_pick_gen
+        slot._refusal_client_pick_epoch = 0  # epoch unmoved when restore starts
+
+        restore_task = _asyncio.create_task(_restore_refusal_fallback(slot, client))
+        await _asyncio.wait_for(restore_entered.wait(), timeout=5)
+
+        async def _alias_pick() -> None:
+            # The pick handler's essential moves, under the SAME session
+            # lock it takes at its acquisition site: bump the shared epoch,
+            # apply the model on the wire.
+            async with slot_switch_session_lock(effective_session_key(slot)):
+                host = pick_epoch_host(client)
+                host._explicit_pick_epoch = getattr(host, "_explicit_pick_epoch", 0) + 1
+                client.served_model = "user-picked"
+
+        pick_task = _asyncio.create_task(_alias_pick())
+        for _ in range(10):  # let the pick reach the lock (or, unfixed, run)
+            await _asyncio.sleep(0)
+        release_restore.set()
+        await _asyncio.wait_for(restore_task, timeout=5)
+        await _asyncio.wait_for(pick_task, timeout=5)
+
+        client.set_model.assert_awaited_once_with("fable-5")
+        assert client.served_model == "user-picked", (
+            "the pick that landed during the restore's set_model await must "
+            "apply last — the restore overwrote the user's selection"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pick_during_swap_set_model_await_is_not_reverted(self, tmp_path, monkeypatch):
+        """A pick landing INSIDE the swap's ``set_model`` await must survive.
+
+        The swap snapshots the client pick epoch AFTER its await, so without
+        the session lock an alias pick landing while the swap's RPC is in
+        flight is folded into the snapshot — the restore's alias-pick guard
+        then reads equal and restores the primary over the user's choice.
+        The swap now holds the session-scoped switch lock across the await
+        and the snapshot (same order as the restore), so the pick is
+        strictly ordered after the snapshot and the restore drops its
+        record instead of touching the model.
+        """
+        import asyncio as _asyncio
+
+        from kiro_crew.dashboard.chat_runner import (
+            _refusal_fallback_swap,
+            _restore_refusal_fallback,
+        )
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+        from kiro_crew.llm_helpers import pick_epoch_host, slot_switch_session_lock
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        client.served_model = "fable-5"  # wire on the primary pre-swap
+
+        swap_entered = _asyncio.Event()
+        release_swap = _asyncio.Event()
+
+        async def _gated_set_model(model: str) -> None:
+            swap_entered.set()
+            await release_swap.wait()
+            client.served_model = model
+
+        client.set_model = AsyncMock(side_effect=_gated_set_model)
+
+        swap_task = _asyncio.create_task(_refusal_fallback_swap(slot, client, "opus-test"))
+        await _asyncio.wait_for(swap_entered.wait(), timeout=5)
+
+        async def _alias_pick() -> None:
+            # The pick handler's essential moves, under the SAME session
+            # lock it takes at its acquisition site: bump the shared epoch,
+            # apply the model on the wire.
+            async with slot_switch_session_lock(effective_session_key(slot)):
+                host = pick_epoch_host(client)
+                host._explicit_pick_epoch = getattr(host, "_explicit_pick_epoch", 0) + 1
+                client.served_model = "user-picked"
+
+        pick_task = _asyncio.create_task(_alias_pick())
+        for _ in range(10):  # let the pick reach the lock (or, unfixed, run)
+            await _asyncio.sleep(0)
+        release_swap.set()
+        assert await _asyncio.wait_for(swap_task, timeout=5) == "fable-5"
+        await _asyncio.wait_for(pick_task, timeout=5)
+
+        # The retry ran; the next genuine turn restores. The record must be
+        # dropped on the epoch mismatch without touching the model.
+        client.set_model = AsyncMock()
+        await _restore_refusal_fallback(slot, client)
+
+        client.set_model.assert_not_awaited()
+        assert client.served_model == "user-picked", (
+            "the pick that landed during the swap's set_model await must "
+            "stand — the restore reverted the user's selection"
+        )
+        assert slot._refusal_fallback_primary == ""
+
+    @pytest.mark.asyncio
+    async def test_drain_purges_replay_after_stop(self, tmp_path, monkeypatch):
+        """A Stop landing between the replay's enqueue and the drain kills the
+        replay: the index-0 entry must never dispatch superseded work."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.dashboard.chat_runner import (
+            SYNTHETIC_RECOVERY_KIND,
+            _start_next_queued_turn,
+        )
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        qid = slot.queue_insert(0, "retry me", kind=SYNTHETIC_RECOVERY_KIND)
+        slot._refusal_retry_text = "retry me"
+        slot._refusal_replay_queue_id = qid
+        slot._refusal_replay_stop_gen = slot._stop_generation
+        slot._refusal_replay_session_stop_gen = 0
+        # The Stop that landed while the replay waited.
+        slot._stop_generation += 1
+        _dispatched = MagicMock()
+        monkeypatch.setattr(chat_runner, "_run_chat", _dispatched)
+
+        assert await _start_next_queued_turn(state, slot) is False
+        _dispatched.assert_not_called()
+        assert all(q.get("id") != qid for q in slot._queue)
+        assert slot._refusal_replay_queue_id == ""
+        assert slot._refusal_retry_text == ""
+        assert any(
+            "Content-filter retry cancelled" in m.get("content", "")
+            for m in slot.messages
+            if m.get("role") == "notice"
+        ), "the transcript must say the retry was cancelled"
+
+    @pytest.mark.asyncio
+    async def test_drain_purges_replay_when_user_correction_queued(self, tmp_path, monkeypatch):
+        """A user correction queued behind the index-0 replay supersedes it:
+        the correction dispatches, the replay dies."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.dashboard.chat_runner import (
+            SYNTHETIC_RECOVERY_KIND,
+            _start_next_queued_turn,
+        )
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        qid = slot.queue_insert(0, "retry me", kind=SYNTHETIC_RECOVERY_KIND)
+        slot._refusal_retry_text = "retry me"
+        slot._refusal_replay_queue_id = qid
+        slot._refusal_replay_stop_gen = slot._stop_generation
+        slot._refusal_replay_session_stop_gen = 0
+        # The correction the refusal card asked for, queued while the replay waited.
+        slot.queue_insert(1, "actually, do this instead")
+
+        _seen: list[str] = []
+
+        def _fake_run_chat(_state, _slot, message, **kwargs):
+            _seen.append(message)
+
+            async def _noop():
+                return None
+
+            return _noop()
+
+        monkeypatch.setattr(chat_runner, "_run_chat", _fake_run_chat)
+
+        assert await _start_next_queued_turn(state, slot) is True
+        assert _seen == [
+            "actually, do this instead"
+        ], "the correction must dispatch, never the purged replay"
+        assert all(q.get("id") != qid for q in slot._queue)
+        assert slot._refusal_retry_text == ""
+
+    @pytest.mark.asyncio
+    async def test_replay_carries_original_turn_attachments(self, tmp_path, monkeypatch):
+        """The replay is the SAME turn again: a refused message with files
+        retries with its files riding the queue entry's meta."""
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        _recovery_meta: list[dict] = []
+        _orig_insert = _ChatSlot.queue_insert
+
+        def _spy_insert(self_slot, index, content, kind="", payload="", meta=None, **kw):
+            if kind:
+                _recovery_meta.append(dict(meta or {}))
+            return _orig_insert(
+                self_slot, index, content, kind=kind, payload=payload, meta=meta, **kw
+            )
+
+        monkeypatch.setattr(_ChatSlot, "queue_insert", _spy_insert)
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello", _attachments=["/tmp/evidence.png"])
+        if slot.task is not None:
+            await slot.task
+
+        assert _recovery_meta, "the refusal replay was never queued"
+        assert _recovery_meta[0].get("files") == [
+            "/tmp/evidence.png"
+        ], "the replay entry must carry the refused turn's attachment list"
+
+    @pytest.mark.asyncio
+    async def test_replay_preserves_folder_attachment_typing(self, tmp_path, monkeypatch):
+        """A folder attachment replays under ``dirs``: rebucketing the flat
+        list under ``files`` would retype it and resolve its
+        ``[attached_dir N]`` marker against the wrong list."""
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(self._refusal_events(category="CYBER"))
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        _recovery_meta: list[dict] = []
+        _orig_insert = _ChatSlot.queue_insert
+
+        def _spy_insert(self_slot, index, content, kind="", payload="", meta=None, **kw):
+            if kind:
+                _recovery_meta.append(dict(meta or {}))
+            return _orig_insert(
+                self_slot, index, content, kind=kind, payload=payload, meta=meta, **kw
+            )
+
+        monkeypatch.setattr(_ChatSlot, "queue_insert", _spy_insert)
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(
+            state,
+            slot,
+            "hello",
+            _attachments=["/tmp/report.pdf", "/tmp/project-dir"],
+            _attachment_meta={
+                "files": ["/tmp/report.pdf"],
+                "dirs": ["/tmp/project-dir"],
+            },
+        )
+        if slot.task is not None:
+            await slot.task
+
+        assert _recovery_meta, "the refusal replay was never queued"
+        assert _recovery_meta[0].get("dirs") == [
+            "/tmp/project-dir"
+        ], "the folder attachment must replay under dirs, not be retyped as a file"
+        assert _recovery_meta[0].get("files") == [
+            "/tmp/report.pdf"
+        ], "the file attachment must stay under files with no dir mixed in"
+
+    @pytest.mark.asyncio
+    async def test_drain_purges_replay_when_binding_changes(self, tmp_path, monkeypatch):
+        """A relink moving the slot to a DIFFERENT session between the
+        replay's enqueue and the drain kills the replay: it belongs to the
+        session the refused turn ran on, never the newly bound one. (The
+        unbound->bound case is already dropped by the admission sweep's
+        fail-closed booleans; a bound->bound relink is invisible to them —
+        this branch is what catches it and clears the episode record.)"""
+        from kiro_crew.dashboard import chat_runner, session_control
+        from kiro_crew.dashboard.chat_runner import (
+            SYNTHETIC_RECOVERY_KIND,
+            _start_next_queued_turn,
+        )
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        # The turn ran on binding A; stamp admission containment as the real
+        # producer (_queue_recovery) does, so the admission sweep sees an
+        # unchanged boolean set and lets the entry through to the replay gate.
+        slot.linked_session_key = "session-a"
+        slot._refusal_fallback_session_key = "session-a"
+        qid = slot.queue_insert(
+            0,
+            "retry me",
+            kind=SYNTHETIC_RECOVERY_KIND,
+            meta=session_control.containment_meta(state, slot),
+        )
+        slot._refusal_retry_text = "retry me"
+        slot._refusal_replay_queue_id = qid
+        slot._refusal_replay_stop_gen = slot._stop_generation
+        slot._refusal_replay_session_stop_gen = 0
+        # The relink that landed while the replay waited.
+        slot.linked_session_key = "session-b"
+        _dispatched = MagicMock()
+        monkeypatch.setattr(chat_runner, "_run_chat", _dispatched)
+
+        assert await _start_next_queued_turn(state, slot) is False
+        _dispatched.assert_not_called()
+        assert all(q.get("id") != qid for q in slot._queue)
+        assert slot._refusal_replay_queue_id == ""
+        assert slot._refusal_retry_text == "", (
+            "the dispatch-gate record must die with the replay — a later "
+            "identical message on session-b is a genuine turn, not a retry"
+        )
+        assert any(
+            "this chat moved to another session" in m.get("content", "")
+            for m in slot.messages
+            if m.get("role") == "notice"
+        ), "the transcript must say the retry died with the old binding"
+
+    @pytest.mark.asyncio
+    async def test_swept_replay_clears_dispatch_gate_record(self, tmp_path, monkeypatch):
+        """A replay entry the admission sweep removed leaves the queue-id
+        pointing at nothing. The drain's replay gate must clear the
+        dispatch-gate text with it: otherwise an identical later resend
+        matches as the retry — running on the fallback with the restore
+        probe skipped and the one-retry allowance kept spent."""
+        from kiro_crew.dashboard import chat_runner, session_control
+        from kiro_crew.dashboard.chat_runner import _start_next_queued_turn
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        # Episode state as the swap left it — but the replay entry itself is
+        # absent (the admission sweep dropped it on a containment change).
+        slot._refusal_retry_text = "retry me"
+        slot._refusal_replay_queue_id = "qid-swept-away"
+        slot._refusal_fallback_attempted = True
+        # The user's identical resend queued behind the (now gone) replay.
+        slot.queue_insert(
+            0,
+            "retry me",
+            meta=session_control.containment_meta(state, slot),
+        )
+        _dispatched = MagicMock()
+        monkeypatch.setattr(chat_runner, "_run_chat", _dispatched)
+
+        await _start_next_queued_turn(state, slot)
+        assert slot._refusal_replay_queue_id == ""
+        assert slot._refusal_retry_text == "", (
+            "the dispatch-gate record must die with the swept replay — the "
+            "identical resend is a genuine turn, not a mistaken retry"
+        )
+
+    @pytest.mark.asyncio
+    async def test_swap_locks_the_turns_captured_binding(self, tmp_path, monkeypatch):
+        """The swap serializes on the TURN's captured key and stamps it: a
+        binding that moved before the refusal arrived must not re-route the
+        lock domain."""
+        import asyncio as _asyncio
+
+        from kiro_crew.dashboard.chat_runner import _refusal_fallback_swap
+        from kiro_crew.llm_helpers import slot_switch_session_lock
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        # The slot was bound AFTER the turn started: live derivation now
+        # disagrees with the turn's captured key.
+        slot.linked_session_key = "cron:job-123"
+        client = self._make_refusing_client([])
+        client.served_model = "fable-5"
+
+        async def _apply_set_model(model: str) -> None:
+            client.served_model = model
+
+        client.set_model = AsyncMock(side_effect=_apply_set_model)
+
+        _turn_key = "dash:turn-key"
+        _held = slot_switch_session_lock(_turn_key)
+        await _held.acquire()
+        try:
+            swap_task = _asyncio.create_task(
+                _refusal_fallback_swap(slot, client, "opus-test", session_key=_turn_key)
+            )
+            for _ in range(10):
+                await _asyncio.sleep(0)
+            assert not swap_task.done(), (
+                "the swap must serialize on the turn's captured key, "
+                "not the newly bound session's"
+            )
+        finally:
+            _held.release()
+        assert await _asyncio.wait_for(swap_task, timeout=5) == "fable-5"
+        assert (
+            slot._refusal_fallback_session_key == _turn_key
+        ), "the swap must stamp the binding it ran under"
+
+    @pytest.mark.asyncio
+    async def test_restore_locks_the_swap_recorded_binding(self, tmp_path, monkeypatch):
+        """The restore serializes on the binding the SWAP recorded — a rebind
+        between swap and restore must not split the two seams into disjoint
+        lock domains."""
+        import asyncio as _asyncio
+
+        from kiro_crew.dashboard.chat_runner import _restore_refusal_fallback
+        from kiro_crew.llm_helpers import slot_switch_session_lock
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        client.served_model = "opus-test"
+        client.set_model = AsyncMock()
+
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        slot._refusal_pick_gen = slot._model_pick_gen
+        slot._refusal_client_pick_epoch = 0
+        slot._refusal_fallback_session_key = "dash:turn-key"
+        # The rebind that landed after the swap.
+        slot.linked_session_key = "cron:job-123"
+
+        _held = slot_switch_session_lock("dash:turn-key")
+        await _held.acquire()
+        try:
+            restore_task = _asyncio.create_task(_restore_refusal_fallback(slot, client))
+            for _ in range(10):
+                await _asyncio.sleep(0)
+            assert not restore_task.done(), (
+                "the restore must serialize on the swap's recorded key, "
+                "not the rebound session's"
+            )
+        finally:
+            _held.release()
+        await _asyncio.wait_for(restore_task, timeout=5)
+        # Once inside the lock, the rebind guard rules: the record belongs to
+        # the recorded session, and ``client`` now serves the rebound one —
+        # the restore must DROP the record, never move the rebound session's
+        # model to a primary it never chose.
+        client.set_model.assert_not_awaited()
+        assert slot._refusal_fallback_primary == ""
+        assert slot._refusal_fallback_candidate == ""
+
+    @pytest.mark.asyncio
+    async def test_replay_recognized_after_credential_redaction(self, tmp_path, monkeypatch):
+        """Replay identity is the queue entry, not the text: the drain redacts
+        credentials AFTER the swap records the raw message, so a refused
+        message carrying a token must still be recognized as the one retry —
+        exactly one swap, no second 'retrying once' notice, no restore probe
+        running the replay back on the primary that just refused."""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._configured_refusal_fallback",
+            lambda: "opus-test",
+        )
+        events = self._refusal_events(category="CYBER")
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        secret_msg = "use token ghp_" + "A" * 36 + " to fetch the repo"
+        await _run_chat(state, slot, secret_msg)
+
+        assert slot.task is not None, "queued replay was not dispatched"
+        await slot.task
+
+        retry_notices = [
+            m
+            for m in slot.messages
+            if m.get("role") == "error" and "retrying once on 'opus-test'" in m.get("content", "")
+        ]
+        assert len(retry_notices) == 1, (
+            "the redacted replay must be recognized as the retry — a second "
+            f"notice means it re-armed as a genuine turn: {retry_notices}"
+        )
+        # Exactly one model move: the swap. No restore probe ran inside the
+        # replay (unrecognized, it would move the model back to the primary
+        # mid-retry), and no second swap happened.
+        client.set_model.assert_awaited_once_with("opus-test")
+        assert slot._refusal_fallback_attempted is True, "allowance must stay spent"
+
+    @pytest.mark.asyncio
+    async def test_replay_consume_aborts_after_stop(self, tmp_path, monkeypatch):
+        """A Stop completing between the drain's dequeue validation and the
+        replay turn's consume must abort the replay: the current stop
+        generation differs from the recorded snapshot, so the stale content
+        never runs."""
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        slot._refusal_fallback_attempted = True
+        slot._refusal_retry_text = "retry me"
+        slot._refusal_fallback_session_key = effective_session_key(slot)
+        # Snapshot taken at enqueue…
+        slot._refusal_replay_stop_gen = getattr(slot, "_stop_generation", 0)
+        slot._refusal_replay_session_stop_gen = 0
+        # …then a Stop pressed AND resolved in the spawn→consume window.
+        slot._stop_generation = getattr(slot, "_stop_generation", 0) + 1
+
+        await _run_chat(state, slot, "retry me", _refusal_replay=True)
+
+        cancelled = [
+            m
+            for m in slot.messages
+            if m.get("role") == "notice"
+            and "Content-filter retry cancelled" in m.get("content", "")
+            and "the turn was stopped." in m.get("content", "")
+        ]
+        assert len(cancelled) == 1, f"expected the consume-time abort notice, got {slot.messages}"
+        client.set_model.assert_not_awaited()
+        assert slot._refusal_retry_text == ""
+        assert slot._refusal_replay_queue_id == ""
+        assert slot._refusal_fallback_attempted is True, "allowance stays spent on abort"
+
+    @pytest.mark.asyncio
+    async def test_replay_consume_aborts_after_rebind(self, tmp_path, monkeypatch):
+        """A session rebind landing between dequeue and consume must abort the
+        replay — the stale content belongs to the OLD session and must not
+        enter the newly bound one."""
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        slot._refusal_fallback_attempted = True
+        slot._refusal_retry_text = "retry me"
+        # The binding the swap recorded differs from the slot's live binding.
+        slot._refusal_fallback_session_key = "dash:old-session"
+        slot._refusal_replay_stop_gen = getattr(slot, "_stop_generation", 0)
+        slot._refusal_replay_session_stop_gen = 0
+
+        await _run_chat(state, slot, "retry me", _refusal_replay=True)
+
+        cancelled = [
+            m
+            for m in slot.messages
+            if m.get("role") == "notice"
+            and "Content-filter retry cancelled" in m.get("content", "")
+            and "this chat moved to another session." in m.get("content", "")
+        ]
+        assert len(cancelled) == 1, f"expected the rebind abort notice, got {slot.messages}"
+        client.set_model.assert_not_awaited()
+        assert slot._refusal_retry_text == ""
+
+    @pytest.mark.asyncio
+    async def test_synthetic_recovery_dispatch_does_not_rearm(self, tmp_path, monkeypatch):
+        """A kind-tagged recovery requeue of the user's OWN words is the same
+        turn retried, not a genuine new message: it must not re-arm the
+        one-retry allowance (re-arming lets a crashing fallback replay cycle
+        primary-refusal → swap → crash indefinitely)."""
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([LLMEvent(kind=EVENT_COMPLETE)])
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        slot._refusal_fallback_attempted = True
+
+        await _run_chat(state, slot, "my own words again", _synthetic_recovery_turn=True)
+
+        assert slot._refusal_fallback_attempted is True, (
+            "a synthetic recovery requeue must not re-arm the refusal-retry "
+            "allowance — only a genuine user-origin dispatch does"
+        )
+
+    @pytest.mark.asyncio
+    async def test_synthetic_recovery_dispatch_skips_restore_probe(self, tmp_path, monkeypatch):
+        """A kind-tagged recovery requeue of the user's OWN words must finish
+        on the model that produced the original attempt: the restore probe at
+        turn start must not move the session back to the primary mid-recovery.
+        The fixed-text membership check cannot recognize a requeued user
+        message, so the gate needs the structural signal."""
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([LLMEvent(kind=EVENT_COMPLETE)])
+        client.served_model = "opus-test"  # still on the fallback candidate
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        slot._refusal_fallback_attempted = True
+        slot._refusal_pick_gen = slot._model_pick_gen
+        slot._refusal_client_pick_epoch = 0
+        slot._refusal_fallback_session_key = effective_session_key(slot)
+
+        await _run_chat(state, slot, "my own words again", _synthetic_recovery_turn=True)
+
+        client.set_model.assert_not_awaited()
+        assert slot._refusal_fallback_primary == "fable-5", (
+            "the restore record must survive a recovery dispatch — the next "
+            "genuine turn owns the restore"
+        )
+
+    @pytest.mark.asyncio
+    async def test_restore_dropped_when_slot_rebound(self, tmp_path, monkeypatch):
+        """A restore record made under session A must never be applied through
+        the provider of a session the slot has since rebound to: the record is
+        dropped without touching the model."""
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        client.served_model = "opus-test"
+        client.set_model = AsyncMock()
+
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        slot._refusal_pick_gen = slot._model_pick_gen
+        slot._refusal_client_pick_epoch = 0
+        # Swap recorded session A; the slot has since rebound elsewhere.
+        slot._refusal_fallback_session_key = "dash:session-a"
+
+        from kiro_crew.dashboard.chat_runner import _restore_refusal_fallback
+
+        await _restore_refusal_fallback(slot, client)
+
+        client.set_model.assert_not_awaited()
+        assert slot._refusal_fallback_primary == ""
+        assert slot._refusal_fallback_candidate == ""
+
+    @pytest.mark.asyncio
+    async def test_recovery_requeue_of_retry_turn_carries_replay_identity(
+        self, tmp_path, monkeypatch
+    ):
+        """A pre-output process failure during the retry turn requeues the
+        user's message verbatim through a GENERIC recovery family. The requeue
+        must carry the refusal-replay identity and fresh stop snapshots onto
+        the new entry — otherwise the requeued entry escapes the drain's
+        refusal-specific validation, and a correction queued in the
+        requeue-to-dispatch window loses to superseded work."""
+        from kiro_crew.acp.client import AcpError
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        state.sessions.reset = AsyncMock()
+
+        async def _raise_dead(msg):
+            raise AcpError("ACP process exited (code=-15)")
+            yield  # make it an async generator
+
+        client.stream = _raise_dead
+        client.stream_command = _raise_dead
+        client.shutdown = AsyncMock()
+
+        # Keep the requeued entry IN the queue: the post-turn drain would
+        # otherwise dequeue and spawn it immediately, racing the assertions.
+        async def _no_drain(_state, _slot) -> bool:
+            return False
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._start_next_queued_turn", _no_drain)
+
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        slot._refusal_fallback_attempted = True
+        slot._refusal_retry_text = "retry me"
+        slot._refusal_fallback_session_key = effective_session_key(slot)
+        slot._refusal_replay_stop_gen = getattr(slot, "_stop_generation", 0)
+        slot._refusal_replay_session_stop_gen = 0
+
+        await _run_chat(state, slot, "retry me", _refusal_replay=True)
+
+        requeued = [q for q in slot._queue if q.get("content") == "retry me"]
+        assert requeued, f"expected the verbatim recovery requeue, queue={slot._queue}"
+        assert slot._refusal_replay_queue_id == requeued[0]["id"], (
+            "the requeued entry must carry the refusal-replay identity so the "
+            "drain applies the refusal-specific validation at dispatch"
+        )
+        assert slot._refusal_replay_stop_gen == getattr(slot, "_stop_generation", 0)
+
+    @pytest.mark.asyncio
+    async def test_swap_during_throttle_fallback_records_true_primary(self, tmp_path, monkeypatch):
+        """A refusal landing while a THROTTLE fallback is serving must record
+        the walk's true primary, not the wire model: the replay turn's
+        throttle probe clears the walk's sticky state via moved-off, so a
+        record naming the throttle candidate would strand the session on a
+        model the user never chose, with no machinery left to recover."""
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client([])
+        client.served_model = "haiku-throttle"  # wire = the throttle candidate
+
+        # The throttle walk is actively serving and knows the true primary.
+        slot._active_fallback_model = "haiku-throttle"
+        slot._fallback_primary_model = "fable-5"
+
+        from kiro_crew.dashboard.chat_runner import _refusal_fallback_swap
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        result = await _refusal_fallback_swap(
+            slot, client, "opus-test", session_key=effective_session_key(slot)
+        )
+
+        assert result == "haiku-throttle", (
+            "the return feeds the 'declined on X' notice — it must name the "
+            "model that actually refused (the wire model)"
+        )
+        assert (
+            slot._refusal_fallback_primary == "fable-5"
+        ), "the record must name the user's model, not the throttle candidate"
+        assert slot._refusal_fallback_candidate == "opus-test"
+
+    @pytest.mark.asyncio
+    async def test_replay_aborts_when_correction_queued_during_preparation(
+        self, tmp_path, monkeypatch
+    ):
+        """The consume-seam supersession check runs at turn ENTRY, but turn
+        preparation awaits (session acquisition, prompt assembly) before the
+        stream opens. A correction queued in that window must abort the
+        replay before any model call — a stale replay dispatching first could
+        run destructive tools the correction cancelled."""
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_refusing_client(
+            [
+                LLMEvent(kind=EVENT_TEXT_CHUNK, text="stale replay output"),
+                LLMEvent(kind=EVENT_COMPLETE),
+            ]
+        )
+
+        _orig_get_or_create = AsyncMock(return_value=(client, True, False))
+
+        async def _acquire_and_inject(*args, **kwargs):
+            # A user correction lands DURING preparation — after the
+            # consume-seam check, before the stream opens.
+            slot.queue_insert(0, "actually do the other thing", kind="")
+            return await _orig_get_or_create(*args, **kwargs)
+
+        state.sessions.get_or_create = _acquire_and_inject
+
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        slot._refusal_fallback_primary = "fable-5"
+        slot._refusal_fallback_candidate = "opus-test"
+        slot._refusal_fallback_attempted = True
+        slot._refusal_retry_text = "retry me"
+        slot._refusal_fallback_session_key = effective_session_key(slot)
+        slot._refusal_replay_stop_gen = getattr(slot, "_stop_generation", 0)
+        slot._refusal_replay_session_stop_gen = 0
+
+        await _run_chat(state, slot, "retry me", _refusal_replay=True)
+
+        cancelled = [
+            m
+            for m in slot.messages
+            if m.get("role") == "notice"
+            and "Content-filter retry cancelled" in m.get("content", "")
+        ]
+        assert len(cancelled) == 1, f"expected the pre-stream abort notice, got {slot.messages}"
+        assert slot._refusal_replay_queue_id == ""
+        assert not any(
+            m.get("role") == "assistant" for m in slot.messages
+        ), "the stale replay must never reach the model"
 
 
 # ── Mode/approval policy propagation (HTTP handlers) ──
@@ -10617,7 +12261,18 @@ class TestMultiPendingApproval:
 class TestApiChatAgentPassing:
     @pytest.mark.asyncio
     async def test_agent_set_on_new_slot(self, tmp_path, monkeypatch):
+        from kiro_crew.config import loader
+
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "agentrock--my-aim-agent.json").write_text(
+            json.dumps({"name": "my-aim-agent"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(loader, "kiro_agents_dir", lambda: agents_dir)
+        monkeypatch.setattr(loader, "_MATERIALIZED_AGENTS", frozenset())
+        monkeypatch.setattr(loader, "_MATERIALIZED_AGENTS_READY", False)
+        await asyncio.to_thread(loader.refresh_materialized_agents)
         state = _make_state(tmp_path)
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post(
@@ -10625,6 +12280,7 @@ class TestApiChatAgentPassing:
                 json={"message": "hello", "slot": "agentrock-my-skill", "agent": "my-aim-agent"},
             )
             data = await resp.json()
+            assert resp.status == 200, data
             assert data["ok"] is True
             assert state._slots["agentrock-my-skill"].agent == "my-aim-agent"
 
@@ -10951,7 +12607,7 @@ class TestOrchestratorPlanGateArming:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.context_window_tokens = MagicMock(return_value=0)
         client.context_used_tokens = MagicMock(return_value=0)
@@ -11048,6 +12704,7 @@ class TestOrchestratorPlanGateArming:
         seen: list[bool] = []
 
         async def _rec(s, sl, msg, **kw):
+            sl.append("assistant", "stage output", "msg msg-a")
             seen.append(sl._in_stage_execution)
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _rec)
@@ -11380,6 +13037,21 @@ class TestWidgetOriginAutoRunGuard:
         assert "[UI] refresh" in run_chat_mock.call_args[0][2]
 
 
+def _stage_output(text: str = "stage output"):
+    """``side_effect`` for a mocked ``_run_chat`` that a stage can call complete.
+
+    The stage loop reads what a stage CAPTURED to decide whether it produced
+    work, so a bare ``AsyncMock()`` models a stage that emitted nothing — which is
+    now a failed stage rather than a completed one. This appends the one assistant
+    row the real ``_run_chat`` would have left on the slot.
+    """
+
+    async def _run(_state, slot, _message, **_kwargs):
+        slot.append("assistant", text, "msg msg-a")
+
+    return _run
+
+
 class TestPythonStageLoop:
     """Tests for the Python-controlled stage execution loop (_stage_loop).
 
@@ -11426,7 +13098,7 @@ class TestPythonStageLoop:
         state.subagents.running_agents_for = MagicMock(return_value=[])
         slot = self._make_slot(max_stages=3)
 
-        run_chat_mock = AsyncMock()
+        run_chat_mock = AsyncMock(side_effect=_stage_output("gated stage"))
         monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", run_chat_mock)
 
         await _stage_loop(state, slot, auto_run=False)
@@ -11457,7 +13129,7 @@ class TestPythonStageLoop:
         state.subagents.running_agents_for = MagicMock(return_value=[])
         slot = self._make_slot(max_stages=3)
 
-        run_chat_mock = AsyncMock()
+        run_chat_mock = AsyncMock(side_effect=_stage_output("auto stage"))
         monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", run_chat_mock)
 
         await _stage_loop(state, slot, auto_run=True)
@@ -11490,6 +13162,7 @@ class TestPythonStageLoop:
         call_count = 0
 
         async def _mock_run_chat(s, sl, msg, **kw):
+            sl.append("assistant", "stage output", "msg msg-a")
             nonlocal call_count
             call_count += 1
             if call_count >= 2:
@@ -11581,6 +13254,7 @@ class TestPythonStageLoop:
         seen = []
 
         async def _mock_run_chat(s, sl, msg, **kw):
+            sl.append("assistant", "stage output", "msg msg-a")
             seen.append(sl._in_stage_execution)
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _mock_run_chat)
@@ -11875,7 +13549,15 @@ class TestPythonStageLoop:
 
     @pytest.mark.asyncio
     async def test_subagent_wait_loop(self, tmp_path, monkeypatch):
-        """Stage loop waits for pending subagents before advancing."""
+        """Stage loop waits for pending subagents before advancing.
+
+        The wait is driven by the manager's completion event, not a 2s poll, so
+        the fixture supplies a real ``asyncio.Event`` and finishes the wave from
+        the moment the loop asks for it — which is the moment before it starts
+        waiting. The mechanism itself is covered in
+        ``test/test_autopilot_wave_wait_event.py``; what this keeps asserting is
+        the loop-level outcome: a pending wave is waited for, and both stages run.
+        """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         monkeypatch.setattr("kiro_crew.dashboard.chat.config_dir", lambda: tmp_path)
         from kiro_crew.dashboard.chat import _stage_loop
@@ -11883,29 +13565,37 @@ class TestPythonStageLoop:
         state = MagicMock()
         state.broadcast_ws = MagicMock()
         state.push_slots_update = MagicMock()
-        state.subagents = MagicMock()
-        state.subagents.running_agents_for = MagicMock(return_value=[])
         slot = self._make_slot(max_stages=2)
 
-        _poll_count = 0
+        pending = [{"id": "sa-1"}]
+        scans = 0
+        event = asyncio.Event()
 
         def _running_agents(key):
-            nonlocal _poll_count
-            _poll_count += 1
-            # Simulate subagent finishing after 2 polls
-            return [{"id": "sa-1"}] if _poll_count < 3 else []
+            nonlocal scans
+            scans += 1
+            return list(pending)
+
+        def _completion_event(key):
+            # The wave finishes one event-loop tick into the wait.
+            def _finish():
+                pending.clear()
+                event.set()
+
+            asyncio.get_running_loop().call_soon(_finish)
+            return event
 
         state.subagents = MagicMock()
         state.subagents.running_agents_for = _running_agents
+        state.subagents.completion_event = _completion_event
 
-        run_chat_mock = AsyncMock()
+        run_chat_mock = AsyncMock(side_effect=_stage_output("waited stage"))
         monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", run_chat_mock)
-        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.asyncio.sleep", AsyncMock())
 
-        await _stage_loop(state, slot, auto_run=True)
+        await asyncio.wait_for(_stage_loop(state, slot, auto_run=True), 5)
 
-        # Should have polled for subagents
-        assert _poll_count >= 3
+        # The wave was actually observed rather than skipped.
+        assert scans >= 2
         # Should still complete both stages
         assert run_chat_mock.call_count == 2
 
@@ -11967,7 +13657,9 @@ class TestPythonStageLoop:
         state.subagents.running_agents_for = MagicMock(return_value=[])
         slot = self._make_slot(max_stages=3)
 
-        run_chat_mock = AsyncMock()
+        # Appends the assistant row a real stage turn leaves behind: a stage
+        # that captures nothing is a failed stage, not a completed one.
+        run_chat_mock = AsyncMock(side_effect=_stage_output("resumed stage"))
         monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", run_chat_mock)
 
         # First Go: runs stage 1 only
@@ -13362,6 +15054,55 @@ class TestFolderCRUD:
             assert resp.status == 404
 
     @pytest.mark.asyncio
+    async def test_expected_created_matching_the_live_slot_files_it(self, tmp_path, monkeypatch):
+        """The generation token is optional; when it matches the slot's own
+        ``created_at`` the write lands exactly as an untokened one does."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("myslot")
+        state._folders = [{"id": "f1", "name": "Test", "order": 0, "collapsed": False}]
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.patch(
+                "/api/chat/slots/myslot/folder",
+                json={"folder_id": "f1", "expected_created": slot.created_at},
+            )
+            assert resp.status == 200
+            assert slot.folder_id == "f1"
+
+    @pytest.mark.asyncio
+    async def test_expected_created_from_a_replaced_slot_is_refused_409(
+        self, tmp_path, monkeypatch
+    ):
+        """A caller that resolved a slot in an earlier request, then saw its
+        tab close and the same key recreated for another conversation, carries
+        the OLD slot's ``created_at``. The recreated slot has the same key and
+        the same ``dashboard:<key>`` transcript key, so only the token can tell
+        them apart — and it must, or the stale write files someone else's
+        session."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        first = state.get_or_create_slot("myslot")
+        stale_token = first.created_at
+        # Close the tab and recreate the key: a different slot object, a
+        # different birth stamp, the same key.
+        del state._slots["myslot"]
+        replacement = state.get_or_create_slot("myslot")
+        replacement.created_at = stale_token + "-later"
+        state._folders = [{"id": "f1", "name": "Test", "order": 0, "collapsed": False}]
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.patch(
+                "/api/chat/slots/myslot/folder",
+                json={"folder_id": "f1", "expected_created": stale_token},
+            )
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "session_gone"
+            # The replacement conversation was not filed.
+            assert replacement.folder_id == ""
+            assert replacement._folder_changed is False
+
+    @pytest.mark.asyncio
     async def test_assign_nonexistent_folder_rejected(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -13571,9 +15312,9 @@ class TestFolderTags:
         held: list[bool] = []
         orig_mutate = state.mutate_folders
 
-        async def _spy(fn):
+        async def _spy(fn, **kwargs):
             held.append(tags_write_lock(state).locked())
-            return await orig_mutate(fn)
+            return await orig_mutate(fn, **kwargs)
 
         monkeypatch.setattr(state, "mutate_folders", _spy)
         app = _make_folder_app(state)
@@ -13712,7 +15453,7 @@ class TestGenerateEmojiForName:
         monkeypatch.setattr("kiro_crew.providers.base.EVENT_COMPLETE", "complete")
         monkeypatch.setattr("kiro_crew.providers.base.EVENT_PERMISSION_REQUEST", "permission")
 
-        mock_client = AsyncMock()
+        mock_client = _provider_mock()
         mock_client.prompt = MagicMock(return_value=AsyncIterator([mock_event, done_event]))
         state.sessions.get_bg_session = AsyncMock(return_value=mock_client)
         state.push_slots_update = MagicMock()
@@ -13751,7 +15492,7 @@ class TestGenerateEmojiForName:
         monkeypatch.setattr("kiro_crew.providers.base.EVENT_COMPLETE", "complete")
         monkeypatch.setattr("kiro_crew.providers.base.EVENT_PERMISSION_REQUEST", "permission")
 
-        mock_client = AsyncMock()
+        mock_client = _provider_mock()
         mock_client.prompt = MagicMock(return_value=AsyncIterator([mock_event, done_event]))
         state.sessions.get_bg_session = AsyncMock(return_value=mock_client)
 
@@ -15139,10 +16880,9 @@ class TestForkSlot:
     async def test_fork_of_temporary_parent_stays_temporary_with_its_history(self, tmp_path):
         """Temporary blocks memory READS, not the session's own thread history.
 
-        ``build_session_context`` assembles the thread-history block from the
-        child's conversation log before any ``blocks_reads`` gate, so a temporary
-        fork still hands the copied turns to its fresh kiro-cli process -- the
-        fork is useful, and the child is as blank to memory as its parent.
+        Cold provider replay uses the child's live message window. A temporary
+        fork carries its copied turns into the fresh provider without writing
+        those bodies into a durable conversation log.
         """
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("src", memory_mode="temporary")
@@ -15161,11 +16901,22 @@ class TestForkSlot:
         assert child.blocks_reads is True
         assert f"dashboard:{data['key']}" in state._restricted_keys
 
+        from kiro_crew.context import build_session_replay
         from kiro_crew.dashboard.chat import _history_key_for
 
-        recent = state.conversation_log.recent(_history_key_for(data["key"]))
-        visible = [m["content"] for m in recent if m.get("role") in ("user", "assistant")]
+        history_key = _history_key_for(data["key"])
+        visible = [m["content"] for m in child.messages if m.get("role") in ("user", "assistant")]
         assert visible == ["parent question", "parent answer"]
+        replay = await asyncio.to_thread(
+            build_session_replay,
+            state.conversation_log,
+            history_key,
+            pending_messages=list(child.messages),
+        )
+        assert "parent question" in replay
+        assert "parent answer" in replay
+        assert state.conversation_log.recent(history_key) == []
+        assert not state.conversation_log._path(history_key).exists()
 
     @pytest.mark.asyncio
     async def test_fork_history_visible_to_new_kiro_via_context_builder(self, tmp_path):
@@ -15811,7 +17562,7 @@ class TestStopReasonCancelled:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
 
         async def _stream(msg):
@@ -17622,11 +19373,17 @@ class TestEmptyResponseRetry:
         state.sessions.mark_provider_switch_replay.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_agent_switch_turn_no_empty_response_error(self, tmp_path: Path) -> None:
+    async def test_agent_switch_turn_no_empty_response_error(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
         """Agent switch turns set assistant_text='' but should NOT trigger the empty-response notice."""
         from kiro_crew.providers.base import EVENT_AGENT_SWITCHED, EVENT_COMPLETE, LLMEvent
 
         state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.config.loader._materialized_kiro_agent",
+            lambda name, project_dir=None: name if name == "new-agent" else "",
+        )
 
         async def _stream(msg):
             yield LLMEvent(kind=EVENT_AGENT_SWITCHED, text="new-agent")
@@ -18290,7 +20047,7 @@ class TestRunChatTransientRetry:
 
     @staticmethod
     def _client(stream):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=0.0)
         # These are sync accessors on the real provider client; _run_chat
         # calls them without awaiting, so a bare AsyncMock attribute here
@@ -19407,6 +21164,55 @@ class TestRunChatModelFallback:
         assert slot._active_fallback_model == "fallback-model"
 
     @pytest.mark.asyncio
+    async def test_fallback_swap_serialises_on_the_session_lock(self, tmp_path, monkeypatch):
+        """The swap awaits set_model and then snapshots the shared client pick
+        epoch. The per-slot pick lock is disjoint across aliases, so a pick made
+        through a DIFFERENT alias of the same wire session could land in that
+        await and be absorbed into the snapshot, after which the restore reads
+        not-stale and silently overwrites the user's choice. The swap must hold
+        the session-scoped switch lock too — with it pre-acquired, the swap may
+        not advance until release. Mirrors the restore probe and refusal path.
+
+        Mutation guard: drop the slot_switch_session_lock acquisition around the
+        swap and this test reddens, because the swap reaches set_model while the
+        session lock is held elsewhere."""
+        import asyncio
+
+        from kiro_crew.dashboard.chat_runner import _fallback_swap_for_turn
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+        from kiro_crew.llm_helpers import slot_switch_session_lock
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._agent_fallback_chain",
+            lambda: ("fallback-model",),
+        )
+        state = self._make_state(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+
+        entered = asyncio.Event()
+
+        class _Client:
+            async def set_model(self, target):
+                entered.set()
+                self._model = target
+
+        client = _Client()
+
+        _session_lock = slot_switch_session_lock(effective_session_key(slot))
+        await _session_lock.acquire()
+        try:
+            task = asyncio.create_task(_fallback_swap_for_turn(slot, client))
+            await asyncio.sleep(0.05)
+            # Session lock held ⇒ the swap must not have reached set_model yet.
+            assert not entered.is_set()
+            assert not task.done()
+        finally:
+            _session_lock.release()
+        candidate = await asyncio.wait_for(task, timeout=2)
+        assert candidate == "fallback-model"
+        assert slot._active_fallback_model == "fallback-model"
+
+    @pytest.mark.asyncio
     async def test_stop_during_fallback_backoff_drops_the_requeue(self, tmp_path, monkeypatch):
         """REGRESSION (review finding on 1a61ddcf): a Stop pressed during the
         fallback backoff sleep resolves while no prompt is active; without the
@@ -19437,8 +21243,13 @@ class TestRunChatModelFallback:
         async def _stop_during_sleep(_secs):
             # Simulate the user pressing Stop while the backoff sleeps: the
             # monotonic generation increments even though the stop resolves
-            # back to "idle" before the sleep returns.
-            slot._stop_generation = getattr(slot, "_stop_generation", 0) + 1
+            # back to "idle" before the sleep returns. Scoped to the backoff this
+            # test is about, because the same-model arm re-reads the stop signals
+            # after ITS wait too: an unscoped press lands on the FIRST backoff,
+            # drops the replay there, and the fallback arm this test measures is
+            # then never reached at all.
+            if slot._fallback_walked:
+                slot._stop_generation = getattr(slot, "_stop_generation", 0) + 1
 
         with patch("asyncio.sleep", new=AsyncMock(side_effect=_stop_during_sleep)):
             await _run_chat(state, slot, "hello")
@@ -20434,7 +22245,6 @@ class TestSlotModelLiveSwitch:
     def _provider(
         *,
         claude: bool = False,
-        codex: bool = False,
         active_turn: bool = False,
         models=("auto",),
         supports_effort: bool = False,
@@ -20448,16 +22258,14 @@ class TestSlotModelLiveSwitch:
         """
         from kiro_crew.providers.acp import AcpProvider
 
-        backend = ACP_BACKEND_CODEX if codex else ACP_BACKEND_CLAUDE if claude else ACP_BACKEND_KIRO
         provider = MagicMock(spec=AcpProvider)
-        provider.capabilities = capabilities_for(backend)
+        provider.capabilities = capabilities_for(ACP_BACKEND_CLAUDE if claude else ACP_BACKEND_KIRO)
         provider.has_active_turn.return_value = active_turn
         provider.available_models.return_value = [{"modelId": m} for m in models]
         provider.supports_effort.return_value = supports_effort
         provider.change_effort = AsyncMock(return_value=change_effort)
         provider.clear_effort = AsyncMock(return_value=False)
         provider.client = MagicMock()
-        provider.client.backend = backend
         provider.client.set_model = AsyncMock()
         return provider
 

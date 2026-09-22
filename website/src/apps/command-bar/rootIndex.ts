@@ -49,6 +49,13 @@ export type RootRowKind =
  * most time-sensitive object this product has and the only kind of row a launcher
  * over a static app catalogue cannot produce. It is built from the store the
  * dashboard already keeps live, so leading with it costs the root no request.
+ *
+ * There is deliberately no `folders` group: the sidebar's folders are a CORPUS, and
+ * a corpus is reached here the way sessions are — one `view` row under `commands`
+ * that the reader enters. Flattening the folder list into this index made the same
+ * collection behave unlike every other corpus the surface holds, and cost it two
+ * mechanisms (an idle demotion and a group cap) to keep tens of the user's own
+ * folders from filling a page they had not typed into.
  */
 export const ROOT_GROUPS = ['attention', 'commands', 'apps', 'settings'] as const
 

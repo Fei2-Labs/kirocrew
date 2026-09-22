@@ -49,7 +49,7 @@ jobs:
     # the guard is on every step, so a step added later cannot quietly run
     # against fork content.
     name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'Design Review' || 'Design Review (same-repo lane, not applicable to forks)' }}"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # Agentic reviewer reading untrusted PR diff content -- never gets fleet credentials, same isolation as claude-review.yml/codex-review.yml.
     timeout-minutes: 30
     steps:
       # persist-credentials:false stops actions/checkout from writing the
@@ -194,7 +194,7 @@ jobs:
       # GPT 5.6 reviewers. github.actor is set by GitHub and cannot be spoofed by
       # PR content. Also skip when a human override is recorded, so an OIDC
       # failure can never keep the override from clearing the lane.
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
           && (
@@ -219,7 +219,7 @@ jobs:
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
           )
-        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
+        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
         with:
           # Inference via Amazon Bedrock (region from the AWS creds step above).
           use_bedrock: "true"
@@ -490,9 +490,13 @@ jobs:
             The FIRST line is machine-parsed — emit it verbatim, value only:
             Design-Verdict: <PASS | CONCERNS | BLOCK>
 
-            Then a blank line and ONE bold punchline (≤25 words): the single most
-            important takeaway — for PASS, why it's sound; for CONCERNS/BLOCK, the
-            core design problem in one breath.
+            Then a blank line and ONE bold punchline (≤25 words). It OPENS with the
+            problem: for CONCERNS/BLOCK, the core design problem in one breath,
+            problem first — never `<what is sound>, but <problem>`, because the
+            reader stops at the comma and the finding is what came after it. For
+            PASS, the ONE thing a human should still verify before merge, or
+            exactly `Nothing to check.` — never why the design is sound; a
+            reviewer that argues the author's case is not reviewing.
 
             Then include a section ONLY if it has real content (omit the heading
             entirely when empty — never write "None" sections, never pad):
@@ -589,6 +593,16 @@ jobs:
               summary="$(jq -rs '[ .[] | (if type=="array" then .[] else . end) | select(.result != null) ] | (last.result // "")' "$EXEC_FILE" 2>/dev/null || true)"
             fi
           fi
+          # Publish only the review. The contract makes the verdict header the
+          # FIRST line, but a model that narrates before it ("All facts verified.
+          # Composing the final review.") ships that narration into a public
+          # comment above the punchline. Trim to the header when one is present;
+          # without one the text is left whole so the no-verdict path below still
+          # sees what the model wrote. Here-strings, not pipes: a long summary
+          # cannot manufacture a SIGPIPE status under `pipefail`.
+          if grep -qiE '^Design-Verdict:' <<< "$summary"; then
+            summary="$(awk 'f || tolower($0) ~ /^design-verdict:/ { f = 1; print }' <<< "$summary")"
+          fi
           if [ -z "$summary" ]; then
             echo "no review text in execution_file ($EXEC_FILE); nothing to post"
             echo "verdict=UNKNOWN" >> "$GITHUB_OUTPUT"
@@ -609,6 +623,16 @@ jobs:
           if ! grep -qF "[DESIGN-REVIEWED] $HEAD" <<< "$summary"; then
             echo "verdict header present but no [DESIGN-REVIEWED] $HEAD marker; treating as UNKNOWN"
             verdict="UNKNOWN"
+          fi
+          # The contract caps the prose at ~150 words outside the collapsed
+          # inventory: a review twice that long is one whose findings sit under
+          # text nobody reads. Count it and say so in the job log and annotations;
+          # the verdict and the comment are unaffected.
+          if [ "$verdict" != "UNKNOWN" ]; then
+            words="$(awk '/<details>/ { skip = 1 } !skip { print } /<\/details>/ { skip = 0 }' <<< "$summary" | wc -w | tr -d ' ')"
+            if [ "${words:-0}" -gt 300 ]; then
+              echo "::warning title=Design Review over length::$words words outside the inventory; the contract caps the review at ~150. Findings past the cap are the ones nobody reads."
+            fi
           fi
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           MARKER="<!-- design-review -->"
@@ -676,7 +700,7 @@ jobs:
               !seen && $0 ~ header { seen = 1; next }
               !seen { next }
               seen == 1 && NF { print; seen = 2; next }
-              /^### / { watch = ($0 ~ /^### Watch[[:space:]]*$/) }
+              /^### / { watch = ($0 ~ /^### (Watch|Not justified as shipped)[[:space:]]*$/) }
               watch { print }
             ' "$file")"
             printf '%s' "${digest:0:2000}"

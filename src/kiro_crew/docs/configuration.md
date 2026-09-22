@@ -110,10 +110,15 @@ the same displays.
   unauthenticated session, and Kiro Crew only sends a model the session
   advertised, so a session may simply run KAS's own default model.
 
+KAS reports managed MCP startup through session-scoped `_kiro/mcp/status` and
+`_kiro/tools/didChange` notifications. Kiro Crew waits for the selected agent's
+required managed servers and tool exposure before its first prompt, including
+after resume. Tools intentionally excluded by the agent remain excluded; their
+absence does not block startup. Failure or missing readiness produces a startup
+error within the configured session-start timeout.
+
 **Signals with no KAS analog** (documented so they are not mistaken for gaps):
-KAS has no `clear/status` notification, and its MCP methods (`_kiro/mcp/status`,
-`_kiro/mcp/toggle`) are request-side only — it emits no MCP server-init
-notification for Kiro Crew to surface. A resumable-session existence probe would
+KAS has no `clear/status` notification. A resumable-session existence probe would
 use KAS's `_kiro/session/list` (which returns the full `sessions[]` to search by
 id); that is deferred to the session-lifecycle work, not the display path.
 
@@ -156,7 +161,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
     "max_channels": 1,
     "max_channel_agents": 3,
     "max_subagents": 0,
-    "subagent_max_turns": 100,
+    "subagent_max_turns": 1000,
     "spawn_min_memory_gb": 4.0,
     "soft_stop_budget_secs": 10.0,
     "completion_keep": "head",
@@ -226,16 +231,17 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `agent.streaming` | Stream response text as it is generated | `true` |
 | `agent.bot_name` | Custom name the bot identifies as | `""` |
 | `agent.session_sharing` | Reuse a shared ACP runtime for subagents on the kiro-cli backend; alternate ACP backends ignore it | `true` |
-| `agent.tool_search` | On the kiro-cli backend, defer MCP tool definitions when either threshold below is exceeded; alternate ACP backends ignore it | `true` |
+| `agent.tool_search` | Defer MCP tool definitions so the model loads them on demand with `tool_search`. kiro-cli defers once either threshold below is exceeded; KAS defers all of them, and only when the active agent's `tools` grants `tool_search` (otherwise the setting is sent off for that agent). Other ACP backends ignore it | `true` |
 | `agent.tool_search_min_pct` | Tool-definition context threshold as a percentage; `0` with the token threshold also `0` always defers | `5` |
 | `agent.tool_search_min_tokens` | Tool-definition token threshold; `0` with the percentage threshold also `0` always defers | `50000` |
 | `agent.fallback_model` | Model used after the active model exhausts its transient-retry budget. `"auto"` defers to availability-aware routing; `""` disables fallback | `"auto"` |
+| `agent.refusal_fallback_model` | Model one declined message is retried on when the active model's content filter refuses it (single-message; the primary returns on the next turn). `"auto"` uses the model the provider's refusal recommends; `""` disables the retry | `""` |
 | `agent.max_channels` | Max concurrent agent channels (1-5) | `1` |
 | `agent.max_channel_agents` | Max agents per channel (1-10) | `3` |
 | `agent.log_level` | Persistent log level for the `kiro_crew` logger, applied at startup. The `--verbose` CLI flag overrides it | `"WARNING"` |
 | `agent.soft_stop_budget_secs` | Seconds to wait for a cooperative cancel before hard-killing the session | `10.0` |
 | `agent.max_subagents` | Max concurrent subagents. `0` auto-sizes the cap at startup from host memory/CPU and a learned per-agent cost. A pin of 1 or 2 is raised to 3, because a cap below 3 would disable auto-sizing and still run under the default | `0` |
-| `agent.subagent_max_turns` | Default tool-call budget per subagent | `100` |
+| `agent.subagent_max_turns` | Default tool-call budget per subagent; stored user values are preserved on upgrade | `1000` |
 | `agent.spawn_min_memory_gb` | Minimum available memory (GB) to spawn a subagent (0 disables the check) | `4.0` |
 | `agent.completion_keep` | Which end of the subagent transcript to keep in the completion event injected into the parent session: `"head"`, `"tail"`, or `"both"` (head + middle marker + tail) | `"head"` |
 | `agent.completion_keep_chars` | Max characters retained in the completion event after applying `completion_keep`. `0` disables truncation. The full transcript stays on disk (see `subagent_result_ttl_secs`) | `3000` |
@@ -269,6 +275,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `dashboard.merge_queued_messages` | Concatenate follow-up messages while the agent is busy | `false` |
 | `dashboard.mcp_probe_timeout_secs` | Seconds to wait for an MCP server handshake during a probe (5-120) | `15` |
 | `dashboard.link_previews` | Fetch and render HTTP(S) link metadata in assistant messages. Off by default because each linked site receives a request from this machine | `false` |
+| `dashboard.usage_text_scrape_enabled` | Let the top-bar credit pill fall back to a `kiro-cli /usage` chat turn when the free usage API returns no plan. That fallback is a real billed LLM turn and it repeats every refresh interval, so it is off by default. Editable at Settings > Display > View | `false` |
 | `dashboard.feature_videos_enabled` | Play a short intro clip for a feature this install has not used yet. Instance-wide kill switch; see [Feature Videos](feature-videos.md). Off until real clips ship | `false` |
 | `dashboard.link_patterns` | Rewrite matching plain text in transcripts into links at display time, through the same autolink rule engine editions register vocabulary on. Each rule pairs a JavaScript regex with an absolute http(s) URL template in which `{match}` inserts the matched text percent-encoded (no userinfo, placeholder outside the host), e.g. `{"pattern": "\\bPROJ-\\d+\\b", "url": "https://tracker.example.com/browse/{match}"}`. Code blocks and existing links are never rewritten; an inline code span whose whole text matches becomes a link chip. At most 50 rules with distinct patterns, each carrying at most one wide quantifier (`*`, `+`, `{n,}` or a wide `{n,m}`; narrow ranges may accompany it), scanning at most 2000 characters per text block | `[]` |
 | `dashboard.feature_videos_cache_max_mb` | Disk budget for downloaded clips. Whole release folders are removed oldest-first to fit; the release you are running is never removed. `0` = no cap | `500` |
@@ -429,8 +436,7 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.decay_rates` | Per-tag episodic recency decay rates, per day (score factor `exp(-rate * days_old)`). Keys are memory tags (case-insensitive); the reserved `default` key replaces the built-in `0.03` for memories matching no configured tag. A memory carrying several configured tags uses the slowest (smallest) rate, so a broad tag can never age out a long-retention one. `0` never ages out of retrieval ranking; `1` falls out of retrieval within about a day. Ranking only: `episodic_max_count` cap eviction (lowest importance, then oldest) still applies regardless of decay rate. Values are clamped to `0..10`; non-numeric values are ignored with a logged warning. Example: `{"legal_precedents": 0.0, "trading_data": 1.0}` | `{}` |
 | `memory.history_idle_hours` | Hours of inactivity before history consolidation | `3.0` |
 | `memory.history_max_days` | Days of history to retain before pruning | `365` |
-| `memory.private_provisioning_enabled` | Allow new private V2 stores for member creation, discovery sync and explicit V1-to-V2 setup; turning off leaves existing stores and their isolation active | `true` |
-| `memory.backup_enabled` | Periodic rotating backups of active member V2 stores only; V1 backups remain manual and retention does not delete active V2 memories | `true` |
+| `memory.backup_enabled` | Periodic rotating backups of every active memory store (the default store, named V1 stores and member V2 stores); retention does not delete active memories | `true` |
 | `memory.backup_keep` | Backup copies retained per store, with a minimum of one | `7` |
 
 Decay, episodic capacity eviction and history age pruning apply to V1 only.
@@ -439,77 +445,42 @@ Global V1 retains its session-start retrieval; V2 injects essential member and
 project guidance and recalls memory fragments on demand. The shared embedding
 worker and its thread defaults affect both versions.
 
-To pause new private memory creation, set `memory.private_provisioning_enabled`
-to the JSON boolean `false` in `config.json`, or use the existing owner-authenticated
-`PATCH /api/config/kirocrew` with this body:
-
-```json
-{"path": "memory.private_provisioning_enabled", "value": false}
-```
-
-Set the value to `true` to resume. The next creation admission reads the setting;
-no gateway restart is needed. Dashboard and CLI member creation, discovery sync
-that would add members, and explicit V1-to-V2 setup refuse while paused. They do
-not create V1 members instead. Existing V1 members keep their bindings, and
-existing V2 execution, memory reads, edits, backups and recovery keep their
-normal isolation checks. Repeating setup for an already-owned V2 store remains
-valid. The setting does not cancel operations already admitted, disable memory
-preparation or withdraw shared startup changes. An absent field defaults to
-`true`; a present non-boolean value pauses creation, and the owner API rejects
-non-boolean writes.
-An unreadable or malformed configuration file or `memory` section also refuses
-new creation until repaired; the default does not override unreadable settings.
-
 #### Named memory stores
 
-Each Crew Member receives its own empty private V2 memory when it is created.
-The generated store is recorded in `agents.<crew>.memory_store` and declared in
-`memory_stores` with its version and owner. Existing Global Memory V1 remains
-with the built-in default assistant; creating a member never copies or migrates it.
+Explicit member creation assigns a stable `member_id`, one managed `store_id`,
+and one SQLite database at `memory_stores/<store_id>/memory.db`. Display names,
+templates, projects and workspaces do not change the memory owner. The database
+contains learned facts, corrections, experiences, history, full-text indexes and
+vectors. Manual member rules and project guidance remain separate documents.
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `memory_stores` | Store declarations; member entries include `memory_version: 2` and `owner_member`. A missing declaration is an error | `{"default": {}}` |
-| `default_memory_store` | Retained for configuration compatibility; never repairs a missing or invalid member binding | `"default"` |
-| `agents.<crew>.memory_store` | Existing members retain their declared V1 binding; new or opted-in members have an immutable private V2 store identity | Allocated on member creation |
+| `memory_stores` | Declares each managed store, its version and stable owner identity | `{"default": {}}` |
+| `agents.<crew>.member_id` | Stable member identity, independent of its display label | Allocated on member creation |
+| `agents.<crew>.memory_store` | The member's single managed store identity | Allocated on member creation |
+| `default_memory_store` | Existing V1 default configuration; never repairs a member identity | `"default"` |
 
-The `default` store keeps the files it already has — `~/.kiro/crew/workspace/memory/`,
-`~/.kiro/crew/memory.db` and `~/.kiro/crew/memory_index.db`. Nothing moves when you
-add a named store. A named store gets `~/.kiro/crew/memory_stores/<name>/`,
-owner-only, holding that crew's markdown memory, its full-text index and its own
-vector database. `kirocrew snapshot` covers the `default` store; a named store's files
-are not in a snapshot yet.
+Global V1 keeps its existing files and behavior. Creating a member does not copy
+Global learning into that member. Opening a missing, corrupt or wrong-member V2
+database reports an error and never creates an empty replacement. Restore a
+damaged member database from its own daily backup. Backups use SQLite's consistent
+backup API and coordinate restore with active connections. Snapshots include
+named memory stores as well as Global memory.
 
-**Store names are strict, and a bad one is refused rather than guessed at.** A name
-is lowercase, 1–80 characters, made of letters, digits and inner hyphens
-(`^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$`), a single path segment, not a Windows
-device name (`con`, `nul`, `aux`, `prn`, `com1`–`com9`, `lpt1`–`lpt9`), and does not
-end in a dot or a space. A name that breaks any of those is reported when the config
-loads and no memory directory is created for it — guessing what was meant is how two
-crews would end up sharing one directory. Your entry stays in `config.json` exactly as
-you wrote it so you can fix the spelling; until you do, a member bound to it
-refuses execution with an explicit memory error.
-
-An undeclared name, mismatched owner, missing directory or unreadable database
-also refuses execution. There is no fallback to `default_memory_store` or Global
-Memory V1. Existing members keep working on their declared V1 store until the
-owner chooses empty V2 memory in member settings, or runs
-`kirocrew agent update <name> --provision-memory`. Their existing memory stays
-untouched. Recover a damaged existing private store from its own
-backup instead of rebinding it to another store.
-
-**Private member execution requires OS filesystem isolation.** File tools fence
-`memory_stores/`, and the process sandbox withholds private stores and Global V1
-memory from member subprocesses. Memory tools reach only the member's bound store
-through the gateway. An unsupported or unavailable sandbox refuses private
-execution; member management and existing V1 bindings remain available.
+Member memory provides separate learning and working context, not adversarial
+confidentiality between agents operated by the same user. Bound memory tools use
+the execution's selected database. Prompt and built-in path guidance discourage
+raw database edits and accidental cross-member file access; arbitrary code can
+read other members' files. Ordinary transport authentication, host sandbox,
+credential protection and enterprise policy remain in force. No additional
+member-memory sandbox is required.
 
 ### Skills
 
 | Key | Description | Default |
 |-----|-------------|---------|
 | `skills.max_triggered` | Maximum skills loaded per message (>=0) | `0` |
-| `skills.lazy_load` | Inject only a usage-ranked top-K of on-demand skills at session start and leave the long tail discoverable via search, so a large skills set cannot crowd out memory and lessons | `false` |
+| `skills.lazy_load` | Inject a usage-ranked top-K of on-demand skills at session start, plus one line naming the families it leaves out, and leave the tail discoverable via search, so a large skills set cannot crowd out memory and lessons. Set false for the shorter entry that names only the eight hottest skills | `true` |
 
 ### MCP Gateway
 
@@ -615,7 +586,7 @@ rules so they cannot be opted out of at all.
 | `~/.kiro/crew/workspace/memory/` | Memory files (default store) |
 | `~/.kiro/crew/memory_index.db` | Full-text search index (default store) |
 | `~/.kiro/crew/memory.db` | Semantic, episodic and lesson memory (default store) |
-| `~/.kiro/crew/memory_stores/<name>/` | A named memory store: one crew's private memory, unreadable by the agent's file tools |
+| `~/.kiro/crew/memory_stores/<name>/` | A managed store: one member’s SQLite learning database and manual context files |
 | `~/.kiro/crew/session_map.json` | Session resume mapping |
 | `~/.kiro/crew/snapshots/` | Default output of `kirocrew snapshot` |
 | `~/.kiro/agents/kirocrew.json` | Installed agent config |

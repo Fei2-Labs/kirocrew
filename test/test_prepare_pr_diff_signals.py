@@ -1,12 +1,12 @@
-"""``diff_signals.py --check-body``: a complete ledger is a gate, a short body is advice.
+"""``diff_signals.py --check-body``: a complete ledger AND a short body are both gates.
 
 Prose is a poor ledger for which areas a diff touches: a long walkthrough
 hides a stray file better than a short body does, because the reader trusts the
-walkthrough and skips the diff. The script keeps the two jobs apart.
-**Accounting** -- every changed area is named somewhere in the body -- is exit
-20. **Length** -- the ``What changed`` prose over a soft word limit -- is a WARN
-and exit 0, because a rename or a shared-helper migration legitimately needs the
-words.
+walkthrough and skips the diff. The script keeps the two jobs apart and gates
+both. **Accounting** -- every changed area is named somewhere in the body -- is
+exit 20. **Length** -- the ``What changed`` prose over ``WORD_LIMIT`` -- is exit
+21: with the ledger guaranteed complete, a cap cannot cut a true fact, only a
+restated one. When both breach, 20 is returned and both findings print.
 
 Pure helpers are tested directly; one end-to-end run against a throwaway git
 repository pins the exit codes and the printed findings.
@@ -204,18 +204,38 @@ def test_prose_is_none_without_the_section() -> None:
 # -------------------------------------------------------------- check_body
 
 
-def test_check_body_soft_limit_warns_but_returns_zero(capsys) -> None:
+def test_check_body_over_the_limit_is_twenty_one(capsys) -> None:
     ns = "M\tsrc/kiro_crew/x/y.py\n"
-    rc = ds.check_body(BODY + "\nAlso x/y.py.\n", ns, soft_words=3)
+    rc = ds.check_body(BODY + "\nAlso x/y.py.\n", ns, word_limit=3)
+    out = capsys.readouterr().out
+    assert rc == 21
+    assert "TOO LONG: What changed is 8 words of prose (limit 3)" in out
+    assert "the diff is the evidence" in out
+    # The ledger still passed; only the prose failed.
+    assert "every changed area is named in the body" in out
+
+
+def test_check_body_under_the_limit_is_zero(capsys) -> None:
+    ns = "M\tsrc/kiro_crew/x/y.py\n"
+    rc = ds.check_body(BODY + "\nAlso x/y.py.\n", ns, word_limit=400)
     out = capsys.readouterr().out
     assert rc == 0
-    assert "WARN: What changed is 8 words of prose (soft limit 3)" in out
-    assert "not a gate" in out
+    assert "What changed: 8 words of prose (limit 400)" in out
+    assert "TOO LONG" not in out
+
+
+def test_check_body_both_breaches_print_both_and_return_twenty(capsys) -> None:
+    ns = "M\tsrc/kiro_crew/x/y.py\nM\tsrc/kiro_crew/z/w.py\n"
+    rc = ds.check_body(BODY + "\nx/y.py changed.\n", ns, word_limit=3)
+    out = capsys.readouterr().out
+    assert rc == 20
+    assert "UNACCOUNTED src/kiro_crew/z" in out
+    assert "TOO LONG: What changed is" in out
 
 
 def test_check_body_missing_area_is_twenty_even_when_prose_is_short(capsys) -> None:
     ns = "M\tsrc/kiro_crew/x/y.py\nM\tsrc/kiro_crew/z/w.py\n"
-    rc = ds.check_body(BODY + "\nx/y.py changed.\n", ns, soft_words=400)
+    rc = ds.check_body(BODY + "\nx/y.py changed.\n", ns, word_limit=400)
     out = capsys.readouterr().out
     assert rc == 20
     assert "UNACCOUNTED src/kiro_crew/z" in out
@@ -306,13 +326,20 @@ def test_end_to_end_body_missing_an_area_exits_twenty(repo: Path) -> None:
     assert "UNACCOUNTED src/kiro_crew/security.py" in out
 
 
-def test_end_to_end_complete_body_exits_zero_and_only_warns_on_length(repo: Path) -> None:
-    prose = "chat/send.py sends once. security.py allows it. " + "word " * ds.SOFT_WORDS
+def test_end_to_end_complete_but_long_body_exits_twenty_one(repo: Path) -> None:
+    prose = "chat/send.py sends once. security.py allows it. " + "word " * ds.WORD_LIMIT
     _body(repo).write_text("## What changed\n\n" + prose + "\n")
     rc, out = _run(repo, "--check-body")
-    assert rc == 0
-    assert "WARN: What changed is {} words".format(ds.SOFT_WORDS + 6) in out
+    assert rc == 21
+    assert "TOO LONG: What changed is {} words".format(ds.WORD_LIMIT + 6) in out
     assert "every changed area is named in the body" in out
+
+
+def test_end_to_end_complete_short_body_exits_zero(repo: Path) -> None:
+    _body(repo).write_text("## What changed\n\nchat/send.py sends once. security.py allows it.\n")
+    rc, out = _run(repo, "--check-body")
+    assert rc == 0
+    assert "What changed: 6 words of prose (limit {})".format(ds.WORD_LIMIT) in out
 
 
 def test_the_body_path_is_fixed_inside_the_git_dir() -> None:
@@ -344,31 +371,64 @@ def _flat(path: Path) -> str:
     return " ".join(path.read_text(encoding="utf-8").split())
 
 
-def test_skill_wires_the_check_at_every_body_write_and_keeps_the_limit_soft() -> None:
+def test_skill_wires_the_check_at_every_body_write_and_gates_both_checks() -> None:
     flat = _flat(SKILL)
     # Phase 1.5, Phase 2 amend, Phase 3 publish -- each names the flag.
     assert flat.count("diff_signals.py --check-body") >= 3
     assert "<body-file>" not in flat
     # The one body path, named once where the body is written.
     assert "$(git rev-parse --absolute-git-dir)/prepare-pr-body.md" in flat
-    # The contract says which check gates and which only advises.
+    # The contract says both checks stop the loop, and why the cap is safe.
     assert "### Two checks, two strengths" in flat
     assert "**exit 20** — stop, fix the body or the diff" in flat
-    assert "**WARN**, exit 0" in flat
+    assert "**exit 21** — stop, compress the prose" in flat
+    assert "**WARN**, exit 0" not in flat
+    assert "SOFT_WORDS" not in flat
     assert "never pad the prose to hide it" in flat
-    # The scripts table advertises the new exit code.
-    assert "20 unaccounted area (`--check-body` only)" in flat
-    # The soft limit is a constant, not a knob nobody turns.
+    # The scripts table advertises both exit codes.
+    assert "20 unaccounted area · 21 `What changed` over `WORD_LIMIT`" in flat
+    # The limit is a constant, not a knob nobody turns.
+    assert "--word-limit" not in flat
     assert "--soft-words" not in flat
     # One bound for section 3: the contract's paragraph rule states the number the
     # script enforces, so the two cannot drift apart.
     assert (
-        f"about {ds.SOFT_WORDS} words of prose; `--check-body` WARNs past that (`SOFT_WORDS`)"
+        f"well under {ds.WORD_LIMIT} words of prose; `--check-body` stops past that (exit 21, `WORD_LIMIT`)"
         in flat
     )
-    assert f"against the {ds.SOFT_WORDS} of section 3" in flat
+    assert f"against the {ds.WORD_LIMIT} of section 3" in flat
     # Phase 3 publishes the same file the check read.
     assert (
         "`<body>` below is the checked file, `$(git rev-parse --absolute-git-dir)/prepare-pr-body.md`"
         in flat
     )
+
+
+def test_skill_reads_the_register_before_the_first_body_write() -> None:
+    """Phase 1 step 5 points at the Age 5 register BEFORE the first --check-body,
+    and adds the two rules a recital-shaped body breaks."""
+    text = SKILL.read_text(encoding="utf-8")
+    step = text.index("5. **Reconcile code and description.**")
+    first_check = text.index("diff_signals.py --check-body", step)
+    register_pointer = text.index("read *Writing register: Age 5* below", step)
+    assert register_pointer < first_check
+    flat = _flat(SKILL)
+    assert "the diff is the evidence, and the body never restates it" in flat
+    assert "One general sentence may cover a whole area" in flat
+    assert "Lead with a table when the change has more than one moving part" in flat
+
+
+def test_skill_has_a_cold_reader_step_after_the_check_and_outside_local_review() -> None:
+    """The only readability measure: one tool-less subagent reads What changed alone.
+    It lives in the skill, not in local_review.py, which mirrors CI prompts byte-for-byte."""
+    text = SKILL.read_text(encoding="utf-8")
+    step = text.index("5. **Reconcile code and description.**")
+    first_check = text.index("diff_signals.py --check-body", step)
+    cold = text.index("**Cold reader.**", step)
+    assert first_check < cold
+    flat = _flat(SKILL)
+    assert "In two sentences, what does this PR change for a user, and why?" in flat
+    assert "agent `kirocrew-lite`" in flat
+    local_review = (PREPARE_PR / "scripts" / "local_review.py").read_text(encoding="utf-8")
+    assert "Cold reader" not in local_review
+    assert "two sentences" not in local_review

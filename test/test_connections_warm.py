@@ -502,6 +502,7 @@ async def test_spawn_and_session_mode_both_resolve_from_one_private_generation(
 
     monkeypatch.setattr(warm, "_acp_runtime_factory", lambda: _Spawnable)
     monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: f"start-{pid}")
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: f"start-{pid}")
     monkeypatch.setattr(warm, "_MINT_GRANT_POLL_SECONDS", 3600)
 
     plan = await warm._warm_mint._ensure_locked([_provider("linear")])
@@ -538,6 +539,7 @@ async def test_generation_directory_is_removed_only_after_a_confirmed_kill(
                 raise TimeoutError("still alive")
 
     monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: f"start-{pid}")
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: f"start-{pid}")
     monkeypatch.setattr(warm, "_WARM_KILL_TIMEOUT_SECONDS", 1)
     work_dir = warm._create_warm_generation_dir()
     runtime = _Process(failures=1)
@@ -654,6 +656,7 @@ def test_a_bound_generation_is_untouched_until_its_identity_proves_dead(
         pid = 4242
 
     monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: f"start-{pid}")
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: f"start-{pid}")
     monkeypatch.setattr(warm, "_process_identity_live", lambda pid, started: True)
     work_dir = warm._create_warm_generation_dir()
     runtime = _Process()
@@ -678,6 +681,7 @@ def test_startup_scavenging_deletes_only_proven_dead_owned_generations(
             self.pid = pid
 
     monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: f"start-{pid}")
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: f"start-{pid}")
     warm._bind_warm_generation(_Process(101), dead)
     warm._bind_warm_generation(_Process(202), live)
     monkeypatch.setattr(
@@ -695,20 +699,100 @@ def test_startup_scavenging_deletes_only_proven_dead_owned_generations(
 def test_recorded_gateway_identity_reads_back_as_live(_private_warm_home: Path):
     """The gateway token the writer stores must round-trip through the reader.
 
-    Writer and reader have to agree on ONE token format, and two different
-    ``platform_compat`` helpers do not: ``own_process_start_time()`` answers
-    ``"{ticks}:{boot_uuid}"`` on Linux and a ``proc_pidinfo`` microtime on macOS,
-    while ``process_start_time(pid)`` -- what the reader compares against --
-    answers bare ticks and a 1s ``ps`` string respectively. Storing one and
-    comparing the other classifies this very much alive gateway as dead on both
-    platforms, and only coincidentally agrees on Windows, where both helpers
-    return the same creation ``FILETIME``.
+    Writer and reader have to agree on ONE token format, and it must be one
+    whose readers never act on a drifted render: both sides go through
+    ``_marker_process_start_id`` (``get_process_start_id``-first), so the
+    locale-rendered ``ps`` spelling is neither written nor compared. Storing a
+    token from one helper and comparing against another -- e.g. the
+    reboot-unique ``own_process_start_time()`` against the reader -- classifies
+    this very much alive gateway as dead, and only coincidentally agreed on
+    Windows, where both helpers return the same creation ``FILETIME``.
     """
     owner = warm._warm_generation_owner()
 
     assert owner["gateway_pid"] == os.getpid()
     assert owner["gateway_started"], "a readable host must record a gateway token"
     assert warm._process_identity_live(owner["gateway_pid"], owner["gateway_started"]) is True
+
+
+def test_writer_never_emits_a_locale_rendered_identity(_private_warm_home: Path):
+    """A persisted marker must never carry the retired ``ps`` spelling.
+
+    The writer and the reader both go through ``_marker_process_start_id``, so
+    whatever lands in ``gateway_started``/``runtime_started`` is in the current
+    representation by construction. This pins that property directly: a future
+    change that routes the writer back through ``process_start_time``'s
+    locale-rendered ``ps`` leg would still round-trip on a same-locale host and
+    only delete trees after a ``TZ``/``LC_TIME`` change, which no round-trip
+    test can observe.
+    """
+
+    class _Process:
+        pid = os.getpid()
+
+    owner = warm._warm_generation_owner(_Process())
+    for key in ("gateway_started", "runtime_started"):
+        recorded = owner[key]
+        assert recorded, "a readable host must record both identities"
+        assert warm._CURRENT_START_ID_RE.match(
+            recorded
+        ), f"{key} is not in the current representation: {recorded!r}"
+
+
+def test_start_ids_comparable_allows_only_the_current_representation():
+    """The migration guard compares kinds, not values.
+
+    Two current-representation values are always comparable -- even when they
+    differ, in which case the mismatch verdict stands. Anything else on either
+    side is "unknown", never "different".
+    """
+    assert warm._start_ids_comparable("12345", "12345") is True
+    assert warm._start_ids_comparable("12345", "67890") is True
+    assert warm._start_ids_comparable("1730.000042", "1730.000043") is True
+    assert warm._start_ids_comparable("Wed Sep  3 10:00:00 2026", "12345") is False
+    assert warm._start_ids_comparable("12345", "Wed Sep  3 10:00:00 2026") is False
+    assert warm._start_ids_comparable("", "12345") is False
+    assert warm._start_ids_comparable("12345", "") is False
+
+
+def test_scavenging_keeps_a_generation_with_a_legacy_ps_marker(
+    _private_warm_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A pre-migration marker must read as unknown, not dead.
+
+    RED before the fix: the marker below carries the retired ``ps -o lstart=``
+    spelling for a gateway that is still running. The old reader compared that
+    render against the freshly read one, called the mismatch death, and the
+    scavenger removed the live gateway's cwd and private agent scope. The
+    runtime half is pinned ALIVE so the comparability guard is the only thing
+    standing between this tree and the ``rmtree`` -- the PID-liveness shortcut
+    must not be what saves it.
+    """
+    legacy_render = "Wed Sep  3 10:00:00 2026"
+    runtime_pid = 747474
+    current_rep = "99999"
+    monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: current_rep)
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: current_rep)
+    monkeypatch.setattr(
+        warm.platform_compat, "pid_liveness", lambda pid: warm.platform_compat.PID_ALIVE
+    )
+
+    work_dir = warm._create_warm_generation_dir()
+    marker = {
+        "sentinel": warm._WARM_GENERATION_SENTINEL,
+        "version": warm._WARM_GENERATION_MARKER_VERSION,
+        "gateway_pid": os.getpid(),
+        "gateway_started": legacy_render,
+        "runtime_pid": runtime_pid,
+        "runtime_started": legacy_render,
+    }
+    warm._warm_generation_marker_path(work_dir).write_text(json.dumps(marker), encoding="utf-8")
+
+    assert warm._process_identity_live(os.getpid(), legacy_render) is None
+    assert warm._process_identity_live(runtime_pid, legacy_render) is None
+    assert warm._scavenge_warm_generation_dirs() == 0
+    assert work_dir.is_dir(), "a legacy marker must keep the tree it cannot judge"
 
 
 def test_scavenging_keeps_a_generation_whose_gateway_is_still_alive(
@@ -726,12 +810,18 @@ def test_scavenging_keeps_a_generation_whose_gateway_is_still_alive(
     is why it cannot observe a wrong token reaching that function.
     """
     real_start_time = warm.platform_compat.process_start_time
+    real_start_id = warm.platform_compat.get_process_start_id
     dead_pid = 424242
 
     monkeypatch.setattr(
         warm.platform_compat,
         "process_start_time",
         lambda pid: "runtime-token" if pid == dead_pid else real_start_time(pid),
+    )
+    monkeypatch.setattr(
+        warm.platform_compat,
+        "get_process_start_id",
+        lambda pid: "runtime-token" if pid == dead_pid else real_start_id(pid),
     )
     monkeypatch.setattr(
         warm.platform_compat,
@@ -767,11 +857,17 @@ def test_release_keeps_the_tree_when_the_killed_runtime_survived(
     """
     survivor_pid = 525252
     real_start_time = warm.platform_compat.process_start_time
+    real_start_id = warm.platform_compat.get_process_start_id
 
     monkeypatch.setattr(
         warm.platform_compat,
         "process_start_time",
         lambda pid: "runtime-token" if pid == survivor_pid else real_start_time(pid),
+    )
+    monkeypatch.setattr(
+        warm.platform_compat,
+        "get_process_start_id",
+        lambda pid: "runtime-token" if pid == survivor_pid else real_start_id(pid),
     )
     monkeypatch.setattr(
         warm.platform_compat, "pid_liveness", lambda pid: warm.platform_compat.PID_ALIVE
@@ -801,11 +897,17 @@ def test_release_removes_the_tree_once_the_runtime_is_provably_dead(
     """
     gone_pid = 636363
     real_start_time = warm.platform_compat.process_start_time
+    real_start_id = warm.platform_compat.get_process_start_id
 
     monkeypatch.setattr(
         warm.platform_compat,
         "process_start_time",
         lambda pid: "runtime-token" if pid == gone_pid else real_start_time(pid),
+    )
+    monkeypatch.setattr(
+        warm.platform_compat,
+        "get_process_start_id",
+        lambda pid: "runtime-token" if pid == gone_pid else real_start_id(pid),
     )
     monkeypatch.setattr(
         warm.platform_compat,
@@ -2631,6 +2733,7 @@ async def test_a_spec_scope_is_retained_while_an_unkilled_child_still_needs_it(
     doomed = _UnkillableRuntime(failures=1)
     doomed.pid = 6060
     monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: f"start-{pid}")
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: f"start-{pid}")
 
     def _liveness(pid: int) -> str:
         """Report the doomed child dead only once its kill has actually taken.

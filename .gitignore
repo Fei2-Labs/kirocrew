@@ -67,6 +67,14 @@ src/kiro_crew/static/dist
 src/kiro_crew/static/.dist.staging.*
 src/kiro_crew/static/.dist.previous.*
 
+# Disposable scratch for Dev Fleet's Pull+Build installability probe
+# (npm_preflight). It lives in the checkout rather than TMPDIR so the rehearsal
+# runs on the filesystem the real `npm ci` writes to; probe() removes it in a
+# `finally`, and this rule covers the one a killed process leaves. Same
+# consequence as the staging entries above: an untracked leftover makes the
+# checkout read as dirty and fail-closes "Prune merged".
+/.kirocrew-npm-preflight-*
+
 # Build-time provenance stamp (scripts/stamp-distribution.sh). Generated per
 # packaging path; a committed copy would mislabel every other build's beacon.
 src/kiro_crew/_build_info.py
@@ -150,7 +158,10 @@ FILE_SPLIT_PLAN.md
 eval_results/
 build-log-trimmed_*.txt
 docs/APP_DEVELOPER_GUIDE.md
-.claude/scheduled_tasks.lock
+# Operator-local Claude Code state: machine-specific permissions and private
+# agent definitions. This repo is PUBLIC, so the whole directory stays out of
+# it rather than merely untracked.
+.claude/
 runs.json
 .review/
 
@@ -181,3 +192,9 @@ evals/*/iteration-*/
 # A distribution stamps its build number here at packaging time (see
 # kiro_crew/__init__.py); never committed -- a dev checkout runs the bare core.
 src/kiro_crew/BUILD_VERSION
+
+# The crew image's wheel, staged by scripts/build_crew_base_image.sh for the
+# context bind mount. `vendor/` is a TRACKED directory (its .gitkeep ships in the
+# sdist so the image can be built from an installed copy), so without this rule a
+# ~27MB build artifact sits in a tracked path waiting for a `git add -A`.
+src/kiro_crew/apps/builtins/aws_control/crew/runtime/vendor/*.whl

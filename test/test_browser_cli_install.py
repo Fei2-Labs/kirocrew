@@ -127,18 +127,56 @@ def test_detect_reports_absent_when_binary_missing(monkeypatch: pytest.MonkeyPat
     assert d["node_ok"] is True
 
 
-def test_detect_reports_version_when_present(monkeypatch: pytest.MonkeyPatch) -> None:
-    _wire(
+def test_detect_reports_version_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "node_modules" / "@playwright" / "cli"
+    package.mkdir(parents=True)
+    entry = package / "playwright-cli.js"
+    entry.write_text("", encoding="utf-8")
+    (package / "package.json").write_text(
+        json.dumps({"name": "@playwright/cli", "version": "0.1.18"}),
+        encoding="utf-8",
+    )
+    calls = _wire(
         monkeypatch,
         {"node": "/n/node", "playwright-cli": "/n/playwright-cli"},
-        {"/n/node": (0, "v22.1.0", ""), "/n/playwright-cli": (0, "0.1.18\n", "")},
+        {"/n/node": (0, "v22.1.0", "")},
     )
+    monkeypatch.setattr(mod, "cli_command", lambda cli=None: ["/n/node", str(entry)])
 
     d = mod.detect()
 
     assert d["installed"] is True
     assert d["cli_path"] == "/n/playwright-cli"
     assert d["cli_version"] == "0.1.18"
+    assert calls == [["/n/node", "--version"]]
+
+
+def test_installed_cli_version_reads_package_metadata_each_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "node_modules" / "@playwright" / "cli"
+    package.mkdir(parents=True)
+    entry = package / "playwright-cli.js"
+    entry.write_text("", encoding="utf-8")
+    manifest = package / "package.json"
+    manifest.write_text(json.dumps({"version": "0.1.21"}), encoding="utf-8")
+    real_read_text = Path.read_text
+    reads: list[Path] = []
+
+    def _read_text(path: Path, *args, **kwargs) -> str:
+        if path == manifest:
+            reads.append(path)
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _read_text)
+    command = ["/n/node", str(entry)]
+
+    assert mod.installed_cli_version(command) == "0.1.21"
+    manifest.write_text(json.dumps({"version": "0.1.22"}), encoding="utf-8")
+    assert mod.installed_cli_version(command) == "0.1.22"
+    assert reads == [manifest, manifest]
 
 
 def test_detect_reports_a_launcher_without_a_safe_runtime_as_absent(
@@ -982,9 +1020,9 @@ class TestFailureDetailIsRedactedAtTheSource:
             )
 
         # ── The timing half: catastrophe only ──
-        mod._redact(small)  # warm up (JIT, import overhead)
+        mod.redact_install_output(small)  # warm up (JIT, import overhead)
         start = time.thread_time()
-        mod._redact(large)
+        mod.redact_install_output(large)
         elapsed = time.thread_time() - start
         assert elapsed < _CATASTROPHIC_CEILING, (
             f"redacting {len(large)} adversarial chars took {elapsed:.3f}s, over the "
@@ -1172,11 +1210,18 @@ class TestWindowsGatewayCommand:
         source.chmod(0o755)
         monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", True)
         monkeypatch.setattr(mod, "config_dir", lambda: crew)
+        probed: list[str] = []
+        monkeypatch.setattr(
+            mod, "_run", lambda argv, timeout: (probed.append(argv[0]), (0, "v24.18.0\n", ""))[1]
+        )
 
         staged = mod._stage_managed_node(str(source))
 
         assert staged == crew / "playwright-cli" / "node.exe"
         assert staged.read_bytes() == b"trusted node"
+        # The smoke run exercised the staged copy inside the leaf, not the source.
+        assert probed and Path(probed[-1]).parent == staged.parent
+        assert Path(probed[-1]) != source
 
         source.write_bytes(b"replacement node")
         replaced = mod._stage_managed_node(str(source))
@@ -1222,24 +1267,37 @@ def test_detect_offers_the_os_appropriate_standalone_installer(
     the URL -- and the dashboard's untranslated-literal gate forbids holding it in
     the component.
     """
-    monkeypatch.setattr(mod.os, "name", "posix")
-    posix = mod._standalone_install_command()
-    assert "playwright-cli.sh" in posix
-    assert "powershell" not in posix
-    # Download-then-run rather than a pipe into a shell: a machine locked down
-    # enough to need this usually forbids piping the network into `sh`.
-    assert "| sh" not in posix
-    assert "curl -fsSL" in posix
+    # Both `os.name` patches live in their OWN throwaway instance, because the
+    # `detect()` call below needs the REAL platform back and `monkeypatch.undo()`
+    # on the shared instance is not a way to get there: it reverts every record on
+    # that instance, including the two module-level autouse fixtures that patched
+    # through it. That would send `_browsers_cache_dir` and `_required_revisions`
+    # back to production for the rest of the test, and `detect()` would iterdir the
+    # developer's real ~/.cache/ms-playwright -- exactly what
+    # `isolated_browser_cache` exists to prevent. Exiting the context restores
+    # `os.name` alone.
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(mod.os, "name", "posix")
+        posix = mod._standalone_install_command()
+        assert "playwright-cli.sh" in posix
+        assert "powershell" not in posix
+        # Download-then-run rather than a pipe into a shell: a machine locked down
+        # enough to need this usually forbids piping the network into `sh`.
+        assert "| sh" not in posix
+        assert "curl -fsSL" in posix
 
-    monkeypatch.setattr(mod.os, "name", "nt")
-    windows = mod._standalone_install_command()
-    assert "playwright-cli.ps1" in windows
-    assert "playwright-cli.sh" not in windows
+        patched.setattr(mod.os, "name", "nt")
+        windows = mod._standalone_install_command()
+        assert "playwright-cli.ps1" in windows
+        assert "playwright-cli.sh" not in windows
 
     # `detect()` is exercised under the REAL platform: with `os.name` patched to
     # "nt", pathlib refuses to build a WindowsPath on Linux and the call dies
     # before the payload exists. The Windows branch above is the helper's job.
-    monkeypatch.undo()
+    # `_wire` for the same reason every other `detect()` call site here uses it --
+    # unwired, `detect()` resolves the real `cli_path()` and spawns the host's own
+    # `playwright-cli --version` and `node --version` with the repo root as cwd.
+    _wire(monkeypatch, {})
     assert mod.detect()["standalone_install"] == mod._standalone_install_command()
 
 
@@ -1969,12 +2027,137 @@ class TestPosixGatewayCommand:
         source.chmod(0o755)
         monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
         monkeypatch.setattr(mod, "config_dir", lambda: crew)
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, "v24.18.0\n", ""))
 
         staged = mod._stage_managed_node(str(source))
 
         assert staged == crew / "playwright-cli" / "gateway-node"
         assert staged.read_bytes() == b"trusted node"
         assert staged.stat().st_mode & 0o777 == 0o500
+
+    def test_install_refuses_a_launcher_script_that_cannot_run_from_the_leaf(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``bin/node`` that is a shell script locates the binary it starts
+        relative to its own path. It copies cleanly and passes the mode checks,
+        but a copy in the managed leaf points at a file that is not there. The
+        smoke run is a REAL process here: the copied script runs from the leaf,
+        its target is missing, and the install refuses, naming the source."""
+        crew = tmp_path / "crew"
+        bin_dir = tmp_path / "node" / "bin"
+        bin_dir.mkdir(parents=True)
+        wrapper = bin_dir / "node"
+        wrapper.write_text('#!/bin/sh\nexec "$(dirname "$0")/node_real" "$@"\n')
+        wrapper.chmod(0o755)
+        real = bin_dir / "node_real"
+        real.write_text("#!/bin/sh\necho v24.18.0\n")
+        real.chmod(0o755)
+        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(mod, "config_dir", lambda: crew)
+
+        # In place the wrapper works; that is what fooled the mode checks.
+        assert mod._run([str(wrapper), "--version"], 20.0)[0] == 0
+
+        with pytest.raises(OSError) as excinfo:
+            mod._stage_managed_node(str(wrapper))
+
+        message = str(excinfo.value)
+        assert str(wrapper) in message
+        assert "does not run from the managed leaf" in message
+        # The copied script looked for its sibling next to ITSELF, i.e. inside
+        # the leaf. The shell's wording differs (dash: "not found", bash: "No such
+        # file or directory"); the path it names is the shell-independent fact.
+        assert str(crew / "playwright-cli" / "node_real") in message
+
+        leaf = crew / "playwright-cli"
+        assert not (leaf / "gateway-node").exists()
+        assert not list(leaf.glob(".gateway-node-*.incoming")), "dead copy left in the leaf"
+
+    def test_install_refuses_a_binary_that_only_runs_under_its_wrapper_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Some distributions wrap Node to inject ``LD_LIBRARY_PATH`` for a
+        bundled ``libstdc++``. The kernel names the real binary, it is a plain
+        executable with no ``#!``, and it still cannot run outside the wrapper.
+        Only running the staged copy catches that class, so the smoke run is
+        what refuses it; a magic-bytes check would have staged a dead file."""
+        crew = tmp_path / "crew"
+        binary = tmp_path / "node_real"
+        binary.write_bytes(b"\x7fELF needs the wrapper's LD_LIBRARY_PATH")
+        binary.chmod(0o755)
+        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(mod, "config_dir", lambda: crew)
+        monkeypatch.setattr(
+            mod,
+            "_run",
+            lambda argv, timeout: (127, "", "error while loading shared libraries: libstdc++.so.6"),
+        )
+
+        with pytest.raises(
+            OSError, match=r"does not run from the managed leaf \(exit 127: .*libstdc\+\+"
+        ):
+            mod._stage_managed_node(str(binary))
+
+        assert not (crew / "playwright-cli" / "gateway-node").exists()
+
+    def test_install_refuses_a_copy_that_runs_but_is_not_node(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exit 0 with no version banner is not a Node either."""
+        crew = tmp_path / "crew"
+        binary = tmp_path / "node"
+        binary.write_bytes(b"\x7fELF something else")
+        binary.chmod(0o755)
+        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(mod, "config_dir", lambda: crew)
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, "usage: not-node\n", ""))
+
+        with pytest.raises(OSError, match=r"did not report a version"):
+            mod._stage_managed_node(str(binary))
+
+        assert not (crew / "playwright-cli" / "gateway-node").exists()
+
+
+class TestNodeRuntimeExecutableProbe:
+    """The staged binary is the one the KERNEL says is running, not the one
+    Node names: ``process.execPath`` is argv[0], and a launcher script that
+    starts the binary with ``exec -a <script>`` makes Node report the script."""
+
+    def _resolved(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        binary = tmp_path / "bin" / "node_real"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"\x7fELF native node")
+        binary.chmod(0o755)
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, f"{binary}\n", ""))
+        return binary
+
+    def test_probe_asks_the_kernel_first_and_falls_back_to_execpath(self) -> None:
+        probe = mod._NODE_EXECUTABLE_PROBE
+        assert "realpathSync('/proc/self/exe')" in probe
+        assert probe.index("/proc/self/exe") < probe.index("process.execPath")
+
+    def test_probe_output_is_resolved_as_an_executable_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = self._resolved(tmp_path, monkeypatch)
+        seen: list[list[str]] = []
+
+        def run(argv: list[str], timeout: float) -> tuple[int, str, str]:
+            seen.append(argv)
+            return (0, f"{binary}\n", "")
+
+        monkeypatch.setattr(mod, "_run", run)
+
+        assert mod._node_runtime_executable("node") == str(binary.resolve())
+        assert seen == [["node", "-p", mod._NODE_EXECUTABLE_PROBE]]
+
+    def test_probe_rejects_a_relative_or_multiline_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, "node_real\n", ""))
+        assert mod._node_runtime_executable("node") is None
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, "/a\n/b\n", ""))
+        assert mod._node_runtime_executable("node") is None
 
 
 class TestSystemGatewayCommand:

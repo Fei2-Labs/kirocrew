@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
-import { X } from 'lucide-react'
+import { X, LoaderCircle } from 'lucide-react'
 import { SplitGlyph } from './SplitGlyph'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
@@ -23,6 +23,7 @@ import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './Queue
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
 import ChatFooter from '../pages/chat/ChatFooter'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
+import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
 import type { DisplayItem } from '../pages/chat/types'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from './AgentDropdownList'
@@ -37,6 +38,7 @@ import { useProvider } from '../providers'
 import type { ModelInfo } from '../providers/types'
 import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
+import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
@@ -52,6 +54,7 @@ import { tryQuickSend } from '../lib/quickSend'
 import { mergeRecoveredDraft } from '../utils/chatDrafts'
 import { takePaneDraft, writePaneDraft, mergePaneDraft, subscribePaneDraft } from '../utils/chatPaneDrafts'
 import { sendTurn, type SendReceiptStatus } from '../chat-core/transport/sendTurn'
+import { applySteerReceipt } from '../chat-core/transport/steerReceipt'
 import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
 import FlyingQuote from './FlyingQuote'
 import { revealComposer } from '../pages/chat/composerFocus'
@@ -60,6 +63,7 @@ import { performSlotSwitch } from '../lib/slotSwitch'
 import { drainPendingChunks } from '../lib/pendingChunkDrain'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
 import { api } from '../api/client'
+import { slotMessagesQueryKey } from '../api/slotMessagesQuery'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import { classifyDrop } from '../utils/dropClassify'
 import { prepareSendPayload, serializeDirTokens, spliceDirTokens, VIDEO_EXT } from '../utils/fileTokens'
@@ -259,8 +263,9 @@ export default function ChatPane({
   // not persist — the shared toast is transient feedback, not the error surface.
   const [switchError, setSwitchError] = useState('')
   const [stopError, setStopError] = useState('')
-  const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
-  const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
+  // In-pane report of a title rename / regenerate that did not land (#9727):
+  // the main header routes the same failure into its action banner.
+  const [titleError, setTitleError] = useState<{ title: string; message: string } | null>(null)
   // The transcript is virtualized (chat-core P5-e): ChatMessageList owns the
   // scroller and the stick-to-bottom follow through VirtualTranscript. The pane
   // keeps the element ref for the pinned-prompt hook, a handle for the jump
@@ -299,9 +304,6 @@ export default function ChatPane({
   // Prefer the warm's value: this pane's own query is staleTime:Infinity, so its
   // has_more freezes at mount while a later bounded warm can truncate the cache.
   const warmHasMore = useAppSelector((s) => s.chat.slotPaneHasMore?.[slotKey])
-  // Plan quota for whatever harness this slot runs on — undefined for the ones
-  // that report none, which is most of them.
-  const rateLimit = useAppSelector((s) => s.chat.slotRateLimit?.[slotKey])
   const paneSlot = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey))
   // The composer is a `Composer` root around the ChatInput preset (chat-core
   // P3-b). Its Voice atom is what gives the pane a microphone: the pane wires no
@@ -434,7 +436,11 @@ export default function ChatPane({
   // This pane takes no project prop, so read THIS slot's project from the store:
   // it scopes which project-local agents exist, so a project change must refetch.
   const paneProject = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.project || undefined)
-  const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
+  const { agents: installedAgents, choices: catalogChoices, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
+  // The picker lists every catalog row (a member and a template of one name
+  // are two rows). A roster source that exposes only the folded list -- one
+  // row per name -- is still a complete, if namespace-blind, catalog.
+  const agentChoices = catalogChoices ?? installedAgents
   // One source for every same-meaning marker: the composer chip, the row's
   // check, and the default-agent row's label. An agent-less slot resolves to
   // the configured default (matching what dispatch runs) before the literal
@@ -458,13 +464,10 @@ export default function ChatPane({
       .then(() => dispatch(triggerRefresh()))
       .catch(() => setDefaultAgentFailed(true))
   }, [dispatch])
-  const agentDD = useFilteredDropdown(installedAgents)
-  const harnessBackend = useAppSelector((s) => s.dashboard.status?.harness?.backend ?? '')
-  const paneBackend = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.acp_backend)
-  const localModels = useAvailableModels({
-    slot: slotKey,
-    backend: paneBackend !== undefined ? paneBackend : harnessBackend,
-  })
+  // The pop-up lists the full catalog (a same-name member and template are
+  // two rows); every other reader of the roster keeps the name-folded list.
+  const agentDD = useFilteredDropdown(agentChoices)
+  const localModels = useAvailableModels()
   const effectiveModels = useMemo<ModelInfo[]>(() => {
     if (!paneRemoteCrew.isRemote) return localModels
     return (paneRemoteCrew.capabilities?.models ?? []).map(model => ({
@@ -485,6 +488,10 @@ export default function ChatPane({
     [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model],
   )
   const modelDD = useFilteredDropdown(modelPickerModels)
+  // Picker anchors: keep each portaled menu glued to the ChatInput chip that
+  // opened it while the menu is open (#10616, same class as #10580).
+  const { rect: agentBtnRect, anchorTo: anchorAgentBtn } = useAnchoredTriggerRect(agentDD.open)
+  const { rect: modelBtnRect, anchorTo: anchorModelBtn } = useAnchoredTriggerRect(modelDD.open)
   // See ChatPage: display what will actually run, not a pin the account lost
   // access to. The slot's own `model_withheld` verdict answers that when the
   // backend has one; the degraded flag gates only the list-membership fallback —
@@ -524,7 +531,7 @@ export default function ChatPane({
   }
   const hydrateLimit = limitRef.current
   const { data: slotDetail, isError: slotDetailFailed, refetch: refetchSlotDetail } = useQuery({
-    queryKey: ['slot-messages', slotKey, hydrateLimit],
+    queryKey: slotMessagesQueryKey(slotKey, hydrateLimit),
     queryFn: () => api.chatSlotDetail(slotKey, hydrateLimit),
     staleTime: Infinity,
   })
@@ -537,14 +544,14 @@ export default function ChatPane({
   // thinking block expanding) and turn-collapse shrink re-pin too.
 
 
-  const switchAgent = useCallback(async (name: string) => {
+  const switchAgent = useCallback(async (name: string, kind?: 'member' | 'template') => {
     dispatch(setAgentSwitchNotice(null))
     setSwitchError('')
     try {
       // Same protocol as switchModel below (#4523): the pane must not depend
       // on the coalesced slots rebroadcast to see its own pick.
       // performAgentSlotSwitch mirrors exactly what the response names.
-      await performAgentSlotSwitch(slotKey, name, dispatch)
+      await performAgentSlotSwitch(slotKey, name, dispatch, kind)
     } catch (e) {
       const msg = agentSwitchFailureMessage(e)
       dispatch(setAgentSwitchNotice(msg))
@@ -587,7 +594,7 @@ export default function ChatPane({
     inputRef: agentDD.inputRef,
     hasFilterInput: true,
     filteredCount: agentDD.filtered.length,
-    onEnterSingleMatch: () => { switchAgent(agentDD.filtered[0].name); agentDD.setOpen(false) },
+    onEnterSingleMatch: () => { switchAgent(agentDD.filtered[0].name, agentDD.filtered[0].selection_kind); agentDD.setOpen(false) },
     closeToTrigger: () => agentDD.setOpen(false),
   })
   const { onListKeyDown: onModelListKeyDown } = useListboxKeyboard({
@@ -803,15 +810,9 @@ export default function ChatPane({
     // reported nothing at all: the composer had already cleared and a rejected
     // fetch was swallowed by `.catch(() => undefined)`, so an undelivered
     // message stayed on screen looking sent. `ChatPage` has always appended an
-    // error row and handed the text back; the pane now does the same.
-    const reportFailedSend = (reason?: string, status?: SendReceiptStatus) => {
-      reportSendFailure(reason, status, !optionText)
-      // Only a composer send has anything to hand back: an option send never
-      // consumed the draft (see the `!optionText` gate above), so restoring the
-      // option label here would CLOBBER the preserved draft with text the user
-      // can re-click any time.
-      if (!optionText) restoreIntoComposer(text, files, slotKey)
-    }
+    // error row and handed the text back; the pane now does the same, split
+    // across the steer-receipt adapter's `reportFailure` (the error row) and
+    // `restore` (handing the payload back) so a `refused` restores exactly once.
     // Receipt semantics live in the chat-core transport (sendTurn owns the
     // abort deadline and the shared readSendReceipt classification). This
     // pane only decides how to REACT
@@ -821,63 +822,71 @@ export default function ChatPane({
     // invite a retry that duplicates a turn already in flight, side effects
     // included, so the optimistic composer row stays pending.
     void sendTurn({ message: llm, slot: slotKey, meta, ...(steerNow ? { steer: true } : {}) }).then((receipt) => {
-      if ((receipt.status === 'response-late' || receipt.status === 'transport-error')
-        && selectSendConfirmed(store.getState(), slotKey, sendId)) return
-      if (receipt.status === 'refused' || receipt.status === 'transport-error') {
-        reportFailedSend(receipt.reason, receipt.status)
-        return
-      }
-      if (receipt.status === 'unknown') return
-      if (receipt.status === 'response-late') {
-        // The "stays pending" reasoning above needs a row to stay pending. A
-        // BUSY send minted none (the server's queue/steer echo was to be the
-        // representation), so if the deadline fires before any echo landed
-        // the text exists nowhere on screen: hand it back and warn, the same
-        // ruling the steer path takes — a duplicate is visible and deletable,
-        // a silently dropped draft is not. A late echo that does arrive
-        // simply adds the server's row; the notice tells the user to look.
-        if (!bubbleMinted && !optionText) {
-          // Only an echo that carries THIS send's id counts. Queue cards carry
-          // no sendId (see useQueuedMessageActions), and matching one by text
-          // cannot tell this send's card from an identical "ok" someone else
-          // queued meanwhile — so a queued card never suppresses the restore.
-          // The cost is a visible duplicate (card + refilled draft + notice)
-          // when the card did belong to this send; the alternative is silent
-          // loss, and the notice says to check the conversation first.
+      // Receipt policy, owned once in chat-core (issue #9457). This is the
+      // PARTIAL copy: doSend is a full send, not only a steer, so the rulings
+      // applySteerReceipt owns (echo short-circuit, refused/response-late/
+      // unknown/steered/queued-demote/dispatched-row) run through the adapter,
+      // while doSend's own send-machinery tail (queue-card stash gate, stateless
+      // card + blocking-ask resolution) stays here, AFTER the rulings, because
+      // it must run on every accepted receipt including a `steered` one.
+      applySteerReceipt(receipt, {
+        // A busy send always mints a sendId; the echo (queue/steer_push) that
+        // carries it reconciles the row. Only this send's id counts -- a queued
+        // card carries none and matching by text cannot tell this send from an
+        // identical one queued meanwhile.
+        echoReconciled: () => selectSendConfirmed(store.getState(), slotKey, sendId),
+        // A BUSY send minted no optimistic bubble (bubbleMinted false: the
+        // server's queue/steer echo was to be the representation), so the text
+        // exists nowhere on screen and must be handed back. The gate differs by
+        // ruling, which is why restore takes the status: a `refused` send never
+        // ran, so it restores whenever it consumed the composer (`!optionText`),
+        // minted bubble or not -- matching the old reportFailedSend gate. A
+        // `response-late` restores only when NO bubble was minted, because a
+        // minted bubble stays pending to avoid a duplicate. This is the ONLY
+        // restore now (reportFailure no longer restores), so `refused` restores
+        // exactly once -- the double-restore GPT 5.6 flagged at :837.
+        restore: (status) => {
+          if (optionText) return
+          if (status === 'response-late' && bubbleMinted) return
           restoreIntoComposer(text, files, slotKey)
-          dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } }))
-        }
-        return
-      }
-      // The correlated user echo owns insertion before streaming, including
-      // when a busy snapshot skipped the optimistic bubble. A receipt only
-      // confirms an existing row; appending here would duplicate or reorder it.
-      // The receipt names the queue entry this send became: bind the
-      // pre-send composer state to it so cancelling that card restores the
-      // TYPED text and re-stages the files (issue #560). The stash is the
-      // lossless path; the parser fallback (`restoreQueuedContent`) inverts
-      // the wire markers the pane now emits, which recovers the paths but not
-      // the exact typed text around them. `!optionText`
-      // mirrors the composer-consumption gate above -- an option send never
-      // consumed the draft, so there is no pre-send state to bind. An empty
-      // wire text can never reach here (sendTurn classifies it `refused`),
-      // and the guard requires the receipt's `queue_id`.
-      if (receipt.status === 'queued' && typeof receipt.body.queue_id === 'string' && receipt.body.queue_id && !optionText) {
-        queuedSendStash.set(receipt.body.queue_id, { raw: text, files, sent: llm })
-      }
-      // The response is the delivery receipt for this pane's optimistic bubble
-      // independently of when its correlated user echo arrives. Only
-      // an IMMEDIATE dispatch counts: a queued acceptance is not a receipt for
-      // this bubble.
-      if (receipt.status === 'dispatched') {
-        dispatch(confirmOptimisticSend({
-          slot: slotKey,
-          sendId,
-          mid: typeof receipt.body.mid === 'string' ? receipt.body.mid : undefined,
-        }))
-      }
+        },
+        // Report ONLY -- the error row. The restore is `restore`'s job above;
+        // handing the payload back here too would restore a `refused` twice.
+        reportFailure: (reason, status) => reportSendFailure(reason, status, !optionText),
+        // Only the no-bubble composer send that actually restored gets the
+        // notice; a bubble that stayed pending needs no "check the transcript"
+        // warning, and an option send restored nothing to warn about.
+        warnUnconfirmed: () => { if (!bubbleMinted && !optionText) dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } })) },
+        // doSend mints no optimistic STEER bubble to drop, so the 'drop' arm
+        // (refused/response-late/queued demotion) is a no-op here -- a non-busy
+        // send's plain bubble and a busy send's absent bubble are both
+        // reconciled by confirmOptimisticSend + the correlated echo, not by the
+        // steer-bubble reducer. The 'turn' arm IS the `dispatched && !steered`
+        // branch, so it carries doSend's dispatched-row confirm: the response is
+        // the delivery receipt for this pane's optimistic bubble independently
+        // of when the correlated echo arrives, and confirmOptimisticSend no-ops
+        // when a busy send skipped the bubble.
+        resolveBubble: (outcome) => {
+          if (outcome !== 'turn') return
+          dispatch(confirmOptimisticSend({
+            slot: slotKey,
+            sendId,
+            mid: typeof receipt.body.mid === 'string' ? receipt.body.mid : undefined,
+          }))
+        },
+        // The receipt names the queue entry this send became: bind the pre-send
+        // composer state to it so cancelling that card restores the TYPED text
+        // and re-stages the files (#560). `!optionText` mirrors the
+        // composer-consumption gate above -- an option send never consumed the
+        // draft, so there is no pre-send state to bind.
+        stashDemoted: (queueId) => { if (!optionText) queuedSendStash.set(queueId, { raw: text, files, sent: llm }) },
+      })
+      // -- doSend's send-machinery tail (not steer-receipt policy) --
+      // Stateless card + blocking ask resolution, owned by doSend and run on
+      // every accepted receipt. Guarded independently of the rulings above so
+      // a `steered` or `queued` receipt still settles the card/ask correctly.
       if (!cardAtSend && !askAtSend) return
-      // Immediate dispatch only: a QUEUED acceptance is still cancellable —
+      // Immediate dispatch only: a QUEUED acceptance is still cancellable --
       // the queued path retires at its queue_pop instead (removeQueuedMessage).
       if (receipt.status === 'dispatched' && cardAtSend) dispatch(retireStatelessQuestion({ slot: slotKey, expected: cardAtSend }))
       void resolveAskAfterSend(receipt.body, askAtSend, dispatch)
@@ -941,46 +950,31 @@ export default function ChatPane({
     setInput('')
     setPendingFiles([])
     void sendTurn({ message: txt, slot: slotKey, steer: true, meta: steerMeta }).then((receipt) => {
-      if ((receipt.status === 'response-late' || receipt.status === 'transport-error')
-        && selectSendConfirmed(store.getState(), slotKey, sendId)) return
-      // Receipt policy, same rulings as ChatPage's steerMutation:
-      // - refused / unconfirmed transport-error: drop the bubble
-      //   (left standing it would be a false third copy next to the error row
-      //   and the refilled composer), say so in this transcript, hand the
-      //   payload back.
-      if (receipt.status === 'refused' || receipt.status === 'transport-error') {
-        dispatch(resolveOptimisticSteer({ slot: slotKey, sendId, outcome: 'queued' }))
-        reportSendFailure(receipt.reason, receipt.status)
-        restoreIntoComposer(raw, files, slotKey)
-        return
-      }
-      // - response-late: the deadline aborted the POST; delivery is
-      //   indeterminate. If the server's own echo already reconciled the bubble
-      //   the steer landed. Otherwise drop the bubble (standing, it would read
-      //   as delivered), hand the text back, and warn — a duplicate is visible
-      //   and deletable, a lost steer is not.
-      if (receipt.status === 'response-late') {
-        dispatch(resolveOptimisticSteer({ slot: slotKey, sendId, outcome: 'queued' }))
-        restoreIntoComposer(raw, files, slotKey)
+      // Receipt policy, owned once in chat-core (issue #9457) -- the same
+      // rulings as ChatPage's steerMutation. applySteerReceipt decides WHICH
+      // ruling; the adapter below is this pane's HOW.
+      applySteerReceipt(receipt, {
+        // A confirmed echo (steer_push carrying this sendId) already reconciled
+        // the bubble: the steer landed, so an indeterminate transport outcome
+        // is ignored.
+        echoReconciled: () => selectSendConfirmed(store.getState(), slotKey, sendId),
+        // refused / response-late hand the payload back into this pane's
+        // composer (raw text + files), addressed to the slot it was typed into.
+        restore: () => restoreIntoComposer(raw, files, slotKey),
+        reportFailure: (reason, status) => reportSendFailure(reason, status),
         // \u26A0 is NoticeCard's warn-tone selector (parseNotice).
-        dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } }))
-        return
-      }
-      // - unknown: a 2xx whose body would not parse. Accepted; an unreadable
-      //   body confirms nothing, so the bubble is left as is.
-      if (receipt.status === 'unknown') return
-      // - steered: the server injected it; the steer_push echo owns the row.
-      if ((receipt.body as { steered?: boolean }).steered) return
-      // - demoted: queued behind the turn (queue_push brings its own card) or
-      //   fell onto a fresh turn (the row is a plain user message). A queued
-      //   demotion binds the PRE-SEND composer state to its queue entry, as
-      //   doSend does: the card's content is the wire text with inlined file
-      //   markers, so cancelling it must restore the typed text and re-stage
-      //   the files, not hand back `[attached_file N]` with the chip gone.
-      if (receipt.status === 'queued' && typeof receipt.body.queue_id === 'string' && receipt.body.queue_id) {
-        queuedSendStash.set(receipt.body.queue_id, { raw, files, sent: txt })
-      }
-      dispatch(resolveOptimisticSteer({ slot: slotKey, sendId, outcome: receipt.status === 'queued' ? 'queued' : 'turn' }))
+        warnUnconfirmed: () => dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } })),
+        // The reducer drops an optimistic bubble left standing (it would be a
+        // false third copy next to the error row and the refilled composer) and
+        // demotes it to a plain user row on 'turn'.
+        resolveBubble: (outcome) => dispatch(resolveOptimisticSteer({ slot: slotKey, sendId, outcome: outcome === 'turn' ? 'turn' : 'queued' })),
+        // A queued demotion binds the PRE-SEND composer state to its queue
+        // entry, as doSend does: the card's content is the wire text with
+        // inlined file markers, so cancelling it must restore the typed text
+        // and re-stage the files, not hand back `[attached_file N]` with the
+        // chip gone (#560).
+        stashDemoted: (queueId) => queuedSendStash.set(queueId, { raw, files, sent: txt }),
+      })
     })
   }, [running, doSend, input, pendingFiles, slotKey, dispatch, reportSendFailure, restoreIntoComposer])
 
@@ -1173,7 +1167,7 @@ export default function ChatPane({
   const inputAreaRef = useRef<HTMLDivElement>(null)
   const { onQuote, onAsk, quoteFlight, endQuoteFlight } = useSelectionQuoteAsk({ slot: slotKey, setInput, revealComposer, openSideChat })
 
-  const ddInputCls = 'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-none focus-visible:border-accent'
+  const ddInputCls = 'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-hidden focus-visible:border-accent'
 
   return (
     <SlotProvider slotId={slotKey}>
@@ -1209,7 +1203,7 @@ export default function ChatPane({
         } as React.CSSProperties}
       >
         {!frameless && (
-        <div data-pane-title-row className={`relative z-50 flex items-center gap-2 pr-3 py-2 border-b border-border bg-card shrink-0 transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${leading?.inset ? 'pl-[49px]' : 'pl-3'}`}>
+        <div data-pane-title-row className={`group/header relative z-50 flex items-center gap-2 pr-3 py-2 border-b border-border bg-card shrink-0 transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${leading?.inset ? 'pl-[49px]' : 'pl-3'}`}>
           {/* Leading edge (#10585): in split view this pane may stand in for
               the single-chat title row at the surface's top-left. `inset`
               clears the shell's stationary sidebar toggle: the pane starts at
@@ -1223,7 +1217,16 @@ export default function ChatPane({
           {leading?.inset && <span aria-hidden="true" data-pane-leading-divider className="absolute left-[41px] top-1/2 -translate-y-1/2 w-px h-5 bg-border" />}
           {leading?.control}
           <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-ok animate-pulse' : 'bg-accent'}`} />
-          <span className="text-[13px] font-semibold text-text-strong truncate min-w-0">{title}</span>
+          {/* Same rename / regenerate control as the single-session header
+              (#9727): the title row is the `group/header` hover target that
+              reveals the Pen and the Sparkles button. */}
+          <SessionTitleControl
+            slotKey={slotKey}
+            title={title}
+            compact
+            onError={(message, lead) => setTitleError({ title: lead, message })}
+            onAttempt={() => setTitleError(null)}
+          />
           {parentKey && (
             <span
               className="shrink-0 text-[10px] text-accent bg-accent/10 rounded-full px-1.5 py-0.5 truncate max-w-[38%]"
@@ -1286,7 +1289,10 @@ export default function ChatPane({
                 bannerH={pinnedState.bannerH}
                 expanded={pin.pinExpanded}
                 onToggleExpanded={() => setPinExpanded(p => !p)}
-                onJump={() => pin.jumpToPinnedPromptInPlace(pinnedState.idx)}
+                onJump={() => pin.jumpToPinnedPromptInPlace(pinnedState.idx, {
+                  mountIndex: (index, opts) => listRef.current?.mountIndex(index, opts) ?? false,
+                  estimateRowTop: (index) => listRef.current?.estimateRowTop(index) ?? null,
+                })}
                 cardRef={pin.pinCardRef}
                 onCollapsedHeight={pin.onPinCollapsedHeight}
               />
@@ -1330,7 +1336,7 @@ export default function ChatPane({
                   </div>
                 )}
                 {messages.length === 0 && !running && !slotDetailFailed && !hideEmptyHint && (
-                  <div className="text-center text-muted text-[13px] py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
+                  <div className="text-center text-muted text-[13px] px-4 py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
                 )}
                 {/* Suppressed on the active slot: that pane renders the store's full
                     history, so the bound does not apply and the row would be false. */}
@@ -1413,6 +1419,97 @@ export default function ChatPane({
               }
             })
           }}
+          /* No-ask_id card: the card IS the interaction, answered in one click.
+             A native AskUserQuestion card is raised while its own turn is still
+             running and waiting on the answer, so a plain send would queue
+             behind that turn and the question would never be consumed (#10634).
+             When the slot is busy the turn is live, so steer the answer INTO it
+             (`steer: true`); when the turn has ended, `busy` is false and this
+             starts an ordinary next turn, exactly as the non-blocking
+             `ask_question` card does. `busy` is the shared `selectComposerBusy`
+             rule (chatSlice) the main chat keys on too, so the two routes match.
+             Steer ONLY the native card (no `ask_id`, no server `card_id`): the
+             client always mints a local `cardId`, so the discriminator is
+             `serverCardId`, which the server sets only for the non-blocking
+             `ask_question` card. That card can be answered while sub-agents keep
+             the slot busy, and it must still start a next turn.
+
+             Recovery differs by whether this is a live steer. A LIVE steer uses
+             the receipt-aware policy owned by `applySteerReceipt` (issue #9457),
+             exactly as the main chat's steer path: a `refused`/`transport-error`
+             reports and restores; a `response-late` restores and warns
+             delivery-unconfirmed -- UNLESS the `steer_push`/user echo carrying
+             this send's `sendId` already reconciled the optimistic bubble, in
+             which case the steer provably landed and the indeterminate HTTP
+             outcome is ignored (no restore, no duplicate). That echo
+             short-circuit is why a CONFIRMED steer is never handed back as if it
+             failed. An IDLE answer is an ordinary send with no live turn to
+             reconcile against, so it keeps the plain report-and-restore the card
+             fallback has always used. `onFallbackSend` is left untouched as the
+             expired-blocking-card (404) recovery path and is NOT reused here. */
+          onDirectSend={(text) => {
+            // The card IS the interaction, answered in one click. A NATIVE
+            // AskUserQuestion card (no `ask_id`, no server `card_id`) is raised
+            // while its own turn is still running and waiting on the answer, so
+            // a plain send would queue behind that turn and the question would
+            // never be consumed (#10634): when the slot is busy that turn is
+            // live, so the answer STEERS into it. The client always mints a
+            // local `cardId`, so the discriminator is `serverCardId`, which the
+            // server sets only for the non-blocking `ask_question` card; that
+            // card can be answered while sub-agents keep the slot busy and must
+            // still start a next turn, never steer.
+            //
+            // Both routes are otherwise ONE path: mint an optimistic user bubble
+            // carrying the `sendId`, POST through `sendTurn`, and reconcile the
+            // bubble through `applySteerReceipt` + `resolveOptimisticSteer`
+            // exactly as `doSteer` does. `resolveOptimisticSteer` is what makes
+            // every receipt cell correct without a bespoke ladder: a `turn`
+            // outcome DEMOTES the bubble to a plain user row (so a dispatched
+            // answer stays in the transcript and survives reload), and every
+            // other outcome (`queued`/drop) REMOVES it (so a queued answer shows
+            // only as its QueueStack card, never a duplicate, and a failed one
+            // leaves no orphan). The card cleared on submit, so a genuine
+            // non-delivery hands the answer back to the composer via `restore`,
+            // UNLESS the `steer_push`/user echo carrying this `sendId` already
+            // reconciled the bubble -- proof it landed, so no restore and no
+            // duplicate. Only the `steer` POST flag and the pre-append chunk
+            // drain differ between the two routes.
+            const steerLive = busy && !pendingQuestion?.ask_id && !pendingQuestion?.serverCardId
+            const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+            // Drain the per-frame chunk buffer before the append, as `doSteer`
+            // does: a pre-steer chunk still buffered means the finalize-on-steer
+            // finds no streaming row, so the bubble would flush BELOW it and
+            // post-steer chunks would corrupt transcript order (#6075 class).
+            // Only a live steer injects into a streaming turn, so only it drains.
+            if (steerLive) drainPendingChunks()
+            dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'user', content: text, cls: 'msg msg-u', ts: new Date().toISOString(), meta: { ...(steerLive ? { steer: true } : {}), optimistic: true, sendId } } }))
+            void sendTurn({ message: text, slot: slotKey, meta: { sendId }, ...(steerLive ? { steer: true } : {}) }).then((receipt) => {
+              applySteerReceipt(receipt, {
+                // A confirmed echo is stronger evidence than a missing/late HTTP
+                // response: if it landed, do NOT restore (the fix for the
+                // "confirmed steers restored as failed" finding).
+                echoReconciled: () => selectSendConfirmed(store.getState(), slotKey, sendId),
+                // The card cleared on submit, so the answer lives nowhere else:
+                // hand it back on every non-delivered ruling. The bubble is
+                // dropped by `resolveBubble` below, so this never leaves an
+                // orphan row beside the restored text.
+                restore: () => restoreIntoComposer(text, [], slotKey),
+                reportFailure: (reason, status) => reportSendFailure(reason, status),
+                // The leading char is NoticeCard's WARN tone selector (parseNotice
+                // strips it and renders a lucide TriangleAlert -- it is never shown
+                // as an emoji icon). Built from code points so the source carries
+                // no emoji literal for the no-emoji-as-icons gate to match.
+                warnUnconfirmed: () => dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: String.fromCodePoint(0x26A0, 0xFE0F) + ' ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } })),
+                // Demote the bubble to a plain user row when the answer landed on
+                // a turn; drop it on every other outcome (queued/refused/late) so
+                // a queued answer shows only as its QueueStack card and a failed
+                // one leaves no orphan.
+                resolveBubble: (outcome) => dispatch(resolveOptimisticSteer({ slot: slotKey, sendId, outcome: outcome === 'turn' ? 'turn' : 'queued' })),
+                // Text-only card answer: no queued-stash binding to carry.
+                stashDemoted: () => undefined,
+              })
+            })
+          }}
         />
 
         {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
@@ -1440,6 +1537,17 @@ export default function ChatPane({
           testId="chat-pane-stop-error"
           message={stopError}
           onDismiss={() => setStopError('')}
+        />
+        {/* No hand-off: the composer draft is untouched by a failed rename; the
+            title in the bar is the one the store still holds, so the user can
+            simply try again. */}
+        <ErrorNotice
+          variant="inline"
+          className="mx-4 mt-2"
+          testId="chat-pane-title-error"
+          title={titleError?.title}
+          message={titleError?.message}
+          onDismiss={() => setTitleError(null)}
         />
 
         {/* Quote transit: the selection flies from where it was taken into this
@@ -1483,9 +1591,8 @@ export default function ChatPane({
           contextPct={contextPct}
           contextUsedTokens={contextTokens?.used}
           contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
-          rateLimit={rateLimit}
-          onAgentClick={!agentLocked && provider.capabilities.agentTemplates ? (rect) => { setAgentBtnRect(rect); agentDD.setOpen(!agentDD.open) } : undefined}
-          onModelClick={(rect) => { setModelBtnRect(rect); modelDD.setOpen(!modelDD.open) }}
+          onAgentClick={!agentLocked && provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); agentDD.setOpen(!agentDD.open) } : undefined}
+          onModelClick={(rect, trigger) => { anchorModelBtn(rect, trigger); modelDD.setOpen(!modelDD.open) }}
           approvalMode={displayMode}
           followUpOptions={followUpOptions}
           followUpPicked={followUpPicked}
@@ -1587,7 +1694,7 @@ export default function ChatPane({
               />
             </div>
             <div role="listbox" aria-label={i18nT('components.chatPane.agent_list')} className="overflow-y-auto max-h-[280px]">
-              <AgentDropdownList agents={agentDD.filtered} activeAgent={paneAgentName} defaultAgent={defaultAgent} onSelect={(name) => { switchAgent(name); agentDD.setOpen(false) }} />
+              <AgentDropdownList agents={agentDD.filtered} activeAgent={paneAgentName} activeKind={paneSlot?.agent_kind} defaultAgent={defaultAgent} onSelect={(name, kind) => { switchAgent(name, kind); agentDD.setOpen(false) }} />
             </div>
             <DefaultAgentRow agentName={paneAgentName} isDefault={paneAgentName === defaultAgent} onSetDefault={() => toggleDefaultAgent(paneAgentName)} />
             <ManageAgentsFooter error={defaultAgentFailed} onManage={() => { agentDD.setOpen(false); navigate('/capabilities?tab=crews') }} />
@@ -1637,8 +1744,23 @@ export default function ChatPane({
                 </Btn>
               </div>
             )}
+            {paneRemoteCrew.failed && (
+              <div className="flex items-center gap-2 px-1.5 py-1">
+                {/* No hand-off: this pane's composer may hold an unsent draft.
+                    Retry keeps the user in the owning chat. */}
+                <ErrorNotice
+                  className="min-w-0 flex-1"
+                  variant="inline"
+                  message={i18nT('components.modelEffortDropdown.models_failed')}
+                />
+                <Btn type="button" className="shrink-0" onClick={() => paneRemoteCrew.refetch()} disabled={paneRemoteCrew.retrying}>
+                  {paneRemoteCrew.retrying && <LoaderCircle className="lucide-inline animate-spin" aria-hidden />}
+                  {i18nT('pages.settings.chatPanel.retry')}
+                </Btn>
+              </div>
+            )}
             <div role="listbox" aria-label={i18nT('components.chatPane.model_list')} className="overflow-y-auto max-h-[280px]">
-              <ModelDropdownList models={modelDD.filtered} activeModel={shownModel} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} />
+              <ModelDropdownList models={modelDD.filtered} activeModel={shownModel} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
             </div>
             {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
               modelDD.setOpen(false)

@@ -80,7 +80,12 @@ from kiro_crew.security import (
     scan_exfiltration_urls,
 )
 from kiro_crew.sel import sel
-from kiro_crew.validation import MCP_CRON_SCHEMAS, ValidationError, validate_tool_args
+from kiro_crew.validation import (
+    MCP_CRON_SCHEMAS,
+    ValidationError,
+    infer_use_case,
+    validate_tool_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1184,7 +1189,7 @@ def _list_tools() -> list[dict[str, Any]]:
                     "member_id": {
                         "type": "string",
                         "description": "Crew Member responsible for this schedule. Uses that "
-                        "member's private memory. Omit to inherit the creating conversation's "
+                        "member's memory. Omit to inherit the creating conversation's "
                         "member; ordinary conversations retain global V1 memory.",
                     },
                     "silent": {
@@ -1869,15 +1874,15 @@ def _validate_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
     """Execute a cron tool and return the result as text."""
-    from kiro_crew.config.paths import private_runtime_log_dir
-
-    if private_runtime_log_dir() is not None:
-        # This marker selects a transport only. The gateway independently
-        # verifies the process/session/store before opening the cron store.
+    # Managed callers use ordinary authenticated gateway routing, including
+    # live restricted sessions whose execution record intentionally is not on disk.
+    if current_caller() is not None or _resolve_session_key():
+        # The gateway authenticates the request and resolves its captured session
+        # execution before opening the cron store.
         from kiro_crew.mcp_core import _post
 
         session_key, refusal = require_strict_session_key(
-            "Cannot verify this private cron caller. Reopen the member conversation.",
+            "Cannot identify this cron caller. Reopen the conversation.",
             server="kirocrew-cron",
         )
         if refusal:
@@ -1892,6 +1897,20 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
         response = _post(
             "/api/crons/tools", {"name": name, "arguments": args}, session_key=session_key
         )
+        if (
+            response.get("refused")
+            and current_caller() is None
+            and infer_use_case(session_key) == "cli"
+        ):
+            # No gateway is listening (nothing was executed) and the identity is
+            # POSITIVELY the attended CLI's own -- ``kirocrew chat`` presents the
+            # ``cli_chat`` key everywhere it is identified, and it is the one
+            # surface whose cron tools always wrote the host store directly.
+            # Keep that. A gateway-minted key (dashboard, channel, cron,
+            # subagent) with no injected caller is the non-pooled gateway
+            # topology, where a refused dial is an outage of the gateway that
+            # validates the call: report it, never write around it.
+            return _call_tool_locally(name, raw_args)
         if response.get("error"):
             advice = (
                 " Outcome unknown; check cron_list before retrying a mutation."
@@ -2565,7 +2584,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return f"Error: {exc}"
         except ValueError as e:
             return f"Error: {e}"
-        sched_str = format_schedule(job.schedule)
+        sched_str = format_schedule(job.schedule, tz_name=job.timezone or "")
         sel().log_api_access(
             caller="mcp",
             operation="cron.create",
@@ -2696,7 +2715,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             source="mcp",
             resources=f"job_id={jid}",
         )
-        sched_str = format_schedule(updated.schedule)
+        sched_str = format_schedule(updated.schedule, tz_name=updated.timezone or "")
         # Read from the SAVED row, not from ``args``: an update that leaves
         # persistent_session alone must still warn if the job is already in that
         # state and this call turned it into an agent job, and the flag is writable

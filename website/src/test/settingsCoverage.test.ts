@@ -61,6 +61,7 @@ function readPanel(file: string): string {
  */
 const UNMAPPED_PANELS: Record<string, string> = {
   'ChannelDisabledPanel.tsx': 'informational placeholder (locked/loading/error states), zero controls',
+  'ChannelFolderBackfill.tsx': 'one action button shared by the channel panels; files existing conversations into the folder the OWNING panel configures, and holds no setting of its own',
   'ChannelsPanel.tsx': 'list-detail shell routing to per-channel panels; carries no controls of its own',
   'DiscordPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=discord',
   'TelegramPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=telegram',
@@ -188,10 +189,12 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       'primitive (manual: notifications.volume)',
   },
   'RemoteCrewPanel.tsx': {
-    counts: { input: 2 },
+    counts: { input: 6 },
     reason:
       'setup-wizard AWS profile/region convenience fields (localStorage) behind a ' +
-      'non-URL sub-tab a deep link cannot mount',
+      'non-URL sub-tab a deep link cannot mount; plus the launch form\'s identity ' +
+      'choice (2 radios) and Identity Center start-URL/region fields — per-launch ' +
+      'arguments sent with the launch request, not persistent settings',
   },
   'SecretsPanel.tsx': {
     counts: { Input: 2 },

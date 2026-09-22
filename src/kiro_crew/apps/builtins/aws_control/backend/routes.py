@@ -36,6 +36,8 @@ MUTATIONS (also restricted-session refused + SEL-audited)
 ``POST /library/{account}/remove``             delete a cloud copy + forget its record
 ``POST /backup/{account}/run``                 run a backup (snapshot | sessions)
 ``POST /backup/{account}/nightly``             toggle the nightly snapshot
+``POST /backup/{account}/retention``           set or clear the retention count
+``POST /backup/{account}/nightly-sessions``    toggle the nightly sessions archive
 ``POST /backup/{account}/restore``             download an archive to the staging dir
 ``POST /install/label``                        rename THIS install (display only, local)
 
@@ -588,8 +590,24 @@ async def _resolve_target(account: str) -> tuple[str, str, str] | web.Response:
     the mapping alone must never pick which account an operation runs
     against. A LIVE identity probe re-verifies that the chosen profile still
     resolves to the REQUESTED account, and a mismatch refuses rather than
-    executing against whatever the profile now points at. The probe's short
-    cache (~30s) bounds the cost without reopening the five-minute window.
+    executing against whatever the profile now points at.
+
+    ``use_cache=False`` is the whole point of the probe here and is NOT a cost
+    oversight. :func:`aws_consent.probe_identity` memoises per
+    ``(profile, region)`` for 30 seconds, which is right for the consent and
+    voice paths that ask "who would bill this" repeatedly. It is wrong for an
+    authorization decision: a cached answer of account A, honoured for a full
+    30 seconds after the profile was repointed to B, verifies A while the read
+    that follows runs against B's live credentials. Switching a profile between
+    accounts is an ordinary operator action, not an extreme one, so that window
+    is reachable in normal use. An authorization check that may answer from
+    memory is not a check.
+
+    What this buys and what it does not: the probe and the read are still two
+    operations, so a repoint landing between them is not caught by anything
+    here. That window is one call wide instead of thirty seconds, which is the
+    difference between a race and a TTL, and closing it entirely would need an
+    atomicity the AWS CLI does not offer.
 
     Takes the id rather than the request because ``GET /shares`` scopes by
     QUERY parameter, not by path segment, and a second copy of this resolution
@@ -604,7 +622,7 @@ async def _resolve_target(account: str) -> tuple[str, str, str] | web.Response:
             "account_unavailable",
         )
     profile, region = resolved
-    identity = await aws_consent.probe_identity(profile, region)
+    identity = await aws_consent.probe_identity(profile, region, use_cache=False)
     if not identity.ok or identity.account != account:
         return _conflict(
             "this connection no longer points at the requested account — "
@@ -2279,6 +2297,33 @@ async def _handle_backup_status(request: web.Request) -> web.Response:
     account, profile, region = target
     payload: dict[str, Any] = {
         "nightly": await asyncio.to_thread(backup_mod.nightly_enabled, account),
+        # The EFFECTIVE count the sweep would use, not the raw stored value, and
+        # `null` when retention is off. A panel reporting a number the sweep would
+        # clamp or ignore is worse than reporting none.
+        "retentionKeep": await asyncio.to_thread(backup_mod.retention_keep, account),
+        # Reported as its own field, never folded into `nightly`. The console
+        # renders two switches because there are two grants, and a single field
+        # would make the page unable to show that transcripts are still off.
+        "nightlySessions": await asyncio.to_thread(backup_mod.nightly_sessions_enabled, account),
+        # Why that grant cannot actually run, or None when it can. Reported
+        # BESIDE the grant rather than folded into it, because the two answer
+        # different questions: the grant is what the owner asked for and must
+        # keep reading back as they set it, while this says whether asking for it
+        # achieves anything here. Without it the console can only show the
+        # switch as on, which on a host that cannot produce the archive is a
+        # claim that transcripts are being backed up when none ever are -- and
+        # the loss only surfaces on the host-loss event the feature exists for.
+        #
+        # ``scheduled_account`` is the part only this route can answer. The grant
+        # is settable on any account in the registry while the nightly loop runs
+        # for the one the default key belongs to, so a grant recorded on a second
+        # account is authorized and unreachable at the same time. Answering it
+        # here turns that into a sentence under the switch instead of a schedule
+        # the operator believes in and nothing ever honours.
+        "nightlySessionsBlocked": await asyncio.to_thread(
+            backup_mod.scheduled_sessions_blocked_code,
+            scheduled_account=account == await accounts_mod.default_account_id(),
+        ),
         "runs": await asyncio.to_thread(backup_mod.last_runs, account),
         "jobs": await asyncio.to_thread(_account_jobs, account),
         # This install's own identity, so every row can be told from every other
@@ -2394,7 +2439,20 @@ async def _handle_backup_run(request: web.Request) -> web.Response:
     return web.json_response({"started": True, "kind": kind, "runId": run_id})
 
 
-async def _handle_backup_nightly(request: web.Request) -> web.Response:
+async def _toggle_nightly(
+    request: web.Request,
+    *,
+    setter: Any,
+    field: str,
+    what: str,
+) -> web.Response:
+    """The shared body of both nightly toggles.
+
+    One implementation rather than two copies: both flips authorize unattended
+    paid uploads, so the validation, the failure posture and the disclosure rule
+    are the same decision and must not be able to drift apart. ``field`` is the
+    key the console reads back and ``what`` names the setting in the error text.
+    """
     target = await _account_target(request)
     if isinstance(target, web.Response):
         return target
@@ -2410,9 +2468,9 @@ async def _handle_backup_nightly(request: web.Request) -> web.Response:
     enabled = raw
     account, _profile, _region = target
     try:
-        await asyncio.to_thread(backup_mod.set_nightly, account, enabled)
+        await asyncio.to_thread(setter, account, enabled)
     except OSError:
-        # `set_nightly` now propagates rather than publishing over state it could
+        # The setters propagate rather than publishing over state they could
         # not read, so this toggle can genuinely fail to persist. It must fail
         # LOUDLY -- reporting a setting the next read contradicts is worse than an
         # error -- but as a structured failure, because every non-2xx this app
@@ -2422,12 +2480,78 @@ async def _handle_backup_nightly(request: web.Request) -> web.Response:
         # renders the absolute path of the state file, and there is no reason to
         # disclose a local filesystem path in a response body when the log below
         # already carries it for whoever is actually debugging.
-        logger.exception("aws-control: the nightly toggle could not be persisted")
+        logger.exception("aws-control: the %s toggle could not be persisted", what)
         return web.json_response(
-            {"error": "the nightly setting could not be saved", "code": "state_persist_failed"},
+            {"error": f"the {what} setting could not be saved", "code": "state_persist_failed"},
             status=500,
         )
-    return web.json_response({"nightly": enabled})
+    return web.json_response({field: enabled})
+
+
+async def _handle_backup_nightly(request: web.Request) -> web.Response:
+    return await _toggle_nightly(
+        request, setter=backup_mod.set_nightly, field="nightly", what="nightly"
+    )
+
+
+async def _handle_backup_nightly_sessions(request: web.Request) -> web.Response:
+    """Authorize unattended TRANSCRIPT uploads -- a separate grant, default off.
+
+    Deliberately its own route rather than a second field on the snapshot
+    toggle's body. A shared route would let one request carry both grants, and
+    the whole point of the separate bit is that the operator says yes to
+    transcripts as its own act.
+    """
+    return await _toggle_nightly(
+        request,
+        setter=backup_mod.set_nightly_sessions,
+        field="nightlySessions",
+        what="nightly sessions",
+    )
+
+
+async def _handle_backup_retention(request: web.Request) -> web.Response:
+    """Set or clear this account's retention count -- the only shipped way in.
+
+    Retention deletes object versions permanently and ships OFF, so this is the
+    switch that turns it on. It takes the count rather than a flag because there is
+    no separate enable bit: a count IS on, and `null` IS off.
+    """
+    target = await _account_target(request)
+    if isinstance(target, web.Response):
+        return target
+    body = await _body(request)
+    raw = body.get("keep", ...)
+    if raw is ...:
+        return _bad_request("keep is required", "invalid_keep")
+    # NOT int(): this value authorizes PERMANENT DELETES of the owner's archives, so
+    # it is validated and never coerced. `True` IS an `int` in Python, so a coercing
+    # handler would read {"keep": true} as keep=1 -- the most destructive value
+    # available -- from a caller that believed it was sending a flag. Out of range is
+    # refused rather than clamped: the stored value must be the one the caller asked
+    # for, so nobody configures 0 and is later told they configured 1. There is no
+    # upper bound to refuse against -- a count larger than the number of archives that
+    # exist keeps all of them, which is not a harm.
+    if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
+        return _bad_request("keep must be an integer or null", "invalid_keep")
+    if raw is not None and raw < backup_mod.RETENTION_KEEP_MIN:
+        return _bad_request(
+            f"keep must be at least {backup_mod.RETENTION_KEEP_MIN}",
+            "invalid_keep",
+        )
+    account, _profile, _region = target
+    try:
+        await asyncio.to_thread(backup_mod.set_retention_keep, account, raw)
+    except OSError:
+        # Loud, and with a FIXED message, for the reasons the nightly toggle states:
+        # reporting a setting the next read contradicts is worse than an error, and
+        # the OSError's own text carries the state file's absolute path.
+        logger.exception("aws-control: the retention count could not be persisted")
+        return web.json_response(
+            {"error": "the retention setting could not be saved", "code": "state_persist_failed"},
+            status=500,
+        )
+    return web.json_response({"retentionKeep": raw})
 
 
 async def _handle_backup_restore(request: web.Request) -> web.Response:
@@ -2602,6 +2726,14 @@ def register_routes(app: web.Application) -> None:
     r.add_post(
         f"{_BASE}/backup/{{account}}/nightly",
         _guarded(_mutating("backup_nightly")(_handle_backup_nightly)),
+    )
+    r.add_post(
+        f"{_BASE}/backup/{{account}}/retention",
+        _guarded(_mutating("backup_retention")(_handle_backup_retention)),
+    )
+    r.add_post(
+        f"{_BASE}/backup/{{account}}/nightly-sessions",
+        _guarded(_mutating("backup_nightly_sessions")(_handle_backup_nightly_sessions)),
     )
     r.add_post(
         f"{_BASE}/backup/{{account}}/restore",

@@ -3283,6 +3283,177 @@ class TestBackupEndpoints:
         assert _payload(resp) == {"nightly": False}
         set_nightly.assert_called_once_with(ACCOUNT, False)
 
+    def test_the_transcript_toggle_flips_only_the_transcript_bit(self):
+        # Its own route and its own field. A caller asking for nightly
+        # transcripts must not be able to reach the snapshot grant, in either
+        # direction -- that separation is the whole reason for a second bit.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request(
+            "POST", f"/backup/{ACCOUNT}/nightly-sessions", match_info={"account": ACCOUNT}
+        )
+        req.json = AsyncMock(return_value={"enabled": True})  # type: ignore[method-assign]
+        with (
+            p1,
+            p2,
+            p3,
+            mock.patch.object(routes_mod.backup_mod, "set_nightly_sessions") as set_sessions,
+            mock.patch.object(routes_mod.backup_mod, "set_nightly") as set_nightly,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/backup/{account}/nightly-sessions")](req)  # type: ignore[operator]
+            )
+        assert _payload(resp) == {"nightlySessions": True}
+        set_sessions.assert_called_once_with(ACCOUNT, True)
+        set_nightly.assert_not_called()
+
+    def test_a_non_boolean_never_starts_uploading_transcripts(self):
+        # `bool("false")` is True, and here that would begin uploading the most
+        # sensitive payload in the product for a caller that asked for off. Same
+        # validation as the snapshot toggle because it is the same code, and this
+        # pins that it really is reached on this route too.
+        handlers = _registered()
+        for raw in ("false", "true", 0, 1, "", None, [], {}):
+            p1, p2, p3 = _enabled_owner_env()
+            req = _request(
+                "POST", f"/backup/{ACCOUNT}/nightly-sessions", match_info={"account": ACCOUNT}
+            )
+            req.json = AsyncMock(return_value={"enabled": raw})  # type: ignore[method-assign]
+            with (
+                p1,
+                p2,
+                p3,
+                mock.patch.object(routes_mod.backup_mod, "set_nightly_sessions") as set_sessions,
+            ):
+                resp = asyncio.run(
+                    handlers[("POST", "/backup/{account}/nightly-sessions")](req)  # type: ignore[operator]
+                )
+            assert resp.status == 400, f"{raw!r} was accepted"
+            assert _payload(resp)["code"] == "invalid_enabled"
+            set_sessions.assert_not_called()
+
+    def test_a_transcript_toggle_that_could_not_persist_says_so(self):
+        # A setting the next read contradicts is worse than an error, and the
+        # response must not echo the OSError's rendering, which carries the
+        # absolute path of the state file.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request(
+            "POST", f"/backup/{ACCOUNT}/nightly-sessions", match_info={"account": ACCOUNT}
+        )
+        req.json = AsyncMock(return_value={"enabled": True})  # type: ignore[method-assign]
+        boom = OSError(28, "No space left on device", "/home/someone/.kirocrew/backup.json")
+        with (
+            p1,
+            p2,
+            p3,
+            mock.patch.object(routes_mod.backup_mod, "set_nightly_sessions", side_effect=boom),
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/backup/{account}/nightly-sessions")](req)  # type: ignore[operator]
+            )
+        body = _payload(resp)
+        assert resp.status == 500
+        assert body["code"] == "state_persist_failed"
+        assert "nightlySessions" not in body
+        assert ".kirocrew" not in body["error"]
+
+    def test_the_status_payload_reports_the_transcript_grant_separately(self):
+        # The console renders two switches, so the payload must carry two fields.
+        # Folded into one, the page could not show that transcripts are still off
+        # while the snapshot nightly is on -- the exact state most installs are in.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("GET", f"/backup/{ACCOUNT}", match_info={"account": ACCOUNT})
+        with (
+            p1,
+            p2,
+            p3,
+            mock.patch.object(routes_mod.backup_mod, "nightly_enabled", return_value=True),
+            mock.patch.object(
+                routes_mod.backup_mod, "nightly_sessions_enabled", return_value=False
+            ),
+            mock.patch.object(routes_mod.backup_mod, "last_runs", return_value={}),
+            mock.patch.object(routes_mod, "_account_jobs", return_value={}),
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/backup/{account}")](req)  # type: ignore[operator]
+            )
+        body = _payload(resp)
+        assert body["nightly"] is True
+        assert body["nightlySessions"] is False
+
+    def test_the_status_payload_says_when_this_account_is_not_the_scheduled_one(self):
+        # The grant is settable on every registered account and the nightly loop
+        # runs for the one the default key belongs to, so a grant recorded on any
+        # other account is authorized and unreachable at once. The payload has to
+        # carry that, or the console can only show a schedule nothing honours.
+        #
+        # The host is pinned SUPPORTED and the redaction gap cleared, because both
+        # outrank the account by design. Without that this asserts the account
+        # answer on a platform whose truthful answer is the capability one, so the
+        # outcome turns on the runner rather than on the code. Pinning them keeps
+        # the assertion universal rather than gating it behind a platform check.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("GET", f"/backup/{ACCOUNT}", match_info={"account": ACCOUNT})
+        with (
+            p1,
+            p2,
+            p3,
+            mock.patch.object(routes_mod.backup_mod, "_CAN_PIN_TRAVERSAL", True),
+            mock.patch.object(
+                routes_mod.backup_mod, "_unattended_sessions_redaction_gap", return_value=None
+            ),
+            mock.patch.object(routes_mod.backup_mod, "nightly_enabled", return_value=False),
+            mock.patch.object(routes_mod.backup_mod, "nightly_sessions_enabled", return_value=True),
+            mock.patch.object(routes_mod.backup_mod, "last_runs", return_value={}),
+            mock.patch.object(routes_mod, "_account_jobs", return_value={}),
+            mock.patch.object(
+                routes_mod.accounts_mod,
+                "default_account_id",
+                AsyncMock(return_value="999988887777"),
+            ),
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/backup/{account}")](req)  # type: ignore[operator]
+            )
+        body = _payload(resp)
+        # The grant still reads back exactly as the owner set it; the notice is a
+        # second field beside it, never a correction of it.
+        assert body["nightlySessions"] is True
+        assert body["nightlySessionsBlocked"] == routes_mod.backup_mod.BLOCK_OTHER_ACCOUNT
+
+    def test_the_scheduled_account_gets_no_account_notice(self):
+        # The other direction, so the notice cannot be one that renders always: on
+        # the account the loop does run for, with the host able and nothing else
+        # withholding, the field is EMPTY. Asserting merely "not the account code"
+        # would also pass on a platform that answers with a DIFFERENT code, which
+        # is how a negative control ends up green by coincidence.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("GET", f"/backup/{ACCOUNT}", match_info={"account": ACCOUNT})
+        with (
+            p1,
+            p2,
+            p3,
+            mock.patch.object(routes_mod.backup_mod, "_CAN_PIN_TRAVERSAL", True),
+            mock.patch.object(
+                routes_mod.backup_mod, "_unattended_sessions_redaction_gap", return_value=None
+            ),
+            mock.patch.object(routes_mod.backup_mod, "nightly_enabled", return_value=False),
+            mock.patch.object(routes_mod.backup_mod, "nightly_sessions_enabled", return_value=True),
+            mock.patch.object(routes_mod.backup_mod, "last_runs", return_value={}),
+            mock.patch.object(routes_mod, "_account_jobs", return_value={}),
+            mock.patch.object(
+                routes_mod.accounts_mod, "default_account_id", AsyncMock(return_value=ACCOUNT)
+            ),
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/backup/{account}")](req)  # type: ignore[operator]
+            )
+        assert _payload(resp)["nightlySessionsBlocked"] is None
+
     def test_restore_downloads_a_valid_archive_key(self):
         handlers = _registered()
         p1, p2, p3 = _enabled_owner_env()
@@ -3624,3 +3795,121 @@ class TestIamPolicy:
             )
         assert _payload(resp) == {"policy": {"Version": "2012-10-17"}}
         policy.assert_called_once_with(tier="drive")
+
+
+class TestBackupRetentionRoute:
+    """The only shipped way to turn retention on, and everything it refuses.
+
+    Retention erases object versions permanently and ships off, so this route IS the
+    switch. It takes the count rather than a flag because there is no separate enable
+    bit: a count is on and ``null`` is off. Anything it accepts authorizes permanent
+    deletion of the owner's archives, which is why it validates and never coerces.
+    """
+
+    _PATH = "/backup/{account}/retention"
+
+    def _post(self, payload, *, setter_error=None):
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("POST", f"/backup/{ACCOUNT}/retention", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(return_value=payload)  # type: ignore[method-assign]
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(
+                routes_mod.backup_mod, "set_retention_keep", side_effect=setter_error
+            ) as setter,
+        ):
+            resp = asyncio.run(handlers[("POST", self._PATH)](req))  # type: ignore[operator]
+        return resp, setter
+
+    def test_the_route_is_registered(self):
+        # The finding this answers was that nothing shipped could set the key, so the
+        # registration itself is the load-bearing part and is asserted directly.
+        assert ("POST", self._PATH) in _registered()
+
+    def test_a_count_is_written_and_echoed(self):
+        resp, setter = self._post({"keep": 5})
+        assert resp.status == 200
+        assert _payload(resp)["retentionKeep"] == 5
+        setter.assert_called_once_with(ACCOUNT, 5)
+
+    def test_null_turns_retention_back_off(self):
+        # A switch that can only be turned ON is worse than none: an operator who
+        # enabled pruning has to be able to stop it without hand-editing a file.
+        resp, setter = self._post({"keep": None})
+        assert resp.status == 200
+        assert _payload(resp)["retentionKeep"] is None
+        setter.assert_called_once_with(ACCOUNT, None)
+
+    def test_true_is_refused_rather_than_stored_as_keep_one(self):
+        # `True` IS an int in Python, so a coercing handler would store keep=1 -- the
+        # most destructive value available -- for a caller that believed it sent a flag.
+        resp, setter = self._post({"keep": True})
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_keep"
+        setter.assert_not_called()
+
+    def test_a_string_count_is_refused(self):
+        resp, setter = self._post({"keep": "5"})
+        assert resp.status == 400
+        setter.assert_not_called()
+
+    def test_a_count_below_the_floor_is_refused_rather_than_clamped(self):
+        # Refused, not clamped: the stored value must be the one the caller asked for,
+        # so nobody configures 0 and is later told they configured 1.
+        resp, setter = self._post({"keep": 0})
+        assert resp.status == 400
+        setter.assert_not_called()
+
+    def test_a_large_count_is_accepted_because_there_is_no_ceiling(self):
+        # Keeping more than exists is not a harm, so there is nothing to refuse. The
+        # route must not invent a bound the module does not have.
+        resp, setter = self._post({"keep": 10_000})
+        assert resp.status == 200
+        setter.assert_called_once()
+        assert setter.call_args.args[1] == 10_000
+
+    def test_a_missing_key_is_refused_rather_than_read_as_off(self):
+        # An absent field must not silently mean "turn it off": a caller that omitted
+        # the value by mistake would then disable pruning without asking.
+        resp, setter = self._post({})
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_keep"
+        setter.assert_not_called()
+
+    def test_a_failed_state_write_reports_the_failure_and_not_the_value(self):
+        # Reporting a setting the next read contradicts is worse than an error, and the
+        # message is fixed because the OSError's own text carries the state file path.
+        resp, _setter = self._post({"keep": 2}, setter_error=OSError("disk full"))
+        assert resp.status == 500
+        body = _payload(resp)
+        assert body["code"] == "state_persist_failed"
+        assert "retentionKeep" not in body
+        assert "disk full" not in body["error"]
+
+    def test_the_status_read_reports_the_effective_count(self):
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod.backup_mod, "nightly_enabled", return_value=False),
+            mock.patch.object(routes_mod.backup_mod, "last_runs", return_value={}),
+            mock.patch.object(routes_mod.backup_mod, "retention_keep", return_value=4) as reader,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/backup/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/backup/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        assert _payload(resp)["retentionKeep"] == 4
+        # The sweep's own resolution, so the panel cannot show a number the sweep would
+        # clamp or ignore.
+        reader.assert_called_once_with(ACCOUNT)

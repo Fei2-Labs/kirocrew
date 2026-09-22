@@ -488,6 +488,13 @@
       "description": "Compact is the original view. Comfortable and Full use more screen space."
     },
     {
+      "id": "chat.content-filter-fallback-model",
+      "label": "Content-filter fallback model",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=key%3Aagent.refusal_fallback_model",
+      "configKey": "agent.refusal_fallback_model"
+    },
+    {
       "id": "chat.default-memory-mode",
       "label": "Default Memory Mode",
       "tab": "chat",
@@ -677,6 +684,12 @@
       "description": "Display used and total tokens next to the context progress bar"
     },
     {
+      "id": "chat.show-pasted-text-in-full",
+      "label": "Show Pasted Text in Full",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=chat.show-pasted-text-in-full"
+    },
+    {
       "id": "chat.show-thinking-inline",
       "label": "Show Thinking Inline",
       "tab": "chat",
@@ -702,6 +715,13 @@
       "label": "Soft-stop budget (seconds)",
       "tab": "chat",
       "route": "/settings/chat?highlight=chat.soft-stop-budget-seconds"
+    },
+    {
+      "id": "chat.spell-check-message-input",
+      "label": "Spell Check Message Input",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=chat.spell-check-message-input",
+      "description": "Underline misspelled words in the message input with a red squiggle. Turn it off to stop the red underlines while you type."
     },
     {
       "id": "chat.split-side-by-side-diffs",
@@ -812,6 +832,45 @@
       "description": "Draw a cursor that glides to each target and pulses when it clicks, so you can follow along on screen. Purely visual — it changes nothing about what the agent is allowed to do, and it only appears for clicks that move the real pointer."
     },
     {
+      "id": "connections.client-id",
+      "label": "Client ID",
+      "tab": "connections",
+      "route": "/settings/connections?highlight=connections.client-id"
+    },
+    {
+      "id": "connections.client-secret",
+      "label": "Client secret",
+      "tab": "connections",
+      "route": "/settings/connections?highlight=connections.client-secret"
+    },
+    {
+      "id": "connections.client-secret-2",
+      "label": "Client secret",
+      "tab": "connections",
+      "route": "/settings/connections?highlight=connections.client-secret-2"
+    },
+    {
+      "id": "connections.oauth-client-github",
+      "label": "OAuth app",
+      "tab": "connections",
+      "route": "/settings/connections?highlight=connections.oauth-client-github",
+      "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+    },
+    {
+      "id": "connections.oauth-client-asana",
+      "label": "OAuth app",
+      "tab": "connections",
+      "route": "/settings/connections?highlight=connections.oauth-client-asana",
+      "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+    },
+    {
+      "id": "developer.also-send-tool-call-arguments-so-jev-can-flag-risky-calls",
+      "label": "Also send tool-call arguments so Jev can flag risky calls",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.also-send-tool-call-arguments-so-jev-can-flag-risky-calls",
+      "description": "In a session that approves its own tool calls, this also sends the name and arguments of each call to Jev, which then puts a note on the ones it thinks are worth a look. Passwords and keys are replaced before anything is sent. It changes nothing about which tool calls are allowed. Off until you turn it on, even if the switch above is already on."
+    },
+    {
       "id": "developer.chat-on-a-crew",
       "label": "Chat on a crew",
       "tab": "developer",
@@ -824,6 +883,13 @@
       "tab": "developer",
       "route": "/settings/developer?highlight=developer.crew-members",
       "description": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on."
+    },
+    {
+      "id": "developer.decisions-jev",
+      "label": "Decisions (Jev)",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.decisions-jev",
+      "description": "Jev is a small, fast decision model. With this on, Kiro Crew asks Jev which one of your skills fits the message you just sent — or that none does — and uses Jev's pick for the share of your sessions shown under the switch; the rest keep the word-matching rule this build ships with. If Jev is slow, unreachable or answers with nothing usable, that message falls back to the same rule, so a decision never holds up your reply. Each call is also recorded in a log on the machine that runs Kiro Crew, for diagnostics. This switch is saved on the machine that runs Kiro Crew, not in this browser, so it applies on every device you open it from."
     },
     {
       "id": "developer.developer-mode",
@@ -947,6 +1013,14 @@
       "description": "Choose a color palette for your sidebar sessions."
     },
     {
+      "id": "display.spend-a-few-credits-to-check-your-balance",
+      "label": "Spend a few credits to check your balance",
+      "tab": "display",
+      "route": "/settings/display?highlight=key%3Adashboard.usage_text_scrape_enabled",
+      "description": "When your usage data is not available for free, your balance can still be checked by sending one billed message, about every 10 minutes while a dashboard tab is open. Each check spends a small number of credits.",
+      "configKey": "dashboard.usage_text_scrape_enabled"
+    },
+    {
       "id": "display.theme",
       "label": "Theme",
       "tab": "display",
@@ -974,18 +1048,18 @@
       "configKey": "instances.enabled"
     },
     {
-      "id": "notifications.sound-category-turn",
-      "label": "Agent replies",
-      "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-turn",
-      "description": "When the agent finishes a turn in any chat"
-    },
-    {
       "id": "notifications.sound-category-approval",
-      "label": "Approval",
+      "label": "Approvals and questions",
       "tab": "notifications",
       "route": "/settings/notifications?highlight=notifications.sound-category-approval",
-      "description": "Tool approval requests"
+      "description": "When the agent needs a tool approval or an answer"
+    },
+    {
+      "id": "notifications.sound-category-turn",
+      "label": "Conversation handoffs",
+      "tab": "notifications",
+      "route": "/settings/notifications?highlight=notifications.sound-category-turn",
+      "description": "When a conversation finishes or pauses for your input"
     },
     {
       "id": "notifications.sound-category-cron",

@@ -85,6 +85,48 @@ kirocrew setup --agent-only
 This regenerates `~/.kiro/agents/kirocrew.json` while preserving your own
 customizations in it.
 
+### Pod commands report Permission denied on the user bus
+
+`kirocrew pod` uses per-user service-manager units. On Linux it must connect to
+`$XDG_RUNTIME_DIR/bus`. Pod verb entry and the Pods row in `kirocrew doctor` run
+`systemctl --user is-system-running` once to test that connection. Low-level unit
+queries do not repeat the probe before each command.
+
+If doctor reports the bus as `sandboxed away`, the socket exists but an outer
+sandbox, such as a container or launcher shim, blocks the current process:
+
+```text
+Failed to connect to bus: Permission denied
+```
+
+Run pod commands from a host shell instead of that sandboxed process:
+
+```bash
+kirocrew doctor
+kirocrew pod status <worktree>
+kirocrew pod up <worktree>
+```
+
+If doctor reports `no user session bus`, or reports the address as stale because
+the socket it names holds nothing, no per-user systemd instance is running for
+this uid, and pods are `systemd --user` units. Start it with the
+`loginctl enable-linger <user>` command doctor prints. That command talks to the
+**system** bus, so it is not self-service on a host that cannot reach a bus at
+all: if it answers `Failed to create bus connection: Permission denied`, run it
+from a host shell, or have an administrator run
+`sudo loginctl enable-linger <uid>` — the numeric uid resolves where a name
+lookup answers `Failed to look up user <user>: No such process`. A Cloud Dev
+Desktop reaches the stale case by exporting `DBUS_SESSION_BUS_ADDRESS` from a
+login session whose manager has since stopped. To preview a worktree with no
+systemd at all, use `./dev-backend.sh`.
+
+Probe and unit operations resolve
+`systemctl` only from trusted system directories and ignore same-named PATH entries. A
+missing trusted executable, missing interpreter, or other failure while executing the
+resolved command is reported as an operational error, not as an absent backend.
+Destructive Dev Fleet cleanup then refuses to remove the worktree. Other Kiro Crew
+features do not depend on the pod service manager.
+
 ### MCP tools not working
 
 `kirocrew doctor` auto-appends missing `tools` / `allowedTools` entries for the
@@ -175,7 +217,7 @@ compaction fires often:
 
 - Reduce always-on skills, which consume context in every session
 - Check memory size: large preferences and project files eat into the budget
-- Enable `skills.lazy_load` so a large skills set injects only a ranked top-K
+- Keep `skills.lazy_load` on (the default) so a large skills set injects only a ranked top-K
   instead of the whole catalog
 - Lower `session.timeout_secs` to recycle sessions more often
 

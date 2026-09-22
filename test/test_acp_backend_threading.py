@@ -127,8 +127,28 @@ def test_registry_model_translation_skipped_when_ids_are_foreign(
 def test_registry_model_translation_still_runs_for_kiro(
     captured: _Captured, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The default path keeps its translation boundary."""
+    """The default path keeps its translation boundary.
+
+    PINS A MODEL EXPLICITLY, added at the 2026-09-21 sync. This test used to
+    leave ``agent.model`` at whatever the loaded config carried, which is the
+    ``auto`` default -- and upstream then added a correct short-circuit: a pin
+    equal to ``DEFAULT_MODEL`` resolves to ``""`` (the nothing-pinned spelling
+    every tier below reads) BEFORE the namespace translation runs.
+
+    So the old form was asserting that translation runs when there is nothing to
+    translate, which passed only because the short-circuit did not exist yet.
+    Relaxing the assertion instead would have thrown away the boundary this test
+    is here for; pinning a model restores the precondition the assertion always
+    needed.
+
+    The pin is READ OUT OF THE REGISTRY rather than written as a literal, per the
+    never-hardcode-a-model-id rule: the point is that SOME registry-native id
+    reaches ``to_acp_id`` on this backend, not which one.
+    """
     from kiro_crew import model_registry
+    from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP
+
+    pinned = next(iter(model_registry._CANONICAL_INDEX[MODEL_NAMESPACE_ACP]))
 
     calls: list[str] = []
     real = model_registry.to_acp_id
@@ -141,6 +161,7 @@ def test_registry_model_translation_still_runs_for_kiro(
 
     cfg = KiroCrewConfig.load()
     cfg.agent.acp_backend = ""
+    cfg.agent.model = pinned
 
     _build(cfg, captured)
 

@@ -180,17 +180,16 @@ class TestDeferQueuedDelivery:
         # Transferred, not copied: _settle_digest_holds must not double-write.
         assert info._digest_settle_ids == []
 
-    def test_failed_durable_member_owes_acknowledgement_without_a_tombstone(self):
+    def test_failed_member_owes_nothing(self):
         slot = _ChatSlot("s1")
         info = _member(error="boom")
-        info._delivery_event_id = "event-1"
 
         _defer(slot, info)
 
-        assert slot._subagent_delivery_pending == {_key(COMPLETION): ["a1"]}
+        assert slot._subagent_delivery_pending == {}
         assert info._delivery_queued is True
 
-    def test_stopped_durable_member_owes_acknowledgement_without_a_tombstone(self):
+    def test_stopped_member_owes_nothing(self):
         """A user stop leaves ``error`` EMPTY (it is a neutral outcome), so the
         error-nullability idiom reads it as completed. It already carries a reap
         tombstone with the 7-day post-mortem window, and a "delivered" write would
@@ -198,12 +197,11 @@ class TestDeferQueuedDelivery:
         slot = _ChatSlot("s1")
         info = _member()
         info.user_stopped = True
-        info._delivery_event_id = "event-1"
         assert info.outcome == "stopped" and not info.error
 
         _defer(slot, info)
 
-        assert slot._subagent_delivery_pending == {_key(COMPLETION): ["a1"]}
+        assert slot._subagent_delivery_pending == {}
 
     def test_flush_only_record_owes_only_the_members_it_releases(self):
         """The synthetic flush record has no run of its own; only the held ids
@@ -899,49 +897,64 @@ class TestReaperDoesNotPruneAQueuedPromise:
         assert not (agent_root / info.id / "tombstone.json").exists()
 
     @pytest.mark.asyncio
-    async def test_gateway_idle_route_settles_only_after_turn_consumption(self):
-        """Dispatching an idle dashboard turn is not durable delivery; the
-        outbox debt clears only after the model consumes the completion."""
-        from test_subagent_scale import _mock_dashboard_state, _mock_sessions
+    async def test_child_completion_waits_for_parent_work_without_interrupting_it(self, agent_root):
+        from test_subagent_scale import _drain_injections, _mock_dashboard_state, _mock_sessions
+
+        from kiro_crew.slack import gateway
 
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
         orch.ctx_builder = MagicMock()
-        orch.ctx_builder.hooks = MagicMock()
         orch.dashboard_state = _mock_dashboard_state()
         slot = _ChatSlot("main")
+        parent_release = asyncio.Event()
+        busy_checked = asyncio.Event()
+        parent = asyncio.create_task(parent_release.wait())
+        slot.task = parent
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
-
-        with patch("kiro_crew.slack.gateway.SubagentManager") as mock_sm:
-            mock_sm_inst = MagicMock()
-            mock_sm_inst.start_reaper = MagicMock()
-            mock_sm_inst.running_agents_for = MagicMock(return_value=[])
-            mock_sm_inst.settle_queued_delivery = AsyncMock()
-            mock_sm.return_value = mock_sm_inst
+        with patch.object(gateway, "SubagentManager") as manager:
+            manager.return_value.running_agents_for.return_value = []
             with patch("kiro_crew.slack.handler.is_yolo_mode", return_value=False):
                 orch._init_subagents()
-            orch.subagent_mgr = mock_sm_inst
-            orch.dashboard_state.subagents = mock_sm_inst
-            on_done = mock_sm.call_args.kwargs["on_done"]
+            on_done = manager.call_args.kwargs["on_done"]
 
-        consumed = asyncio.Event()
+        injected = []
+        real_busy = gateway._injection_slot_busy
 
-        async def consume_turn(_state, _slot, _announce, **kwargs):
-            callback = kwargs.get("_on_consumed")
-            assert callback is not None
-            callback()
-            consumed.set()
+        def checked_busy(current):
+            busy_checked.set()
+            return real_busy(current)
+
+        async def run_chat(_state, _slot, text, **kwargs):
+            assert parent.done() and not parent.cancelled()
+            injected.append(text)
+            if kwargs.get("_on_consumed"):
+                kwargs["_on_consumed"]()
 
         info = _member()
-        info._delivery_event_id = "event-1"
-        with patch("kiro_crew.slack.gateway._run_chat", side_effect=consume_turn):
-            await on_done(info)
-            assert info._delivery_queued is True
-            assert slot._subagent_delivery_pending
-            await asyncio.wait_for(consumed.wait(), timeout=1)
-            await _settled(lambda: mock_sm_inst.settle_queued_delivery.await_count == 1)
-
-        mock_sm_inst.settle_queued_delivery.assert_awaited_once_with([info.id])
+        _finished_run(info.id, agent_root)
+        with (
+            patch.object(gateway, "_injection_slot_busy", side_effect=checked_busy),
+            patch.object(gateway, "_run_chat", side_effect=run_chat),
+        ):
+            delivery = asyncio.create_task(on_done(info))
+            try:
+                await asyncio.wait_for(busy_checked.wait(), 3)
+                assert not parent.done()
+                assert not delivery.done()
+                assert not injected
+                parent_release.set()
+                await asyncio.wait_for(delivery, 3)
+                await asyncio.wait_for(_drain_injections(orch), 3)
+            finally:
+                parent_release.set()
+                await parent
+                if not delivery.done():
+                    delivery.cancel()
+                await asyncio.gather(delivery, return_exceptions=True)
+        assert len(injected) == 1
+        assert info.id in injected[0]
+        assert slot._subagent_deliveries_inflight == 0
 
 
 def _make_orchestrator():

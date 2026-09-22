@@ -1631,6 +1631,7 @@ _SELF_PROTECTION_UNGATED_FLOOR_IDS: frozenset[str] = frozenset(
     {
         "self-protection-restart",
         "self-protection-update",
+        "self-protection-file-delivery",
         "self-protection-gateway-restart",
         "self-protection-cloud",
     }
@@ -1662,8 +1663,9 @@ _SELF_PROTECTION_FLOOR_NOTES: dict[str, str] = {
     "credential-exfil-kirocrew-token": (
         "Matched structurally on the command's argv, not by the pattern text above: "
         "the product CLI is invoked to mint a dashboard token, or an inline "
-        "interpreter program imports it (an imported CLI can construct the token verb "
-        "itself, so the import is the gate and no 'token' word need appear)."
+        "interpreter program names the mint surface -- the CLI module, the token "
+        "subcommand's module, or a token-producing product import (an imported CLI can "
+        "construct the token verb itself, so no 'token' argv word need appear)."
     ),
     "self-protection-kill": (
         "Matched structurally on the command's argv, not by the pattern text above: "
@@ -1678,6 +1680,14 @@ _SELF_PROTECTION_FLOOR_NOTES: dict[str, str] = {
         "Matched structurally on the command's argv: the product CLI is the argv's own "
         "program and its leading subcommand self-updates this gateway. This floor has "
         "no catalog row and no opt-out."
+    ),
+    "self-protection-file-delivery": (
+        "Matched structurally on the command's argv: the product CLI is the argv's own "
+        "program and its leading subcommands are 'file-delivery approve', which would "
+        "complete a flagged-file delivery consent step-up. This floor has no catalog row "
+        "and no opt-out. The read-only forms that dispatch nothing -- 'file-delivery' "
+        "with no verb, and 'file-delivery --help' -- are not refused, so the usage this "
+        "command family is quoted from stays reachable."
     ),
     "self-protection-gateway-restart": (
         "Matched structurally on the command's argv: the product CLI is the argv's own "

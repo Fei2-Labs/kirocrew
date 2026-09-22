@@ -166,7 +166,10 @@ export default function LibraryPage() {
         setUninstallTarget(app)
         setKeepData(true)
         setKeepSpecific(new Set())
-        // Fetch uninstall preview (best-effort — dialog works without it)
+        // The preview is optional UI enrichment: when the request succeeds the
+        // dialog shows the dependency classification, and when it fails the
+        // dialog still works — just without the dependency panel. No error toast:
+        // the primary action must not depend on the preview.
         try {
           setUninstallPreview(await api.uninstallPreview(name))
         } catch {
@@ -288,7 +291,7 @@ export default function LibraryPage() {
             interaction, hence the scoped disables. */}
         {uninstallTarget && (
           // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
-          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/60 backdrop-blur-sm animate-rise"
+          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/60 backdrop-blur-xs animate-rise"
             onClick={() => { setUninstallTarget(null); setUninstallPreview(null) }}
             onKeyDown={e => { if (e.key === 'Escape') { setUninstallTarget(null); setUninstallPreview(null) } }}
             tabIndex={-1} ref={el => el?.focus()} role="dialog" aria-modal="true" aria-label={i18nT('pages.appsPage.confirm_uninstall')}

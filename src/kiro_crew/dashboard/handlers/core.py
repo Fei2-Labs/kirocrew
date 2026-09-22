@@ -55,7 +55,11 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_path,
 )
-from kiro_crew.config.sections import STT_LANGUAGE_AUTO
+from kiro_crew.config.sections import (
+    DECISION_BUCKET_MAX,
+    DECISION_BUCKET_MIN,
+    STT_LANGUAGE_AUTO,
+)
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
@@ -67,9 +71,15 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.dashboard.origin import check_host, is_direct_local_request
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.stt_stream import _STREAMING_PROVIDERS, PROVIDER_LOCAL
-from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token, parse_duration
+from kiro_crew.dashboard.token_auth import (
+    MAX_SESSION_TTL_SECS,
+    _unix_request_socket,
+    generate_token,
+    parse_duration,
+)
 from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.executors import discovery_executor
+from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self
 from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
 from kiro_crew.session_workspace import is_valid_id
@@ -138,6 +148,7 @@ _SENSITIVE_MASK = "••••••••"
 # does not refuse a credential-shaped name, so this view cannot assume one never
 # arrives.
 _AGENT_UNTRUSTED_TEXT_FIELDS = (
+    "member_id",
     "description",
     "triggers",
     "kiro_agent",
@@ -1864,6 +1875,17 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
         "validate_fn": _validate_role_model,
     },
+    # Content-filter (refusal) fallback model. Single value: "" (default)
+    # disables the single-message retry; "auto" retries on the model the
+    # provider's refusal envelope recommends; a concrete id retries on it.
+    # Same grammar + entitlement validation as the role-model pins ("" /
+    # "auto" always allow), so the dropdown and the wire cannot disagree.
+    "agent.refusal_fallback_model": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "validate_fn": _validate_role_model,
+    },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
     # Per-role reasoning effort, paired with role_models. Same enum as the chat
     # default; "" = inherit. Applies only on reasoning-capable models.
@@ -1882,7 +1904,6 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.sandbox": {"type": "enum", "values": ["auto", "off"]},
     "agent.sandbox_allow_no_isolation": {"type": "bool"},
     "agent.tool_search": {"type": "bool"},
-    "memory.private_provisioning_enabled": {"type": "bool"},
     "agent.completion_keep": {"type": "enum", "values": ["head", "tail", "both"]},
     "agent.completion_keep_chars": {
         "type": "int",
@@ -1911,6 +1932,12 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # opt-in. The cadence/cap fields (min_user_turns, max_intents, …) stay
     # config-file-only — they are power-user knobs, not first-run choices.
     "session_summary.enabled": {"type": "bool"},
+    # Which monitoring path a session arms by default. Safe on this generic
+    # route for the reason ``computer_use.enabled`` is NOT: this key grants no
+    # capability. Both monitoring paths are armable with it off, so flipping it
+    # cannot open an unattended path -- it only changes which of the two the
+    # monitor tool descriptions name as the default.
+    "monitoring.prefer_structured_arming": {"type": "bool"},
     "auto_update": {"type": "bool"},
     "dashboard.mcp_probe_timeout_secs": {
         "type": "int",
@@ -1957,6 +1984,15 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # behavior (not a display pref), read by the prevent-sleep poll in
     # dashboard/server.py; off by default.
     "dashboard.prevent_sleep": {"type": "bool"},
+    # Whether the credit pill may fall back to a BILLED `kiro-cli /usage` chat
+    # turn when the free usage API returns no plan. Read by
+    # ``handlers/sessions._text_scrape_enabled`` (fail-closed) and off by
+    # default, and the default is unchanged by being editable here: this entry
+    # only makes the value REACHABLE from the dashboard. Without it the schema
+    # published a label and help text for a setting whose PATCH was refused
+    # ``field not editable``, so the only way to opt in was to know the key
+    # name and edit config.json by hand.
+    "dashboard.usage_text_scrape_enabled": {"type": "bool"},
     # User profile (onboarding step 2 + Settings > General > About You).
     # Structured slugs, not free text: context.py maps them to prompt-ready
     # descriptions in its [USER PROFILE] block. "" = unspecified/cleared.
@@ -2067,6 +2103,25 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "type": "int",
         "min": _CU_MIN_SCREENSHOT_MAX_PX,
         "max": _CU_MAX_SCREENSHOT_MAX_PX,
+    },
+    # Decision seam (src/kiro_crew/decisions/). The sampling rate is the one
+    # value this route writes for it. The ENABLE is not a config path at all: it
+    # is the keystone `decisions_consent.json`, written only by the browser-only
+    # `PUT /api/decisions/consent` (handlers/decisions.py), because config.json
+    # is agent-writable and consent to egress must not be. `provider.*` is
+    # deliberately NOT here either. The endpoint would let a dashboard caller
+    # choose where the state a decision point collects is sent, and `api_key` is
+    # schema-`sensitive`, so the masked GET returns the sentinel for it — a PATCH
+    # offered next to that would let a caller overwrite a key it cannot read
+    # back. Both stay config-file-only, the same split telemetry.beacon_endpoint
+    # already has.
+    #
+    # Bounds come from the config section itself, so this write gate and the
+    # load-time clamp in `DecisionsConfig.from_raw` cannot drift.
+    "decisions.bucket": {
+        "type": "int",
+        "min": DECISION_BUCKET_MIN,
+        "max": DECISION_BUCKET_MAX,
     },
 }
 
@@ -2307,6 +2362,26 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                 },
                 status=400,
             )
+
+    # ── Enabling the billed credit-meter fallback is owner-only ──
+    # Every other path in the allowlist is a preference, so the route's "any
+    # authenticated caller" bar is the right one for them. It is not the right bar
+    # for this one: enabling it makes the credit pill fall back to a REAL billed
+    # `kiro-cli /usage` turn, and repeat it every refresh interval for as long as
+    # any tab is open. A dashboard token does not imply ownership -- an
+    # allow-listed messaging user holds one -- so without this gate a non-owner
+    # could start recurring spend on the owner's account, and nothing
+    # self-corrects an enabled state.
+    #
+    # Only the ENABLE is gated, exactly like the two telemetry writes below:
+    # turning billing OFF must never require authorization. Refusing that would
+    # leave someone able to see spend they cannot stop, and the narrower choice
+    # always composes.
+    if path_key == "dashboard.usage_text_scrape_enabled" and value is True:
+        denial = await require_owner_dashboard_request(request, "config.patch.usage_text_scrape")
+        if denial is not None:
+            _log_sel("denied", f"{path_key}={value}")
+            return denial
 
     # ── Governance: refuse a write an enterprise ceiling has pinned ──
     # Only re-ENABLING is refused. Writing `false` is always allowed even under a
@@ -2677,6 +2752,31 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 # ── Local token bootstrap (Electron / local apps) ─────────────────────
 
 
+def _unix_peer_is_self(request: web.Request) -> bool:
+    """True iff *request* arrived on an ``AF_UNIX`` socket AND the kernel
+    positively confirms the peer runs as this process's own principal.
+
+    Transport-admission twin of ``is_loopback`` for the local-secret endpoints:
+    an ``AF_UNIX`` request has an EMPTY ``request.remote``, so the
+    loopback test alone 403s the transport that is strictly HARDER to reach
+    than loopback TCP — the dashboard's socket sits ``0600`` inside a ``0700``
+    owner-only directory, and the kernel reports who connected, which loopback
+    TCP cannot. Because ``/api/token/local`` is ``token_auth``-bypassed, this
+    admission is deny-by-default via ``check_peer_is_self``: ``MISMATCH``
+    (another principal reached our socket — exactly when the directory gate
+    has failed and refusing matters most) and ``UNVERIFIABLE`` (no mechanism,
+    failed syscall) are BOTH refused, so a platform without peer credentials
+    never silently widens the gate. This admits a TRANSPORT, never a caller —
+    the ``X-Local-Secret`` check downstream is unchanged.
+
+    Transport discrimination is delegated to ``token_auth._unix_request_socket``,
+    the one shared definition of "arrived on the dashboard's unix socket" for
+    the CSRF and token-auth layers.
+    """
+    sock = _unix_request_socket(request)
+    return sock is not None and check_peer_is_self(sock) is PeerCredResult.MATCH
+
+
 async def api_token_local(request: web.Request) -> web.Response:
     """GET /api/token/local — issue a token for local apps.
 
@@ -2684,10 +2784,15 @@ async def api_token_local(request: web.Request) -> web.Response:
     gateway startup. Only processes on the same machine can read the file.
     Secret passed via ``X-Local-Secret`` header (not query string, to avoid
     leaking in logs).
+
+    Reachable over loopback TCP or the dashboard's ``AF_UNIX`` socket; unix
+    peers are admitted only on a positive kernel same-principal check
+    (``_unix_peer_is_self``), which is stronger locality evidence than a
+    loopback address. The secret is required on both transports.
     """
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
-    if not _h.is_loopback(request.remote or ""):
+    if not _h.is_loopback(request.remote or "") and not _unix_peer_is_self(request):
         _sel().log_api_access(
             caller=request.remote or "unknown",
             operation="token.local",

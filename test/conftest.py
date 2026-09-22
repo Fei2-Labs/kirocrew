@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import shutil
+import site
 import socket
 import struct
 import sys
@@ -151,6 +152,27 @@ def posix_test_shell() -> str:
 from kiro_crew import platform_compat  # noqa: E402
 
 
+@pytest.fixture
+def nonbundled_python_without_user_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model a non-bundled venv whose user site is already unavailable."""
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: False)
+
+
+@pytest.fixture
+def nonbundled_python_with_user_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model a hosted interpreter whose user site is enabled."""
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", True)
+    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: False)
+
+
+@pytest.fixture
+def bundled_python_with_user_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model the bundled interpreter with an otherwise enabled user site."""
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", True)
+    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: True)
+
+
 def _collect_ignore_from(listname: str) -> list:
     """Bare test filenames listed in ``test/<listname>``, comments stripped."""
     path = os.path.join(os.path.dirname(__file__), listname)
@@ -255,6 +277,88 @@ def forget_env_at_teardown(monkeypatch, *names: str) -> None:
         else:
             monkeypatch.setenv(name, "")  # records "was absent" as the undo
             monkeypatch.delenv(name)
+
+
+#: Thread-CPU budget for ONE rejection of a pump in the SMALL ramp. The shipped
+#: grammars spend under one clock tick here; the exponential class a shared character
+#: between two adjacent quantified classes produces measured 4.3 s at 24 characters
+#: and doubles per character, so it is more than a decade over.
+REDOS_SMALL_BUDGET_SECONDS = 0.5
+#: Pump lengths for the small ramp, ONE unit at a time. Ramping (not one fixed size)
+#: is what bounds the cost of catching a regression: the mutant with the steepest
+#: growth measured (~8x per pumped block) spends at most ~growth x budget on the
+#: first size that overruns, and the ramp stops there. A single 24-unit probe
+#: against that mutant would not return inside pytest's ``--timeout``.
+REDOS_SMALL_PUMPS = tuple(range(1, 25))
+#: Thread-CPU budget for one rejection of a pump in the LARGE ramp. The shipped
+#: grammars measured 0.03 s at 20 000; a quadratic regression is 4e8 steps there.
+REDOS_LARGE_BUDGET_SECONDS = 2.0
+#: Pump lengths for the polynomial class, ascending so a cubic overruns at 2 000
+#: (8e9 steps) before 20 000 is ever attempted.
+REDOS_LARGE_PUMPS = (200, 2_000, 20_000)
+
+
+def assert_rejected_without_backtracking(reject, build_pump) -> None:
+    """Assert a marker grammar handles an adversarial pump in linear CPU time.
+
+    ``build_pump(n)`` returns an input with an ``n``-unit pump (a run of tabs, ``n``
+    repeated heads or blocks); ``reject(text)`` runs the grammar and asserts its own
+    outcome (a refusal, or the one legitimate match the shape has). Replaces the
+    ``elapsed < 1.0`` wall-clock shape, which flaked in one of five full runs:
+    ``perf_counter`` charges the time this worker spent DESCHEDULED behind nine
+    siblings to a regex that took 0.15 s of CPU (class 5 in testing-conventions),
+    and a ``monotonic()`` ratio read 16x from a 15.6 ms clock tick. Four properties:
+
+    * **Thread CPU, not wall clock.** ``time.thread_time`` counts this thread's
+      own execution, so another worker's slice cannot inflate it; the regex runs
+      in C, so coverage instrumentation does not either.
+    * **A one-unit ramp FIRST, and it is what catches the real regression.** A
+      shared character between two adjacent quantified classes in these grammars
+      is not polynomial but EXPONENTIAL (measured: 0.27 s at 20 characters, 4.3 s
+      at 24, doubling per character; an interior that admits every bracket grows
+      ~8x per block), so the 200 000-character input the old tests used would never
+      return under a regression and the worker would be killed at ``--timeout`` --
+      a lost run (class 6), not a red test. Ramping one unit at a time means the
+      first over-budget size costs at most ~growth x budget, and the assertion
+      fires there; only when the whole ramp passes is a long pump tried at all.
+    * **Ascending long pumps** for the polynomial class, so a cubic overruns at
+      2 000 before 20 000 is attempted.
+    * **Minimum of two readings, and the second is taken only if the first
+      overran.** A gen-2 garbage collection charged to this thread mid-search is
+      the one thing that can still spend CPU here; it cannot hit two consecutive
+      readings, so a first reading under budget is a verdict on its own and two
+      over-budget readings are a verdict the other way -- the measurement never
+      pays a regression's cost more than twice per size.
+
+    The budgets are generous on purpose (a decade or more over the shipped cost):
+    a real complexity regression is orders of magnitude, and a tight bound only
+    turns runner variance into red.
+    """
+    import time
+
+    def cheapest(text: str, budget: float) -> float:
+        start = time.thread_time()
+        reject(text)
+        first = time.thread_time() - start
+        if first < budget:
+            return first
+        start = time.thread_time()
+        reject(text)
+        return min(first, time.thread_time() - start)
+
+    for n in REDOS_SMALL_PUMPS:
+        cost = cheapest(build_pump(n), REDOS_SMALL_BUDGET_SECONDS)
+        assert cost < REDOS_SMALL_BUDGET_SECONDS, (
+            f"handling a {n}-unit pump cost {cost:.2f}s of CPU -- the grammar "
+            "backtracks catastrophically (a body class now shares a character with "
+            "an adjacent quantified run, or two alternatives can consume one span?)"
+        )
+    for n in REDOS_LARGE_PUMPS:
+        cost = cheapest(build_pump(n), REDOS_LARGE_BUDGET_SECONDS)
+        assert cost < REDOS_LARGE_BUDGET_SECONDS, (
+            f"handling a {n}-unit pump cost {cost:.2f}s of CPU -- superlinear in the "
+            "pump length"
+        )
 
 
 def cap_project_root_walk(monkeypatch, ceiling: pathlib.Path) -> None:
@@ -387,6 +491,23 @@ def _drop_live_config_snapshot():
     live.reset_for_tests()
     yield
     live.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _inline_taskq_pump(_floor_monkeypatch):
+    """Run the subagent pump and the store open inline for the suite.
+
+    In production the pump is a coroutine whose store reads run on the task
+    store's writer thread, and a manager built on a running loop opens its
+    store on a worker; the suite's harnesses settle with ``sleep(0)`` loops
+    and virtual clocks, and construct a manager and spawn on the next line,
+    which cannot wait for a thread hop. Both off-loop paths are pinned by their
+    own tests, which turn the switches back on.
+    """
+    from kiro_crew.subagent_manager.admission import SpawnAdmissionCoordinator
+
+    _floor_monkeypatch.setattr(SpawnAdmissionCoordinator, "pump_off_loop", False)
+    _floor_monkeypatch.setattr(SpawnAdmissionCoordinator, "open_store_off_loop", False)
 
 
 @pytest.fixture(autouse=True)
@@ -780,6 +901,14 @@ def _isolate_kiro_window_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_advertised_model_cache(_floor_monkeypatch):
+    """Keep one session's advertised model spellings inside its own test."""
+    from kiro_crew import model_registry
+
+    _floor_monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {})
+
+
+@pytest.fixture(autouse=True)
 def _isolate_message_entry_cache():
     """Give every test an EMPTY ``chat_persistence`` persisted-entry cache.
 
@@ -849,6 +978,36 @@ def _disarm_agent_slice_memory_high():
         _sb._SLICE_MEMHIGH_APPLIED = saved_applied
         _sb._SLICE_MEMHIGH_EVENTS_SEEN = saved_events_seen
         _sb._SLICE_MEMHIGH_CLIMB_WARNED = saved_climb_warned
+
+
+@pytest.fixture(autouse=True)
+def _reset_live_execution_records():
+    """A reused temporary home must not inherit another test's live records."""
+
+    def clear():
+        for name, attribute in (
+            ("kiro_crew.execution_context", "_LIVE_EXECUTIONS"),
+            ("kiro_crew.subagent_persistence", "_LIVE_RUN_STATES"),
+        ):
+            module = sys.modules.get(name)
+            if module is not None:
+                getattr(module, attribute).clear()
+
+    clear()
+    try:
+        yield
+    finally:
+        clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_session_switch_locks(monkeypatch):
+    """Tests reuse session keys across loops; the gateway has one serving loop."""
+    import weakref
+
+    from kiro_crew import llm_helpers
+
+    monkeypatch.setattr(llm_helpers, "_slot_switch_session_locks", weakref.WeakValueDictionary())
 
 
 @pytest.fixture(autouse=True)
@@ -1263,11 +1422,13 @@ def short_sock_dir(tmp_path):
     """
     import tempfile
 
+    from tmpdir_helpers import SHORT_TMP_PREFIX
+
     short_root = "/tmp" if os.path.isdir("/tmp") else None
     if short_root is None:
         yield tmp_path
         return
-    path = tempfile.mkdtemp(dir=short_root, prefix="kcsock-")
+    path = tempfile.mkdtemp(dir=short_root, prefix=SHORT_TMP_PREFIX + "unixsock-")
     try:
         yield pathlib.Path(path)
     finally:
@@ -1509,6 +1670,7 @@ _REAL_MCP_POST_MODULES = frozenset(
         "test_mcp_core",
         "test_mcp_core_coverage",
         "test_mcp_internal_caller",
+        "test_session_token_header_parity",
     }
 )
 

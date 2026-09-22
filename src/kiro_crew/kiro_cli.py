@@ -175,6 +175,29 @@ def _windows_program_files(environ: Mapping[str, str]) -> str:
     return environ.get("ProgramFiles") or environ.get("PROGRAMFILES") or r"C:\Program Files"
 
 
+#: The macOS install locations that are FIXED system-wide, in search order, with
+#: the user's own bundle inserted after the first entry by
+#: :func:`known_kiro_cli_dirs`.
+#:
+#: Named rather than inlined because these are the ONE part of the candidate set
+#: no argument can point elsewhere: every other entry is derived from ``home`` or
+#: ``environ`` (the mise shim entry with the exception this function's own
+#: docstring records -- ``mise_data_dir`` still honours the PROCESS-level
+#: ``MISE_DATA_DIR`` / ``XDG_DATA_HOME``, so it is home-pinned only in their
+#: absence), which is what lets a caller pin the set and then report it as the
+#: directories that were searched. A test that fakes a host by pinning
+#: ``(platform_name, home, environ)`` still gets these three, so on a developer
+#: machine with a real install it is asserting about that machine's
+#: ``/Applications`` rather than about its own fixture. Emptying this tuple is how
+#: such a test fences them; the values themselves are pinned by
+#: ``test_kiro_cli_pin.py`` so an empty default can never ship.
+_MACOS_SYSTEM_DIRS: tuple[str, ...] = (
+    "/Applications/Kiro CLI.app/Contents/MacOS",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+)
+
+
 def known_kiro_cli_dirs(
     platform_name: str,
     home: Path,
@@ -205,14 +228,13 @@ def known_kiro_cli_dirs(
             str(home / ".cargo" / "bin"),
         ]
     if platform_name == "darwin":
-        dirs.extend(
-            [
-                "/Applications/Kiro CLI.app/Contents/MacOS",
-                str(home / "Applications" / "Kiro CLI.app" / "Contents" / "MacOS"),
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-            ]
-        )
+        # Slicing rather than unpacking: a test fences the fixed locations by
+        # emptying ``_MACOS_SYSTEM_DIRS``, and slices are safe at any length while
+        # ``head, *rest = ()`` raises. Order is preserved -- the system bundle, the
+        # user's own bundle, then the shared bin dirs.
+        fixed = list(_MACOS_SYSTEM_DIRS)
+        user_app = str(home / "Applications" / "Kiro CLI.app" / "Contents" / "MacOS")
+        dirs.extend(fixed[:1] + [user_app] + fixed[1:])
     if include_inherited_path and platform_name == "win32":
         dirs.extend(part for part in environ.get("PATH", "").split(";") if part)
         # A GUI-launched Windows gateway can retain an old PATH after a user
@@ -303,3 +325,49 @@ def resolve_kiro_cli(
         include_inherited_path=include_inherited_path,
     )
     return candidates[0] if candidates else None
+
+
+#: Fixed wording for the one refusal worth reporting: an install that exists but
+#: only through ``PATH``. Named here so ``kirocrew update`` and the diagnostics
+#: bundle tell the operator the same thing, including the override that fixes it.
+PATH_ONLY_INSTALL_NOTE = (
+    "kiro-cli resolves only through PATH, which this spawn does not trust; "
+    "point KIROCREW_KIRO_BIN at the binary's absolute path to have it used here"
+)
+
+
+def pin_kiro_cli() -> tuple[str | None, bool]:
+    """``(pinned absolute path or None, an unpinned install exists)``.
+
+    The sync pin for a spawn that must not exec a bare argv0. ``argv0`` is
+    re-resolved off the inherited ``PATH`` inside ``exec``, and a gateway's
+    ``PATH`` can lead with an agent-writable directory (a worktree venv's
+    ``bin``), so the candidate set is :func:`resolve_kiro_cli` with
+    ``include_inherited_path=False``: the fixed known install directories plus
+    the operator's own ``KIROCREW_KIRO_BIN``. ``None`` means refuse — callers
+    skip the step rather than fall back to the bare name.
+
+    The second element separates the two ways the pin comes back empty, which
+    a caller reports differently: kiro-cli is not installed at all (nothing to
+    say — the backend is optional), or it IS installed somewhere the pin does
+    not accept, which an operator needs told about, together with
+    :data:`PATH_ONLY_INSTALL_NOTE`. The ``PATH``-inclusive lookup that answers
+    it only ever decides the wording; it never names what gets spawned.
+
+    Absolute or nothing. The one candidate that can come back relative is the
+    override itself (``KIROCREW_KIRO_BIN=kiro-cli``): the existence check would
+    pass against the current directory while ``exec`` re-resolved the bare
+    argv0 off ``PATH`` — the exact divergence this pin exists to remove. A
+    relative pin is therefore refused and reported like a ``PATH``-only
+    install, since the note already names the fix.
+
+    Sync and unbounded: it stats directories under the home directory. The
+    gateway's unattended paths run this in a thread under a timeout
+    (``slack.gateway._pinned_kiro_cli``); a CLI command or a request handler
+    already blocking on the spawn itself has nothing to gain from that.
+    """
+
+    pinned = resolve_kiro_cli(include_inherited_path=False)
+    if pinned is not None and os.path.isabs(pinned):
+        return pinned, False
+    return None, resolve_kiro_cli() is not None

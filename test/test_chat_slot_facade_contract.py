@@ -18,6 +18,7 @@ _TO_DICT_KEYS = (
     "key",
     "title",
     "agent",
+    "agent_kind",
     "effective_agent",
     "model",
     "model_withheld",

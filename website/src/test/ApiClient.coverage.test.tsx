@@ -149,6 +149,34 @@ describe('client transport', () => {
     expect(call(1).body).toEqual({ rule: 'never force push' })
   })
 
+  it('deleteLesson sends the repo_scope selector only when it is a string (#10651)', async () => {
+    // A lesson's identity is (rule, repo_scope). The route reads the selector by
+    // presence: "" names the global row, a fragment names that scope's row, and
+    // an ABSENT key deletes every scope's same-rule row.
+    await api.deleteLesson('never force push', 'src/pkg')
+    expect(call().body).toEqual({ rule: 'never force push', repo_scope: 'src/pkg' })
+    await api.deleteLesson('never force push', '')
+    expect(call(1).body).toEqual({ rule: 'never force push', repo_scope: '' })
+    // null marks a row whose stored scope is unusable: the route refuses a null
+    // selector (400), so the client must send none -- the unselective delete is
+    // the only path that reaches such a row.
+    await api.deleteLesson('never force push', null)
+    expect(call(2).body).toEqual({ rule: 'never force push' })
+    expect(call(2).body).not.toHaveProperty('repo_scope')
+    // The row's JSONL tier rides along when the list reported one, so the route
+    // deletes from the file the row was read from rather than its global default.
+    await api.deleteLesson('never force push', '', { scope: 'workspace', workspace: 'ws-1' })
+    expect(call(3).body).toEqual({ rule: 'never force push', repo_scope: '', scope: 'workspace', workspace: 'ws-1' })
+    await api.deleteLesson('never force push', '', { scope: undefined, workspace: undefined })
+    expect(call(4).body).toEqual({ rule: 'never force push', repo_scope: '' })
+    // `exact` is sent only when true: the route's default is the substring match
+    // the CLI relies on, and a table row that holds the whole rule opts out of it.
+    await api.deleteLesson('never force push', '', { exact: true })
+    expect(call(5).body).toEqual({ rule: 'never force push', repo_scope: '', exact: true })
+    await api.deleteLesson('never force push', '', { exact: false })
+    expect(call(6).body).not.toHaveProperty('exact')
+  })
+
   it('POST omits the body entirely when none is given', async () => {
     await api.mcpProbe()
     expect(call().init?.body).toBeUndefined()
@@ -909,8 +937,13 @@ describe('request bodies with conditionally-omitted keys', () => {
       title: 't', artifact: 'slug', folder_id: 'f1',
     })
     // This build's two extra create fields ride at the END of the positional
-    // list, after upstream's remote-binding pair, so the shared order stays.
-    await api.createChatSlot('n', 'a', 'm', 'mode', 'mem', 't', 'slug', 'f1', undefined, undefined, false, null)
+    // list, so the shared order stays. Upstream then inserted `agent_kind`
+    // (the namespace `agent` was chosen in) AFTER the remote-binding pair, so
+    // `clean_mode` and `project` are the 12th and 13th arguments — the
+    // `undefined` below is that namespace, not padding. Passing them one slot
+    // early is silent: `false` lands in `agent_kind` and is dropped as falsy,
+    // `null` lands in `clean_mode`, and `project` never reaches the body.
+    await api.createChatSlot('n', 'a', 'm', 'mode', 'mem', 't', 'slug', 'f1', undefined, undefined, undefined, false, null)
     expect(call(3).body).toEqual({
       name: 'n', agent: 'a', model: 'm', mode: 'mode', memory_mode: 'mem',
       title: 't', artifact: 'slug', folder_id: 'f1', clean_mode: false, project: null,
@@ -1024,13 +1057,6 @@ describe('request bodies with conditionally-omitted keys', () => {
     await api.sideQueueCancel('chat-1', 'q1')
     expect(call(2).method).toBe('DELETE')
     expect(call(2).body).toHaveProperty('client')
-  })
-
-  it('handoffSlot posts no body when the channel is left to the server', async () => {
-    await api.handoffSlot('chat-1')
-    expect(call().init?.body).toBeUndefined()
-    await api.handoffSlot('chat-1', 'slack')
-    expect(call(1).body).toEqual({ channel: 'slack' })
   })
 
   it('cancelTaskRunner and installDiscoveredSkill keep their optional fields optional', async () => {
@@ -1626,6 +1652,12 @@ describe('every api method issues one well-formed /api request', () => {
       { id: 'send', app: 'doc-store', endpoint: '/api/apps/doc-store/send' },
       { surface: 'file-overflow', path: '/tmp/a.txt', kind: 'file' },
     ],
+    // `importSessionFromFile(file)` posts the file's BYTES as the request body,
+    // deliberately un-wrapped. The generic `'sw-1'` would arrive as a STRING
+    // body, which `call()` above then tries to JSON-parse -- a harness artifact,
+    // not a defect: a real caller hands this a Blob, exactly as here, and a Blob
+    // body is left alone the same way a FormData one is.
+    importSessionFromFile: [new Blob(['{}'], { type: 'application/gzip' })],
   }
 
   it('covers the whole surface (guards against the table silently shrinking)', () => {

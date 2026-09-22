@@ -65,6 +65,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_COPILOT,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -152,6 +153,19 @@ class AgentAuthDeclaration:
     #: subset of :attr:`credential_leaves`: excluding a leaf the declaration
     #: never put on the floor is either a no-op or an attempt to open something
     #: the host fenced for another reason.
+    #:
+    #: ACCEPTED RISK, stated so a reader meets it here rather than deducing it. The
+    #: leaf named is the harness's OWN provider credential, and the model already
+    #: holds its USE-power through the harness: every turn it takes is already spent
+    #: against that credential. What the exclusion adds is the possibility of
+    #: EXFILTRATION -- a shell the model spawns inside the harness can read the file
+    #: and send the secret somewhere. That is a real residual risk and it is carried
+    #: knowingly, because the alternative is a harness that cannot sign in at all.
+    #: Four harnesses carry it today, and the maintainer weighed and accepted this
+    #: exact trade rather than it being an oversight. What bounds it is the
+    #: subset rule above: the exclusion can only re-open a file this same
+    #: declaration put on the floor, so no harness can reach another harness's
+    #: credential or anything the floor fences for a different reason.
     adapter_own_leaves: Tuple[str, ...]
 
     #: What an operator DOES to sign this harness in. Rendered VERBATIM.
@@ -481,7 +495,12 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
     ),
     # ── This build's registry adapters ──
-    # Each signs in through its OWN tooling and Kiro Crew never reads the result.
+    # FORK-ONLY (restored at the 2026-09-21 sync, where a whole-file pick took
+    # upstream's table and dropped the row). copilot is in this fork's
+    # BASELINE_SELECTABLE_BACKENDS but not upstream's, so only our table owes it
+    # a declaration.
+    #
+    # It signs in through its OWN tooling and Kiro Crew never reads the result.
     # No credential leaf is declared: none has been verified on disk here, and a
     # guessed path would fence the wrong file while leaving the real one open
     # (.fork-sync.yml, divergences/fork-adapters-without-corpus). The remedy states
@@ -504,33 +523,137 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_GOOSE,
-        credential_leaves=(),
-        home_override_env_vars=(),
-        adapter_own_leaves=(),
+        # Verified on disk rather than read off documentation: the harness's own
+        # ``goose info`` reports its config directory, and pointed at a scratch
+        # ``XDG_CONFIG_HOME`` it reports and populates the tree there. This leaf is
+        # the FILE-BASED half of a two-store design: the harness keeps provider
+        # secrets in the OS keyring by default and writes this file instead when
+        # ``GOOSE_DISABLE_KEYRING`` selects file storage, which the harness itself
+        # describes as plain text. The keyring half is fenced by the OS rather than
+        # by a path, so a floor can only name this one -- which is the half an
+        # agent's file tools could otherwise read.
+        credential_leaves=(".config/goose/secrets.yaml",),
+        # Only the CONFIG home, because on this harness that IS where the secret
+        # store lives -- the inverse of the opencode declaration above, whose token
+        # sits under the data home and whose config home is therefore deliberately
+        # absent. The data and state homes are excluded here for that same reason:
+        # they hold this harness's session database and logs, and anchoring a
+        # credential on them would fence files that carry no secret.
+        home_override_env_vars=("XDG_CONFIG_HOME",),
+        # ``XDG_CONFIG_HOME`` replaces ``.config``, not the leaf's parent, so the
+        # relocated file keeps both remaining segments.
+        override_relative_leaves=("goose/secrets.yaml",),
+        # The one leaf the mask must spare: this harness is enforced, so the mask
+        # denies it the whole credential floor, and it resolves its own provider
+        # secret from this file. The read gate still refuses the same leaf to the
+        # AGENT's file tools, so the two controls cover different readers.
+        adapter_own_leaves=(".config/goose/secrets.yaml",),
+        # Action only, and no state, because for this harness there may be no state
+        # to assert: a model served locally on the operator's own machine needs no
+        # provider secret at all.
         sign_in_remedy=(
-            "goose signs in on its own — run goose configure in a terminal and name "
-            "a provider. Nothing is checked here."
+            "goose signs in on its own — run goose configure in a terminal to name a "
+            "provider and store its key. A model served locally on this machine "
+            "needs no key: name it as the provider instead. Neither is checked here: "
+            "the harness reads them."
         ),
         signed_out_message=(
-            "goose has no provider configured. Run goose configure in a terminal, "
-            "then start a new chat."
+            "goose has no provider configured. Run `goose configure` in your terminal "
+            "to set one up, or configure a locally served model, then start a new "
+            "chat."
         ),
+        # Excluded deliberately: it resolves its own provider secret, so a
+        # ``kiro-cli logout`` says nothing about whether a running goose session can
+        # still reach its model.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_PI,
-        credential_leaves=(),
-        home_override_env_vars=(),
-        adapter_own_leaves=(),
+        # Verified on disk rather than read off documentation: a key written into
+        # ``auth.json`` under a scratch ``PI_CODING_AGENT_DIR`` is what
+        # ``pi auth check --credentials`` reports back, and the same probe against
+        # the default directory reports the provider absent. API keys and OAuth
+        # tokens for every provider share this one file.
+        credential_leaves=(".pi/agent/auth.json",),
+        # The variable relocates pi's WHOLE agent directory -- settings, models,
+        # sessions and this file together -- so it stands in for the leaf's parent
+        # and the default override spelling (final segment) is the right one.
+        home_override_env_vars=("PI_CODING_AGENT_DIR",),
+        # The one leaf the mask must spare: this harness is enforced, so the mask
+        # denies its child the whole credential floor, and pi authenticates ITSELF
+        # from this file. The read gate still refuses the same leaf to the agent's
+        # file tools.
+        adapter_own_leaves=(".pi/agent/auth.json",),
+        # Action only, no state: a model served locally on the operator's own
+        # machine needs no sign-in, only a provider entry.
         sign_in_remedy=(
-            "pi signs in on its own — run pi in a terminal and complete its "
-            "provider login. Nothing is checked here."
+            "Pi signs in on its own — run pi in a terminal and use its /login command "
+            "to reach a hosted model. A model served locally on this machine needs no "
+            "sign-in: name it in pi's models.json instead. Neither is checked here: "
+            "the harness reads them."
         ),
         signed_out_message=(
-            "pi is not signed in. Run pi in a terminal and complete its provider "
-            "login, then start a new chat."
+            "Pi is not signed in. Run `pi` in your terminal and complete `/login`, or "
+            "name a locally served model in `~/.pi/agent/models.json`, then start a "
+            "new chat."
         ),
+        # Excluded deliberately: it signs in through its own credential file, so a
+        # ``kiro-cli logout`` says nothing about whether a running pi session is
+        # still authenticated.
+        host_logout_retires_children=False,
+        entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+    ),
+    AgentAuthDeclaration(
+        backend=ACP_BACKEND_DEEPSEEK,
+        # The harness's ACP layer authenticates NOTHING: its ``initialize`` result
+        # advertises no auth methods and its ``authenticate`` returns immediate
+        # success. The secret it needs is a PROVIDER key, resolved inside the harness
+        # from its own store, so these are the leaves that store is made of.
+        #
+        # Verified on disk rather than read off documentation: run with ``DSH_HOME``
+        # pointed at a scratch tree, the harness creates its home there and its own
+        # credential provider names ``<home>/.credentials.yaml`` as the file it
+        # writes and ``<home>/.env`` as the read-only fallback it also resolves keys
+        # from. The fallback is on the floor beside the writable file because a key
+        # is a key wherever the harness reads it: fencing only the file it writes
+        # would leave the same secret readable one path over.
+        credential_leaves=(".dsh/.credentials.yaml", ".dsh/.env"),
+        # One variable relocates the whole home, which is what makes it the override
+        # that matters here.
+        home_override_env_vars=("DSH_HOME",),
+        # Stated rather than left empty. ``DSH_HOME`` stands in for the leaves' own
+        # parent, so each keeps only its final segment there, and that happens to be
+        # what an empty tuple would have anchored. Spelling it out is the point: the
+        # floor re-anchors by the spelling declared here, and a reader checking
+        # whether the right file is fenced under an override should not have to
+        # re-derive which prefix this variable replaces.
+        override_relative_leaves=(".credentials.yaml", ".env"),
+        # Nothing excluded from the mask, because no mask is applied: this harness's
+        # routing is ``UNVERIFIED``, so it is outside ``tool_gate.ENFORCED_ROUTINGS``,
+        # ``adapter_hidden_credential_dirs`` returns empty for it, and there is
+        # nothing to carve an exception out of. Declaring one anyway would be an
+        # assertion about a control that never runs. The leaves above still stand:
+        # they are what the READ GATE fences from the agent's own file tools, which is
+        # a separate control and does run.
+        adapter_own_leaves=(),
+        # States the ACTION only, and asserts no state, because for this harness
+        # there may be no state to assert: a provider route pointed at a model served
+        # on the operator's own machine needs no key at all.
+        sign_in_remedy=(
+            "DeepSeek Harness holds its own provider key. Save one in its "
+            "configuration to reach a hosted model. A model served locally on this "
+            "machine needs no key: point a provider route at it instead. Neither is "
+            "checked here, because the harness reads them itself."
+        ),
+        signed_out_message=(
+            "DeepSeek Harness has no provider key. Save one in its configuration, or "
+            "point a provider route at a model served locally on this machine, then "
+            "start a new chat."
+        ),
+        # Excluded deliberately, and for this harness the reason is stronger than a
+        # separate store: there is no host credential on the wire at all, so a
+        # ``kiro-cli logout`` cannot bear on whether a running session still works.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
     ),

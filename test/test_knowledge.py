@@ -287,9 +287,15 @@ class TestKnowledgeStore:
         migration runs on EVERY store open, so an uncaught one would abort every
         construction rather than skipping the row.
         """
-        deep = '{"sync_status": "active"}'
-        for _ in range(60000):
-            deep = '{"a": ' + deep + '}'
+        # Built by multiplication, not by wrapping in a loop: the accumulator
+        # would sit on the RIGHT of the concat, so CPython cannot append in
+        # place and every iteration recopies the whole string -- ~25 GB of
+        # transient memcpy, 10 s of CPU on a loaded worker, to produce the same
+        # 420 KB blob this builds in 0.3 ms. Same idiom as
+        # test_cron_count_from_disk.py's `"[" * depth + "]" * depth`. The depth
+        # is load-bearing, not padding: python3.12 decodes ~10,000 levels
+        # before RecursionError, so a small number would assert nothing.
+        deep = '{"a": ' * 60000 + '{"sync_status": "active"}' + '}' * 60000
         with pytest.raises(RecursionError):
             json.loads(deep)
 
@@ -2572,13 +2578,26 @@ class TestPysqlite3Fallback:
     )
 
     def _reload_without_pysqlite3(self, module_name: str):
-        """Force-reimport a module with pysqlite3 blocked."""
+        """Force-reimport a module with pysqlite3 blocked.
+
+        The fallback lives in ``_sqlite_compat``, which resolves the driver once
+        per process, so that module is reloaded too -- otherwise the reimport
+        just rebinds the name the first import already resolved.
+        """
         import sqlite3 as stdlib_sqlite3
 
+        compat = "kiro_crew._sqlite_compat"
         saved = sys.modules.pop("pysqlite3", None)
-        for mod in list(sys.modules):
-            if mod == module_name or mod.startswith(module_name + "."):
-                sys.modules.pop(mod)
+        # Restore the original module objects afterwards: a reloaded module is a
+        # different object, and later tests compare driver exception classes.
+        reloaded = (compat, module_name)
+        saved_modules = {
+            name: mod
+            for name, mod in sys.modules.items()
+            if any(name == target or name.startswith(target + ".") for target in reloaded)
+        }
+        for name in saved_modules:
+            sys.modules.pop(name)
 
         sys.modules["pysqlite3"] = None  # type: ignore[assignment]
         try:
@@ -2588,6 +2607,7 @@ class TestPysqlite3Fallback:
             del sys.modules["pysqlite3"]
             if saved is not None:
                 sys.modules["pysqlite3"] = saved
+            sys.modules.update(saved_modules)
 
     def test_store_falls_back_to_stdlib_sqlite3(self):
         self._reload_without_pysqlite3("kiro_crew.knowledge.store")

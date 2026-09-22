@@ -1,7 +1,10 @@
+import { installSessionExpiryHandler } from './sessionExpirySignal'
+import { chatSlotDetailPath } from './chatSlotPaths'
 import { resizeImageForModel, type ResizeInfo } from '../utils/resizeImage'
 import type {
   AppContributor,
   ChatSlot,
+  CronJob,
   IssueSource,
   McpApplyChange,
   MemoryBackup,
@@ -20,12 +23,15 @@ import type {
   SessionStorageEmptyJob,
   SessionStorageReport,
   SessionTrashResult,
+  SubagentInfo,
   UpdateCheckResult,
   WorkflowRunSummary,
 } from '../types'
 import type { RemoteCrewCapabilities } from '../hooks/useRemoteCapabilities'
+import type { KiroCrewAgent } from '../components/AgentSelector'
 import type { MemoryRecord, MemoryRecordRef, MemoryRecordQuery, MemoryRecordSelection, MemoryEditOperation, MemoryEditPreview, MemoryRecordRevision } from '../types/memoryEditing'
 import type { AutoNudgeListResponse } from '../components/autoNudgeLoop'
+import type { TaskDetailResponse, TasksListResponse, TasksSummary } from './tasks'
 import { ApiError, friendlyErrText } from './apiError'
 import { SESSION_CONTROL_STATUS_PATH_RE } from '../lib/sessionControlStatusPath'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
@@ -255,6 +261,36 @@ export interface ConnectionStatus {
    *  "could not look" rather than "absent". */
   grantIndeterminate?: boolean
   connectedSince?: string
+  /** True for a pre-registered provider whose operator has not entered a usable
+   *  OAuth client; present only when true and never alongside a held grant. */
+  needsClientConfig?: boolean
+}
+
+/** Where a client-record half came from; `null` means not set anywhere. */
+export type ConnectionOAuthClientSource = 'env' | 'config' | 'vault' | 'registry'
+
+/** One pre-registered provider's operator OAuth client, as GET /api/connections/oauth-clients
+ *  reports it. Carries the PUBLIC client id and only a boolean for the secret. */
+export interface ConnectionOAuthClient {
+  slug: string
+  /** The vendor requires a client secret at the token endpoint. */
+  confidential: boolean
+  /** The exact redirect URI to register in the vendor console. */
+  redirect_uri: string
+  /** Path under docs/guides/ of the registration runbook. */
+  registration_guide: string
+  client_id: string | null
+  client_id_source: ConnectionOAuthClientSource | null
+  client_secret_set: boolean
+  client_secret_source: ConnectionOAuthClientSource | null
+  /** A client id is present, plus a secret when `confidential`. */
+  configured: boolean
+}
+
+export interface ConnectionOAuthClientSave {
+  client_id?: string
+  client_secret?: string
+  client_secret_clear?: boolean
 }
 
 /** Authenticated provider-tool verdict returned by POST /api/connections/test. */
@@ -377,6 +413,30 @@ export interface ComputerUsePermissions {
   screen_recording: string
   responsible_hint: string
 }
+
+/** Decision-seam consent as returned by GET/PUT /api/decisions/consent.
+ *  `enabled` is the keystone; `endpoint` is the address it was given for;
+ *  `configured_endpoint` is where config.json points now; `permits` is whether a
+ *  decision would actually be sent (both true and equal). */
+export interface DecisionsConsentData {
+  enabled: boolean
+  endpoint: string
+  configured_endpoint: string
+  permits: boolean
+  /**
+   * Whether the owner consented to sending TOOL-CALL ARGUMENTS — the extra egress
+   * category `tool.risk` needs. Absent on a gateway older than the scope, which
+   * reads as not consented; the keystone's own absent value reads the same way, so a
+   * consent recorded before this existed authorizes only what its owner reviewed.
+   */
+  tool_args?: boolean
+}
+
+/** Which side of a logged decision a reader's verdict is about. */
+export type DecisionFeedbackSide = 'jev' | 'baseline'
+
+/** A reader's verdict on one side. `null` retracts an earlier one. */
+export type DecisionVerdictValue = 'right' | 'wrong' | null
 
 /** Computer-use config as returned by GET /api/computer-use/config.
  *
@@ -874,6 +934,45 @@ export interface AwsConsentStatus {
   grant: { account: string; region: string; profile: string; granted_at: string } | null
 }
 
+/** One recorded consent to deliver scanner-flagged files to a destination class. */
+export interface FileDeliveryGrant {
+  destination_class: string
+  granted_at: string
+}
+
+/**
+ * Which flagged-file delivery destinations the owner has confirmed.
+ *
+ * Every list here is SERVER-OWNED and rendered as returned. The panel keeps no
+ * copy of which classes are grantable, so a class moving between `grantable` and
+ * `never_grantable` cannot leave the UI offering a control the backend would
+ * refuse — the handler validates `destination_class` against its own grantable
+ * set and answers `unknown_destination_class` otherwise.
+ *
+ * `grants` is keyed by destination class with `null` meaning "not confirmed",
+ * which is the same fail-closed reading the backend applies to a missing or
+ * unparseable record.
+ */
+export interface FileDeliveryConsentStatus {
+  ok?: boolean
+  grantable: string[]
+  never_grantable: string[]
+  labels: Record<string, string>
+  grants: Record<string, FileDeliveryGrant | null>
+}
+
+/** The SPA-safe view of an armed grant request. The approval NONCE is never
+ *  sent to the browser: finishing the grant needs `approve_command` run on the
+ *  host, which is the human-presence proof an agent-driven browser cannot fake. */
+export interface ArmedFileDeliveryConsent {
+  ok?: boolean
+  armed: boolean
+  request_id?: string
+  destination_class?: string
+  expires_in?: number
+  approve_command?: string
+}
+
 /** Full denied-commands snapshot returned by every denied-commands endpoint. */
 /** The keystone opt-ins that LOOSEN an agent restriction (`workflow_policy.json`).
  *
@@ -1134,32 +1233,17 @@ export interface TailnetMobileData {
   /** Per-process marker used only to prove a requested restart completed. */
   boot_id: string
   step: TailnetMobileStep
-  /** MagicDNS name as resolved right now; `''` when unresolvable. */
-  host: string
   origin: string
-  installed: boolean
-  reachable: boolean
-  logged_in: boolean
   /** Other devices on this tailnet. `0` means there is nothing to reach this
    *  dashboard FROM — publishing and the QR both still succeed, so this is the
    *  only signal that the scan is going to fail. */
   peer_count: number
   /** How many of those are online right now. */
   peers_online: number
-  /** `dashboard.tailscale.enabled` — the origin-trust config switch. */
-  trusted: boolean
-  /** Whether the RUNNING server trusted this exact name at startup. */
-  startup_trusted: boolean
-  /** `null` when serve state could not be determined — never render as false. */
-  published: boolean | null
   keep_awake: boolean
-  governance_pinned: boolean
   /** Verbatim daemon/serve text. Shown as-is; never rephrased client-side. */
   detail: string
   download_url: string
-  qr_ttl_secs: number
-  serve_port: number
-  dashboard_port: number
 }
 
 /** Result of a publish/unpublish attempt. `detail` carries the daemon's own
@@ -1167,7 +1251,6 @@ export interface TailnetMobileData {
  *  rewords its errors. */
 export interface TailnetMobileMutation {
   ok: boolean
-  code: string
   detail: string
 }
 
@@ -1196,7 +1279,6 @@ export interface TailnetMobileQr {
   /** Window in which the LINK must be opened — much shorter than `ttl_secs`,
    *  and the part that surprises people. */
   link_window_secs: number
-  host: string
 }
 
 /**
@@ -1259,13 +1341,11 @@ export interface AcpBackendProbe {
   installed: AcpBackendInstalled
   missing_components: string[]
   install_command: string
-  /** Rich descriptor fields returned when the endpoint is probed. */
   label?: string
   experimental?: boolean
   signin_command?: string
   dialect?: string
   routing?: string
-  capabilities?: Record<string, string>
   degraded_count?: number
   /**
    * Installed on disk, but the RUNNING gateway already resolved its absence and
@@ -1290,10 +1370,93 @@ export interface AcpBackendProbe {
     sign_in_remedy: string
     signs_in_separately: boolean
   }
+  /**
+   * The capability card: what this harness can do, projected on the server from
+   * the capability memberships it already declared
+   * (`agent_sdk/backend_cards.py`). OPTIONAL, like `auth`, because a gateway
+   * that predates it sends none and the panel says nothing about what it was
+   * not told.
+   *
+   * A LIST and not a map, so the SERVER owns the order: a new line appears in
+   * the right place with no edit here. `id` is a stable machine key and the
+   * LABEL is this frontend's, which is what makes the labels translatable at
+   * all -- a label is written once per capability and every harness reuses it.
+   * An id with no label here is SKIPPED rather than rendered raw, the opposite
+   * of the `policy_id` fallback for a name: a bare `private_memory_mcp` in
+   * front of a reader is worse than one line fewer, while a chip with no text
+   * at all is worse than a policy id.
+   */
+  capabilities?: { id: string; available: boolean }[]
+  /**
+   * Ids of the SECURITY notes that hold for this harness: which layer confines
+   * the agent, whether Crew hands its own credential to the child, how an
+   * unclassifiable approval is answered.
+   *
+   * A separate list from `operator_notes` because the panel renders them in two
+   * places. These go OUTSIDE every disclosure, beside `tool_approval`: "Crew's
+   * sandbox is not confining this child" is as material as how the harness is
+   * made to ask, and a fact behind a closed disclosure is one an operator
+   * comparing harnesses does not see. The split is the SERVER's, so this frontend
+   * cannot promote or bury a note by accident.
+   */
+  security_notes?: string[]
+  /**
+   * Ids of the where-it-lives notes that hold: whose disk holds the transcript,
+   * which side supplies the model list, which channel carries a command. Ids
+   * only, because a note is either raised or absent -- "this harness does not
+   * relocate its home on a pod" is not a line anyone reads.
+   */
+  operator_notes?: string[]
+  /**
+   * How this harness is made to ask before it runs a tool: the core's own
+   * `Routing` value, as the string. The one GRADED line on the card, and the
+   * reason the card is otherwise two-level -- a membership set carries one bit,
+   * while this enum already names five mechanisms and one "not established".
+   */
+  tool_approval?: string
+  /**
+   * Whether the BUILD offers this harness as a choice, before deployment policy
+   * narrows anything. False means known-but-never-offered, which is a different
+   * state from policy-denied and is the one the panel shows rather than hides:
+   * a policy denial is not the reader's to fix, and a build exclusion is a
+   * standing fact the tool-approval line explains.
+   */
+  offered_by_build?: boolean
+  /**
+   * What switching to this harness COSTS the reader, from the mirror declarations
+   * `providers/mirrors/registry.py` already carries (`agent_sdk/backend_mcp_ability.py`).
+   * OPTIONAL, like every other card field, because a gateway that predates it sends
+   * none.
+   *
+   * A user-consequence subset rather than a projection dump: a line is here only where
+   * switching costs a feature, adds a risk, or makes one of the reader's own agent-file
+   * settings ineffective. Which ROUTE Crew takes to the harness -- native, mirror,
+   * external -- is deliberately absent: it is true, and it costs the reader nothing.
+   * `kirocrew doctor` states it for the reader diagnosing a route.
+   *
+   * `per_tool_deny` is `PerToolDeny`'s value (`settings-file` / `per-call` /
+   * `whole-server`), `''` where the declaration carries none, and
+   * `costs_whole_server` is the server's own classification of it: `true` where
+   * switching ONE tool off can cost a whole server rather than that tool, which is
+   * `whole-server` and `per-call` alike. The panel renders the rule only where that
+   * flag holds, and the `per-call` exception under it.
+   *
+   * `ineffective` lists the spec settings that will not take effect here, as one list
+   * however the core ruled them -- a withhold is a settled decision, a no-channel an
+   * open gap, and both answer the reader's one question the same way. Stated only where
+   * they hold, so a harness that honours the whole file renders nothing.
+   *
+   * It is ADVISORY. Per-tool MCP deny is not a requirement on every provider: a harness
+   * with no per-call deny channel withholds the whole server instead, and this is where
+   * it says so before a session runs. Nothing here refuses a selection.
+   */
+  mcp?: {
+    per_tool_deny: string
+    costs_whole_server?: boolean
+    ineffective: string[]
+  }
 }
 
-/** Combined response shape: unprobed requests expose registry/probe rows, while
- * probed requests add active routing metadata and richer row descriptors. */
 export interface AcpBackendsResponse {
   backends: AcpBackendProbe[]
   active?: string
@@ -1550,6 +1713,7 @@ function handleStaleOwnerSession(): void {
 // it supplies the prompt those detections raise. Re-exported so consumers of
 // the blessed transport can reference the wire contract from one place.
 installStaleOwnerHandler(handleStaleOwnerSession)
+installSessionExpiryHandler(checkSessionExpired)
 export { STALE_OWNER_SESSION_CODE }
 
 /**
@@ -1727,7 +1891,7 @@ const put = (url: string, body: object, sessionKey?: string, extra?: HeadersInit
   trackArtifactWrite(url, fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: JSON.stringify(body) }))
 const del = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
   trackArtifactWrite(url, fetch(url, { method: 'DELETE', headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: body ? JSON.stringify(body) : undefined }))
-const patch = (url: string, body: object, sessionKey?: string) =>
+const patch = (url: string, body: object, sessionKey?: string, signal?: AbortSignal) =>
   trackArtifactWrite(url, fetch(url, {
     method: 'PATCH',
     // Same override as post(): replace the shared `dashboard:ui` placeholder with
@@ -1735,6 +1899,7 @@ const patch = (url: string, body: object, sessionKey?: string) =>
     // restricted-session gate applies to it.
     headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) },
     body: JSON.stringify(body),
+    signal,
   }))
 
 // Publish the blessed transport so a downstream edition can build its OWN typed
@@ -1790,6 +1955,8 @@ export interface InstanceView {
   /** SSM-only: AWS region ('' = profile/environment default). */
   aws_region: string
   ssm_run_as: string
+  /** Provisioner that created this crew, when it came from a launcher. */
+  provisioner_id?: string
   was_connected: boolean
   status: InstanceTunnelStatus
 }
@@ -1891,11 +2058,33 @@ export interface CloudLaunchSignin {
   ports?: number[]
 }
 
+/** The Kiro identity a managed crew signs in as. Empty fields = Builder ID.
+ *  `region` is the IAM Identity Center region, NOT the EC2 region. Never a credential. */
+export interface KiroLoginTarget {
+  license: '' | 'free' | 'pro'
+  start_url: string
+  region: string
+}
+
+/** `GET /api/cloud/identity` — the launching machine's own kiro-cli sign-in and
+ *  the launch target it suggests (Identity Center region left empty: whoami
+ *  does not report it, the form asks). A suggestion the user can override.
+ *  `discovery: 'unknown'` means whoami could not answer: both fields are null
+ *  and the form must not present the Builder ID default as a read value. */
+export interface CloudIdentity {
+  identity: { account_type?: string; start_url?: string } | null
+  suggested_target: KiroLoginTarget | null
+  discovery?: 'read' | 'unknown'
+}
+
 export interface LaunchJob {
   id: string
   /** Which provisioner ran this job. A job persisted before the provisioner seam
    *  existed loads as "aws_ec2", so this is always present. */
   provider_id: string
+  /** The identity this launch signs the crew in as; absent on jobs from an
+   *  older gateway, which means Builder ID. */
+  login_target?: KiroLoginTarget
   profile: string
   region: string
   size_key: string
@@ -2034,7 +2223,15 @@ export interface KiroBonusCreditGrantPayload {
 
 export interface KiroUsagePayload {
   available?: boolean
-  /** Why usage is unavailable when `available` is false (e.g. `api_key_auth`). */
+  /**
+   * Why usage is unavailable when `available` is false (e.g. `api_key_auth`,
+   * `scrape_disabled`, `signin_required`).
+   *
+   * `signin_required` and `scrape_disabled` are deliberately distinct: the first
+   * is fixed by signing in again and costs nothing, the second by opting into a
+   * billed scrape. Reporting the second for the first told users to spend credits
+   * on a fetch that cannot authenticate.
+   */
   reason?: string
   credits_used?: number
   credits_covered?: number
@@ -2335,6 +2532,15 @@ export interface MemberRosterRow {
   /** Epoch seconds of the DM transcript's last write; 0 = never talked. */
   last_active_ts?: number
   last_message?: string
+  /** True when the DM thread's NEWEST event is a Stop press. The server skips
+   *  the stop card's raw JSON from `last_message`, so the preview is the last
+   *  conversational line — which reads as ongoing work on a thread the user has
+   *  stopped. This locale-independent boolean lets the roster render a localized
+   *  "Stopped" chip beside that preview; the word itself is never sent from the
+   *  server, where the client's locale is unknown. Omitted (not `false`) when
+   *  the newest event is not a stop, and absent again once a newer
+   *  conversational row lands. */
+  last_message_stopped?: boolean
   kiro_agent?: string
   workspace?: string
   memory_store?: string
@@ -2567,6 +2773,60 @@ const memoryQuery = (q: MemoryCarveQuery): string => {
   return s ? `?${s}` : ''
 }
 
+/**
+ * One row of `GET /api/apps/registries`, in either the `registries` (operator)
+ * or `pinned` (build) list.
+ *
+ * `name` is the IDENTITY: the index cache path and every installed app's
+ * `_registry` tag are keyed by it, so it is what per-registry counts and refresh
+ * calls must use. `label` is a display name shown instead of it, and `review`
+ * says how thoroughly the listings were reviewed before publication. Both are
+ * display-only and neither changes the credential posture — that is `trust`
+ * alone. The backend reports both empty on an operator row and drops them from a
+ * PUT, because only the build may make either claim.
+ */
+export type ExternalRegistryRow = {
+  name: string
+  repo: string
+  branch: string
+  trust?: string
+  label?: string
+  review?: string
+}
+
+/** One moved conversation, as `POST /api/channel-folders/backfill` reports it. */
+export interface ChannelFolderBackfillMoved {
+  key: string
+  title: string
+  label: string
+}
+
+/** The report `POST /api/channel-folders/backfill` answers with.
+ *
+ *  The endpoint's report IS its response body and the settings panel renders
+ *  exactly these fields, so anything added here has to be kept true on every
+ *  path through the handler.
+ *
+ *  Typed HERE rather than in the panel that renders it because the request itself
+ *  belongs on this transport. The panel used to issue its own `fetch`, which
+ *  carried no `X-Session-Key` and reached none of the recovery `j` runs, so an
+ *  expired session was reported as a generic failure with no way to sign back in
+ *  (#12127).
+ */
+export interface ChannelFolderBackfillReport {
+  folder_name: string
+  moved: ChannelFolderBackfillMoved[]
+  /** Which non-success outcome this was, `''` on a plain pass. Carried on a 200
+   *  as well: the endpoint answers 200 with a reason, because "nothing to do" is
+   *  a normal result the panel has to render rather than an error. */
+  reason: string
+  remaining: number
+  /** How many of `remaining` are outstanding because their write FAILED rather
+   *  than because the run hit its cap. The two need different copy: one says
+   *  click again to continue, the other says something went wrong. */
+  failed: number
+}
+
 export const api = {
   status: () => fetch('/api/status').then(j),
   tunnelStatus: () => fetch('/api/tunnel/status').then(j) as Promise<TunnelStatus>,
@@ -2593,6 +2853,32 @@ export const api = {
   /** Move explicit selection to trash (§3). */
   sessionInventoryTrash: (uids: string[]) =>
     post('/api/system/session-storage/trash', { uids }).then(j) as Promise<SessionTrashResult>,
+  /** The five session folds of a crew log, keyed by name, in ONE request.
+   *
+   *  The batch route is what makes the answer coherent: it resolves the session
+   *  once and folds once, so all five values come from the same file at the same
+   *  moment. Five per-name requests could not promise that -- a session replaced
+   *  while they were in flight would leave some describing the unit going away and
+   *  some the one arriving, and the panel would show a mix it cannot detect.
+   *
+   *  Each fold still carries its OWN `seq`, because they really do differ: an entry
+   *  advances the folds it belongs to and leaves the rest where they were. */
+  sessionCrewLogProjections: async (slot: string) => {
+    const body = await fetch(`/api/sessions/${encodeURIComponent(slot)}/crew-log/projections`).then(j)
+    const read = body as { projections?: Record<string, unknown>; resolved?: unknown; writes_drained?: unknown }
+    return {
+      folds: read.projections ?? {},
+      // Whether a unit was NAMED for the id sent. An empty fold cannot say why it
+      // is empty, and the two reasons need different words on screen: a slot that
+      // never recorded anything, versus one whose ACP session was torn down and
+      // whose record is still on disk under the retired id.
+      resolved: read.resolved !== false,
+      // False when the writer still owed this process entries as the fold was
+      // taken, so the value may be behind the record. Absent reads as drained: an
+      // older gateway does not send the field and did not race either.
+      writesDrained: read.writes_drained !== false,
+    }
+  },
   telemetryStartup: () => fetch('/api/telemetry/startup').then(j),
   // Per-turn context injection breakdown for one session. Independent of the
   // telemetry main switch: the usage rows it reads are always written.
@@ -2768,14 +3054,14 @@ export const api = {
   // render — because the response is a live credential. `sessionKey` carries
   // the caller's REAL slot key so the server's restricted-session guard sees
   // it instead of the shared `dashboard:ui` placeholder.
-  tailnetMobileQr: (ttl?: string, sessionKey?: string) =>
-    post('/api/tailnet/mobile/qr', ttl ? { ttl } : {}, sessionKey).then(j) as Promise<TailnetMobileQr>,
+  tailnetMobileQr: (sessionKey?: string) =>
+    post('/api/tailnet/mobile/qr', {}, sessionKey).then(j) as Promise<TailnetMobileQr>,
   // Denied commands (Settings → Security). Every endpoint returns the full
   // refreshed snapshot so callers can seed their query cache from the response.
-  deniedCommands: () => get('/api/security/denied-commands').then(j) as Promise<DeniedCommandsData>,
   workflowPolicy: () => get('/api/security/workflow-policy').then(j) as Promise<WorkflowPolicyData>,
   setWorkflowPolicy: (patchBody: Partial<Pick<WorkflowPolicyData, 'git_publication_mode' | 'forward_ssh_agent' | 'allow_external_handoff'>>) =>
     patch('/api/security/workflow-policy', patchBody).then(j) as Promise<WorkflowPolicyData>,
+  deniedCommands: () => get('/api/security/denied-commands').then(j) as Promise<DeniedCommandsData>,
   toggleBuiltinDeniedCommand: (id: string, enabled: boolean) =>
     patch('/api/security/denied-commands/builtins/' + encodeURIComponent(id), { enabled }).then(j) as Promise<DeniedCommandsData>,
   setDeniedCommandsDisableAll: (value: boolean) =>
@@ -2813,8 +3099,8 @@ export const api = {
   // gateway startup) — enabled-but-not-active means a restart is required.
   listInstances: () => get('/api/instances').then(j) as Promise<{ active: boolean; instances: InstanceView[]; warm_set_cap: number; sso: SsoStatus }>,
   addInstance: (body: AddInstanceBody) => post('/api/instances', body).then(j) as Promise<InstanceView>,
-  updateInstance: (id: string, body: Partial<AddInstanceBody>) =>
-    patch('/api/instances/' + encodeURIComponent(id), body).then(j) as Promise<InstanceView>,
+  updateInstance: (id: string, body: Partial<AddInstanceBody>, opts?: { signal?: AbortSignal }) =>
+    patch('/api/instances/' + encodeURIComponent(id), body, undefined, opts?.signal).then(j) as Promise<InstanceView>,
   removeInstance: (id: string) => del('/api/instances/' + encodeURIComponent(id)).then(j),
   instanceStatus: (id: string, diagnose = false) =>
     get('/api/instances/' + encodeURIComponent(id) + '/status' + (diagnose ? '?diagnose=1' : '')).then(j) as Promise<InstanceTunnelStatus>,
@@ -2876,6 +3162,32 @@ export const api = {
     a.remove()
     URL.revokeObjectURL(url)
   },
+  /** Install a session from an exported file, as its own new session.
+   *
+   *  Posts the file's BYTES unchanged — no gunzip, no re-encode, no JSON wrapper.
+   *  The endpoint reads the format off the first two bytes, so a `.gz` straight
+   *  off disk and a plain `.json` a user unpacked by hand both work, and the
+   *  browser never has to know which it was handed. Sending
+   *  `application/octet-stream` is honest for the same reason: the file's type is
+   *  whatever the platform recorded, and it is not this call's to assert.
+   *
+   *  An install ADDS a session and touches no existing one, so a repeat needs no
+   *  confirm step: installing the same file twice is two sessions, which is the
+   *  documented behaviour rather than an accident to guard against. */
+  importSessionFromFile: async (file: Blob) => {
+    const r = await fetch('/api/chat/slots/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', ..._sk },
+      body: file,
+    })
+    return (await j(r)) as {
+      ok: boolean
+      key: string
+      title: string
+      messages: number
+      resume_mode: string
+    }
+  },
   sendSessionToInstance: (id: string, slot: string) =>
     post('/api/instances/' + encodeURIComponent(id) + '/send-session', { slot }).then(j) as Promise<{
       ok: boolean
@@ -2906,9 +3218,11 @@ export const api = {
   cloudProvisioners: () =>
     get('/api/cloud/provisioners').then(j) as Promise<{ provisioners: RemoteProvisioner[] }>,
   cloudLaunches: () => get('/api/cloud/launch').then(j) as Promise<{ jobs: LaunchJob[] }>,
+  /** The launching machine's own Kiro sign-in — the launch form's inherited default. */
+  cloudIdentity: () => get('/api/cloud/identity').then(j) as Promise<CloudIdentity>,
   // `provider_id` is optional on the wire: the server defaults it to "aws_ec2"
   // and answers 400 `unknown_provisioner` for an id it does not offer.
-  cloudLaunch: (body: { provider_id?: string; profile: string; region: string; size_key: string }) =>
+  cloudLaunch: (body: { provider_id?: string; profile: string; region: string; size_key: string; login_target?: KiroLoginTarget }) =>
     post('/api/cloud/launch', body).then(j) as Promise<LaunchJob>,
   cloudLaunchStatus: (id: string) =>
     get('/api/cloud/launch/' + encodeURIComponent(id)).then(j) as Promise<LaunchJob>,
@@ -2918,6 +3232,14 @@ export const api = {
   // there is no pending prompt (surfaced as ApiError(409) to the caller).
   cloudLaunchSignin: (id: string) =>
     post('/api/cloud/launch/' + encodeURIComponent(id) + '/signin').then(j) as Promise<{ signin: CloudLaunchSignin }>,
+  // Starts the Kiro sign-in AGAIN on a crew whose launch finished unsigned: a
+  // fresh device code, run with the `login_target` the job was created with, so
+  // a company-SSO crew is not retried through the Builder ID prompt its
+  // organization cannot approve. Answers the job, which becomes the polled one.
+  // 409 while another launch or sign-in is already running on it, 400 when the
+  // job never created a crew (there is nothing to sign in).
+  cloudLaunchSigninRestart: (id: string) =>
+    post('/api/cloud/launch/' + encodeURIComponent(id) + '/signin/restart').then(j) as Promise<LaunchJob>,
   // The gateway resolves the stack from the tag but needs the launch's AWS
   // coordinates: a crew created under a non-default profile/region is invisible
   // to the default ones, so omitting them makes stop/start/destroy fail. destroy
@@ -3052,6 +3374,13 @@ export const api = {
       rss_mb: number | null; procs: number | null; mcp: number | null
       cpu_cores: number | null; uptime_s: number | null
       credits: number | null; turns: number | null
+      /**
+       * The session that opened this one through session_create, as the child's
+       * own crew log records it; null for a session nobody created. `key` is the
+       * creator's live session key when it is running (the edge the table nests
+       * on) and null when it is not, so the citation outlives the creator.
+       */
+      parent: { slot: string; key: string | null } | null
     }[]
     tasks: {
       id: string; task: string; agent: string; parent: string
@@ -3062,6 +3391,15 @@ export const api = {
     totals: {
       rss_mb: number; runtimes: number; host_mb: number | null
       host_pct: number | null; rss_is_upper_bound: boolean
+      /**
+       * Whether the store held more session logs than the lineage scan admits
+       * (`lineage_cap`), on this sample; false within the cap or with the crew
+       * log off (cap 0 then). The live sessions' logs are read first, so what
+       * went unread is closed sessions' logs: no row on this page is affected.
+       * A fact, not a count: counting would mean walking the whole store.
+       */
+      lineage_over_cap: boolean
+      lineage_cap: number
     }
     history: { t: number; mb: number }[]
   }>,
@@ -3095,7 +3433,16 @@ export const api = {
    *  `agent` resolves the configured default agent. */
   agentResolvedModel: (agent: string) =>
     fetch('/api/agents/resolved-model?agent=' + encodeURIComponent(agent)).then(j),
-  syncKirocrewAgents: () => post('/api/agents/sync', {}).then(j),
+  /** Execution choices for a chat: configured members AND installed shared
+   *  templates, each row tagged with its `selection_kind`. Read-only -- unlike
+   *  the sync route it enrols nothing and allocates no member memory, so
+   *  every picker can call it without side effects. Same `X-Session-Key`
+   *  scoping as `kirocrewAgents`: project templates come from THIS chat's
+   *  project, never from another open pane's. */
+  agentCatalog: (sessionKey?: string) =>
+    fetch('/api/agents/catalog', {
+      headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk },
+    }).then(j) as Promise<{ agents: KiroCrewAgent[]; default_agent: string }>,
   createKirocrewAgent: (body: object) => post('/api/agents', body).then(j),
   // Crew Members page — roster of GLOBAL crews with DM-thread binding and the
   // cheap live-status fields the backend can answer without IO (richer live
@@ -3124,8 +3471,6 @@ export const api = {
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) =>
     del('/api/agents/' + encodeURIComponent(name)).then(j),
-  models: (opts?: { slot?: string }) =>
-    fetch('/api/models' + (opts?.slot ? '?slot=' + encodeURIComponent(opts.slot) : '')).then(j),
   /** Stage a crew's picture on the server (a `.pending` file only — the
    *  config PUT with `avatar: {kind:'image'}` is what promotes it live,
    *  keeping the editor's Apply→Save two-step a real commit point). */
@@ -3179,6 +3524,8 @@ export const api = {
       body: form,
     }).then(j) as Promise<{ ok?: boolean; staged?: boolean; token?: string; error?: string }>
   },
+  models: (opts?: { slot?: string }) =>
+    fetch('/api/models' + (opts?.slot ? '?slot=' + encodeURIComponent(opts.slot) : '')).then(j),
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
   // Bounded HERE, not per initiator: react-query dedupes on the key, so the
@@ -3186,8 +3533,15 @@ export const api = {
   slashCommands: (signal?: AbortSignal) =>
     withDeadline(SLASH_COMMANDS_TIMEOUT_MS, signal, s =>
       fetch('/api/slash-commands', { signal: s }).then(j)),
-  chatSlotAgent: (slot: string, agent: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', { agent }).then(j) as Promise<{ ok?: boolean; agent?: string; workspace?: string }>,
+  /** `kind` names the namespace the user picked from. Omitted, the backend
+   *  keeps its legacy name-first resolution; stated, a same-name template and
+   *  member are told apart and an unresolvable choice is refused (409) rather
+   *  than answered by the default agent. */
+  chatSlotAgent: (slot: string, agent: string, kind?: 'member' | 'template') =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', {
+      agent,
+      ...(kind ? { agent_kind: kind } : {}),
+    }).then(j) as Promise<{ ok?: boolean; agent?: string; agent_kind?: 'member' | 'template' | ''; workspace?: string }>,
   chatSlotModel: (slot: string, model: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/model', { model }).then(j) as Promise<{ ok?: boolean; model?: string }>,
   /** This slot's auto-compact threshold override (null = follows the global). */
@@ -3221,6 +3575,8 @@ export const api = {
     }>,
   recentProjects: () => fetch('/api/recent-projects').then(j) as Promise<{ dirs: string[] }>,
   browseDirs: (path?: string) => fetch('/api/browse-dirs' + (path ? '?path=' + encodeURIComponent(path) : '')).then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string }[] }>,
+  /** Windows only: the mounted drive roots, as the virtual level above every `X:\`. `path` is `""`: this listing is not a directory. */
+  browseDrives: () => fetch('/api/browse-dirs?drives=1').then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string }[] }>,
   browseFiles: (path?: string) => fetch('/api/browse-files' + (path ? '?path=' + encodeURIComponent(path) : '')).then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string; mtime: number }[]; files: { name: string; path: string; mtime: number }[] }>,
   projectGit: (path: string) => fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{ path: string; repo: boolean; repoRoot?: string; branch?: string; detached?: boolean; head?: string }>,
   projectGitStatus: (path: string, fresh = false) => fetch('/api/project/git/status?path=' + encodeURIComponent(path) + (fresh ? '&refresh=1' : '')).then(j) as Promise<{ repo: boolean; repoRoot?: string; branch?: string; ahead?: number; behind?: number; refused?: boolean
@@ -3230,7 +3586,7 @@ export const api = {
      *  `files`, grouped per repo. Absent for the single-repo case. */
     repos?: { root: string; name: string; branch?: string; refused?: boolean; truncated?: boolean; files: ProjectGitFile[] }[] }>,
   projectGitLog: (path: string, limit = 20) => fetch('/api/project/git/log?path=' + encodeURIComponent(path) + '&limit=' + limit).then(j) as Promise<{ repo: boolean; commits: { sha: string; message: string; author: string; date: string; isHead: boolean }[] }>,
-  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; repo: boolean; truncated?: boolean }>,
+  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; directories?: string[]; repo: boolean; truncated?: boolean; truncatedDirectories?: string[] }>,
   workspaces: () => fetch('/api/workspaces').then(j),
   createWorkspace: (body: object) => post('/api/workspaces', body).then(j),
   updateWorkspace: (name: string, body: object) =>
@@ -3238,7 +3594,7 @@ export const api = {
   deleteWorkspace: (name: string) =>
     del('/api/workspaces/' + encodeURIComponent(name)).then(j),
   // Crons
-  crons: () => fetch('/api/crons').then(j),
+  crons: (): Promise<{ jobs?: CronJob[] }> => fetch('/api/crons').then(j),
   createCron: (body: object) => post('/api/crons', body).then(j),
   deleteCron: (id: string) => del('/api/crons/' + id).then(j),
   batchDeleteCron: (ids: string[]) => del('/api/crons', { ids }).then(j),
@@ -3291,7 +3647,29 @@ export const api = {
       outcome: 'inserted' | 'enriched' | 'unchanged' | 'deduped' | 'refused'
       reason: string
     }>,
-  deleteLesson: (rule: string) => del('/api/lessons', { rule }).then(j),
+  // The selector is sent only when it is a string: `""` names the global row
+  // and a fragment names that scope's row, while an absent key deletes every
+  // scope's same-rule row -- which is the only delete that can reach a row the
+  // list reports as `null` (stored scope present but unusable). Passing `null`
+  // through would be refused (400 repo_scope_not_string) rather than widened.
+  // `selectors` are the row's own from the list: `scope` / `workspace` pick the
+  // JSONL file (the route defaults to the global one, so a workspace row's delete
+  // has to carry them back), and `exact` narrows the rule match to the whole
+  // rule -- the route matches by SUBSTRING by default, which is right for a CLI
+  // fragment and wrong for a table row that holds the full text ("use tabs"
+  // would also take "always use tabs").
+  deleteLesson: (
+    rule: string,
+    repoScope?: string | null,
+    selectors?: { scope?: 'global' | 'workspace'; workspace?: string; exact?: boolean },
+  ) =>
+    del('/api/lessons', {
+      rule,
+      ...(typeof repoScope === 'string' ? { repo_scope: repoScope } : {}),
+      ...(selectors?.scope ? { scope: selectors.scope } : {}),
+      ...(selectors?.workspace ? { workspace: selectors.workspace } : {}),
+      ...(selectors?.exact ? { exact: true } : {}),
+    }).then(j) as Promise<{ ok: boolean }>,
   // Hooks
   hooks: () => fetch('/api/hooks').then(j),
   kiroHooks: () => fetch('/api/kiro-hooks').then(j),
@@ -3515,6 +3893,18 @@ export const api = {
   // field sends none.
   connectionsDisconnect: (slug: string) =>
     post('/api/connections/disconnect', { slug }).then(j) as Promise<{ ok: boolean; grantRemoved: boolean; grantSurviving: string[]; entryRemoved: boolean; grantSharedWith: string[]; grantCensusIncomplete: boolean; grantCensusUnreadable?: string[] }>,
+  // Operator-registered OAuth clients for providers that refuse dynamic client
+  // registration (Settings → OAuth Apps). The list is readable by any dashboard
+  // user (it is what the gallery's "needs configuration" card is built from and
+  // carries no secret); save and delete are owner-only.
+  connectionsOAuthClients: () =>
+    fetch('/api/connections/oauth-clients').then(j) as Promise<{ schema_version: number; clients: ConnectionOAuthClient[] }>,
+  // Omitted fields are left as they are, so the id can be saved without re-entering
+  // a secret the panel never displays; `client_secret_clear` removes the stored one.
+  connectionsOAuthClientSave: (slug: string, body: ConnectionOAuthClientSave) =>
+    put(`/api/connections/oauth-clients/${encodeURIComponent(slug)}`, body).then(j) as Promise<{ ok: boolean; client: ConnectionOAuthClient | null }>,
+  connectionsOAuthClientDelete: (slug: string) =>
+    del(`/api/connections/oauth-clients/${encodeURIComponent(slug)}`).then(j) as Promise<{ ok: boolean; client: ConnectionOAuthClient | null }>,
   // MCP Gateway (shared pool)
   mcpGatewayStatus: () => fetch('/api/mcp-gateway/status').then(j) as Promise<{ enabled: boolean; stub: string[]; stub_count: number; running: boolean; ping_ok: boolean; supported: boolean }>,
   mcpGatewayEnable: (enabled: boolean) => post('/api/mcp-gateway/enable', { enabled }).then(j) as Promise<{ ok: boolean; enabled: boolean; running: boolean; ping_ok: boolean }>,
@@ -3548,6 +3938,12 @@ export const api = {
   // to be treated as fail-open rather than as a verdict.
   acpBackends: ({ probe }: { probe?: boolean } = {}) =>
     fetch('/api/acp-backends' + (probe ? '?probe=1' : '')).then(j) as Promise<AcpBackendsResponse>,
+  // Re-take ONE backend's verdict with this gateway's cached absence dropped first,
+  // and answer with that backend's row in the shape `acpBackends` sends -- so the
+  // caller splices it into the list it already holds rather than keeping a second
+  // notion of a row. A POST, because it mutates spawn-path state; the GET above can
+  // only report the divergence, which is what `restart_required` says.
+  acpBackendRecheck: (backend: string) => post('/api/acp-backends/recheck', { backend }).then(j) as Promise<{ backend: AcpBackendProbe }>,
   // Optional integrations — backend endpoints are graceful no-ops on a public
   // install (AIM / kiro usage are stubbed). Kept so the UI compiles and
   // degrades gracefully (panels render empty when the feature is absent).
@@ -3664,7 +4060,7 @@ export const api = {
     const p = new URLSearchParams()
     if (limit) p.set('limit', String(limit))
     if (before !== undefined) p.set('before', String(before))
-    return fetch('/api/chat/slots/' + encodeURIComponent(slot) + '?' + p, { signal }).then(j)
+    return fetch(chatSlotDetailPath(slot) + '?' + p, { signal }).then(j)
   },
   /** Create a chat slot. `instance_id` binds the new session to a connected crew
    *  for EXECUTION: it lives in this machine's list and history, and its turns run
@@ -3679,7 +4075,7 @@ export const api = {
    *  the `remote_already_bound` guard does not fire, and the peer's transcript is
    *  backfilled server-side. Requires `instance_id`; without it the backend
    *  answers `400 adopt_needs_instance`. */
-  createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, instance_id?: string, adopt_remote_slot?: string, clean_mode?: boolean, project?: string | null) => {
+  createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, instance_id?: string, adopt_remote_slot?: string, agent_kind?: 'member' | 'template', clean_mode?: boolean, project?: string | null) => {
     // ADOPT deliberately resolves NO default memory mode. The adopted slot carries
     // the PEER session's own `memory_mode` — that mode is the privacy boundary and
     // the session it belongs to already chose it — so sending this machine's
@@ -3694,6 +4090,8 @@ export const api = {
     return post('/api/chat/slots', {
       ...(name ? { name } : {}),
       ...(agent ? { agent } : {}),
+      // Only beside an agent: a namespace without a name selects nothing.
+      ...(agent && agent_kind ? { agent_kind } : {}),
       ...(model ? { model } : {}),
       ...(mode ? { mode } : {}),
       ...(resolvedMemoryMode ? { memory_mode: resolvedMemoryMode } : {}),
@@ -3702,6 +4100,7 @@ export const api = {
       ...(folder_id ? { folder_id } : {}),
       ...(instance_id ? { instance_id } : {}),
       ...(adopt_remote_slot ? { adopt_remote_slot } : {}),
+      // FORK params: clean mode and the project directory the new session opens in.
       ...(clean_mode !== undefined ? { clean_mode } : {}),
       ...(project !== undefined ? { project } : {}),
     }).then(j) as Promise<ChatSlot>
@@ -3764,10 +4163,32 @@ export const api = {
   chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
   /** `config` carries the folder settings the create modal collects. Each is
    *  omitted when empty so the backend applies its own default. */
-  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; tags?: string[] }) =>
+  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; icon?: string; tags?: string[] }) =>
     post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
   updateChatFolder: (id: string, body: object) => patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
+  /** Set several folders' `order` in ONE atomic request. The sidebar drag
+   *  renumbers a run of siblings, and one PATCH per row has no transaction: a
+   *  failure partway leaves a mix of old and new order numbers. This posts the
+   *  whole list to the reorder endpoint, which applies it all-or-none under the
+   *  folder-store lock, so a rejected write leaves the stored order untouched
+   *  rather than half-applied (issue #10406). */
+  reorderChatFolders: (orders: { id: string; order: number }[]) =>
+    post('/api/chat/folders/reorder', { orders }).then(j),
   deleteChatFolder: (id: string) => del('/api/chat/folders/' + encodeURIComponent(id)).then(j),
+  /** File a channel's EXISTING conversations into the folder its settings name.
+   *
+   *  On this transport rather than the panel's own `fetch`, which is what every
+   *  sibling settings panel already does and what the panel gains by it: the
+   *  `X-Session-Key` header, `checkSessionExpired`'s silent refresh and re-auth
+   *  banner, and an `ApiError` whose message is the sign-in instruction instead of
+   *  the gateway's cryptographic reason. Raw `fetch` reaches none of that, so an
+   *  expired session was told the panel's generic failure sentence and given no
+   *  way to sign back in (#12127).
+   *
+   *  A 4xx is reserved for a request that was never actionable; every other
+   *  outcome arrives as a 200 whose `reason` says which it was. */
+  backfillChannelFolder: (namespace: string) =>
+    post('/api/channel-folders/backfill', { namespace }).then(j) as Promise<ChannelFolderBackfillReport>,
   setSlotFolder: (slot: string, folderId: string | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/folder', { folder_id: folderId || '' }).then(j),
   setSlotColor: (slot: string, colorIndex: number | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_index: colorIndex }).then(j),
   /** Set a custom per-session color (#rrggbb). The backend clears color_index
@@ -3822,6 +4243,18 @@ export const api = {
     return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}), ...(steer ? { steer: true } : {}) }), signal }).then(sendResponseAuthRecovery)
   },
   sessionsHealth: () => fetch('/api/sessions/health').then(j),
+  // Durable task queue + capacity view (System > Services "Tasks & capacity").
+  tasksSummary: () => fetch('/api/tasks/summary').then(j) as Promise<TasksSummary>,
+  tasksList: (params: { state?: string; lane?: string; limit?: number } = {}) => {
+    const q = new URLSearchParams()
+    if (params.state) q.set('state', params.state)
+    if (params.lane) q.set('lane', params.lane)
+    if (params.limit != null) q.set('limit', String(params.limit))
+    const qs = q.toString()
+    return fetch(`/api/tasks${qs ? `?${qs}` : ''}`).then(j) as Promise<TasksListResponse>
+  },
+  taskDetail: (id: string) => fetch(`/api/tasks/${encodeURIComponent(id)}`).then(j) as Promise<TaskDetailResponse>,
+  taskCancel: (id: string) => post(`/api/tasks/${encodeURIComponent(id)}/cancel`).then(j) as Promise<{ ok: boolean; cancelled: boolean; code?: string }>,
   // Knowledge
   knowledgeSearch: (q: string) => get(`/api/knowledge/search-for-context?q=${encodeURIComponent(q)}`).then(j),
   // Notifications
@@ -3834,9 +4267,6 @@ export const api = {
   notificationChannels: () => fetch('/api/notifications/channels').then(j),
   updateNotificationChannelSettings: (channel: string, settings: { muted?: boolean; priority?: string | null }) =>
     put('/api/notifications/channels/settings', { channel, ...settings }).then(j),
-  // Handoff
-  handoffChannels: () => fetch('/api/handoff-channels').then(j) as Promise<Record<string, string> | null>,
-  handoffSlot: (slot: string, channel?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/handoff', channel ? { channel } : undefined).then(j),
   // Sessions (history)
   // `excludeOpen` drops sessions already open as a tab — for the sidebar's
   // Older-sessions pane, which is the complement of the tab list above it.
@@ -3883,7 +4313,7 @@ export const api = {
   // Autocomplete
   autocomplete: (q: string): Promise<{suggestions: string[]}> => fetch('/api/autocomplete?q=' + encodeURIComponent(q)).then(j),
   // Spawn
-  spawnList: () => fetch('/api/spawn').then(j),
+  spawnList: (): Promise<{ agents?: SubagentInfo[] }> => fetch('/api/spawn').then(j),
   spawn: (task: string) => post('/api/spawn', { task }).then(j),
   spawnStatus: (id: string, opts?: { signal?: AbortSignal }) => fetch('/api/spawn/' + encodeURIComponent(id), opts).then(j),
   spawnDelete: (id: string) => del('/api/spawn/' + encodeURIComponent(id)).then(j),
@@ -4041,7 +4471,9 @@ export const api = {
   // In-app wheel update step-up: arming records the request and returns the
   // host command to run; the approval nonce never reaches this client.
   armUpdate: () => post('/api/update/arm').then(j) as Promise<{ ok?: boolean; armed?: boolean; request_id?: string; version?: string; expires_in?: number; approve_command?: string; error?: string; code?: string }>,
-  armStatus: () => fetch('/api/update/arm').then(j) as Promise<{ armed: boolean; request_id?: string; version?: string; expires_in?: number; approve_command?: string }>,
+  armStatus: () => fetch('/api/update/arm').then(j) as Promise<{ armed: boolean; managed_by?: string; request_id?: string; version?: string; requested_by?: string; armed_at?: number; expires_in?: number; approve_command?: string }>,
+  // Decline a packaged-app update request. Removes a nudge, grants nothing.
+  dismissUpdateArm: (requestId: string) => del(`/api/update/arm?request_id=${encodeURIComponent(requestId)}`).then(j) as Promise<{ ok?: boolean; armed?: boolean; dismissed?: boolean }>,
   cancelUpdate: () => post('/api/update/cancel').then(j),
   simulateUpdate: (opts?: { delay?: number; fail_at?: string }) => post('/api/update/simulate', opts || {}).then(j),
   pickFiles: () => post('/api/upload').then(j) as Promise<{ paths: string[] }>,
@@ -4058,6 +4490,15 @@ export const api = {
     if (kinds) p.set('kinds', kinds)
     if (limit) p.set('limit', String(limit))
     return fetch(`/api/file-search?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string }>
+  },
+  /** One directory level of a project, for the composer's `./` path completion.
+   *  `dir` is the literal prefix typed (`./`, `../src/`) and `q` the partial entry
+   *  name; the server resolves `dir` under the named project and answers an empty
+   *  set for anything that leaves the project root. */
+  pathComplete: (project: string, dir: string, q: string, signal?: AbortSignal) => {
+    const p = new URLSearchParams({ path: project, dir })
+    if (q) p.set('q', q)
+    return fetch(`/api/path-complete?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string; outside?: boolean }>
   },
   /** Upload files via browser File API (cross-platform) */
   uploadFiles: async (files: File[]) => {
@@ -4173,6 +4614,32 @@ export const api = {
     }).then(j) as Promise<{ ok?: boolean; error?: string; code?: string; identityDetail?: string }>,
   revokeAwsConsent: (service: string) =>
     del('/api/aws/consent?service=' + encodeURIComponent(service)).then(j) as Promise<{ ok?: boolean; removed?: boolean }>,
+
+  // Flagged-file delivery consent (Settings > Security > Flagged-file delivery).
+  // FOUR EXPLICIT VERBS, deliberately not one helper that takes a method: the
+  // handler re-applies the owner gate on each separately, and a caller that
+  // collapsed them onto a shared path would be expressing a read and a write as
+  // the same grant. Read #8514 for why that shape is a hazard -- a fence keyed on
+  // a path PREFIX cannot tell the verbs apart, so admitting the read admits the
+  // write in the same stroke.
+  //
+  // Recording a grant is a two-step STEP-UP (issue #7770): POST only ARMS a
+  // request (writing a host-only nonce the browser never sees), and the grant is
+  // recorded by `kirocrew file-delivery approve` on the machine. That closes the
+  // hole where an owner-authenticated but agent-DRIVEN browser could self-grant.
+  //
+  // The class travels in the query string, not a body, because that is what the
+  // handler reads (`request.query.get("destination_class")`) on the writes.
+  fileDeliveryConsent: () =>
+    fetch('/api/file-delivery/consent').then(j) as Promise<FileDeliveryConsentStatus>,
+  armFileDeliveryConsent: (destinationClass: string) =>
+    post('/api/file-delivery/consent?destination_class=' + encodeURIComponent(destinationClass))
+      .then(j) as Promise<ArmedFileDeliveryConsent>,
+  fileDeliveryConsentArmStatus: () =>
+    fetch('/api/file-delivery/consent/arm').then(j) as Promise<ArmedFileDeliveryConsent>,
+  revokeFileDeliveryConsent: (destinationClass: string) =>
+    del('/api/file-delivery/consent?destination_class=' + encodeURIComponent(destinationClass))
+      .then(j) as Promise<{ ok?: boolean; removed?: boolean }>,
   voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; request_id?: string }) => {
     const request_id = opts?.request_id || createVoiceRequestId()
     window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot, request_id } }))
@@ -4209,7 +4676,7 @@ export const api = {
   getApp: (name: string) => fetch('/api/apps/' + encodeURIComponent(name)).then(j).then(normalizeInstalledApp),
   getAppManifest: (name: string) => fetch('/api/apps/' + encodeURIComponent(name) + '/manifest').then(j),
   installApp: (source: string) => post('/api/apps/install', { source }).then(j),
-  enableApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/enable').then(j),
+  enableApp: (name: string, sessionApprovalConsent = false) => post('/api/apps/' + encodeURIComponent(name) + '/enable', { sessionApprovalConsent }).then(j),
   disableApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/disable').then(j),
   openApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/open').then(j),
   uninstallApp: (name: string, keepData = true, keepDependencies?: boolean, keepSpecific?: string[]) =>
@@ -4235,8 +4702,8 @@ export const api = {
   // unknown[] here would break those structural assignments across files.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   listRegistry: () => fetch('/api/apps/registry').then(j) as Promise<{ apps: any[]; serverPlatform: { os: string; arch: string }; categoryOrder?: string[]; editorialSections?: unknown[] }>,
-  listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: { name: string; repo: string; branch: string; trust?: string }[]; pinned?: { name: string; repo: string; branch: string; trust?: string }[] }>,
-  updateRegistries: (registries: { name: string; repo: string; branch: string; trust?: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: { name: string; repo: string; branch: string; trust?: string }[]; newlyTrustedHosts: string[] }>,
+  listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: ExternalRegistryRow[]; pinned?: ExternalRegistryRow[] }>,
+  updateRegistries: (registries: { name: string; repo: string; branch: string; trust?: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: ExternalRegistryRow[]; newlyTrustedHosts: string[] }>,
   // Drops the server's on-disk caches of the published documents (catalog /
   // category order / editorial) so the NEXT listRegistry() is rebuilt from
   // fresh fetches instead of waiting out TTLs. A POST because it is a state
@@ -4514,6 +4981,25 @@ export const api = {
   getComputerUseConfig: () => get('/api/computer-use/config').then(j) as Promise<ComputerUseConfigData>,
   saveComputerUseConfig: (body: Partial<ComputerUseConfigSave>) =>
     put('/api/computer-use/config', body).then(j) as Promise<ComputerUseConfigData>,
+  // Decision-seam consent (Settings > Developer > Feature Previews). The switch
+  // is a KEYSTONE, not a config path: see decisionsPreview.ts. The PUT returns
+  // the state written so the card re-renders from server truth.
+  getDecisionsConsent: () => get('/api/decisions/consent').then(j) as Promise<DecisionsConsentData>,
+  // Enabling echoes the endpoint the card showed: the gateway binds consent to
+  // that address and answers 409 if config.json moved it since the read.
+  // `toolArgs` is OMITTED when the caller does not pass one, and that omission is
+  // meaningful: the gateway preserves the recorded scope for an absent field, so
+  // an ordinary switch flip can neither grant nor erase it. Pass a boolean only
+  // when the owner acted on the tool-argument switch itself.
+  saveDecisionsConsent: (enabled: boolean, endpoint?: string, toolArgs?: boolean) =>
+    put('/api/decisions/consent', enabled
+      ? (toolArgs === undefined ? { enabled, endpoint } : { enabled, endpoint, tool_args: toolArgs })
+      : { enabled }).then(j) as Promise<DecisionsConsentData>,
+  // One reader's verdict on one side of one decision, from the transcript's
+  // decision strip. `verdict: null` takes an answer back, which is why the field
+  // is nullable rather than absent — the server records the retraction.
+  sendDecisionsFeedback: (turnId: string, verdict: DecisionVerdictValue, side: DecisionFeedbackSide) =>
+    post('/api/decisions/feedback', { turn_id: turnId, verdict, side }).then(j) as Promise<unknown>,
   // Slack integration config
   getSlackConfig: () => get('/api/slack/config').then(j) as Promise<SlackConfigData>,
   getSlackManifest: () => get('/api/slack/manifest').then(j) as Promise<{ alias: string; manifest: string; create_url: string }>,

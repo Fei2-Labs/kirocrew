@@ -340,7 +340,7 @@ def read_issues_cache(
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
-    if data.get("schema") != ISSUES_CACHE_SCHEMA:
+    if not isinstance(data, dict) or data.get("schema") != ISSUES_CACHE_SCHEMA:
         return None  # stale schema → treat as a miss so the route refetches
     issues = data.get("issues")
     return issues if isinstance(issues, list) else None
@@ -514,6 +514,8 @@ def read_members_cache(owner: str, repo: str, root: Path | None = None) -> dict 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
         return None
     # Coerce ``members`` to a list: the members cache carries no schema stamp
     # (unlike issues), so a file written by an older build with a different
@@ -748,6 +750,12 @@ DEFAULT_REPO_SETTINGS: dict[str, Any] = {
     "unlabeled_is_untriaged": True,
     "good_first_issue_labels": [],
     "notify_on_new_issue": False,
+    # Local absolute path to this repo's working copy. Empty string means "use
+    # the gateway's default cwd" (the pre-workspace behavior). Local-only, like
+    # every other field here -- never written back to the source host. The
+    # Investigate action opens its chat session with this as the working
+    # directory so the agent sees the repo's real source.
+    "workspace_path": "",
     # Bumped by every write; a full-document PUT must echo what it read so a
     # stale snapshot cannot overwrite a newer change. See SettingsConflict.
     "revision": 0,
@@ -778,11 +786,21 @@ def _normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         revision = int(raw.get("revision", 0))
     except (TypeError, ValueError):
         revision = 0
+
+    # A local filesystem path is stored verbatim (only stripped): it is NOT
+    # validated against the filesystem here. The gateway may run on a different
+    # host than the one the operator has in mind, and a path that does not exist
+    # yet is a legitimate not-yet-checked-out state -- an empty string, not an
+    # error. A non-string (or missing) value degrades to "" (default cwd).
+    ws = raw.get("workspace_path", "")
+    workspace_path = ws.strip() if isinstance(ws, str) else ""
+
     return {
         "triage_labels": _labels("triage_labels"),
         "unlabeled_is_untriaged": bool(raw.get("unlabeled_is_untriaged", True)),
         "good_first_issue_labels": _labels("good_first_issue_labels"),
         "notify_on_new_issue": bool(raw.get("notify_on_new_issue", False)),
+        "workspace_path": workspace_path,
         # Monotonic per-repo counter, bumped by every write. A full-document PUT
         # carries the revision it read, so a write built on a snapshot that has
         # since moved is REFUSED instead of silently discarding the newer change
@@ -992,6 +1010,8 @@ def read_issue_detail_cache(owner: str, repo: str, number: int, root: Path | Non
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+    if not isinstance(data, dict):
+        return None
     return {"detail": data.get("detail"), "timeline": data.get("timeline", [])}
 
 
@@ -1145,6 +1165,8 @@ def read_issue_ai_cache(
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
         return None
     return {
         "summary": data.get("summary", ""),
@@ -1326,6 +1348,8 @@ def read_recommendations_cache(
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
         return None
     return {
         "recommendations": data.get("recommendations", []),
@@ -1974,9 +1998,10 @@ def _load_list_cache(owner: str, repo: str, root: Path | None, state: str) -> tu
     if not path.is_file():
         return None, path
     try:
-        return json.loads(path.read_text(encoding="utf-8")), path
+        data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None, path
+    return (data if isinstance(data, dict) else None), path
 
 
 def apply_label_change_to_caches(
@@ -1993,7 +2018,7 @@ def apply_label_change_to_caches(
     if dpath.is_file():
         try:
             d = json.loads(dpath.read_text(encoding="utf-8"))
-            if isinstance(d.get("detail"), dict):
+            if isinstance(d, dict) and isinstance(d.get("detail"), dict):
                 d["detail"]["labels"] = label_objs
                 atomic_write(dpath, json.dumps(d, indent=2))
         except json.JSONDecodeError:
@@ -2028,7 +2053,7 @@ def apply_state_change_to_caches(
     if dpath.is_file():
         try:
             d = json.loads(dpath.read_text(encoding="utf-8"))
-            if isinstance(d.get("detail"), dict):
+            if isinstance(d, dict) and isinstance(d.get("detail"), dict):
                 d["detail"]["state"] = state
                 d["detail"]["state_reason"] = state_reason
                 atomic_write(dpath, json.dumps(d, indent=2))
@@ -2061,7 +2086,7 @@ def apply_assignees_change_to_caches(
     if dpath.is_file():
         try:
             d = json.loads(dpath.read_text(encoding="utf-8"))
-            if isinstance(d.get("detail"), dict):
+            if isinstance(d, dict) and isinstance(d.get("detail"), dict):
                 d["detail"]["assignees"] = logins
                 atomic_write(dpath, json.dumps(d, indent=2))
         except json.JSONDecodeError:

@@ -1743,7 +1743,13 @@ class TestEndToEndMacOS:
             pytest.skip("no `say` to synthesize a fixture")
 
         audio = tmp_path / "sample.aiff"
-        proc = await asyncio.create_subprocess_exec("say", "-o", str(audio), "the build is green")
+        # ``-o`` makes ``say`` write the AIFF instead of playing it through the
+        # sound output, so the fixture is silent on the developer's machine. The
+        # child runs from tmp_path so any file it creates lands there, not in
+        # the checkout it would otherwise inherit as CWD.
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-o", str(audio), "the build is green", cwd=tmp_path
+        )
         await proc.wait()
         assert audio.is_file()
 
@@ -1774,17 +1780,29 @@ class TestEndToEndMacOS:
                 pytest.skip(f"no `{tool}` to build a 16 kHz fixture")
 
         aiff = tmp_path / "s.aiff"
+        # ``-o`` writes the AIFF instead of playing it; cwd=tmp_path keeps any
+        # stray output out of the checkout (see test_round_trip).
         proc = await asyncio.create_subprocess_exec(
             "say",
             "-o",
             str(aiff),
             "the continuous integration build is green and the tests all pass",
+            cwd=tmp_path,
         )
         await proc.wait()
         wav = tmp_path / "s.wav"
         # LEI16 @ 16 kHz mono — the format the dashboard's audio worklet produces.
         proc = await asyncio.create_subprocess_exec(
-            "afconvert", str(aiff), str(wav), "-f", "WAVE", "-d", "LEI16@16000", "-c", "1"
+            "afconvert",
+            str(aiff),
+            str(wav),
+            "-f",
+            "WAVE",
+            "-d",
+            "LEI16@16000",
+            "-c",
+            "1",
+            cwd=tmp_path,
         )
         await proc.wait()
         if not wav.is_file():

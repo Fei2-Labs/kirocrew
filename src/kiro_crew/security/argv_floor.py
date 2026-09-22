@@ -76,6 +76,11 @@ from .host_addresses import (  # noqa: F401  (parser re-imported as a test entry
     _parse_netlink_addr_dump,
     _windows_interface_addresses,
 )
+from .inline_payload import (
+    _INLINE_DYNAMIC_EXEC_RE,
+    _decoded_b64_literal_sources,
+    _inline_payload_reaches_cli,
+)
 from .shell_normalizer import (
     _AMBIGUOUS_EXPANSION_RE,
     _PROCESS_SUBSTITUTION_OPENERS,
@@ -119,7 +124,7 @@ from .shell_normalizer import (
     _substitution_depth_delta,
     _xargs_here_string_rebuild,
 )
-from .vocabulary import _KILL_BY_NAME_PROGRAMS, _SELF_NAME_RE
+from .vocabulary import _KILL_BY_NAME_PROGRAMS, _SELF_FILE_DELIVERY_VERBS, _SELF_NAME_RE
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -205,40 +210,12 @@ _GIT_PUBLISH_DENY_LABEL = "git push"
 _SELF_MODULE_SPELLINGS = ("kiro_crew",)
 
 
-#: The import name as it appears INSIDE a ``-c`` payload. A payload that both names the package
-#: and calls something is the module form written longhand; matching the bare package name is
-#: enough, because reaching the CLI at all requires importing it under one of these spellings —
-#: PROVIDED the name is written literally, which the split/base64 forms below deliberately avoid.
+#: The import name as it appears INSIDE a ``-c`` payload, for the VERB-GATED module check
+#: (``_is_self_module_invocation``): the package named plus a ``token`` argv word is the
+#: ``-m`` form written longhand. Deliberately NOT the inline-program gate, which asks for
+#: the mint surface: the package name alone is in every ``src/kiro_crew/`` path a patch
+#: script mentions as DATA.
 _SELF_IMPORT_RE = re.compile(r"\bkiro_crew\b")
-
-#: Dynamic-execution primitives that let an inline Python payload REACH the CLI without the
-#: package name ever appearing as a literal token: string-concatenated imports
-#: (``__import__('kiro'+'_crew')``), name-computed imports (``importlib.import_module(...)``),
-#: and second-stage decode/eval (``exec(base64.b64decode(...))``). ``_SELF_IMPORT_RE`` cannot
-#: see through any of these, so a payload combining an inline-program interpreter with one of
-#: them is treated as opaque and DENIED — the same fail-closed reading as a literal import,
-#: because "I cannot tell what this imports" is not "it is safe". Kept as a NARROW list of the
-#: dynamic-exec verbs, not a blanket deny on all inline Python: ``python -c "print(1)"`` and
-#: routine one-liners stay allowed, and the residual — arbitrary code that avoids even these
-#: (``perl``, a written-then-run script, a renamed interpreter) — is out of a string matcher's
-#: reach and is documented as such rather than papered over.
-_INLINE_DYNAMIC_EXEC_RE = re.compile(
-    r"\b__import__\s*\(|\bimportlib\b|\bimport_module\b|\bexec\s*\(|\beval\s*\(|"
-    r"\bcompile\s*\(|\bb64decode\b|\bmarshal\b|\bgetattr\s*\("
-)
-
-
-def _inline_payload_reaches_cli(payload: str) -> bool:
-    """True if an inline-program payload could import this package, LITERALLY or opaquely.
-
-    Two ways: it names ``kiro_crew`` outright, or it uses a dynamic-execution primitive that
-    could construct that import from pieces a static matcher cannot follow. The second is a
-    deliberate over-match — a payload doing ``exec(...)`` or ``__import__(...)`` might import
-    something else entirely — but on the credential-mint path "I cannot tell what this runs" is
-    the fail-closed answer, and the cost is refusing an inline one-liner that happens to use
-    ``exec``/``eval``, which is not a shape ordinary tooling relies on.
-    """
-    return bool(_SELF_IMPORT_RE.search(payload) or _INLINE_DYNAMIC_EXEC_RE.search(payload))
 
 
 def _is_self_module_invocation(tokens: list[str], i: int) -> bool:
@@ -499,7 +476,9 @@ def _stdin_program_text(tokens: list[str], i: int) -> "Iterator[str]":
     yield from _stdin_redirect_carriers(tokens, 0, len(tokens))
 
 
-def _has_self_importing_inline_program(tokens: list[str], i: int) -> bool:
+def _has_self_importing_inline_program(
+    tokens: list[str], i: int, decoded_literals: "tuple[tuple[str, str], ...]" = ()
+) -> bool:
     """True if ``tokens[i]`` is an interpreter given a ``-c`` payload that imports this package.
 
     Separate from ``_is_self_module_invocation`` because the two answer different questions.
@@ -536,11 +515,16 @@ def _has_self_importing_inline_program(tokens: list[str], i: int) -> bool:
     # a heredoc body, a redirected file, or a pipe producer — so the search space is those
     # carriers rather than this position's operands. `_python_reads_stdin` is precise so this
     # does not fire for `python script.py`, `python -c …`, or `python -m …`.
-    if _python_reads_stdin(later_tokens) and any(
-        _inline_payload_reaches_cli(t.strip(_SHELL_WRAPPER_CHARS))
-        for t in _stdin_program_text(tokens, i)
-    ):
-        return True
+    if _python_reads_stdin(later_tokens):
+        # The carriers arrive whitespace-split -- a heredoc body is one word per token --
+        # so a statement spanning several words (``from kiro_crew.x import generate_token``)
+        # is only legible with the carrier tokens read together.  Joined with a NEWLINE:
+        # the one joiner under which an import statement is still seen at a statement
+        # start while a path inside a string never becomes one.  Only LEADING wrappers
+        # come off, for the reason the ``-c`` payload below states in full.
+        program = "\n".join(t.lstrip(_SHELL_WRAPPER_CHARS) for t in _stdin_program_text(tokens, i))
+        if program and _inline_payload_reaches_cli(program, decoded_literals):
+            return True
     expect_payload = False
     skip_next = False
     for later in later_tokens:
@@ -548,10 +532,14 @@ def _has_self_importing_inline_program(tokens: list[str], i: int) -> bool:
         # the first control operator, which is correct for an operand the shell will split — but
         # a `-c` payload is a quoted program, so its `;` is Python, not a command separator.
         # Normalising `"import sys; ...; from kiro_crew.cli import main; main()"` down to
-        # `import sys` hid the import entirely and let the bypass through.
-        raw = later.strip(_SHELL_WRAPPER_CHARS)
+        # `import sys` hid the import entirely and let the bypass through.  Only LEADING
+        # wrapper characters come off: a payload's own closing quote and paren are its
+        # last characters, and stripping them leaves the final string literal
+        # unterminated, so ``__import__('kiro_' 'crew.cli')`` reads as ``'kiro_' 'crew.cli``
+        # and the fold that joins the two pieces never fires.
+        raw = later.lstrip(_SHELL_WRAPPER_CHARS)
         if expect_payload:
-            if _inline_payload_reaches_cli(raw):
+            if _inline_payload_reaches_cli(raw, decoded_literals):
                 return True
             expect_payload = False
             continue
@@ -564,7 +552,7 @@ def _has_self_importing_inline_program(tokens: list[str], i: int) -> bool:
             expect_payload = True
             continue
         if len(raw) > 2 and raw[:2] in _PYTHON_INLINE_PROGRAM_FLAGS:
-            if _inline_payload_reaches_cli(raw):
+            if _inline_payload_reaches_cli(raw, decoded_literals):
                 return True
         if stripped in _PYTHON_OPERAND_FLAGS:
             skip_next = True
@@ -666,17 +654,14 @@ def _python_reads_stdin(later_tokens: list[str]) -> bool:
             continue
         redirect = _shell_normalizer._output_redirect_scan(redirect_word)
         if redirect is not None:
-            # An OUTPUT redirect and its target are not this command's arguments, and
-            # neither says anything about where the program comes from -- so the walk has
-            # to step over both and keep looking, exactly as it does for a stdin
-            # redirect. Falling through instead read the leftover descriptor digits of
-            # `2>&1` as a script path and answered False, so `python 2>&1 <<< '<program>'`
-            # had its stdin program go unscanned. Bash runs every one of these.
+            # An OUTPUT redirect and its target are not this command's arguments and say
+            # nothing about where the program comes from, so the walk steps over both and
+            # keeps looking, as for a stdin redirect. Falling through read the leftover
+            # digits of `2>&1` as a script path, so `python 2>&1 <<< '<program>'` went unscanned.
             redirect_target, position = redirect
             # A chain of output redirects glued into ONE word (`>a>a>a...`) is walked
-            # here, in place. Re-injecting each remainder into the token stream instead
-            # re-sliced the word per operator, which is quadratic in its length on a
-            # floor that runs for every command.
+            # here, in place, to stay linear in the word length on a floor that runs
+            # for every command.
             while position < len(redirect_word):
                 further = _shell_normalizer._output_redirect_scan(redirect_word, position)
                 if further is None:
@@ -815,7 +800,7 @@ def _self_floor_can_fire(text_lower: str) -> bool:
     return bool(_INLINE_DYNAMIC_EXEC_RE.search(stripped))
 
 
-def _is_credential_mint(text_lower: str) -> bool:
+def _is_credential_mint(text_lower: str, *, raw_text: "str | None" = None) -> bool:
     """True if *text_lower* invokes the ``kirocrew token`` credential mint.
 
     The mint prints a signed dashboard access URL, so it is the escalation path
@@ -836,21 +821,27 @@ def _is_credential_mint(text_lower: str) -> bool:
     # input carries neither a self name nor the machinery to synthesize one.
     if not _self_floor_can_fire(text_lower):
         return False
+    # Base64 is case-sensitive and the floor reads a lower-cased view, so the literals are
+    # decoded from the command AS SUBMITTED when the caller has it; a lower-cased-only
+    # caller gets literals that decode to nothing and so fold in nothing.  Each decoding
+    # arrives paired with the literal it came from, so a payload borrows a decoding only
+    # of bytes IT carries -- one command's decoder call does not lend its result to the
+    # next command's payload.
+    submitted = raw_text if raw_text is not None else text_lower
+    decoded_literals = _decoded_b64_literal_sources(submitted)
     for tokens in _self_token_frames(text_lower):
         programs = _argv_programs(tokens)
         for i, token in enumerate(tokens):
-            # AN INLINE PROGRAM THAT IMPORTS OUR CLI IS DENIED WITHOUT NEEDING THE VERB, and
-            # this is checked FIRST because it does not depend on the self-program/module gate
-            # below. Everywhere else the verb is the trigger, because ``kirocrew doctor`` is
-            # legitimate and only ``kirocrew token`` mints. That reasoning does not survive an
-            # inline program: ``-c`` and stdin (``python -``) both run arbitrary Python with
-            # the interpreter's full authority, so it can BUILD the verb rather than pass it —
-            # ``python -c "import sys; sys.argv.append('token'); from kiro_crew.cli import main;
-            # main()"`` names no ``token`` argv word, and ``python - <<'PY' … PY`` puts the
-            # program on stdin, off argv entirely. The honest gate is the import. Scoped to
-            # ``_SELF_IMPORT_RE``, so ``python -c "print(1)"`` and a bare ``python -`` running
-            # unrelated code are untouched.
-            if _has_self_importing_inline_program(tokens, i):
+            # AN INLINE PROGRAM THAT NAMES THE MINT SURFACE IS DENIED WITHOUT NEEDING THE VERB
+            # AS AN ARGV WORD, and it is checked FIRST because it does not depend on the
+            # self-program/module gate below. Elsewhere the verb is the trigger, since
+            # ``kirocrew doctor`` is legitimate and only ``kirocrew token`` mints -- reasoning
+            # an inline program does not survive: ``-c`` and stdin both run arbitrary Python
+            # with the interpreter's authority, so the payload can BUILD the verb rather than
+            # pass it (``sys.argv.append('token')`` names no ``token`` word) or keep the whole
+            # program off argv on stdin. So the gate is what the payload NAMES, and a payload
+            # that only mentions the package as a path is untouched.
+            if _has_self_importing_inline_program(tokens, i, decoded_literals):
                 return True
             # Either the console script IS the program, or an interpreter runs the product as
             # a MODULE (`python -m kiro_crew ... token`). The module form mints the identical
@@ -863,6 +854,10 @@ def _is_credential_mint(text_lower: str) -> bool:
             # (``echo <name> <verb>`` prints two words) -- a mention, not a mint.
             if _data_consumer_exempt(i, token, programs, tokens):
                 continue
+            # A program token ending with an operator (``kirocrew;``) is NOT skipped: the
+            # quotes are already off these tokens, so ``'/tmp/kirocrew;' token`` (a symlink
+            # literally so named) reads like a closed argv, and skipping the verb scan on
+            # it is the mint.  Over-reading the next command's words is the safe direction.
             # Check each argument for the verb BEFORE testing whether it ends the
             # argv, then stop.  Order matters for the same reason it does in the kill
             # scan: ``if true; then <name> <verb>; fi`` hands the verb over as
@@ -1252,6 +1247,10 @@ def _is_self_kill(text_lower: str) -> bool:
             # ``echo pkill kirocrew`` prints two words; it does not kill anything.
             if _data_consumer_exempt(i, token, programs, tokens):
                 continue
+            # A program token ending with an operator (``pkill;``) is NOT skipped: the
+            # quotes are already off, so ``'pkill;' -f kirocrew`` (a symlink literally so
+            # named) reads like a closed argv, and the skip would be the kill.  A glob
+            # ARGUMENT glued to an operator (``ls $dir/*;``) is ``_data_consumer_exempt``.
             # Check each argument for the target BEFORE testing whether it ends the
             # argv, then stop.  Order matters: the target is often a quoted pattern
             # whose own characters look like separators (``pkill -f '[;]*kirocrew'``),
@@ -1525,8 +1524,7 @@ def _matches_self_subcommand(text_lower: str, spec: "tuple[object, ...]") -> boo
         return False
     for tokens in _self_token_frames(_shell_join_continuations(text_lower)):
         programs = _argv_programs(tokens)
-        # Once per FRAME, not once per token: this is the loop whose per-token scan
-        # made the floor quadratic.
+        # Once per FRAME, not once per token, to keep the floor linear in token count.
         scan = _self_module_flag_scan(tokens)
         for i in range(len(tokens)):
             prog_idx = _self_program_index(tokens, i, scan)
@@ -1548,6 +1546,11 @@ def _is_self_restart(text_lower: str) -> bool:
 def _is_self_update(text_lower: str) -> bool:
     """``kirocrew update`` behind any shell dressing of interposed flags."""
     return _matches_self_subcommand(text_lower, ("update",))
+
+
+def _is_self_file_delivery(text_lower: str) -> bool:
+    """``kirocrew file-delivery <verb>`` behind any shell dressing of interposed flags."""
+    return _matches_self_subcommand(text_lower, ("file-delivery", _SELF_FILE_DELIVERY_VERBS))
 
 
 def _is_self_gateway_restart(text_lower: str) -> bool:

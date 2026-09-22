@@ -8,7 +8,7 @@ from member_memory_helpers import declare_v2_store
 
 from kiro_crew import embeddings as emb
 from kiro_crew import memory_stores
-from kiro_crew.vector_memory import VectorMemoryStore
+from kiro_crew.vector_memory import VectorMemoryStore, open_member_database
 
 
 @pytest.fixture
@@ -21,13 +21,16 @@ def migration(tmp_path, monkeypatch):
     with model.open("wb") as stream:
         stream.truncate(emb._GGUF_MIN_BYTES + 1)
     private = declare_v2_store(tmp_path, "member-test")
+    global_store = VectorMemoryStore(db_path=tmp_path / "memory.db", embedding_dim=2)
+    global_store.init()
     stores = [
-        VectorMemoryStore(db_path=path, embedding_dim=2)
-        for path in (tmp_path / "memory.db", private / "memory.db")
+        global_store,
+        open_member_database(
+            private / "memory.db", member_id="test", store_id="member-test", embedding_dim=2
+        ),
     ]
     try:
         for store in stores:
-            store.init()
             store.write_episodic("a durable deployment incident", defer_embedding=True)
             store.set_semantic("project.status", "active", 1.0, "test")
             store.db.execute(
@@ -236,8 +239,13 @@ def test_lazily_opened_store_keeps_vectors_after_restart(migration, monkeypatch,
     assert second is not first
     assert second.model_id == first.model_id
     for original, expected in zip(stores, before):
-        reopened = VectorMemoryStore(db_path=original._db_path, embedding_dim=2)
-        reopened.init()
+        if original.algorithm_version == "v2":
+            reopened = open_member_database(
+                original._db_path, member_id="test", store_id="member-test", embedding_dim=2
+            )
+        else:
+            reopened = VectorMemoryStore(db_path=original._db_path, embedding_dim=2)
+            reopened.init()
         try:
             generation = reopened.space_generation
             assert emb.align_store_embedding_space(reopened) == 0
@@ -505,10 +513,10 @@ async def test_apply_rebuilds_inherited_vectors_only_after_config_succeeds(
         elif mode in {"write_failure", "reconcile_failure"}:
             assert status["step"] == "failed"
             assert [vectors(store) for store in stores] == before
-            assert (
-                json.loads(config.read_text(encoding="utf-8"))["memory"]
-                == json.loads(original_config)["memory"]
-            )
+            saved_memory = json.loads(config.read_text(encoding="utf-8"))["memory"]
+            if mode == "reconcile_failure":
+                assert saved_memory.pop("embed_rebuild_generation")
+            assert saved_memory == json.loads(original_config)["memory"]
             assert emb._shared_embedder is None
             assert calls == []
         else:

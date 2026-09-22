@@ -26,6 +26,7 @@ is the contract for the machinery underneath it.
 | `src/kiro_crew/subagent.py` | `UNADVERTISED_AGENTS` — the conductor is never offered in a rendered agent roster |
 | `src/kiro_crew/builtin_skills/pipeline-conductor/SKILL.md` | The operating procedure: pipeline spec, claim preflight, work-order brief, probe cycle and action table, intervention ladder, adjudication and override protocol, admission table, credit rules, `conductor-status/v1`, cleanup |
 | `.../pipeline-conductor/scripts/claim_preflight.py` | One claim verdict per candidate item |
+| `.../pipeline-conductor/scripts/coverage_filter.py` | The batch open-PR exclusion for the queue build |
 | `.../pipeline-conductor/scripts/fleet_probe.py` | The batch patrol probe |
 | `.../pipeline-conductor/scripts/credit_spend.py` | Per-item credit rollup and budget verdict |
 | `.../pipeline-conductor/scripts/spec_check.py` | The spec's closed-value fields, checked once before the run arms |
@@ -120,7 +121,7 @@ is optional in that config and is what makes `cwd=fleet` reachable, so omitting
 it classifies every banned-process line as `foreign` or `unknown` and the one
 enforcing row of the banned-ops table never fires.
 
-## The three scripts
+## The bundled scripts
 
 Anything the procedure states as prose rots silently; anything a script computes
 can be tested. So every decision the skill delegates is the script's answer to
@@ -131,6 +132,17 @@ the exit code: `CLAIM` 0, `UNKNOWN` 3, `SKIP` 10, `CLOSE` 11, `REVIEW` 13. Two
 rules are load-bearing. `UNKNOWN` is never permission. And `REVIEW` is a closure
 request read out of the item's prose, which the conductor confirms itself,
 because prose never closes an item.
+
+**`coverage_filter.py`** answers the same coverage question as
+`claim_preflight.py` check 2, for MANY candidates in one forge call, so the queue
+build can drop covered items instead of rediscovering them one dispatch at a
+time. Its evidence is the repository's open pull requests (title and body, fork
+and draft PRs included) rather than the item's timeline, and the rule that makes
+two evidence sources safe is that this one only ever SUBTRACTS: `COVERED` is a
+positive finding and removes an item, `UNCOVERED` certifies nothing, and an
+unreadable forge exits 3 printing no `uncovered` list at all, so an unanswered
+batch cannot render as a finding about the items. `claim_preflight.py` remains the
+authority before every claim.
 
 **`fleet_probe.py`** answers, in one call per cycle, whether anything in the
 fleet needs judgment: per-session tail classification, tail index, idle age,
@@ -238,6 +250,16 @@ cycle's fleet view; when the two disagree the ledger wins and this file is what
 gets fixed. Two independent spellings of item state would drift, and the drift
 would be silent.
 
+Two more conductor-owned artifacts live beside the spec, opened empty at
+startup: `decisions.md`, one line per decision
+(`<ts> | <subject> | <decision> | <reason>`) appended at the moment the decision
+is made, and the run's retrospective, appended in the cycle a lesson happens.
+They are the durable record, and they exist because every alternative is a
+tail: `events_tail` is a bounded, newest-first mirror of the most recent
+`decisions.md` lines, and the session ledger keeps `_MAX_EVENTS` = 100 events on
+disk while `session_ledger_read` returns only the newest `_MAX_EVENT_TAIL` = 20
+(`session_ledger.py`), so neither can hold a whole run's rulings.
+
 `open_rulings` is reviewed every cycle independently of what the probe fired.
 That is structural: the probe is right not to re-fire a signal already marked
 handled, and that suppression is what keeps a quiet cycle quiet, so a worker on
@@ -305,7 +327,8 @@ derive `permissions` from the filtered list; only the conductor mounts
 
 | Test | What it holds |
 |---|---|
-| `test/test_pipeline_conductor_agent.py` | Identity and charter, the owned filename, the verbosity placeholder, patrol via `monitor_start` rather than `wait`, that the prompt names the tools and scripts it runs on, that no file-writing tool is mounted, that dashboard grants are create-and-read only, that core grants are named verbs rather than a whole server, that `mcpServers` is narrowed, and that a governed host withholds and audits |
+| `test/test_pipeline_conductor_agent.py` | Identity and charter, the owned filename, that the retired verbosity token is absent, patrol via `monitor_start` rather than `wait`, that the prompt names the tools and scripts it runs on, that no file-writing tool is mounted, that dashboard grants are create-and-read only, that core grants are named verbs rather than a whole server, that `mcpServers` is narrowed, and that a governed host withholds and audits |
 | `test/test_pipeline_conductor_skill_contract.py` | That the skill cites the script rather than a prose predicate, that every exit code has a documented action, that all five verdicts are named, that `UNKNOWN` is never permission, that a prose closure request needs author authorization, that an absent script has defined behaviour, and that a `verifier.repro_gate` outside its two declared values refuses the run instead of degrading to the generic contract |
 | `test/test_pipeline_conductor_probe_roundtrip.py` | That the probe classifies what the conversation log actually wrote, that the watchdog patterns match the constants the gateway emits, that the index needle matches the real writer, that a raw slot key finds the transcript the dashboard writes, and that `credit_spend.py` sums what the recorder wrote |
 | `test/test_pipeline_conductor_claim_preflight.py` | The claim verdict lattice: merged-PR coverage and its near misses, fork PRs, prose self-claims, closure requests outranking claims, and absent-symbol risk handling |
+| `test/test_pipeline_conductor_coverage_filter.py` | The batch coverage exclusion: that a title or body reference to an item is coverage whether or not it carries a closing keyword, that fork and draft PRs count while a neighbouring number does not, that an unreadable forge exits 3 with no `uncovered` list, that the filter writes nothing, and that its reference vocabulary agrees with `claim_preflight.py`'s |

@@ -164,31 +164,94 @@ async def _head_contained_in_pr(path: str, branch_oid: str, pr_head_oid: str) ->
     return rc == 0
 
 
+#: How many PRs one head may carry before the reused-head decision refuses to
+#: rule. The head is normally unique, so this ceiling is only ever approached by
+#: a reused branch name -- an old MERGED PR plus a newer OPEN one on the same
+#: head -- and it exists so that decision reads EVERY PR on the head rather than
+#: trusting a sort position (see _fetch_pr_head_oid). The lookup asks gh for one
+#: row MORE than this (the saturation sentinel), so a head that carries more
+#: than the ceiling is DETECTED as possibly-truncated and fails closed instead
+#: of being ruled on from a partial view.
+_PR_HEAD_LOOKUP_LIMIT = 10
+
+
 async def _fetch_pr_head_oid(branch: str, repo: str | None = None) -> str | None:
-    """Fetch the headRefOid of the PR for *branch* — FRESH and MERGED-gated.
+    """Fetch the headRefOid of the PR for *branch* -- FRESH and MERGED-gated.
 
     Destructive callers (prune/removal) rely on this as the authoritative
-    check: the state and head OID come from the SAME live response, and a
-    non-MERGED state returns None. A stale cached MERGED verdict for a
-    reused branch name can therefore never authorize removing the new
-    branch's worktree — the fresh state here is OPEN and we refuse.
+    check, so three properties must hold:
+
+      (a) FRESH -- this runs ``gh`` every call and reads no cache, so a stale
+          cached MERGED verdict cannot leak in here.
+      (b) STATE AND HEAD OID FROM THE SAME RESPONSE -- both come out of the one
+          ``gh pr list`` JSON row, so the OID always describes the PR whose
+          state was checked, never a different fetch.
+      (c) NON-MERGED RETURNS None -- a branch name reused for new work resolves
+          to an OPEN PR, so its worktree is never authorized for removal on the
+          strength of a stale MERGED verdict.
+
+    ``gh pr list --head <branch> --state all`` is the query because it still
+    finds a merged PR and its head OID after the head branch is deleted (the
+    default on merge here); a name-keyed ``gh pr view <branch>`` cannot, and
+    returns nothing for a merged-and-branch-deleted worktree. The product's own
+    ``_pr_query_one`` uses the same list shape.
+
+    Reused-head safety (property (c), the hard case): a single head can carry
+    BOTH a MERGED PR and an OPEN one. ``gh pr list`` sorts by ``createdAt``
+    descending and is not configurable, so a sort position is not trusted:
+    the whole batch is read and a MERGED head OID is returned ONLY when NO
+    OPEN PR appears on the head. To keep that "no OPEN PR" conclusion PROVABLE
+    rather than probable at the edge, the query asks for ``_PR_HEAD_LOOKUP_LIMIT
+    + 1`` rows -- one saturation sentinel beyond the ceiling. A response with
+    more than ``_PR_HEAD_LOOKUP_LIMIT`` rows means the head carries more PRs
+    than can be examined here, so an OPEN one could sit past the ceiling: the
+    lookup refuses rather than rule on a possibly-truncated view. A head with
+    that many PRs does not occur in practice.
     """
     owner_repo = repo or await _get_owner_repo()
     if not owner_repo or not branch:
         return None
     rc, stdout, _ = await runtime._run_cmd(
-        ["gh", "pr", "view", branch, "--repo", owner_repo, "--json", "headRefOid,state"],
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            owner_repo,
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "state,headRefOid",
+            # One row beyond the ceiling: the saturation sentinel below.
+            "--limit",
+            str(_PR_HEAD_LOOKUP_LIMIT + 1),
+        ],
         timeout=15,
     )
     if rc != 0:
         return None
     try:
-        data = json.loads(stdout)
-        if data.get("state") != "MERGED":
-            return None
-        return data.get("headRefOid")
+        prs = json.loads(stdout)
     except ValueError:
         return None
+    if not isinstance(prs, list):
+        return None
+    # Saturation: more rows than the ceiling means the batch may be truncated,
+    # so an OPEN PR could sit past what was fetched. Fail closed rather than
+    # rule on a partial view (withholding costs a manual removal; a wrong
+    # ancestry-contained removal would destroy active work).
+    if len(prs) > _PR_HEAD_LOOKUP_LIMIT:
+        return None
+    # A reused head carrying any OPEN (non-terminal) PR is work a MERGED verdict
+    # does not describe -- refuse rather than authorize removal.
+    if any(pr.get("state") == "OPEN" for pr in prs):
+        return None
+    for pr in prs:
+        if pr.get("state") == "MERGED":
+            return pr.get("headRefOid")
+    return None
 
 
 async def _pr_status_cached(branch: str, head_oid: str | None = None) -> dict | None:
@@ -1054,9 +1117,58 @@ def _orphan_count_sync(cfg: Any) -> int | None:
         return None
 
 
+def _completed_cutover_undo_target(
+    worktrees: list[dict],
+    rows: list[dict],
+    *,
+    live_path: str | None,
+    staged_path: str | None,
+    previous_path: Path | None,
+) -> dict | None:
+    """Return the discovered previous checkout only after a completed cutover."""
+    if (
+        staged_path is not None
+        or live_path is None
+        or previous_path is None
+        or repository._same_path(live_path, str(previous_path))
+    ):
+        return None
+    return next(
+        (
+            {"name": row["name"], "path": row["path"]}
+            for raw, row in zip(worktrees, rows)
+            if repository._same_path(str(previous_path), raw.get("path", ""))
+        ),
+        None,
+    )
+
+
 async def _build_fleet() -> dict:
-    live_path = await live._live_worktree_path()
-    staged_path = live._staged_target()
+    # Pointer state is answered by the gateway (the pointer file is masked from this
+    # backend). A broker outage must not take the whole fleet view down with it: the
+    # rows still render with no live/staged badge, and the reason goes to the backend
+    # log — the operator-facing surface for a gateway that stopped answering. The
+    # destructive paths (removal, prune override) refuse on the same condition.
+    # ONE snapshot carries all four pointer-derived fields (live, staged, cancel
+    # availability, undo target), so a gateway that goes away while the rest of the
+    # fleet is being built cannot fail a later read.
+    try:
+        pointer = await live.pointer_state()
+        live_state_known = True
+    except live.PointerUnavailable as exc:
+        runtime.logger.warning(
+            "fleet view: live-target state unavailable, no row will be marked live or "
+            "staged: %s",
+            runtime._redact(str(exc)),
+        )
+        pointer = live.PointerState(live=None, staged=None, staged_cancel_available=False)
+        # Carried in the payload so "state unknown" is not rendered as "nothing is
+        # live": the two invite opposite actions (check the gateway vs. stage a
+        # cutover). The badges below stay unset; this one field says why.
+        live_state_known = False
+    live_path = pointer.live
+    staged_path = pointer.staged
+    previous_path = Path(pointer.previous) if pointer.previous is not None else None
     worktrees = await repository._discover_worktrees()
     cfg = runtime._load_cfg()
     loop = asyncio.get_running_loop()
@@ -1266,6 +1378,19 @@ async def _build_fleet() -> dict:
             )
         except Exception:  # noqa: BLE001
             pass
+    # Undo exists only for a COMPLETED cutover: while a pointer is staged the
+    # existing Cancel staged cutover action is the truthful inverse. Bind the
+    # payload to a currently discovered row so a pruned/foreign checkout never
+    # becomes a clickable target; _make_live re-checks the pointer history under
+    # its mutation lock before acting.
+    undo_target = _completed_cutover_undo_target(
+        worktrees,
+        wts,
+        live_path=live_path,
+        staged_path=staged_path,
+        previous_path=previous_path,
+    )
+
     # The run pointers a reloaded page reattaches to -- `sync_run_id` and each
     # row's `provision_run_id` -- are deliberately NOT set here. This snapshot is
     # cached and served stale-while-revalidate, so a pointer written at build
@@ -1284,12 +1409,17 @@ async def _build_fleet() -> dict:
         # persistent pending-restart state from this, so the instruction outlives
         # the toast that announced it.
         "staged_target": runtime._redact(staged_path) if staged_path else None,
+        # One-level post-cutover inverse. Null for legacy pointers, invalid or
+        # pruned previous checkouts, and every still-staged transition.
+        "undo_target": undo_target,
         # Whether the pointer-only cancel of that stage would be accepted (see
-        # _staged_cancel_available). Only probed while a stage exists; false
-        # otherwise so the dashboard's cancel control stays hidden.
-        "staged_cancel_available": (
-            staged_path is not None and await live._staged_cancel_available()
-        ),
+        # _staged_cancel_available). From the same snapshot as the stage itself, so
+        # the two can never disagree; false with no stage so the dashboard's cancel
+        # control stays hidden.
+        "staged_cancel_available": (staged_path is not None and pointer.staged_cancel_available),
+        # False only while the gateway's pointer state could not be read: the
+        # live/staged fields above are then UNKNOWN, not empty.
+        "live_state_known": live_state_known,
         "manual_restart": live._manual_restart_command(),
         # WHY the gateway cannot be restarted/repointed from here, when it
         # cannot. Same lesson as pods_unavailable_reason below: the previous

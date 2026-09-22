@@ -30,17 +30,22 @@ from kiro_crew.dashboard.chat_utils import (
     remember_slack_options,
 )
 from kiro_crew.executors import run_in_embed_pool
-from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY
+from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY, hook_gate_kwargs
 from kiro_crew.llm_helpers import save_conversation_turn_off_loop
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging import auto_title
-from kiro_crew.messaging.dispatch import admit_inbound_callback, build_directive_consumer
+from kiro_crew.messaging.dispatch import (
+    admit_inbound_callback,
+    build_directive_consumer,
+    consume_reinjection,
+    driver_turn_landed,
+    rearm_reinjection,
+)
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.platform import current_context
-from kiro_crew.providers.acp import provider_label
 from kiro_crew.security import redact, redact_local_paths
 from kiro_crew.sel import sel
 from kiro_crew.session_allocation import SessionClosingError
@@ -54,7 +59,6 @@ from kiro_crew.slack.handler import (
     _thread_agents,
     get_dashboard_state,
     get_orch_cfg,
-    inject_busy_followup,
     is_slack_session_trusted,
     is_thread_temporary,
     maybe_apply_privacy_modifiers,
@@ -388,6 +392,10 @@ async def handle_message_transport(
     # handling the original error.
     _logged_user_turn = False
     _stamped_turn = False
+    # Post-compaction re-injection bookkeeping for the finally: whether this
+    # turn consumed the one-shot flag, and whether it landed (recorded success).
+    _needs_reinjection = False
+    _turn_landed = False
 
     try:
         # ── Fire the ack reaction + working status IMMEDIATELY, before the
@@ -418,6 +426,7 @@ async def handle_message_transport(
             # this True while nothing passed it meant the ceiling did not exist.
             uploads_allowed=not _is_slack_restricted(session_key),
         )
+        await renderer.on_turn_start()
 
         # ── Session acquisition (same as handle_message) ──
         # Durable thread overrides + conv flags were already hydrated at the top
@@ -468,25 +477,6 @@ async def handle_message_transport(
             or _get_default_agent()
             or _DEFAULT_KIROCREW_AGENT
         )
-        _mid_turn = await inject_busy_followup(
-            sessions,
-            session_key,
-            text,
-            msg_ts,
-            slack=slack,
-            channel=channel,
-            thread_ts=reply_ts,
-            enqueue_kwargs={
-                "channel": channel,
-                "thread_ts": thread_ts,
-                "sender_id": user_id,
-                "agent_override": agent_override,
-                "user_display_name": user_display_name,
-            },
-        )
-        if _mid_turn != "idle":
-            return
-        await renderer.on_turn_start()
         client, is_new, resumed = await sessions.get_or_create(
             session_key, agent=_agent, channel_id=channel
         )
@@ -594,6 +584,10 @@ async def handle_message_transport(
             # resolves to ``default`` for exactly the crew that configured
             # otherwise. Its private tier was validated and prepared before
             # provider acquisition; an unavailable member store refuses the turn.
+            # A compaction drops session-start context. Read-and-clear the
+            # one-shot flag so this turn re-injects that context exactly once;
+            # the finally re-arms it if this turn never lands.
+            _needs_reinjection = consume_reinjection(sessions, session_key)
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 context_builder.build_message,
@@ -605,6 +599,7 @@ async def handle_message_transport(
                 agent=_agent,
                 memory_store=_memory_store,
                 resumed=resumed,
+                needs_reinjection=_needs_reinjection,
                 user_display_name=user_display_name,
                 # Temporary mode reads NO memory, and that is the half the
                 # write-side ``_is_slack_restricted`` gates cannot cover:
@@ -616,7 +611,7 @@ async def handle_message_transport(
                 # between the two modes.
                 blocks_reads=is_thread_temporary(session_key),
                 runtime_source="slack",
-                provider_type=provider_label(client),
+                context_provider=client,
             )
         else:
             full_message = text
@@ -636,14 +631,7 @@ async def handle_message_transport(
                 getattr(event, "title", "") or "",
                 session_key=session_key,
                 agent=_agent or "",
-                tool_kind=getattr(event, "tool_kind", "") or "",
-                raw_params=getattr(event, "raw_tool_params", None),
-                diff_path=getattr(event, "diff_path", "") or "",
-                command=getattr(event, "shell_command", None),
-                is_shell=bool(getattr(event, "is_shell", False)),
-                mcp_server_name=getattr(event, "mcp_server_name", "") or "",
-                mcp_tool_name=getattr(event, "tool_name", "") or "",
-                mcp_identity_trusted=bool(getattr(event, "mcp_identity_trusted", False)),
+                **hook_gate_kwargs(event),
             )
             if result.action == TOOL_DENY:
                 return "deny"
@@ -753,6 +741,10 @@ async def handle_message_transport(
         # context-usage accounting or conversation logging must NOT fall through
         # to the outer except and double-record the turn as a failure.
         sessions.record_success(session_key)
+        # The prompt (with any re-injected context) reached the model and the
+        # turn completed, so the finally must NOT restore the one-shot flag --
+        # unless the user cancelled it, which discards that prompt.
+        _turn_landed = driver_turn_landed(driver)
         Stats().inc_message_success()
 
         # Remember this turn's OPTIONS control, if it posted one, so the next
@@ -939,6 +931,22 @@ async def handle_message_transport(
             )
         with contextlib.suppress(Exception):
             await slack.set_thread_status(channel, reply_ts, "")
+    except asyncio.CancelledError:
+        # A mid-turn cancellation (per-turn deadline, shutdown, or session
+        # supersession) can land on an await after the model completed.
+        # ``except Exception`` below does NOT catch a ``CancelledError`` (a
+        # ``BaseException``), so without this the cancellation would reach the
+        # ``finally`` teardown with NO verdict booked. When the renderer did not
+        # finalize its delivery, an answer-carrying send was cancelled (most
+        # narrowly the OPTIONS footer, whose choices ride only in that footer), so
+        # the reader did not get the answer: book a failure rather than leave an
+        # unrecorded verdict hole. A finalized turn keeps its normal accounting.
+        # Then re-raise: a cancellation must always propagate.
+        if client and _acquired and renderer is not None and not renderer.turn_finalized:
+            with contextlib.suppress(Exception):
+                await sessions.record_failure(session_key)
+                Stats().inc_message_failed()
+        raise
     except Exception as exc:
         logger.exception("transport_dispatch: error handling message")
         Stats().inc_message_failed()
@@ -1063,6 +1071,10 @@ async def handle_message_transport(
         except Exception:
             pass
     finally:
+        # A turn that consumed the post-compaction flag but never landed
+        # discarded the prompt carrying the re-injected context; put the flag
+        # back so the next turn re-injects it.
+        rearm_reinjection(sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed)
         # Guarantee renderer teardown even if TurnDriver.run() raised before
         # on_done: cancels the 30s tool-elapsed timer so it can't survive the
         # turn and keep hitting append_task against a dead stream.

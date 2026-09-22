@@ -3874,6 +3874,7 @@ class TestInstallScriptFailurePreservesStaleCheckout:
             name = "testapp"
             message = "installed"
             error = None
+            notice = ""
 
         with (
             patch(
@@ -3907,6 +3908,67 @@ class TestInstallScriptFailurePreservesStaleCheckout:
             pkg_dir / "replacement.txt"
         ).exists(), "a durable success must keep the tree it installed"
         assert stale_dir.exists(), "the old checkout is retained beside it, not restored"
+
+    @pytest.mark.asyncio
+    async def test_self_managed_install_propagates_reconsent_notice(self, tmp_path):
+        from kiro_crew.apps.registry import install_from_registry
+
+        pkg_dir = tmp_path / "testapp"
+        pkg_dir.mkdir()
+        (pkg_dir / "app.json").write_text(
+            json.dumps(
+                {
+                    "name": "testapp",
+                    "version": "1.0.0",
+                    "resources": "app",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+            return {"ok": True, "pkg_dir": pkg_dir}
+
+        registration = SimpleNamespace(
+            ok=True,
+            notice="session_approval_reconsent",
+        )
+        with (
+            patch(
+                "kiro_crew.apps.registry.get_registry_app",
+                return_value={
+                    "repo": "https://example.com/app.git",
+                    "branch": "main",
+                    "resources": "app",
+                },
+            ),
+            patch(
+                "kiro_crew.apps.registry._entry_git_url",
+                return_value="https://example.com/app.git",
+            ),
+            patch("kiro_crew.apps.registry._clone_build_app", new=_fake_clone_build),
+            patch("kiro_crew.apps.registry.app_admission_denied", return_value=None),
+            patch("kiro_crew.apps.registry.app_execution_denied", return_value=None),
+            patch(
+                "kiro_crew.apps.registry._fetch_app_manifest",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "kiro_crew.apps.manager.register_external_app",
+                return_value=registration,
+            ),
+            patch("kiro_crew.apps.registry.set_app_provenance"),
+            patch("kiro_crew.apps.registry.is_clone_host_trusted", return_value=True),
+            patch(
+                "kiro_crew.apps.registry._sweep_stale_checkouts",
+                new=AsyncMock(),
+            ),
+            patch("kiro_crew.apps.registry.sel"),
+        ):
+            result = await install_from_registry("testapp")
+
+        assert result["ok"] is True
+        assert result["notice"] == "session_approval_reconsent"
 
     @pytest.mark.asyncio
     async def test_stale_not_cleaned_when_install_from_registry_fails(self, tmp_path):

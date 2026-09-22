@@ -291,7 +291,9 @@ _SENSITIVE_RELATIVE_DIRS = (
     ".claude/.credentials.json",
     ".codex/auth.json",
     ".config/gcloud",
+    ".config/goose/secrets.yaml",
     ".docker/config.json",
+    ".dsh/.credentials.yaml",
     ".git-credentials",
     ".gnupg",
     ".gpg",
@@ -302,6 +304,7 @@ _SENSITIVE_RELATIVE_DIRS = (
     ".local/share/opencode/auth.json",
     ".netrc",
     ".npmrc",
+    ".pi/agent/auth.json",
     ".pypirc",
     ".ssh",
 )

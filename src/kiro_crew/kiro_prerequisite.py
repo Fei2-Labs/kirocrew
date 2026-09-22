@@ -46,7 +46,7 @@ import sys
 import tempfile
 import time
 import urllib.request
-from collections.abc import Awaitable, Callable, MutableMapping
+from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -57,17 +57,20 @@ from kiro_crew.agent_files import AGENT_FILENAME, LITE_AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import CRED_KIRO_API_KEY, read_env_file_credential
 from kiro_crew.config.paths import config_dir
+from kiro_crew.executors import kiro_spawn_executor
 from kiro_crew.kiro_cli import (
     find_kiro_cli_candidates,
     known_kiro_cli_dirs,
 )
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
+    corroborate_launcher_refusal,
+    launcher_refusal,
     resource_limit_supervisor_argv,
     sandboxed_spawn_argv,
     shielded_prepare_off_loop,
 )
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
 
@@ -405,10 +408,15 @@ class ProcessResult:
     timed_out: bool = False
     error: str = ""
     # ``(kind, detail, remedy)`` when the spawn was refused because the sandbox
-    # could not be built — set ONLY from the typed SandboxUnavailableError, never
-    # inferred from host capability. A probe that failed for any other reason
-    # leaves this None, so an unrelated failure can never be misreported as a
-    # sandbox problem.
+    # could not be built. Set from exactly two structural sources and never
+    # inferred from host capability or from the child's text: the typed
+    # SandboxUnavailableError raised BEFORE the spawn, and -- when the launcher
+    # refused AFTER the spawn -- a fresh run of the real launcher around a
+    # trusted no-op (``sandbox.corroborate_launcher_refusal``), which the
+    # candidate's stderr line merely triggers and whose own stderr is the
+    # verdict. A trusted run that succeeds, times out, or refuses over host
+    # state leaves this None, so an unrelated failure can never be misreported
+    # as a sandbox problem, and a child cannot print its way into one.
     sandbox_failure: tuple[str, str, str] | None = None
 
 
@@ -634,8 +642,7 @@ def _probe_failure_text(result: ProcessResult | None) -> str:
     # sees), and this string travels to the status payload and the setup
     # screen, so it is redacted BEFORE the cut: truncating first could leave
     # the recognisable half of a secret in the kept tail.
-    text, _ = redact_credentials(text)
-    text, _ = redact_exfiltration_urls(text)
+    text = redact(text)
     if len(text) > _PROBE_ERROR_MAX_CHARS:
         text = text[-_PROBE_ERROR_MAX_CHARS:]
     return text
@@ -1657,6 +1664,66 @@ async def _prepare_sandboxed_spawn(
     )
 
 
+async def _run_on_private_loop(
+    make_coro: Callable[[], Coroutine[Any, Any, ProcessResult]],
+) -> ProcessResult:
+    """Run one spawn on a PRIVATE event loop owned by a worker thread.
+
+    Windows only, and it exists for one call: ``CreateProcess``. CPython performs
+    it SYNCHRONOUSLY on whichever thread asks for the child, and on the Proactor
+    loop there is no await point in between --
+    ``ProactorEventLoop._make_subprocess_transport`` constructs
+    ``_WindowsSubprocessTransport`` before its first ``await waiter``, that
+    constructor calls ``self._start()``, and ``_start`` calls
+    ``windows_utils.Popen`` -> ``subprocess.Popen._execute_child`` ->
+    ``CreateProcess``. So the loop thread is inside ``CreateProcess`` for its
+    whole duration, which on an image with an endpoint-protection filter driver
+    is seconds, and nothing else on that loop advances.
+
+    ``asyncio.to_thread(asyncio.create_subprocess_exec, ...)`` does NOT fix that,
+    which is why the offload is a whole loop rather than one call: that is a
+    coroutine FUNCTION, so the worker thread would only build a coroutine object
+    and hand it back unawaited -- no child is spawned there at all, and awaiting
+    the result on the gateway loop performs the identical on-loop
+    ``CreateProcess``. Nothing narrower works either: asyncio offers no way to
+    adopt an already-spawned ``Popen`` into a subprocess transport, so the only
+    place the spawn can happen off the gateway loop is on another loop.
+
+    A private loop rather than a rewrite to blocking ``Popen`` keeps the Windows
+    retained-tree guarantee byte-for-byte: the descendant tracker, the exact-handle
+    snapshots and the terminate path all still run against a real
+    ``asyncio.subprocess.Process`` on a real Proactor loop, just not this one.
+    ``asyncio.run`` off the main thread is fine on Windows -- it installs signal
+    handlers only on the main thread -- and the loop is closed when the call
+    returns, so none stays bound to the pooled worker. It is spelled through
+    ``asyncio.Runner``, which is literally what ``asyncio.run`` uses internally
+    (same loop creation, same task-cancellation and async-generator shutdown on
+    close), because ``asyncio.run`` would trip test_spawn_audit: that scanner
+    matches ``<spawn module>.<spawn attr>`` and carries ``asyncio`` as a module
+    and ``run`` as an attr in order to catch ``subprocess.run``, so the name
+    collides. Nothing here spawns a child -- the spawn is in ``_run_process``,
+    which the audit already lists -- so allowlisting this function would put a
+    non-spawn in a list of judged-benign spawns. Do not simplify it back.
+
+    Residue, deliberate: a started ``run_in_executor`` future cannot be
+    cancelled, so cancelling the awaiting task does not reach the worker. The
+    child is then reaped by the body's own ``timeout_secs`` rather than at once,
+    and the ``finally`` there still terminates the tree, closes every retained
+    handle and removes the cleanup path -- so a cancel delays the reap, it does
+    not leak a process. Making the cancel prompt needs a signal threaded through
+    that teardown, which is its own change.
+    """
+
+    def _own_loop() -> ProcessResult:
+        with asyncio.Runner() as runner:
+            return runner.run(make_coro())
+
+    return await asyncio.get_running_loop().run_in_executor(
+        kiro_spawn_executor(),
+        _own_loop,
+    )
+
+
 async def _run_process(
     command: str,
     args: list[str],
@@ -1666,13 +1733,37 @@ async def _run_process(
     sandbox_mode: str = _UNVERIFIED_SANDBOX_MODE,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
+    _on_private_loop: bool = False,
 ) -> ProcessResult:
     """Run one fixed argv with bounded output, always inside the OS sandbox.
 
     There is no opt-out: every spawn this module makes is a probe or a Kiro auth
     call, and all of them are sandboxed. Nothing here may run a child
     unsandboxed.
+
+    On Windows this re-enters itself once, on a private event loop owned by a
+    pooled worker thread, because the spawn below reaches ``CreateProcess``
+    synchronously on whatever loop asks for the child -- see
+    :func:`_run_on_private_loop` for why that is the narrowest offload available
+    and why the POSIX path needs none. ``_on_private_loop`` is that re-entry's
+    own marker and is private: nothing outside this function may set it, and a
+    caller that did would put the spawn back on its own loop.
     """
+
+    if platform_compat.IS_WINDOWS and not _on_private_loop:
+        return await _run_on_private_loop(
+            functools.partial(
+                _run_process,
+                command,
+                args,
+                env=env,
+                timeout_secs=timeout_secs,
+                sandbox_mode=sandbox_mode,
+                extra_hidden_dirs=extra_hidden_dirs,
+                extra_visible_dirs=extra_visible_dirs,
+                _on_private_loop=True,
+            )
+        )
 
     if platform_compat.IS_POSIX and not _PROCESS_GROUP_SUPERVISOR_CODE:
         return ProcessResult(ok=False, error=_PROCESS_GROUP_SUPERVISOR_ERROR)
@@ -1871,11 +1962,35 @@ async def _run_process(
             platform_compat.close_process_handle(windows_root_handle)
         await _unlink_off_loop(cleanup_path)
 
+    if proc.returncode == 0:
+        return ProcessResult(ok=True, output=output, returncode=0)
+    # The launcher exits 1 with its refusal on stderr, exactly like a candidate
+    # that exited 1 on its own -- and the candidate can print the launcher's
+    # line: it is the unverified binary this spawn exists to verify. So the
+    # candidate's line is never the verdict. It only decides whether to look
+    # further, and the verdict comes from re-running the real launcher around a
+    # trusted no-op under THIS spawn's own mode and hidden/visible dirs, whose
+    # stderr no child wrote. Only where a launcher ran at all: Windows skips the
+    # wrap, so a ``sandbox:`` line there could only be the candidate's own text.
+    # Off the loop: the trusted run blocks on a subprocess, and a spawn-time
+    # refusal must not stall the gateway.
+    sandbox_failure = None
+    if not platform_compat.IS_WINDOWS and launcher_refusal(output) is not None:
+        sandbox_failure = await asyncio.to_thread(
+            functools.partial(
+                corroborate_launcher_refusal,
+                output,
+                mode=sandbox_mode,
+                extra_hidden_dirs=extra_hidden_dirs,
+                extra_visible_dirs=extra_visible_dirs,
+            )
+        )
     return ProcessResult(
-        ok=proc.returncode == 0,
+        ok=False,
         output=output,
         returncode=proc.returncode,
-        error="" if proc.returncode == 0 else f"process exited with code {proc.returncode}",
+        error=f"process exited with code {proc.returncode}",
+        sandbox_failure=sandbox_failure,
     )
 
 
@@ -2783,12 +2898,18 @@ class KiroPrerequisiteService:
                 # cannot build one a perfectly good, already-authenticated CLI
                 # fails verification and must not be reported as missing.
                 #
-                # This keys on the typed failure the spawn actually raised, NOT
-                # on whether the host has a backend. Host capability is not
-                # evidence: _run_process skips the wrap on Windows, and the
-                # allow_unsandboxed_exec opt-in bypasses it, so a broken CLI on
-                # either would otherwise be blamed on the sandbox and lose the
-                # repair actions that would genuinely help.
+                # This keys on what the spawn itself reported, NOT on whether the
+                # host has a backend: the typed SandboxUnavailableError when the
+                # sandbox could not be built before the spawn, or — when the
+                # launcher refused after it (a container that grants the
+                # namespaces but denies the launcher's first mount can pass a
+                # cached boot probe and fail here) — the sandbox's own fresh
+                # probe, which the launcher's stderr line only triggers and
+                # which a candidate's output can therefore never forge. Host
+                # capability is not evidence: _run_process skips the wrap on
+                # Windows, and the allow_unsandboxed_exec opt-in bypasses it, so
+                # a broken CLI on either would otherwise be blamed on the sandbox
+                # and lose the repair actions that would genuinely help.
                 sandbox_failure = version_probe.sandbox_failure if version_probe else None
                 first_candidate = candidates[0] if candidates else ""
                 # Off-loop: _is_runnable_executable realpath()s and stat()s the

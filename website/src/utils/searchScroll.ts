@@ -1,3 +1,5 @@
+import { getCurrentSearchRange } from './domHighlight'
+
 /** Threshold (ms) below which consecutive search-nav steps are treated as
  * "rapid stepping" and snap instantly instead of smooth-scrolling. */
 export const RAPID_STEP_MS = 250
@@ -117,8 +119,12 @@ let activeScrollOwner: (() => void) | null = null
  * owner that it has been taken over. Returns a release function that clears
  * ownership only if this owner is still the active one (so a stale poll's
  * teardown can never revoke a newer poll's claim).
+ *
+ * Exported for the one other scroll driver, the converging glide
+ * (utils/convergingGlide), whose eased travel writes `scrollTop` every frame
+ * without going through a poll and so must hold the claim itself.
  */
-function claimScrollOwnership(supersede: () => void): () => void {
+export function claimScrollOwnership(supersede: () => void): () => void {
   const prev = activeScrollOwner
   // Install FIRST: `prev()` may synchronously run its own teardown, whose
   // release must compare against `prev` and therefore no-op.
@@ -226,13 +232,14 @@ export function glideOnceStep(
 }
 
 /**
- * Center the active search occurrence (`mark.search-current`) in the viewport,
+ * Center the active search occurrence (the Range `domHighlight` paints as the
+ * current match) in the viewport,
  * re-applying across frames so it CONVERGES as the target settles. A far jump
  * mounts an unmeasured virtualized row, a match inside a collapsed turn
  * triggers a ~300ms expand animation, and a match near a widget shifts as the
  * widget builds (~450ms) — all keep moving layout after an initial scroll, so a
  * single (or short frame-capped) attempt lands on a stale offset (often
- * top-of-list). This re-centers until the mark's viewport position stops moving
+ * top-of-list). This re-centers until the match's viewport position stops moving
  * (row measured, expansion + build finished), then stops — landing on the
  * correct spot on the FIRST click. A ~2s wall-clock backstop guarantees a
  * genuinely unreachable match still terminates rather than spinning.
@@ -298,10 +305,48 @@ export function attachUserScrollIntent(
     const dy = (e as WheelEvent).deltaY
     onUser(dy < 0 ? 'up' : dy > 0 ? 'down' : undefined)
   }
-  // Track the previous touch Y within this attachment: a finger moving DOWN the
-  // screen scrolls the content UP. The first move has no baseline and reports
-  // no direction rather than guessing.
+  // Track the previous touch Y within ONE gesture: a finger moving DOWN the
+  // screen scrolls the content UP.
+  //
+  // The baseline is taken at `touchstart` and dropped at `touchend`, because a
+  // baseline that OUTLIVES its gesture reports the opposite direction. Carried
+  // across, the first move of every later gesture is compared against wherever
+  // the previous finger was lifted: lift at y=500, touch down at y=200 and drag
+  // to 260, and a scroll into older history reports 'down'. On a phone that is
+  // the one event that matters -- it is the input the clamp-release gate looks
+  // for at the start of a scroll-up -- and the gesture only self-corrects on its
+  // SECOND move. Anchoring on `touchstart` also gives the first move of the
+  // first gesture a direction, which a NaN seed could not.
   let lastTouchY = Number.NaN
+  // Baseline only: `pointerdown` already reports the directionless "a finger
+  // landed" input for this same touch, so stamping again here would say nothing
+  // new. Gated on the touch COUNT so a landing finger never moves the baseline
+  // mid-gesture: a second finger landing would otherwise rebase finger 0's path
+  // onto finger 1's starting point and invert one move. A finger LIFTING is the
+  // mirror case and is handled in `onTouchEnd`, which rebases onto the touch
+  // still on the glass rather than dropping the baseline or keeping the lifted
+  // finger's.
+  const onTouchStart = (e: Event) => {
+    const touches = (e as TouchEvent).touches
+    if (touches && touches.length !== 1) return
+    const y = touches?.[0]?.clientY
+    lastTouchY = typeof y === 'number' ? y : Number.NaN
+  }
+  const onTouchEnd = (e: Event) => {
+    const touches = (e as TouchEvent).touches
+    // A finger leaving a multi-touch gesture does not end the gesture, but it
+    // can change WHICH finger `touches[0]` names: lift the first of two and the
+    // remaining one takes that slot, so holding the lifted finger's Y would
+    // measure the survivor's next move against a finger no longer on the glass
+    // and invert it. Rebase onto whoever holds the slot the move handler reads;
+    // only an empty list drops the baseline.
+    if (touches && touches.length > 0) {
+      const y = touches[0]?.clientY
+      lastTouchY = typeof y === 'number' ? y : Number.NaN
+      return
+    }
+    lastTouchY = Number.NaN
+  }
   const onTouch = (e: Event) => {
     const y = (e as TouchEvent).touches?.[0]?.clientY
     if (typeof y !== 'number') {
@@ -316,14 +361,20 @@ export function attachUserScrollIntent(
   const onPointer = () => onUser()
   const passive = { passive: true } as const
   target.addEventListener('wheel', onWheel, passive)
+  target.addEventListener('touchstart', onTouchStart, passive)
   target.addEventListener('touchmove', onTouch, passive)
+  target.addEventListener('touchend', onTouchEnd, passive)
+  target.addEventListener('touchcancel', onTouchEnd, passive)
   // pointerdown fires when the scrollbar thumb is grabbed, before any scroll
   // event arrives, so the abort lands ahead of the first drag movement.
   target.addEventListener('pointerdown', onPointer, passive)
   target.addEventListener('keydown', onKey, passive)
   return () => {
     target.removeEventListener('wheel', onWheel)
+    target.removeEventListener('touchstart', onTouchStart)
     target.removeEventListener('touchmove', onTouch)
+    target.removeEventListener('touchend', onTouchEnd)
+    target.removeEventListener('touchcancel', onTouchEnd)
     target.removeEventListener('pointerdown', onPointer)
     target.removeEventListener('keydown', onKey)
   }
@@ -336,25 +387,28 @@ export function scrollCurrentMatchIntoView(
   const { maxMs = CONVERGE_MAX_MS, now = defaultNow, raf = defaultRaf } = opts
   const target: EventTarget | undefined =
     typeof window !== 'undefined' ? window : undefined
-  const scope: ParentNode | null =
-    root ?? (typeof document !== 'undefined' ? document : null)
-  let mark: HTMLElement | null = null
+  let match: Range | null = null
   // Hoisted so `cleanup` (referenced by pollRowSettled's onEnd) can name it.
   function onUser() { stop() }
   let detachUser: () => void = () => {}
   const cleanup = () => { detachUser() }
   const stop = pollRowSettled({
-    // Reading the mark's position IS the convergence signal; scrolling is the
-    // step. While the mark is absent (off-window row not mounted), measure
-    // returns null and the poll idles until the backstop.
+    // Reading the match's position IS the convergence signal; scrolling is the
+    // step. The match is a Range painted by domHighlight, not an element: the
+    // transcript never wraps matched text in a node of its own (see
+    // `applySearchHighlights`), so there is no `<mark>` to query. While the
+    // range is absent (off-window row not mounted, or its text node replaced
+    // by a re-render and not yet re-walked), measure returns null and the poll
+    // idles until the backstop.
     measure: () => {
-      mark = (scope?.querySelector('mark.search-current') as HTMLElement | null) ?? null
-      if (!mark) return null
-      return typeof mark.getBoundingClientRect === 'function'
-        ? mark.getBoundingClientRect().top
+      const r = getCurrentSearchRange()
+      match = r && (!root || root.contains(r.startContainer)) ? r : null
+      if (!match) return null
+      return typeof match.getBoundingClientRect === 'function'
+        ? match.getBoundingClientRect().top
         : 0
     },
-    step: () => { mark?.scrollIntoView?.({ block: 'center' }) },
+    step: () => { if (match) scrollRangeToCenter(match) },
     raf,
     now,
     maxMs,
@@ -362,4 +416,38 @@ export function scrollCurrentMatchIntoView(
   })
   detachUser = attachUserScrollIntent(target, onUser)
   return () => { stop(); cleanup() }
+}
+
+/**
+ * Scroll so `range` sits at the vertical centre of every scrollable ancestor
+ * and of the viewport — what `Element.scrollIntoView({ block: 'center' })` does
+ * for an element, which `Range` does not offer. Each scroller is adjusted by
+ * the range's offset from that scroller's own centre, and the adjustment the
+ * scroller actually accepted (a clamped `scrollTop` moves less than asked) is
+ * carried outward so the enclosing scrollers centre the range's final position.
+ *
+ * Scrollers are detected by computed `overflow-y` plus real overflow, so a
+ * paragraph taller than the scroller still centres on the match itself rather
+ * than on the paragraph.
+ */
+export function scrollRangeToCenter(range: Range): void {
+  if (typeof getComputedStyle !== 'function') return
+  const rect = range.getBoundingClientRect()
+  let mid = rect.top + rect.height / 2
+  const start = range.startContainer
+  let el: HTMLElement | null =
+    start.nodeType === Node.ELEMENT_NODE ? (start as HTMLElement) : start.parentElement
+  for (; el; el = el.parentElement) {
+    if (el.scrollHeight <= el.clientHeight) continue
+    const overflowY = getComputedStyle(el).overflowY
+    if (overflowY !== 'auto' && overflowY !== 'scroll') continue
+    const box = el.getBoundingClientRect()
+    const before = el.scrollTop
+    el.scrollTop = before + (mid - (box.top + box.height / 2))
+    mid -= el.scrollTop - before
+  }
+  if (typeof window !== 'undefined' && typeof window.scrollBy === 'function') {
+    const delta = mid - window.innerHeight / 2
+    if (Math.abs(delta) >= 1) window.scrollBy(0, delta)
+  }
 }

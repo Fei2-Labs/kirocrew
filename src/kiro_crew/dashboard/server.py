@@ -12,15 +12,15 @@ import os
 import stat
 import sys
 import time
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from aiohttp import web
 
-from kiro_crew import platform_compat, port_resolution
-from kiro_crew.apps.backend import start_enabled_app_backends
+from kiro_crew import platform_compat, port_resolution, shutdown_event
+from kiro_crew.apps.backend import start_deferred_app_backends, start_enabled_app_backends
 from kiro_crew.apps.hook_reconcile import init_hook_reconciler, stop_hook_reconciler
 from kiro_crew.apps.hooks_integration import (
     init_hooks_system,
@@ -125,8 +125,10 @@ from kiro_crew.dashboard.handlers.source_providers import (
     register_status_delta_sink,
     unregister_status_delta_sink,
 )
+from kiro_crew.dashboard.handlers.spawn_resume import setup_spawn_resume_routes
 from kiro_crew.dashboard.handlers.weixin_qr import setup_weixin_routes
 from kiro_crew.dashboard.handlers.whatsapp_setup import setup_whatsapp_routes
+from kiro_crew.dashboard.listener_guard import ListenerGuard, release_site
 from kiro_crew.dashboard.loop_watchdog import LoopStallWatchdog
 from kiro_crew.dashboard.origin import (
     AUDIT_CLAIMED_KEY,
@@ -153,6 +155,7 @@ from kiro_crew.dashboard.state import _DEFAULT_PORT, DashboardState
 from kiro_crew.dashboard.token_auth import (
     _cookie_port_from_host,
     _is_spa_shell_request,
+    internal_path_matches,
     is_csrf_exempt,
     register_app_window_paths,
     token_auth_middleware,
@@ -411,6 +414,43 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # boundary, and the handler re-asserts host-locality itself because a
         # local_only=False deployment reclassifies strict paths as mixed.
         "/api/update/approve",
+        # Flagged-file delivery approval step-up, the exact mirror
+        # of /api/update/approve above and STRICT for the identical reason: its
+        # only legitimate caller is `kirocrew file-delivery approve` on the gateway
+        # host presenting the sandbox-masked nonce plus X-Internal-Secret. As with
+        # update approve, "no browser ever posts to it -- the SPA can only ARM;
+        # keeping it off the cookie fall-through means a dashboard bearer cannot
+        # even reach the handler whose refusal is the boundary". The handler
+        # (api_file_delivery_consent_approve -> _approve_is_local) re-asserts
+        # host-locality itself, so the STRICT entry is the outer of two fences and
+        # a local_only=False deployment that reclassifies strict paths as mixed is
+        # still caught by the handler's own check.
+        "/api/file-delivery/consent/approve",
+        # Dev Fleet pod lifecycle — the agent surface behind the ``pod_up`` /
+        # ``pod_down`` / ``pod_status`` / ``pod_ls`` MCP tools. An agent session
+        # runs behind a sandbox with its own user namespace, so its shells cannot
+        # connect the systemd user bus every pod verb needs; the gateway holds the
+        # host bus and does the systemd part on the agent's behalf. Without these
+        # entries the tools 403: an agent has no dashboard cookie,
+        # ``KIROCREW_INTERNAL_SECRET`` is stripped from its env, and
+        # ``.local_secret`` is on the sensitive-path denylist.
+        #
+        # STRICT, not mixed: no browser calls these. The dashboard's own pod
+        # buttons go to the app backend through the ``/apps/dev-fleet/api/*``
+        # reverse proxy, which is a different surface with cookie auth. Each
+        # handler re-asserts loopback AND ``internal_auth`` itself, because a
+        # ``local_only=False`` deployment reclassifies strict paths as mixed —
+        # same reason ``/api/computer-use/frame`` re-asserts both.
+        #
+        # FOUR EXACT paths, never the ``/api/apps/dev-fleet/pod`` prefix. The
+        # match is ``path == p or path.startswith(p + "/")``, so a prefix entry
+        # would silently admit every future route under that segment — and this
+        # app's neighbourhood includes worktree PRUNE and the Make Live cutover,
+        # which must never become reachable by holding the internal secret.
+        "/api/apps/dev-fleet/pod/up",
+        "/api/apps/dev-fleet/pod/down",
+        "/api/apps/dev-fleet/pod/status",
+        "/api/apps/dev-fleet/pod/list",
         "/api/session-tool-policy",
         # NOTE: "/api/hooks/agent" is deliberately NOT here. It is an inbound
         # webhook for EXTERNAL callers (CI runners, review bots) that hold no
@@ -441,6 +481,17 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # the tools' internal-secret calls fall through to cookie auth and are
         # refused before the handler's own session recognition can run.
         "/api/work-ledger",
+        # MCP-only (the three kirocrew-crew-log read tools); no browser caller.
+        # Prefix matching covers "/sessions", "/resolve" and every "/units/..."
+        # sub-route. STRICT, not mixed, for the reason the session-control block
+        # below gives: these read ANOTHER live session's recorded history, so a
+        # forwarded browser must be hard-denied rather than fall through to a
+        # cookie. Strict membership is NOT the whole gate -- a loopback request
+        # with no secret header still reaches the handler through cookie auth --
+        # so handlers/crew_log.py refuses a cookie-authed caller itself, and the
+        # browser reads its own log through the cookie-only
+        # "/api/sessions/{id}/crew-log" pair this entry does not cover.
+        "/api/crew-log",
         # MCP-only (knowledge_add_document tool); no browser caller — the
         # dashboard ingests via its own cookie-authed knowledge routes. Same
         # wiring class as "/api/notifications/agent" above.
@@ -734,6 +785,16 @@ _MIXED_INTERNAL_API_PATHS = frozenset(
         # Called by MCP (loopback + secret) AND browser polling
         # (DCV/SSH-forwarded cookie auth).  See token_auth.py.
         "/api/spawn",
+        # The update step-up's arm record: POST (arm), GET (status), DELETE
+        # (decline). Two callers, two credentials: the About panel polls it with
+        # a cookie, and an agent asking for an app update presents
+        # X-Internal-Secret. EXACT path — a sibling of the STRICT
+        # `/api/update/approve`, never its prefix: token_auth matches `p` or
+        # `p + "/"`, so `/api/update` here would turn a host-only approval into
+        # a cookie-reachable one. Arming grants nothing (the record carries no
+        # nonce and no endpoint installs from it), so a mixed admission widens
+        # nothing.
+        "/api/update/arm",
         "/api/chat",
         "/api/lessons",
         # MCP recall still requires the handler's protected member/session proof.
@@ -843,6 +904,165 @@ _MIXED_INTERNAL_API_PATHS = frozenset(
         "/v1/chat/completions",  # OpenAI-compat API
     }
 )
+
+
+def _would_soften_a_strict_path(candidate: str) -> bool:
+    """Whether admitting *candidate* to the mixed set reclassifies a strict route.
+
+    BOTH directions, because `internal_path_matches` is prefix-based and the
+    request is what gets matched, not the entry:
+
+    * candidate is a strict entry, or a CHILD of one — the obvious case.
+    * candidate is an ANCESTOR of a strict entry — the case a one-directional
+      check misses. Contributing ``/api/browser`` against the strict
+      ``/api/browser/command`` admits every route beneath it, so a request for
+      the strict path matches BOTH sets, and token_auth's off-loopback arm tests
+      ``_matches_mixed`` first (``elif _matches_internal: if _matches_mixed:``) —
+      the strict hard-deny is replaced by cookie acceptance.
+
+    The docstring's "never an app root, enumerate" is guidance; this is the
+    enforcement, so the ancestor direction is not left to the contributor.
+    """
+    if internal_path_matches(candidate, _STRICT_INTERNAL_API_PATHS):
+        return True
+    return any(internal_path_matches(strict, {candidate}) for strict in _STRICT_INTERNAL_API_PATHS)
+
+
+def _mixed_internal_api_paths() -> frozenset[str]:
+    """``_MIXED_INTERNAL_API_PATHS`` plus the edition's contributed paths.
+
+    Both middleware construction sites build their mixed set through here — the
+    dashboard chain and the headless ``--slack-only`` one — so the two can never
+    disagree about which routes an internal loopback caller may reach. Drift
+    there is an auth bug, not a cosmetic one.
+
+    WHY A SEAM AT ALL. An edition mounts its routes through
+    ``DashboardContributor.contribute_routes``, so the core cannot name those
+    paths in a module-level frozenset. Without the contribution, an edition's own
+    MCP tool authenticating with the loopback ``X-Internal-Secret`` handshake is
+    not recognized as internal: token_auth ignores the secret, falls through to
+    cookie auth, and the tool answers ``Token required`` on every call.
+
+    TWO LIMITS THE CORE ENFORCES rather than trusting the contributor:
+
+    * a contributed path matching a CORE STRICT entry is DROPPED. Strict and mixed
+      differ off-loopback — strict hard-denies, mixed accepts a validated
+      cookie — so admitting one would soften a route the core deliberately keeps
+      loopback-only. The overlap is checked in BOTH directions (see
+      :func:`_would_soften_a_strict_path`): a contributed ANCESTOR of a strict
+      entry reclassifies it just as a child does. Dropping is audited, because a
+      silently-ignored contribution and an honoured one look identical from the
+      edition's side.
+    * the result is a UNION, so a contribution can never remove a core entry. A
+      contributor returning an unrelated or empty set is harmless by construction,
+      which is why the read below can fail closed to "no contribution".
+
+    Fail-closed through ``safe_context_call``, the idiom this repo centralizes for
+    exactly this seam: a ``PlatformCompositionError`` is RE-RAISED, because a host
+    that could not compose its companion must abort rather than fall back to
+    open-source defaults, while any other contributor failure degrades to no
+    contribution. A contributor that raises, hands back a generator that raises
+    part-way through iteration, returns a non-iterable, or yields non-string
+    entries therefore contributes nothing rather than widening the admitted set on
+    a value the core could not check — and none of those can abort the gateway
+    bind, which is what a raise escaping middleware construction would do.
+
+    BOTH outcomes are recorded, because each is invisible to a different party: a
+    dropped contribution is invisible to the EDITION, and an honoured one is
+    invisible to the OPERATOR. So the admitted set is logged and SEL-audited at
+    composition time alongside the drop audit — without it SEL cannot tell a
+    deployment whose auth surface an edition widened from a stock one. A public
+    build contributes nothing and stays silent.
+    """
+
+    def _read() -> set[str]:
+        # LOOKUP separated from INVOCATION on purpose. Guarding the call itself
+        # against AttributeError would also swallow one raised INSIDE an
+        # implemented contributor, so a genuinely broken edition would take the
+        # silent "predates the seam" path and contribute nothing with no warning —
+        # indistinguishable from an honoured empty contribution, which is the
+        # confusion the audit below exists to remove. A MISSING method is the happy
+        # path (returns nothing, silently); a BROKEN one raises and is reported.
+        reader = getattr(current_context().dashboard, "mixed_internal_api_paths", None)
+        if reader is None:
+            return set()
+        # Materialized INSIDE the thunk. A contributor may hand back a generator,
+        # and one that raises part-way through iteration is a contributor failure
+        # like any other — but the comprehension is where it surfaces, so leaving
+        # it outside would let it escape middleware construction and stop the
+        # gateway binding at all. A non-iterable raises TypeError here and lands on
+        # the same degrade path.
+        return {p for p in reader() if isinstance(p, str) and p.startswith("/")}
+
+    def _degraded() -> set[str]:
+        # Invoked only on the degrade path and INSIDE the except block, so
+        # ``exc_info`` still carries the live exception. WARNING rather than the
+        # helper's debug line because a broken contributor is a fault an operator
+        # has to see: the edition's tool will answer Token required with nothing
+        # else naming the cause.
+        logger.warning(
+            "dashboard contributor mixed_internal_api_paths failed; "
+            "contributing no internal paths",
+            exc_info=True,
+        )
+        return set()
+
+    # safe_context_call, not a hand-written try/except: it is the CPP fail-closed
+    # idiom this repo centralizes, and the reason is exactly the divergence a copy
+    # invites — a bare ``except Exception`` swallows PlatformCompositionError, and a
+    # non-standalone host that could not compose its companion MUST abort rather
+    # than silently fall back to open-source defaults. Degrading THAT to the core
+    # set would answer a mis-composed edition with a quietly narrower auth surface.
+    entries = safe_context_call(_read, fallback_factory=_degraded, log_message=None)
+
+    softening = {p for p in entries if _would_soften_a_strict_path(p)}
+    if softening:
+        # Loud, and dropped rather than honoured: the edition asked for a route
+        # the core keeps loopback-only to be reachable off-loopback with a cookie.
+        logger.error(
+            "dashboard contributor tried to soften strict internal paths to mixed; " "dropping %s",
+            sorted(softening),
+        )
+        try:
+            sel().log_api_access(
+                caller="dashboard_contributor",
+                operation="mixed_internal_api_paths",
+                outcome="denied",
+                source="dashboard",
+                resources=",".join(sorted(softening)),
+                error="would soften a core strict path",
+            )
+        except Exception:  # pragma: no cover - audit must not change the outcome
+            logger.debug("SEL audit for dropped internal paths failed", exc_info=True)
+        entries -= softening
+
+    if entries:
+        # The symmetric half of the drop audit, and the reason both exist: a
+        # dropped contribution is invisible to the EDITION, and an honoured one is
+        # invisible to the OPERATOR. Without this, SEL cannot distinguish a
+        # deployment whose auth surface an edition widened from a stock one, which
+        # is exactly the composed surface SEL exists to make visible.
+        #
+        # Only when something was actually admitted: a public build contributes an
+        # empty set, so staying silent there keeps every stock gateway start free
+        # of a line that says nothing.
+        logger.info(
+            "dashboard contributor admitted %d internal-reachable path(s): %s",
+            len(entries),
+            sorted(entries),
+        )
+        try:
+            sel().log_api_access(
+                caller="dashboard_contributor",
+                operation="mixed_internal_api_paths",
+                outcome="allowed",
+                source="dashboard",
+                resources=",".join(sorted(entries)),
+            )
+        except Exception:  # pragma: no cover - audit must not change the outcome
+            logger.debug("SEL audit for admitted internal paths failed", exc_info=True)
+
+    return _MIXED_INTERNAL_API_PATHS | frozenset(entries)
 
 
 # Base Content-Security-Policy applied to all dashboard responses.
@@ -1473,6 +1693,10 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/mcp-apps/call", handlers.api_mcp_apps_call)
     app.router.add_get("/api/spawn", handlers.api_spawn_list)
     app.router.add_post("/api/spawn/stop-all", handlers.api_spawn_stop_all)
+    # Fairness: the resume-hold, lanes and adaptive routes
+    # (``handlers/spawn_resume.py``), registered before ``{agent_id}`` so
+    # ``/api/spawn/lanes`` and ``/api/spawn/adaptive`` are not read as run ids.
+    setup_spawn_resume_routes(app)
     app.router.add_get("/api/spawn/{agent_id}", handlers.api_spawn_status)
     app.router.add_delete("/api/spawn/{agent_id}", handlers.api_spawn_delete)
     app.router.add_post("/api/spawn/{agent_id}/retry", handlers.api_spawn_retry)
@@ -1872,8 +2096,11 @@ async def _start_site(
             if exc.errno != errno.EADDRINUSE:
                 raise
             last_exc = exc
-            # release the partially-started site before retrying
-            await site.stop()
+            # release the partially-started site before retrying, listener only:
+            # TCPSite.stop() would also fire the application's on_shutdown
+            # signals and wait on the runner's shutdown timeout, and this
+            # application has not started serving yet (see release_site).
+            release_site(site)
             if attempt == 0:
                 try:
                     outcome = await _reclaim(port)
@@ -2631,6 +2858,218 @@ def _dispatch_owner_dm(state: DashboardState, text: str) -> None:
     task.add_done_callback(state._background_tasks.discard)
 
 
+async def _initialize_workflow_service(state: DashboardState) -> None:
+    """Restore fully off the boot path; publish only on the owning loop."""
+    service = None
+    attachment_started = False
+    try:
+        from kiro_crew.dashboard.handlers import workflows as wf_handlers
+        from kiro_crew.dashboard.workflow_inject import inject_bound_workflow_result
+        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+        from kiro_crew.workflows.service import WorkflowService
+
+        def _wf_on_event(run_id: str, event_json: dict) -> None:
+            try:
+                sess = ""
+                svc = getattr(state, "workflow_service", None)
+                if svc is not None:
+                    h = svc.registry.get(run_id)
+                    if h is not None:
+                        sess = h.session_key
+                safe_event = wf_handlers._redact_obj(event_json)
+                state.broadcast_ws(
+                    "workflow_run_event",
+                    {"run_id": run_id, "session_key": sess, **safe_event},
+                )
+            except Exception:
+                logger.debug("workflow on_event broadcast failed", exc_info=True)
+
+        def _wf_on_done(run_id: str, snapshot: dict) -> None:
+            def _auto_turn(slot: Any, snap: dict) -> None:
+                try:
+                    from kiro_crew.dashboard.chat import _run_chat
+
+                    raw_name = snap.get("name") or snap.get("run_id", run_id)
+                    name, _ = redact_exfiltration_urls(str(raw_name))
+                    name, _ = redact_credentials(name)
+                    status, _ = redact_exfiltration_urls(str(snap.get("status", "")))
+                    status, _ = redact_credentials(status)
+                    prompt = (
+                        f"[Workflow `{name}` finished: {status}] Its result was just "
+                        "posted above. The user is waiting on the answer to the "
+                        "request that prompted this workflow — find that request "
+                        "earlier in this conversation and answer it directly. Your "
+                        "final message is the only part of this turn the user is "
+                        "guaranteed to see, so make it a standalone deliverable: lead "
+                        "with the answer, and keep run mechanics (which agents ran, "
+                        "what was verified, what is still uncertain) to a short "
+                        "closing note or a collapsed fold. If the workflow failed or "
+                        "came back incomplete, say that plainly and state what is "
+                        "still unknown."
+                    )
+                    started = slot.enqueue_or_run_prompt(prompt, _run_chat, state)
+                    state.push_slots_update()
+                    logger.info(
+                        "workflow %s result -> chat slot %s: agent turn %s",
+                        run_id,
+                        getattr(slot, "key", "?"),
+                        "started" if started else "queued",
+                    )
+                except Exception:
+                    logger.warning("workflow %s auto-turn failed", run_id, exc_info=True)
+
+            try:
+                delivery = asyncio.create_task(
+                    inject_bound_workflow_result(state, run_id, snapshot, on_injected=_auto_turn)
+                )
+                state._background_tasks.add(delivery)
+                delivery.add_done_callback(state._background_tasks.discard)
+            except Exception:
+                logger.debug("workflow on_done injection failed", exc_info=True)
+
+        # Workflow agent concurrency stays at this fixed cap ON PURPOSE. Sizing it
+        # from resolve_max_subagents() looks tempting (it is the sizing authority
+        # in mcp_core / slack gateway / context), but the warm pool keeps a
+        # SEPARATE sub-pool per agent/model/CWD identity and its own documented
+        # aggregate bound is ``(max_identities + 1) * max_workers`` — 9 * this
+        # value (see workflows/agent_pool.py). Feeding an auto-sized cap in here
+        # would raise the worst-case resident kiro-cli workers from 9*4=36 to
+        # 9*subagent_auto_max=288 and OOM the gateway on a large host. Revisit
+        # only once the pool enforces ONE aggregate worker limit.
+        _wf_concurrency = 4
+        # The run ceiling is unaffected by that and IS config-driven.
+        _wf_timeout_secs: int | None = None
+        try:
+            cfg = await asyncio.to_thread(KiroCrewConfig.load)
+            _wf_timeout_secs = int(cfg.agent.workflow_run_timeout_secs)
+        except Exception:
+            logger.debug("workflow run-ceiling config unavailable; using default", exc_info=True)
+
+        async def _wf_nudge_authorizer(
+            *, slot_key: str, message: str, idle_secs: int, max_cycles: int
+        ) -> str | None:
+            """Keep workflow nudges on the shared authorization/audit chokepoint."""
+            _loop, error, _status = await authorize_and_add_nudge(
+                svc=_autonudge_get(),
+                state=state,
+                slot_key=slot_key,
+                message=message,
+                idle_secs=idle_secs,
+                max_cycles=max_cycles,
+                source="workflow",
+            )
+            if error is not None:
+                logger.info("workflow ctx.nudge not armed for %s: %s", slot_key, error)
+            return error
+
+        service = await WorkflowService.create(
+            sessions=state.sessions,
+            context_builder=state.context_builder,
+            on_done=_wf_on_done,
+            on_event=_wf_on_event,
+            now_fn=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            concurrency=_wf_concurrency,
+            nudge_authorizer=_wf_nudge_authorizer,
+            timeout_secs=_wf_timeout_secs,
+        )
+        # Cancellation cannot stop a to_thread worker. Even if the factory
+        # finishes while shutdown drains it, its result must remain unpublished.
+        if (
+            state.workflow_startup_stopping
+            or getattr(state.sessions, "admission_closed", False) is True
+        ):
+            state.workflow_startup_status = "stopped"
+            return
+        if state.task_runner is not None:
+            attachment_started = True
+            service.attach_task_runner(state.task_runner)
+            state.task_runner.attach_workflow_service(service)
+        # No await between attachment, publication and opening admission.
+        state.workflow_service = service
+        state.workflow_startup_status = "ready"
+        logger.info("WorkflowService ready (run ceiling=%ss)", service.timeout_secs)
+    except asyncio.CancelledError:
+        state.workflow_startup_status = "stopped" if state.workflow_startup_stopping else "failed"
+        raise
+    except Exception:
+        state.workflow_startup_status = "failed"
+        logger.warning("WorkflowService unavailable", exc_info=True)
+    finally:
+        if state.workflow_startup_status != "ready":
+            state.workflow_service = None
+            if state.task_runner is not None:
+                try:
+                    if attachment_started:
+                        state.task_runner.attach_workflow_service(None)
+                finally:
+                    state.task_runner.defer_workflow_attachment(
+                        failed=state.workflow_startup_status == "failed"
+                    )
+            if service is not None and attachment_started:
+                service.attach_task_runner(None)
+
+
+def _register_workflow_lifecycle(app: web.Application, state: DashboardState) -> None:
+    """Install gates before bind, without starting imports or disk recovery."""
+    state.workflow_startup_status = "pending"
+    state.workflow_startup_stopping = False
+    if state.task_runner is not None:
+        state.task_runner.defer_workflow_attachment()
+
+    @web.middleware
+    async def _workflow_ready(request: web.Request, handler: Any) -> web.StreamResponse:
+        # TaskRunner owns its typed mutation gate; status and cancel stay usable.
+        dependent = request.path == "/api/workflows" or request.path.startswith("/api/workflows/")
+        if dependent and state.workflow_startup_status != "ready":
+            failed = state.workflow_startup_status == "failed"
+            return web.json_response(
+                {
+                    "error": (
+                        "Workflow initialization failed; restart the gateway."
+                        if failed
+                        else "Workflows are not ready; retry later"
+                    ),
+                    "code": "workflow_initialization_failed" if failed else "workflows_unavailable",
+                },
+                status=503,
+            )
+        return await handler(request)
+
+    async def _workflow_stop_publication(_app: web.Application) -> None:
+        state.workflow_startup_stopping = True
+        state.workflow_startup_status = "stopped"
+        if state.task_runner is not None:
+            state.task_runner.defer_workflow_attachment()
+
+    async def _workflow_shutdown(_app: web.Application) -> None:
+        task = state.workflow_startup_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        drain = asyncio.gather(task, return_exceptions=True)
+        while not drain.done():
+            try:
+                await asyncio.shield(drain)
+            except asyncio.CancelledError:
+                pass
+
+    app.middlewares.append(_workflow_ready)
+    app.on_shutdown.append(_workflow_stop_publication)
+    # Registered after tunnel cleanup, but fenced before any cleanup can yield.
+    app.on_cleanup.append(_workflow_shutdown)
+
+
+def _kick_workflow_initialization(state: DashboardState) -> None:
+    """Called only after listener bind and successful credential publication."""
+    if state.workflow_startup_task is not None or state.workflow_startup_stopping:
+        return
+    task = asyncio.create_task(_initialize_workflow_service(state), name="workflow-initialization")
+    state.workflow_startup_task = task
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
 def _register_connections_warm_lifecycle(app: web.Application, state: DashboardState) -> None:
     """Retire warm generations on cleanup; startup scavenging is kicked post-bind.
 
@@ -2929,8 +3368,31 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
         if manager is not None:
             await manager.shutdown()
 
+    async def _crew_log_drain(app_: web.Application) -> None:
+        """Write out the session's log buffered appends before the process goes.
+
+        The emitter hands appends to a writer thread so a turn never waits on the
+        filesystem, which means a record can be in memory when shutdown starts.
+        Exiting without this drops exactly the entries a reader most wants after a
+        restart -- the last thing each session did. The drain is bounded inside
+        the emitter, and runs in a thread so a slow disk delays the exit instead
+        of blocking the loop that is closing everything else down.
+        """
+        try:
+            # Imported here, not at module scope: this file is on the gateway boot
+            # path, and the emitter is flag-gated behind KIROCREW_CREW_LOG.
+            # AUTOSDE's no-new-work-on-gateway-boot-path rule asks for the IMPORT to
+            # be gated, not just the handler, so a launch with the flag unset pays
+            # nothing for a subsystem it will never call.
+            from kiro_crew.crew_log import emit as crew_log_emit
+
+            await asyncio.to_thread(crew_log_emit.drain_for_shutdown)
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            logger.debug("crew log drain failed during shutdown", exc_info=True)
+
     app.on_startup.append(_instances_startup)
     app.on_cleanup.append(_instances_shutdown)
+    app.on_cleanup.append(_crew_log_drain)
 
 
 def build_host_canonical_redirect(canonical_host: str) -> Any:
@@ -3083,6 +3545,47 @@ def _register_prevent_sleep_shutdown(app: web.Application, state: DashboardState
                 logger.debug("prevent-sleep release on shutdown failed", exc_info=True)
 
     app.on_cleanup.append(_prevent_sleep_shutdown)
+
+
+def _register_listener_guard_shutdown(app: web.Application, state: DashboardState) -> None:
+    """Register the on_cleanup hook that detaches the listener guard.
+
+    MUST be called BEFORE ``runner.setup()`` freezes the app's signal lists. The
+    guard is created after the TCP site binds (:func:`_arm_listener_guard`) and
+    resolved here lazily via ``getattr``. Detaching first matters: cleanup stops
+    every site, and a guard still armed would read its own site's closed
+    listener as a lost one and try to rebind it mid-shutdown.
+    """
+
+    async def _listener_guard_shutdown(app_: web.Application) -> None:
+        guard = getattr(state, "_listener_guard", None)
+        if guard is not None:
+            guard.stop()
+
+    app.on_cleanup.append(_listener_guard_shutdown)
+
+
+def _arm_listener_guard(state: DashboardState, runner: web.AppRunner, site: web.TCPSite) -> None:
+    """Watch the just-started TCP *site* and rebind it if its listener dies.
+
+    Windows only, because the defect is: one failed ``accept()``
+    (``ERROR_NETNAME_DELETED`` from an aborted tunnelled peer) makes the
+    proactor loop close the LISTEN socket for good while the process and its
+    accepted connections live on. The guard hooks the loop's exception handler
+    for that exact report, self-probes ``/api/live`` over loopback
+    periodically, rebinds the same host/port with bounded backoff, and exits
+    non-zero when it cannot -- see
+    :mod:`kiro_crew.dashboard.listener_guard`. Shared by ``start_dashboard``
+    and the headless ``start_api_server``. POSIX selector loops keep the
+    listener registered across a failed accept, so on those platforms this is
+    a no-op rather than an idle probe task.
+    """
+    if not platform_compat.IS_WINDOWS:
+        return
+
+    guard = ListenerGuard(runner, site, shutdown_event)
+    guard.arm()
+    state._listener_guard = guard
 
 
 def _import_stt_engine() -> Any:
@@ -3628,147 +4131,6 @@ async def start_dashboard(
     except Exception:
         logger.debug("Could not register pending-skill staged hook", exc_info=True)
 
-    # --- Dynamic Workflows ---
-    _workflow_stopping = False
-    _workflow_task: asyncio.Task[None] | None = None
-    _workflow_start: Callable[[], Coroutine[Any, Any, None]] | None = None
-    try:
-        from kiro_crew.dashboard.handlers import workflows as wf_handlers
-        from kiro_crew.dashboard.workflow_inject import inject_workflow_result
-        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-        from kiro_crew.workflows.service import WorkflowService
-
-        def _wf_on_event(run_id: str, event_json: dict) -> None:
-            try:
-                sess = ""
-                svc = getattr(state, "workflow_service", None)
-                if svc is not None:
-                    h = svc.registry.get(run_id)
-                    if h is not None:
-                        sess = h.session_key
-                safe_event = wf_handlers._redact_obj(event_json)
-                state.broadcast_ws(
-                    "workflow_run_event",
-                    {"run_id": run_id, "session_key": sess, **safe_event},
-                )
-            except Exception:
-                logger.debug("workflow on_event broadcast failed", exc_info=True)
-
-        def _wf_on_done(run_id: str, snapshot: dict) -> None:
-            def _auto_turn(slot: Any, snap: dict) -> None:
-                try:
-                    from kiro_crew.dashboard.chat import _run_chat
-
-                    raw_name = snap.get("name") or snap.get("run_id", run_id)
-                    name, _ = redact_exfiltration_urls(str(raw_name))
-                    name, _ = redact_credentials(name)
-                    status, _ = redact_exfiltration_urls(str(snap.get("status", "")))
-                    status, _ = redact_credentials(status)
-                    prompt = (
-                        f"[Workflow `{name}` finished: {status}] Its result was just "
-                        "posted above. The user is waiting on the answer to the "
-                        "request that prompted this workflow — find that request "
-                        "earlier in this conversation and answer it directly. Your "
-                        "final message is the only part of this turn the user is "
-                        "guaranteed to see, so make it a standalone deliverable: lead "
-                        "with the answer, and keep run mechanics (which agents ran, "
-                        "what was verified, what is still uncertain) to a short "
-                        "closing note or a collapsed fold. If the workflow failed or "
-                        "came back incomplete, say that plainly and state what is "
-                        "still unknown."
-                    )
-                    started = slot.enqueue_or_run_prompt(prompt, _run_chat, state)
-                    state.push_slots_update()
-                    logger.info(
-                        "workflow %s result -> chat slot %s: agent turn %s",
-                        run_id,
-                        getattr(slot, "key", "?"),
-                        "started" if started else "queued",
-                    )
-                except Exception:
-                    logger.warning("workflow %s auto-turn failed", run_id, exc_info=True)
-
-            try:
-                inject_workflow_result(state, run_id, snapshot, on_injected=_auto_turn)
-            except Exception:
-                logger.debug("workflow on_done injection failed", exc_info=True)
-
-        # Workflow agent concurrency stays at this fixed cap ON PURPOSE. Sizing it
-        # from resolve_max_subagents() looks tempting (it is the sizing authority
-        # in mcp_core / slack gateway / context), but the warm pool keeps a
-        # SEPARATE sub-pool per agent/model/CWD identity and its own documented
-        # aggregate bound is ``(max_identities + 1) * max_workers`` — 9 * this
-        # value (see workflows/agent_pool.py). Feeding an auto-sized cap in here
-        # would raise the worst-case resident kiro-cli workers from 9*4=36 to
-        # 9*subagent_auto_max=288 and OOM the gateway on a large host. Revisit
-        # only once the pool enforces ONE aggregate worker limit.
-        _wf_concurrency = 4
-        # The run ceiling is unaffected by that and IS config-driven.
-        _wf_timeout_secs: int | None = None
-        try:
-            _wf_timeout_secs = int(KiroCrewConfig.load().agent.workflow_run_timeout_secs)
-        except Exception:
-            logger.debug("workflow run-ceiling config unavailable; using default", exc_info=True)
-
-        async def _wf_nudge_authorizer(
-            *, slot_key: str, message: str, idle_secs: int, max_cycles: int
-        ) -> str | None:
-            """Route a workflow ``ctx.nudge`` through the SHARED authorize/audit
-            chokepoint before arming an AutoNudge loop — same ownership/allowlist
-            checks, message limit, and SEL audit as ``POST /api/autonudge`` (so a
-            caller-influenced session key can't spoof another session's loop).
-            Returns the rejection reason (or None on success) so the workflow
-            port can surface the outcome in the run's event stream."""
-            _loop, error, _status = await authorize_and_add_nudge(
-                svc=_autonudge_get(),
-                state=state,
-                slot_key=slot_key,
-                message=message,
-                idle_secs=idle_secs,
-                max_cycles=max_cycles,
-                source="workflow",
-            )
-            if error is not None:
-                logger.info("workflow ctx.nudge not armed for %s: %s", slot_key, error)
-            return error
-
-        async def _initialize_workflows() -> None:
-            try:
-                service = await WorkflowService.create(
-                    sessions=sessions,
-                    on_done=_wf_on_done,
-                    on_event=_wf_on_event,
-                    now_fn=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    concurrency=_wf_concurrency,
-                    nudge_authorizer=_wf_nudge_authorizer,
-                    timeout_secs=_wf_timeout_secs,
-                )
-                if _workflow_stopping:
-                    return
-                # No await across attachment/publication: requests cannot start a
-                # TaskRunner run without the restored registry or see half a service.
-                if task_runner is not None:
-                    service.attach_task_runner(task_runner)
-                    task_runner.attach_workflow_service(service)
-                state.workflow_service = service
-                logger.info(
-                    "WorkflowService ready (dynamic workflows, max parallel agents=%s, run ceiling=%ss)",
-                    _wf_concurrency,
-                    service.timeout_secs,
-                )
-            except Exception:
-                # Preserve the existing degraded TaskRunner mode on init failure,
-                # but never reopen admission after shutdown has started.
-                if not _workflow_stopping and task_runner is not None:
-                    task_runner.attach_workflow_service(None)
-                logger.warning("WorkflowService unavailable", exc_info=True)
-
-        _workflow_start = _initialize_workflows
-    except Exception:
-        if task_runner is not None:
-            task_runner.attach_workflow_service(None)
-        logger.warning("WorkflowService unavailable", exc_info=True)
-
     # Initialize script hook store
     state._hook_store = ScriptHookStore()
     set_global_hook_store(state._hook_store)
@@ -3790,6 +4152,9 @@ async def start_dashboard(
     wire_session_subagent_probe(state)
     # Visible notice in a channel that just lost its session-resume binding
     state.wire_session_unbind_listener()
+    # Crew-log class record for a binding that just COMMITTED, taken before anything
+    # can be routed through it
+    state.wire_session_bind_listener()
 
     app = web.Application(
         client_max_size=60 * 1024 * 1024
@@ -3801,26 +4166,6 @@ async def start_dashboard(
     # number as a global request cap is the false invariant to avoid.
     app["state"] = state
 
-    async def _workflow_stop_publication(_app: web.Application) -> None:
-        nonlocal _workflow_stopping
-        _workflow_stopping = True
-
-    async def _workflow_shutdown(_app: web.Application) -> None:
-        if _workflow_task is None:
-            return
-        if not _workflow_task.done():
-            _workflow_task.cancel()
-        drain = asyncio.gather(_workflow_task, return_exceptions=True)
-        while not drain.done():
-            try:
-                await asyncio.shield(drain)
-            except asyncio.CancelledError:
-                # Finish owned I/O even on repeated stop requests, then let the
-                # remaining aiohttp cleanup hooks run rather than abandoning them.
-                pass
-
-    # Fence before cleanup can yield in tunnel teardown; do not drain here.
-    app.on_shutdown.append(_workflow_stop_publication)
     # Bind the serving loop once, here: this runs ON that loop, so every
     # surface that later hands work in from a foreign thread -- slots
     # coalescing, an off-loop websocket send, the log handler's fan-out --
@@ -3844,7 +4189,6 @@ async def start_dashboard(
     # ``setup_tunnel`` assigns it further below, and this is still well before
     # ``runner.setup()`` freezes the signal lists. See ``_wire_tunnel_shutdown``.
     _wire_tunnel_shutdown(app, state)
-    app.on_cleanup.append(_workflow_shutdown)
     from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
 
     app["kiro_prerequisite_service"] = await asyncio.to_thread(
@@ -4012,6 +4356,10 @@ async def start_dashboard(
     # wedge-prone blocking work that would freeze this event loop if run inline.
     # subprocess_executor (not the default to_thread pool) isolates it so a hung
     # `ps` cannot starve asyncio's default executor (the RFC's bulkhead intent).
+    # This wave runs BEFORE ``runner.setup()`` so an app's startup hooks find its
+    # backend running. The one exception is deferred: a backend that is handed the
+    # gateway's actually-bound port at spawn (``KIROCREW_BOUND_PORT``) is started
+    # after ``_export_bound_port`` below, because that value does not exist yet.
     await cautious_boot.pause_before("app backends")
     started_apps = await asyncio.get_running_loop().run_in_executor(
         subprocess_executor(), start_enabled_app_backends
@@ -4310,6 +4658,12 @@ async def start_dashboard(
     # failed warm never blocks readiness.
     await warm_sel_singleton()
 
+    # Bind the crew-log push to this loop and register it with the session
+    # emitter. Installed here rather than lazily on a first request: the frame
+    # exists so a watching client learns of a growth it did not ask for, and a
+    # publisher armed by the first read would miss every growth before it.
+    handlers.install_crew_log_publisher(state)
+
     # Explicit middleware ordering — self-documenting and immune to future insertions
     app.middlewares[:] = [
         # Outermost: privacy-safe per-route latency. Times the FULL
@@ -4328,7 +4682,7 @@ async def start_dashboard(
         csrf_middleware,
         token_auth_middleware(
             internal_paths=_STRICT_INTERNAL_API_PATHS,
-            mixed_internal_paths=_MIXED_INTERNAL_API_PATHS,
+            mixed_internal_paths=_mixed_internal_api_paths(),
             internal_secret=_internal_secret,
             port=port,
             local_only=local_only,
@@ -4388,6 +4742,9 @@ async def start_dashboard(
     # same reason as the watchdog hook above. The inhibitor + poll task are
     # created after runner.setup by _arm_prevent_sleep_poll and released here.
     _register_prevent_sleep_shutdown(app, state)
+    # Listener guard detach hook -- same ordering constraint; the guard itself
+    # is armed after the TCP site binds (below).
+    _register_listener_guard_shutdown(app, state)
 
     async def _kiro_prerequisite_shutdown(app_: web.Application) -> None:
         await app_["kiro_prerequisite_service"].close()
@@ -4418,6 +4775,7 @@ async def start_dashboard(
     _register_instances_hooks(app, state, port)
     _register_browser_view_cleanup(app, state)
     _register_connections_warm_lifecycle(app, state)
+    _register_workflow_lifecycle(app, state)
 
     # Unix-socket cleanup hook — registered before runner.setup freezes the
     # signal lists; the path itself only becomes known after the site starts
@@ -4434,9 +4792,25 @@ async def start_dashboard(
     await runner.setup()
     site = web.TCPSite(runner, bind_address_for(local_only), port)
     await _start_site(site, port)
+    # The listener is up -- keep it up. One failed accept() on Windows would
+    # otherwise close it for the life of the process (see listener_guard).
+    _arm_listener_guard(state, runner, site)
     # Export the port this gateway ACTUALLY bound so child processes resolve
     # loopback callbacks against the truth, not a re-derived config guess.
     _export_bound_port(runner, port)
+
+    # The backend the main wave deferred (``apps.backend.DEV_FLEET_APP_NAME``):
+    # ``apps/backend.py`` hands the Dev Fleet backend ``KIROCREW_BOUND_PORT`` at
+    # spawn, and that value exists only once the site is bound — a backend spawned
+    # before the export reads pointer state through no port at all until something
+    # restarts it. Same bulkhead as the main wave; admission already ran there.
+    deferred_apps = await asyncio.get_running_loop().run_in_executor(
+        subprocess_executor(), start_deferred_app_backends
+    )
+    if deferred_apps:
+        logger.info(
+            "Started %d bound-port app backend(s): %s", len(deferred_apps), ", ".join(deferred_apps)
+        )
     # Additional kernel-verifiable transport for the internal API (POSIX only;
     # degrades to TCP-only on any failure — see _start_unix_site).
     _unix_socket_holder["path"] = await _start_unix_site(runner, port)
@@ -4464,6 +4838,7 @@ async def start_dashboard(
     # inside runner.setup(), before the bind, and the scavenge's deferred
     # import must never sit in front of the listener
     # (no-new-work-on-gateway-boot-path).
+    _kick_workflow_initialization(state)
     _kick_connections_warm_scavenge(state)
     _kick_session_search_index(state)
     _kick_config_watch(app, state)
@@ -4582,7 +4957,16 @@ async def start_dashboard(
     _prior_dump = await asyncio.to_thread(newest_dump_with_stacks)
     if _prior_dump is not None:
         _age_h = await asyncio.to_thread(dump_age_seconds, _prior_dump) / 3600
-        if _age_h < 168:  # Only surface dumps less than 7 days old
+        # One stall is reported once, on the first start after it, across every
+        # surface below. A dump stays on disk for a week and is re-detected on
+        # every start, so an unclaimed warning-and-replay prints the same thread
+        # stacks at every boot for that week — and a reader cannot tell that log
+        # from a gateway wedging right now, which is the only reason to print it
+        # at all. The claim is the same idempotency key the notification uses, so
+        # the log line, the replay and the notification agree on what has already
+        # been reported; the dump stays on disk for `kirocrew doctor` to show on
+        # demand.
+        if _age_h < 168 and await asyncio.to_thread(claim_dump_notification, _prior_dump):
             logger.warning(
                 "⚠️  Prior loop-stall crash dump found: %s (%.1f hours ago). "
                 "Run `kirocrew doctor` for details.",
@@ -4601,35 +4985,32 @@ async def start_dashboard(
             # exited by hard-exit: no `finally` ran, nothing was flushed, and any
             # turn in flight lost work that was written but not yet committed.
             # The user needs to know that happened rather than discovering a
-            # monitoring loop had silently stopped hours earlier. Claimed once
-            # per dump — the dump is re-detected for up to 7 days on every
-            # start, so notifying unconditionally would alert every restart.
-            if await asyncio.to_thread(claim_dump_notification, _prior_dump):
-                # Say who the loop was working for, from the same evidence the
-                # doctor reads, so the person restarting knows which job to look
-                # at without opening the dump.
-                try:
-                    _attr_lines = describe(
-                        await asyncio.to_thread(attribute_dump, _prior_dump, data_home())
-                    )
-                except Exception:
-                    logger.debug("stall attribution for notification failed", exc_info=True)
-                    _attr_lines = []
-                try:
-                    state.notify(
-                        "heartbeat",
-                        "⚠️ Gateway restarted after an event-loop stall",
-                        (
-                            f"The previous gateway stopped responding and exited "
-                            f"{_age_h:.1f}h ago, then restarted. Work in flight at "
-                            f"that moment was interrupted and not saved. "
-                            + ("".join(f"{ln}. " for ln in _attr_lines))
-                            + f"Thread stacks: {_prior_dump}"
-                        ),
-                        meta={"url": "/settings", "dump": str(_prior_dump)},
-                    )
-                except Exception:
-                    logger.debug("stall-exit notification failed", exc_info=True)
+            # monitoring loop had silently stopped hours earlier.
+            # Say who the loop was working for, from the same evidence the
+            # doctor reads, so the person restarting knows which job to look
+            # at without opening the dump.
+            try:
+                _attr_lines = describe(
+                    await asyncio.to_thread(attribute_dump, _prior_dump, data_home())
+                )
+            except Exception:
+                logger.debug("stall attribution for notification failed", exc_info=True)
+                _attr_lines = []
+            try:
+                state.notify(
+                    "heartbeat",
+                    "⚠️ Gateway restarted after an event-loop stall",
+                    (
+                        f"The previous gateway stopped responding and exited "
+                        f"{_age_h:.1f}h ago, then restarted. Work in flight at "
+                        f"that moment was interrupted and not saved. "
+                        + ("".join(f"{ln}. " for ln in _attr_lines))
+                        + f"Thread stacks: {_prior_dump}"
+                    ),
+                    meta={"url": "/settings", "dump": str(_prior_dump)},
+                )
+            except Exception:
+                logger.debug("stall-exit notification failed", exc_info=True)
 
     # Fire background MCP probe at startup (non-blocking). The probe spawns a
     # handshake subprocess per configured MCP server, so under cautious boot it
@@ -4916,13 +5297,6 @@ async def start_dashboard(
     state.ready = True
     record_boot_to_ready((time.time() - state.start_time) * 1000.0, server="dashboard")
 
-    # Post-readiness only: rehydration scales with user data and must not delay
-    # either socket bind or boot-to-ready. Cleanup owns cancellation and draining.
-    if _workflow_start is not None and not _workflow_stopping:
-        _workflow_task = asyncio.create_task(_workflow_start(), name="workflow-initialization")
-        state._background_tasks.add(_workflow_task)
-        _workflow_task.add_done_callback(state._background_tasks.discard)
-
     return runner, state
 
 
@@ -4940,6 +5314,7 @@ async def start_api_server(
     assume_kiro_ready: bool = False,
     conversation_log: Any = None,
     schedule_memory_preparation: "Callable[[], asyncio.Task[None] | None] | None" = None,
+    context_builder: ContextBuilder | None = None,
 ) -> tuple[web.AppRunner, DashboardState]:
     """Start a minimal API-only server for MCP tool transport (no UI).
 
@@ -4952,6 +5327,8 @@ async def start_api_server(
     requests are guarded against DNS-rebinding (Host) and cross-site browsers
     (Origin). Every in-repo caller (mcp-core, cron) already sends the secret.
     """
+    if task_runner is not None:
+        task_runner.defer_workflow_attachment()
     state = DashboardState(
         sessions=sessions,
         crons=crons,
@@ -4967,14 +5344,13 @@ async def start_api_server(
         # can't-tell branch: an OPTIONS control posted in this mode carried no
         # position and every click on it was honoured, however stale.
         conversation_log=conversation_log,
+        context_builder=context_builder,
     )
     state._hook_store = ScriptHookStore()
     set_global_hook_store(state._hook_store)
 
-    # This path builds its state without a context_builder, so the loader is
-    # reached through the task runner. Logged on a miss rather than silently
-    # recording nothing, since a route that credits no reads is the bias this
-    # observer exists to remove.
+    # API-only gateways share the orchestrator's context builder. Standalone
+    # callers may omit it; try the task runner's loader before reporting a miss.
     if not register_skill_read_observer(state.context_builder, getattr(task_runner, "_ctx", None)):
         logger.info("skill-read observer not registered: no skills loader reachable")
 
@@ -4991,6 +5367,9 @@ async def start_api_server(
     wire_session_subagent_probe(state)
     # Visible notice in a channel that just lost its session-resume binding
     state.wire_session_unbind_listener()
+    # Crew-log class record for a binding that just COMMITTED, taken before anything
+    # can be routed through it
+    state.wire_session_bind_listener()
 
     app = web.Application(
         client_max_size=60 * 1024 * 1024
@@ -5169,7 +5548,7 @@ async def start_api_server(
         csrf_middleware,
         token_auth_middleware(
             internal_paths=_STRICT_INTERNAL_API_PATHS,
-            mixed_internal_paths=_MIXED_INTERNAL_API_PATHS,
+            mixed_internal_paths=_mixed_internal_api_paths(),
             internal_secret=_internal_secret,
             port=port,
             local_only=local_only,
@@ -5221,7 +5600,9 @@ async def start_api_server(
     # is what makes headless --slack-only keep the host awake during a long
     # Slack task, identically to the full dashboard.
     _register_prevent_sleep_shutdown(app, state)
+    _register_listener_guard_shutdown(app, state)
     _register_connections_warm_lifecycle(app, state)
+    _register_workflow_lifecycle(app, state)
 
     # Unix-socket cleanup hook — same holder pattern as start_dashboard,
     # registered before runner.setup freezes the signal lists.
@@ -5241,6 +5622,9 @@ async def start_api_server(
     bind_addr = bind_address_for(local_only)
     site = web.TCPSite(runner, bind_addr, port)
     await _start_site(site, port)
+    # Same listener guard as start_dashboard: a headless gateway loses its
+    # listener to a failed accept() exactly the same way.
+    _arm_listener_guard(state, runner, site)
     # Export the actually-bound port for child processes (parity with
     # start_dashboard — headless gateways spawn the same MCP stdio children).
     _export_bound_port(runner, port)
@@ -5270,6 +5654,7 @@ async def start_api_server(
     # Listener is bound — kick the warm crash-residue scavenge (parity with
     # start_dashboard: never an on_startup hook, which would run the deferred
     # import before the bind).
+    _kick_workflow_initialization(state)
     _kick_connections_warm_scavenge(state)
     _kick_session_search_index(state)
     _kick_config_watch(app, state)

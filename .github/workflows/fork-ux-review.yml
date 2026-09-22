@@ -77,8 +77,15 @@ jobs:
       # runs on Bedrock in us-west-2 (see the AWS_BEDROCK_ROLE_ARN region below).
       # VERIFY before merge that this SHA resolves to the intended harden-runner
       # release (authoring host had no network to confirm it).
+      #
+      # The three ubuntu archive hosts carry claude-code-action's bubblewrap
+      # bootstrap (`apt-get install bubblewrap socat`), which this lane needs
+      # because it sets `allowed_non_write_users`. This lane hid the breakage
+      # rather than escaping it: its early exit on a diff with no UI surface
+      # returns success WITHOUT reaching the model, so the failure only appears
+      # once a fork PR does touch UI. Rationale: fork-opus-review.yml.
       - name: Harden runner (egress allowlist)
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: block
           disable-telemetry: true
@@ -96,9 +103,13 @@ jobs:
             github.com:443
             api.github.com:443
             objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
             github-production-user-asset-6210df.s3.amazonaws.com:443
             codeload.github.com:443
             registry.npmjs.org:443
+            azure.archive.ubuntu.com:80
+            archive.ubuntu.com:443
+            security.ubuntu.com:443
 
       - name: Resolve and validate PR (authoritative from GitHub)
         id: pr
@@ -399,7 +410,7 @@ jobs:
       # Mint short-lived, Bedrock-only creds immediately before the model call,
       # via the SAME dedicated least-privilege role the same-repo UX reviewer
       # uses (us-west-2). Only when the UI-scope gate passed.
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         if: steps.scope.outputs.ui == 'true'
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
@@ -412,7 +423,7 @@ jobs:
         # errored advisory review must never fail the gate; only a real BLOCK
         # does). Gated on the UI-scope pass.
         if: steps.scope.outputs.ui == 'true'
-        uses: anthropics/claude-code-action@1f291e1cfe0f5fc21db2aef19af844591600ade7 # v1
+        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
         with:
           # Inference via Amazon Bedrock. Model id form (bare, regional `us.`
           # inference profile, no `[1m]` tag) is load-bearing — see the
@@ -956,9 +967,13 @@ jobs:
             The FIRST line is machine-parsed — emit it verbatim, value only:
             UX-Verdict: <PASS | CONCERNS | BLOCK>
 
-            Then a blank line and ONE bold punchline (≤25 words): the single
-            most important takeaway — for PASS, why the experience holds; for
-            CONCERNS/BLOCK, the core UX problem in one breath.
+            Then a blank line and ONE bold punchline (≤25 words). It OPENS with
+            the problem: for CONCERNS/BLOCK, the core UX problem in one breath,
+            problem first — never `<what works>, but <problem>`, because the
+            reader stops at the comma and the finding is what came after it.
+            For PASS, the ONE thing a human should still verify before merge,
+            or exactly `Nothing to check.` — never why the experience holds; a
+            reviewer that argues the author's case is not reviewing.
 
             Then include a section ONLY if it has real content (omit the
             heading entirely when empty — never write "None" sections):
@@ -1057,6 +1072,16 @@ jobs:
               summary="$(jq -rs '[ .[] | (if type=="array" then .[] else . end) | select(.result != null) ] | (last.result // "")' "$EXEC_FILE" 2>/dev/null || true)"
             fi
           fi
+          # Publish only the review. The contract makes the verdict header the
+          # FIRST line, but a model that narrates before it ("All facts verified.
+          # Composing the final review.") ships that narration into a public
+          # comment above the punchline. Trim to the header when one is present;
+          # without one the text is left whole so the no-verdict path below still
+          # sees what the model wrote. Here-strings, not pipes: a long summary
+          # cannot manufacture a SIGPIPE status under `pipefail`.
+          if grep -qiE '^UX-Verdict:' <<< "$summary"; then
+            summary="$(awk 'f || tolower($0) ~ /^ux-verdict:/ { f = 1; print }' <<< "$summary")"
+          fi
           # An evidence step that failed because an attachment download
           # failed leaves no transcript either (the model never ran), but that
           # outcome IS this run's result for the head and has a remedy, so it
@@ -1091,6 +1116,16 @@ jobs:
           if [ -n "$summary" ] && ! grep -qF "[UX-REVIEWED] $HEAD" <<< "$summary"; then
             echo "verdict header present but no [UX-REVIEWED] $HEAD marker; treating as UNKNOWN"
             verdict="UNKNOWN"
+          fi
+          # The contract caps the prose at ~150 words outside the collapsed
+          # inventory: a review twice that long is one whose findings sit under
+          # text nobody reads. Count it and say so in the job log and annotations;
+          # the verdict and the comment are unaffected.
+          if [ "$verdict" != "UNKNOWN" ]; then
+            words="$(awk '/<details>/ { skip = 1 } !skip { print } /<\/details>/ { skip = 0 }' <<< "$summary" | wc -w | tr -d ' ')"
+            if [ "${words:-0}" -gt 300 ]; then
+              echo "::warning title=UX Review over length::$words words outside the inventory; the contract caps the review at ~150. Findings past the cap are the ones nobody reads."
+            fi
           fi
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           case "$verdict" in
@@ -1333,7 +1368,7 @@ jobs:
               !seen && $0 ~ header { seen = 1; next }
               !seen { next }
               seen == 1 && NF { print; seen = 2; next }
-              /^### / { watch = ($0 ~ /^### Watch[[:space:]]*$/) }
+              /^### / { watch = ($0 ~ /^### (Watch|Not justified as shipped)[[:space:]]*$/) }
               watch { print }
             ' "$file")"
             printf '%s' "${digest:0:2000}"
@@ -1358,7 +1393,7 @@ jobs:
               if gh api --method PATCH "repos/$REPO/check-runs/$1" \
                 -f status="completed" -f conclusion="$2" \
                 -f "output[title]=UX Review — $3" \
-                -f "output[summary]=$summary" >/dev/null 2>&1; then
+                -f "output[summary]=$summary" >/dev/null; then
                 return 0
               fi
               sleep 5

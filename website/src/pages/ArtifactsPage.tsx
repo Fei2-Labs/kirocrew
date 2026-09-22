@@ -619,6 +619,7 @@ function LibraryMasonry({
   cols,
   widthRef,
   scrollerRef,
+  fillPage,
   onOpen,
   onDelete,
   deletingSlug,
@@ -638,6 +639,8 @@ function LibraryMasonry({
    *  virtualizer takes `externalScrollerRef` and reads it when it needs it, so
    *  nothing has to re-render just because the element appeared. */
   scrollerRef: React.RefObject<HTMLDivElement | null>
+  /** Fill the remaining page height only when no remote sections need the page axis. */
+  fillPage: boolean
   onOpen: (slug: string) => void
   onDelete: (a: Artifact) => void
   deletingSlug: string | null
@@ -661,17 +664,16 @@ function LibraryMasonry({
   // and below the gallery reachable by scrolling, and it is free here because at
   // one column the two layouts render the same thing.
   const asList = virtualized && cols === 1
-  // The masonry owns the axis only when it is actually a masonry. This must stay
-  // in lockstep with the page's own `galleryOwnsScroll`.
+  // Multi-column masonry always needs its own viewport. It fills the page only
+  // when there are no remote sections; otherwise it is a bounded section inside
+  // the scrolling page. A one-column list uses the page's external scroller.
   const masonryOwnsScroll = virtualized && cols > 1
   return (
     // -mr-3 offsets each card's own mr-3 so the trailing column's gutter
     // doesn't add page width; cards carry mr-3 (gutter) + mb-3 (row gap).
-    //
-    // Only the masonry needs to fill the page's content column (`flex-1
-    // min-h-0`, which is what lets a flex child shrink to its parent instead of
-    // its content). A list scrolling inside the page column is content-sized.
-    <div ref={widthRef} className={masonryOwnsScroll ? '-mr-3 flex-1 min-h-0' : '-mr-3'}>
+    <div ref={widthRef} data-testid="artifacts-gallery" className={masonryOwnsScroll
+      ? (fillPage ? '-mr-3 flex-1 min-h-0' : '-mr-3 h-[60vh]')
+      : '-mr-3'}>
       {asList ? (
         <LibraryList entries={entries} context={context} scrollerRef={scrollerRef} />
       ) : masonryOwnsScroll ? (
@@ -681,10 +683,8 @@ function LibraryMasonry({
           data={entries}
           context={context}
           ItemContent={GridCard}
-          // 100% of the flex-sized parent, NOT a viewport fraction: a `72vh`
-          // box does not know how much room the toolbar and folder rows above
-          // it already took, so it overflowed the page column and forced a
-          // second scroller into existence.
+          // The parent supplies either the remaining page height or a bounded
+          // section height when remote lists need to scroll past the gallery.
           style={{ height: '100%' }}
         />
       ) : (
@@ -790,7 +790,7 @@ function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }:
       <div
         ref={listRef}
         tabIndex={-1}
-        className={`flex flex-col gap-0.5 outline-none ${expanded ? 'max-h-[40vh] overflow-y-auto' : ''}`}
+        className={`flex flex-col gap-0.5 outline-hidden ${expanded ? 'max-h-[40vh] overflow-y-auto' : ''}`}
       >
         {visible.map((d) => (
           <div key={d.path} className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg">
@@ -1158,7 +1158,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     }
   }, [deletingFolder, folders, scopeFolderId, openFolder, invalidateFolders])
 
-  const { data, isLoading, error } = useQuery<{ artifacts: Artifact[] }>({
+  const { data, isLoading, error, refetch } = useQuery<{ artifacts: Artifact[] }>({
     queryKey: ['artifacts', { tag: tagFilter, kind: kindFilter }],
     queryFn: () =>
       api.artifacts({
@@ -1521,35 +1521,18 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   // Hooks must run before the `isLoading` early return below, so the scroll
   // wiring lives here rather than beside the JSX it feeds.
   //
-  // The virtualized gallery brings its OWN vertical scroller. Two same-axis
-  // scrollers on one page is a defect: whichever one the finger lands in decides
-  // whether anything moves, and the page-level one has only ~113px of travel
-  // once the gallery is on screen, so a swipe that lands there stops dead after
-  // a few pixels and reads as "this card does not scroll". Measured at 390px with
-  // 42 artifacts: page column 706px tall over 819px of content, gallery scroller
-  // 608px tall over 12485px. So exactly one element owns the axis; below the
-  // threshold the gallery is content-sized and the page column scrolls, as before.
-  // Measured here, not inside the gallery, because two independent measurements
-  // of the same width could disagree at a boundary and leave the page holding an
-  // axis the gallery also thinks it owns. `galleryWidthRef` is attached to the
-  // gallery's own column-defining wrapper so the number still describes the
-  // element that lays the columns out.
+  // Measure once so the gallery and page use the same column count. Small
+  // galleries are content-sized; one-column LibraryList uses the page scroller.
   const [galleryWidthRef, cols] = useColumnCount(300)
-  // Scroll ownership. A virtualized MASONRY can only own a scroller of its own,
-  // so the page column has to stop scrolling and hand the axis over — otherwise
-  // both scroll on the same axis and the page column has only ~113px of travel
-  // once the gallery is on screen, so a swipe that lands there stops dead after
-  // a few pixels and reads as "this card does not scroll". Measured at 390px with
-  // 42 artifacts: page column 706px tall over 819px of content, gallery scroller
-  // 608px tall over 12485px.
-  //
-  // At ONE column there is no masonry to preserve, so the gallery renders as a
-  // list windowed against this column (`LibraryList`) and the page column KEEPS
-  // the axis. That is the narrow case, and it is the one where handing the axis over
-  // hurt: it is what forced the pre-gallery region to be capped into a scroller
-  // of its own and the chrome to hide on scroll, and it is what left sections
-  // rendered after the gallery unreachable.
+  // Without remote sections, multi-column masonry fills the remaining page
+  // height and owns the axis. That mode must not add a nearly travel-free outer
+  // scroller where a swipe would stop after a few pixels.
+  // Remote lists are independent content below the saved gallery. Keep them
+  // in normal page flow rather than shrinking them into a height-locked column.
+  // Use provider capability, not asynchronously loaded rows, so pending, empty,
+  // filtered, and failed remote reads all keep the same scroll ownership.
   const galleryOwnsScroll = view === 'grid' && gridEntries.length >= VIRTUALIZE_AT && cols > 1
+    && discoveryProviders.length === 0
   // Hide-on-scroll for the page's own chrome. At 390x844 the title, subtitle,
   // heading row and filter rows pin 317px — 38% of the viewport — above a 527px
   // gallery. This is only reachable when the masonry owns the axis (so, several
@@ -1961,7 +1944,25 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             )}
             </div>
 
-            {gridEntries.length === 0 && (view === 'grid' || filtersActive) ? (
+            {errMessage && artifacts.length === 0 ? (
+              /* The list query FAILED with nothing cached — the library's
+                 contents are unknown, not absent. Rendered in EVERY view mode
+                 (grid, table, filtered or not): the persisted-Table lane must
+                 not show an empty tree over intact artifacts, which is the
+                 exact misread #10867 describes. The error itself (message +
+                 agent hand-off) is already on screen in the page-level
+                 <ErrorNotice> banner above (errors-use-error-notice); this
+                 placeholder exists so the gallery does not claim "No
+                 artifacts yet" about a library it never read. Retry heals
+                 every read that fails under the same trigger: the list, the
+                 tag options, and the folder list. */
+              <EmptyState
+                testId="artifacts-error-state"
+                icon={<AlertTriangle className="lucide-inline" />}
+                title={i18nT('pages.artifactsPage.couldn_t_load_your_artifacts')}
+                action={<Btn onClick={() => { void refetch(); void allTagsQ.refetch(); void qc.invalidateQueries({ queryKey: ['artifact-folders'] }) }}>{i18nT('pages.artifactsPage.retry')}</Btn>}
+              />
+            ) : gridEntries.length === 0 && (view === 'grid' || filtersActive) ? (
               (artifacts.length === 0 && folders.length === 0) ? (
                 <EmptyState
                   icon={<Bookmark className="lucide-inline" />}
@@ -1985,6 +1986,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 cols={cols}
                 widthRef={galleryWidthRef}
                 scrollerRef={chromeHostRef}
+                fillPage={galleryOwnsScroll}
                 onOpen={handleOpen}
                 onDelete={handleDelete}
                 deletingSlug={deleteMut.isPending ? (deleteMut.variables as string) : null}

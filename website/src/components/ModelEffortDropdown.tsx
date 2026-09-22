@@ -1,5 +1,5 @@
 import { Trans } from 'react-i18next'
-import { Settings2, Pin, Check, Ban, ChevronRight } from 'lucide-react'
+import { Settings2, Pin, Check, Ban, ChevronRight, LoaderCircle } from 'lucide-react'
 import { Btn, Input } from './ui'
 import ErrorNotice from './ErrorNotice'
 import ModelDropdownList, { type ModelItem } from './ModelDropdownList'
@@ -15,6 +15,21 @@ interface Props {
   models: ModelItem[]
   activeModel: string
   onSelectModel: (name: string) => void
+  /** True while the model list's source is still being fetched (a remote-bound
+   *  session's peer capability read in flight or re-polling). Forwarded to the
+   *  list so an empty picker shows a loading row rather than "No matches". */
+  modelsLoading?: boolean
+  /** True when the model list's source READ failed outright (the peer
+   *  capability request errored, not a per-field miss inside a good reply).
+   *  Renders an `ErrorNotice` row: without it the failure would wear the
+   *  empty list's "No matches" clothes and read as "this crew has no models". */
+  modelsFailed?: boolean
+  /** In-place retry for that failure; omit to hide the button. */
+  onRetryModels?: () => void
+  /** True while that retry is in flight. The failed state persists until the
+   *  refetch settles, so the Retry button disables and spins instead of
+   *  sitting apparently dead under the unchanged error row. */
+  retryingModels?: boolean
   filter: string
   setFilter: (v: string) => void
   onClose: () => void
@@ -68,7 +83,8 @@ export default function ModelEffortDropdown({
   filter, setFilter, onClose, hasEffort, slot, currentEffort, onListKeyDown, onSetDefault, onManageModels,
   modelVisibilityError = false, onRetryModelVisibility,
   defaultEffort = '', effortLevelsOverride, onPinToAgent, agentName = '', pinModelName = '',
-  pinModelUnavailable = false, pinnedToAgent = false,
+  pinModelUnavailable = false, pinnedToAgent = false, modelsLoading = false,
+  modelsFailed = false, onRetryModels, retryingModels = false,
 }: Props) {
   const ime = useImeGuard()
   // Right-align the dropdown to the button's right edge (clamped to viewport).
@@ -181,8 +197,25 @@ export default function ModelEffortDropdown({
                 )}
               </div>
             )}
+            {modelsFailed && (
+              <div className="flex shrink-0 items-center gap-2 px-1.5 py-1">
+                {/* No hand-off: the chat composer may contain an unsent draft.
+                    Retrying in place preserves it. */}
+                <ErrorNotice
+                  className="min-w-0 flex-1"
+                  variant="inline"
+                  message={i18nT('components.modelEffortDropdown.models_failed')}
+                />
+                {onRetryModels && (
+                  <Btn type="button" className="shrink-0" onClick={onRetryModels} disabled={retryingModels}>
+                    {retryingModels && <LoaderCircle className="lucide-inline animate-spin" aria-hidden />}
+                    {i18nT('pages.settings.chatPanel.retry')}
+                  </Btn>
+                )}
+              </div>
+            )}
             <div role="listbox" aria-label={i18nT('components.modelEffortDropdown.model_list')} className="min-h-0 flex-1 max-h-[240px] overflow-y-auto">
-              <ModelDropdownList models={models} activeModel={activeModel} onSelect={onSelectModel} />
+              <ModelDropdownList models={models} activeModel={activeModel} onSelect={onSelectModel} loading={modelsLoading} failed={modelsFailed} />
             </div>
             {onManageModels && <ManageModelsFooter onManage={onManageModels} />}
             {hasEffort && slot && (

@@ -78,7 +78,7 @@ export function FolderColorSwatches({ value, onPick, size = 16 }: { value?: stri
           title={label()}
           onClick={(e) => { e.stopPropagation(); onPick(c) }}
           onPointerDown={(e) => e.stopPropagation()}
-          className={`rounded-full border cursor-pointer transition-transform hover:scale-110 ${
+          className={`rounded-full border cursor-pointer hover:brightness-125 swatch-cue ${
             value === c ? 'ring-2 ring-accent ring-offset-1 ring-offset-bg border-transparent' : 'border-border'
           }`}
           style={{ width: size, height: size, background: c }}
@@ -92,8 +92,8 @@ export function FolderColorSwatches({ value, onPick, size = 16 }: { value?: stri
         title={i18nT('pages.artifactsPage.no_color')}
         onClick={(e) => { e.stopPropagation(); onPick('') }}
         onPointerDown={(e) => e.stopPropagation()}
-        className={`rounded-full border cursor-pointer transition-transform hover:scale-110 flex items-center justify-center text-muted bg-transparent ${
-          !value ? 'ring-2 ring-accent ring-offset-1 ring-offset-bg border-transparent' : 'border-border'
+        className={`rounded-full border cursor-pointer hover:brightness-125 swatch-cue flex items-center justify-center text-muted bg-transparent ${
+          !value ? 'ring-2 ring-accent ring-offset-1 ring-offset-bg border-transparent' : 'border-border hover:border-border-strong'
         }`}
         style={{ width: size, height: size }}
       >
@@ -148,7 +148,7 @@ export function FolderNameInput({ initial = '', placeholder = 'Folder name', onC
       onClick={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
-      className="w-full bg-transparent border border-accent rounded px-1.5 py-0.5 text-text-strong outline-none text-sm select-text focus-ring"
+      className="w-full bg-transparent border border-accent rounded px-1.5 py-0.5 text-text-strong outline-hidden text-sm select-text focus-ring"
       {...ime.bindEnter<HTMLInputElement>({
         onFocus: (e) => (e.target as HTMLInputElement).select(),
         onEnter: () => { (document.activeElement as HTMLInputElement)?.blur() },

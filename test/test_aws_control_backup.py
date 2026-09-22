@@ -62,7 +62,13 @@ class TestAuthorizeUpload:
             return_value=json.dumps({"Account": "999988887777"}),
         ):
             with pytest.raises(RuntimeError, match="no longer points at"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
     def test_unparseable_sts_output_reads_as_no_account_and_refuses(self):
         # A garbled STS response must not be trusted as a match: it decodes to
@@ -70,7 +76,13 @@ class TestAuthorizeUpload:
         # upload is refused rather than proceeding on unknown identity.
         with mock.patch("kiro_crew.deploy.engine._checked", return_value="not json"):
             with pytest.raises(RuntimeError, match="no longer points at"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
     def test_upload_refused_when_app_disabled_during_build(self):
         # STS agrees, but the app was disabled while the archive built: the
@@ -83,7 +95,13 @@ class TestAuthorizeUpload:
             mock.patch("kiro_crew.apps.manager.is_app_enabled", return_value=False),
         ):
             with pytest.raises(RuntimeError, match="was disabled"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
     def test_upload_refused_when_s3_consent_no_longer_holds(self):
         # STS agrees and the app is on, but S3 consent was withdrawn: the
@@ -97,7 +115,13 @@ class TestAuthorizeUpload:
             mock.patch("kiro_crew.aws_consent.is_granted", return_value=(False, "expired")),
         ):
             with pytest.raises(RuntimeError, match="consent no longer holds.*expired"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +133,12 @@ class TestRunSnapshotBackup:
     @pytest.fixture(autouse=True)
     def _isolated_state(self, tmp_path, monkeypatch):
         monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+        # A successful push ends with the retention sweep, which LISTS the drive.
+        # Stubbed here rather than per test: the sweep swallows its own failures by
+        # design, so an unstubbed test would attempt a real CLI call and still
+        # pass. Retention's own behaviour is covered in
+        # test_aws_control_backup_retention.py.
+        monkeypatch.setattr(backup.storage, "list_object_versions", lambda *a, **k: [])
         yield
 
     def test_failed_snapshot_build_raises_before_any_upload(self):
@@ -153,19 +183,46 @@ class TestRunSnapshotBackup:
         with (
             mock.patch.object(backup, "snapshot_main", side_effect=fake_snapshot),
             mock.patch.object(backup, "_authorize_upload") as authz,
-            mock.patch.object(backup.storage, "put_file") as put_file,
+            mock.patch.object(backup.storage, "put_file", return_value="v-test") as put_file,
         ):
             record = backup.run_snapshot_backup(
                 ACCOUNT, "p", "us-west-2", "bkt", caller=backup.CALLER_OWNER
             )
 
-        # ONE authorization per S3 write, and that is the contract: the archive
-        # PUT and each of the two label PUTs sit immediately after their own gate,
-        # so none of them runs on a decision that went stale during another's
-        # round trip.
+        # ONE authorization per S3 operation, and that is the contract: the
+        # archive PUT and each of the two label PUTs sit immediately after their
+        # own gate, so none of them runs on a decision that went stale during
+        # another's round trip.
+        #
+        # THREE, not four: this fixture configures no retention count, so retention
+        # is off and the sweep declines before asking for anything. That is the
+        # shipped default, and it is worth pinning as an absence rather than as a
+        # smaller number -- an off sweep costs no authorization round trip and no
+        # listing call, so a fourth gate appearing here would mean the sweep had
+        # started doing cloud work on an install that never asked for it.
+        #
+        # Each write also NAMES what it carries, which is what lets the gate
+        # re-read the unattended grant for the right payload. The archive is the
+        # snapshot's payload; the two label writes are one caption published under
+        # both prefixes and are nobody's payload, so they name none.
+        #
+        # The write gates are checked field by field rather than against a whole
+        # expected call: they now carry `payload_kind` as well, so an equality
+        # against a fixed call would assert the ABSENCE of that argument, which is
+        # the opposite of what the line above pins.
         assert authz.call_count == 3
+        write_gates = [c for c in authz.call_args_list if "operation" not in c.kwargs]
+        assert len(write_gates) == 3
+        sweep_gates = [c for c in authz.call_args_list if "operation" in c.kwargs]
+        assert sweep_gates == []
+        assert [c.kwargs["payload_kind"] for c in authz.call_args_list] == [
+            backup.KIND_SNAPSHOT,
+            None,
+            None,
+        ]
         for call in authz.call_args_list:
-            assert call == mock.call(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+            assert call.args == (ACCOUNT, "p", "us-west-2")
+            assert call.kwargs["caller"] == backup.CALLER_OWNER
         # Two pushes now: the archive, then this install's label sidecar beside it.
         # The label is what stops another install's rows reading as 32 hex
         # characters, and it is published from here because this is the one place
@@ -224,6 +281,10 @@ class TestRunSessionsBackup:
     @pytest.fixture(autouse=True)
     def _isolated_state(self, tmp_path, monkeypatch):
         monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+        # See TestRunSnapshotBackup: the push ends with a drive listing, and the
+        # sweep swallows its own failures, so leaving it unstubbed would attempt a
+        # real CLI call from a passing test.
+        monkeypatch.setattr(backup.storage, "list_object_versions", lambda *a, **k: [])
         yield
 
     def test_empty_session_dirs_raise_before_upload(self, tmp_path, monkeypatch):
@@ -1386,14 +1447,10 @@ class TestALostRunWriteDoesNotReUploadForever:
         monkeypatch.setattr(backup, "_state_path", lambda: elsewhere)
         assert backup.last_runs(ACCOUNT) == {}
 
-    def test_a_persisting_run_does_not_evict_a_newer_held_run(self):
-        # The pop happens after the sidecar lock is released, so a run that
-        # failed its write can cache a NEWER record in the window between another
-        # run's write and that pop. An unconditional pop would evict it and the
-        # panel would report the older archive while the newer upload has no
-        # record anywhere. Two gateway processes hold separate caches, so no file
-        # lock can close this -- only monotonic eviction can.
+    def test_an_older_acknowledgement_does_not_evict_a_newer_held_run(self):
+        # A stale acknowledgement cannot clear a subsequently held record.
         backup.set_nightly(ACCOUNT, True)
+        persisted = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/older.tar.gz", 7)
         newer = {
             "key": "snapshots/newer.tar.gz",
             "bytes": 11,
@@ -1402,9 +1459,7 @@ class TestALostRunWriteDoesNotReUploadForever:
             ),
         }
         backup._remember_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, newer)
-
-        # This one persists, and its stamp is older than the held record's.
-        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/older.tar.gz", 7)
+        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, persisted)
 
         assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT]["key"] == "snapshots/newer.tar.gz"
 
@@ -1498,39 +1553,37 @@ class TestALostRunWriteDoesNotReUploadForever:
             runs = backup.last_runs(ACCOUNT)
             assert runs[backup.KIND_SNAPSHOT]["key"] == "snapshots/x.tar.gz"
 
-    def test_a_held_run_with_an_equal_stamp_is_evicted(self):
-        # Windows clock granularity is far above a microsecond, so two
-        # back-to-back runs can stamp IDENTICALLY -- this is what reddened
-        # `test_a_later_successful_write_takes_over_from_memory` on the Windows
-        # shard while it passed on Linux. On a tie the entry must go: the two
-        # records are simultaneous and the persisted one is on disk, and keeping
-        # the held copy would make it immortal for the life of the process
-        # because no later write can ever compare greater. Only a STRICTLY newer
-        # held record is protected. Asserted directly rather than through the
-        # clock, so it pins the rule on every platform.
+    def test_only_the_exact_same_time_run_is_acknowledged(self):
+        # Only the exact acknowledged run is removed, not another same-time run.
         stamp = dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc).isoformat(timespec="microseconds")
-        backup._remember_unpersisted(
-            ACCOUNT,
-            backup.KIND_SNAPSHOT,
-            {"key": "snapshots/tie.tar.gz", "bytes": 5, "at": stamp},
+        held = {"key": "snapshots/tie.tar.gz", "bytes": 5, "at": stamp}
+        backup._remember_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, held)
+        backup._forget_unpersisted(
+            ACCOUNT, backup.KIND_SNAPSHOT, {**held, "key": "snapshots/other.tar.gz"}
         )
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == held
 
-        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, stamp)
+        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, dict(held))
 
         assert (backup._state_key(), ACCOUNT, backup.KIND_SNAPSHOT) not in backup._unpersisted_runs
 
-    def test_two_runs_in_the_same_second_are_distinguishable(self):
-        # `_stamp` already carries entropy because a manual run can race the
-        # nightly loop into the same second. The run record has to be orderable
-        # at that resolution too, or the overlay cannot tell which of two uploads
-        # is the later one: at `timespec="seconds"` these compare EQUAL.
+    @pytest.mark.parametrize("backwards", [False, True], ids=["equal", "backwards"])
+    def test_two_runs_in_the_same_second_are_distinguishable(self, monkeypatch, backwards):
+        first_time = dt.datetime(2026, 9, 19, 11, 23, 39, 817045, tzinfo=dt.timezone.utc)
+        second_time = first_time - dt.timedelta(microseconds=int(backwards))
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = first_time
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
         backup.set_nightly(ACCOUNT, True)
         first = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/a.tar.gz", 1)
+        clock.now.return_value = second_time
         second = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/b.tar.gz", 2)
 
-        assert first["at"] != second["at"]
-        assert first["at"] < second["at"]
-        # And it still parses as a timestamp, which `due_for_nightly` relies on.
+        assert first["at"] == first_time.isoformat(timespec="microseconds")
+        assert second["at"] == second_time.isoformat(timespec="microseconds")
+        assert first["process"] == second["process"]
+        assert first["sequence"] < second["sequence"]
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
         assert dt.datetime.fromisoformat(second["at"]).tzinfo is not None
 
     def test_the_later_of_two_same_second_runs_wins_the_overlay(self):
@@ -1550,6 +1603,205 @@ class TestALostRunWriteDoesNotReUploadForever:
         backup._remember_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, held)
 
         assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT]["key"] == "snapshots/second.tar.gz"
+
+    @pytest.mark.parametrize("backwards", [False, True], ids=["equal", "backwards"])
+    @pytest.mark.parametrize("failure", ["read", "write"])
+    @pytest.mark.parametrize("recover", ["same-kind", "sibling-kind", "toggle"])
+    def test_run_identity_recovery(self, monkeypatch, backwards, failure, recover):
+        now = dt.datetime(2026, 9, 19, 11, 23, 39, 817045, tzinfo=dt.timezone.utc)
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
+        backup.set_nightly(ACCOUNT, True)
+        first = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/a.tar.gz", 1, "a")
+        clock.now.return_value = now - dt.timedelta(hours=int(backwards))
+        target = "_read_state_for_update" if failure == "read" else "write_state"
+        with mock.patch.object(backup, target, side_effect=OSError(errno.EIO, "injected")):
+            second = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/b.tar.gz", 2, "b")
+        assert second["at"] == clock.now.return_value.isoformat(timespec="microseconds")
+        assert self._on_disk()["accounts"][ACCOUNT]["runs"][backup.KIND_SNAPSHOT] == first
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+        assert backup.uploaded_objects(ACCOUNT)[second["key"]] == "b"
+        assert backup.due_for_nightly(ACCOUNT, now=now) is False
+        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, first)
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+
+        # A second failed recovery must not acknowledge or discard either upload.
+        with mock.patch.object(backup, "write_state", side_effect=OSError(errno.EIO, "injected")):
+            with pytest.raises(OSError):
+                backup.set_nightly(ACCOUNT, True)
+        assert backup.uploaded_objects(ACCOUNT)[second["key"]] == "b"
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+
+        expected = second
+        if recover == "toggle":
+            backup.set_nightly(ACCOUNT, True)
+        else:
+            kind = backup.KIND_SNAPSHOT if recover == "same-kind" else backup.KIND_SESSIONS
+            third = backup._record_run(ACCOUNT, kind, "recovery/c.tar.gz", 3, "c")
+            if recover == "same-kind":
+                expected = third
+        disk = self._on_disk()["accounts"][ACCOUNT]
+        assert disk["runs"][backup.KIND_SNAPSHOT] == expected
+        assert disk["uploads"][first["key"]] == "a"
+        assert disk["uploads"][second["key"]] == "b"
+        assert (backup._state_key(), ACCOUNT, backup.KIND_SNAPSHOT) not in backup._unpersisted_runs
+        assert (backup._state_key(), ACCOUNT) not in backup._unpersisted_uploads
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == expected
+        assert backup.due_for_nightly(ACCOUNT, now=now) is False
+
+    @pytest.mark.parametrize("legacy", [False, True], ids=["prior-process", "legacy"])
+    @pytest.mark.parametrize("backwards", [False, True], ids=["equal", "backwards"])
+    @pytest.mark.parametrize(
+        "pending_kind,record_new",
+        [(None, True), ("snapshot", True), ("sessions", True), ("snapshot", False)],
+    )
+    def test_locked_run_and_recovery_ordering(
+        self, monkeypatch, legacy, backwards, pending_kind, record_new
+    ):
+        now = dt.datetime(2026, 9, 19, 11, 23, 39, 817045, tzinfo=dt.timezone.utc)
+        old = {
+            "key": "old.tar.gz",
+            "at": (now + dt.timedelta(seconds=int(backwards))).isoformat(timespec="microseconds"),
+        }
+        if not legacy:
+            old.update(process="prior-process", sequence=7)
+        backup.write_state(
+            {
+                "accounts": {
+                    ACCOUNT: {
+                        "nightly": True,
+                        "runs": {backup.KIND_SNAPSHOT: old},
+                        "uploads": {old["key"]: "old-fingerprint"},
+                    }
+                }
+            }
+        )
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
+        if pending_kind is not None:
+            with self._full_disk():
+                pending = backup._record_run(ACCOUNT, pending_kind, "pending.tar.gz", 1, "pending")
+            pending_before = dict(pending)
+        expected_uploads = {"old.tar.gz": "old-fingerprint"}
+        expected_run = old
+        if record_new:
+            expected_run = backup._record_run(
+                ACCOUNT, backup.KIND_SNAPSHOT, "new.tar.gz", 2, "new-fingerprint"
+            )
+            assert expected_run["at"] == now.isoformat(timespec="microseconds")
+            expected_uploads["new.tar.gz"] = "new-fingerprint"
+        else:
+            # Recovery alone is not a new run: preserve the foreign/legacy
+            # wall-time fallback, but migrate the pending fingerprint.
+            backup.set_nightly(ACCOUNT, True)
+        disk = self._on_disk()["accounts"][ACCOUNT]
+        assert disk["runs"][backup.KIND_SNAPSHOT] == expected_run
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == expected_run
+        if pending_kind is not None:
+            assert pending == pending_before
+            expected_uploads["pending.tar.gz"] = "pending"
+            assert (backup._state_key(), ACCOUNT, pending_kind) not in backup._unpersisted_runs
+            if pending_kind == backup.KIND_SESSIONS:
+                assert disk["runs"][pending_kind] == pending
+        assert disk["uploads"] == expected_uploads
+        assert backup.uploaded_objects(ACCOUNT) == expected_uploads
+        assert (backup._state_key(), ACCOUNT) not in backup._unpersisted_uploads
+        assert backup.due_for_nightly(ACCOUNT, now=now) is False
+
+    def test_run_identity_exact_acknowledgement(self, monkeypatch):
+        now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
+        with self._full_disk():
+            first = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "same.tar.gz", 1, "a")
+            second = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "same.tar.gz", 1, "a")
+        assert first["at"] == second["at"]
+        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, first)
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, dict(second))
+        assert backup.last_runs(ACCOUNT) == {}
+        # Run acknowledgement cannot silently acknowledge a fingerprint too.
+        assert backup.uploaded_objects(ACCOUNT)[second["key"]] == "a"
+
+    def test_run_identity_pending_metadata_is_bounded_and_recovered(self, monkeypatch):
+        monkeypatch.setattr(backup, "MAX_REMEMBERED_UPLOADS", 3)
+        with self._full_disk():
+            for index in range(5):
+                last = backup._record_run(
+                    ACCOUNT, backup.KIND_SNAPSHOT, f"snapshots/{index}.tar.gz", index, str(index)
+                )
+        expected = {f"snapshots/{i}.tar.gz": str(i) for i in range(2, 5)}
+        assert backup.uploaded_objects(ACCOUNT) == expected
+        assert backup.last_runs(ACCOUNT) == {backup.KIND_SNAPSHOT: last}
+        backup.set_nightly(ACCOUNT, True)
+        assert self._on_disk()["accounts"][ACCOUNT]["uploads"] == expected
+        assert backup.uploaded_objects(ACCOUNT) == expected
+
+    def test_run_identity_different_process_sequences_are_not_comparable(self):
+        earlier = {"process": "other", "sequence": 999, "at": "2026-09-18"}
+        later = {"process": "this", "sequence": 1, "at": "2026-09-19"}
+        assert backup._run_is_newer(later, earlier)
+        assert not backup._run_is_newer(earlier, later)
+        # Tied foreign/legacy wall times retain the disk selection, not a
+        # fabricated total ordering by random process identity or sequence.
+        assert not backup._run_is_newer({**earlier, "at": later["at"]}, later)
+
+    def test_run_identity_concurrent_failure_then_recovery(self, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        entered, release, contender = Event(), Event(), Event()
+        now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
+        real_write = backup.write_state
+
+        def writer(state):
+            if not entered.is_set():
+                entered.set()
+                assert release.wait(10), "test did not release the failed writer"
+                raise OSError(errno.EIO, "injected")
+            real_write(state)
+
+        def second_run():
+            contender.set()
+            return backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "second.tar.gz", 2, "b")
+
+        monkeypatch.setattr(backup, "write_state", writer)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                backup._record_run, ACCOUNT, backup.KIND_SNAPSHOT, "first.tar.gz", 1, "a"
+            )
+            try:
+                assert entered.wait(10)
+                second_future = pool.submit(second_run)
+                assert contender.wait(10)
+            finally:
+                release.set()
+            first = first_future.result(timeout=10)
+            second = second_future.result(timeout=10)
+        assert first["at"] == second["at"]
+        assert first["sequence"] < second["sequence"]
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+        assert self._on_disk()["accounts"][ACCOUNT]["uploads"] == {
+            "first.tar.gz": "a",
+            "second.tar.gz": "b",
+        }
+
+
+@pytest.mark.parametrize("basename", ["backup.tar.gz", "备份.tar.gz", "x" * 255])
+def test_staging_name_preserves_digest_and_byte_budget(basename):
+    key = "snapshots/install/" + basename
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    prefix = digest + "-"
+    budget = backup.STAGING_NAME_MAX_BYTES - len(prefix)
+    expected = prefix + basename.encode("utf-8")[:budget].decode("utf-8", "ignore")
+    assert backup._staging_name(key) == expected
+    assert len(expected.encode("utf-8")) <= backup.STAGING_NAME_MAX_BYTES
 
 
 class TestCostsCacheBranches:

@@ -136,6 +136,44 @@ import pytest
 # through monkeypatch.
 os.environ.pop("KIROCREW_ACP_RECORD_FRAMES", None)
 
+# ── how this run names the directories it leaves in the platform temp root ────
+#
+# Defined up here, far from :func:`_create_tmp_root` and the rest of the temp-base
+# section, because the import-time data-home floor below is created BEFORE any of
+# that runs and has to be named by the same stem: a stray directory is attributable
+# to the run that made it or it is attributable to nobody.
+
+
+#: Prefix for the run's own temp base, a sibling of the platform temp root.
+#:
+#: The name is ``kc-pytest-<user>-<pid>``. The pid is what lets a later run tell an
+#: ABANDONED root (its process is gone) from one a concurrent run is still using. The
+#: user segment is not decoration: on POSIX the platform temp root is SHARED between
+#: accounts, so a bare pid collides across users -- two accounts can hold the same pid
+#: at the same time, and the second would try to reuse a directory it cannot write.
+#: Windows gives each account its own temp root, so there the segment is redundant and
+#: harmless.
+_TMP_ROOT_PREFIX = "kc-pytest-"
+
+
+def _tmp_root_prefix_for_run() -> str:
+    """``kc-pytest-<user>-<pid>-`` -- the stem this run's temp root is created under.
+
+    The user segment is not decoration: on POSIX the platform temp root is SHARED between
+    accounts, so a bare pid collides across users -- two accounts can hold the same pid at
+    the same time. The pid is what lets a later run tell an ABANDONED root from one a
+    concurrent run is still using. The trailing hyphen is where ``mkdtemp`` appends its
+    random component; see :func:`_create_tmp_root` for why that randomness is required and
+    not cosmetic.
+    """
+    try:
+        raw = getpass.getuser()
+    except Exception:  # noqa: BLE001 - no passwd entry and no env fallback
+        raw = "u"
+    user = "".join(ch if ch.isalnum() else "_" for ch in raw)[:24] or "u"
+    return f"{_TMP_ROOT_PREFIX}{user}-{os.getpid()}-"
+
+
 # ── The data-home floor, installed at IMPORT time ────────────────────────────
 #
 # Every per-test redirect of ``KIROCREW_HOME`` is a value laid over whatever the
@@ -175,7 +213,18 @@ _REAL_DATA_HOMES = (
 
 
 def _create_host_home_floor() -> pathlib.Path:
-    """Create the import-time floor without consulting temp environment vars."""
+    """Create the import-time floor without consulting temp environment vars.
+
+    Named with :func:`_tmp_root_prefix_for_run` plus ``home-``, so the directory reads
+    ``kc-pytest-<user>-<pid>-home-<random>`` and sorts beside the temp root the same run
+    creates later. That naming is the whole point: this floor is removed only by the
+    ``atexit`` handler below, which a SIGKILL (a CI timeout, a watchdog, an agent-driven
+    run's kill) does not run, and ``_tmp_residue`` scans only under the run's OWN temp
+    base -- so a surviving floor is invisible to the residue report and the account plus
+    pid in its name is the only signal a human has for attributing it. The earlier
+    ``kirocrew-test-floor-`` name identified neither the account nor the run, so a stray
+    one could not be told from another user's or from a run still in progress.
+    """
     if os.name == "nt":
         candidates = (
             pathlib.Path.home() / "AppData" / "Local" / "Temp",
@@ -201,7 +250,8 @@ def _create_host_home_floor() -> pathlib.Path:
         if unsafe or not base.is_dir():
             continue
         try:
-            return pathlib.Path(tempfile.mkdtemp(dir=base, prefix="kirocrew-test-floor-"))
+            prefix = f"{_tmp_root_prefix_for_run()}home-"
+            return pathlib.Path(tempfile.mkdtemp(dir=base, prefix=prefix))
         except OSError:
             continue
     raise RuntimeError("no writable system temp directory exists outside live Kiro Crew homes")
@@ -214,11 +264,28 @@ if not os.environ.get("KIROCREW_HOME"):
 
     @atexit.register
     def _remove_host_home_floor() -> None:
-        """Remove the floor, so it does not accumulate or trip the residue reporter.
+        """Remove the floor, so it does not accumulate in the platform temp root.
 
-        The suite's own temp-residue check reports anything that outlives a run, and
-        ``KIROCREW_TMP_RESIDUE_STRICT`` turns that report into a failure -- attributed
-        to whichever test happened to be last, not to this floor.
+        This is the ONLY removal, and it is deliberately the only one. ``atexit`` is
+        skipped by the SIGKILL that produces the residue actually MEASURED on developer
+        hosts (one stray floor per aborted run), but no in-process hook does better: a
+        session-fixture finalizer or ``pytest_unconfigure`` is skipped by the same signal,
+        and under ``-n auto`` the process that OWNS the floor is the CONTROLLER -- it sets
+        ``KIROCREW_HOME`` at conftest import, every execnet worker inherits it and so takes
+        the branch above as false, and the controller runs no session fixtures at all.
+        Sweeping OTHER runs' floors is ruled out by the same unsoundness argument
+        :func:`_isolate_tempfile_base` spells out for the temp root: the name is
+        pre-createable by another local account and a pid means nothing across PID
+        namespaces. So a killed run leaves TWO directories for the platform to reclaim --
+        the run's temp root and this floor -- and the floor leaks MORE often, because it is
+        created at conftest import and therefore survives even a run aborted during
+        collection, before any session fixture existed to make a temp root.
+
+        Nothing reports it either: ``_tmp_residue`` scans only under the run's own temp
+        base, and this floor is a SIBLING of that base in the platform temp root, so
+        neither the residue warning nor ``KIROCREW_TMP_RESIDUE_STRICT`` can see it or
+        anything a test wrote into it. That invisibility is why the directory carries
+        ``_tmp_root_prefix_for_run()`` in its name.
         """
         if _HOST_HOME_FLOOR is not None:
             shutil.rmtree(_HOST_HOME_FLOOR, ignore_errors=True)
@@ -366,6 +433,84 @@ def _redirect_bytecode_cache() -> None:
         return
     sys.pycache_prefix = candidate
     os.environ["PYTHONPYCACHEPREFIX"] = candidate
+
+
+class _AsyncFixtureScanGate:
+    """Run pytest-asyncio's fixture scan only when a fixture was registered since.
+
+    pytest-asyncio 0.20.3 hooks ``pytest_pycollect_makeitem`` and, for EVERY test
+    function name it sees, walks EVERY fixture definition the session has registered
+    so far to wrap the async ones (``_preprocess_async_fixtures``). Fixtures already
+    wrapped are skipped by a set lookup, but the ~1,400 synchronous ones are
+    re-inspected with ``asyncio.iscoroutinefunction`` on each call. That is
+    O(tests x fixtures): cProfile of a ``--collect-only`` over this suite (112,246
+    tests) counted 87,244 scans x ~1,420 fixtures = 123.8 million coroutine checks,
+    1,098 of the 1,285 profiled seconds -- 85% of collection. Every xdist worker pays
+    it in full, and under coverage instrumentation each check costs ~2.3x more, which
+    is what made the CI shards' ~33-minute "collection" phase.
+
+    The scan's result only changes when a fixture is ADDED, and pytest funnels every
+    registration -- conftest, module, class, unittest, plugin -- through
+    ``FixtureManager._register_fixture``. So this wraps that one method to raise a
+    dirty flag, and lets the scan through only while the flag is up. A scan on a clean
+    flag would iterate the same definitions and find nothing new: the async marker
+    (``_force_asyncio_fixture``) is set by the decorator at definition time and
+    ``asyncio_mode`` is fixed for the run, so the skip is behaviour-preserving.
+
+    Pinned to the plugin version it patches: upstream's own fix for this (v0.25.1,
+    then v1.0.0) sits behind the v0.23 event-loop-scope rework this suite has not
+    migrated to. When pytest-asyncio moves, delete this class and the install below.
+    """
+
+    def __init__(self, scan) -> None:
+        self._scan = scan
+        self.dirty = True
+        self.scans = 0
+
+    def mark_dirty(self) -> None:
+        self.dirty = True
+
+    def __call__(self, config, processed_fixturedefs) -> None:
+        if not self.dirty:
+            return
+        self._scan(config, processed_fixturedefs)
+        self.scans += 1
+        self.dirty = False
+
+
+def _gate_pytest_asyncio_fixture_scan() -> None:
+    """Install :class:`_AsyncFixtureScanGate` once per process (each xdist worker)."""
+    try:
+        import pytest_asyncio.plugin as pa
+    except ImportError:  # pragma: no cover - plugin absent; nothing to gate
+        return
+    from _pytest.fixtures import FixtureManager
+
+    scan = getattr(pa, "_preprocess_async_fixtures", None)
+    register = getattr(FixtureManager, "_register_fixture", None)
+    if isinstance(scan, _AsyncFixtureScanGate):
+        return  # already installed (pytest_configure re-entered in-process)
+    if scan is None or register is None:
+        # Both seams are private to their packages. A version that renamed either
+        # must not turn into a crash before collection; it turns into the slow
+        # collection this gate exists to remove, said out loud so the pin is revisited.
+        warnings.warn(
+            "pytest-asyncio fixture-scan gate not installed: a private seam moved "
+            "(pytest_asyncio.plugin._preprocess_async_fixtures / "
+            "_pytest.fixtures.FixtureManager._register_fixture); collection will be slow",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    gate = _AsyncFixtureScanGate(scan)
+
+    @functools.wraps(register)
+    def _register_fixture(self, *args, **kwargs):
+        gate.mark_dirty()
+        return register(self, *args, **kwargs)
+
+    FixtureManager._register_fixture = _register_fixture
+    pa._preprocess_async_fixtures = gate
 
 
 def _root_can_create_real_symlink() -> bool:
@@ -642,10 +787,27 @@ def _floor_monkeypatch():
     test and the floor's value is what gets put back first, then the original.
     """
     mp = pytest.MonkeyPatch()
+    # In-process CLI calls clear the sandbox markers and publish the UTF-8
+    # process contract. Preserve the worker's exact outer environment for the
+    # next test, including absent and explicitly empty values.
+    cli_process_environment = {
+        name: os.environ.get(name)
+        for name in (
+            "KIROCREW_SANDBOX_ACTIVE",
+            "KIROCREW_SANDBOX_LEVEL",
+            "PYTHONUTF8",
+            "PYTHONIOENCODING",
+        )
+    }
     try:
         yield mp
     finally:
         mp.undo()
+        for name, value in cli_process_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 @pytest.fixture
@@ -1350,11 +1512,13 @@ def pytest_make_collect_report(collector):
     above turns it into, so an emitter is caught whether or not it reached the host.
     ``reset_for_testing()`` then drops what was built (stopping an exporter thread if
     one exists), so the next module starts clean and the attribution stays per-module.
-    Recorded per worker under xdist: every worker collects the whole tree.
+    Fail the collection report on the detecting worker: file shards do not all
+    collect the test that asserts the record, and xdist forwards collection errors
+    to the controller even when that worker executes no tests.
     """
     provider = _metrics_provider_module()
     built_before = bool(provider is not None and getattr(provider, "_ever_built", False))
-    yield
+    outcome = yield
     if not isinstance(collector, pytest.Module):
         return
     provider = _metrics_provider_module()
@@ -1368,6 +1532,13 @@ def pytest_make_collect_report(collector):
         IMPORT_TIME_METRIC_EMITTERS.append(collector.nodeid)
     with contextlib.suppress(Exception):
         provider.reset_for_testing()
+    report = outcome.get_result()
+    if not report.failed:
+        report.outcome = "failed"
+        report.longrepr = (
+            f"Import-time metric emission: {IMPORT_TIME_METRIC_EMITTERS[-1]}. "
+            "Build the value inside the test or fixture instead."
+        )
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -1377,6 +1548,7 @@ def pytest_configure(config: pytest.Config) -> None:
     _prefer_short_tmp_base()
     _redirect_hypothesis_database()
     _redirect_bytecode_cache()
+    _gate_pytest_asyncio_fixture_scan()
     global _SESSION_CWD
     try:
         _SESSION_CWD = os.getcwd()
@@ -1938,8 +2110,9 @@ def _restore_log_record_factory():
     installing over the already-installed wrapper captured it as its own base factory.
 
     **Sharding hides this class, so the floor cannot rely on a full-suite run to find it.**
-    ``ci.yml`` slices the suite into duration-balanced pytest-split groups and a leak only
-    damages tests in the SAME process, so PR CI usually cannot observe it at all; the
+    ``ci.yml`` assigns whole files to Linux/Windows shards before import (macOS keeps
+    pytest-split groups), and a leak only damages tests in the SAME process, so PR CI
+    usually cannot observe it at all; the
     release job runs the suite whole and is otherwise the first place it appears -- as
     failures in files unrelated to the cause, long after the diff merged. Restoring here
     removes the class outright rather than improving the odds of noticing it.
@@ -2235,12 +2408,18 @@ def pytest_collection_modifyitems(config, items):
     a junction, silently dropping the Windows behavior those tests exist to
     cover.  Exact collection markers leave every non-link path untouched.
 
-    The lists live in ``test/windows-expected-failures.txt`` and
-    ``test/macos-expected-failures.txt`` -- one unparametrized node id per line,
-    captured from the first CI runs on that OS. Each is a burn-down backlog: fixed
+    The lists live in ``test/windows-expected-failures.txt``,
+    ``test/macos-expected-failures.txt`` and
+    ``test/codebuild-expected-failures.txt`` -- one node id per line, captured from
+    the first CI runs on that OS or runner. Each is a burn-down backlog: fixed
     tests get their line deleted, and anything NOT on the list still fails the
-    job, so the line holds for the tests that pass today. Both go through the same
-    ``_apply_tracked_gap_list`` matcher; do not add a third mechanism.
+    job, so the line holds for the tests that pass today. All three go through the
+    same ``_apply_tracked_gap_list`` matcher; do not add a fourth mechanism.
+
+    Two of the three are keyed on the OS and the third on the runner, because the
+    environment it describes is a Linux one that ``sys.platform`` cannot tell from
+    the hosted Linux shards passing the same tests in the same run. See
+    :func:`on_self_hosted_runner`.
 
     Lives HERE rather than in ``test/conftest.py`` because the lists already name node
     ids under ``src/kiro_crew/apps/builtins/auto_improvement/tests/``, and a hook rooted
@@ -2279,15 +2458,41 @@ def pytest_collection_modifyitems(config, items):
         _apply_tracked_gap_list(items, "windows-expected-failures.txt", "Windows")
     elif pc.IS_MACOS:
         _apply_tracked_gap_list(items, "macos-expected-failures.txt", "macOS")
+    elif on_self_hosted_runner():
+        _apply_tracked_gap_list(
+            items, "codebuild-expected-failures.txt", "self-hosted Linux runner"
+        )
+
+
+def on_self_hosted_runner() -> bool:
+    """Whether this run is on a self-hosted CI runner rather than a hosted one.
+
+    The third gap list is keyed on the RUNNER rather than the OS, because the
+    environment that fails those tests is a Linux one: no IPv6 loopback, no ``link``
+    on the filesystem, and an unprivileged user whose resolved home is ``/root``.
+    ``sys.platform`` cannot tell it from the hosted Linux shards that pass the same
+    tests in the same run, so the list would either apply everywhere or nowhere.
+
+    ``RUNNER_ENVIRONMENT`` is GitHub's own answer to that question, and ``ci.yml``
+    already gates this job's non-root boundary assertion on the same value
+    (``runner.environment == 'self-hosted'``). Keying off it reuses the signal the
+    workflow already treats as identifying the runner instead of inventing a second
+    one, and needs nothing added to the job's environment.
+
+    Absent outside CI, so a developer machine reads as hosted and applies no list --
+    which is right: a local run has none of the three constraints.
+    """
+    return os.environ.get("RUNNER_ENVIRONMENT") == "self-hosted"
 
 
 def _apply_tracked_gap_list(items, listname: str, platform_label: str) -> None:
     """Mark every collected item named in ``test/<listname>`` as a STRICT xfail.
 
-    ONE mechanism serves both OS gap lists. macOS reuses it rather than growing a
-    second matcher, so the node-id spelling rule (``_base_nodeid``: no ``[params]``,
-    no ``@group``) and the burn-down semantics -- anything NOT listed still fails
-    the job -- are identical on both platforms by construction.
+    ONE mechanism serves all three gap lists. macOS and the self-hosted Linux runner
+    reuse it rather than growing a second matcher, so the node-id spelling rule
+    (``_base_nodeid``: no ``[params]``, no ``@group``) and the burn-down semantics --
+    anything NOT listed still fails the job -- are identical for every list by
+    construction.
 
     **``xfail(strict=True)``, not ``skip``, because these files call themselves a
     burn-down backlog and say "fix the test and DELETE the line".** A skip does not
@@ -2396,34 +2601,11 @@ def platform_compat_or_none():
 # ── the system temp directory is host state too ───────────────────────
 
 
-#: Prefix for the run's own temp base, a sibling of the platform temp root.
-#:
-#: The name is ``kc-pytest-<user>-<pid>``. The pid is what lets a later run tell an
-#: ABANDONED root (its process is gone) from one a concurrent run is still using. The
-#: user segment is not decoration: on POSIX the platform temp root is SHARED between
-#: accounts, so a bare pid collides across users -- two accounts can hold the same pid
-#: at the same time, and the second would try to reuse a directory it cannot write.
-#: Windows gives each account its own temp root, so there the segment is redundant and
-#: harmless.
-_TMP_ROOT_PREFIX = "kc-pytest-"
-
-
-def _tmp_root_prefix_for_run() -> str:
-    """``kc-pytest-<user>-<pid>-`` -- the stem this run's temp root is created under.
-
-    The user segment is not decoration: on POSIX the platform temp root is SHARED between
-    accounts, so a bare pid collides across users -- two accounts can hold the same pid at
-    the same time. The pid is what lets a later run tell an ABANDONED root from one a
-    concurrent run is still using. The trailing hyphen is where ``mkdtemp`` appends its
-    random component; see :func:`_create_tmp_root` for why that randomness is required and
-    not cosmetic.
-    """
-    try:
-        raw = getpass.getuser()
-    except Exception:  # noqa: BLE001 - no passwd entry and no env fallback
-        raw = "u"
-    user = "".join(ch if ch.isalnum() else "_" for ch in raw)[:24] or "u"
-    return f"{_TMP_ROOT_PREFIX}{user}-{os.getpid()}-"
+# ``_TMP_ROOT_PREFIX`` and ``_tmp_root_prefix_for_run`` are defined ABOVE the
+# import-time data-home floor rather than here, beside their main consumer, because
+# ``_create_host_home_floor`` calls the helper at conftest IMPORT time -- long before
+# this line executes -- to name the floor after the run that made it. Everything else
+# about the run's temp naming stays in this section.
 
 
 def _create_tmp_root(parent: pathlib.Path) -> pathlib.Path:
@@ -2465,6 +2647,18 @@ _TMP_ENV_VARS = ("TMPDIR", "TEMP", "TMP")
 #: directory in a 26k-test run names no culprit. Re-run the suspect subset with
 #: ``KIROCREW_TMP_PER_TEST=1`` and the residue's parent directory IS the test id.
 _TMP_PER_TEST_ENV = "KIROCREW_TMP_PER_TEST"
+
+#: Whether this run is in that mode, read ONCE at conftest import.
+#:
+#: Read here rather than per test because it decides whether the per-test fixture below
+#: is DEFINED at all, and an autouse fixture that exists costs whether or not its body
+#: does anything: its name joins the fixture closure of every collected item (~106 bytes
+#: each, so ~5.8 MiB per xdist worker retained for the whole session) and the fixture
+#: protocol sets it up once per test (~50us, ~3 CPU-seconds across a full run). A
+#: whole-run operator switch is the right thing to read once: each xdist worker is a
+#: fresh process that inherits the environment, so the answer cannot differ between the
+#: registration decision and the teardown that reads it.
+_TMP_PER_TEST = bool(os.environ.get(_TMP_PER_TEST_ENV))
 
 #: Names under the run's temp base that are NOT this suite's residue.
 #:
@@ -2629,7 +2823,9 @@ def _isolate_tempfile_base(tmp_path_factory):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
-        per_test = bool(os.environ.get(_TMP_PER_TEST_ENV))
+        # The same value the per-test fixture's REGISTRATION was decided on, so the
+        # scan depth here cannot disagree with whether that fixture ever ran.
+        per_test = _TMP_PER_TEST
         leaked = _tmp_residue(base, per_test=per_test)
         # Removed even when it is empty, and even when the report below raises:
         # leaving the root behind would itself be the accumulation this guards.
@@ -2648,7 +2844,10 @@ def _tmp_residue(base: pathlib.Path, *, per_test: bool) -> list[str]:
     In per-test mode the immediate children are the per-test bases the fixture itself
     created, so the scan descends one level and reports ``<test id>/<name>``. Without
     that, every test in the run would be reported as its own leak and the mode would
-    answer nothing.
+    answer nothing. The allow-list is applied to the LEAF in that mode: the by-design
+    entries it names (the screenshot spool, a nested basetemp) land inside the per-test
+    base, so matching only the base's name would report every one of them as a leak
+    of the test that happened to reach the feature.
     """
     try:
         children = sorted(base.iterdir())
@@ -2662,7 +2861,11 @@ def _tmp_residue(base: pathlib.Path, *, per_test: bool) -> list[str]:
             residue.append(child.name)
             continue
         try:
-            residue.extend(f"{child.name}/{leaf.name}" for leaf in sorted(child.iterdir()))
+            residue.extend(
+                f"{child.name}/{leaf.name}"
+                for leaf in sorted(child.iterdir())
+                if not leaf.name.startswith(_TMP_RESIDUE_ALLOWED_PREFIXES)
+            )
         except OSError:
             continue
     return residue
@@ -2693,24 +2896,30 @@ def _tmp_residue_report(base: pathlib.Path, leaked: list[str], *, per_test: bool
     )
 
 
-@pytest.fixture(autouse=True)
-def _isolate_tempfile_base_per_test(_isolate_tempfile_base, request):
-    """Opt-in: give this test its own temp base so a leak names its own test.
+if _TMP_PER_TEST:
 
-    Inert unless ``KIROCREW_TMP_PER_TEST`` is set, so the steady-state cost is one
-    environment read per test. See ``_TMP_PER_TEST_ENV``.
+    @pytest.fixture(autouse=True)
+    def _isolate_tempfile_base_per_test(_isolate_tempfile_base, request):
+        """Opt-in: give this test its own temp base so a leak names its own test.
 
-    Named from the NODEID, not ``node.name``. The bare function name carries no module
-    or class, and 807 function names are duplicated across this suite (``test_defaults``
-    appears 17 times, ``test_invalid_json_is_400`` 29), so a name-keyed directory would
-    report a leak against a name shared by dozens of tests -- answering the wrong
-    question in the one mode that exists to answer it precisely. The nodeid is kept
-    TAIL-first under the length cap, because the distinguishing part is at the end.
-    """
-    if not os.environ.get(_TMP_PER_TEST_ENV):
-        return
-    safe = "".join(ch if (ch.isalnum() or ch in "-._") else "_" for ch in request.node.nodeid)
-    _redirect_tempfile_base(_isolate_tempfile_base / safe[-100:])
+        DEFINED only in that mode, rather than defined always with an env-guarded early
+        return, so the steady-state cost is zero rather than "one environment read per
+        test". The read was never the expensive half: an autouse fixture that exists is
+        added to the fixture closure of every collected item (~106 bytes per item, ~5.8
+        MiB per xdist worker held for the whole session) and goes through setup/teardown
+        once per test (~3 CPU-seconds across a full run) even when its body returns
+        immediately -- which, since nothing in the tree sets the variable, it did 100% of
+        the time. See ``_TMP_PER_TEST``; the diagnostic itself is unchanged.
+
+        Named from the NODEID, not ``node.name``. The bare function name carries no module
+        or class, and 807 function names are duplicated across this suite (``test_defaults``
+        appears 17 times, ``test_invalid_json_is_400`` 29), so a name-keyed directory would
+        report a leak against a name shared by dozens of tests -- answering the wrong
+        question in the one mode that exists to answer it precisely. The nodeid is kept
+        TAIL-first under the length cap, because the distinguishing part is at the end.
+        """
+        safe = "".join(ch if (ch.isalnum() or ch in "-._") else "_" for ch in request.node.nodeid)
+        _redirect_tempfile_base(_isolate_tempfile_base / safe[-100:])
 
 
 # ── the operator's data home is host state too ────────────────────────
@@ -3229,12 +3438,14 @@ def _isolate_subagents_dir(_isolation_dirs, _floor_monkeypatch):
     stub agent folders into the operator's real ``~/.kirocrew/subagents/``. On the
     next gateway start, orphan reconciliation sweeps those stubs and floods the
     logs with "lost to gateway restart" warnings (e.g. tasks ``t`` / ``ls /tmp``).
-    Redirecting the module global gives every test an isolated, empty registry.
+    The registry lives beneath its own per-test home so sibling protected
+    identity records are isolated too, including runs with repeated ids.
     """
+
     monkeypatch = _floor_monkeypatch
     monkeypatch.setattr(
         "kiro_crew.subagent_persistence._SUBAGENTS_DIR",
-        _isolation_dirs("subagents"),
+        _isolation_dirs("subagents") / "subagents",
     )
 
 
@@ -3410,6 +3621,19 @@ def _is_under(path: pathlib.Path, root: pathlib.Path) -> bool:
     return resolved == root or root in resolved.parents
 
 
+#: Single-slot memo for :func:`_test_owned_roots`.
+#:
+#: Both roots are session constants -- pytest memoises its basetemp per worker, and
+#: ``_isolate_tempfile_base`` sets the ``tempfile`` base exactly once -- yet the two
+#: ``resolve()`` walks below were re-done once per test by the autouse
+#: :func:`_isolate_kiro_sessions_dir`, MEASURED at 26.9us and ~6 ``lstat`` calls each,
+#: for one answer that cannot change. Keyed on both inputs, so
+#: ``KIROCREW_TMP_PER_TEST`` -- the one mode that repoints ``tempfile``'s base per test
+#: -- simply misses and pays exactly what it pays today. ONE slot rather than a dict:
+#: in that mode an unbounded cache would grow an entry per test.
+_OWNED_ROOTS_MEMO: "tuple[tuple[str, str | None], tuple[pathlib.Path, ...]] | None" = None
+
+
 def _test_owned_roots(tmp_path_factory) -> tuple[pathlib.Path, ...]:
     """This run's own temp trees: pytest's basetemp and the redirected ``tempfile`` base.
 
@@ -3419,13 +3643,31 @@ def _test_owned_roots(tmp_path_factory) -> tuple[pathlib.Path, ...]:
     ``~/.kiro/crew/scratch/``, which puts both trees under the real ``~/.kiro``. A fence
     keyed on the real home alone would then redirect a test that relocated kiro-cli's
     home to its OWN ``tmp_path`` away from the tree it just built.
+
+    Memoised on its two inputs; see ``_OWNED_ROOTS_MEMO``. The key reads
+    ``tempfile.gettempdir()`` -- the CALL, not the ``tempfile.tempdir`` global -- because
+    a test that patches ``gettempdir`` still wins (``_isolate_tempfile_base`` says so),
+    and keying on the global would make the memo blind to such a patch. The call costs
+    0.09us once ``tempdir`` is set, so honouring it is free.
     """
-    roots = [tmp_path_factory.getbasetemp().resolve()]
+    global _OWNED_ROOTS_MEMO
+    basetemp = tmp_path_factory.getbasetemp()
     try:
-        roots.append(pathlib.Path(tempfile.gettempdir()).resolve())
+        tmp_base: "str | None" = tempfile.gettempdir()
     except OSError:  # pragma: no cover - no usable temp dir at all
-        pass
-    return tuple(roots)
+        tmp_base = None
+    key = (str(basetemp), tmp_base)
+    if _OWNED_ROOTS_MEMO is not None and _OWNED_ROOTS_MEMO[0] == key:
+        return _OWNED_ROOTS_MEMO[1]
+    roots = [basetemp.resolve()]
+    if tmp_base is not None:
+        try:
+            roots.append(pathlib.Path(tmp_base).resolve())
+        except OSError:  # pragma: no cover - unresolvable temp base
+            pass
+    value = tuple(roots)
+    _OWNED_ROOTS_MEMO = (key, value)
+    return value
 
 
 @pytest.fixture(autouse=True)

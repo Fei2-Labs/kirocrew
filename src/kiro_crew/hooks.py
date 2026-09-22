@@ -28,7 +28,7 @@ from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import platform_compat, security, webhooks
+from kiro_crew import pinned_fs, platform_compat, security, webhooks
 
 # The xattr ACL-carry policy is shared with atomic_write.atomic_write: both
 # install a fresh inode and must reproduce the source's access controls or
@@ -73,7 +73,10 @@ from kiro_crew.security import (
     is_sensitive_bash_command,
     is_sensitive_path,
     is_sensitive_write_path,
+    is_unverifiable_path_refusal,
+    sensitive_path_refusal,
 )
+from kiro_crew.security.readonly_bash import is_read_only_bash
 from kiro_crew.sel import sel
 from kiro_crew.session_directive import CORE_MCP_SERVER
 from kiro_crew.validation import _bounded_pattern_search
@@ -526,6 +529,63 @@ def event_is_spawn_run(event: object) -> bool:
     )
 
 
+def hook_gate_kwargs(event: object, **overrides: Any) -> dict[str, Any]:
+    """The event-derived keyword arguments for ``HookManager.on_tool_call``.
+
+    One extraction, used by every permission-path dispatcher
+    (``...hooks.on_tool_call(event.title, session_key=..., **hook_gate_kwargs(event))``)
+    so an enforcement-relevant event field is threaded ONCE. A dispatcher that
+    hand-copies the fields it happens to know about drops the ones it does not
+    — the edit gate's ``diff_path``, or the trusted MCP identity a per-tool
+    deny / governance ``@server/tool`` rule keys on — and the drop is SILENT:
+    the gate never sees that signal on that surface. That is why the threading
+    lives here and not at the sites. ``test_hooks.py`` pins the helper's output
+    against the gate's own keyword signature (a new gate parameter must be
+    extracted here) and scans the package so no site hand-copies a field.
+
+    Reads the event duck-typed (``getattr`` with the gate's own defaults),
+    exactly as the channel dispatchers already did: an ``AcpEvent`` yields its
+    fields verbatim, a provider event or test double missing a field yields the
+    gate default for it, and a ``None`` in a string/bool slot is normalised to
+    that default. ``command`` comes from ``AcpEvent.shell_command`` (None for a
+    non-shell tool or an unrecoverable command, which the gate then denies by
+    default when ``is_shell`` is set); ``mcp_tool_name`` is the event's
+    ``tool_name`` (the ``_meta.kiro`` identity, not the model-authored
+    ``title``).
+
+    ``overrides`` let a surface with a genuinely different event shape replace
+    an extracted value (the auto-improvement runner recovers the command
+    provider-agnostically and falls back from ``tool_kind`` to ``tool_purpose``).
+    An override key the helper does not emit is refused: a misspelt override
+    would otherwise add a stray kwarg the gate rejects — or worse, one a future
+    gate accepts with a meaning the site never intended — so the failure is
+    loud and at the site. The structural test pins which sites override which
+    keys, so a new override is a reviewed change, never drift.
+    """
+    kwargs: dict[str, Any] = {
+        "tool_kind": getattr(event, "tool_kind", "") or "",
+        "raw_params": getattr(event, "raw_tool_params", None),
+        "diff_path": getattr(event, "diff_path", "") or "",
+        "command": getattr(event, "shell_command", None),
+        "is_shell": bool(getattr(event, "is_shell", False)),
+        "mcp_server_name": getattr(event, "mcp_server_name", "") or "",
+        "mcp_tool_name": getattr(event, "tool_name", "") or "",
+        "mcp_identity_trusted": bool(getattr(event, "mcp_identity_trusted", False)),
+        # FORK ADDITION: the boundary-ambiguity flag is an enforcement input
+        # like the pair above (an ``mcp__a__b__c`` title that resolves two ways
+        # cannot be checked against a per-tool rule), so it is extracted HERE
+        # rather than at each site, for the reason this helper exists.
+        "mcp_identity_ambiguous": bool(getattr(event, "mcp_identity_ambiguous", False)),
+    }
+    unknown = set(overrides) - set(kwargs)
+    if unknown:
+        raise TypeError(
+            "hook_gate_kwargs: override of a key it does not extract: " + ", ".join(sorted(unknown))
+        )
+    kwargs.update(overrides)
+    return kwargs
+
+
 # ── HookManager ──
 
 
@@ -882,8 +942,12 @@ class HookManager:
         ctx = current_context()
         enabled_ids = security.enabled_rule_ids(self._effective_denied(ctx))
         for target in security_targets:
-            if is_sensitive_path(target):
-                return ToolHookResult.deny(f"Blocked: access to sensitive path: {target}")
+            # Reason-or-None, like the two tiers below: a stall is refused with its
+            # own wording (unverifiable, not a match) instead of being reported as
+            # a credential hit on whatever the target happened to be.
+            reason = sensitive_path_refusal(target)
+            if reason:
+                return ToolHookResult.deny(reason)
             # execute_bash (prefixed or bare) — IMDS reach, env-credential leaks,
             # and the scan-size ceiling.
             reason = is_sensitive_bash_command(target, enabled_ids=enabled_ids)
@@ -923,8 +987,9 @@ class HookManager:
                     "paths (deny-by-default)"
                 )
             for real_path in real_paths:
-                if is_sensitive_path(real_path):
-                    return ToolHookResult.deny(f"Blocked: access to sensitive path: {real_path}")
+                reason = sensitive_path_refusal(real_path)
+                if reason:
+                    return ToolHookResult.deny(reason)
         # Config files are WRITE-protected (reads stay allowed): block the agent's
         # file-EDIT tool from modifying config.json / config.local.json so a
         # prompt-injected agent cannot rewrite its own resource ceilings
@@ -1330,8 +1395,10 @@ class HookManager:
         # and governance). Its position guarantees a read-only classification can
         # never re-admit anything the gates above blocked. This re-homes the
         # "reads don't nag" UX now that kiro-cli's autoAllowReadonly is retired.
-        # Imports are function-local: slack.gateway imports hooks at module top,
-        # so a top-level import here would create a boot import cycle.
+        # The slack.gateway import below is function-local: slack.gateway imports
+        # hooks at module top, so a top-level import here would create a boot
+        # import cycle. The bash classifier lives on the security surface, which
+        # this module already imports at top, so it needs no such dodge.
         # Every auto-approve below carries ``read_only=True``: a verdict about the
         # call's EFFECT, and the only auto-approve READ_ONLY honours. The grant
         # tiers above stay untagged.
@@ -1340,8 +1407,6 @@ class HookManager:
             # classifier (rejects redirects/substitution/backgrounding). When the
             # command could not be recovered we already denied above; a present
             # command that is not read-only falls through to interactive approval.
-            from kiro_crew.dashboard.state import is_read_only_bash
-
             if command and is_read_only_bash(command):
                 return ToolHookResult.auto_approve(read_only=True)
         else:
@@ -2469,11 +2534,12 @@ def _unc_agents_root() -> Path | None:
 # start, off the loop, so the one resolution per configuration lands there.
 # Best-effort: a failure here memoizes root-absent exactly as a lazy miss would.
 _unc_agents_root()
-#: Upper bound on the Windows leaf link chain validate_file_path will walk
-#: hop-by-hop before refusing. Mirrors the kernels' own symlink-resolution
-#: ceilings (Linux SYMLOOP_MAX chains resolve to ELOOP at 40): a longer
-#: chain is refused rather than probed.
-_LEAF_LINK_CHAIN_MAX = 40
+#: Upper bound on the Windows link chain validate_file_path will walk
+#: hop-by-hop before refusing. Covers both linked ancestors and the leaf.
+#: Mirrors the kernels' own symlink-resolution ceilings (Linux SYMLOOP_MAX
+#: chains resolve to ELOOP at 40): a longer chain is refused rather than
+#: probed.
+_WINDOWS_LINK_CHAIN_MAX = 40
 
 #: Component-depth ceiling for the Windows link screens in
 #: validate_file_path. The ancestor walk costs one lstat per component, so an
@@ -2593,13 +2659,84 @@ def _is_representable_path(raw: str) -> bool:
     return True
 
 
+def _normalize_windows_link_target(link_path: str, raw_target: str) -> str | None:
+    r"""Normalize one Windows link target without traversing through the link.
+
+    The return value is safe to screen as a new path. Untrusted UNC targets,
+    ambiguous drive/root-relative targets, and extended device namespaces are
+    refused before any filesystem probe can follow them.
+    """
+    target = raw_target
+    if target[:8].upper() == "\\\\?\\UNC\\":
+        target = "\\\\" + target[8:]
+    elif target.startswith("\\\\?\\"):
+        if not _DRIVE_ABS_RE.match(target[4:]):
+            return None
+        target = target[4:]
+
+    if is_unc_shape(target):
+        if not unc_probe_allowed(target):
+            return None
+    elif _DRIVE_ABS_RE.match(target):
+        pass
+    elif target[:1] in "\\/" or _DRIVE_PREFIX_RE.match(target):
+        return None
+    else:
+        target = os.path.normpath(os.path.join(os.path.dirname(link_path), target))
+
+    if target.count("\\") + target.count("/") > _MAX_SCREENED_PATH_DEPTH:
+        return None
+    return target
+
+
+def _screen_windows_links(target: str) -> str | None:
+    """Replace Windows links with screened targets before ``realpath``.
+
+    ``first_linked_ancestor`` walks root-first without traversing a link.
+    Reading that link's own reparse metadata is safe. Replacing the linked
+    prefix with its vetted target preserves the remaining child path while
+    avoiding the blanket rejection of benign local junctions.
+    """
+    for _ in range(_WINDOWS_LINK_CHAIN_MAX):
+        if target.count("\\") + target.count("/") > _MAX_SCREENED_PATH_DEPTH:
+            return None
+
+        linked = platform_compat.first_linked_ancestor(target)
+        if linked is not None:
+            try:
+                raw_target = os.readlink(linked)  # lgtm[py/path-injection]
+                suffix = os.path.relpath(target, linked)
+            except (OSError, ValueError):
+                return None
+            if suffix == ".." or suffix.startswith(".." + os.sep):
+                return None
+            normalized = _normalize_windows_link_target(linked, raw_target)
+            if normalized is None:
+                return None
+            target = os.path.normpath(os.path.join(normalized, suffix))
+            continue
+
+        if not platform_compat.is_link_or_junction(target):
+            return target
+        try:
+            raw_target = os.readlink(target)  # lgtm[py/path-injection]
+        except OSError:
+            return None
+        normalized = _normalize_windows_link_target(target, raw_target)
+        if normalized is None:
+            return None
+        target = normalized
+
+    return None
+
+
 def validate_file_path(raw: str) -> str | None:
     """Validate and canonicalize a file path for dashboard file I/O.
 
     Enforces: representability in the OS path layer (BEFORE any syscall sees the
     string), the Windows UNC trusted-root gate (BEFORE any resolution --
     ``realpath`` on a UNC path is itself the outbound SMB probe), the Windows
-    linked-ancestor gate (a linked ancestor launders the same probe past the
+    link-target screen (a link can launder the same probe past the
     lexical UNC check), is_sensitive_path(), realpath canonicalization.
     Returns the canonical path or None if rejected.
     """
@@ -2650,103 +2787,10 @@ def validate_file_path(raw: str) -> str | None:
         # dashboard/handlers/themes.py::_resolve_local_source.
         if is_unc_shape(target) and not unc_probe_allowed(target):
             return None
-        # Bound the walk's cost BEFORE starting it: the screen is one lstat
-        # per component, so an adversarially deep path would stall the event
-        # loop inside the guard itself. Lexical separator count; deeper
-        # paths are refused, never probed.
-        if target.count("\\") + target.count("/") > _MAX_SCREENED_PATH_DEPTH:
+        screened = _screen_windows_links(target)
+        if screened is None:
             return None
-        # A linked ANCESTOR defeats the lexical UNC gates above: the path is
-        # not itself UNC-shaped -- only the link's target is -- and `realpath`
-        # below resolves the whole chain, so an ancestor symlink/junction
-        # whose target is a UNC share turns it into exactly the outbound SMB
-        # probe the gates exist to prevent. Windows-only on purpose: on POSIX
-        # resolving through a symlink is harmless and `is_sensitive_path` on
-        # the RESOLVED path below is the real guard (an unconditional walk
-        # would refuse legitimate setups like a symlinked /home). Reference:
-        # dashboard/handlers/themes.py::_resolve_local_source.
-        if platform_compat.first_linked_ancestor(target) is not None:
-            return None
-        # The LEAF is deliberately NOT blanket-refused at this site: the
-        # documented contract (pinned by tests) RESOLVES a benign leaf
-        # symlink and re-checks the resolved path. Instead the leaf's link
-        # CHAIN is walked hop by hop -- `readlink` is a local reparse-point
-        # metadata read, never a traversal -- and every hop's target is
-        # screened the same way the original path was (UNC shape, then
-        # linked-ancestor walk) BEFORE any lstat touches it, so a leaf link
-        # aimed at an untrusted UNC share, directly or through intermediate
-        # LOCAL links, is refused before the `realpath` that would probe it.
-        # Bounded like the OS's own ELOOP limit; fails closed on an
-        # unreadable link or an over-long chain.
-        hop = target
-        for _ in range(_LEAF_LINK_CHAIN_MAX):
-            if not platform_compat.is_link_or_junction(hop):
-                break
-            try:
-                # Guarded false-positive (same shape as the resolve() inside
-                # security.is_sensitive_path): this readlink IS the sanitizer
-                # -- it reads the link's own metadata to VET the user path
-                # and performs no read/write through it.
-                nxt = os.readlink(hop)  # lgtm[py/path-injection]
-            except OSError:
-                return None
-            # Fold the NT long-path spellings into the screened shapes:
-            # \\?\UNC\host\share is the long form of \\host\share, and a
-            # plain \\?\C:\... prefix is local. The OS honors the UNC
-            # component case-insensitively (\\?\unc\... resolves the same
-            # share), so the fold must too -- a case-sensitive match would
-            # let a lowercase spelling fall into the \\?\ branch below and
-            # launder the share into a relative-looking string.
-            if nxt[:8].upper() == "\\\\?\\UNC\\":
-                nxt = "\\\\" + nxt[8:]
-            elif nxt.startswith("\\\\?\\"):
-                # Only a drive-absolute remainder is a plain local spelling.
-                # Other extended namespaces (\\?\GLOBALROOT\Device\Mup\...,
-                # \\?\Volume{guid}\..., device paths) name kernel objects the
-                # walk cannot reason about, and stripping the prefix would
-                # launder them into relative-looking strings that realpath
-                # then follows -- refused fail-closed.
-                if not _DRIVE_ABS_RE.match(nxt[4:]):
-                    return None
-                nxt = nxt[4:]
-            # Shape screen FIRST: a UNC-shaped target is never relative, and
-            # anchoring must not run before the screen or it would rewrite
-            # the very shape being screened. Targets are held to a strict
-            # shape ALLOWLIST -- UNC (trusted roots only), drive-absolute,
-            # or plain relative -- because only those resolve against state
-            # this walk can also see.
-            if is_unc_shape(nxt):
-                if not unc_probe_allowed(nxt):
-                    return None
-            elif _DRIVE_ABS_RE.match(nxt):
-                pass  # fully qualified local target -- walked as-is below
-            elif nxt[:1] in "\\/" or _DRIVE_PREFIX_RE.match(nxt):
-                # Root-relative (\pivot resolves against the CURRENT drive's
-                # root) and drive-relative (D:pivot resolves against D:'s own
-                # per-drive CWD) targets depend on ambient state, so the
-                # string screened here and the string realpath resolves
-                # could diverge by drive -- the walk would inspect the wrong
-                # drive's ancestors. Legal but exotic link-target shapes no
-                # legitimate gateway path uses; refused fail-closed.
-                return None
-            else:
-                # A plain relative target resolves against the link's own
-                # directory (which carries the hop's drive); anchor it
-                # lexically the same way the OS would.
-                nxt = os.path.normpath(os.path.join(os.path.dirname(hop), nxt))
-            # Same depth bound as the entry screen: a link may point at an
-            # adversarially deep target, and the hop's own ancestor walk
-            # below costs one lstat per component.
-            if nxt.count("\\") + nxt.count("/") > _MAX_SCREENED_PATH_DEPTH:
-                return None
-            # The next hop's OWN ancestor chain is screened before the
-            # loop's lstat resolves it.
-            if platform_compat.first_linked_ancestor(nxt) is not None:
-                return None
-            hop = nxt
-        else:
-            # Chain longer than the bound: refuse rather than probe.
-            return None
+        target = screened
     # `realpath` consumes the SAME string the walk inspected -- resolving a
     # different form would traverse a chain the walk never saw.
     path = os.path.realpath(target)
@@ -2755,16 +2799,72 @@ def validate_file_path(raw: str) -> str | None:
     return path
 
 
+def _darwin_case_alias_matches(fd: int, path: str, opened_path: str) -> bool:
+    """Prove a case-only spelling difference without following a swapped link.
+
+    Case folding selects candidates, never authorizes them: case-sensitive
+    volumes can hold distinct inodes at those names. Walk the validated name
+    without resolving it again, then compare against the descriptor we READ.
+    """
+    if (
+        sys.platform != "darwin"
+        or path.casefold() != opened_path.casefold()
+        or not pinned_fs.supports_pinned_walk()
+    ):
+        return False
+    try:
+        witness = pinned_fs.open_in_pinned_parent(
+            os.path.dirname(path),
+            os.path.basename(path),
+            flags=os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            mode=0o600,
+            what="validated file",
+            refusal=OSError,
+        )
+        try:
+            return os.path.samestat(os.fstat(fd), os.fstat(witness))
+        finally:
+            os.close(witness)
+    except OSError:
+        return False
+
+
 def _opened_file_matches_validated_path(fd: int, path: str) -> bool:
-    """Check the opened regular file without resolving its original name again."""
+    """Check the opened regular file against its validated, symlink-free name."""
     if not _stat.S_ISREG(os.fstat(fd).st_mode):
         return False
     opened_path = _fd_real_path(fd)
-    return (
-        opened_path is not None
-        and os.path.normcase(os.path.normpath(opened_path)) == os.path.normcase(path)
-        and not is_sensitive_path(opened_path)
-    )
+    if opened_path is None:
+        return False
+    matches = os.path.normcase(os.path.normpath(opened_path)) == os.path.normcase(path)
+    if not matches:
+        matches = _darwin_case_alias_matches(fd, path, os.path.normpath(opened_path))
+    return matches and not is_sensitive_path(opened_path)
+
+
+def _opened_path_within_root(
+    opened_path: str, within_root: str, *, root_is_canonical: bool = False
+) -> bool:
+    """Compare kernel spellings on macOS without case-folding containment."""
+    root_real = within_root if root_is_canonical else os.path.realpath(within_root)
+    try:
+        if os.path.commonpath([opened_path, root_real]) == root_real:
+            return True
+    except ValueError:
+        return False
+    if sys.platform != "darwin" or not pinned_fs.supports_pinned_walk():
+        return False
+    # realpath can preserve an APFS alias. Pin that resolved root without
+    # following links, then compare kernel paths, never a folded prefix.
+    root_fd = pinned_fs.pin_parent(root_real, what="read root", refusal=OSError)
+    try:
+        root_witness = _fd_real_path(root_fd)
+        return (
+            root_witness is not None
+            and os.path.commonpath([opened_path, root_witness]) == root_witness
+        )
+    finally:
+        os.close(root_fd)
 
 
 def safe_read_file(path: str) -> str:
@@ -2786,12 +2886,17 @@ def safe_read_file(path: str) -> str:
     unchanged so callers surface accurate messages.
     """
     resolved = os.path.realpath(os.path.expanduser(path))
-    if is_sensitive_path(resolved):
+    refusal = sensitive_path_refusal(resolved)
+    if refusal:
         # {resolved!r}, not {resolved}: the resolved target is caller/attacker
         # influenced (a symlink target is chosen by whoever wrote the link) and
         # this text reaches log records via ``exc_info`` — a raw newline in it
-        # would forge a second record.
-        raise PermissionError(f"Blocked: access to sensitive path: {resolved!r}")
+        # would forge a second record. The unverifiable wording is recognised by
+        # its fixed prefix, which no path spelling can produce, and already
+        # quotes the path; anything else is re-spelled here with the repr.
+        if not is_unverifiable_path_refusal(refusal):
+            refusal = f"Blocked: access to sensitive path: {resolved!r}"
+        raise PermissionError(refusal)
     try:
         fd = platform_compat.open_file_no_reparse(resolved, nonblocking=True)
     except OSError as exc:
@@ -2829,8 +2934,9 @@ def safe_read_file_bytes(raw: str) -> bytes | None:
 
     Before reading, the opened descriptor must be a regular file whose kernel
     path still matches the canonical name validated above and is not sensitive.
-    This also refuses an ancestor-directory swap. The comparison is lexical:
-    resolving the original name again could authorize the swapped destination.
+    This also refuses an ancestor-directory swap. Comparison is lexical except
+    for a macOS case-only mismatch, which requires a no-follow walk back to the
+    held inode. Resolving the original name again could authorize a swap.
 
     Returns file content as bytes, or None if path is rejected or unreadable.
     """
@@ -2930,6 +3036,7 @@ def safe_read_file_bytes_nolink(
     *,
     max_bytes: int | None = None,
     allow_truncate: bool = False,
+    within_root_is_canonical: bool = False,
 ) -> bytes | None:
     """Like :func:`safe_read_file_bytes` but also rejects hardlinked inodes.
 
@@ -2950,6 +3057,8 @@ def safe_read_file_bytes_nolink(
     the tree walk and the open would silently escape the approved tree. The
     fd-path check is pinned to the inode actually opened, so no check-to-use
     window remains. If the fd's real path cannot be determined, fail closed.
+    ``within_root_is_canonical`` preserves a caller's already-resolved admission
+    root literally, so replacing that directory with a link cannot redefine it.
 
     That final-component refusal comes from
     :func:`kiro_crew.platform_compat.open_file_no_reparse`, not from an
@@ -2989,12 +3098,9 @@ def safe_read_file_bytes_nolink(
             fd_real = _fd_real_path(fd)
             if fd_real is None:
                 return None  # cannot verify containment -> fail closed
-            root_real = os.path.realpath(within_root)
-            try:
-                contained = os.path.commonpath([fd_real, root_real]) == root_real
-            except ValueError:
-                contained = False
-            if not contained:
+            if not _opened_path_within_root(
+                fd_real, within_root, root_is_canonical=within_root_is_canonical
+            ):
                 return None  # opened inode escapes the approved tree
             if is_sensitive_path(fd_real):
                 return None
@@ -3103,12 +3209,7 @@ def _pinned_replace(
             fd_real = _fd_real_path(fd)
             if fd_real is None:
                 return None  # cannot verify containment -> fail closed
-            root_real = os.path.realpath(within_root)
-            try:
-                contained = os.path.commonpath([fd_real, root_real]) == root_real
-            except ValueError:
-                contained = False
-            if not contained:
+            if not _opened_path_within_root(fd_real, within_root):
                 return None  # opened inode escapes the approved tree
             if is_sensitive_path(fd_real):
                 return None
@@ -3293,12 +3394,7 @@ def _pinned_replace(
             dir_real = _fd_real_path(dfd)
             if dir_real is None:
                 return "refused"  # cannot verify containment -> fail closed
-            root_real = os.path.realpath(within_root)
-            try:
-                contained = os.path.commonpath([dir_real, root_real]) == root_real
-            except ValueError:
-                contained = False
-            if not contained or is_sensitive_path(dir_real):
+            if not _opened_path_within_root(dir_real, within_root) or is_sensitive_path(dir_real):
                 return "refused"
         elif within_root is not None:
             # No directory handle to interrogate, so the parent is verified by

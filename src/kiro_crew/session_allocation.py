@@ -13,19 +13,20 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from kiro_crew.member_memory_auth import private_memory_store_for_session
+from kiro_crew.agent_spec_format import iter_agent_spec_files
 from kiro_crew.metrics.sessions import (
     END_REASON_EVICTED,
     discard_session_start,
     record_session_ended,
     record_session_started,
 )
+from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
@@ -36,6 +37,19 @@ else:
 
 
 ProviderFactory = Callable[..., LLMProvider]
+
+
+def _bounded_session_id(value: object) -> "str | None":
+    """*value* when it is a non-empty ACP session id within
+    ``MAX_ACP_SESSION_ID_LEN``, else ``None``.
+
+    The id comes from the backend, so it is bounded at the point of retention
+    rather than trusted: a runtime that hands back an oversize string gets no
+    id on the row, never a truncated one that would name a different unit.
+    """
+    if not isinstance(value, str) or not value or len(value) > MAX_ACP_SESSION_ID_LEN:
+        return None
+    return value
 
 
 class SessionClosingError(RuntimeError):
@@ -95,13 +109,23 @@ class AllocationDeps:
     session_provider_type: Callable[[], Callable[[Any, Any], LLMProvider]]
     unlink_session_queue: Callable[[Any], None]
     unlink_queued_temp_paths: Callable[[dict[str, Any]], None]
-    session_model: Callable[[Any, str | None, bool], str | None]
+    session_model: Callable[..., str | None]
+    # FORK: whether this backend consumes model_registry ids. Decides if a bound
+    # KIRO agent file may be read for it -- see session._session_model's guard.
     uses_registry_model_ids: Callable[[str], bool]
     load_config: Callable[[], Any]
     resolve_crew_identity: Callable[[Any, str | None, str | None], str]
     load_watchdog_settings: Callable[[str], object]
     advertised_model_ids: Callable[[Any], list[str]]
     model_is_unusable: Callable[[str, list[str]], bool]
+    #: Whether a stored pin belongs to the harness a provider runs on
+    #: (``model_scope.pin_applies``), and that harness's model-id namespace.
+    #: Injected rather than imported for the same reason every other model
+    #: helper here is: this module is constructed with its whole world so a test
+    #: can substitute one, and reaching for ``kiro_crew.model_scope`` directly
+    #: would make the pool's scope rule the only one a test cannot swap.
+    model_pin_applies: Callable[[str, str, Sequence[str] | None], bool]
+    provider_model_namespace: Callable[[LLMProvider], str]
     resolve_pin_spelling: Callable[[str, list[str]], str]
     to_provider_id: Callable[[str, str], str]
     to_acp_id: Callable[[str], str]
@@ -132,6 +156,7 @@ class SessionRegistryState:
     subagent_runtimes: dict[str, Any] = field(default_factory=dict)
     subagent_runtime_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     continuable_keys: set[str] = field(default_factory=set)
+    capability_failures: dict[str, dict[str, str]] = field(default_factory=dict)
     continuable_fallback: Callable[[str], bool] | None = None
 
 
@@ -166,10 +191,9 @@ class _AllocationOwner(Protocol):
     _background_tasks: set[asyncio.Task[Any]]
     _bg_runtime: Any | None
 
+    # FORK: the crossover factory for a caller-named backend that is NOT the
+    # configured one -- restored with the crossover block in _get_or_create_impl.
     def _provider_factory_for_backend(self, backend: str) -> ProviderFactory: ...
-
-    @property
-    def acp_backend(self) -> str: ...
 
     def _fold_key(self, key: str) -> str: ...
 
@@ -252,6 +276,13 @@ def _collect_parent_runtime_kwargs(
         value = getattr(client, attribute, None)
         if value is not None:
             kwargs[key] = value
+    # The MCP Tool Search choice rides the runtime constructor on a wire-settings
+    # host, so a companion runtime built without it would run with the setting
+    # left to the host's default rather than the explicit value the parent sent.
+    # Read off the LLMProvider capability (safe default None), never probed.
+    tool_search = provider.tool_search_settings
+    if tool_search is not None:
+        kwargs["tool_search"] = tool_search
     return kwargs
 
 
@@ -426,6 +457,12 @@ class SessionAllocationService:
         await session.semaphore.acquire()
         return True
 
+    def capability_runtime_view(self, member: str, saved_revision: str) -> dict[str, Any]:
+        """Read capability adoption from this boundary's registry on the event loop."""
+        from kiro_crew.session_capabilities import runtime_view
+
+        return runtime_view(self.state, member, saved_revision)
+
     def active_providers(self) -> list[LLMProvider]:
         return [session.provider for session in self._sessions.values()]
 
@@ -446,8 +483,6 @@ class SessionAllocationService:
 
     async def get_subagent_runtime(self, parent_session_key: str, agent: str | None = None) -> Any:
         """Get or spawn the canonical shared companion runtime for a parent."""
-        if await asyncio.to_thread(private_memory_store_for_session, parent_session_key):
-            raise RuntimeError("Private member memory requires a dedicated runtime")
         runtime_type, runtime_dead = self._deps.runtime_types()
         max_retries = 1
         attempt = 0
@@ -465,7 +500,9 @@ class SessionAllocationService:
                     return existing
                 if existing is not None:
                     try:
-                        await existing.kill()
+                        await existing.kill(
+                            reason="reaping a dead shared subagent runtime before respawn"
+                        )
                     except Exception:
                         self._deps.logger.debug(
                             "get_subagent_runtime: dead runtime kill failed for %s",
@@ -509,7 +546,7 @@ class SessionAllocationService:
             runtime = self._subagent_runtimes.pop(parent_session_key, None)
         if runtime is not None:
             try:
-                await runtime.kill(expected=True)
+                await runtime.kill(expected=True, reason="subagent runtime released")
             except Exception:
                 self._deps.logger.warning(
                     "Failed to kill subagent runtime for %s",
@@ -525,8 +562,6 @@ class SessionAllocationService:
         cwd: str | None = None,
     ) -> Any:
         """Adopt a configured bootstrap provider's runtime for a task run."""
-        if await asyncio.to_thread(private_memory_store_for_session, parent_session_key):
-            raise RuntimeError("Private member memory requires a dedicated runtime")
         owner = self._owner
         if not owner._provider_factory:
             # Outside the per-key lock: get_subagent_runtime takes that lock and
@@ -639,19 +674,15 @@ class SessionAllocationService:
 
         owner = self._owner
         key = owner._fold_key(session_key)
-        private_stores = await asyncio.gather(
-            asyncio.to_thread(private_memory_store_for_session, key),
-            asyncio.to_thread(private_memory_store_for_session, parent_session_key),
-        )
-        if private_stores[1] and not private_stores[0]:
-            raise RuntimeError(
-                "A private member task requires a trusted child memory binding before execution"
-            )
-        if any(private_stores):
+        from kiro_crew.execution_context import read_session_execution
+
+        execution = await asyncio.to_thread(read_session_execution, key)
+        if execution is not None and execution.memory_mode != "persistent":
+            # A restricted task starts a fresh native conversation whose
+            # retention policy is fixed before launch; do not borrow a parent.
             return await owner.get_or_create(
                 key, agent=agent, approval_policy=approval_policy, cwd=cwd
             )
-
         async with self._lock:
             existing = self._sessions.get(key)
             if existing is not None:
@@ -663,6 +694,13 @@ class SessionAllocationService:
                 return existing.provider, False, False
             await owner._evict_stale_session(key, existing)
 
+        from kiro_crew.session_capabilities import prepare_runtime
+
+        prepared = await asyncio.to_thread(prepare_runtime, agent, None, cwd)
+        if prepared.revision:
+            return await owner.get_or_create(
+                key, agent=agent, approval_policy=approval_policy, cwd=cwd
+            )
         runtime = await owner._get_or_bootstrap_run_runtime(
             parent_session_key, agent=agent, cwd=cwd
         )
@@ -675,6 +713,7 @@ class SessionAllocationService:
                 # resolve to nothing (fail closed), and before the token they
                 # resolved to the run's parent session.
                 session_key=key,
+                memory_mode=execution.memory_mode if execution is not None else "persistent",
             )
         except AcpWorkspaceBindingError:
             return await owner.get_or_create(
@@ -684,6 +723,11 @@ class SessionAllocationService:
                 cwd=cwd,
             )
         provider = self._deps.session_provider_type()(handle, runtime)
+        setattr(
+            provider,
+            "memory_mode",
+            execution.memory_mode if execution is not None else "persistent",
+        )
 
         duplicate: LLMProvider | None = None
         won_race_session: Any | None = None
@@ -702,6 +746,7 @@ class SessionAllocationService:
                     approval_policy=approval_policy,
                     agent=agent or "",
                 )
+                session.capability_member = prepared.member
                 self._sessions[key] = session
                 self.advance_ownership_generation(key)
                 won_race_session = session
@@ -761,7 +806,7 @@ class SessionAllocationService:
         session = self._sessions.get(parent_session_key)
         if session is None:
             return False
-        if getattr(session.provider, "_private_memory", False) is True:
+        if session.loaded_capabilities is not None:
             return False
         return getattr(session.provider, "is_session_sharing_eligible", False)
 
@@ -782,6 +827,12 @@ class SessionAllocationService:
                 {
                     "key": key,
                     "agent": session.agent,
+                    # The ACP session id, which is also the id of this session's
+                    # crew log unit; the Sessions table's lineage reader joins on
+                    # it. Backend-authored, so bounded here where it is retained
+                    # (the bound every other store of this id applies); an
+                    # oversize or empty value is carried as None, not truncated.
+                    "sid": _bounded_session_id(getattr(session.provider, "session_id", None)),
                     "pid": self._runtime_pid(runtime),
                     "owns_runtime": bool(getattr(client, "_owns_runtime", True)),
                     "created_at": session.created_at,
@@ -1065,6 +1116,20 @@ class SessionAllocationService:
         session = self._sessions.get(self._owner._fold_key(key))
         return session.agent if session else ""
 
+    def get_agent_selection(self, key: str) -> tuple[str, str]:
+        """Copy the live allocation's selection without reinterpreting its name."""
+        session = self._sessions.get(self._owner._fold_key(key))
+        if session is None:
+            return "template", ""
+        member = getattr(session, "capability_member", None)
+        agent = getattr(session, "agent", None)
+        if not isinstance(member, str) or not isinstance(agent, str):
+            raise ValueError("resume_failed: parent agent selection unavailable")
+        # prepare_runtime captures the member even before capability enrollment.
+        # An empty member means this allocation selected the provider template;
+        # subsequent roster changes must not reinterpret that literal.
+        return ("member", member) if member else ("template", agent)
+
     def set_approval_policy(self, key: str, policy: str) -> None:
         key = self._owner._fold_key(key)
         session = self._sessions.get(key)
@@ -1101,7 +1166,7 @@ class SessionAllocationService:
 
         model = "auto"
         try:
-            for agent_file in agents_dir.glob("*.json"):
+            for agent_file in iter_agent_spec_files(agents_dir, ordered=False):
                 data = self._deps.read_agent_spec(
                     agent_file,
                     operation="resolve_agent_model",
@@ -1242,6 +1307,20 @@ class SessionAllocationService:
         self._remove_reservation_now(reserved_key, token)
         return result
 
+    def _remember_capability_failure(self, key: str, preparation: Any) -> None:
+        # Only closed error vocabulary reaches the owner API; provider errors
+        # can contain transport credentials. Successful retry removes this row.
+        failures = self.state.capability_failures
+        failures.pop(key, None)
+        failures[key] = {
+            "member": preparation.member,
+            "status": "failed",
+            "saved_revision": preparation.revision,
+            "error_code": "capability_startup_failed",
+        }
+        if len(failures) > 128:
+            failures.pop(next(iter(failures)))
+
     async def _get_or_create_impl(
         self,
         key: str,
@@ -1267,9 +1346,11 @@ class SessionAllocationService:
         owner = self._owner
         constants = self._deps.constants
         key = owner._fold_key(key)
-        # A binding can belong to any session kind (cron, delegated run, or
-        # consolidation), and must be checked before even reusing a live client.
-        private_memory = bool(await asyncio.to_thread(private_memory_store_for_session, key))
+        from kiro_crew.execution_context import read_session_execution
+
+        execution = await asyncio.to_thread(read_session_execution, key)
+        member_context = execution is not None and execution.member_id is not None
+        memory_mode = execution.memory_mode if execution is not None else "persistent"
         stale_provider: LLMProvider | None = None
         stale_session: Any | None = None
         claimed: Any | None = None
@@ -1286,12 +1367,9 @@ class SessionAllocationService:
                 recycling = existing is not None and owner._recycling.get(key) is existing
                 if existing is not None and not recycling:
                     session = existing
-                    if (
-                        getattr(session.provider, "_private_memory", False) is True
-                    ) != private_memory:
+                    if getattr(session.provider, "memory_mode", "persistent") != memory_mode:
                         raise RuntimeError(
-                            "Session runtime memory isolation does not match its trusted binding; "
-                            "restart the session before continuing"
+                            "This conversation's privacy mode changed; open a new conversation"
                         )
                     alive = session.provider.is_process_alive()
                     if not alive:
@@ -1367,6 +1445,16 @@ class SessionAllocationService:
                 raise RuntimeError("No provider factory configured")
             factory = owner._provider_factory
 
+        # FORK CROSSOVER (restored at the 2026-09-21 sync; upstream has no
+        # equivalent). A caller may name a backend that is NOT the configured one
+        # -- a dedicated child on its parent's harness, a Settings change mid-run.
+        # Two things then have to change together: the FACTORY must be the one
+        # that can construct that backend's provider class, and the configured
+        # harness's own model pin must NOT be inherited across the namespace
+        # boundary, or the child is handed a model its harness never served.
+        # Namespace scoping alone cannot object here: a harness that has
+        # advertised nothing is silent, and silence is not a refusal
+        # (see model_scope) -- which is exactly the crossover case.
         configured_backend = getattr(owner, "acp_backend", "")
         if not isinstance(configured_backend, str):
             configured_backend = ""
@@ -1378,17 +1466,6 @@ class SessionAllocationService:
             extra_factory_kwargs["inherit_config_model"] = False
             factory = owner._provider_factory_for_backend(effective_backend)
 
-        # Model resolution reads agent JSON and therefore stays off the loop.
-        if model is None and inherits_config_model:
-            registry_model_ids = self._deps.uses_registry_model_ids(effective_backend)
-            model = await asyncio.get_running_loop().run_in_executor(
-                None,
-                self._deps.session_model,
-                owner._cfg,
-                agent,
-                registry_model_ids,
-            )
-
         resume_sid: str | None = None
         is_stateless = (
             key in (constants.background_key, constants.heartbeat_key)
@@ -1398,6 +1475,41 @@ class SessionAllocationService:
             resume_sid = owner._session_map.get(key)
         if speculative and resume_sid and not speculative_resume:
             raise SpeculativeResumeRefused(key)
+
+        from kiro_crew.session_capabilities import prepare_runtime
+
+        effective_cwd = cwd
+        if not effective_cwd and resume_sid:
+            stored_cwd = owner._session_map.get_cwd(key)
+            if stored_cwd and await asyncio.to_thread(Path(stored_cwd).is_dir):
+                effective_cwd = stored_cwd
+        claim_crew = extra_factory_kwargs.get("crew_agent")
+        session_agent = agent
+        preparation = await asyncio.to_thread(prepare_runtime, agent, claim_crew, effective_cwd)
+        if preparation.revision:
+            # The factory may retain the pre-reconciliation config snapshot.
+            # Pass the prepared template explicitly, keeping the member namespace.
+            agent = preparation.template
+            effective_cwd = preparation.project or effective_cwd
+            extra_factory_kwargs["crew_agent"] = preparation.member
+
+        # Reconciliation can publish a new template model. Resolve only after
+        # that boundary, while retaining an explicit caller model unchanged.
+        if model is None and inherits_config_model:
+
+            def resolve_model() -> str | None:
+                cfg = self._deps.load_config() if preparation.revision else owner._cfg
+                selected = preparation.member or agent
+                # Pass the namespace verdict: an adapter that does not consume
+                # registry model ids must not have a kiro agent file read for it.
+                return self._deps.session_model(
+                    cfg,
+                    selected,
+                    claim_crew,
+                    self._deps.uses_registry_model_ids(effective_backend),
+                )
+
+            model = await asyncio.to_thread(resolve_model)
 
         self._deps.logger.info(
             "Pool decision: key=%s resume_sid=%s model=%s agent=%s "
@@ -1415,8 +1527,8 @@ class SessionAllocationService:
         cwd_blocks_pool = bool(cwd and cwd != owner._pool_cwd)
         if not owner._pool_size:
             pool_decision = "disabled"
-        elif private_memory:
-            pool_decision = "bypass_private_memory"
+        elif preparation.revision:
+            pool_decision = "bypass_member_capabilities"
         elif resume_sid:
             pool_decision = "bypass_resume"
         elif is_stateless:
@@ -1429,6 +1541,12 @@ class SessionAllocationService:
             # its tools; cold-starting through the factory is what makes the
             # member route real. String check — as cheap as the arms above.
             pool_decision = "bypass_member"
+        elif memory_mode != "persistent":
+            pool_decision = "bypass_restricted_context"
+        elif member_context:
+            # Native launch documents are captured before session creation.
+            # An already launched generic pool cannot supply that receipt.
+            pool_decision = "bypass_member_context"
         elif cwd_blocks_pool:
             pool_decision = "bypass_cwd"
         elif extra_env:
@@ -1437,6 +1555,13 @@ class SessionAllocationService:
             "acp_backend" in extra_factory_kwargs
             and extra_factory_kwargs["acp_backend"] != configured_backend
         ):
+            # FORK ARM (restored at the 2026-09-21 sync). A pooled child was
+            # spawned with no session key, so it runs the factory's DEFAULT
+            # backend. Claiming it for a caller pinned to a DIFFERENT harness
+            # hands that caller a process of the wrong harness entirely -- the
+            # model namespace, the wire dialect and the tool-approval route all
+            # belong to the pool's backend, not the one asked for. Cold-starting
+            # through the factory is what makes the pin real.
             pool_decision = "bypass_backend"
         elif await self._crew_pins_effort(agent, extra_factory_kwargs.get("crew_agent")):
             # A CREW's pinned effort is fixed at spawn time and the warm-pool
@@ -1458,6 +1583,9 @@ class SessionAllocationService:
         owner._record_pool_decision(pool_decision, key)
         if pooled is not None:
             provider = pooled
+            cast(Any, provider).memory_mode = memory_mode
+            if self._deps.is_acp_provider(provider):
+                cast(Any, provider).member_context = member_context
             try:
                 if self._deps.is_acp_provider(provider):
                     claim_kwarg = extra_factory_kwargs.get("crew_agent")
@@ -1482,11 +1610,27 @@ class SessionAllocationService:
                         watchdog=claim_watchdog,
                     )
                     if model:
+                        # A cache miss walks the agents directory and reads specs
+                        # until the pool agent matches: filesystem work, off the
+                        # loop like the config load above.
                         pool_model = (
-                            owner._resolve_agent_model(owner._pool_agent)
+                            await asyncio.to_thread(owner._resolve_agent_model, owner._pool_agent)
                             if owner._pool_agent
                             else None
                         )
+                        if pool_model:
+                            try:
+                                advertised = self._deps.advertised_model_ids(
+                                    provider.available_models()
+                                )
+                            except Exception:  # pragma: no cover - defensive
+                                advertised = []
+                            _namespace = self._deps.provider_model_namespace(provider)
+                            _foreign_scope = not self._deps.model_pin_applies(
+                                model,
+                                _namespace,
+                                advertised,
+                            )
                         if self._deps.is_claude_backend(provider):
                             switch_model = self._deps.to_provider_id(model, "claude_code")
                             comparable_pool = (
@@ -1499,13 +1643,18 @@ class SessionAllocationService:
                             comparable_pool = (
                                 self._deps.to_acp_id(pool_model) if pool_model else pool_model
                             )
-                        if pool_model and switch_model != comparable_pool:
-                            try:
-                                advertised = self._deps.advertised_model_ids(
-                                    provider.available_models()
-                                )
-                            except Exception:  # pragma: no cover - defensive
-                                advertised = []
+                        if pool_model and _foreign_scope:
+                            # Harness ownership and account entitlement are
+                            # separate decisions. A foreign pin inherits this
+                            # harness's current pooled model.
+                            self._deps.logger.info(
+                                "Pool post-claim: model %s belongs to another harness, "
+                                "not %s; leaving the claimed process on %s",
+                                model,
+                                _namespace,
+                                pool_model,
+                            )
+                        elif pool_model and switch_model != comparable_pool:
                             _send_model = switch_model
                             if advertised and self._deps.model_is_unusable(
                                 switch_model, advertised
@@ -1575,12 +1724,6 @@ class SessionAllocationService:
                 owner._dispatch_hard_kill(provider)
                 raise
         else:
-            effective_cwd = cwd
-            if not effective_cwd and resume_sid:
-                stored_cwd = owner._session_map.get_cwd(key)
-                if stored_cwd and Path(stored_cwd).is_dir():
-                    effective_cwd = stored_cwd
-                    self._deps.logger.info("Resume CWD override for %s: %s", key, stored_cwd)
             provider = factory(
                 key,
                 agent=agent,
@@ -1590,10 +1733,11 @@ class SessionAllocationService:
                 extra_env=extra_env,
                 **extra_factory_kwargs,
             )
+            cast(Any, provider).memory_mode = memory_mode
             if self._deps.is_acp_provider(provider):
-                await cast(Any, provider).prepare_private_memory()
-            if (getattr(provider, "_private_memory", False) is True) != private_memory:
-                raise RuntimeError("Provider does not match the session's memory isolation")
+                cast(Any, provider).member_context = member_context
+            if memory_mode != "persistent":
+                resume_sid = None
             provider_switched = False
             if resume_sid:
                 is_claude_now = self._deps.is_claude_provider(
@@ -1620,8 +1764,21 @@ class SessionAllocationService:
                     self._deps.logger.info("CC resume for %s (sid=%s)", key, resume_sid)
             async with self._start_sem:
                 try:
+                    if preparation.revision:
+                        from kiro_crew.session_capabilities import (
+                            CapabilityStartupError,
+                            verify_saved,
+                        )
+
+                        if provider.member_capabilities_supported is not True:
+                            raise CapabilityStartupError("capability_harness_unsupported")
+                        if provider.process_instance:
+                            raise CapabilityStartupError("capability_runtime_not_fresh")
+                        await asyncio.to_thread(verify_saved, preparation, provider.cwd)
                     await provider.start()
                 except (asyncio.CancelledError, Exception):
+                    if preparation.revision:
+                        self._remember_capability_failure(key, preparation)
                     owner._dispatch_hard_kill(provider)
                     raise
 
@@ -1641,6 +1798,15 @@ class SessionAllocationService:
         won_race_session: Any | None = None
         duplicate_provider: LLMProvider | None = None
         try:
+            stamp = None
+            if preparation.revision:
+                from kiro_crew.session_capabilities import loaded_stamp, verify_saved
+
+                observed = loaded_stamp(provider, preparation)
+                await asyncio.to_thread(verify_saved, preparation, provider.cwd)
+                stamp = loaded_stamp(provider, preparation)
+                if stamp != observed:
+                    raise RuntimeError("capability_process_changed_during_verification")
             resumed = False
             if self._deps.is_acp_provider(provider):
                 resumed = cast(Any, provider).client.resumed
@@ -1660,17 +1826,11 @@ class SessionAllocationService:
                 recycling = existing is not None and owner._recycling.get(key) is existing
                 if existing is not None and not recycling:
                     session = existing
-                    if (
-                        getattr(session.provider, "_private_memory", False) is True
-                    ) != private_memory:
-                        raise RuntimeError(
-                            "Concurrent session runtime has incompatible memory isolation"
-                        )
                     session.last_used = time.monotonic()
                     if approval_policy:
                         session.approval_policy = approval_policy
-                    if agent:
-                        session.agent = agent
+                    if session_agent and not preparation.revision:
+                        session.agent = session_agent
                     won_race_session = session
                     duplicate_provider = provider
                 else:
@@ -1684,8 +1844,11 @@ class SessionAllocationService:
                         provider=provider,
                         first_turn=first_turn,
                         approval_policy=approval_policy,
-                        agent=agent or "",
+                        agent=session_agent or "",
                     )
+                    session.capability_member = preparation.member
+                    session.loaded_capabilities = stamp
+                    self.state.capability_failures.pop(key, None)
                     replay_needed = getattr(provider, "_history_replay_needed", False) is True
                     provider_label = self._deps.provider_label(provider)
                     defer_sid_promotion = (
@@ -1754,6 +1917,8 @@ class SessionAllocationService:
                     self._deps.inc_session_created()
                     result = (provider, True, resumed)
         except BaseException:
+            if preparation.revision:
+                self._remember_capability_failure(key, preparation)
             owner._dispatch_hard_kill(provider)
             raise
         finally:
@@ -1791,7 +1956,7 @@ class SessionAllocationService:
                 )
             return await owner.get_or_create(
                 key,
-                agent=agent,
+                agent=session_agent,
                 channel_id=channel_id,
                 approval_policy=approval_policy,
                 model=model,

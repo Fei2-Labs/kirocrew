@@ -459,6 +459,8 @@ class TestLinuxPrivilegeResolution:
 
         monkeypatch.setenv("USER", "root")
         monkeypatch.setenv("SUDO_USER", "alice")
+        # Keep inherited tool paths independent of the HOME assertion.
+        monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
         # Simulate `sudo -H`: process home is /root.
         monkeypatch.setattr(svc_linux.Path, "home", classmethod(lambda cls: Path("/root")))
         # alice's passwd home.
@@ -1503,13 +1505,20 @@ class TestLinuxControlPaths:
     def _run_responder(self, *steps_and_results: tuple):
         """Helper: route subprocess.run by inspecting the command being run.
 
-        Each step is (substring_to_match, result_mock). The first step
-        whose substring appears in the command is returned. Anything
+        Each step is (argv_token_to_match, result_mock). The first step whose
+        token equals one of the command's argv elements is returned. Anything
         unmatched returns a default-success mock.
 
         This is more robust than a positional list because ``render_unit``
         also calls ``subprocess.run`` (for ``id -gn``), and the count of
         calls during install is not stable.
+
+        The match is whole-token, never substring: the unit-file write's argv
+        carries a ``tempfile.mkstemp`` path, and that path inherits ``TMPDIR``,
+        which the suite's per-test mode names after the test's own nodeid. A
+        substring match on ``"restart"`` would then select the *write* step of
+        ``test_install_propagates_failure_at_restart`` and the failure under
+        test would never be reached.
         """
         ok = MagicMock(returncode=0, stdout="", stderr="")
 
@@ -1517,9 +1526,9 @@ class TestLinuxControlPaths:
             # subprocess.run is called positionally as run([...], **kwargs).
             # MagicMock side_effect receives the same args, so cmd_list is
             # the list of argv strings.
-            cmd = " ".join(cmd_list) if isinstance(cmd_list, list) else str(cmd_list)
+            tokens = list(cmd_list) if isinstance(cmd_list, list) else [str(cmd_list)]
             for needle, result in steps_and_results:
-                if needle in cmd:
+                if needle in tokens:
                     return result
             return ok
 

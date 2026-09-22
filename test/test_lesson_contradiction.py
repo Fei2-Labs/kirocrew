@@ -312,12 +312,21 @@ class TestResolveAndSupersede:
         """Only V1 may remove a persisted rule on an inferred contradiction."""
         from kiro_crew import memory_stores
         from kiro_crew.dashboard.handlers.cron import _resolve_and_supersede
+        from kiro_crew.vector_memory import open_member_database
 
         root = tmp_path / "memory_stores"
         monkeypatch.setattr(memory_stores, "memory_stores_root", lambda: root)
         directory = declare_v2_store(tmp_path, "member-alice") if private_memory else tmp_path
-        vs = VectorMemoryStore(db_path=directory / "memory.db")
-        await asyncio.to_thread(vs.init)
+        if private_memory:
+            vs = await asyncio.to_thread(
+                open_member_database,
+                directory / "memory.db",
+                member_id="alice",
+                store_id="member-alice",
+            )
+        else:
+            vs = VectorMemoryStore(db_path=directory / "memory.db")
+            await asyncio.to_thread(vs.init)
         try:
             assert vs.algorithm_version == ("v2" if private_memory else "v1")
             old_rule = {"rule": "Use X format", "category": "tool"}
@@ -569,7 +578,7 @@ class TestApiLessonsDeleteOffloadsRemove:
         seen: dict[str, int] = {}
 
         class _RecordingStore:
-            def remove(self, rule_sub):  # noqa: ANN001 - test double
+            def remove(self, rule_sub, repo_scope=None, *, exact=False):  # noqa: ANN001 - test double
                 seen["remove"] = threading.get_ident()
                 return True
 
@@ -1113,6 +1122,9 @@ class TestApiLessonsSanitizesStoredFields:
         state = MagicMock()
         vs = MagicMock()
         vs.get_lessons.return_value = rows
+        # The route sizes the body from the store's count; a MagicMock here would
+        # not be a number.
+        vs.count_lessons.return_value = len(rows)
         with patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=vs)), \
              patch.object(cron, "_blocks_reads_session", return_value=False):
             resp = await cron.api_lessons(self._request(state))
@@ -1226,14 +1238,19 @@ class TestApiLessonsReturnsTheNewest:
         ]
 
     def _vector_store(self, rows):
-        """A store with the real one's contract: newest first, cap applied in SQL."""
+        """A store with the real one's contract: newest first, the window
+        (``limit`` rows after skipping ``offset``) applied in SQL, and the
+        population counted without materializing it."""
         newest_first = sorted(rows, key=lambda r: r["updated_at"], reverse=True)
 
-        def get_lessons(limit=None):
-            return newest_first[:limit] if limit else list(newest_first)
+        def get_lessons(limit=None, offset=0):
+            if limit:
+                return newest_first[offset : offset + limit]
+            return list(newest_first)
 
         vs = MagicMock()
         vs.get_lessons.side_effect = get_lessons
+        vs.count_lessons.return_value = len(rows)
         return vs
 
     async def _get_vector(self, rows):
@@ -1252,7 +1269,10 @@ class TestApiLessonsReturnsTheNewest:
 
         state = MagicMock()
         state.lessons.load_all.return_value = [
-            SimpleNamespace(rule=r, category="tool", ts=f"t{i}") for i, r in enumerate(rules)
+            # The double carries every field the handler reads off a Lesson row,
+            # repo_scope included: the list emits it as the row's delete selector.
+            SimpleNamespace(rule=r, category="tool", ts=f"t{i}", negative=None, repo_scope=None)
+            for i, r in enumerate(rules)
         ]
         with patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=None)), \
              patch.object(cron, "_get_active_workspace", return_value="default"), \
@@ -1307,7 +1327,7 @@ class TestApiLessonsReturnsTheNewest:
         from kiro_crew.dashboard.handlers import cron
 
         _, vs = await self._get_vector(self._rows(cron.LESSON_LIST_LIMIT + 20))
-        vs.get_lessons.assert_called_once_with(cron.LESSON_LIST_LIMIT)
+        vs.get_lessons.assert_called_once_with(cron.LESSON_LIST_LIMIT, 0)
 
     async def test_jsonl_tier_answers_the_newest_lessons(self):
         """The append-ordered tier keeps its tail slice -- pinned here so a later

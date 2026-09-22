@@ -180,32 +180,41 @@ class TestSpawnResolvesEachBackendsOwnArgv:
         backend absent from the chain is not refused, it is silently served
         kiro-cli, so the assertion is that each id appears in the dispatch.
 
-        FORK DIVERGENCE: upstream's codex arm dispatches on the
-        ``ACP_BACKEND_CODEX`` literal and resolves the adapter in-client. This
-        fork dispatches on the positive ``_is_codex`` predicate and routes the
-        resolution through ``kiro_crew.acp.codex``, which additionally enforces a
-        Node-MAJOR floor (codex-acp 1.4.0 dies on Node 16). Only the symbols
-        changed: codex still has its OWN positive branch and still does not fall
-        through to kiro. Pinned at the fork's symbols so a later sync cannot
-        "restore" upstream's and silently drop the Node floor, and not relaxed to
-        a bare ``"codex" in source``, which a comment would satisfy. The same
-        invariant is pinned from the other side in
-        ``test_harness_parity.py::test_codex_spawn_keeps_its_own_branch``.
+        CODEX MOVED at the 2026-09-21 sync, and asserting it here now pins a
+        branch that must NOT exist. Upstream graduated codex onto ``AcpRuntime``
+        (it is a member of ``ACP_BACKENDS_ACP_RUNTIME``), so a codex session is
+        never constructed through ``AcpClient`` and therefore cannot reach this
+        dispatch at all; its spawn lives in ``acp.harness.codex.CodexHarness``.
+        The fork's reason for pinning the symbol -- that a sync must not silently
+        drop the Node-MAJOR floor, because codex-acp 1.4.0 dies on Node 16 -- is
+        preserved: the harness resolves through the shared
+        ``_resolve_codex_acp_bin`` ladder, and that ladder still applies the floor
+        via ``_script_runtime_is_supported`` (``client.py``, ``_MIN_ADAPTER_NODE_MAJOR``).
+        So codex is asserted where it now lives, and the arms that DO run on this
+        client keep being pinned by name here.
         """
         import inspect
 
         from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.harness.codex import CodexHarness
 
         source = inspect.getsource(AcpClient._spawn)
-        assert "_is_codex" in source
-        # Upstream owns the codex branch now: it resolves through the shared
-        # ``_resolve_codex_acp_bin`` ladder rather than this build's ``acp.codex``.
-        assert "_resolve_codex_acp_bin" in source or "acp.codex" in source
-        assert "ACP_BACKEND_GOOSE" in source
-        # opencode's branch is upstream's (resolved through the shared ladder), so
-        # only this build's own adapters are pinned by name here.
-        assert "ACP_BACKEND_PI" in source
-        assert "resolve_argv_cached" in source
+        # The client-served arms. Each must be its own POSITIVE branch: a backend
+        # absent from the chain is not refused, it falls to the registry arm.
+        assert "_is_claude" in source
+        assert "_is_opencode" in source
+        assert "_is_copilot" in source
+        assert "_is_goose" in source
+        assert "_is_pi" in source
+        assert "_is_deepseek" in source
+        # And kiro is a POSITIVE arm too, not the fall-through -- serving it by
+        # absence is what let a known id exec kiro-cli under another label.
+        assert "ACP_BACKEND_KIRO" in source
+
+        # Codex: its own harness, resolving through the ladder that carries the
+        # Node floor. Not a bare ``"codex" in source``, which a comment satisfies.
+        codex_source = inspect.getsource(CodexHarness.resolve_spawn)
+        assert "_resolve_codex_acp_bin" in codex_source
 
     @pytest.mark.asyncio
     async def test_unmapped_known_backend_refuses_before_kiro_resolution(
@@ -237,12 +246,24 @@ class TestSpecAdaptersAreNotToldWeSupportElicitation:
     codex-acp gates MCP approvals on that capability: declare it and approvals
     arrive as `elicitation/create`, which Kiro Crew answers -32601, which the
     adapter converts to `action: "cancel"`. No prompt, no visible error, and the
-    call never reaches the PreToolUse gate. The constant existed for this and was
-    referenced nowhere.
+    call never reaches the PreToolUse gate.
+
+    WIDENED at the 2026-09-21 sync. This fork removed the key for SPEC ADAPTERS
+    only, keeping it on the kiro set; upstream then removed it for EVERY backend
+    on the same reasoning -- a client that sees the capability routes its
+    human-in-the-loop prompts through `elicitation/create` INSTEAD of falling
+    back to `session/request_permission`, so the declaration is not inert
+    anywhere, it replaces a working path with one that errors. That is strictly
+    stronger, so the old assertion (`"elicitation" in ACP_CLIENT_CAPABILITIES`)
+    now demands the very vulnerability this class is named for. What is pinned
+    here is the PROPERTY -- no backend is told we serve it -- and
+    `test_acp_client_capabilities.py::test_elicitation_is_not_advertised_without_a_handler`
+    is upstream's own guard on the same fact. Re-add the key only in the change
+    that registers a handler for it.
     """
 
     def test_the_spec_set_omits_elicitation(self) -> None:
-        assert "elicitation" in ACP_CLIENT_CAPABILITIES
+        assert "elicitation" not in ACP_CLIENT_CAPABILITIES
         assert "elicitation" not in ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER
 
     def test_initialize_selects_the_set_by_dialect(self) -> None:

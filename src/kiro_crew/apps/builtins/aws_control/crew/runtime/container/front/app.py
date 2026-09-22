@@ -55,7 +55,7 @@ logger = logging.getLogger("smc.front.app")
 CUSTOMER_TURN_PATH = "/v1/chat/completions"
 HEALTH_PATH = "/health"
 
-# The header the API Gateway control integration sets to the value of
+# The header a control-route request must carry, holding the value of
 # SMC_CONTROL_SECRET. ``common`` is the single definition and this is an alias for
 # readability at the use sites below, so the deploy integration matches whatever
 # ``common.CONTROL_SECRET_HEADER`` says rather than a name chosen here. An earlier comment
@@ -385,7 +385,7 @@ def build_app(
     # every path that can serve a request goes through this function.
     audit.configure_sink()
     app = FastAPI(
-        title="share-my-crew front",
+        title="remote crew front",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,

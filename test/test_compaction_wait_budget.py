@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import ast
 import inspect
-from pathlib import Path
 
 import pytest
+from source_corpus import parsed_candidates, src_root
 
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 
-_SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
+# One xdist worker for the whole module: `test_no_call_site_pins_a_shorter_wait` scans
+# src/ through the shared corpus, and under `--dist loadgroup` an unmarked module is
+# spread across workers, each of which re-pays the corpus read. One group PER FILE.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_compaction_wait_budget")
 
 
 def _wait_default(func) -> object:
@@ -126,8 +129,14 @@ def test_no_call_site_pins_a_shorter_wait():
     they are derived from the shared budget and covered by the tests above.
     """
     offenders: list[str] = []
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    # Only a file whose text names `wait_for_compaction` can hold a call to it, so
+    # the corpus parses those few files instead of the whole tree; the corpus
+    # NFKC-folds both sides, as CPython does for identifiers. A module that fails
+    # to parse propagates -- an unparseable file is a hole in this gate's coverage.
+    root = src_root()
+    for path, _text, tree in parsed_candidates(
+        require_all=("wait_for_compaction",), skip_syntax_errors=False
+    ):
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -143,7 +152,7 @@ def test_no_call_site_pins_a_shorter_wait():
                     continue  # non-literal (derived) timeouts are exempt
                 if isinstance(value, (int, float)) and value < COMPACT_WAIT_TIMEOUT_SECS:
                     offenders.append(
-                        f"{path.relative_to(_SRC_ROOT.parent.parent)}:{node.lineno}"
+                        f"src/kiro_crew/{path.relative_to(root).as_posix()}:{node.lineno}"
                         f" (timeout={value})"
                     )
     assert not offenders, (

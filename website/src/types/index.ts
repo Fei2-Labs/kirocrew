@@ -4,10 +4,11 @@ export interface StatusData {
   sessions: number
   messages: number
   /**
-   * `null` means UNKNOWN — the WS pusher's count refresh has not succeeded
-   * yet (e.g. the lesson store is failing). StatCard renders null as a
-   * loading skeleton; publishing 0 instead would assert an authoritative
-   * false zero (issue #7204). HTTP/SSE paths always send numbers.
+   * `null` means UNKNOWN — the shared count cache has not refreshed
+   * successfully yet (e.g. the lesson store is failing). StatCard renders null
+   * as a loading skeleton; publishing 0 instead would assert an authoritative
+   * false zero (issue #7204). All three transports (WS push, /api/status, SSE)
+   * read the same cache and may send null.
    */
   cron_jobs: number | null
   subagents: number
@@ -147,7 +148,7 @@ export interface StatusData {
   release_channel?: 'nightly' | 'insider' | 'stable'
   branch?: string
   commit?: string
-  /** Default ACP harness for newly created sessions. Empty backend means Kiro CLI. */
+  /** Default ACP harness for newly created sessions. */
   harness?: { backend: string; label: string; kiro_credits: boolean } | null
   /**
    * Short content hash of the SERVED frontend bundle's entry point. The SPA
@@ -456,6 +457,13 @@ export interface CronJob {
   skip_dates?: string[] | null
   script?: string | null; command?: string | null; last_result?: string | null; last_error?: string | null
   is_running?: boolean; running_since?: number | null
+  /** The installed app that owns this job, or null/absent for a person-owned
+   * one. Host-derived from the job's `created_by` stamp, which an app never
+   * supplies, so it cannot be used to claim another app's jobs. Absent on an
+   * older gateway. */
+  app?: string | null
+  /** True only when the USER paused the job; execution never sets it. */
+  user_paused?: boolean
   /** Operator-granted vault secrets injected into a script/command job's env at
    * fire time: env-var name -> vault secret NAME (values never leave the vault).
    * Absent/null when the job holds no grant. */
@@ -466,6 +474,15 @@ export interface CronJob {
   secret_env_pending?: Record<string, string> | null
   secret_env_pending_ts?: number | null
   folder_id?: string
+  /** Sidebar chat folder this job's `cron-{id}` tab is filed into, or ""/absent
+   *  for a job that is not filed. Persistent jobs only: a stateless job has no
+   *  job-wide tab, and the backend refuses the pair at save time. A different
+   *  tree from `folder_id` directly above, which groups this job's ROW on the
+   *  Schedule page — the two are never read off each other. */
+  chat_folder_id?: string
+  /** False for a job that runs on a fresh session every fire. The form does not
+   *  edit it; it only reads it to disable the chat-folder picker. */
+  persistent_session?: boolean
   /** Chat session that owns this job — ownership decides chat-side reachability
    * (cron_list only lists a session its own jobs). Null for an ownerless job,
    * which is invisible to every chat session and manageable only from the
@@ -486,6 +503,19 @@ export interface CronJob {
 
 export interface Lesson {
   rule: string; category: string; ts: string
+  /** The `DELETE /api/lessons` selector that names exactly this row. A lesson's
+   *  identity is `(rule, repo_scope)`, so two same-rule rows in two scopes are
+   *  two lessons: `""` is the global row, a fragment is that scope's row, and
+   *  `null` is a row whose stored scope is unusable -- send NO selector for it,
+   *  the unselective delete is the only path that reaches such a row. */
+  repo_scope?: string | null
+  /** Which JSONL file the row was read from, when the list is the JSONL union of
+   *  the global file and the active workspace's. `DELETE /api/lessons` defaults to
+   *  the global file, so a workspace row's delete must carry these back or it
+   *  removes a same-text global row and leaves this one. Absent on vector rows,
+   *  where the delete reaches the store whatever `scope` says. */
+  scope?: 'global' | 'workspace'
+  workspace?: string
 }
 
 /** One row of `GET /api/memory/stores` — a declared memory store.
@@ -758,10 +788,18 @@ export interface DiscoveredMcpServer {
   deprecated: boolean
 }
 
+/** Outcome of one provider leg in an MCP discovery search. */
+export interface McpProviderOutcome {
+  name: string
+  status: 'ok' | 'timeout' | 'error'
+}
+
 /** Response from GET /api/mcp/discover */
 export interface McpDiscoverResponse {
   results: DiscoveredMcpServer[]
   providers: string[]
+  /** Additive for compatibility with gateways that predate outcome reporting. */
+  provider_outcomes?: McpProviderOutcome[]
 }
 
 /** Install-plan preview inside the discover detail response. */
@@ -1014,6 +1052,11 @@ export interface RemoteCrewCapabilities {
 }
 
 export interface ChatSlot {
+  /** Which namespace `agent` was chosen in: a configured member, a shared
+   *  provider template, or "" when the choice was made by name alone or came
+   *  back from history. Display provenance for the picker's selected row; the
+   *  backend never reads it as authority. */
+  agent_kind?: 'member' | 'template' | ''
   /** The agent that will actually answer, when it is NOT the requested `agent`;
    *  "" / absent means nothing to report. The backend stores `agent` verbatim
    *  (the user's intent) and reports the divergence here instead of rewriting it,
@@ -1036,6 +1079,8 @@ export interface ChatSlot {
    *  `model_withheld`: it describes the session, so it must not drive a
    *  write. */
   served_model?: string
+  /** Live ACP provider label for this slot. */
+  provider_label?: string
   /** Remote-execution binding. `executor` is "local" for an ordinary session and
    *  "remote" for one whose turns run on a connected crew; `instance_id` names
    *  that crew. The backend ships BOTH on every slot so "runs locally" is a
@@ -1057,17 +1102,17 @@ export interface ChatSlot {
    *  falls back to `peer_id` + `key` for those. Never parse it to recover the local
    *  slot key: read `key`. */
   row_identity?: string
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number; clean_mode?: boolean; provider_label?: string;
+  /** Provider session identity when it differs from the dashboard slot key. */
+  linked_session_key?: string
+  /** Prompts held for a later turn on this slot. */
+  queue_depth?: number
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
    * | "system"; absent/"" for untagged background slots). The session-pulse
    * survey shows only on a "user" slot, so an imported Slack thread, a
    * task-runner slot, or an app/cron-minted session (which can share the
    * `chat-<n>-<ts>` key shape) never triggers it. */
   origin?: string
-  /** Live ACP harness this slot's provider is driving (``''`` = kiro).
-   * Omitted when no provider is bound yet. Distinct from `status.harness`,
-   * which is the default for *new* sessions. */
-  acp_backend?: string
   /** Slot key of the session that asked for this one via the session-control
    * create verb; "" / absent for a person's own tab, a fork, a restore. Durable
    * (written at birth, rehydrated), so it is the one link from a crew member's
@@ -1265,7 +1310,7 @@ export interface PullRequestSource {
 }
 
 export interface ChatFolder {
-  id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; icon?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
   /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
    *  this folder. Absent = no tags, mirroring the optional `color`. */
   tags?: string[]
@@ -1315,6 +1360,22 @@ export interface ChatMessage {
   seq?: number
   /** Gateway process generation that numbered `seq` (folded snapshot rows). */
   gen?: string
+  /** One skill-selection decision the gateway stamped on the row that ends the
+   *  turn, when the Decisions (Jev) seam answered for it. Typed `unknown`
+   *  because the shape is validated at the read, by
+   *  `pages/chat/decisionRecord.ts` — the strip draws nothing for a record it
+   *  cannot check. The gateway stamps it under `meta` on both doors, and this
+   *  top-level spelling is accepted as well, the split `kind` above has too. */
+  decisions_strip?: unknown
+  /** One risk annotation the gateway stamped on a TOOL row when the Decisions
+   *  (Jev) seam answered `tool.risk` for that call. Typed `unknown` because the
+   *  shape is validated at the read, by `pages/chat/toolRiskRecord.ts` — the
+   *  badge draws nothing for a record it cannot check, and nothing for the `safe`
+   *  tier. An ANNOTATION: the permission decision was taken without it, so a
+   *  record never means the call was stopped or altered. Stamped under `meta` on
+   *  both doors; this top-level spelling is accepted too, as `decisions_strip`
+   *  and the split `kind` above are. */
+  decisions_tool_risk?: unknown
 }
 
 export interface SubagentActivity {
@@ -1338,6 +1399,15 @@ export interface SubagentActivity {
   status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped'
   streaming: string; lastTool: string
   startedAt: number; elapsed: number; error?: string
+  /** True when `startedAt` was ASSUMED rather than observed, which is the case
+   *  for an entry minted by `upsertSlotSub` from an incremental frame: that frame
+   *  carries no start time, so the entry records its arrival instant. The agent
+   *  may already have been running for minutes, so a row MUST NOT render an
+   *  elapsed figure derived from it -- a card reading "3s" for a five-minute run
+   *  is the two-numbers-disagree confusion the idle row exists to remove. Cleared
+   *  by any frame that supplies real timing: a `subagent_snapshot` replay carries
+   *  `started`, and `subagent_done` carries `elapsed`. */
+  startedAtAssumed?: boolean
   toolCount?: number      // observed tool calls (incl. auto-approved) — running-card progress
   stalled?: boolean       // reaper flagged this subagent as idle/stalled
   /** Seconds of no stream activity measured when the reaper raised `stalled`
@@ -1362,7 +1432,7 @@ export interface SubagentActivity {
 
 export interface ToolActivity {
   type: string
-  text: string          // reasoning text or tool name
+  text: string          // tool name (or approval / activity label)
   purpose?: string      // tool purpose
   input?: string        // tool input (commands, file content, etc.)
   output?: string       // tool output (stdout, results, etc.)
@@ -1375,6 +1445,8 @@ export interface ToolActivity {
   rejected?: boolean     // true when approval was rejected
   kind?: string          // ACP tool kind; execute is the legacy shell signal
   is_shell?: boolean     // shell tools can expose an indeterminate live status
+  tool_name?: string     // trusted programmatic tool name (_meta.kiro.toolName), when sent
+  mcp_server?: string    // MCP server that served the call (_meta.kiro.mcpServerName), when sent
 }
 
 /** Parsed content block produced by the block assembler. */
@@ -1437,8 +1509,11 @@ export interface TaskDetail {
 export type RunStatus = 'planning' | 'planned' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused' | 'pausing';
 export interface ProjectRun {
   task_id: string; name?: string; running: boolean; status: RunStatus
-  steps: number; completed: number; failed: number; skipped: number
-  current_step: number; spec: string; spec_name: string; error: string
+  /** Total step count. Named for the wire: `build_status` emits `tasks`, and
+   *  `steps`/`current_step` — the names this interface used to declare — are
+   *  sent by no producer, so both read `undefined` on every row. */
+  tasks: number; completed: number; failed: number; skipped: number
+  current_task: number; spec: string; spec_name: string; error: string
   tokens_used: number; replan_count: number; task_details: TaskDetail[]
   started_at: number; finished_at: number
   work_dir: string; branch_name: string
@@ -1506,6 +1581,11 @@ export interface PublishProviderDescriptor {
    *  available. Optional: older gateways omit it, and a row with no hint simply shows
    *  none rather than inventing one. */
   install_hint?: string
+  /** False => the published link requires authentication (content is stored privately),
+   *  so the publish flow shows neither the public-exposure warning nor the "publish
+   *  publicly" acknowledgment. Optional: older gateways omit it, and absence means
+   *  reachable -- a missing warning on a public link is the worse mistake. */
+  public_reachable?: boolean
   sharing_model: {
     supports_private: boolean
     supports_shared: boolean

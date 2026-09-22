@@ -22,6 +22,7 @@ from unittest import mock
 import pytest
 
 import kiro_crew.discord.transport_dispatch as td_mod
+from conftest import assert_rejected_without_backtracking
 from kiro_crew import session_directive
 from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
@@ -1191,19 +1192,16 @@ class TestExtractOptions:
         # each position — polynomial. The tempered body
         # (?:[^[]|\[(?!OPTIONS:))* forbids only a re-occurring "[OPTIONS:", so
         # the body is unambiguous (linear). A whitespace-padded unterminated tag
-        # and many repeated "[OPTIONS:" prefixes (the real pump) must both return
-        # promptly.
-        import time
-
-        for evil in (
-            "[OPTIONS:" + ("\t" * 200_000) + "x",
-            "[OPTIONS:" * 100_000 + "x",
-        ):
-            start = time.perf_counter()
-            body, opts = _extract_options(evil)
-            elapsed = time.perf_counter() - start
-            assert elapsed < 1.0, f"_extract_options took {elapsed:.2f}s (possible ReDoS)"
+        # and many repeated "[OPTIONS:" prefixes (the real pump) must both be
+        # rejected in CPU time linear in the pump -- see
+        # conftest.assert_rejected_without_backtracking for why this is not a
+        # 1.0 s wall-clock bound.
+        def reject(text: str) -> None:
+            body, opts = _extract_options(text)
             assert opts == []
+
+        assert_rejected_without_backtracking(reject, lambda n: "[OPTIONS:" + ("\t" * n) + "x")
+        assert_rejected_without_backtracking(reject, lambda n: "[OPTIONS:" * n + "x")
 
 
 class TestStripSteering:
@@ -1441,12 +1439,13 @@ class TestDiscordAttachmentAdapter:
         client.attachment_bodies[url] = b"OggS" + b"\x00" * 32
         transcribed: list[str] = []
 
-        async def _transcribe(path: str) -> str:
+        async def _transcribe(path: str, _cfg: object) -> str:
             assert os.path.exists(path)
             transcribed.append(path)
             return "spoken words"
 
         monkeypatch.setattr("kiro_crew.transcribe.is_available", lambda: True)
+        monkeypatch.setattr("kiro_crew.transcribe.batch_duration_cap_secs", lambda _cfg: None)
         monkeypatch.setattr("kiro_crew.transcribe.transcribe_audio", _transcribe)
 
         result = await process_discord_attachments(
@@ -4210,6 +4209,132 @@ class TestUndeliveredTurnIsNotASuccess:
         d, _cli, sess = _dispatcher({"u1"})
         await d.handle_message(_inbound("hi"))
         assert sess.successes and not sess.failures
+
+
+class _RecordingCtx(FakeCtx):
+    """``FakeCtx`` that also keeps every ``build_message`` kwarg."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.build_calls: list[dict[str, Any]] = []
+
+    def build_message(self, text: str, is_new: bool, key: str, **kw: Any) -> Any:
+        self.build_calls.append({"text": text, "is_new": is_new, "key": key, **kw})
+        return super().build_message(text, is_new, key, **kw)
+
+
+def _arm_reinjection(sessions: Any) -> dict[str, Any]:
+    """Give the session stand-in the real manager's one-shot flag surface."""
+    ledger: dict[str, Any] = {"consumed": [], "marks": 0, "armed": True}
+
+    def _consume(key: str) -> bool:
+        ledger["consumed"].append(key)
+        was = ledger["armed"]
+        ledger["armed"] = False
+        return was
+
+    def _mark(key: str) -> None:
+        ledger["marks"] += 1
+        ledger["armed"] = True
+
+    sessions.consume_needs_reinjection = _consume
+    sessions.mark_needs_reinjection = _mark
+    return ledger
+
+
+class _DyingProvider(FakeProvider):
+    """A provider whose very next turn fails before any text lands."""
+
+    async def stream(self, message: str) -> Any:
+        raise RuntimeError("provider fell over")
+        yield  # pragma: no cover -- makes this an async generator
+
+
+class TestCompactionReinjection:
+    """The Discord turn loop is its own copy, so it must consume the flag itself.
+
+    ``session_compaction`` marks ``needs_reinjection`` after an in-place compaction
+    dropped the session-start context. A turn loop that does not read it runs
+    every turn after ``!compact`` without the skills index or the response-preferences
+    block.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_compacted_session_forwards_the_flag_to_build_message(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        d.ctx_builder = _RecordingCtx()  # type: ignore[assignment]
+        ledger = _arm_reinjection(sess)
+        await d.handle_message(_inbound("hi"))
+        call = d.ctx_builder.build_calls[-1]
+        assert ledger["consumed"] == [call["key"]], "consumed under the key the turn runs as"
+        assert call["needs_reinjection"] is True
+        # Landed: consumed exactly once, and NOT put back.
+        assert ledger["marks"] == 0 and ledger["armed"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_session_stand_in_without_the_flag_gets_the_false_default(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        d.ctx_builder = _RecordingCtx()  # type: ignore[assignment]
+        assert not hasattr(sess, "consume_needs_reinjection")
+        await d.handle_message(_inbound("hi"))
+        assert d.ctx_builder.build_calls[-1]["needs_reinjection"] is False
+        assert sess.successes, "the turn still ran"
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_consuming_turn_puts_the_flag_back(self) -> None:
+        # A !stop completes the turn normally with stop_reason "cancelled", and
+        # the backend drops that turn from its transcript -- the re-injected
+        # context goes with it, so the flag must come back like a raised turn.
+        d, _cli, sess = _dispatcher({"u1"})
+        d.ctx_builder = _RecordingCtx()  # type: ignore[assignment]
+        ledger = _arm_reinjection(sess)
+
+        class _Cancelled(FakeProvider):
+            async def stream(self, message: str) -> Any:
+                yield _Ev(EVENT_COMPLETE, stop_reason="cancelled")
+
+        async def _cancelled(key: str, **kw: Any) -> Any:
+            return _Cancelled(), True, False
+
+        sess.get_or_create = _cancelled  # type: ignore[method-assign]
+        await d.handle_message(_inbound("hi"))
+        assert d.ctx_builder.build_calls[-1]["needs_reinjection"] is True
+        assert ledger["marks"] == 1 and ledger["armed"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_delivery_failure_after_a_landed_turn_does_not_rearm(self) -> None:
+        # The provider completed the turn, so the re-injected context is in the
+        # conversation; Discord then failed every send. That is a delivery
+        # failure (recorded as one), not a lost prompt -- re-arming would inject
+        # the same context a second time on the next turn.
+        d, cli, sess = _dispatcher({"u1"})
+        d.ctx_builder = _RecordingCtx()  # type: ignore[assignment]
+        ledger = _arm_reinjection(sess)
+        cli.edit_ok = False
+        cli.fail_sends = True
+        await d.handle_message(_inbound("hi"))
+        assert d.ctx_builder.build_calls[-1]["needs_reinjection"] is True
+        assert sess.failures and not sess.successes, "undelivered is still a failure"
+        assert ledger["marks"] == 0 and ledger["armed"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_failed_consuming_turn_puts_the_flag_back(self) -> None:
+        # The flag is cleared BEFORE build_message; a provider error on that very
+        # turn discards the prompt carrying the re-injected context. Without the
+        # re-arm the session runs without it until the NEXT compaction -- the
+        # contract the dashboard runner keeps in its finally, applied here.
+        d, _cli, sess = _dispatcher({"u1"})
+        d.ctx_builder = _RecordingCtx()  # type: ignore[assignment]
+        ledger = _arm_reinjection(sess)
+
+        async def _dying(key: str, **kw: Any) -> Any:
+            return _DyingProvider(), True, False
+
+        sess.get_or_create = _dying  # type: ignore[method-assign]
+        await d.handle_message(_inbound("hi"))
+        assert d.ctx_builder.build_calls[-1]["needs_reinjection"] is True
+        assert sess.failures and not sess.successes
+        assert ledger["marks"] == 1 and ledger["armed"] is True
 
 
 class TestGuildCommandRefusalsAreVisible:

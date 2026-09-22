@@ -167,7 +167,13 @@ class TestDescriptorPayload:
         """
         capabilities = handler._descriptor_payload(ACP_BACKEND_CODEX)["capabilities"]
         assert capabilities["reasoning_effort"] == "supported"
-        assert capabilities["session_sharing"] == "unavailable"
+        # An UNAVAILABLE and a DEGRADED level, so a boolean collapse is still
+        # caught: this used to read session_sharing, which became "supported"
+        # when upstream graduated codex onto AcpRuntime and measured it. The
+        # capability named here is incidental -- what is pinned is that the four
+        # levels stay four distinct strings.
+        assert capabilities["mcp_tool_search"] == "unavailable"
+        assert capabilities["slash_commands"] == "degraded"
         assert capabilities["native_resume"] == "supported"
         kas = handler._descriptor_payload(ACP_BACKEND_KAS)["capabilities"]
         assert kas["reasoning_effort"] == "unverified"

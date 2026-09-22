@@ -146,7 +146,12 @@ predate this subsystem and remain the color-theme surface.)
   `fcntl.F_GETPATH` on macOS, and `GetFinalPathNameByHandleW` on Windows. The
   resolved path must remain inside the pack root; an unavailable or failed
   resolution rejects the read rather than falling back to a pathname-only
-  check.
+  check. On macOS, a case-only spelling mismatch is accepted by the shared
+  reader only after a no-follow walk proves identity with the held descriptor;
+  containment compares kernel spellings of the file and pinned root, never a
+  globally case-folded prefix. This lets legitimate APFS aliases reach the
+  install destination guard, which still refuses a source inside its own
+  destination before promotion and preserves source and sibling contents.
 - **postMessage allowlist** — the parent (`ThemeExperienceLayer.tsx`) accepts
   only `theme:resize`, `theme:sound`, `theme:visibility`, and `theme:state`
   messages from a pack iframe; all others are dropped.
@@ -228,6 +233,7 @@ predate this subsystem and remain the color-theme surface.)
 | Loader | `website/src/hooks/useTheme.tsx` | Applies CSS vars; `applyThemeOverrides` → `_scopeOverridesCss` + `_rewriteOverridesUrls`; `injectThemeFonts`; pre-apply self-repair; `themeSwitching` state |
 | Experience layer | `website/src/components/ThemeExperienceLayer.tsx` | Mounts sandboxed overlay/topbar iframes + audio; enforces the postMessage allowlist |
 | Settings UI | `website/src/pages/settings/DisplayPanel.tsx` | Single Theme dropdown + install-from-local/GitHub + remove + "Applying…" status indicator |
+| Utility bridge | `website/src/tailwind-theme.css` | Tailwind v4 `@theme` mapping each utility (`bg-accent`, `text-muted/40`, `rounded-md`, `shadow-sm`, `font-mono`) onto the runtime CSS variable of the same stem, plus the `dark:` variant keyed on `[data-theme="dark"]`. A pack changes what a utility renders by writing the variable; it never touches this file. |
 
 ### One theme, one picker row (registered vs installed)
 

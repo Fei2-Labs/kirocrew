@@ -47,6 +47,9 @@ def _mock_sessions() -> MagicMock:
     provider.start = AsyncMock()
     provider.shutdown = AsyncMock()
     provider.context_usage_pct = lambda: 0.0
+    # Read synchronously by the run loop's window resolution; as an AsyncMock
+    # child it would hand back a coroutine nobody awaits.
+    provider.context_window_tokens = lambda: 0
 
     async def _empty_stream(*_args: object, **_kwargs: object):  # type: ignore[no-untyped-def]
         return
@@ -58,6 +61,7 @@ def _mock_sessions() -> MagicMock:
     sessions.reset = AsyncMock()
     sessions.record_success = MagicMock()
     sessions.get_agent = MagicMock(return_value="")
+    sessions.get_agent_selection = MagicMock(return_value=("template", ""))
     # NOT "auto": a default install has no session trust, so the spawn falls
     # through to the interactive approval callback.
     sessions.get_approval_policy = MagicMock(return_value="ask")

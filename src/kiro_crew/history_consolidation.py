@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -58,6 +59,64 @@ _CONSOLIDATION_MAX_ATTEMPTS = 5
 _CONSOLIDATION_BACKOFF_BASE_SECS = 900.0
 _CONSOLIDATION_BACKOFF_MAX_SECS = 86400.0
 _SKILL_DETECTION_WINDOW = 200
+
+#: Wall-clock ceiling on the memory writes of ONE consolidation pass that embed
+#: inline. A pass writes up to ``_MAX_SEMANTIC_PER_CONSOLIDATION`` +
+#: ``_MAX_EPISODIC_PER_CONSOLIDATION`` rows and each one embeds its text through a
+#: blocking inference call, so a degraded embedder makes the pass cost N times one
+#: call's latency — all of it on an embed-pool worker, which is shared with every
+#: other embed consumer. Past the ceiling the rest of the pass is written with its
+#: embedding deferred, so it stops queueing inference it has measured to be slow.
+#: Deferred rows are filled in by the standing repair sweep
+#: (``backfill_missing_embeddings``), which is what makes deferral lossless.
+_EMBED_BUDGET_SECS_PER_PASS = 60.0
+
+
+class _EmbedBudget:
+    """One consolidation pass's embed-time ceiling, and the latch it arms.
+
+    The ceiling is measured over the store WRITES, not over the embed calls
+    themselves: the consolidation layer has no seam onto an individual embed, and
+    write time is the quantity that actually has to be bounded. Inference is the
+    only unbounded part of a write — the rest is local SQLite work — so a slow
+    embedder is what normally spends this budget, though lock contention or a
+    stalled disk can spend it too. The remedy for either is the same, and it is
+    self-healing: the repair sweep embeds what this pass deferred.
+
+    Once tripped the latch stays tripped for the rest of the pass — that is the
+    whole point. Without it, an embedder that is slow for the first row is slow for
+    every row, and the pass pays that latency once per item before finishing with
+    exactly the same rows it would have written anyway (a failed embed already
+    stores a NULL vector for the repair sweep to fill).
+    """
+
+    __slots__ = ("_budget", "_logger", "_spent", "tripped")
+
+    def __init__(self, budget_secs: float, logger: logging.Logger) -> None:
+        self._budget = budget_secs
+        self._logger = logger
+        self._spent = 0.0
+        self.tripped = False
+
+    @contextlib.contextmanager
+    def measured(self):
+        """Time one store write and charge it to the pass, arming the latch once."""
+        started = _time.monotonic()
+        try:
+            yield
+        finally:
+            self._spent += _time.monotonic() - started
+            if not self.tripped and self._spent >= self._budget:
+                self.tripped = True
+                # Once per pass, not once per row: a degraded embedder would
+                # otherwise repeat this line for every remaining item.
+                self._logger.warning(
+                    "Consolidation spent %.1fs on memory writes (budget %.1fs); "
+                    "embedding is deferred to the repair sweep for the rest of this pass",
+                    self._spent,
+                    self._budget,
+                )
+
 
 #: Default for the two write helpers' store arguments, meaning "argument not
 #: supplied — use the global handle off ``self``". It cannot be ``None``, because
@@ -816,6 +875,16 @@ class HistoryConsolidator:
         # itself raised, and that path is not billed.
         attempted = AttemptedSpan(0, 0, 0)
         try:
+            from kiro_crew.execution_context import read_session_execution
+            from kiro_crew.history import is_incognito_transcript
+
+            execution = await asyncio.to_thread(read_session_execution, key)
+            if execution is not None and execution.memory_mode != "persistent":
+                return _CONSOLIDATION_REFUSED
+
+            metadata = await asyncio.to_thread(self._log.get_metadata, key)
+            if isinstance(metadata, dict) and is_incognito_transcript(metadata.get("memory_mode")):
+                return _CONSOLIDATION_REFUSED
             # Atomically snapshot the unconsolidated tail, the total message
             # count (the absolute offset handed to mark_consolidated below), and
             # the rotation generation under ONE lock hold. Reading them as
@@ -868,31 +937,27 @@ class HistoryConsolidator:
                 offset=total - len(unconsolidated),
             )
 
-            # Resolve this session's memory target from its metadata. A NAMED
-            # memory store is the tighter scope and takes all three handles --
-            # markdown, lessons and vectors -- because the vector handle is what
-            # actually creates isolation: without it a crew reads its own markdown
-            # and writes its semantic, episodic and lesson rows into the global
-            # table. The workspace arm below is byte-identical to the v1 path.
+            # Resolve the owning execution once. V2 learning requires its exact
+            # database; only V1 retains Markdown and JSONL learning handles.
             from kiro_crew.context import store_of_session
             from kiro_crew.memory_stores import memory_store_version
 
             # Resolve through the same strict metadata reader as interactive
             # turns before any consolidation provider or memory write starts.
             def _resolve_memory_identity() -> tuple[str, bool]:
-                store_name = store_of_session(self._log, key)
+                store_name = (
+                    execution.store.legacy_name
+                    if execution is not None
+                    else store_of_session(self._log, key)
+                )
                 return store_name, bool(store_name and memory_store_version(store_name) == 2)
 
-            store_name, private_memory = await asyncio.to_thread(_resolve_memory_identity)
+            store_name, member_memory = await asyncio.to_thread(_resolve_memory_identity)
             # V2 anchors are owner-managed essentials. Extract proposed facts
             # through the revision-aware structured path; never let a legacy
             # whole-file rewrite remove their rules or age out project guides.
-            allow_markdown_updates = not self._migrated and not private_memory
-            if private_memory:
-                from kiro_crew.member_memory_auth import require_private_memory_execution
-
-                await asyncio.to_thread(require_private_memory_execution)
-            meta = self._log.get_metadata(key)
+            allow_markdown_updates = not self._migrated and not member_memory
+            meta = metadata
             facets = _session_facets(meta, key)
             ws_name = meta.get("workspace")
             lessons_store = self._lesson_store
@@ -903,8 +968,12 @@ class HistoryConsolidator:
                 memory = await asyncio.to_thread(
                     ContextBuilder.get_memory_for, memory_store=store_name
                 )
-                lessons_store = await asyncio.to_thread(
-                    ContextBuilder.get_lessons_for, memory_store=store_name
+                lessons_store = (
+                    None
+                    if member_memory
+                    else await asyncio.to_thread(
+                        ContextBuilder.get_lessons_for, memory_store=store_name
+                    )
                 )
                 # May be None when the store could not be stood up; the writes
                 # below then skip the vector tier rather than falling back to the
@@ -918,6 +987,45 @@ class HistoryConsolidator:
             else:
                 memory = self._memory
                 vector_store = self._vector_store
+
+            source_id = ""
+            if member_memory:
+                if vector_store is None:
+                    raise RuntimeError("Member memory database is unavailable")
+                source_id = hashlib.sha256(
+                    json.dumps(
+                        [
+                            key,
+                            generation_at_snapshot,
+                            attempted.offset,
+                            include_history,
+                            None if include_history else total,
+                        ]
+                    ).encode("utf-8")
+                ).hexdigest()
+                committed = await asyncio.to_thread(vector_store.consolidation_receipt, source_id)
+                if committed is not None:
+                    from kiro_crew.vector_memory import consolidation_source_digest
+
+                    count = committed["source_count"]
+                    if (
+                        len(unconsolidated) < count
+                        or await asyncio.to_thread(
+                            consolidation_source_digest, unconsolidated[:count]
+                        )
+                        != committed["source_digest"]
+                    ):
+                        raise ValueError(
+                            "Committed consolidation source changed before acknowledgement"
+                        )
+                    if include_history:
+                        await asyncio.to_thread(
+                            self._log.mark_consolidated,
+                            key,
+                            committed["source_total"],
+                            generation_at_snapshot,
+                        )
+                    return None
 
             conversation = "\n".join(_fmt_message(m) for m in unconsolidated)
 
@@ -1089,8 +1197,8 @@ class HistoryConsolidator:
             ]
             if has_vector:
                 prompt_parts.append(f"\n\n## Current Semantic Memory\n{semantic_json}")
-            if allow_markdown_updates or private_memory:
-                if private_memory:
+            if allow_markdown_updates or member_memory:
+                if member_memory:
                     prompt_parts.append(
                         "\n\nThe following member anchors are read-only. Do not return "
                         "preferences_update or projects_update; preserve the owner's core "
@@ -1105,9 +1213,9 @@ class HistoryConsolidator:
 
             try:
                 result = (
-                    await self._call_llm(prompt, memory_store=store_name)
-                    if private_memory
-                    else await self._call_llm(prompt)
+                    await self._call_llm(prompt, memory_store=store_name, session_key=key)
+                    if member_memory
+                    else await self._call_llm(prompt, session_key=key)
                 )
             except _ConsolidationNotDispatched as exc:
                 # Nothing was sent, so nothing was billed. Charging this to the
@@ -1150,7 +1258,21 @@ class HistoryConsolidator:
                 )
                 return _CONSOLIDATION_REFUSED
 
-            if entry := result.get("history_entry"):
+            if member_memory:
+                if vector_store is None:
+                    raise RuntimeError("Member memory database is unavailable")
+                await run_in_embed_pool(
+                    vector_store.apply_consolidation,
+                    source_id=source_id,
+                    session_key=key,
+                    source_total=total,
+                    result=result,
+                    snapshot={row["key"]: row for row in current_semantic},
+                    messages=unconsolidated,
+                    facets=facets,
+                )
+
+            if not member_memory and (entry := result.get("history_entry")):
                 # Offloaded to a worker thread: append_history takes a blocking
                 # advisory file lock (cross-process) and does synchronous file
                 # IO, and _consolidate runs on the event loop thread (fired via
@@ -1164,7 +1286,7 @@ class HistoryConsolidator:
             # to the in-process embedder, and _consolidate runs on the event loop thread (fired via
             # asyncio.create_task). Running it inline stalls the whole gateway loop
             # if the embedding endpoint is slow/hung (heartbeats, Slack, dashboard).
-            if vector_store:
+            if vector_store and not member_memory:
                 await run_in_embed_pool(
                     self._write_structured_memory,
                     result,
@@ -1231,7 +1353,11 @@ class HistoryConsolidator:
             # Lesson extraction: _save_lessons calls write_lesson which embeds
             # each rule (+ up to 5 lazy backfills) via blocking urllib to Ollama.
             # Same rationale as _write_structured_memory above — must offload.
-            if (lessons_store or vector_store) and (raw_lessons := result.get("lessons")):
+            if (
+                not member_memory
+                and (lessons_store or vector_store)
+                and (raw_lessons := result.get("lessons"))
+            ):
                 await run_in_embed_pool(
                     self._save_lessons,
                     raw_lessons,
@@ -1247,7 +1373,7 @@ class HistoryConsolidator:
             # Auto-skills are shared install-wide. Private member experience
             # must not be published or contribute to another member's skills.
             if (
-                not private_memory
+                not member_memory
                 and include_history
                 and self._auto_skills_enabled
                 and self._skills_loader is not None
@@ -1263,7 +1389,7 @@ class HistoryConsolidator:
             # the existing idle/periodic path; throttle to at most once/hour
             # across all sessions so frequent consolidations don't rescan the set.
             if (
-                not private_memory
+                not member_memory
                 and self._skills_loader is not None
                 and (_time.time() - self._last_lifecycle) > 3600
             ):
@@ -1580,7 +1706,7 @@ class HistoryConsolidator:
                 scope, drop = self._gated_lesson_scope(item)
                 if drop:
                     continue
-                lesson_store.save(
+                outcome = lesson_store.save(
                     Lesson(
                         ts=datetime.now(tz=_tz.utc).isoformat(),
                         rule=item["rule"],
@@ -1591,7 +1717,8 @@ class HistoryConsolidator:
                         repo_scope=scope,
                     )
                 )
-                count += 1
+                if outcome != "refused":
+                    count += 1
         if count:
             self._logger.info("Extracted %d lesson(s) from chat", count)
 
@@ -1618,6 +1745,9 @@ class HistoryConsolidator:
             return
         source = f"consolidation:{key}"
         private_policy = getattr(vector_store, "algorithm_version", "v1") == "v2"
+        # Shared by both tiers below: each embeds inline, so both charge the same
+        # pass and either can arm the latch for the other.
+        budget = _EmbedBudget(_EMBED_BUDGET_SECS_PER_PASS, self._logger)
 
         # Semantic entries
         semantic_items = result.get("semantic")
@@ -1675,14 +1805,16 @@ class HistoryConsolidator:
                     if evidence:
                         extra["correction"] = evidence
                         extra["expected_revision"] = evidence.revision
-                err = vector_store.set_semantic(
-                    key=item["key"],
-                    value=item["value"],
-                    confidence=conf,
-                    source=source,
-                    facets=facets,
-                    **extra,
-                )
+                with budget.measured():
+                    err = vector_store.set_semantic(
+                        key=item["key"],
+                        value=item["value"],
+                        confidence=conf,
+                        source=source,
+                        facets=facets,
+                        defer_embedding=budget.tripped,
+                        **extra,
+                    )
                 if err is None:
                     written += 1
                 else:
@@ -1707,6 +1839,7 @@ class HistoryConsolidator:
         episodic_items = result.get("episodic")
         if isinstance(episodic_items, list):
             written = 0
+            deferred = 0
             for item in episodic_items[:_MAX_EPISODIC_PER_CONSOLIDATION]:
                 if not isinstance(item, dict) or not isinstance(item.get("text"), str):
                     continue
@@ -1719,18 +1852,43 @@ class HistoryConsolidator:
                     continue
                 if not math.isfinite(importance) or not 0 <= importance <= 1:
                     continue
-                ep_ok = vector_store.write_episodic(
-                    text=item["text"],
-                    conversation_id=key,
-                    tags=tags,
-                    importance=importance,
-                    source=source,
-                    facets=facets,
-                )
+                # `defer_embedding` stores the row with a NULL vector instead of
+                # embedding it here. The text is keyword-searchable at once and the
+                # repair sweep fills the vector in.
+                #
+                # `preserve_existing` comes with it, and is not optional: without a
+                # vector the similarity dedup cannot run, and on a legacy V1 store
+                # at its episodic cap the insert would then tombstone the
+                # lowest-importance row to make room for a paraphrase it never
+                # compared against. A write that cannot arbitrate a conflict has no
+                # standing to evict, so at the cap the deferred row is refused
+                # instead — the transcript it came from is still on disk, and the
+                # row it would have displaced is not recoverable.
+                #
+                # Read before the write, so the row that SPENDS the budget is the
+                # last one to pay for an embed rather than the first to skip one.
+                defer = budget.tripped
+                with budget.measured():
+                    ep_ok = vector_store.write_episodic(
+                        text=item["text"],
+                        conversation_id=key,
+                        tags=tags,
+                        importance=importance,
+                        source=source,
+                        facets=facets,
+                        defer_embedding=defer,
+                        preserve_existing=defer,
+                    )
                 if ep_ok:
                     written += 1
+                    if defer:
+                        deferred += 1
             if written:
-                self._logger.info("Wrote %d episodic entries from consolidation", written)
+                self._logger.info(
+                    "Wrote %d episodic entries from consolidation (%d with embedding deferred)",
+                    written,
+                    deferred,
+                )
 
     def _dedupe_candidate(
         self, slug: str, description: str, triggers: str
@@ -2325,7 +2483,9 @@ class HistoryConsolidator:
                     metadata={"name": name, "reason": "update_failed"},
                 )
 
-    async def _call_llm(self, prompt: str, *, memory_store: str = "") -> dict | None:
+    async def _call_llm(
+        self, prompt: str, *, memory_store: str = "", session_key: str = ""
+    ) -> dict | None:
         """Call LLM for consolidation via the persistent background session.
 
         Uses the shared background kiro-cli process (no spawn/teardown cost).
@@ -2363,6 +2523,13 @@ class HistoryConsolidator:
                         self._sessions,
                         task="consolidation",
                         agent="kirocrew-lite",
+                        # This turn is spent on ONE session's transcript, so its
+                        # cost belongs in that session's log even though the user
+                        # never asked for it. Callers that pass no key -- skill
+                        # detection, the dedupe and merge judges -- are not charged
+                        # to a single session and record nothing.
+                        crew_log_kind="memory_consolidation",
+                        crew_log_session_key=session_key,
                         **({"memory_store": memory_store} if memory_store else {}),
                     )
                 )

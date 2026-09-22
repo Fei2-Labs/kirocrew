@@ -231,8 +231,14 @@ class TestRuntimeCapabilityGate:
         leaves residue for a session that was never allowed to start.
         """
         work_dir = tmp_path / "never-created"
+        # CLAUDE, not codex: the refusal under test is "this backend is not served
+        # by AcpRuntime", and codex no longer qualifies -- upstream graduated it
+        # onto the runtime unconditionally (ACP_BACKENDS_ACP_RUNTIME), so spawning
+        # it here is now allowed and the test would be asserting the refusal of a
+        # backend that is never refused. claude runs one process per session on the
+        # AcpClient path, so it is genuinely ineligible.
         runtime = AcpRuntime(
-            agent="kirocrew", work_dir=str(work_dir), acp_backend=ACP_BACKEND_CODEX
+            agent="kirocrew", work_dir=str(work_dir), acp_backend=ACP_BACKEND_CLAUDE
         )
         with pytest.raises(AcpRuntimeError):
             await runtime.spawn()

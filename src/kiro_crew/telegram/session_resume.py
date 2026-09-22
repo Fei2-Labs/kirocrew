@@ -18,6 +18,7 @@ from kiro_crew.messaging.session_resume import (
     SessionChoice,
     SessionResumeController,
     same_bucket_origin_keys,
+    session_title_of,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -315,14 +316,8 @@ class TelegramSessionResume:
         return released
 
     async def _title_of(self, session_key: str) -> str:
-        title = ""
-        if self.conv_log is not None:
-            try:
-                meta = await asyncio.to_thread(self.conv_log.get_metadata, session_key)
-                title = str((meta or {}).get("title") or "")
-            except Exception:
-                logger.debug("Telegram resume: title lookup failed", exc_info=True)
-        return title or session_key.removeprefix("dashboard:")
+        """The stored title for *session_key*, read off-loop, with a stable fallback."""
+        return await asyncio.to_thread(session_title_of, self.conv_log, session_key, "Telegram")
 
     async def show_picker(
         self,

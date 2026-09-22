@@ -333,9 +333,7 @@ def test_exec_in_pod_refuses_before_touching_the_pod(tmp_path, monkeypatch):
     """The refusal must precede resolution, so it holds even for a pod that has
     no pinned checkout — and must never reach execve."""
     cfg = _pod_cfg(tmp_path)
-    monkeypatch.setattr(
-        rt.os, "execve", lambda *a: pytest.fail("execve must not be reached")
-    )
+    monkeypatch.setattr(rt.os, "execve", lambda *a: pytest.fail("execve must not be reached"))
 
     with pytest.raises(rt.PodError, match="refusing `service`"):
         rt.exec_in_pod(cfg, "wt-feature", ["service", "uninstall"])
@@ -389,9 +387,19 @@ def test_the_pod_workspace_is_not_the_live_workspace(tmp_path, monkeypatch):
     checkout = _provisioned_checkout(tmp_path)
     env = rt.build_pod_env(cfg, cfg.home_dir("wt-feature"), 7900, checkout)
 
+    # Dropping the override makes workspace_root() fall through to the platform
+    # default, and _resolve_workspace_root() CREATES whatever it resolves. The
+    # default base is not derived from HOME on macOS (it is a fixed volume path),
+    # so faking the home is not enough: relocate the resolver's default itself,
+    # in the namespace workspace_root() reads it from.
+    live_base = tmp_path / "operator-default-base"
+    monkeypatch.setattr(loader, "_default_workspace_base", lambda: live_base)
     monkeypatch.delenv("KIROCREW_WORKSPACE", raising=False)
     live = loader.workspace_root()
 
+    # The default path was exercised (not a saved workspace_dir) and it stayed
+    # under this test's own tree, so no operator directory was created.
+    assert live.is_relative_to(live_base.resolve())
     assert Path(env["KIROCREW_WORKSPACE"]).resolve() != live.resolve()
 
 

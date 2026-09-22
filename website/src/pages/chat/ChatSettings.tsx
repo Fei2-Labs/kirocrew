@@ -42,12 +42,23 @@ export interface ChatConfig {
   defaultAutopilot: boolean
   /** Pin the most recent prompt above the fold as a sticky banner. */
   pinLastPrompt: boolean
+  /** Spellcheck the message composer. When off, the composer input carries
+   *  `spellCheck={false}` so the browser draws no red misspelled-word
+   *  underlines. Default true — the behaviour every install has always had. */
+  spellcheck: boolean
   /** Opt in to giving a folder that holds nothing no body at all, so it costs one
    *  row instead of two. Default false: this changes how every empty folder in
    *  the sidebar reads, and the row it removes is the only labelled "New chat in
    *  <name>" affordance those folders have, so it is the user's call rather than
    *  something a client with no stored config inherits. */
   hideEmptyFolderBody: boolean
+  /** Keep a long paste as full editable text in the composer instead of
+   *  collapsing it into a `[ Paste #N · M lines ]` chip. Default false: the chip
+   *  is what keeps the composer (and the sent bubble) from laying out a
+   *  hundred-thousand-line paste on the main thread, so the full-text shape is
+   *  the user's call rather than something a client with no stored config
+   *  inherits. Cmd/Ctrl+Shift+V remains the per-paste escape hatch either way. */
+  showFullPastes: boolean
 }
 
 export type FileChipStyle = 'expanded' | 'minimal'
@@ -66,7 +77,7 @@ const LS_KEY = 'mc-chat-config'
  *  it. The sidebar's view toggle persists this flag BEFORE creating its first
  *  column, so a deliberate board user always has an explicit `true` stored and
  *  is unaffected by the default. */
-const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, defaultAutopilot: false, pinLastPrompt: true, hideEmptyFolderBody: false }
+const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, defaultAutopilot: false, pinLastPrompt: true, hideEmptyFolderBody: false, spellcheck: true, showFullPastes: false }
 
 const VALID_FILE_CHIP_STYLES: ReadonlySet<FileChipStyle> = new Set(['expanded', 'minimal'])
 const VALID_FOLLOW_UP_LAYOUTS: ReadonlySet<FollowUpLayout> = new Set(['multiline', 'scroll'])
@@ -100,9 +111,16 @@ export function loadChatConfig(): ChatConfig {
     if (typeof cfg.showContextTokens !== 'boolean') cfg.showContextTokens = false
     if (typeof cfg.showTurnStats !== 'boolean') cfg.showTurnStats = true
     if (typeof cfg.pinLastPrompt !== 'boolean') cfg.pinLastPrompt = true
+    // Coerced, not trusted: a stored non-boolean must not decide whether the
+    // composer draws the browser's red spellcheck underlines.
+    if (typeof cfg.spellcheck !== 'boolean') cfg.spellcheck = true
     // Coerced, not trusted: a stored non-boolean would otherwise make the empty
     // folder shape depend on a truthy string.
     if (typeof cfg.hideEmptyFolderBody !== 'boolean') cfg.hideEmptyFolderBody = false
+    // Coerced, not trusted: a stored non-boolean would otherwise let a truthy
+    // string turn off paste collapsing, which is the main-thread guard for a
+    // very large paste.
+    if (typeof cfg.showFullPastes !== 'boolean') cfg.showFullPastes = false
     return cfg
   }
   catch { return { ...DEFAULTS } }

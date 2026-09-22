@@ -346,6 +346,38 @@ def test_rehydrate_slot_restores_persisted_tab_id_for_fork_chaining(tmp_path, mo
     assert persisted_meta.get("tab_id") == slot2._tab_id
 
 
+def test_restore_carries_the_agent_selection_namespace(tmp_path, monkeypatch):
+    """A template-picked slot comes back as a template pick after a restart.
+
+    ``agent_kind`` is what tells the picker which of two same-name rows the
+    slot runs; restored as ``""`` it would light the MEMBER row for a slot the
+    user explicitly bound to the template. Persisted with the other slot-owned
+    metadata (``SLOT_OWNED_META_KEYS``), and only the two known values are
+    honoured on the way back in.
+    """
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    state = _make_state(tmp_path / "sessions")
+    _seed_session(state, "chat-1-template-pick")
+    history_key = _history_key_for("chat-1-template-pick")
+    state.conversation_log.update_metadata(
+        history_key, {"agent": "reviewer", "agent_kind": "template"}
+    )
+    _seed_session(state, "chat-2-junk-kind")
+    state.conversation_log.update_metadata(
+        _history_key_for("chat-2-junk-kind"), {"agent": "reviewer", "agent_kind": "crew"}
+    )
+    (tmp_path / "open_slots.json").write_text(
+        json.dumps({"keys": ["chat-1-template-pick", "chat-2-junk-kind"], "ts": 0.0})
+    )
+
+    state2 = _make_state(tmp_path / "sessions")
+    assert restore_open_slots(state2) == 2
+    assert state2._slots["chat-1-template-pick"].agent_kind == "template"
+    # An unknown value is not a namespace the backend ever wrote; it reads as
+    # "picked by name alone" rather than being trusted.
+    assert state2._slots["chat-2-junk-kind"].agent_kind == ""
+
+
 def test_rehydrate_slot_uses_chained_read_with_500_message_window(tmp_path, monkeypatch):
     """Chained read + 500-message window on rehydrate.
 
@@ -2299,8 +2331,21 @@ def test_an_older_close_does_not_block_an_open_slot_restore(tmp_path, monkeypatc
     state2 = _make_state(tmp_path / "sessions")
     from kiro_crew.dashboard import channel_slots
 
-    channel_slots.note_slot_closed(state2, "chat-1-reopened")  # then reopened
-    time.sleep(0.01)
+    # The close must land STRICTLY before the driver's own ``started =
+    # time.time()``, and a real sleep does not guarantee that: on Windows under
+    # CPython <= 3.12 (what CI pins) ``time.sleep`` waits on a high-resolution
+    # timer while ``time.time`` still steps in ~15.6 ms system-clock ticks, so a
+    # 10 ms sleep can leave both readings EQUAL — and ``slot_closed_since`` is
+    # inclusive (``when >= instant``), so the tombstone would block the reopen
+    # and this negative control would accuse the guard of the very defect it
+    # exists to disprove. Stamp an explicitly older instant instead, making
+    # eligibility arithmetic on every platform. 60 s is far inside
+    # ``_CLOSE_TOMBSTONE_TTL_SECS`` (3600 s), so the tombstone still EXISTS when
+    # the guard consults it and the assertion cannot pass vacuously.
+    closed_at = time.time() - 60.0
+    with monkeypatch.context() as mp:
+        mp.setattr(time, "time", lambda: closed_at)
+        channel_slots.note_slot_closed(state2, "chat-1-reopened")  # then reopened
 
     assert asyncio.run(restore_open_slots_async(state2)) == 1
     assert "chat-1-reopened" in state2._slots

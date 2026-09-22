@@ -80,14 +80,28 @@ jobs:
       # reached only when pass 2 emitted [BLOCK-MERGE]. Those three endpoints
       # mirror fork-opus-review.yml's allowlist. Comments cannot live inside the
       # folded block below: its lines are literal endpoint text.
+      #
+      # The GPT passes do NOT reach Bedrock on the classic runtime host: the
+      # review CLI's amazon-bedrock provider posts to
+      # https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses, so that
+      # host needs its own line. Without it both passes retry five times, exit 1
+      # and the lane fails closed with `review incomplete`.
+      #
+      # The three ubuntu archive hosts carry claude-code-action's bubblewrap
+      # bootstrap (`apt-get install bubblewrap socat`). This lane's two GPT
+      # passes do not use that action, so the gap is latent here: it bites only
+      # on the Opus ADJUDICATION pass, which runs solely after pass 2 emits
+      # [BLOCK-MERGE] -- exactly the run that must not fail for an install
+      # reason. Full rationale and exfil analysis: fork-opus-review.yml.
       - name: Harden runner (egress allowlist)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: block
           disable-telemetry: true
           allowed-endpoints: >
             bedrock-runtime.us-east-1.amazonaws.com:443
             bedrock.us-east-1.amazonaws.com:443
+            bedrock-mantle.us-east-1.api.aws:443
             sts.amazonaws.com:443
             sts.us-east-1.amazonaws.com:443
             bedrock-runtime.us-west-2.amazonaws.com:443
@@ -96,8 +110,12 @@ jobs:
             github.com:443
             api.github.com:443
             objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
             codeload.github.com:443
             registry.npmjs.org:443
+            azure.archive.ubuntu.com:80
+            archive.ubuntu.com:443
+            security.ubuntu.com:443
 
       - name: Resolve and validate PR (authoritative from GitHub)
         id: pr
@@ -416,7 +434,7 @@ jobs:
 
       # Mint short-lived, Bedrock-only creds immediately before the model call,
       # via the SAME dedicated least-privilege role the same-repo GPT reviewer uses.
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
           role-to-assume: ${{ secrets.AWS_CODEX_BEDROCK_ROLE_ARN }}
           aws-region: us-east-1
@@ -552,7 +570,7 @@ jobs:
           DIVISION OF LABOUR — read this first; it defines what is NOT your job
           ══════════════════════════════════════════════════════════════════
           Every PR in this repo is ALREADY gated on deterministic tooling:
-          mypy, flake8, isort, eslint (--max-warnings ratchet), tsc -b, jscpd,
+          mypy, flake8, isort, eslint (--max-warnings ratchet), tsc -p tsconfig.app.json, jscpd,
           cfn-lint, Semgrep, 12 pytest shards
           (Linux 3.10/3.12 + Windows), an offline Playwright e2e suite with
           strict on-loop-persist assertions, and a FAIL-CLOSED Coverage Gate
@@ -688,7 +706,7 @@ jobs:
       # discovery pass that consumes most of it used to leave pass 2 to die
       # mid-call on an expired security token, failing the gate closed with no
       # verdict. Keep in sync with codex-review.yml.
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
           role-to-assume: ${{ secrets.AWS_CODEX_BEDROCK_ROLE_ARN }}
           aws-region: us-east-1
@@ -984,7 +1002,7 @@ jobs:
       # The OPUS Bedrock role -- the same dedicated least-privilege role
       # fork-opus-review.yml uses, in its region, assumed only here and only
       # after the codex CLI has finished.
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         if: >-
           (steps.adj_input.outputs.adjudicable != '' && steps.adj_input.outputs.adjudicable != '0')
           || (steps.adj_input.outputs.fenced != '' && steps.adj_input.outputs.fenced != '0')
@@ -1054,7 +1072,7 @@ jobs:
         if: >-
           (steps.adj_input.outputs.adjudicable != '' && steps.adj_input.outputs.adjudicable != '0')
           || (steps.adj_input.outputs.fenced != '' && steps.adj_input.outputs.fenced != '0')
-        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
+        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -1540,7 +1558,7 @@ jobs:
               if gh api --method PATCH "repos/$REPO/check-runs/$1" \
                 -f status="completed" -f conclusion="$2" \
                 -f "output[title]=GPT 5.6 Review — $3" \
-                -f "output[summary]=$summary" >/dev/null 2>&1; then
+                -f "output[summary]=$summary" >/dev/null; then
                 return 0
               fi
               sleep 5

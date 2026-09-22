@@ -41,7 +41,7 @@ from kiro_crew.config.sections import _clamp_pct
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import mint_row_mid
-from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
+from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, hook_gate_kwargs
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging import auto_title, privacy_mode
 from kiro_crew.messaging.attachments import IngestLimits, append_attachment_context
@@ -64,7 +64,10 @@ from kiro_crew.messaging.dispatch import (
     admit_inbound_callback,
     build_auto_approve,
     build_directive_consumer,
+    consume_reinjection,
     delivery_is_muted,
+    driver_turn_landed,
+    rearm_reinjection,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
@@ -97,7 +100,6 @@ from kiro_crew.messaging.upload_gate import (
     session_is_restricted,
     uploads_restricted,
 )
-from kiro_crew.providers.acp import provider_label
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import redact, redact_local_paths
 from kiro_crew.sel import sel
@@ -967,6 +969,10 @@ class TelegramDispatcher:
         _acquired = False
         failure_reason: str | None = None
         attachment_temp_paths: list[str] = []
+        # Post-compaction re-injection bookkeeping for the finally: whether this
+        # turn consumed the one-shot flag, and whether it landed (recorded success).
+        _needs_reinjection = False
+        _turn_landed = False
         try:
             # Ack placeholder first (before the potentially slow cold-start);
             # on_turn_start is idempotent so the driver's later call no-ops.
@@ -1024,6 +1030,10 @@ class TelegramDispatcher:
             # disjoint from ``cfg.agents``, so a store derived from it resolves to
             # ``default`` for exactly the crew that configured otherwise. Private
             # memory was prepared before provider acquisition and fails closed.
+            # A compaction drops session-start context. Read-and-clear the
+            # one-shot flag so this turn re-injects that context exactly once;
+            # the finally re-arms it if this turn never lands.
+            _needs_reinjection = consume_reinjection(self.sessions, session_key)
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 self.ctx_builder.build_message,
@@ -1034,8 +1044,9 @@ class TelegramDispatcher:
                 agent=agent,
                 memory_store=_memory_store,
                 resumed=resumed,
+                needs_reinjection=_needs_reinjection,
                 runtime_source="telegram",
-                provider_type=provider_label(provider),
+                context_provider=provider,
                 # Temporary mode reads NO memory, which is the half the transcript
                 # gate cannot cover: refusing to WRITE still leaves yesterday's
                 # memories and lessons in today's prompt. Incognito deliberately
@@ -1059,14 +1070,7 @@ class TelegramDispatcher:
                     getattr(event, "title", "") or "",
                     session_key=session_key,
                     agent=agent,
-                    tool_kind=getattr(event, "tool_kind", "") or "",
-                    raw_params=getattr(event, "raw_tool_params", None),
-                    diff_path=getattr(event, "diff_path", "") or "",
-                    command=getattr(event, "shell_command", None),
-                    is_shell=bool(getattr(event, "is_shell", False)),
-                    mcp_server_name=getattr(event, "mcp_server_name", "") or "",
-                    mcp_tool_name=getattr(event, "tool_name", "") or "",
-                    mcp_identity_trusted=bool(getattr(event, "mcp_identity_trusted", False)),
+                    **hook_gate_kwargs(event),
                 )
                 if result.action == TOOL_DENY:
                     return "deny"
@@ -1111,6 +1115,10 @@ class TelegramDispatcher:
             # ── Post-turn bookkeeping (each guarded so a failure here can't
             # fall through to the except and re-record the successful turn). ──
             self.sessions.record_success(session_key)
+            # The prompt (with any re-injected context) reached the model and
+            # the turn completed, so the finally must NOT restore the flag --
+            # unless the user cancelled it, which discards that prompt.
+            _turn_landed = driver_turn_landed(driver)
             Stats().inc_message_success()
             if accumulated and not muted and self._voice_enabled(route):
                 # Its own bookkeeping step, and last-effort by design: the text
@@ -1278,6 +1286,12 @@ class TelegramDispatcher:
                 await self.sessions.record_failure(session_key)
                 Stats().inc_message_failed()
         finally:
+            # A turn that consumed the post-compaction flag but never landed
+            # discarded the prompt carrying the re-injected context; put the
+            # flag back so the next turn re-injects it.
+            rearm_reinjection(
+                self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
+            )
             # Always finalize the placeholder (no perma-"🤔 …"), even if
             # get_or_create raised before the semaphore was held. Only release
             # the semaphore if we actually acquired it.
@@ -2501,7 +2515,7 @@ class TelegramDispatcher:
         # Rotated: the subagent's completion arrives later and is routed by this
         # key, so binding it to a generation the next message abandons sends the
         # result to a conversation nobody is reading.
-        reply = spawn_task_reply(
+        reply = await spawn_task_reply(
             arg, self.subagent_manager, session_key or self._rotated_session_key(route)
         )
         if reply is None:

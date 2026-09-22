@@ -32,6 +32,12 @@ from slack_sdk.socket_mode.websockets import SocketModeClient as WSSocketModeCli
 from slack_sdk.web.async_client import AsyncWebClient
 
 from kiro_crew import __version__
+from kiro_crew.agent_discovery import agent_spec_stems
+from kiro_crew.agent_spec_format import (
+    is_markdown_spec,
+    iter_agent_spec_files,
+    parse_agent_spec_text,
+)
 from kiro_crew.config.loader import (
     ACTIVATION_MENTION,
     ACTIVATION_OBSERVE,
@@ -102,6 +108,7 @@ from kiro_crew.slack.sessions_view import (
     _SESSIONS_DEFAULT_LIMIT,
     _build_sessions_blocks,
     _collect_recent_sessions_off_loop,
+    sessions_include_ended,
 )
 from kiro_crew.slack.transport_dispatch import handle_message_transport
 from kiro_crew.stats import Stats
@@ -332,6 +339,14 @@ async def _handle_dashboard(
         await respond("❌ Failed to send dashboard link.")
 
 
+def _selector_agent_names() -> list[str]:
+    """The sorted agent stems the ``/agent`` selector offers; a thread-side read."""
+    agents_dir = kiro_agents_dir()
+    if not agents_dir.is_dir():
+        return []
+    return sorted(agent_spec_stems(agents_dir, operation="slack_agent_selector", source="slack"))
+
+
 async def _handle_agent(
     orch: GatewayOrchestrator, caller_id: str, args: str, respond: Callable
 ) -> None:
@@ -354,17 +369,18 @@ async def _handle_agent(
             await run_config_write(_set_default_agent, "")
             await respond("🔄 Reset to default agent.")
             return
-        resolved = _resolve_agent_name(name)
+        # Resolution reads a spec's content; off the loop, like the listing.
+        resolved = await asyncio.to_thread(_resolve_agent_name, name)
         if resolved:
             await run_config_write(_set_default_agent, resolved)
             await respond(f"🔄 Switched to agent: *{resolved}*")
             return
         await respond(f"❌ Unknown agent `{name}`. Pick one below:")
 
-    # Show selector dropdown
-    agents_dir = kiro_agents_dir()
-    jsons = sorted(agents_dir.glob("*.json")) if agents_dir.is_dir() else []
-    agent_names = sorted(f.stem for f in jsons)
+    # Show selector dropdown. The listing walks the agents directory and reads
+    # every markdown candidate to decide whether it is a spec, so it runs off
+    # the event loop: a large directory must not stall every other session.
+    agent_names = await asyncio.to_thread(_selector_agent_names)
     current = _get_default_agent() or ""
 
     options = [{"text": {"type": "plain_text", "text": n[:75]}, "value": n} for n in agent_names]
@@ -593,9 +609,9 @@ def _get_agent_names() -> list[str]:
     if not agents_dir.is_dir():
         return []
     names = []
-    for f in agents_dir.glob("*.json"):
+    for f in iter_agent_spec_files(agents_dir, ordered=False):
         try:
-            data = json.loads(safe_read_file(str(f)))
+            data = parse_agent_spec_text(safe_read_file(str(f)), f)
             name = data.get("name") if isinstance(data, dict) else None
         except PermissionError as exc:
             # Symlink or resolved path landed in a sensitive location — audit it.
@@ -615,8 +631,13 @@ def _get_agent_names() -> list[str]:
                     exc_info=True,
                 )
             name = None
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            # UnicodeDecodeError (a ValueError subclass, NOT an OSError) is
+        except (ValueError, OSError):
+            if is_markdown_spec(f):
+                # A markdown file that does not parse as a spec is not a spec
+                # (a README, notes); only a broken JSON keeps its stem below.
+                continue
+            # ValueError covers bad JSON, bad frontmatter AND UnicodeDecodeError
+            # (a ValueError subclass, NOT an OSError), which is
             # raised by safe_read_file's utf-8 read on a non-UTF-8 *.json —
             # e.g. a macOS AppleDouble ._foo.json stub in ~/.kiro/agents.
             # Catching it here keeps a non-UTF-8 file from crashing the
@@ -644,7 +665,8 @@ async def _handle_channel_cmd(
         }
         for cid in current_ids
     ]
-    agent_names = _get_agent_names()
+    # Reads every spec's declared name; off the loop like the other listings.
+    agent_names = await asyncio.to_thread(_get_agent_names)
     modal = channels_modal(channels, agent_names=agent_names)
 
     trigger_id = getattr(orch, "_last_trigger_id", "")
@@ -666,7 +688,12 @@ register_slash_command("channels", _handle_channel_cmd, "manage tracked channels
 async def _handle_sessions(
     orch: GatewayOrchestrator, caller_id: str, args: str, respond: Callable
 ) -> None:
-    """List last 10 sessions as task_card blocks with resume buttons."""
+    """List last 10 sessions as task_card blocks with resume buttons.
+
+    *args* of ``all`` or ``ended`` includes rows the user has dismissed with
+    End; by default those are left out, so End takes a row off the list.
+    """
+
     # Deny-by-default authorization gate (defense-in-depth).
     #
     # Session JSONLs contain prior conversation contents — only owner /
@@ -699,6 +726,7 @@ async def _handle_sessions(
         rows = await _collect_recent_sessions_off_loop(
             orch.sessions if orch is not None else None,
             limit=_SESSIONS_DEFAULT_LIMIT,
+            include_ended=sessions_include_ended(args or ""),
         )
     except Exception as exc:
         # Redact-then-truncate: redact() first so credential / exfil
@@ -1110,7 +1138,7 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
         blocks.append({"type": "header", "text": {"type": "plain_text", "text": "🔌 Capabilities"}})
         try:
             servers = list_servers()
-            skills = _get_skills_loader().list_skills()
+            skills = await asyncio.to_thread(lambda: _get_skills_loader().list_skills())
 
             # Slack caps a single section's text at 3000 chars. MCP servers and
             # skills each get their OWN section with an independent length cap

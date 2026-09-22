@@ -3468,7 +3468,12 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
             await asyncio.to_thread(_mark_error)
 
     task = asyncio.create_task(_bg_ingest())
-    app_tasks = request.app.setdefault("_bg_tasks", set())
+    # Seeded by register_routes; the create branch serves an Application that
+    # skipped registration and is still mutable (a directly driven handler).
+    app_tasks = request.app.get("_bg_tasks")
+    if app_tasks is None:
+        app_tasks = set()
+        request.app["_bg_tasks"] = app_tasks
     app_tasks.add(task)
     task.add_done_callback(app_tasks.discard)
     _audit("campaign_to_knowledge", cid, source_id=sid)
@@ -3619,6 +3624,9 @@ async def _handle_grill_tree(request: web.Request) -> web.Response:
 
 
 def register_routes(app: web.Application) -> None:
+    # Seeded while the app is still mutable; a handler-time ``setdefault`` would
+    # write to the frozen app. Shared with the knowledge routes, so setdefault.
+    app.setdefault("_bg_tasks", set())
     app.router.add_post("/api/apps/auto-research/validate", _handle_validate)
     app.router.add_post("/api/apps/auto-research/grill/expand", _handle_grill_expand)
     app.router.add_post("/api/apps/auto-research/campaigns", _handle_create)

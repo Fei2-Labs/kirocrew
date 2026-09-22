@@ -58,7 +58,7 @@ def _patch_generator(monkeypatch, reply: str | Exception):
     """Replace the refresh generator; returns the list of recorded calls."""
     calls: list[str] = []
 
-    async def _fake(_state, _messages, current_title):
+    async def _fake(_state, _messages, current_title, *, session_key: str = ""):
         calls.append(current_title)
         if isinstance(reply, Exception):
             raise reply
@@ -203,7 +203,7 @@ class TestRefreshOutcomes:
         """A manual rename landing mid-generation bumps the epoch; the refresh
         must stand down instead of clobbering the user's name."""
 
-        async def _rename_mid_flight(_state, _messages, _current):
+        async def _rename_mid_flight(_state, _messages, _current, *, session_key: str = ""):
             slot.title = "User chosen name"
             slot._title_origin = _TITLE_ORIGIN_USER
             slot._title_epoch += 1
@@ -361,7 +361,7 @@ class TestManualRegenerateWindow:
 class TestOriginRecording:
     @pytest.mark.asyncio
     async def test_auto_title_success_records_auto_origin(self, monkeypatch):
-        async def _fake_generate(_state, _messages):
+        async def _fake_generate(_state, _messages, *, session_key: str = ""):
             return "Generated title"
 
         async def _noop(*_a, **_kw):
@@ -379,7 +379,7 @@ class TestOriginRecording:
 
     @pytest.mark.asyncio
     async def test_definitive_fallback_records_auto_origin(self, monkeypatch):
-        async def _fake_generate(_state, _messages):
+        async def _fake_generate(_state, _messages, *, session_key: str = ""):
             return ""  # SKIP
 
         async def _noop(*_a, **_kw):
@@ -407,7 +407,7 @@ class TestOriginRecording:
         slot = _ChatSlot("chat-1-1")
         slot.messages = [{"role": "user", "content": "hello world task"}]
 
-        async def _rename_mid_flight(_state, _messages):
+        async def _rename_mid_flight(_state, _messages, *, session_key: str = ""):
             slot.title = "User chosen name"
             slot._titled = True
             slot._title_origin = _TITLE_ORIGIN_USER
@@ -844,7 +844,7 @@ class TestRefreshCancelSafety:
             order.append(f"persist:{s._title_refresh_mark}")
             return True
 
-        async def _cancelled_generation(_state, _messages, _current):
+        async def _cancelled_generation(_state, _messages, _current, *, session_key: str = ""):
             order.append("generate")
             raise asyncio.CancelledError()
 
@@ -971,7 +971,7 @@ class TestRefreshDurableMarkGate:
         async def _failing_persist(_state, _slot):
             return False
 
-        async def _spy_generate(_state, _messages, current):
+        async def _spy_generate(_state, _messages, current, *, session_key: str = ""):
             generated.append(current)
             return "New Title"
 

@@ -94,6 +94,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
   onSessionOpen,
   sessions,
   activeSession,
+  messageTs,
   disclosureKey,
   onOpenPanel,
 }: {
@@ -104,6 +105,9 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
    *  assistant row passes. Omitted by hosts with no slot roster. */
   onSessionOpen?: (key: string) => void
   sessions?: ReadonlyMap<string, string>
+  /** When this row was written, ISO. The session chip's SHORT-name form needs it:
+   *  slot numbers are reused, so without a write time no short name resolves. */
+  messageTs?: string
   activeSession?: string
   disclosureKey?: string
   /** Opens the Subagents side panel. Omitted by hosts that have no side panel
@@ -327,7 +331,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
         // bottom) — pre-fix, the only indicator was the UA :focus-visible
         // outline reduced to a hairline on the top edge alone (WCAG 2.4.7).
         <div
-          className="px-3 pb-2 pt-1 border-t border-accent/10 max-h-[24rem] overflow-y-auto overflow-x-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+          className="px-3 pb-2 pt-1 border-t border-accent/10 max-h-[24rem] overflow-y-auto overflow-x-hidden focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
           data-testid="subagent-completion-body"
           role="region"
           aria-labelledby={headlineId}
@@ -345,6 +349,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
             onSessionOpen={onSessionOpen}
             sessions={sessions}
             activeSession={activeSession}
+            messageTs={messageTs}
             softBreaks
           />
         </div>

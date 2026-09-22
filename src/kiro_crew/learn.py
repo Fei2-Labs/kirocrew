@@ -16,9 +16,15 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.lesson_validation import contains_volatile_lesson_fact
 from kiro_crew.memory_startup import require_memory_ready
 from kiro_crew.memory_stores import named_store_operation
-from kiro_crew.project_scope import canonical_scope, project_scope_satisfied
+from kiro_crew.project_scope import (
+    canonical_scope,
+    project_scope_satisfied,
+    scope_is_admissible,
+    scope_selector_is_inadmissible,
+)
 
 try:
     from kiro_crew.config.loader import config_dir as _config_dir
@@ -73,7 +79,6 @@ def _is_owned_store_root(base_dir: Path) -> bool:
 
 
 _LESSONS_FILE = "lessons.jsonl"
-_MAX_LESSONS_IN_CONTEXT = 50
 _MAX_LESSONS_TOTAL = 200  # prune oldest when exceeded
 
 # One lock PER FILE, shared by every LessonStore instance addressing it. A
@@ -142,6 +147,11 @@ class LessonStore:
         from kiro_crew.security import is_sensitive_path
 
         if base_dir:
+            from kiro_crew.memory_stores import memory_store_version, named_store_of_db
+
+            store_name = named_store_of_db(base_dir / "memory.db")
+            if store_name and memory_store_version(store_name) == 2:
+                raise ValueError("Member lessons are stored only in the member database")
             if _is_owned_store_root(base_dir):
                 # A named memory store's own root. It is inside the keystone
                 # ``memory_stores/`` fence, so ``is_sensitive_path`` answers True
@@ -237,7 +247,7 @@ class LessonStore:
         self._cache = None  # invalidate
 
     @named_store_operation
-    def save(self, lesson: Lesson) -> None:
+    def save(self, lesson: Lesson) -> str:
         """Insert *lesson*, skipping a rule that is already stored.
 
         Deliberately does NOT enrich. Most callers here are automatic --
@@ -246,14 +256,17 @@ class LessonStore:
         explicit refinement (the /api/lessons route, ``kirocrew learn add``)
         should attach a clause, and those call :meth:`save_or_enrich`.
 
-        Kept returning ``None`` so every existing caller is unaffected.
+        Returns the same outcome string as the shared body. Automatic callers use
+        ``refused`` to avoid counting, notifying, or ledgering a lesson that did not
+        persist; callers that ignore the return remain unaffected.
         """
-        self._insert_or_enrich(lesson, enrich=False)
+        return self._insert_or_enrich(lesson, enrich=False)
 
     @named_store_operation
     def save_or_enrich(self, lesson: Lesson) -> str:
         """Insert *lesson*, or attach its NOT-clause to the record holding the same
-        rule, in ONE lock acquisition. Returns ``inserted``/``enriched``/``unchanged``.
+        rule, in ONE lock acquisition. Returns
+        ``inserted``/``enriched``/``unchanged``/``refused``.
 
         For EXPLICIT refinement only -- see :meth:`save` for why automatic writers
         must not reach this.
@@ -290,6 +303,8 @@ class LessonStore:
         A re-submit carrying NO clause never strips one that is already stored --
         it reports ``unchanged``, matching the vector store for the same case.
         """
+        if contains_volatile_lesson_fact(lesson.rule, lesson.negative):
+            return "refused"
         with self._lock:
             # A whitespace-only clause is no clause. Same defect as the vector store's:
             # `--negative "   "` is truthy, so it would replace a real stored clause
@@ -367,17 +382,79 @@ class LessonStore:
         return outcome
 
     @named_store_operation
-    def remove(self, rule_substring: str) -> bool:
+    def remove(
+        self, rule_substring: str, repo_scope: str | None = None, *, exact: bool = False
+    ) -> bool:
         """Remove lessons whose rule contains *rule_substring*. Returns True if any removed.
+
+        Substring matching on the rule text is deliberate: a user targets a
+        lesson by a fragment of its rule rather than retyping the whole thing
+        (``test_remove_matching`` deletes "Use tool-b" by passing "tool-b").
+        *exact* narrows the text match to the whole rule (case-insensitive,
+        surrounding whitespace ignored): a caller that holds the full rule -- a
+        table row's Delete button -- names ONE row, where the substring path would
+        also take every longer rule containing it ("use tabs" -> "always use
+        tabs"). The scope selector applies identically in both modes.
+
+        A lesson's identity is the pair ``(rule, repo_scope)``: the same rule
+        scoped to a repo and stored globally are two distinct rows, and the
+        selector decides which of them a delete reaches.
+
+        When *repo_scope* is None (the default) the scope is not part of the
+        match: every row whose rule contains the substring is removed. When
+        *repo_scope* is given, a row is removed only when it ALSO carries that
+        scope, compared after ``canonical_scope`` on both sides so
+        trailing-slash and backslash variants fold together (matching the
+        write path's identity). Passing the canonical form of ``None`` -- an
+        empty or whitespace-only selector -- targets the unscoped (global)
+        rows specifically, which is how a caller deletes the global row while
+        leaving a same-rule scoped one in place. A nonempty selector the write
+        surface would refuse -- a bare ``/``, an absolute path, a dot segment
+        -- is refused with :class:`ValueError` rather than canonically folded
+        onto rows the caller never named. A STORED scope that is present but
+        inadmissible marks a scoped-but-broken row, which the injection gate
+        withholds; a scope-selective delete never claims such a row, and the
+        unselective (absent) path is what removes it.
 
         Holds the lock. An unlocked read-modify-write here would lose a concurrent
         ``save`` outright -- and without that lock the atomicity
         :meth:`save_or_enrich` claims would not actually hold.
         """
+        if repo_scope is not None and scope_selector_is_inadmissible(repo_scope):
+            raise ValueError(f"repo_scope does not name a usable scope: {repo_scope!r}")
         with self._lock:
             lessons = self.load_all()
             lower = rule_substring.lower()
-            kept = [le for le in lessons if lower not in le.rule.lower()]
+            wanted_text = lower.strip()
+            # A missing selector leaves scope out of the match. A present one --
+            # including the canonical form of an empty string, which is None and
+            # targets the unscoped rows -- is compared canonically against each
+            # row's own canonical scope, so the two never disagree with the
+            # write path over trailing-slash / backslash forms.
+            scope_selective = repo_scope is not None
+            wanted_scope = canonical_scope(repo_scope) if scope_selective else None
+
+            def _matches(le: Lesson) -> bool:
+                if exact:
+                    if le.rule.lower().strip() != wanted_text:
+                        return False
+                elif lower not in le.rule.lower():
+                    return False
+                if scope_selective:
+                    # A stored scope that is present but inadmissible (an
+                    # imported "/") is scoped-but-broken, not global: the
+                    # injection gate withholds such a row rather than treating
+                    # it as applies-everywhere, so a scope-selective delete
+                    # never claims it -- it would otherwise fold to None and be
+                    # removed by the explicit-global selector. The unselective
+                    # (absent) path still reaches it.
+                    if le.repo_scope is not None and not scope_is_admissible(le.repo_scope):
+                        return False
+                    if canonical_scope(le.repo_scope) != wanted_scope:
+                        return False
+                return True
+
+            kept = [le for le in lessons if not _matches(le)]
             if len(kept) == len(lessons):
                 return False
             self._write_all(kept)
@@ -427,41 +504,68 @@ class LessonStore:
         return lessons
 
     def _applicable(self, lessons: list[Lesson], project_dir: str | Path | None) -> list[Lesson]:
-        """Drop lessons whose ``repo_scope`` does not cover *project_dir*.
+        """Drop volatile lessons and lessons outside *project_dir*.
 
-        A lesson with no scope applies everywhere, so an existing store is
-        unaffected. A scoped one is withheld unless the session's project is
-        positively inside the named tree -- the gate fails closed, so a surface
-        with no project loses the scoped lessons rather than inheriting another
-        repository's rules.
+        Existing volatile rows remain readable through ``load_all`` and removable by
+        the user, but never reach a prompt. A lesson with no scope applies everywhere;
+        a scoped one is withheld unless the session's project is positively inside the
+        named tree.
         """
         return [
             le
             for le in lessons
-            if not le.repo_scope or project_scope_satisfied(le.repo_scope, project_dir)
+            if not contains_volatile_lesson_fact(le.rule, le.negative)
+            and (not le.repo_scope or project_scope_satisfied(le.repo_scope, project_dir))
         ]
 
     @named_store_operation
-    def get_context(self, project_dir: str | Path | None = None) -> str:
+    def get_context(self, project_dir: str | Path | None = None, *, cap: int = 0) -> str:
         """Format lessons as context for injection into prompts.
 
         *project_dir* is the session's active project, used only by the
-        ``repo_scope`` gate; omitting it withholds every scoped lesson.
+        ``repo_scope`` gate; omitting it withholds every scoped lesson. ``cap``
+        is a model-safety ceiling for this rendered block, not the ordinary
+        background budget. Content at or below it is byte-identical to the
+        uncapped result; overflow keeps the newest complete lessons first.
         """
         lessons = self._applicable(self.load_all(), project_dir)
         if not lessons:
             return ""
 
-        lessons = lessons[-_MAX_LESSONS_IN_CONTEXT:]
+        def render(selected: list[Lesson], omitted: int = 0) -> str:
+            lines = [
+                "[Learned corrections — user-taught rules from past mistakes.\n"
+                "ALWAYS follow these. They override default behavior.]"
+            ]
+            for lesson in selected:
+                entry = f"- {lesson.rule}"
+                if lesson.negative:
+                    entry += f" — {lesson.negative}"
+                lines.append(entry)
+            lines.append("[End of learned corrections]\n")
+            context = "\n".join(lines)
+            if omitted:
+                context += (
+                    f"[Context budget: omitted {omitted} lessons above the model-safe "
+                    "protected-content ceiling; use memory_recall.]\n\n"
+                )
+            return context
 
-        lines = [
-            "[Learned corrections — user-taught rules from past mistakes.\n"
-            "ALWAYS follow these. They override default behavior.]"
-        ]
-        for lesson in lessons:
-            entry = f"- {lesson.rule}"
-            if lesson.negative:
-                entry += f" — {lesson.negative}"
-            lines.append(entry)
-        lines.append("[End of learned corrections]\n")
-        return "\n".join(lines)
+        full = render(lessons)
+        if not cap or len(full) <= cap:
+            return full
+
+        # JSONL has no relevance signal. Newest-first is the only stable ranking
+        # available when the model-safe ceiling forces a choice. Keep the longest
+        # newest-first prefix that fits, reserving room for the omission notice
+        # at its widest (every lesson omitted), so one pass over the list decides.
+        frame = len(render([], len(lessons)))
+        budget = cap - frame
+        selected: list[Lesson] = []
+        for lesson in reversed(lessons):
+            entry = len(lesson.rule) + 3 + (len(lesson.negative) + 3 if lesson.negative else 0)
+            if entry > budget:
+                break
+            budget -= entry
+            selected.append(lesson)
+        return render(selected, len(lessons) - len(selected))

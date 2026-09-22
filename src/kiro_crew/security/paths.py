@@ -204,13 +204,6 @@ _SENSITIVE_HOME_DIRS: list[str] = [
 _CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
 _CREW_SECRET_LEAVES: list[str] = [
     ".env",
-    # Bring-your-own-key store (acp.byok): the operator's own model-provider API
-    # keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...), injected into a BYOK backend's
-    # child environment at spawn. Live bearer credentials, so the agent's own file
-    # and bash tools must neither read them (exfiltration) nor rewrite them
-    # (repoint a backend at an attacker's key). The BYOK module and CLI open it
-    # directly rather than through this gate, so management still works.
-    "byok.json",
     # Owner-authored meetings edits are deliberately outside the meeting
     # directories agents write. They are returned verbatim to the owner and may
     # contain credential-shaped examples or private corrections, so an agent must
@@ -268,6 +261,12 @@ _CREW_SECRET_LEAVES: list[str] = [
     # backend opens it directly rather than through this gate, so writes keep
     # working.
     "md-notebook-staging",
+    # Where the sandbox launcher stages the live-target pointer's absent-equivalent
+    # stub before linking it into place. Classified as the whole DIRECTORY so the
+    # in-flight temp is never a visible, linkable name: a second hard link to that
+    # inode would be an unmasked path to the bytes the gateway executes. Only the
+    # gateway process writes here.
+    "live-target-staging",
     # The AWS Control builtin's app data directory. ``backup.json`` in here holds
     # ``nightly``, the bit that AUTHORIZES the app's startup loop to upload the
     # gateway's memory and workspace to S3 unattended, so a prompt-injected agent
@@ -320,6 +319,16 @@ _CREW_SECRET_LEAVES: list[str] = [
     # opens all of it directly rather than through this gate, so spooling and
     # the notice pass keep working.
     "inbound-spool",
+    # The durable task queue (taskq/store.py): ``tasks/tasks.db`` plus its WAL
+    # and journal siblings. Every row is another session's accepted work --
+    # the task prompt, its parameters, its lease and generation -- and the
+    # store is the scheduler's authority: an agent that could write it could
+    # cancel or re-dispatch another session's task, or forge a claim. Whole
+    # DIRECTORY (SQLite writes ``-wal`` / ``-journal`` / ``-shm`` siblings).
+    # Every legitimate reader and writer is the GATEWAY process (the subagent
+    # manager, the runner adapters, ``/api/tasks``), which opens the path
+    # directly; the MCP tools reach the queue through ``/api/spawn``.
+    "tasks",
     # Per-session work ledgers (session_ledger.py). Not credentials, but each
     # directory is one session's private work state, and the ledger's whole
     # authorization model is "a session reaches only its OWN ledger" (the HTTP
@@ -339,6 +348,29 @@ _CREW_SECRET_LEAVES: list[str] = [
     # straight off disk, and a corrupted record reads as ABSENT to the store —
     # silent loss the conductor cannot see. No legitimate file-tool reader.
     "work-ledger",
+    # Every append-only per-unit crew log, crew and session alike (crew_log/store.py).
+    # Not credentials, but the design's whole premise is that the crew log is the
+    # AUTHORITY and the context window only a cache: a conductor reads a unit's
+    # history as fact instead of re-deriving it. An agent's auto-approved file
+    # tools reaching this subtree would let it forge an entry attributed to the
+    # gateway, or rewrite the history it is supposed to be reporting into, which
+    # is the one thing an append-only record exists to prevent. The write-side
+    # rules (type ownership, guest namespacing, seq under the lock) live in the
+    # library, so they bind only callers who go through it; this entry is what
+    # keeps a file tool from going around it, and the sandbox mask on the same
+    # leaf is what keeps a spawned subprocess from going around BOTH. Named at the
+    # shared ``crew-log`` root so every unit kind is fenced by one entry — session
+    # crew logs included, which is why they do not live under the ``sessions``
+    # transcript root. The store opens these paths directly rather than through
+    # this gate, so nothing breaks.
+    "crew-log",
+    # The RETIRED root the same store used before it was renamed. Kept because this
+    # rename ships no migration: a machine that ran the old build with the feature
+    # flag on still has real entries under ``<home>/ledgers``, and dropping the leaf
+    # would un-fence them from the agent's file tools on upgrade. Nothing writes here
+    # any more, so the entry costs a retired name and refuses nothing legitimate --
+    # the same reasoning the retired browser leaves above are kept under.
+    "ledgers",
     # The optional Playwright extension token. It removes the browser-side approval
     # click for an attach, so a process that could read it could attach to the
     # operator's logged-in browser without them seeing a prompt. The gateway hands
@@ -368,7 +400,6 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``workspace/`` was itself replaceable with one ``ln -s``, and the app opens the
     # path directly (as keystone writers must), so it would have followed the link.
     "trust",
-    "member-memory-bindings",
     "security_events.jsonl",
     # Rotated SEL segments. sel.py closes the live log at a size cap and renames
     # it into this directory, so a segment holds exactly the same audit records
@@ -394,15 +425,6 @@ _CREW_SECRET_LEAVES: list[str] = [
     # policy_distribution.py opens both files directly, not through this gate.
     "policy_cache",
     "admission_policy.json",
-    # FORK KEYSTONE. ``workflow_policy.json`` carries the operator's
-    # repository-governed opt-out: with it set, ``_git_publication_floor_applies``
-    # stands the branch-name floor down and the agent's pushes stop being parsed.
-    # That makes it a ceiling the agent must be unable to reach — a writable copy
-    # would let a prompt-injected shell grant itself an unparsed push target, and a
-    # readable one discloses which pushes would go ungated. ``workflow_policy.py``
-    # opens it directly, not through this gate, so the operator surface is
-    # unaffected. Pinned by test/test_workflow_policy.py.
-    "workflow_policy.json",
     "denied_commands.json",
     # The cron store. It holds access-control state, not just scheduling data:
     # ``session_key`` decides which session may manage a job through the MCP cron
@@ -452,6 +474,11 @@ _CREW_SECRET_LEAVES: list[str] = [
     # Recovery is a re-import, but a prompt-injected agent corrupting user data
     # is the mainline threat these leaves exist for.
     "appearance-library",
+    # The chat_tag authorization store. Grant rows decide which tags an agent
+    # may self-apply, so agent file tools must neither read nor write them;
+    # the OS-sandbox counterpart is ``sandbox._CREW_HIDDEN_LEAVES``. Only the
+    # gateway opens the path.
+    "tag-grants",
     # The operator's OAuth consent-endpoint extension
     # ({additional_authorization_endpoints: [{host, path}]}). Each entry widens
     # the banner-only OAuth entropy carve-out (_OAUTH_AUTHORIZATION_ENDPOINTS),
@@ -476,9 +503,11 @@ _CREW_SECRET_LEAVES: list[str] = [
     # resolved during startup and exec'd into, so a writable one is arbitrary
     # code execution in the gateway's own identity — the agent must not be able
     # to author it, and must not be able to read it back to discover a target to
-    # aim at either. Only the human-driven dashboard cutover writes it, and the
-    # gateway's own startup reader opens it directly rather than through this
-    # gate, so both keep working.
+    # aim at either. The GATEWAY process writes it (Dev Fleet's in-gateway
+    # cutover route, on the dashboard owner's request); the sandboxed Dev Fleet
+    # backend does not touch the file at all and reads pointer state through
+    # that route. The gateway's own startup reader opens it directly rather than
+    # through this gate, so both keep working.
     "live_target.json",
     # Holds `backup/redaction.json`, the switch that decides whether a bundle
     # leaving this machine is redacted first. An agent that could write it would
@@ -559,6 +588,14 @@ _CREW_SECRET_LEAVES: list[str] = [
     # and the ``kirocrew aws-consent`` CLI are the only writers and open the
     # path directly, not through this gate, so both keep working.
     "aws_service_consent.json",
+    # Recorded consent to send conversation state to the external decision
+    # provider (Jev). Same class of control as ``aws_service_consent.json``
+    # above: the record is what AUTHORIZES message text and skill descriptions
+    # to leave the machine, so an agent that could write it would consent on the
+    # owner's behalf to its own egress. The authenticated, browser-only dashboard
+    # ``/api/decisions/consent`` handler is the only writer and opens the path
+    # directly, not through this gate.
+    "decisions_consent.json",
     # Recorded consent to deliver a file whose contents the credential scanner
     # flagged. Same class of control as ``aws_service_consent.json`` above: the
     # record is what AUTHORIZES a flagged file past four independent content
@@ -571,6 +608,21 @@ _CREW_SECRET_LEAVES: list[str] = [
     # writer and opens the path directly, not through this gate, so it keeps
     # working; there is deliberately no CLI verb to fence.
     "file_delivery_consent.json",
+    "ssh_auth_sock_consent.json",
+    # The single-use step-up nonce that authorizes RECORDING a flagged-file
+    # delivery grant. A whole DIRECTORY, not a leaf file, because arming writes a
+    # sibling ``.tmp`` and renames it into place. It lives in its OWN top-level
+    # leaf rather than under ``trust/`` on purpose: ``trust/`` is sandbox-VISIBLE
+    # (it holds SEL append targets an in-sandbox MCP server writes), so a
+    # prompt-injected agent could FORGE a nonce there with a runtime-constructed
+    # shell path (the acknowledged evadable tier) and then drive the owner's
+    # loopback browser to POST that chosen nonce -- recording a grant with no
+    # human present. This leaf has NO in-sandbox reader (the gateway writes it on
+    # arm, the host ``kirocrew file-delivery approve`` reads it), so it is also
+    # bind-masked in ``sandbox._CREW_HIDDEN_LEAVES``; masking is what actually
+    # closes the forge path, since the text/argv file gate alone does not stop a
+    # runtime-constructed shell write.
+    "file-delivery-consent-pending",
     "token_signing.key",
     "refresh_chains.json",
     ".local_secret",
@@ -645,22 +697,11 @@ _CREW_SECRET_LEAVES: list[str] = [
     # gateway's own writers open these paths directly and do NOT route through this
     # gate, so legitimate startup/spawn writes still work.
     "run",
-    # Canonical run/command/outbox metadata and SQLite's WAL/SHM/journal
-    # sidecars (this build's durable run coordinator). An agent that can read or
-    # rewrite this directory can steal task payloads, forge completion delivery,
-    # or alter its own execution/lease state. Protect the whole directory so
-    # every SQLite sidecar inherits the same read/write floor.
-    "run-coordinator",
-    # Legacy process-tracking files lived at the data-home root, where an agent
-    # could forge a PID plus a real process-start token and turn the orphan
-    # reaper into kill authority over another same-user process. Current
-    # tracking lives inside the protected run/ directory above; keep the old
-    # leaves sealed too so a downgrade or stale binary cannot recreate the
-    # writable authority surface.
-    "kiro_pids.txt",
-    "kiro_pids.lock",
-    "kiro_session_pids.txt",
-    "kiro_session_pids.lock",
+    # Pi gate artifacts have asymmetric readers. The OS mask deliberately excludes
+    # this directory from an enforced harness's credential mask so its child can exec
+    # the launcher and read the sealed extension. This floor still keeps the agent's
+    # own file tools out; the controls cover different readers rather than cancelling.
+    "pi-gate",
     # Encrypted secret vault directory — denylists the entire subdirectory so
     # the key file, ciphertext store, lock, and atomic-write temp files are all
     # unreadable to the agent through any Kiro Crew-mediated channel.
@@ -707,32 +748,12 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``identity_stores`` and opens it directly, not through this gate.
     AUTH_SQLITE_DB,
     *(f"{AUTH_SQLITE_DB}{suffix}" for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES),
-    # Named memory stores. Each subdirectory is ONE crew's private memory silo --
-    # its markdown tree, its FTS index and its vector-store SQLite file -- and the
-    # whole point of a named store is that a crew reaches only its own. Agent file
-    # tools run as the same UID as every store on disk, so owner-only modes decide
-    # nothing here: without this entry any crew's agent could read another crew's
-    # preferences and lessons straight off disk, or rewrite them, which is the
-    # boundary the split exists to draw. Read AND write, because reading another
-    # crew's memory is the primary harm and writing it is steering that crew's
-    # future turns.
-    #
-    # A DIRECTORY entry, for the reason ``routing`` and ``webhooks`` above are:
-    # markdown files are published through ``atomic_write``'s ``mkstemp`` sibling,
-    # so fencing final names only would leave a writable path to the same bytes
-    # under a random temp name.
-    #
-    # DELIBERATE ASYMMETRY, do not "tidy" it: the DEFAULT store's own ``memory.db``
-    # and ``workspace/memory/`` stay readable, because that is the agent's own
-    # memory and reading it is the product working. Fencing them would be a
-    # default-path behaviour change, which the coexistence constraint forbids. So
-    # ``is_sensitive_path(<home>/memory.db)`` is False and
-    # ``is_sensitive_path(<home>/memory_stores/work/memory.db)`` is True, on
-    # purpose. Full reasoning: docs/system-specs/modules/security.md.
-    #
-    # Every legitimate reader opens a store path DIRECTLY rather than through this
-    # gate -- the established keystone-reader pattern -- so the memory subsystem is
-    # unaffected.
+    # Managed memory uses bound tools. This directory guard keeps ordinary raw
+    # file operations away from DB/WAL/SHM and manual context publication files;
+    # glob-based project guidance skips it. It is a best-effort path guard, not
+    # confidentiality against arbitrary code run by the same OS user. Memory
+    # services open their captured store directly. Global V1 retains its existing
+    # file access behavior. See docs/system-specs/modules/security.md.
     MEMORY_STORES_DIR_NAME,
 ]
 _SENSITIVE_HOME_DIRS += [
@@ -828,15 +849,15 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
     # turn the browser sandbox OFF for every later browse, and the change persists
     # until the next gateway start re-converges the file. Kiro Crew generates it
     # directly and does NOT route through this gate, so its own write still works.
+    # Cold continuation restores app ownership from canonical run records, or
+    # the retained V1 sidecar. Gateway writers bypass this tool gate; agents
+    # may read results but cannot turn an app-owned run into a personal run.
     for leaf in (
-        # Executable adapter metadata: the selected package, argv and admitted env
-        # are consumed by the next ACP session spawn. Kiro Crew refreshes this
-        # cache directly; agent tools may read it but must not persist a launch
-        # substitution through it.
-        "acp-registry.json",
         "config.json",
         "config.local.json",
         "playwright-cli-config.json",
+        "subagents",
+        "member-memory-bindings",
     )
 ] + [
     # Ops Mission Control's on-call schedule. WRITE-protected, not read+write
@@ -856,6 +877,42 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
     # a direct `git checkout` on the merge path, not through this gate, so team
     # sync still converges.
     f"{prefix}/apps/ops-mission-control/data/rotation.yaml"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The cloud launcher's config. WRITE-protected for the same reason as
+    # ``playwright-cli-config.json`` above and by the same placement-not-logic fix:
+    # it holds no credential (its own module docstring is explicit that it stores a
+    # profile NAME, and the Fargate block stores secret names and ARNs, never
+    # values), and the gateway must READ it on every request to build the remote
+    # provisioner list, so sealing it against reads would break the Set-up tab.
+    #
+    # But it is an INPUT TO A SECURITY DECISION. ``fargate.image`` chooses the
+    # container image a launch runs, and the task's execution role delivers the
+    # model credential into that container before it starts. An agent that could
+    # rewrite this file could name a digest-pinned image of its own -- the digest
+    # rule constrains the FORM of the reference, not who owns the registry -- and
+    # leave every other field the owner wrote intact, so the owner's next launch
+    # hands the credential to an image the owner never chose.
+    #
+    # Nothing in the product writes it: the launch path's own profile, region and tag
+    # live in ``cloud.launch_state``, so this leaf has no product writer to exempt.
+    f"{prefix}/cloud.json"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The cloud launcher's LAUNCH RECORD (``cloud/launch_state.py``): the profile, region
+    # and tag the last launch decided. WRITE-protected on the same footing as
+    # ``cloud.json`` above, and for a reason that is specific rather than inherited: the
+    # tag in it is what ``kirocrew cloud destroy`` resolves when no ``--tag`` is given, so
+    # an agent that could write this file could choose which of the owner's CloudFormation
+    # stacks a ``destroy --yes`` deletes. Interactive ``destroy`` describes the instance
+    # and asks first, but ``--yes`` is exactly the path that does not.
+    #
+    # Readable, like ``cloud.json``: every ``cloud`` subcommand resolves the tag from it,
+    # and sealing it against reads would break them all. The gateway and the CLI write it
+    # outside the agent's file-edit gate, so the launch path is unaffected.
+    f"{prefix}/cloud_launch_state.json"
     for prefix in _CREW_HOME_PREFIXES
 ]
 _WRITE_PROTECTED_HOME_PATHS += [
@@ -900,6 +957,27 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # gate, so first-run fetches, re-downloads after a failed check and the embedding
     # model install all keep working; only the agent's file-edit tool is refused.
     f"{prefix}/models"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The decision log (``decisions/decisions-YYYYMMDD.jsonl``, written by
+    # ``decisions.log``). Another instance of the input-to-an-authorization-decision
+    # class, reached through the record rather than through the grant: the day-file
+    # carries `kind="feedback"` rows, which are the OWNER's verdicts on what the skills
+    # decision chose. An agent that can append there can put a verdict nobody gave into
+    # the record, which is the one reading the feature exists to produce. The keystone next to it
+    # (``decisions_consent.json``) is already read+write sensitive, and sealing the
+    # grant while leaving the record writable would be half a control.
+    #
+    # WRITE-protected, not read+write sensitive: the rows are the machine's own
+    # measurements and reading them is the point -- an owner or an agent asked to
+    # explain a decision should be able to. There is no legitimate agent WRITE:
+    # ``platform_log_append`` opens the file directly and does not route through this
+    # gate, so the gateway keeps recording. The directory is separately mounted
+    # read-only in the sandbox (``sandbox._CREW_READONLY_LEAVES``); that layer covers a
+    # shell, and this one covers the file-edit tool, which is present on every host
+    # whether or not the OS sandbox is.
+    f"{prefix}/decisions"
     for prefix in _CREW_HOME_PREFIXES
 ]
 _WRITE_PROTECTED_HOME_PATHS += [
@@ -1738,7 +1816,9 @@ def _realpath_or_none(path: str) -> str | None:
         return None
 
 
-def _candidate_forms(path_str: str, base_dir: str | None = None) -> set[str]:
+def _candidate_forms(
+    path_str: str, base_dir: str | None = None, *, pre_resolved: bool = False
+) -> set[str]:
     """Expand *path_str* into every candidate form the sensitive-path gates match.
 
     Symlink-resolved forms defeat a link bypass; the lexical forms are the
@@ -1748,6 +1828,13 @@ def _candidate_forms(path_str: str, base_dir: str | None = None) -> set[str]:
     :func:`_path_in_home_dirs` (is the path INSIDE a protected location?) and
     :func:`path_contains_sensitive` (does the path CONTAIN one?) so the
     symlink/anchoring hardening cannot drift between the two directions.
+
+    *pre_resolved* says the caller ALREADY holds the canonical spelling -- the
+    output of ``os.path.realpath`` computed on its own thread -- so no
+    resolution is submitted to the ``mc-pathres`` pool: the candidates are the
+    input and its ``normpath``, which is exactly what :func:`_resolved_spellings`
+    returns for a path that has no link left to follow. Reserved for
+    :func:`is_sensitive_resolved_path`; see there for why a caller may claim it.
     """
     # Expand ~ and $HOME
     expanded = os.path.expanduser(os.path.expandvars(path_str))
@@ -1768,7 +1855,7 @@ def _candidate_forms(path_str: str, base_dir: str | None = None) -> set[str]:
     # A resolution that does not COMPLETE raises PathResolutionStalled through
     # here, and every gate turns that into a refusal: no lexical-only matching
     # of a path whose canonical form is unknown.
-    candidates: set[str] = _resolved_forms_bounded(expanded)
+    candidates: set[str] = set() if pre_resolved else _resolved_forms_bounded(expanded)
     candidates.add(os.path.normpath(expanded))
     candidates.add(expanded)
     return candidates
@@ -1809,6 +1896,16 @@ def _home_dir_targets_uncached(
     secrets. On POSIX a single-segment entry splits to a 1-element list, so
     this is a no-op there.
     """
+    # Both supported Crew home prefixes map to the same override leaves.
+    # Resolve each identical spelling once within this build; never carry these
+    # answers across builds or cache keys, so root and leaf freshness is unchanged.
+    resolved_paths: dict[str, str | None] = {}
+
+    def resolve_target(path: str) -> str | None:
+        if path not in resolved_paths:
+            resolved_paths[path] = _realpath_or_none(path)
+        return resolved_paths[path]
+
     resolved = roots if roots is not None else _resolved_root_key()
     home = resolved.home
     crew_home = resolved.crew_home
@@ -1857,14 +1954,14 @@ def _home_dir_targets_uncached(
     if os_home:
         for d in home_dirs:
             sensitive_targets |= _anchor_both_separators(os_home, d)
-        os_home_real = _realpath_or_none(os_home) or os_home
+        os_home_real = resolve_target(os_home) or os_home
         if os_home_real.casefold() != os_home.casefold():
             for d in home_dirs:
                 sensitive_targets |= _anchor_both_separators(os_home_real, d)
     # ``home`` arrives RESOLVED from the cache key, so this is normally a no-op;
     # it still opens the directory on Windows, which is why the whole rebuild
     # runs off the loop.  None degrades to the lexical anchors already in the set.
-    home_real = _realpath_or_none(home) or home
+    home_real = resolve_target(home) or home
     if home_real.casefold() != home.casefold():
         sensitive_targets |= {_anchor(home_real, d) for d in home_dirs}
     # ``home`` arrives RESOLVED (the cache is keyed on the resolved roots), so
@@ -1898,7 +1995,7 @@ def _home_dir_targets_uncached(
                     sensitive_targets.add(full.casefold())
                     # Also add the resolved form in case the env value itself has
                     # symlinks (matches the home/home_real duality above).
-                    full_real = _realpath_or_none(full)
+                    full_real = resolve_target(full)
                     if full_real is not None:
                         sensitive_targets.add(full_real.casefold())
                     break
@@ -1918,7 +2015,7 @@ def _home_dir_targets_uncached(
     if kiro_home_override and _KIRO_AGENTS_DIR in home_dirs:
         agents_full = os.path.join(kiro_home_override, "agents")
         sensitive_targets.add(agents_full.casefold())
-        agents_real = _realpath_or_none(agents_full)
+        agents_real = resolve_target(agents_full)
         if agents_real is not None:
             sensitive_targets.add(agents_real.casefold())
     # An ACP adapter's OAuth token follows that adapter's own home override, so
@@ -1937,7 +2034,7 @@ def _home_dir_targets_uncached(
                 continue
             _full = os.path.join(_root, *_leaf_segments(_under_root))
             sensitive_targets.add(_full.casefold())
-            _full_real = _realpath_or_none(_full)
+            _full_real = resolve_target(_full)
             if _full_real is not None:
                 sensitive_targets.add(_full_real.casefold())
     return sensitive_targets
@@ -1991,6 +2088,9 @@ def _home_dir_targets_uncached(
 _HOME_TARGETS_TTL_SECS = 0.1
 # key -> (expiry_monotonic, targets)
 _home_targets_cache: dict[tuple[object, ...], tuple[float, set[str]]] = {}
+# Only off-loop bulk readers acquire this lock. Event-loop gates retain their
+# bounded resolver and must never wait for an inline filesystem rebuild.
+_home_targets_inline_lock = threading.Lock()
 
 
 class _ResolvedRoots(NamedTuple):
@@ -2211,11 +2311,23 @@ def _resolved_root_key() -> _ResolvedRoots:
     return roots
 
 
-def _home_dir_targets(home_dirs: list[str]) -> set[str]:
+def _home_dir_targets(home_dirs: list[str], *, inline: bool = False) -> set[str]:
     """TTL-cached :func:`_home_dir_targets_uncached`.
 
     Keyed on the *home_dirs* list plus the RESOLVED home and crew-home roots
     (see the note above the constant for why the raw env vars are not enough).
+
+    *inline* resolves the anchors and rebuilds the set on the CALLING thread
+    instead of through the bounded ``mc-pathres`` hop -- the same stance
+    :func:`sandbox_credential_targets` takes, and for the same reason: the
+    bound exists to keep the EVENT LOOP responsive, and a caller that is
+    already on a worker thread gains nothing from it while its submissions
+    queue ahead of the loop's own. Reserved for :func:`is_sensitive_resolved_path`,
+    whose contract is exactly such a caller. The freshness invariant is kept:
+    the roots are still resolved on every call and key the cache, so a repointed
+    root still invalidates; what changes is only WHERE the ``realpath`` runs. A
+    wedged mount blocks the calling thread here rather than raising a stall --
+    which is what the same thread's own ``os.walk`` on that mount does anyway.
 
     ponytail: the returned set is the cached instance, not a copy — both
     callers only iterate it. A future caller that MUTATES the result would
@@ -2226,13 +2338,32 @@ def _home_dir_targets(home_dirs: list[str]) -> set[str]:
     # reads file one root's targets under the other root's key — a fail-OPEN
     # TOCTOU, pinned by the regression test
     # test_roots_are_resolved_once_for_key_and_build.
-    roots = _resolved_root_key()
+    if inline:
+        roots = _resolve_root_anchors(str(Path.home()))
+        cached = _home_targets_cache.get((tuple(home_dirs),) + roots)
+        if cached is not None and time.monotonic() < cached[0]:
+            return cached[1]
+        with _home_targets_inline_lock:
+            # Resolve after acquiring: a queued worker must not reuse anchors
+            # captured before another worker's potentially slow rebuild.
+            roots = _resolve_root_anchors(str(Path.home()))
+            return _cached_home_dir_targets(home_dirs, roots, inline=True)
+    return _cached_home_dir_targets(home_dirs, _resolved_root_key(), inline=False)
+
+
+def _cached_home_dir_targets(
+    home_dirs: list[str], roots: _ResolvedRoots, *, inline: bool
+) -> set[str]:
+    """Share the target cache while coalescing inline builders at the caller."""
     key = (tuple(home_dirs),) + roots
     now = time.monotonic()
     cached = _home_targets_cache.get(key)
     if cached is not None and now < cached[0]:
         return cached[1]
-    targets = _rebuild_targets_bounded(home_dirs, roots)
+    if inline:
+        targets = _home_dir_targets_uncached(home_dirs, roots)
+    else:
+        targets = _rebuild_targets_bounded(home_dirs, roots)
     # Bound the dict: the key space is tiny (two constant home_dirs lists ×
     # roots), but a test or embedder that churns KIROCREW_HOME must not grow it
     # without limit.
@@ -2290,7 +2421,14 @@ def _rebuild_targets_bounded(home_dirs: list[str], roots: _ResolvedRoots) -> set
     return targets
 
 
-def _path_in_home_dirs(path_str: str, home_dirs: list[str], base_dir: str | None = None) -> bool:
+def _path_in_home_dirs(
+    path_str: str,
+    home_dirs: list[str],
+    base_dir: str | None = None,
+    *,
+    strict: bool = False,
+    pre_resolved: bool = False,
+) -> bool:
     """Return True if *path_str* resolves under any of *home_dirs* (``$HOME``-relative).
 
     Shared matching core for :func:`is_sensitive_path` (read+write gate,
@@ -2319,19 +2457,27 @@ def _path_in_home_dirs(path_str: str, home_dirs: list[str], base_dir: str | None
     ``sub/cfg.ini`` resolves against the real directory rather than whatever CWD
     the gateway process happens to have.  Absolute inputs are unaffected;
     ``base_dir=None`` preserves the historical CWD-relative behavior.
+    ``pre_resolved`` is :func:`_candidate_forms`'s flag of the same name, and
+    such a caller is by contract on its own worker thread, so the anchors are
+    resolved inline as well (``_home_dir_targets(inline=True)``): the whole
+    check then performs no ``mc-pathres`` submission.
     """
     if not path_str:
         return False
 
     try:
-        candidates = _candidate_forms(path_str, base_dir)
+        candidates = _candidate_forms(path_str, base_dir, pre_resolved=pre_resolved)
         # The anchors are bounded the same way (see _rebuild_targets_bounded):
         # a stall with no prior canonical resolution to serve refuses too.
-        sensitive_targets = _home_dir_targets(home_dirs)
+        sensitive_targets = _home_dir_targets(home_dirs, inline=pre_resolved)
     except PathResolutionStalled:
         # Canonical form unavailable (wedged mount under the path): refuse.  A
         # lexical-only match here would pass a workspace symlink into a
-        # credential store for the length of the stall.
+        # credential store for the length of the stall.  A *strict* caller
+        # (``sensitive_path_refusal``) wants to REPORT that as what it is rather
+        # than as a match, so it gets the exception; the refusal is the same.
+        if strict:
+            raise
         return True
 
     # Case-fold both sides for the membership test.  On a case-insensitive
@@ -2350,7 +2496,13 @@ def _path_in_home_dirs(path_str: str, home_dirs: list[str], base_dir: str | None
     return False
 
 
-def _is_keystone_publish_artifact(path_str: str, base_dir: str | None = None) -> bool:
+def _is_keystone_publish_artifact(
+    path_str: str,
+    base_dir: str | None = None,
+    *,
+    strict: bool = False,
+    pre_resolved: bool = False,
+) -> bool:
     """Return True if *path_str* is the atomic-write temp or lock beside a keystone leaf.
 
     Closes the gap between a keystone leaf's FINAL name, which
@@ -2374,9 +2526,11 @@ def _is_keystone_publish_artifact(path_str: str, base_dir: str | None = None) ->
     if not path_str:
         return False
     try:
-        artifact_parents = _home_dir_targets(_KEYSTONE_ARTIFACT_PARENTS)
-        candidates = _candidate_forms(path_str, base_dir)
+        artifact_parents = _home_dir_targets(_KEYSTONE_ARTIFACT_PARENTS, inline=pre_resolved)
+        candidates = _candidate_forms(path_str, base_dir, pre_resolved=pre_resolved)
     except PathResolutionStalled:
+        if strict:
+            raise
         return True  # fail closed: see _path_in_home_dirs
     for cand in candidates:
         cand_cf = cand.casefold()
@@ -2416,10 +2570,108 @@ def is_sensitive_path(path_str: str, base_dir: str | None = None) -> bool:
     the leaf holds the leaf's full payload, so READ is blocked alongside write -- a
     write-only fence there would still disclose ``.env`` or ``token_signing.key`` to a
     reader that wins the race.
+
+    The decision is :func:`sensitive_path_refusal`'s -- this is its boolean
+    spelling, so the two cannot diverge. A stall is refused there (a string) and is
+    therefore ``True`` here: the callers that only hold this boolean keep refusing
+    fail-closed; what they lose is the distinct WORDING, which is the gate
+    consumers' business.
     """
-    return _path_in_home_dirs(
-        path_str, _SENSITIVE_HOME_DIRS, base_dir
-    ) or _is_keystone_publish_artifact(path_str, base_dir)
+    return sensitive_path_refusal(path_str, base_dir) is not None
+
+
+def is_sensitive_resolved_path(resolved: str) -> bool:
+    """:func:`is_sensitive_path` for a path the caller has ALREADY canonicalised.
+
+    Same decision and same targets, with NO ``mc-pathres`` submission on either
+    half: the candidate is matched lexically, and the anchors (``$HOME``, the
+    override roots, the keystone leaves) are resolved inline on the calling
+    thread (:func:`_home_dir_targets` with ``inline=True``), fresh on every call
+    and keying the same TTL cache the bounded path uses. *resolved* MUST be the
+    output of ``os.path.realpath`` (or ``Path.resolve``) that the caller computed
+    on its OWN worker thread: the only thing the bounded resolution would add for
+    such an input is the same string back, since a canonical path has no link
+    left to follow. Handing this an unresolved spelling is a link bypass, and
+    calling it from the event loop forfeits the bound the pool exists to give
+    that loop -- so it is for exactly one shape of caller: a bulk WALK on a
+    worker thread that already resolves every entry to detect symlink loops and
+    prove containment, and only then asks whether the entry is fenced.
+
+    Why a separate entry point rather than "just call the pool anyway": the pool
+    is sized for the event loop (two workers, so a wedged mount can pin at most
+    two threads), and it is FIFO. A walk over a thousand skill directories, each
+    submitting a resolution the walk had already performed plus an anchor
+    resolution per call, fills that queue from worker threads while the loop's
+    own latency-critical resolutions wait behind it -- not for a slow disk, for
+    the queue -- and the accumulated waits cross the loop-stall watchdog. The
+    scanner's realpath is unbounded either way (it runs off the loop, and
+    ``os.walk`` on the same mount is unbounded too), so the pool bought that
+    caller nothing and cost the loop its budget.
+
+    A wedged mount therefore does not surface here as a refusal: it blocks the
+    calling thread inside ``realpath``, exactly as that thread's own walk of the
+    same mount would. Nothing is admitted while it blocks.
+    """
+    return _path_in_home_dirs(resolved, _SENSITIVE_HOME_DIRS, pre_resolved=True) or (
+        resolved.casefold().endswith(_KEYSTONE_ARTIFACT_SUFFIXES)
+        and _is_keystone_publish_artifact(resolved, pre_resolved=True)
+    )
+
+
+#: The fixed opening of an unverifiable-path refusal. Consumers tell a stall from a
+#: match with :func:`is_unverifiable_path_refusal`, a prefix test, and never by
+#: searching the text: both refusals embed the caller-chosen path, and a prefix is
+#: the one place that path cannot reach -- a substring test would let a path
+#: spelled to contain the phrase pass itself off as a stall.
+UNVERIFIABLE_PATH_PREFIX = (
+    "Blocked: the path could not be verified against the sensitive-path list within "
+    "the resolver budget"
+)
+
+
+def is_unverifiable_path_refusal(reason: str) -> bool:
+    """True when *reason* is the stall refusal :func:`sensitive_path_refusal` produces.
+
+    Structural, by the fixed prefix that precedes any caller-influenced text. The
+    match refusal opens ``Blocked: access to sensitive path:`` instead, so no path
+    spelling can move one refusal into the other's class.
+    """
+    return reason.startswith(UNVERIFIABLE_PATH_PREFIX)
+
+
+def sensitive_path_refusal(path_str: str, base_dir: str | None = None) -> str | None:
+    """The path tier of the tool gate: the refusal for *path_str*, or ``None``.
+
+    Reason-or-``None`` like the other tiers (``is_sensitive_bash_command``,
+    ``audit_bash_exfiltration``, ``is_denied``), so ``hooks.on_tool_call`` applies
+    it the same way.
+
+    The ONE decision: :func:`is_sensitive_path` is ``refusal is not None``. A path
+    whose canonical form (or whose anchors) could not be established within the
+    resolve budget is refused exactly as a match is, fail-closed, and this function
+    is never a way to let one through -- but the two refusals get different WORDS.
+    A match is ``Blocked: access to sensitive path: <path>``. A stall opens with
+    :data:`UNVERIFIABLE_PATH_PREFIX`, says the path is NOT a match, and quotes the
+    path LAST: a stall reported as a match leads the agent reading it to conclude,
+    reasonably and wrongly, that an ordinary project file holds a credential, that
+    the session has been locked down, or that a different spelling might pass, and
+    each of those costs a wasted round where "could not verify within budget, retry
+    shortly" costs one wait.
+    """
+    try:
+        matched = _path_in_home_dirs(
+            path_str, _SENSITIVE_HOME_DIRS, base_dir, strict=True
+        ) or _is_keystone_publish_artifact(path_str, base_dir, strict=True)
+    except PathResolutionStalled:
+        return (
+            f"{UNVERIFIABLE_PATH_PREFIX} (symlink resolution did not complete in time), "
+            "so it is refused fail-closed. This is NOT a match: the path is not known to "
+            "be sensitive. Retry the same call after a short wait; do not re-spell it. "
+            f"Path: {path_str!r}"
+        )
+    if matched:
+        return f"Blocked: access to sensitive path: {path_str}"
+    return None
 
 
 def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:

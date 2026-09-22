@@ -6,7 +6,7 @@ import { copySessionLink } from '../../utils/shareUrl'
 import { ICON_ACTION_ROW_CLS } from '../../utils/touchActions'
 import { useSearchHighlight, useCurrentOcc } from '../../hooks/SearchHighlightContext'
 import { useImeGuard } from '../../hooks/useImeGuard'
-import { applySearchHighlights } from '../../utils/domHighlight'
+import { applySearchHighlights, clearSearchHighlights } from '../../utils/domHighlight'
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
 import { containedSelectionRange } from '../../utils/selectionContainment'
 import { type PasteBlock, expandAll as expandPasteTokens } from '../../utils/pasteTokens'
@@ -25,7 +25,11 @@ interface UserMessageProps {
   meta?: Record<string, unknown>
   timestamp?: string
   timestampTitle?: string
-  renderContent: (content: string, meta: Record<string, unknown> | undefined) => React.ReactNode
+  /** `messageTs` is handed over because the session chip's short-name form needs
+   *  to know WHEN the text was written: a bare `chat-1380` resolves against the
+   *  live roster, and slot numbers are reused, so without a write time it cannot
+   *  tell the session that name meant from the one that later took its number. */
+  renderContent: (content: string, meta: Record<string, unknown> | undefined, messageTs?: string) => React.ReactNode
   canEdit?: boolean
   messageIndex?: number
   messageTs?: string
@@ -179,7 +183,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     // Converge-center the exact occurrence (see scrollCurrentMatchIntoView).
     // Cancel on re-run/unmount so rapid navigation doesn't accumulate loops.
     const cancelScroll = currentOcc >= 0 ? scrollCurrentMatchIntoView(el) : undefined
-    return () => cancelScroll?.()
+    // The ranges live on a page-wide CSS.highlights entry (see domHighlight):
+    // withdraw this bubble's on unmount so a virtualized row that scrolls away
+    // is not kept alive through them.
+    return () => { cancelScroll?.(); clearSearchHighlights(el) }
   }, [term, caseSensitive, currentOcc, content])
 
   /** Native select+copy from a sent bubble gives the literal chip label
@@ -224,7 +231,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             bubble it replaces, capped at 550px or the column, whichever is
             smaller. No JS measurement. */}
         <div
-          className="edit-grow user-bubble px-4 py-2 text-sm leading-6 rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline outline-2 -outline-offset-2 outline-accent/60"
+          className="edit-grow user-bubble px-4 py-2 text-sm leading-6 rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline-solid outline-2 -outline-offset-2 outline-accent/60"
           data-replicated-value={draft}
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
         >
@@ -232,7 +239,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             ref={taRef}
             rows={1}
             aria-label={i18nT('pages.chat.userMessage.edit_message')}
-            className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-none text-sm leading-6"
+            // focus-cue-ok: the cue is the wrapping .edit-grow frame above, which
+            // paints a 2px accent outline for the whole edit session; a second
+            // ring on the textarea would double-paint the one control.
+            className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-hidden text-sm leading-6"
             value={draft}
             onChange={e => setDraft(e.target.value)}
             {...ime.bindComposition()}
@@ -261,7 +271,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   const bubble = (
     // 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md
     <div ref={userRef} onCopy={handleCopy} className={`message-bubble msg-content px-4 py-2 text-sm leading-6 rounded-xl overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-      {renderContent(content, meta)}
+      {/* `messageTs` FIRST, `clientTs` only as a fallback. The opposite order is
+          correct for the audio key above, which wants the optimistic bubble's own
+          identity, but this value is COMPARED against server-clock slot mint
+          epochs: `clientTs` is the client's clock, retained through reconcile, so
+          an ahead-skewed one would let a reused slot pass the mint check and open
+          the wrong conversation, silently. The fallback still covers a bubble that
+          has no server ts yet. */}
+      {renderContent(content, meta, messageTs || ((meta as { clientTs?: string })?.clientTs))}
     </div>
   )
 

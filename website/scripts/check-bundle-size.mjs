@@ -71,7 +71,18 @@ export const CHUNK_BUDGETS = {
   // editor, store picker/card, carve, backups, retired) across all 13 catalogs
   // on top of that: with them the chunk builds at 11,332,186 B (11067 KB), so
   // the 5% headroom is taken over that measurement rather than main's.
-  all: 11620 * KB, // measured 11067 KB on feat/memory-v2-ui 2026-09-10 (~5% headroom)
+  // Re-measured 2026-09-16: main @ a9c1cb253d alone builds the chunk at
+  // 11,880,309 B (11602.8 KB) against the 11620 KB ceiling -- 17.2 KB left, or
+  // 0.15% headroom. Same recurrence as every note above: the ceiling drifted to
+  // under 1% on accumulated catalog copy, so it now fails on the next feature
+  // PR's ordinary strings rather than on the new library or surface it exists to
+  // catch. Attribution measured, not assumed: this branch adds 61 catalog lines
+  // x 13 languages for the tasks-capacity panel (49,821 B, 48.7 KB) and no
+  // module -- the chunk still holds the same 13 catalogs plus the entry, and no
+  // lazy import() boundary can move a catalog string out of `all`, which is why
+  // shrinking is not an option here. Back to the 5% convention over the
+  // measurement that includes this branch (11,930,130 B).
+  all: 12240 * KB, // measured 11650.5 KB on fix/gatewayd-overload-liveness 2026-09-16 (5.1% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
@@ -102,7 +113,33 @@ export const CHUNK_BUDGETS = {
   // merged analyze build measures the chunk at 807,525 B (788.6 KB); keep
   // roughly 5% headroom (matching the `all` entry's convention above) over that
   // combined measurement so expected catalog growth does not block descendants.
-  t: 819 * KB, // measured 788.6 KB on the merged (structured-monitor + managed-credentials) build (~3.7% headroom)
+  // Re-measured 2026-09-13 on the reviewed member capability inheritance
+  // branch rebased onto main @ f382f0a70: the analyze build emits the chunk at
+  // 839,943 B (820.3 KB) against the 819 KB ceiling -- 1,287 B over. The
+  // growth is English catalog copy only: the feature's 96 keys
+  // (`crewCapabilities` / `crewCapabilityEditing`, ~4.7 KB) plus 15 upstream
+  // keys that landed on main after the branch's previous rebase. The chunk
+  // report counts 12 modules; this PR adds no dependency. This is the
+  // documented catalog-growth drift again: the previous ceiling
+  // was set at 3.7% over its own measurement, below the 5% convention, and
+  // ordinary catalog growth since then used that margin up. Back to the 5%
+  // convention over the measured size.
+  // Re-measured 2026-09-19 on this channel-folder backfill branch rebased onto
+  // main @ 1c7f963706: main's catalogs ALONE build the chunk at 881,305 B
+  // (860.6 KB) against the 861 KB ceiling -- 359 B left, or 0.04% headroom. With
+  // this feature's copy it builds at 882,910 B (862.2 KB), 1.2 KB over.
+  // Attribution is measured, not assumed: reverting ONLY the 14 files under
+  // `website/src/i18n/` to the base and rebuilding drops the chunk to the
+  // 881,305 B above, so the delta this branch owns is 1,605 B -- its 18 keys of
+  // product copy across 13 catalogs plus the generated `en-XA` pseudo-locale,
+  // which roughly doubles the byte cost of every string. The report still counts
+  // 12 modules and this branch adds no dependency, and no lazy `import()`
+  // boundary can move a catalog string out of this chunk (same as the `all`
+  // entry's note above). This is the documented drift for the fourth time: a
+  // ceiling left at 0.04% headroom fails on the next feature's ordinary strings
+  // rather than on the new library it exists to catch. Back to the 5% convention
+  // over the measured size.
+  t: 905 * KB, // measured 862.2 KB on this branch rebased onto 1c7f963706 (~5% headroom)
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor

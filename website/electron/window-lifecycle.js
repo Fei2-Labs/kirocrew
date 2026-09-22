@@ -6,7 +6,7 @@ const path = require("path");
 const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
 const { createRendererRecovery } = require("./renderer-recovery");
 const { createHangRecovery } = require("./hang-recovery");
-const { armSplashHistoryClear } = require("./splash-history");
+const { armSplashHistoryClear, fileShellPageBasename } = require("./splash-history");
 const { hideToTray, cancelPendingTrayHide } = require("./hide-to-tray");
 const { attachHtmlFullScreen } = require("./html-fullscreen");
 const { createDisplayMediaHandler } = require("./display-media");
@@ -20,6 +20,7 @@ const { resolveThemeSource } = require("./native-theme");
 const { sanitizeWindowState, captureWindowState } = require("./window-state");
 const { clampZoomFactor, stepZoomFactor } = require("./zoom");
 const { createBrowserViewManager, isUntrustedContents } = require("./browser-view");
+const { registerCaptureSurface, createCaptureTrust } = require("./capture-trust");
 const {
   canAgentControl,
   isLoopbackUrl,
@@ -475,6 +476,11 @@ function createWindowLifecycle(options) {
     };
     win._mcGetCustomName = () => customName;
     win._mcBackendUrl = windowBackendUrl;
+    // The dashboard SPA is a capture surface (the chat composer's snip and the
+    // web-preview crop). Registered against the gateway origin THIS window was
+    // opened on, so a secondary window pointed at a remote gateway is bound to
+    // its own origin and never to a sibling's.
+    registerCaptureSurface(view.webContents, windowBackendUrl);
     win._mcView = view;
 
     // One native browser view/control plane per dashboard panel. The renderer
@@ -1527,9 +1533,15 @@ function createWindowLifecycle(options) {
     if (sessionSecurityConfigured) return;
 
     // Screen capture has its own handler. Prefer the native system picker when
-    // available and fall back to desktopCapturer elsewhere.
+    // available and fall back to desktopCapturer elsewhere. WHO may be granted a
+    // screen is decided by identity in capture-trust.js: a registered surface,
+    // its own main frame, still on its registered origin. Without this dep the
+    // handler denies everything, so the wiring is not optional.
     session.defaultSession.setDisplayMediaRequestHandler(
       createDisplayMediaHandler({
+        isTrustedRequest: createCaptureTrust({
+          fromFrame: (frame) => webContents.fromFrame(frame),
+        }),
         getSources: () => desktopCapturer.getSources({
           types: ["screen", "window"],
         }),
@@ -1539,7 +1551,18 @@ function createWindowLifecycle(options) {
             : "granted"
         ),
         onPermissionNeeded: (reason) => {
-          if (reason === "denied") showScreenPermissionDialog();
+          if (reason === "denied") return showScreenPermissionDialog();
+          // No dialog for a trust refusal: an embedded pane or a browsed page
+          // asked, and nothing the user can change in System Settings would
+          // make that grantable. One breadcrumb instead, for the same reason
+          // permission-handler.js logs its denials -- a silent refusal is
+          // indistinguishable from an OS one when someone has to diagnose it.
+          if (reason === "untrusted-frame") {
+            // eslint-disable-next-line no-console -- see the note above
+            console.warn(
+              "[display-media] DENY capture: requester is not a registered capture surface",
+            );
+          }
         },
       }),
       { useSystemPicker: true },
@@ -1647,7 +1670,11 @@ function createWindowLifecycle(options) {
 
   function zoomMenuItem(apply) {
     return () => {
-      const wc = webContents.getFocusedWebContents();
+      // Match the sibling reload/devtools handlers: a BaseWindow has no
+      // top-level webContents, so getFocusedWebContents() returns null here and
+      // zoom would silently no-op. focusedDashboardWebContents() reaches the
+      // dashboard view nested in the contentView.
+      const wc = focusedDashboardWebContents();
       if (!wc) return;
       apply(wc);
       // Chromium applies zoom per-origin, so same-origin sibling windows move
@@ -1744,10 +1771,43 @@ function createWindowLifecycle(options) {
     applyFocusModeChrome(win, visible, { positionTrafficLights });
   }
 
-  function handleWindowControl(sender, action) {
-    if (!LINUX_FRAMELESS) return;
+  function handleWindowControl(sender, action, senderFrame) {
     const win = windowForWebContents(sender);
-    if (win) applyWindowControl(win, action);
+    if (!win) return;
+    if (LINUX_FRAMELESS) {
+      applyWindowControl(win, action);
+      return;
+    }
+    // Off Linux the OS draws the captions, so this channel stays closed to the
+    // dashboard. The one admission is `close` from the splash (loading.html):
+    // it is painted into this window with no chrome of its own, and on macOS
+    // the window may have no reachable close control at that moment -- native
+    // fullscreen hides the traffic lights, and focus mode hides them in
+    // windowed mode with nothing left to restore them once the dashboard
+    // document is gone. `close` runs the window's own close handler, which
+    // hides to tray and leaves fullscreen first, exactly like the native
+    // button. Admission uses the immutable URL of the top-level frame that sent
+    // the IPC; the WebContents current URL may change before this handler runs.
+    // The page is named by exactly one literal: the splash is the only shell
+    // page that carries a close control. The token prompt is a transient shell
+    // page for history pruning (splash-history.js) but sends nothing on this
+    // channel, so it gets no admission on it. fileShellPageBasename yields ""
+    // for anything that is not a file: URL, so a dashboard route that merely
+    // mentions loading.html never matches, and junk fails closed.
+    if (
+      action !== "close"
+      || fileShellPageBasename(sendingMainFrameUrl(sender, senderFrame)) !== "loading.html"
+    ) return;
+    applyWindowControl(win, "close");
+  }
+
+  function sendingMainFrameUrl(sender, senderFrame) {
+    try {
+      if (!senderFrame || senderFrame !== sender?.mainFrame) return "";
+      return typeof senderFrame.url === "string" ? senderFrame.url : "";
+    } catch {
+      return ""; // missing, malformed, or torn down: fail closed
+    }
   }
 
   function setThemeMode(pref) {

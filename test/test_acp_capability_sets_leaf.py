@@ -33,15 +33,21 @@ import pytest
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
+    ACP_BACKENDS_SESSION_EVICTION,
     ACP_BACKENDS_SESSION_SHARING,
+    ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
     ACP_BACKENDS_STEER,
     model_registry_namespace,
 )
@@ -64,7 +70,9 @@ CAPABILITY_SETS = (
     "ACP_BACKENDS_COMPACT",
     "ACP_BACKENDS_INTERNAL_SANDBOX",
     "ACP_BACKENDS_SEED_LOCAL_SETTINGS",
+    "ACP_BACKENDS_SESSION_EVICTION",
     "ACP_BACKENDS_SESSION_SHARING",
+    "ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE",
     "ACP_BACKENDS_STEER",
 )
 
@@ -156,30 +164,65 @@ def test_membership_is_unchanged_by_the_move() -> None:
     Opting a harness in is a deliberate edit with evidence (harness-parity H5/H6);
     a relocation is not the place for it.
     """
-    assert ACP_BACKENDS_SESSION_SHARING == frozenset({ACP_BACKEND_KIRO})
-    assert ACP_BACKENDS_COMPACT == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE})
+    # kiro and codex are in all three; KAS is on the runtime and in eviction, and
+    # out of sharing. No two of these sets may be derived from another, and KAS is
+    # the case that shows it: eviction and sharing both read its teardown verb and
+    # reach opposite conclusions, because ``_kiro/session/delete`` frees the session
+    # (eviction) by REMOVING the record a continuation would load (no sharing).
+    # codex's ``session/close`` frees the session and leaves the record, so it is in
+    # both.
+    assert ACP_BACKENDS_SESSION_SHARING == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
+    # The three harnesses added on captured evidence are named here too, so a
+    # relocation still cannot grant the capability quietly -- the pin moves with
+    # the deliberate edit rather than being loosened to accommodate it.
+    assert ACP_BACKENDS_COMPACT == frozenset(
+        {
+            ACP_BACKEND_KIRO,
+            ACP_BACKEND_CLAUDE,
+            ACP_BACKEND_CODEX,
+            ACP_BACKEND_OPENCODE,
+        }
+    )
     assert ACP_BACKENDS_INTERNAL_SANDBOX == frozenset({ACP_BACKEND_KIRO})
     assert ACP_BACKENDS_STEER == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
-    assert ACP_BACKENDS_ACP_RUNTIME == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+    assert ACP_BACKENDS_ACP_RUNTIME == frozenset(
+        {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX}
+    )
+    assert ACP_BACKENDS_SESSION_EVICTION == frozenset(
+        {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX}
+    )
+    # The spec's own servers reach kiro-cli from disk and KAS as a projected agent
+    # definition; codex mounts exactly the array it is sent, so it is judged by it.
+    assert ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
     assert backends_retired_by_host_logout() == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
     # The provider-advertised-model seams. claude for the spelling fold; codex
     # because its configOptions ``model`` select is the ONLY source of ids the
-    # adapter accepts back, so the capture is what the picker reads; opencode for
-    # the same capture reason, its ids being ``provider/model`` pairs drawn from the
-    # operator's own provider list. The settings seed stays claude-only — the two
-    # opt-ins are independent, and a deliberate edit this pin forces to be seen.
+    # adapter accepts back, so the capture is what the picker reads; opencode and
+    # pi for the same capture reason, their ids being ``provider/model`` pairs drawn
+    # from the operator's own provider list. The settings seed stays claude-only —
+    # the two opt-ins are independent, and a deliberate edit this pin forces to be
+    # seen.
+    # deepseek joins for that same capture reason, in its strongest form: its
+    # select's values are JSON-encoded ``[provider, model]`` pairs from its own live
+    # catalog, which nothing can spell from a stored bare model name.
     assert ACP_BACKENDS_ADVERTISED_MODEL_SELECTION == frozenset(
-        {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_OPENCODE}
+        {
+            ACP_BACKEND_CLAUDE,
+            ACP_BACKEND_CODEX,
+            ACP_BACKEND_OPENCODE,
+            ACP_BACKEND_PI,
+            ACP_BACKEND_GOOSE,
+            ACP_BACKEND_DEEPSEEK,
+        }
     )
     assert ACP_BACKENDS_SEED_LOCAL_SETTINGS == frozenset({ACP_BACKEND_CLAUDE})
 
 
 def test_model_registry_namespace_maps_every_known_backend() -> None:
-    """The namespace is a registry index selector, mapped for every backend so a
-    future ADVERTISED_MODEL_SELECTION member already has an entry. The kiro
-    family lives in the ``acp`` namespace; claude uses ``claude_code``; codex has
-    its own, because the same key selects the advertised-model cache bucket and
-    codex's served ids are not kiro's."""
+    """The namespace is a registry index selector, and the same key selects the
+    advertised-model cache bucket. The kiro family lives in the ``acp`` namespace;
+    claude uses ``claude_code``; codex has its own, because codex's served ids are not
+    kiro's."""
     assert model_registry_namespace(ACP_BACKEND_CLAUDE) == "claude_code"
     assert model_registry_namespace(ACP_BACKEND_KIRO) == "acp"
     assert model_registry_namespace(ACP_BACKEND_KAS) == "acp"
@@ -188,14 +231,59 @@ def test_model_registry_namespace_maps_every_known_backend() -> None:
     assert model_registry_namespace("something-new") == "acp"
 
 
+def test_a_harness_that_persists_a_catalog_owns_its_own_namespace() -> None:
+    """A member of ADVERTISED_MODEL_SELECTION must not share the kiro bucket.
+
+    That set is exactly the harnesses whose advertised models are CAPTURED off
+    ``session/new`` and persisted to the cross-session provider-model cache, and this
+    key is the bucket they are persisted into. So a member with no entry of its own
+    falls back to ``acp`` and its catalog replaces kiro-cli's -- the picker then offers
+    kiro-cli whatever the other harness happened to advertise.
+
+    Derived from the SET rather than from a list of ids, which is what the spot-check
+    above cannot do: it named four backends, and a fifth joining the set was invisible
+    to it. Each of these harnesses draws its ids from the operator's own provider
+    configuration, so no two of them may share a bucket either.
+    """
+    kiro_namespace = model_registry_namespace(ACP_BACKEND_KIRO)
+    seen: dict = {}
+    for backend in sorted(ACP_BACKENDS_ADVERTISED_MODEL_SELECTION):
+        namespace = model_registry_namespace(backend)
+        assert namespace != kiro_namespace, (
+            f"{backend!r} persists an advertised catalog but shares the kiro namespace "
+            f"{namespace!r}, so its models overwrite kiro-cli's in the picker -- give it "
+            "its own key in _MODEL_REGISTRY_NAMESPACE_BY_BACKEND"
+        )
+        assert namespace not in seen, (
+            f"{backend!r} and {seen[namespace]!r} both persist advertised catalogs into "
+            f"namespace {namespace!r}, so whichever starts last wins"
+        )
+        seen[namespace] = backend
+    assert seen, "no harness persists an advertised catalog, so this ratchet is vacuous"
+
+
 def test_acp_runtime_is_a_superset_of_session_sharing() -> None:
     """The documented relationship between the two sets, asserted rather than described.
 
     Running on AcpRuntime is necessary for session sharing but not sufficient: KAS
-    runs there yet is excluded from sharing until keep-aware teardown lands. A future
-    edit that adds a harness to sharing without adding it to the runtime set would
-    describe a backend that multiplexes sessions without a multiplexer.
+    runs there and is still excluded, because its teardown removes the record a
+    continuation would load. A future edit that adds a harness to sharing without
+    adding it to the runtime set would describe a backend that multiplexes sessions
+    without a multiplexer.
     """
     assert ACP_BACKENDS_SESSION_SHARING <= ACP_BACKENDS_ACP_RUNTIME
     assert ACP_BACKEND_KAS in ACP_BACKENDS_ACP_RUNTIME
     assert ACP_BACKEND_KAS not in ACP_BACKENDS_SESSION_SHARING
+    # Sharing is a PROPER subset, and KAS is now the only member of the runtime that
+    # demonstrates it -- so the assertion is kept rather than dropped when codex
+    # moved across, or nothing would hold the two sets apart.
+    assert ACP_BACKENDS_SESSION_SHARING != ACP_BACKENDS_ACP_RUNTIME
+    # codex is in ALL THREE, and the pair below is the fact that puts it in sharing
+    # without softening its teardown: the session is evicted, and the record the
+    # harness owns is what a ``session/load`` restores.
+    assert ACP_BACKEND_CODEX in ACP_BACKENDS_ACP_RUNTIME
+    assert ACP_BACKEND_CODEX in ACP_BACKENDS_SESSION_SHARING
+    assert ACP_BACKEND_CODEX in ACP_BACKENDS_SESSION_EVICTION
+    assert ACP_BACKEND_CODEX in ACP_BACKENDS_HARNESS_OWNED_SESSIONS
+    # KAS is in eviction too, so eviction cannot be what sharing is read off.
+    assert ACP_BACKEND_KAS in ACP_BACKENDS_SESSION_EVICTION

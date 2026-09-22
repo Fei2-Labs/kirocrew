@@ -12,6 +12,50 @@ upstream:
   fork_branch: main
   sync_branch: "sync/upstream-{date}"
 
+# ── HOW TO RESOLVE, whatever a glob below says ──
+#
+# A whole-file `fork_wins`/`upstream_wins` pick is NOT a resolution when BOTH
+# sides edited the file. The 2026-09-21 sync (704 commits) lost ~20 fork
+# additions that way, and none of them failed to compile: each surfaced later as
+# an ImportError, an AttributeError on a live path, or a test whose own fixtures
+# survived while the code they exercised did not. Two shapes to expect:
+#
+#   * a file resolved `upstream_wins` drops a fork-only SYMBOL other files still
+#     import (grep the symbol across the tree, do not just check the file
+#     compiles); and
+#   * a file resolved either way drops a fork FEATURE whose backend half has no
+#     upstream counterpart and therefore survives untouched -- so the feature
+#     looks present, its tests still pass on the surviving half, and only the
+#     user-facing surface is gone. FIVE instances at that one sync:
+#     divergences/multi-repo-git-panel (backend handler AND frontend, plus the
+#     test file itself came back as upstream's copy, so its 25 assertions were
+#     gone and it passed VACUOUSLY against the deleted code),
+#     divergences/workflow-policy-panel, divergences/acp-backend-card-catalog,
+#     the ChatInput provider badge + plan-quota block, and the AboutPanel
+#     fork-identity block -- where `dashboard/state.py` kept publishing all four
+#     fields under their exact names while nothing on the frontend could read
+#     them. So: check the TEST file as carefully as the source (a pin that
+#     returns as the other side's file pins nothing), and when a backend still
+#     publishes a field, grep for its READER before believing the feature is
+#     present.
+#
+#   * a restored surface can still be unreachable: `providerLabel` came back on
+#     the ChatInput badge but not in the SHELF's own visibility gate, so the
+#     badge could not render alone -- the "declared, mounted and unreachable"
+#     shape the comment beside that gate already warns about. Restore the
+#     rendering AND whatever decides it is drawn.
+#
+# So: `git merge-file` the three versions, read the whole function around every
+# hunk, and for a file upstream rewrote, RE-APPLY the fork's delta onto
+# upstream's structure rather than choosing a side. The policy below says which
+# side's INTENT wins, not which file to copy.
+#
+# The other lesson from that sync: to tell a merge regression from an
+# environmental failure, create two extra worktrees -- one at the pre-merge fork
+# commit, one at MERGE_HEAD -- and run the failing test file in each. 52 of 53
+# failures in `test_acp_runtime.py` failed identically on PURE UPSTREAM (a
+# pytest-asyncio cross-loop issue on that host), so exactly one was ours.
+
 conflict_policy:
   # ── keystone security surfaces: the fork's hardening is the point ──
   - glob: "src/kiro_crew/security.py"
@@ -120,6 +164,40 @@ conflict_policy:
   # parent afterwards.
   - glob: "src/kiro_crew/**"
     policy: upstream_wins
+  # ── frontend surfaces carrying a fork FEATURE, not just fork strings ──
+  # Upstream rewrites these files too, so `upstream_wins` on the blanket rule
+  # below silently deletes the feature while its backend half and its tests
+  # survive. Re-apply the fork delta onto upstream's structure.
+  - glob: "website/src/components/GitPanel.tsx"
+    policy: manual
+    note: |
+      divergences/multi-repo-git-panel: the per-repo grouping, the SKIPPED
+      marker, the repo-count header, `?refresh=1` on the refresh button, and the
+      row-own-repoRoot file open. Upstream rewrote the whole panel at the
+      2026-09-21 sync (264 added lines) and the fork's 118 went with it.
+  - glob: "website/src/pages/settings/SecurityPanel.tsx"
+    policy: manual
+    note: |
+      divergences/workflow-policy-panel: `WorkflowPolicyCard` is the only surface
+      that reads or writes the three keystone loosening opt-ins.
+  - glob: "website/src/api/client.ts"
+    policy: manual
+    note: |
+      The fork's own endpoints and response fields live beside upstream's in one
+      file: `workflowPolicy`/`setWorkflowPolicy`, `ProjectGitFile` +
+      `projectGitStatus`'s `repos`/`reposTruncated`/`refused`/`fresh`,
+      `createChatSlot`'s `clean_mode`/`project` tail, `AcpBackendsResponse`.
+      Union the members; never take either file whole.
+  - glob: "website/src/i18n/locales/*.json"
+    policy: union
+    note: |
+      `en.json` is REGENERATED wholesale by the i18n codemod, so upstream's copy
+      carries none of the fork's namespaces -- taking it drops
+      `pages.overview.acpBackend.*` and the workflow-policy and multi-repo keys
+      at once, and every affected string renders as its raw key. Union per key in
+      all 13 locales, and re-check `catalogParity` (plural VARIANTS are separate
+      keys: a base key restored without its `_one`/`_other` siblings still fails).
+
   - glob: "website/src/**"
     policy: upstream_wins
     note: "Keep fork-only i18n/glossary additions (union within this policy)."
@@ -282,6 +360,89 @@ conflict_policy:
       guards nothing.
 
 divergences:
+  - id: multi-repo-git-panel
+    what: |
+      Fork-only (5cb712fb5, on upstream's `feat/multi-repo-git-status` branch but
+      NOT on upstream main). BOTH halves are losable and BOTH were lost at the
+      2026-09-21 sync.
+
+      Backend, in `dashboard/handlers/files.py`: `_discover_repo_roots` (the
+      up-then-down scan, bounded depth 3 / 12 repos / 4000 entries, cached 60s,
+      bypassed by `?refresh=1`), `_verify_descendant_roots` (a realpath identity
+      check at USE time -- `core.worktree` can point a contained repo at an
+      outside tree), the `_REPO_STATUS_CONCURRENCY` semaphore around the per-repo
+      git spawns, the shared `_REPO_ROW_BUDGET`, and the grouped response:
+      `repos[]` (each with `root`/`name`/`branch`/`refused`/`truncated`/`files`),
+      `reposTruncated`, and a per-row `repoRoot` on every file.
+
+      Frontend: the panel groups by repo, names each group, renders a SKIPPED
+      marker for a refused one, anchors a file open on that row's OWN repo root,
+      and arms `?refresh=1` from the refresh button.
+    why: |
+      A multi-repo workspace (one repo per package) answered `{"repo": false}` and
+      the Git panel stayed empty, because git only walks upward.
+
+      Every file this feature lives in is a file upstream ALSO edits --
+      `handlers/files.py`, `GitPanel.tsx`, `api/client.ts` and
+      `test_project_git_status_log.py` -- so a whole-file pick on any of them
+      deletes that half. The 2026-09-21 sync took upstream's copy of all four:
+      the feature was gone end to end AND the test file lost its own 25 `repos`
+      assertions, so it kept passing on what remained. Re-apply the fork's delta
+      onto upstream's structure; never resolve these whole-file, and check the
+      TEST file too -- a pin that came back as upstream's copy pins nothing.
+
+      Two traps when re-applying the backend (both hit during the restore):
+      upstream's git probe must stay UNCONDITIONAL -- gating it on
+      `known_root is None` skips the HEAD and filter-refusal checks on the
+      single-repo route, and discovery's answer can be 60s stale, so "was a repo
+      a minute ago" is not evidence it is readable now. And a probe FAILURE is not
+      "no repo": treating it as one licenses the downward scan and converts an
+      outage into an empty-workspace 200. Only git's `fatal: not a git
+      repository` licenses the scan; an outage is a 503, while a per-repo outage
+      inside the grouped path is `refused` on THAT group at 200 so one unreadable
+      sibling cannot blank the panel.
+
+      Upstream's `_repo_filter_refusal_cause` SUPERSEDES the fork's boolean
+      `_repo_declares_filter_driver` -- it reports unavailable with a cause
+      instead of `{"repo": true, "files": []}`, which a reader cannot tell from
+      clean. Keep upstream's, and the dedup key must include `repoRoot` or
+      same-named files in sibling repos collapse into one row.
+    pinned_by: "test/test_project_git_status_log.py::TestMultiRepoDiscovery (the backend half), website/src/test/GitPanel.refusedRepo.test.tsx, website/src/test/PierreWorkspaceTreeImpl.test.tsx, website/src/i18n/catalogParity.test.ts (the repos_count plural set)"
+    decided: 2026-09-21
+
+  - id: workflow-policy-panel
+    what: |
+      The keystone loosening opt-ins (`workflow_policy.json`): the
+      `WorkflowPolicyCard` in `website/src/pages/settings/SecurityPanel.tsx`, the
+      `WorkflowPolicyData` type and the `workflowPolicy`/`setWorkflowPolicy` calls
+      in `website/src/api/client.ts`, and their `pages.settings.securityPanel.*`
+      catalog keys in all 13 locales.
+    why: |
+      `git_publication_mode`, `forward_ssh_agent` and `allow_external_handoff`
+      each WIDEN what the agent may do, and the API is their only writer (they are
+      deliberately not in the agent-readable config). The backend half --
+      `workflow_policy.py`, the two `/api/security/workflow-policy` routes and
+      their handlers -- has no upstream counterpart and survives a sync
+      untouched; the frontend half lives in files upstream rewrites, so the merge
+      drops the only surface an operator can read or change them from. The
+      opt-ins then sit at whatever the file says with no way to see it.
+    pinned_by: "website/src/pages/settings/SecurityPanel.workflowPolicy.test.tsx, website/src/components/commandPalette/providers/settingsRegistry.test.ts"
+    decided: 2026-09-21
+
+  - id: acp-backend-card-catalog
+    what: |
+      The `pages.overview.acpBackend.*` catalog namespace (26 generated + 9 manual
+      keys) that the fork's own `AcpBackendCard` renders from.
+    why: |
+      The card is fork-only (divergences/acp-backends-registry-merged-route), so
+      upstream's catalogs carry none of its keys -- and `en.json` is REGENERATED
+      wholesale by the i18n codemod, which makes "take upstream's file" drop the
+      whole namespace at once. Every one of the card's strings then renders as its
+      raw key. Checked by `catalogParity`, not by the card's own tests, so verify
+      the namespace exists in all 13 locales after any sync.
+    pinned_by: "website/src/test/AcpBackendCard.test.tsx, website/src/i18n/catalogParity.test.ts"
+    decided: 2026-09-21
+
   - id: model-picker-upstream-bugfixes
     what: |
       Two fixes in the model picker's save and list paths that upstream's own
@@ -638,7 +799,40 @@ divergences:
     decided: 2026-09-15
 
   - id: durable-run-coordinator
+    status: retired
     what: |
+      RETIRED at the 2026-09-21 sync, by the decision recorded below. Upstream's
+      `taskq/` subsystem supersedes this one: its RFC
+      (`rfc-overload-resilience.md`) carries
+      `supersedes: [rfc-durable-run-coordinator.md]`, and adopting it was the
+      decision taken for this sync rather than carrying two competing schedulers.
+
+      WHAT WENT: the WIRING into `SubagentManager` -- it no longer accepts
+      `coordinator=`, no longer exposes `command_authority`, and
+      `_ack_delivery_for_run` / `_shadow_submit_accepted_run` /
+      `_resume_legacy_terminal_after_failed_shadow_submit` appear nowhere in the
+      source. `_settle_digest_holds_impl` is SYNC again: the fork made it async
+      solely to await that outbox ack, so upstream's sync version is the correct
+      post-retirement shape and a test awaiting it is stale.
+      `test_run_coordinator_{wiring,delivery,recovery}.py` tested that wiring and
+      are deleted with it; the 286 taskq tests are the replacement's cover.
+
+      WHAT STAYS, and is still tested directly: the modules themselves, plus
+      `test_run_coordinator_{sqlite,contract,shadow,admission}.py`
+      (15/70/9/9 passing). Deleting those too would drop coverage of code that is
+      still importable.
+
+      ONE LIVE CONSUMER remains: `dashboard/handlers/messaging.py`'s keyed-command
+      paths (spawn/steer/cancel/lookup). They now resolve the authority through
+      `_command_authority_or_none` and answer 503 `coordinator_unavailable` when it
+      is absent, because reaching for the attribute directly raises
+      `AttributeError` inside the handler and turns an UNSUPPORTED request into a
+      500. Watch this at the next sync: `test_run_coordinator_admission.py` injects
+      a `MagicMock` manager, so it passes whether or not the real attribute exists
+      -- it cannot catch the regression, and the degrade path is what makes the
+      absence safe.
+
+    superseded_what: |
       `src/kiro_crew/run_coordinator/` (models, sqlite, shadow, delivery, recovery,
       memory, legacy) plus its wiring in `subagent_manager/`: `_coordinator_fence`,
       `_coordinator_mark_running`, `_coordinator_record_process`,
@@ -661,8 +855,9 @@ divergences:
 
       The RFC status row in docs/request-for-change/README.md describes THIS tree,
       so upstream's "draft / Nothing" row is wrong here and must not be taken.
-    pinned_by: "test/test_run_coordinator_sqlite.py, test/test_run_coordinator_delivery.py, test/test_run_coordinator_recovery.py, test/test_subagent_command_authority.py"
+    pinned_by: "test/test_run_coordinator_sqlite.py, test/test_run_coordinator_contract.py, test/test_run_coordinator_shadow.py, test/test_run_coordinator_admission.py, test/test_subagent_command_authority.py, test/taskq/ (the replacement's own cover)"
     decided: 2026-09-14
+    retired: 2026-09-21
 
   - id: mcp-injection-composition
     what: |
@@ -730,11 +925,36 @@ divergences:
       respawn, so `running` is derived from the live child plus adopted
       ownership rather than from gatewayOwnership alone; and the observer is
       notification-only, wrapped so a throwing tray callback cannot break boot.
+      HOW IT WAS LOST at the 2026-09-21 sync, exactly as predicted above: the
+      whole file was resolved to upstream's copy (byte-identical to MERGE_HEAD),
+      so `observeState` went with it -- and `main.js` still CALLED it at module
+      level, so the desktop app could not boot at all
+      (`TypeError: gateway.observeState is not a function`). The seven
+      `notifyStateChange()` sites are the load-bearing part: restoring the
+      accessor while missing one leaves the tray reporting a running gateway
+      that is dead, which is the staleness the seam exists to prevent. Two more
+      were needed for transitions upstream added after the seam was written (the
+      liveness SIGKILL, whose three following paths return WITHOUT respawning,
+      and the service-manager adopt, which makes `running` true and returns).
+
+      **THE PIN BELOW WAS DEAD FOR A FULL RELEASE CYCLE.** At the PREVIOUS sync
+      (1f5d2fec0) `test/gateway-supervisor.test.js` was committed TRUNCATED
+      mid-test -- one unclosed `{`, two unclosed `(`, spliced into an unrelated
+      upstream comment -- so the file never parsed and node:test silently
+      reported nothing for it. The merge base parses and MERGE_HEAD parses; only
+      fork HEAD was broken. Every test in it, including the three named here,
+      had been absent since. So a `pinned_by` entry is only true if the file
+      PARSES: after any sync, run `node --check` on every named JS pin before
+      believing the coverage claim. The Electron suite counts tests rather than
+      files, so a whole file going missing does not show up as a failure.
     pinned_by: |
       website/electron/test/gateway-supervisor.test.js (controlState/observeState/
       runControlAction), website/electron/test/hide-to-tray.test.js::"keeps the
-      fork's gateway controls on the tray menu"
+      fork's gateway controls on the tray menu",
+      website/electron/test/early-boot-guard.test.js::"loads main.js to
+      completion" (the one that catches a missing export at module level)
     decided: 2026-09-04
+    revised: 2026-09-21
 
   - id: signed-bundle-bytecode-floor
     status: scoped
@@ -887,6 +1107,16 @@ known_red:
     fix: "Not fixable without rewriting history. Read the working-tree result only."
 
 environmental_failures:
+  - pattern: "test/test_acp_runtime.py (the kas_readiness_wire / managed-readiness family)"
+    reason: |
+      ~52 tests in that file fail with `TimeoutError` and, in the log,
+      `got Future <Future pending> attached to a different loop` from the reader
+      loop. Verified environmental the only way that claim can be made: a
+      worktree at MERGE_HEAD (pure upstream, none of this fork's code) fails the
+      SAME set. It is pytest-asyncio 1.4's loop binding against the fixture's
+      hand-built StreamReader on this host, not a Kiro Crew defect. Re-verify by
+      worktree rather than by assumption -- exactly one failure in that file WAS
+      a real merge regression, and only the differential distinguished it.
   - pattern: "test/test_tailnet_e2e.py"
     reason: "Needs tailscale + network the runner denies; fails on the merge base."
   - pattern: "*@pty_integration"

@@ -51,6 +51,18 @@ WAVE = (
 )
 
 
+def _swallow_turn(_state, _slot, coro):
+    """Stand-in for ``spawn_guarded_turn`` that never runs the turn.
+
+    The drain hands a live ``_run_chat`` coroutine to the spawner; a bare
+    ``MagicMock`` would drop it un-awaited and the interpreter reports that at
+    garbage collection, against whichever later test happens to trigger it.
+    Closing it here settles the coroutine without running a model turn.
+    """
+    coro.close()
+    return MagicMock()
+
+
 class TestMetaHelperShapes:
     """The dict shape is a wire contract with subagentCompletion.ts; keep the
     field names and the outcome tokens in lockstep with the ParsedSingleCompletion
@@ -134,8 +146,7 @@ class TestDrainStampsMetaOntoRow:
                 )
             },
         )
-        with patch("kiro_crew.dashboard.chat_runner.spawn_guarded_turn") as spawn:
-            spawn.return_value = MagicMock()
+        with patch("kiro_crew.dashboard.chat_runner.spawn_guarded_turn", side_effect=_swallow_turn):
             started = await _start_next_queued_turn(state, slot)
 
         assert started is True
@@ -157,8 +168,7 @@ class TestDrainStampsMetaOntoRow:
                 )
             },
         )
-        with patch("kiro_crew.dashboard.chat_runner.spawn_guarded_turn") as spawn:
-            spawn.return_value = MagicMock()
+        with patch("kiro_crew.dashboard.chat_runner.spawn_guarded_turn", side_effect=_swallow_turn):
             await _start_next_queued_turn(state, slot)
 
         row = [m for m in slot.messages if m["role"] == "subagent"][0]
@@ -172,8 +182,7 @@ class TestDrainStampsMetaOntoRow:
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("meta-user")
         slot.queue_append("please fix the bug")
-        with patch("kiro_crew.dashboard.chat_runner.spawn_guarded_turn") as spawn:
-            spawn.return_value = MagicMock()
+        with patch("kiro_crew.dashboard.chat_runner.spawn_guarded_turn", side_effect=_swallow_turn):
             await _start_next_queued_turn(state, slot)
 
         row = [m for m in slot.messages if m["role"] == "user"][0]
@@ -202,8 +211,7 @@ class TestDrainStampsMetaOntoRow:
                 )
             },
         )
-        with patch("kiro_crew.dashboard.chat_runner.spawn_guarded_turn") as spawn:
-            spawn.return_value = MagicMock()
+        with patch("kiro_crew.dashboard.chat_runner.spawn_guarded_turn", side_effect=_swallow_turn):
             await _start_next_queued_turn(state, slot)
 
         drained = [m for m in slot.messages if m["role"] in ("user", "subagent")][0]

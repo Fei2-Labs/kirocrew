@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { frecencyScore, recordUse, _clearUsageForTest, type UsageMap } from './frecency'
-import { rankRootRows, type RootRow } from './rootIndex'
+import { rankRootRows, ROOT_GROUPS, type RootRow } from './rootIndex'
 
 /**
  * Unit tests for the Command Bar root index and its frecency ranking.
@@ -139,6 +139,29 @@ describe('rankRootRows', () => {
     expect(rankRootRows(rows, '', {}, 0)).toHaveLength(2)
     // Typed: they rank normally, up to the usual per-group cap.
     expect(rankRootRows(rows, 'setting', {}, 0)).toHaveLength(6)
+  })
+
+  it('opens on commands and apps, with settings behind them', () => {
+    // The whole point of the settings idle cap: what a launcher LEADS WITH is a
+    // product decision, and with no usage every score ties so the alphabet would
+    // otherwise decide. This pins the opening page's composition, not just the cap.
+    const rows: RootRow[] = []
+    for (let i = 0; i < 4; i++) {
+      rows.push(row({ id: `app${i}`, title: `Alpha app ${i}`, group: 'apps' }))
+      rows.push(row({ id: `set${i}`, title: `Beta setting ${i}`, group: 'settings' }))
+      rows.push(row({ id: `cmd${i}`, title: `Zulu command ${i}`, group: 'commands' }))
+    }
+    const groups = rankRootRows(rows, '', {}, 0).map(r => r.group)
+    // Commands lead despite sorting last alphabetically; settings are held to two.
+    expect(groups.slice(0, 4)).toEqual(['commands', 'commands', 'commands', 'commands'])
+    expect(groups.filter(g => g === 'settings')).toHaveLength(2)
+  })
+
+  it('carries no folders group, so the folder list cannot reach the first page', () => {
+    // The corpus is reached through a `view` row, and this is the structural half of
+    // that decision: with no group to file them under, a future caller cannot push
+    // folder rows into the root without first reopening the question.
+    expect(ROOT_GROUPS).not.toContain('folders')
   })
 })
 

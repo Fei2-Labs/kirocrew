@@ -306,7 +306,7 @@ cannot drift.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `instances.enabled` | `false` | Primary opt-in, read at gateway startup. Also gates the CSP `frame-src` `*.localhost` extension. |
-| `instances.warm_set_cap` | `0` (automatic) | Max instances kept warm at once (bounds memory/sockets; each warm instance is a full dashboard SPA). `0` tracks how many crews are registered, so up to an internal ceiling no configured crew is evicted; an explicit value is honoured exactly, including one below the registered count. Negative values fall back to automatic. |
+| `instances.warm_set_cap` | `0` (automatic) | Max instances kept warm at once (bounds memory/sockets; each warm instance is a full dashboard SPA). `0` tracks how many crews are registered, so up to the internal ceiling no configured crew is evicted; an explicit value is honoured exactly, including one below the registered count. Negative values fall back to automatic. |
 | `instances.tunnel_base_port` | `7778` | First local loopback port the allocator hands out. Out-of-range values fall back to the default. |
 | `instances.ssh_compression` | `true` | Add `-C` to the tunnel argv. See §5.2. |
 | `instances.connect_timeout_secs` | unset (SSH `15.0`, SSM `25.0`) | How long (secs) to wait for the local forward port to accept connections before declaring a connect attempt failed. Hosts behind a ProxyCommand or jump host need longer (the proxy handshake runs before ssh begins the forward). An explicit value applies to both transports, including a value equal to either transport's default. Values below 1 fall back to the transport defaults; values above 120 are clamped to 120. |
@@ -467,6 +467,7 @@ request with no `request["user"]` with `401`, and rejects a disabled feature wit
 | `POST /api/instances/{id}/disconnect` | Tear down one tunnel. |
 | `GET /api/instances/{id}/status[?diagnose=1]` | Live status; `?diagnose=1` runs the failure ladder and merges the result. |
 | `POST /api/instances/{id}/restart` | Restart the remote gateway over SSH. |
+| `GET /api/instances/{id}/capabilities` | What a CONNECTED peer can do, for a local session bound to it: `version` (+ `local_version` and the `version_match` gate the relay enforces), `agents` + `default_agent`, `models`, `effort_levels`, `workspaces` + `default_workspace`. Aggregates five fixed peer reads (`/api/version`, `/api/agents`, `/api/models`, `/api/effort-levels`, `/api/workspaces`) through `SshTunnelManager.peer_capability` — a closed path set, deliberately NOT the prefix-fenced proxy above, which would have granted the peer's mutating `PUT /api/agents/{name}` in the same stroke. The reads fan out concurrently, each under `DEFAULT_CAPABILITY_PROXY_TIMEOUT_SECS` (8s) except `/api/models`, which gets `DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS` (20s): the model list is the one read whose COLD path runs bounded subprocess work on the peer (up to 5s sandbox-backend detection + up to 10s `kiro-cli chat --list-models`, ~15s worst case), so an 8s budget killed every cold read and reported a healthy peer as `capability_unreachable` (#10621). One failed read does not fail the request: the reply is a PARTIAL document with the miss named per-field in `unavailable` (`capability_unreachable`, `capability_unauthorized`, `capability_peer_too_old`, …), so the frontend disables exactly that control. The dashboard (`useRemoteCapabilities`) re-polls a partial document every 8s while the peer is version-compatible and the per-field code is the transient `capability_unreachable` — never for version-skewed, disconnected, or terminally-failing peers — and its model pickers render a loading row (`aria-busy`) rather than an empty list while the model roster is pending, and an inline `ErrorNotice` with in-place retry when the read itself fails — an empty list would claim the peer offers no models. Replies are untrusted input: every string crosses the redact + clamp chain (`_cap_str` / `_cap_rows`, row cap 500) before reaching a picker. Owner-only, like the proxy and the federated search. |
 | `ANY /api/instances/{id}/proxy/{path}` | Generic chat proxy — the carrier for the remote-crew chat view. Forwards a **bounded slice** of a CONNECTED peer's `/api/` surface over the already-open tunnel via `SshTunnelManager.proxy_request`, streaming the reply chunk-by-chunk (a proxied chat turn streams SSE for minutes, so the client timeout is connect + read-idle, never total). Credential rules match the federated search: the manager-held token travels as the port-scoped cookie and never reaches the browser; a `401/403` gets exactly one transparent re-mint retry; `allow_redirects=False` (a compromised peer answering 30x must not steer the hub — SSRF). Path policy is a **canonicalization**, not a pattern check, and runs before any URL is built: the caller's path is percent-decoded to a fixed point (bounded by `PROXY_PATH_MAX_DECODE_PASSES`, a deeper chain is refused), then every segment must be a plainly-named token — no empty segment, no all-dots segment, and only unreserved/sub-delim characters — and the forwarded path is **rebuilt from exactly those vetted segments**. Vetting the decoded form and forwarding the rebuilt one is what closes encoded traversal at any depth: a half-decoded `%252e%252e` matches no denylist rule yet still normalizes back into the control plane. On that canonical form the vet policy is a **positive prefix allowlist** (`_PROXY_ALLOWED_PREFIXES`, `api/chat` + `api/stream` today): only the peer's `api/chat` subtree and its `api/stream` event feed are forwarded — each a prefix grant, so every route under one is reachable, which is the chat feature's own wire surface — and everything outside the named prefixes is refused by default: the peer's own `api/instances` plane (one hub cannot chain through a peer into a third machine's SSH control plane), the peer's token-minting routes (whose JSON replies would carry a minted peer credential back through the hub in-band), and any endpoint the peer grows outside the allowlisted prefixes. `api/stream` is the peer's own SSE broadcast endpoint and the out-of-turn half of the chat view: the per-turn reply streams back from `api/chat`, while session-list and slot-state changes arrive on `api/stream`. It is deliberately that endpoint and **not** its WebSocket sibling `api/ws` — a WS row would need a `101 Switching Protocols` to cross this proxy, and the reply content-type gate below exists precisely to stop a peer serving anything but JSON/SSE onto the authenticated hub origin, so an upgrade would tunnel straight through it. Note what the row admits: that feed is per-client but not per-slot, so a hub holding it receives the peer's whole notification/slot broadcast rather than only the session on screen — peer content crossing to a hub user who is already the peer's owner (this route is owner-only), so it widens volume, not privilege, and is the reason it is a named row rather than a blanket `api/` grant. A new prefix is added to the constant explicitly, never by widening back to deny-only; the constant's exact value is pinned by a test so widening is always a reviewed act. Methods limited to GET/POST/PUT/PATCH/DELETE; inbound bodies capped at `PROXY_REQUEST_BODY_MAX_BYTES` before buffering. No browser Origin or cookies are forwarded to the peer (the hub presents as a same-origin loopback client), and the hub's own `?token=` credential is **stripped from the forwarded query** — the browser may authenticate the proxy request with it, and forwarding it would hand the peer a replayable hub credential. Replies are gated to an **allowlist**: only `application/json` and `text/event-stream` content types are forwarded (a compromised peer must not serve active content that executes on the hub origin), and only allowlisted headers (`Content-Type`, `Cache-Control`, `X-Accel-Buffering`) cross back — `Set-Cookie` and everything else is dropped, with `X-Content-Type-Options: nosniff` added. Typed failures (`proxy_peer_not_connected`, `proxy_no_credential`, `proxy_unauthorized`, `proxy_peer_unreachable`) map to 5xx with a machine-readable `code`. |
 
 **Two routes cross the token boundary, not one.** `connect` and `refresh-token`
@@ -628,6 +629,54 @@ what its own edit invalidated, and never reopens anything on the user's behalf.
    row. **Edit settings** / **Remove** live in the row's overflow menu — a row
    shows two primary actions plus that menu, so everything past them is one
    menu deep.
+
+Every configured row carries separate source and transport badges from the
+instance record. `connection_method="ssm"` shows **SSM**; every other transport
+shows **SSH**. A record whose persisted `provisioner_id` is `aws_ec2` also shows
+**EC2**, independently of launch-job history. `provisioner_id` is stamped by
+`register_instance` on each EC2 registration and relaunch; a record created
+before the field existed carries `""` until its next relaunch, and until then
+the launch-job correlation supplies the EC2 badge and posture. A hand-added
+record with no known provisioner shows only its transport rather than being
+guessed into an EC2 category.
+
+One residual for operators: an EC2 row registered before `provisioner_id`
+existed whose launch job has since been garbage-collected shows only its
+transport badge, and Remove on it is NOT confirm-gated — Remove could stop a
+billing machine without a warning — until a relaunch stamps it. Relaunch the
+crew to get the guard now, or check the AWS console before removing. A one-time
+heuristic backfill was judged and rejected: stamping rows whose `ssm_target`
+sits in a known launcher region would mis-stamp hand-added SSM crews in that
+region, and a wrong `aws_ec2` stamp produces a false billing warning and a
+false "delete it in the AWS console" remedy on a machine the launcher never
+created. `provisioner_id` is data the launcher records at registration, not a
+guess inferred later.
+
+Renaming a crew is done from **Edit settings**: its Name field writes through
+the same `PATCH /api/instances/{id}` as every other field, and the registry
+persists the new name. A successful save invalidates the shared instances
+query, updating the list and pane labels; an API rejection stays beside the
+open draft instead of closing the form. The held draft is keyed only by crew,
+so an in-app route remount reopens that crew's full form, and choosing Edit
+settings again on the same row reuses the draft. Switching to another row while
+a draft exists is refused until Save or Cancel, so unsaved work is never
+cleared by changing rows.
+
+A save is bound to the form that started it. While its request is in flight, that
+form freezes its fields, Save, and Rebase. The exit button reads "Stop waiting"
+while pending and stays enabled. It aborts the request client-side, refreshes
+the instances list, and returns the form to editable with its typed draft kept.
+The client cannot tell whether that save landed; the refreshed list shows the
+current state. An inline status names that outcome and offers
+Save again or Cancel. The refresh shows a save the gateway already applied;
+stopping the wait does not undo it. When no save is pending, the button reads
+"Cancel". Navigating away also aborts the request; the held draft is restored on
+remount, enabled for another save. The server may still apply a request despite
+the client cancellation, even after that one refresh;
+the shared `['instances']` cache is re-read every 60 seconds by the instances
+viewport and on window focus, so the list shows the server's record within a
+minute. If the record changed meanwhile, the shared Rebase path reconciles the
+restored draft with the record that exists now.
 
 An unsaved edit is held by the PANEL, keyed by crew, not by the form component.
 The crew list unmounts for any number of reasons the form cannot see — switching
@@ -855,8 +904,9 @@ its real jobs.
 | `GET /api/cloud/launch` | List launch jobs, in progress and finished. |
 | `POST /api/cloud/launch` | Start a launch job; returns the job immediately. `409` when one is already in flight. Body `{provider_id?, profile, region, size_key}`; `provider_id` defaults to `aws_ec2`, and an id the seam does not list or cannot back answers `400 unknown_provisioner` before any job file exists. The job carries `provider_id`, and its step labels are the provisioner's. |
 | `GET /api/cloud/launch/{id}` | Poll one job: per-step state plus the device-code prompt while signing in. |
-| `POST /api/cloud/launch/{id}/cancel` | Request cancellation; honored between steps and inside the sign-in wait. A cancel during provisioning is acted on when the deploy returns, and the stack it created is rolled back. |
+| `POST /api/cloud/launch/{id}/cancel` | Request cancellation; honored between steps and inside the sign-in wait. A cancel during provisioning is acted on when the deploy returns, and the stack it created is rolled back. It also stops the remote `kiro-cli login` **before** that rollback and regardless of whether the rollback confirms: teardown can end in `DELETE_FAILED`, and an instance that survives with a login still polling would sign the crew in minutes after the owner cancelled. Stopping the login is deliberately not a `logout` — the box may hold an older session the cancelled attempt never touched. |
 | `POST /api/cloud/launch/{id}/signin` | Acknowledge the device-code prompt (`409` when none is pending). |
+| `POST /api/cloud/launch/{id}/signin/restart` | Re-run **only** the sign-in step on a crew that already exists, for a launch that finished unsigned: a fresh device code, run with the job's stored `login_target` so a company-SSO crew is not retried through a Builder ID prompt. Owner-only; never re-provisions. `400` when the job never created a crew, `409` while any launch or sign-in is already running on it. The RUNNING transition is persisted under the launch lock that admitted the request, so a second restart arriving in that window cannot pass the same check. |
 | `POST /api/cloud/{tag}/stop` | Stop the instance behind a stack tag. |
 | `POST /api/cloud/{tag}/start` | Start it again. |
 | `DELETE /api/cloud/{tag}` | Terminate the stack (`wait=False`; a denied human-action check surfaces as `403`). |
@@ -883,6 +933,17 @@ that no longer exists. Ownership is tracked (`adopt()`) so a live process never
 reaps its own in-flight jobs. The CloudFormation stack may well have completed in
 AWS, so the message points the user at their crew list rather than implying
 nothing was created.
+
+One shape is parked rather than failed: a job whose connect step already ran.
+The crew exists and is registered, so `failed` would hide a working instance
+behind a red card. It is parked `done` with the sign-in step skipped and — when
+the sign-in never confirmed — its device code **kept**. The remote `kiro-cli
+login` is `nohup`'d on the instance and outlives the gateway, so the code it is
+polling for is still live; discarding the local record would leave a poller
+nothing tracks, whose approval signs the crew in silently. Kept, the job lands in
+the stale-code shape the dashboard already serves: **I approved it — check now**
+re-probes the box and clears the badge if the approval landed, and **Get a new
+sign-in code** replaces the login (killing the old poller) if it did not.
 
 Because the gateway cannot answer the device login on the user's behalf, a job
 parks in `awaiting_signin` with the verification URL and user code exposed as
@@ -1399,7 +1460,7 @@ versions is what lets a v2 instance still receive a copy from a v1 one.
 |---|---|
 | `POST /api/instances/{id}/send-session` | Sending side. Body `{"slot": "<local slot key>"}`. Bundles the local session and delivers it over that instance's open tunnel. |
 | `GET /api/chat/slots/{slot}/export` | Sending side, file hop. Streams the SAME bundle as a gzipped download instead of over a tunnel — see §14.7. |
-| `POST /api/chat/slots/import` | Receiving side. Accepts a bundle and materialises a new slot. |
+| `POST /api/chat/slots/import` | Receiving side, for BOTH arrival routes. Accepts a bundle — gzipped or plain JSON, sniffed from its own bytes — and materialises a new slot. See §14.5a. |
 
 `send-session` goes through the same `_guard()` as every other route in §6
 (owner-only, never Slack, feature-gated, SEL-audited as
@@ -1444,6 +1505,67 @@ re-reads, so:
   agent-facing "send a message to a peer" tool: no inbound text can make a
   remote agent act.
 
+### 14.5a Arrival: one route, one set of rules
+
+`POST /api/chat/slots/import` is the **only** server route behind both ways a
+session can arrive — a peer's `send_session_bundle` pushing over the tunnel, and
+a person importing an exported file from `ImportSessionItem`. So everything
+that must hold for "a session arrived here" is written in `api_chat_slot_import`
+and nowhere else. One rule lives there.
+
+**The body is gzip or plain JSON, decided by its own first two bytes.** Not by
+`Content-Type`: `GET .../export` answers `application/gzip`, a browser uploading
+that same file off disk sends whatever its platform guesses, and the tunnel sends
+`application/json` — sniffing the magic (`1f 8b`) keeps all three working without
+asking any caller to relabel what it already sends. The tunnel's plain-JSON body
+is unchanged on purpose: the sender is an independently-updated install, so a
+receiver that started demanding compression would refuse every peer that has not
+shipped this yet.
+
+A compressed upload is an amplifier, so the expansion is bounded **while it is
+being produced** rather than measured afterwards — `_gunzip_bounded` decompresses
+in chunks and refuses at `_MAX_DECOMPRESSED_BYTES`, holding at most one chunk
+past the cap.
+
+What makes that ceiling safe is the comparison to the gateway's own body limit,
+not the arithmetic behind it. `client_max_size` is 60 MiB and applies to every
+body, compressed or not, so the PLAIN path can never deliver more than that much
+JSON; the ceiling sits above it, which means the gzip path accepts strictly more
+than the plain path can and a body it refuses is one the plain path refuses too.
+The magnitude is taken from §14.5's own ceilings
+(`_MAX_TOTAL_CHARS + _MAX_LAYER_B_CHARS` plus a structural allowance) so the
+number moves with them, but it is deliberately NOT the worst-case ENCODED width:
+those ceilings count CHARACTERS and `ensure_ascii` renders one non-ASCII
+character as six bytes, so sizing for that case would admit a ~360 MB allocation
+on an authenticated write route to accommodate a bundle `client_max_size` already
+refuses.
+
+The per-body ceiling bounds ONE request; the sum across concurrent requests is
+what reaches a host, so expansion is also ADMITTED rather than merely started.
+`_expansion_admission` caps how many bodies expand at once and keeps a short
+queue in front; anything past the queue answers `429 transfer_expansion_busy`
+immediately rather than parking, because a queue that grows without limit is the
+same failure with a delay in front of it.
+
+A permit is held for the whole ARRIVAL, not for the decompression: it is entered
+on an `AsyncExitStack` the handler owns, which is why the arrival is a separate
+function from the route. What has to be bounded is how many decompressed bundles
+are RESIDENT at once, and a bundle is resident — first as bytes, then as the
+parsed document — through validation, redaction and persistence. A permit ending
+at the gunzip would bound the CPU of expansion while leaving that count
+unbounded, which is the sum the admission exists to bound; the cost is
+throughput, since concurrent importers now reach the queue sooner. The plain-JSON
+path takes no permit: it is bounded by the Application's own `client_max_size`
+(60 MiB) and is not amplified, so a peer posting uncompressed cannot be refused
+with `429` by a busy host.
+
+A corrupt or truncated stream answers `transfer_invalid_gzip`, distinct from
+`transfer_invalid_json`, because "your file did not survive the trip" and "your
+document has a syntax error" send a reader to different places. A concatenated
+(multi-member) gzip is refused rather than decoded to its first member: the
+export writes exactly one member, so decoding one and dropping the rest would be
+a truncation nobody asked for.
+
 ### 14.6 Direction and topology
 
 The submenu on a given dashboard lists **that** gateway's registry, so a push
@@ -1460,7 +1582,8 @@ remote → hub and remote → remote work without any reverse reachability.
 The same bundle, written to a file instead of pushed down a tunnel. Code:
 `src/kiro_crew/dashboard/session_export.py`, with the menu action
 `ExportSessionItem` mounted beside `SendToInstanceSubmenu` in the shared
-`SessionActionsMenu`.
+`SessionActionsMenu`, and `ImportSessionItem` — the reverse direction — mounted
+directly beside it, because the file this reads is the file that row writes.
 
 **Why the hop exists.** §14.4's send is a request/response between two live
 gateways, so it needs both machines up at the same moment, reachable from one
@@ -1516,18 +1639,27 @@ on purpose.
 
 Three properties worth stating because they are easy to lose:
 
-- **Layer A only — the context window does not travel in a file.** §14.1a's
-  byte-exact, unredacted Layer B is justified by its DESTINATION, not by its
-  payload: a send reaches the operator's own authenticated peer, which stores it
-  `0600`, so the context never leaves their trust boundary. A file has no
-  destination — it can sit in a download, a bucket or on a USB stick — so that
-  justification does not carry over: an export withholds Layer B and sets
-  `layer_b_skipped`, so the loss is stated rather than inferred from an absent
-  key. Redacting it instead is not available, because the thinking-block
-  signatures inside it are validated on replay (§14.1a) and redacting and
-  transplanting cannot both hold. The cost is real and accepted — a session
-  installed from a file resumes from its transcript rather than through
-  `session/load`.
+- **Layer B leaves in an export only on an explicit operator opt-in, and is
+  withheld by default.** An export CAN carry §14.1a's byte-exact, unredacted
+  Layer B so an installed file RESUMES through `session/load` rather than
+  replaying a lossy prefix. Byte-exact is forced, not chosen: the thinking-block
+  signatures inside Layer B are validated on replay (§14.1a), so redacting and
+  transplanting cannot both hold and there is no redacted variant. Because an
+  export can be shared with another person, unredacted context must not ride
+  along unasked: `rfc-s3-backup.md` O1 assigns that risk to the operator, not the
+  exporter, and its minimum bar for a sensitive payload in a bundle is
+  conjunctive (`rfc-s3-backup.md`:317-319) -- a config key OFF by default AND an
+  explicit per-invocation flag. So Layer B travels only when BOTH
+  `dashboard.export_include_layer_b` is enabled (standing permission, default
+  `false`) AND the request carries `?include_layer_b=true` (this export asked).
+  A default-on would ship the implementer's decision to everyone who never chose,
+  the opposite of what O1 assigns, so the default withholds: the export sets
+  `layer_b_skipped`, the loss is stated rather than inferred from an absent key,
+  and the importer marks the arriving tab "transcript only". Layer B is also
+  withheld with the same flag for a mid-turn snapshot (its context would lag the
+  visible transcript); a session that never opened a kiro-cli context sets neither
+  key (it had nothing to carry). When both conditions hold and Layer B is carried,
+  `layer_b_skipped` is absent and the tab is not marked.
 - **The filename is an egress surface, not decoration.** A name is displayed by
   whatever holds the file — a share, a bucket listing, a chat attachment — so the
   slug is built from the bundle's **already-redacted** title and never from
@@ -1541,8 +1673,8 @@ Three properties worth stating because they are easy to lose:
   FLUSHES a dirty slot first, because slicing a stale transcript would ship a
   superseded turn — so an export can persist pending session state and fails
   rather than exporting when that write fails. Reading such a file back is
-  separate work that does not exist yet: today a file is installed by POSTing its
-  decompressed contents to `/api/chat/slots/import` with a dashboard credential.
+  `ImportSessionItem` beside this row, which posts the file's bytes unchanged to
+  `/api/chat/slots/import` — see §14.5a for what that route accepts.
 
 ### 14.8 The `source` provenance record — recorded, never applied
 

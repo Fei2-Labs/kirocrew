@@ -132,11 +132,20 @@ export function isSelfScroll(
  * observer already knows the row and both heights, so the correction belongs in
  * that same fire.
  *
- * Only a row that lay ENTIRELY above the fold BEFORE the change counts, and
- * `prevHeight` is what decides that: a row straddling the top edge grows
- * downward from its own top, so what the reader sees is the row they are looking
- * at expanding — usually because they opened it — and holding their scroll
- * position there would fight the expansion instead of hiding it.
+ * A row that lies entirely above the fold always counts. A row that STRADDLES
+ * the top edge counts too when it is being REPRICED (an estimate replaced by a
+ * measurement, a disclosure opened): every pixel of that change lands above the
+ * fold and shoves the reader by it. It does NOT count when the change is
+ * APPENDED at the row's bottom -- the streaming row growing by a token. Those
+ * pixels arrive BELOW the reader's eye line, nothing they can see moves, and
+ * the row's top edge above the fold stays exactly where it was. Compensating
+ * that walks the reader down the message by one token's height per tick,
+ * arriving on screen as the text they are reading sliding UP and out from
+ * under them -- reported as "can't read the middle of a long reply while it
+ * streams" (kirodotdev/KiroCrew#10810). The scroll inspector showed the
+ * signature directly: `WRITE abovefold` firing +27/+54px per tick with
+ * `Δtop == Δh`, while the same reader parked at the message's HEAD (row top
+ * inside the fold) held perfectly.
  *
  * The sign is kept: a SHRINK above the fold pulls content up by the same rule.
  */
@@ -147,19 +156,32 @@ export function repriceAboveFoldDelta(input: {
   newHeight: number
   /** Viewport-relative top of the scroll container. */
   foldTop: number
+  /**
+   * True when the row's height change is appended at its BOTTOM (the
+   * actively-streaming row, or the row still in its post-stream settle grace).
+   * A straddling row growing this way moves nothing the reader can see.
+   */
+  appendsAtBottom?: boolean
 }): number {
-  // The test is on the row's TOP, not its whole box. A reprice does not move a
-  // row's top -- it moves its BOTTOM, and with it everything below, so a row
-  // that STRADDLES the top edge displaces the reader by the full change just
-  // like one entirely above it. Measured on the device and reproduced in
-  // Chromium with `overflow-anchor: none`: four of the five drift steps in a
-  // twelve-step walk were straddling rows shrinking 12-24px each, and excluding
-  // them is what left the reader displaced.
-  //
-  // A row whose top is at or below the fold is still excluded: it grows and
-  // shrinks downward, away from everything already on screen, and its own top --
-  // the reader's eye line on it -- does not move.
+  // A row whose top is at or below the fold is excluded: it grows and shrinks
+  // downward, away from everything already on screen, and its own top -- the
+  // reader's eye line on it -- does not move.
   if (input.rowTop >= input.foldTop) return 0
+  // Entirely above the fold: the whole change is above the reader whatever
+  // its cause, and moves them by exactly that.
+  const rowBottom = input.rowTop + input.prevHeight
+  if (rowBottom <= input.foldTop) return input.newHeight - input.prevHeight
+  // STRADDLING. A reprice does not move a row's top -- it moves its BOTTOM,
+  // and with it everything below, so a repriced straddler displaces the reader
+  // by the full change just like one entirely above it. Measured on the device
+  // and reproduced in Chromium with `overflow-anchor: none`: four of the five
+  // drift steps in a twelve-step walk were straddling rows shrinking 12-24px
+  // each, and excluding them is what left the reader displaced.
+  //
+  // Appended growth is the one case where that reasoning inverts: the new
+  // pixels are at the bottom, below the fold, and the visible part of the row
+  // is unchanged. See the docstring for what compensating it does.
+  if (input.appendsAtBottom) return 0
   return input.newHeight - input.prevHeight
 }
 
@@ -226,15 +248,21 @@ export const FOLLOW_REENGAGE_PX = 16
  * Direction-aware `stick` decision for a *user-initiated* scroll (self-scrolls
  * filtered out by the caller via `isSelfScroll`):
  *
- *   1. At the true bottom (within the DPR-aware epsilon) → follow. This also
- *      absorbs the layout engine's clamp: a mid-stream content SHRINK drops
- *      scrollTop (which reads as an upward move) but lands exactly at the new
- *      bottom — releasing there froze streaming follow for the rest of the
- *      turn. The exception is a non-downward landing under a confirmed UPWARD
- *      user input inside the settle window (`upwardInputWithinSettle`): that
- *      shrink coincided with the reader's own scroll-up, so it belongs to the
- *      user and releases follow. A downward or directionless input keeps the
- *      clamp absorbed.
+ *   1. At the true bottom (within the DPR-aware epsilon) → follow, PROVIDED
+ *      follow was already armed. This absorbs the layout engine's clamp: a
+ *      mid-stream content SHRINK drops scrollTop (which reads as an upward
+ *      move) but lands exactly at the new bottom — releasing there froze
+ *      streaming follow for the rest of the turn. Two exceptions, both meaning
+ *      "this landing is not the engine carrying a follower":
+ *        - a non-downward landing under a confirmed UPWARD user input inside
+ *          the settle window (`upwardInputWithinSettle`): that shrink
+ *          coincided with the reader's own scroll-up, so it belongs to the
+ *          user and releases follow. A downward or directionless input keeps
+ *          the clamp absorbed.
+ *        - follow already RELEASED (`stick === false`) and the reader did not
+ *          move DOWN to get here: the content below them collapsed and the
+ *          engine clamped them flush. Arriving at the bottom is not asking for
+ *          it, and re-arming hands the rest of the turn to the pin.
  *   2. Any other upward move → release, regardless of distance from the
  *      bottom. The scroll position now belongs to the user; only returning to
  *      the bottom (3) re-engages.
@@ -312,7 +340,32 @@ export function resolveUserScrollStick(args: {
     // release. Direction-blind or downward input keeps the clamp guard.
     const movedDown = prevScrollTop >= 0 && scrollTop > prevScrollTop + atBottomEpsilon()
     if (args.upwardInputWithinSettle && !movedDown) return false
-    return clampedByViewport ? stick : true
+    if (clampedByViewport) return stick
+    // ARRIVING at the bottom is not the same as ASKING for it. Rule 1 exists to
+    // carry a reader who was ALREADY following across a mid-stream content
+    // shrink, and that reader is `stick === true` by construction: the shrink's
+    // own scroll event is the first thing that could have released them. So a
+    // reader whose follow is already RELEASED reaches this branch for a
+    // different reason -- the content below them collapsed far enough to drop
+    // the maximum scrollTop under where they sat, and the engine clamped them
+    // flush with no finger anywhere near the screen.
+    //
+    // Re-arming there hands the rest of the turn to the pin: every later token
+    // drags the reader along, which is the phone report of scrolling up to read
+    // and being taken to the end seconds later. It is the exact defect rule 3
+    // already refuses inside FOLLOW_REENGAGE_PX ("the band arrives at a STILL
+    // reader"), and a clamp lands at distance ~0 rather than inside that band,
+    // so it slipped past that fix through here. A phone is where it bites: the
+    // narrow column prices unmeasured rows far under their real wrapped height,
+    // so the collapse is large enough to clamp rather than merely nudge.
+    //
+    // The old reading was "at the true bottom there is nothing below to be
+    // yanked to" -- true for that one instant, and false for every token after
+    // it. `movedDown` is the discriminator the same way it is in rule 3: a
+    // clamp only ever LOWERS scrollTop, so a reader who moved DOWN to get here
+    // came on their own and re-engages.
+    if (!stick) return movedDown
+    return true
   }
   if (prevScrollTop < 0) return dist <= FOLLOW_REENGAGE_PX
   if (scrollTop < prevScrollTop - 0.5) return false

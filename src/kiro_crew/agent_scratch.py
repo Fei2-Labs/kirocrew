@@ -28,9 +28,33 @@ Reclamation is keyed on PROCESS liveness, never on file age:
   a gateway restart), an ownerless directory is never deleted, and a garbled
   owner file is left for a human.
 
+kiro-cli's own log rides along. The CLI writes ``kiro-log/kiro-chat.log`` (plus
+``mcp.log`` / ``lsp.log`` beside it) under ``$XDG_RUNTIME_DIR`` when that is
+set, else ``$TMPDIR`` -- ONE file per machine, unlinked by whichever process
+starts next once it passes 10 MiB. Every long-lived kiro-cli then keeps
+writing into its own unlinked inode, which ``du`` cannot see and nothing
+frees until the process exits; on Linux the runtime dir is a RAM-backed
+tmpfs, so a host running many concurrent agents fills it and systemd stops
+creating transient scopes. :func:`scratch_env` therefore pins
+``KIRO_CHAT_LOG_FILE`` into this process's OWN scratch directory (the same
+place the ``TMPDIR`` fallback already puts it on macOS), so the log is
+per-process, on disk, and reclaimed with the directory. kiro-cli never
+bounds a log while running, so :func:`cap_kiro_cli_logs` rotates any that
+outgrows :data:`KIRO_CLI_LOG_CAP_BYTES` in place. The pin is set only where
+that cap can run (:data:`_CAN_CAP_LOGS`): a pinned log nothing bounds is
+worse than the CLI's own 10 MiB unlink, so Windows keeps kiro-cli's default
+location until the cap runs there.
+
 Sweep hygiene follows the house rules of :mod:`kiro_crew.agents_janitor`:
 ``os.lstat`` classification, symlinks never followed, deletion only for
 direct children of the managed root, per-entry fail-open.
+
+The WRITE side is bound by the same rule, and has to be: a spawned agent OWNS
+its scratch directory -- it is that process's own ``TMPDIR`` (:func:`scratch_env`)
+-- while the gateway that records the owner marker inside it runs UNSANDBOXED.
+So the managed root and the marker are both link-checked before anything is
+created or written through them, and the marker is installed by rename instead
+of by truncating a name the child can point somewhere else.
 """
 
 from __future__ import annotations
@@ -43,8 +67,10 @@ import shutil
 import stat
 import time
 from pathlib import Path
+from typing import Literal
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 
 logger = logging.getLogger(__name__)
@@ -54,6 +80,14 @@ _SUBDIR = "scratch"
 #: Owner-pid marker written by the spawner right after the child starts.
 OWNER_FILENAME = ".owner"
 
+#: What :func:`record_owner` did. A spawner has to tell a write that could not
+#: HAPPEN from one that was REFUSED: the first is hygiene lost (a full disk) and
+#: the agent still runs, the second is a live child steering an unsandboxed
+#: gateway write and the spawn must not continue. ``"stale"`` is the third
+#: don't-continue case and is nobody's fault: the write failed AND the marker it
+#: left behind could not be cleared, so the directory still names the gateway.
+OwnerOutcome = Literal["recorded", "unwritable", "refused", "stale"]
+
 #: A directory younger than this with no ``.owner`` yet is mid-spawn, not an
 #: orphan: allocation happens before the child pid exists. Anything older
 #: with no owner belongs to a spawn that never completed.
@@ -61,10 +95,160 @@ _UNOWNED_GRACE_SECONDS = 3600.0
 
 _LABEL_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
+#: kiro-cli's log directory INSIDE a scratch dir, and the files it writes there.
+#: The chat log MUST keep its default name: kiro-cli places ``mcp.log`` and
+#: ``lsp.log`` beside the chat log only when it is named ``kiro-chat.log``.
+KIRO_CLI_LOG_SUBDIR = "kiro-log"
+KIRO_CLI_CHAT_LOG_NAME = "kiro-chat.log"
+KIRO_CLI_LOG_NAMES = (KIRO_CLI_CHAT_LOG_NAME, "mcp.log", "lsp.log")
+#: kiro-cli's own override for the chat log path.
+KIRO_CHAT_LOG_FILE_ENV = "KIRO_CHAT_LOG_FILE"
+#: A live kiro-cli log larger than this is rotated in place. At the CLI's
+#: default level a process writes a few KiB a minute; ``KIRO_LOG_LEVEL=debug``
+#: writes ~40 MiB a minute, and the cap exists for that setting.
+KIRO_CLI_LOG_CAP_BYTES = 64 * 1024 * 1024
+#: Newest bytes preserved in ``<name>.1`` when a log is rotated.
+KIRO_CLI_LOG_KEEP_BYTES = 8 * 1024 * 1024
+#: How often the gateway runs :func:`cap_kiro_cli_logs`. Bounds the overshoot
+#: past the cap to ``interval x write rate``.
+KIRO_CLI_LOG_CAP_INTERVAL_SECONDS = 300
+
+#: The cap needs ``openat``-style descriptor-relative opens and ``O_NOFOLLOW``
+#: to act on a directory the SUBJECT process owns; without them it does nothing.
+_CAN_CAP_LOGS = (
+    hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "pread")
+    and os.open in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+)
+
+
+class ScratchBoundaryError(Exception):
+    """A scratch path is a link, so writing through it would leave the boundary.
+
+    Deliberately NOT an ``OSError``. Every write site here carries an ``except
+    OSError`` branch meaning "the write did not happen, and the grace-window
+    rule covers an unowned dir", and a planted link is not a failed write, so
+    it must not read as one.
+
+    The same event has two right answers, which is why the two raise sites are
+    handled differently:
+
+    * from :func:`allocate_scratch` no child exists yet, and scratch is hygiene
+      rather than a spawn prerequisite -- the spawners catch this beside
+      ``OSError`` and spawn with inherited temp.
+    * from :func:`record_owner` a child is already LIVE and is aiming an
+      unsandboxed gateway write at a path of its own choosing -- the spawners'
+      live-process guard reaps it, which stops the attempt instead of declining
+      one write of it.
+    """
+
 
 def scratch_root() -> Path:
     """The managed root: ``<data home>/scratch``."""
     return config_dir() / _SUBDIR
+
+
+def _refuse_linked(path: Path, what: str) -> None:
+    """Refuse *path* when it is a symlink or a Windows directory junction.
+
+    :func:`platform_compat.is_link_or_junction`, never ``os.path.islink``:
+    ``islink`` reports False for a junction, so an ``islink``-only guard would
+    leave the one platform without ``O_NOFOLLOW`` following exactly the link
+    the other two refuse.
+
+    *what* is the path SHAPE for the log -- a managed-root or marker name plus
+    the allocation's own ``<label>-<token8>`` basename. Never the target: which
+    file a planted link names is the attacker's input, and nothing an operator
+    can act on.
+    """
+    if not platform_compat.is_link_or_junction(path):
+        return
+    logger.warning("agent-scratch: refusing to write through a linked %s", what)
+    raise ScratchBoundaryError(f"agent scratch {what} is a link")
+
+
+def _write_owner_marker(directory: Path, pid: int) -> None:
+    """Install *pid* as *directory*'s owner marker, never following a link.
+
+    Two independent guards, because neither does the other's job:
+
+    * an ``lstat`` REFUSAL on the directory and on the marker, so a planted
+      link is a reported boundary event the caller can act on;
+    * an ATOMIC INSTALL -- :func:`kiro_crew.atomic_write.atomic_write` stages
+      the bytes in an ``O_EXCL`` temp beside the marker and moves it on with
+      ``os.replace``, which does not follow the final component on any
+      platform. A link planted in the window after the lstat therefore
+      replaces the LINK, and its target keeps its contents; the previous
+      ``Path.write_text`` opened ``O_WRONLY|O_CREAT|O_TRUNC`` by name and
+      truncated that target instead.
+
+    The directory must also already BE a directory, for the reason given at
+    that check: the atomic install would otherwise create one.
+
+    What is left is an ANCESTOR swapped between the lstat and the staging open.
+    Closing that needs descriptor-relative traversal, which Windows does not
+    expose -- ``atomic_write._refuse_linked_parent`` documents the same
+    residual window for secret writes -- so an lstat refusal plus a
+    non-following install is the portable ceiling here, not a chosen floor.
+    """
+    _refuse_linked(directory, f"scratch dir {directory.name!r}")
+    if not _is_plain_dir(directory):
+        # Absent, or replaced by a file. NOT an attack signal -- the allocation
+        # can simply be gone -- but it still must not reach the write:
+        # ``atomic_write`` does ``mkdir(parents=True, exist_ok=True)`` on the
+        # parent, which ``Path.write_text`` never did, so an absent directory
+        # would be built back. That resurrects a dir nothing allocated, and if
+        # the managed root had been swapped for a link since the allocation
+        # checked it, builds that tree under the link's target. An ``OSError``
+        # lands in the fail-open branch, where a write that could not happen
+        # belongs.
+        raise NotADirectoryError(f"agent scratch dir is not a directory: {directory.name}")
+    marker = directory / OWNER_FILENAME
+    _refuse_linked(marker, f"{OWNER_FILENAME} in {directory.name!r}")
+    atomic_write(marker, str(pid))
+
+
+def _discard_owner_marker(directory: Path) -> bool:
+    """Remove *directory*'s owner marker after a FAILED update; did it go?
+
+    ``atomic_write`` stages into a temp and moves it on, so a write that never
+    completed leaves the PREVIOUS marker byte-for-byte intact. On the update
+    path those previous bytes are the provisional pid of the SPAWNING gateway,
+    and a stale owner is worse than none: the gateway exits, its pgroup goes
+    dead, and the next boot sweep reads dead-owner-plus-idle on a directory
+    whose real owner -- the child, spawned ``start_new_session=True`` -- is
+    still alive holding it. An UNOWNED dir is never swept, so removing the
+    marker is what keeps that child's temp dir.
+
+    ``os.unlink`` removes a link itself and never follows one, but the marker
+    is still lstat-refused first, matching :func:`_refuse_linked`'s rule that
+    nothing here acts on a path the child has turned into a link.
+
+    False means the stale marker SURVIVED -- a Windows file lock on the marker
+    is the reachable case, since deleting a file another process holds open is
+    refused there. The caller must not treat that as hygiene lost: the
+    directory still names a pid that dies with the gateway, which is the whole
+    condition this discard exists to prevent.
+    """
+    marker = directory / OWNER_FILENAME
+    if platform_compat.is_link_or_junction(marker):
+        logger.warning(
+            "agent-scratch: refusing to discard a linked %s in %r",
+            OWNER_FILENAME,
+            directory.name,
+        )
+        return False
+    try:
+        os.unlink(marker)
+    except FileNotFoundError:
+        return True  # never installed, or already gone
+    except OSError:
+        logger.debug(
+            "agent-scratch: could not discard owner marker for %r", directory.name, exc_info=True
+        )
+        return False
+    return True
 
 
 def allocate_scratch(label: str) -> Path:
@@ -80,38 +264,241 @@ def allocate_scratch(label: str) -> Path:
     if the owner write fails (ENOSPC, inode exhaustion), the dir is removed
     and the failure propagates, degrading the spawn to inherited temp.
     :func:`record_owner` later replaces the provisional pid with the child's.
+
+    Raises :class:`ScratchBoundaryError` when the managed root is a link.
     """
     root = scratch_root()
+    # Twice around the mkdir, which is both the step a pre-planted link
+    # subverts and the moment one could win the race with the first check:
+    # ``mkdir(parents=True, exist_ok=True)`` SUCCEEDS on a link to a directory,
+    # so without this every allocation -- and the sweep's ``shutil.rmtree``
+    # target -- lands under whatever that link names. Only the ``scratch``
+    # component is judged, never the data home above it: reaching a home
+    # directory through a link is ordinary, and refusing it would break every
+    # spawn on such a host rather than protect it.
+    _refuse_linked(root, f"managed root {_SUBDIR!r}")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _refuse_linked(root, f"managed root {_SUBDIR!r}")
     safe = _LABEL_SAFE.sub("-", label)[:40].strip("-") or "agent"
     path = root / f"{safe}-{secrets.token_hex(4)}"
+    # No ``exist_ok``: ``mkdir`` never follows the final component, so this
+    # already fails on anything sitting at the name, a link included.
     path.mkdir(mode=0o700)
     try:
-        (path / OWNER_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
-    except OSError:
+        _write_owner_marker(path, os.getpid())
+    except (OSError, ScratchBoundaryError):
         shutil.rmtree(path, ignore_errors=True)
         raise
     return path
 
 
-def record_owner(path: Path, pid: int) -> None:
-    """Record the spawned child's pid so the boot sweep can check liveness."""
+def record_owner(path: Path, pid: int) -> OwnerOutcome:
+    """Record the spawned child's pid so the boot sweep can check liveness.
+
+    Reports which of four things happened, because a spawner must act on two
+    of them and must not act on the other two:
+
+    * ``"recorded"`` -- the marker now names *pid*.
+    * ``"unwritable"`` -- an ``OSError``, and still fail-open: scratch is
+      hygiene, an unowned dir is covered by the grace-window rule, and failing
+      a spawn because the disk is full would stop the agent for a reason that
+      is not a security one. The stale marker is DISCARDED first, so the
+      directory really is unowned rather than still labelled with the
+      provisional gateway pid (see :func:`_discard_owner_marker`).
+    * ``"stale"`` -- the write failed AND the discard could not clear what it
+      left, so the directory still names the gateway. The spawners fail the
+      spawn on this exactly as they do on a refusal, for a different reason:
+      not an attack, but a marker that will read as a dead owner over a live
+      child, which is how the sweep comes to delete work in progress. Reaping
+      the child is recoverable; deleting its temp dir later is not.
+    * ``"refused"`` -- the directory or the marker is a LINK. The child is live
+      by now and owns this directory, so a link there is it steering this
+      unsandboxed gateway write. Nothing is written, and the spawners fail the
+      spawn on it, reaping the child rather than leaving it running with one
+      declined write behind it.
+
+    A refusal is REPORTED rather than raised for two reasons. It keeps this
+    callable from a caller that cannot absorb an exception without leaking the
+    process it is recording, and it keeps the two "did not write" answers
+    distinguishable: an exception for one beside a silent return for the other
+    collapses them at every call site that already catches ``OSError``.
+    """
     try:
-        (path / OWNER_FILENAME).write_text(str(pid), encoding="utf-8")
+        _write_owner_marker(path, pid)
+    except ScratchBoundaryError:
+        return "refused"  # already logged at warning by _refuse_linked
     except OSError:
-        # Fail-open: an unowned dir is reclaimed by the grace-window rule.
+        # Fail-open: the sweep never deletes an UNOWNED dir, so a failed write
+        # leaves one that is kept, not reclaimed -- but only once the
+        # provisional marker is gone, because a failed atomic write leaves the
+        # gateway's pid in place and a STALE owner reads as dead to the sweep
+        # while the child it names is still running.
         logger.debug("agent-scratch: could not record owner for %r", path.name, exc_info=True)
+        if not _discard_owner_marker(path):
+            logger.warning(
+                "agent-scratch: %r still names this gateway after a failed owner update",
+                path.name,
+            )
+            return "stale"
+        return "unwritable"
+    return "recorded"
 
 
 def scratch_env(path: Path) -> dict[str, str]:
-    """Env exports pointing a child's temp AND scratch at *path*.
+    """Env exports pointing a child's temp, scratch AND kiro-cli log at *path*.
 
     ``TMPDIR``/``TMP``/``TEMP`` cover ``tempfile`` and shell ``mktemp`` on
     both platforms; ``KIROCREW_SCRATCH`` is the prompt-visible name for
     deliberate work products (clones, logs, screenshots).
+    ``KIRO_CHAT_LOG_FILE`` pins kiro-cli's log to ``<path>/kiro-log/kiro-chat.log``
+    so it is per-process (see the module docstring), but only where
+    :func:`cap_kiro_cli_logs` can bound it (:data:`_CAN_CAP_LOGS`); elsewhere
+    (Windows) the key is omitted and kiro-cli keeps its default location. Where
+    set, it overrides any inherited value, because an inherited value names a
+    path SHARED with other processes, which is the failure this exists to prevent.
     """
     value = str(path)
-    return {"TMPDIR": value, "TMP": value, "TEMP": value, "KIROCREW_SCRATCH": value}
+    env = {
+        "TMPDIR": value,
+        "TMP": value,
+        "TEMP": value,
+        "KIROCREW_SCRATCH": value,
+    }
+    if _CAN_CAP_LOGS:
+        env[KIRO_CHAT_LOG_FILE_ENV] = str(path / KIRO_CLI_LOG_SUBDIR / KIRO_CLI_CHAT_LOG_NAME)
+    return env
+
+
+def cap_kiro_cli_logs(
+    *,
+    cap_bytes: int = KIRO_CLI_LOG_CAP_BYTES,
+    keep_bytes: int = KIRO_CLI_LOG_KEEP_BYTES,
+) -> int:
+    """Periodic: rotate in place every kiro-cli log under scratch past *cap_bytes*.
+
+    kiro-cli holds each log open in append mode for the life of the process
+    and checks size only at startup, so an outside bound has to act on the
+    OPEN file: the newest *keep_bytes* are copied to ``<name>.1`` and the log
+    is truncated to zero. ``O_APPEND`` makes the writer's next record land at
+    the new end, so no hole is created. Records written between the tail copy
+    and the truncate are lost; this is a diagnostic log, and losing a few
+    lines beats losing the disk.
+
+    Every scratch directory is OWNED by a sandboxed agent process while this
+    runs unsandboxed, so nothing here trusts a name the agent controls: the
+    ``kiro-log`` directory is opened ``O_NOFOLLOW`` and every member is opened
+    relative to that descriptor, also ``O_NOFOLLOW``; a member is acted on only
+    if the fstat of the descriptor actually opened shows a regular file with a
+    single link owned by this uid (a planted hard link would otherwise truncate
+    the file it points at); the rotated copy is created ``O_EXCL`` after
+    unlinking the old name, never written through an existing entry. Per-entry
+    fail-open. Platforms without descriptor-relative opens do nothing.
+
+    Returns the number of logs rotated.
+    """
+    if not _CAN_CAP_LOGS:
+        return 0
+    root = scratch_root()
+    if platform_compat.is_link_or_junction(root):
+        logger.warning("agent-scratch: managed root %r is a link; skipping log cap", _SUBDIR)
+        return 0
+    try:
+        entries = list(os.scandir(root))
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        logger.debug("agent-scratch: could not list %s; skipping log cap", root, exc_info=True)
+        return 0
+    rotated = 0
+    for entry in entries:
+        child = root / entry.name  # name-composed: cannot escape the root
+        if not _is_plain_dir(child):
+            continue
+        rotated += _cap_log_dir(child / KIRO_CLI_LOG_SUBDIR, cap_bytes, keep_bytes)
+    if rotated:
+        hint = ""
+        if os.environ.get("KIRO_LOG_LEVEL", "").lower() in ("debug", "trace"):
+            hint = "; KIRO_LOG_LEVEL=%s in the gateway environment is the likely cause" % (
+                os.environ["KIRO_LOG_LEVEL"],
+            )
+        logger.warning(
+            "agent-scratch: rotated %d kiro-cli log(s) larger than %d MiB%s",
+            rotated,
+            cap_bytes // (1024 * 1024),
+            hint,
+        )
+    return rotated
+
+
+def _cap_log_dir(log_dir: Path, cap_bytes: int, keep_bytes: int) -> int:
+    """Rotate the oversized members of one ``kiro-log`` directory; see the caller."""
+    try:
+        dir_fd = os.open(log_dir, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    except OSError:
+        # Absent (the CLI has not logged yet), or a link (ELOOP) -- never followed.
+        return 0
+    try:
+        return sum(
+            1
+            for name in KIRO_CLI_LOG_NAMES
+            if _rotate_in_place(dir_fd, name, cap_bytes, keep_bytes)
+        )
+    finally:
+        os.close(dir_fd)
+
+
+def _rotate_in_place(dir_fd: int, name: str, cap_bytes: int, keep_bytes: int) -> bool:
+    """Tail-copy then truncate ``name`` (relative to *dir_fd*) when it exceeds the cap."""
+    try:
+        fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError:
+        return False  # absent, a link, or unopenable: nothing to bound
+    try:
+        info = os.fstat(fd)
+        # Judge the descriptor we hold, not the name: a regular file, with the
+        # one link kiro-cli gave it, owned by us. Anything else was planted.
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
+            return False
+        if info.st_size <= cap_bytes:
+            return False
+        keep = min(keep_bytes, info.st_size)
+        try:
+            tail = os.pread(fd, keep, info.st_size - keep)
+            _write_rotated(dir_fd, name + ".1", tail)
+        except OSError:
+            # The copy is a courtesy; the truncate is the bound. A full disk is
+            # exactly when the copy fails and the truncate matters most.
+            logger.debug("agent-scratch: could not keep a tail of %s", name, exc_info=True)
+        os.ftruncate(fd, 0)
+        return True
+    except OSError:
+        logger.debug("agent-scratch: could not rotate %s", name, exc_info=True)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _write_rotated(dir_fd: int, name: str, data: bytes) -> None:
+    """Replace ``name`` under *dir_fd* with *data*, never writing through an existing entry."""
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    # O_EXCL after the unlink: an entry re-planted in between (a link, a hard
+    # link) makes this fail with EEXIST instead of being written through.
+    fd = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=dir_fd,
+    )
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+    finally:
+        os.close(fd)
 
 
 def _is_plain_dir(path: Path) -> bool:
@@ -198,6 +585,13 @@ def sweep_dead_scratch(now: float | None = None) -> int:
     Returns the number of directories removed.
     """
     root = scratch_root()
+    if platform_compat.is_link_or_junction(root):
+        # The per-entry lstat below classifies the CHILDREN, and
+        # "name-composed: cannot escape the root" holds only while the root is
+        # real -- a link here aims every rmtree at another tree. Fail-open like
+        # the rest of the sweep: report it and sweep nothing.
+        logger.warning("agent-scratch: managed root %r is a link; skipping sweep", _SUBDIR)
+        return 0
     try:
         entries = list(os.scandir(root))
     except FileNotFoundError:
@@ -217,8 +611,23 @@ def sweep_dead_scratch(now: float | None = None) -> int:
             continue
         if idle < _UNOWNED_GRACE_SECONDS:
             continue  # recently active anywhere in the tree, whoever owns it
+        marker = child / OWNER_FILENAME
+        if platform_compat.is_link_or_junction(marker):
+            # A LINK where the marker belongs, read by the one loop here that
+            # DELETES. ``read_text`` follows it, so an owner planted by the very
+            # process being judged would name whatever pid those bytes hold --
+            # pick a dead one and the sweep destroys a live agent's own tree.
+            # Joins the unowned-or-garbled rule below: never delete on evidence
+            # the subject controls. The dir is then unreclaimable while the link
+            # stands, which is the safe direction to fail.
+            logger.warning(
+                "agent-scratch: %r has a linked %s; not judging its owner",
+                entry.name,
+                OWNER_FILENAME,
+            )
+            continue
         try:
-            pid = int((child / OWNER_FILENAME).read_text(encoding="utf-8").strip())
+            pid = int(marker.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             # Unowned or garbled: never delete on absence of evidence.
             continue

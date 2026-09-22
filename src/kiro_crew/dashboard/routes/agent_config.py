@@ -12,6 +12,10 @@ from __future__ import annotations
 from aiohttp import web
 
 from kiro_crew.dashboard import handlers
+from kiro_crew.dashboard.handlers.acp_backend_status import (
+    api_acp_backend_recheck,
+    api_acp_backend_status,
+)
 from kiro_crew.dashboard.handlers.mcp_custom import (
     api_mcp_custom_add,
     api_mcp_custom_get,
@@ -24,20 +28,6 @@ from kiro_crew.dashboard.handlers.mcp_discover import (
 )
 
 
-async def _api_acp_backends(request: web.Request) -> web.Response:
-    """Load the backend descriptor surface on first request.
-
-    Lazy on purpose: ``handlers.acp_backends`` imports ``kiro_crew.acp`` at
-    module scope, which pulls in the ACP client AND the runtime. This module is
-    imported on the boot path, so a module-scope import here would drag both
-    into gateway start.
-    """
-
-    from kiro_crew.dashboard.handlers.acp_backends import api_acp_backends
-
-    return await api_acp_backends(request)
-
-
 def register(app: web.Application) -> None:
     """Register the agent_config routes on *app*."""
     # Agent config
@@ -46,16 +36,15 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/config/default-agent", handlers.api_default_agent)
     app.router.add_put("/api/config/default-agent", handlers.api_default_agent)
     app.router.add_get("/api/config/schema", handlers.api_config_schema)
-    # Per-backend selectability, the capability table, and whether THIS machine
-    # has the harness installed. Beside the schema route because the dashboard's
-    # backend switch reads both: the schema says which options this build/policy
-    # allows, this says which of them would actually start and what each supports.
-    #
-    # THE ONLY registration of this path. aiohttp answers from the first match in
-    # registration order, so a second one elsewhere in the table does not merge
-    # with this -- it makes one of the two payloads unreachable, silently and
-    # with no failing test. ``test_dashboard_route_table.py`` pins uniqueness.
-    app.router.add_get("/api/acp-backends", _api_acp_backends)
+    # Per-backend selectability + whether THIS machine has the harness installed.
+    # Beside the schema route because the dashboard's backend switch reads both:
+    # the schema says which options this build/policy allows, this says which of
+    # them would actually start.
+    app.router.add_get("/api/acp-backends", api_acp_backend_status)
+    # The same facts, re-taken for ONE backend with this process's cached absence
+    # dropped first. A POST because it mutates spawn-path state: the GET above may
+    # only report the divergence, which is what ``restart_required`` is for.
+    app.router.add_post("/api/acp-backends/recheck", api_acp_backend_recheck)
     app.router.add_get("/api/config/kirocrew", handlers.api_kirocrew_config)
     app.router.add_put("/api/config/kirocrew", handlers.api_kirocrew_config)
     app.router.add_patch("/api/config/kirocrew", handlers.api_kirocrew_config_patch)
@@ -113,6 +102,13 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/connections/test", handlers.api_connections_test)
     app.router.add_post("/api/connections/cancel", handlers.api_connections_cancel)
     app.router.add_post("/api/connections/disconnect", handlers.api_connections_disconnect)
+    app.router.add_get("/api/connections/oauth-clients", handlers.api_connections_oauth_clients)
+    app.router.add_put(
+        "/api/connections/oauth-clients/{slug}", handlers.api_connections_oauth_client_put
+    )
+    app.router.add_delete(
+        "/api/connections/oauth-clients/{slug}", handlers.api_connections_oauth_client_delete
+    )
     # REST-style MCP server registration (App Kit)
     app.router.add_put("/api/mcp/servers/{name}", handlers.api_mcp_server_detail)
     app.router.add_delete("/api/mcp/servers/{name}", handlers.api_mcp_server_detail)

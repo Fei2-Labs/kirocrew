@@ -39,11 +39,13 @@ from kiro_crew.jsonl_util import (
     rotate_jsonl_at,
     strict_records,
 )
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.pinned_fs import (
     PinnedPathRefusal,
     open_in_pinned_parent,
     supports_pinned_walk,
 )
+from kiro_crew.slugs import slug_hash_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +190,7 @@ def select_provider_backend(
             member_backend,
         )
         return backend
-    return configured_default
+    return _direct_factory_backend(configured_default, "configured default")
 
 
 def _resolve(backend: str) -> str:
@@ -226,7 +228,9 @@ def _direct_factory_backend(backend: str, source: str) -> str:
 MEMBER_DISPATCH_SERVER = "kirocrew-dashboard"
 
 
-def member_dispatch_session_server(session_key: str) -> dict[str, object] | None:
+def member_dispatch_session_server(
+    session_key: str, session_token: str = ""
+) -> dict[str, object] | None:
     """ACP ``session/new`` ``mcpServers`` element mounting session control.
 
     The entry carries ``KIROCREW_SESSION_KEY`` so the server's strict identity
@@ -235,6 +239,15 @@ def member_dispatch_session_server(session_key: str) -> dict[str, object] | None
     which the KAS projection's credential stripping never touches (that filter
     applies to the agent-declared ``mcpServers`` block, not to what the host
     itself injects per session).
+
+    ``session_token`` is this ACP session's own name, and it rides BESIDE the key
+    rather than replacing it (see
+    :func:`~kiro_crew.providers.mirrors.identity.control_plane_identity_env` for
+    the full argument). It matters most on a SHARED runtime, where the key baked
+    into this element names the session that was claiming when it was built while
+    the token's mapping is republished on every rekey — so a member thread on a
+    recycled process resolves to itself rather than to its predecessor. Empty
+    leaves the entry byte-identical to the pre-token shape.
 
     The env also carries ``KIROCREW_BOUND_PORT`` — the port this gateway is
     actually serving. Unlike a chat session's MCP child, which inherits the
@@ -281,7 +294,11 @@ def member_dispatch_session_server(session_key: str) -> dict[str, object] | None
     # DEFAULT home's gateway — where the member slot does not exist and every
     # verb is refused as ``caller_unidentified``. Empty on a default install.
     env: list[dict[str, str]] = [{"name": k, "value": v} for k, v in _managed_mcp_env().items()]
-    # Then the identity key.
+    # Then the identity: the signed per-session token first (the resolver reads it
+    # first, because it cannot go stale across a rekey), then the key as fallback
+    # for the one case the token cannot cover — no SEL trust root to sign with.
+    if session_token:
+        env.append({"name": STUB_SESSION_TOKEN_ENV, "value": session_token})
     env.append({"name": "KIROCREW_SESSION_KEY", "value": session_key})
     # resolve_serving_port() reads KIROCREW_BOUND_PORT first and only then falls
     # through the client order, so one call covers both "the gateway exported the
@@ -367,10 +384,32 @@ def slug_for_name(name: str) -> str:
     entirely in punctuation still yields something addressable.
     """
     base = slugify(name)
-    # slugify falls back to its own module's noun; ours should read as a member.
-    if base == "artifact":
+    # slugify hash-falls-back under its own module's noun; a member's stored
+    # activity, rules, and DM bindings are addressed by this slug, so keep the
+    # documented "member" fallback rather than adopting the artifact-prefixed
+    # hash (which would also strand data recorded under "member").
+    if base == slug_hash_fallback(name, "artifact"):
         base = "member"
     return validate_slug(base)
+
+
+def member_slug(name: str, config=None) -> str:
+    """Use persisted member identity; legacy members retain their existing slug."""
+    if config is None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        config = KiroCrewConfig.load()
+    agent = config.agents.get(name)
+    member_id = getattr(agent, "member_id", "") if agent else ""
+    return validate_slug(member_id) if member_id else slug_for_name(name)
+
+
+def _stable_member_slug(slug: str, name: str) -> bool:
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig.load()
+    agent = cfg.agents.get(name)
+    return bool(agent and getattr(agent, "member_id", "") == slug)
 
 
 def member_dir(slug: str) -> Path:
@@ -627,7 +666,16 @@ def read_dm_binding(slug: str) -> dict | None:
     # differs) would otherwise pin A's thread — and A's restored transcript —
     # to B's identity. Colliding names are fine: every name that slugifies to
     # this slug passes; anything else reads as absent.
-    if slug_for_name(data["member"]) != slug:
+    if data.get("member_id") == slug:
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.execution_context import member_config_for_id
+
+        try:
+            alias, _ = member_config_for_id(KiroCrewConfig.load(), slug)
+        except ValueError:
+            return None
+        data["member"] = alias
+    elif slug_for_name(data["member"]) != slug:
         return None
     return data
 
@@ -661,6 +709,7 @@ def write_dm_binding(slug: str, *, member: str, slot_key: str, memory_store: str
             f"(expected {member_slot_key(slug, memory_store)!r}); such a binding always reads back as absent"
         )
     binding = {
+        "member_id": slug if _stable_member_slug(slug, member) else "",
         "member": member,
         "slug": slug,
         "slot_key": slot_key,
@@ -774,7 +823,7 @@ def read_member_rules(slug: str, member: str) -> str:
             f"shape); the member will not run until the file is repaired — "
             f"rewrite or clear the rules via PUT /api/members/{slug}/rules"
         )
-    if data["member"] != member:
+    if data.get("member_id") != slug and data["member"] != member:
         # A colliding slug's file holds another exact name's rules; for THIS
         # member that is "never set", not an error.
         return ""
@@ -838,7 +887,12 @@ def write_member_rules(slug: str, *, member: str, text: str) -> None:
             platform_compat.restrict_dir_to_owner(_dir)
         except OSError:
             logger.debug("could not tighten mode on %s", _dir, exc_info=True)
-    payload = {"member": member, "slug": slug, "rules": text}
+    payload = {
+        "member": member,
+        "member_id": slug if _stable_member_slug(slug, member) else "",
+        "slug": slug,
+        "rules": text,
+    }
     atomic_write(path, json.dumps(payload, ensure_ascii=False), fsync=True)
     # atomic_write's fsync=True forces the file DATA; the rename that
     # publishes it — and, on first save, the just-created member-rules
@@ -1042,7 +1096,7 @@ def record_activity(
     if via:
         entry["via"] = via
     try:
-        slug = slug_for_name(member)
+        slug = member_slug(member)
         path = member_dir(slug)
         if dedupe_session:
             prior, complete = _read_activity_checked(slug)

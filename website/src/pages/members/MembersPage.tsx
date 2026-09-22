@@ -29,12 +29,17 @@
  *
  * Which member is open rides the URL (`?member=<name>`), and the last one
  * opened is remembered per browser: a visit that names no member lands on
- * the remembered one (else the first row), never on the empty column.
+ * the remembered one if it is still on the roster. A fresh visit with
+ * nothing remembered lands on the roster with no member pre-opened (the
+ * 'Pick a member' empty pane), matching the below-md two-level list rule, so
+ * the user picks rather than being primed on whichever row the sort floated
+ * to the top (#11763).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Clock, ExternalLink, Goal, MessageCircleQuestionMark, Pencil, Route, Star, UserPlus, Users, Webhook, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Clock, ExternalLink, Goal, MessageCircleQuestionMark, Pencil, Plus, Route, Square, Star, Webhook, Zap } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
+import { CrewMemberMark } from '../../components/CrewMemberMark'
 import { useTranslation } from 'react-i18next'
 import { api, type MemberRosterRow, type WebhookTokenEntry } from '../../api/client'
 import {
@@ -61,13 +66,14 @@ import { usePersistedString } from '../../hooks/usePersistedString'
 import { findReport, type ErrorReport } from '../../utils/errorReport'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { markSlotRead } from '../../store/dashboardSlice'
-import { emitSlotRead } from '../../lib/slotReadRelay'
+import { emitSlotRead, flushSlotRead } from '../../lib/slotReadRelay'
+import { setViewedThreadSlot, clearViewedThreadSlot } from '../../lib/viewedThread'
 import CrewAvatar from '../../components/CrewAvatar'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
 import ChatPane from '../../components/ChatPane'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
-import { useGuardedLeave } from '../../components/NavigationLeaveGuard'
+import { useGuardedLeave, useRegisterNavigationLeaveGuard, usePublishNavigationStake } from '../../components/NavigationLeaveGuard'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { useConnected } from '../../hooks/useConnected'
 import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FILTER_MENU_LABEL_CLS, FILTER_MENU_CONTENT_CLS } from '../../components/SearchFilterBar'
@@ -77,7 +83,12 @@ import {
   SORT_OPTIONS, SOURCE_FILTERS, STATUS_FILTERS,
   type MemberSignals, type MemberSort, type MemberSourceFilter, type MemberStatusFilter, type RosterQuery,
 } from './rosterFilter'
-import { Btn } from '../../components/ui'
+import { Btn, SendBtn } from '../../components/ui'
+import {
+  Dialog, DialogContent, DialogHeader, DialogBody, DialogFooter, DialogTitle,
+} from '../../components/ui/dialog'
+import JobForm from '../../components/JobForm'
+import { SaveCreateLabel } from '../../utils/cronUtils'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { isSidePanelHidden, shouldMountSidePanel, sidePanelDockMotion } from '../chat/sidePanelMount'
 import SidePanel, { SIDE_PANEL_MIN_W, SIDE_PANEL_RESERVED_W, type SidePanelLeadingTab, type SidePanelWithholdable } from '../chat/SidePanel'
@@ -131,11 +142,17 @@ const MEMBER_PARAM = 'member'
  *  localStorage is already per-gateway. */
 const LAST_MEMBER_KEY = 'mc-members-last-member'
 
-/** Which member to open when the URL names none, or names one that is gone
- *  (deleted or renamed since the link/memory was written): the remembered
- *  member if it is still on the roster, else the first row in display order.
- *  `undefined` only for an empty roster. Pure, so the three cases — default,
- *  restore, stale fallback — are tested directly. */
+/** Which member to RESTORE when the URL names none, or to fall back to when
+ *  it names one that is gone (deleted or renamed since the link/memory was
+ *  written): the remembered member if it is still on the roster, else
+ *  `undefined`. It deliberately does NOT fall back to the first row — a fresh
+ *  visit with nothing remembered lands on the roster with no member pre-opened
+ *  (the empty column, matching the below-md two-level list rule), so the user
+ *  picks the member they want rather than being primed on whichever row the
+ *  sort floated to the top (#11763). `undefined` therefore means both "empty
+ *  roster" and "nothing remembered": either way there is nothing to auto-open.
+ *  Pure, so the cases — restore, nothing-remembered, stale — are tested
+ *  directly. */
 export function resolveDefaultMember(
   remembered: string | null,
   ordered: readonly MemberRosterRow[],
@@ -144,7 +161,7 @@ export function resolveDefaultMember(
     const hit = ordered.find((m) => m.name === remembered)
     if (hit) return hit
   }
-  return ordered[0]
+  return undefined
 }
 
 type MemberMemoryDisplay = 'global' | 'legacy' | 'private' | 'ownership_mismatch' | 'unavailable'
@@ -313,6 +330,113 @@ const PATROL_TICK_MS = 15_000
  *  `members` do not recompute on every render while the first fetch is out. */
 const EMPTY_ROSTER: readonly MemberRosterRow[] = []
 
+/**
+ * "New schedule" for the member whose Crew summary is open.
+ *
+ * A DIALOG rather than the crew editor's inline form (`CrewWakeSection`), for
+ * one reason: a dialog owns its own cancel and confirm, so the typed draft
+ * never becomes the host's problem. The inline form makes its host carry draft
+ * accounting — `onDraftChange` / `onSavingChange` / `onRequestCancel`, feeding a
+ * dirty dot, Save gating and a discard confirm — and this page has no such
+ * model: it is read-only observation whose only writes are starring a member
+ * and opening a thread. Growing one here to host a form would be a second
+ * spelling of the crew editor's, not a smaller change.
+ *
+ * The crew field is LOCKED to the open member: this surface exists because the
+ * member is already the subject, so offering a picker would only be a way to
+ * file the schedule against somebody else. `memberId` is the separate,
+ * load-bearing half — it is what binds the job to that member's PRIVATE memory
+ * rather than Global V1.
+ */
+function MemberScheduleDialog({ member, agentTemplate, saving, onSavingChange, onDirtyChange, onSubmitError, onClose, onSaved }: {
+  member: string
+  /** The member's provider template, so the form can offer that agent's models. */
+  agentTemplate?: string
+  /** Whether the create is in flight. Drives the footer's honesty — the label
+   *  and the caveat — and nothing else: dismissal is never refused, because a
+   *  POST cannot be un-sent and refusing only moved the harm elsewhere. */
+  saving: boolean
+  onSavingChange: (saving: boolean) => void
+  /** Typed-work signal, so the host can guard a dismissal gesture. */
+  onDirtyChange: (dirty: boolean) => void
+  /** A failed submit, for the host to surface when this dialog is already gone.
+   *  `confirmed` distinguishes a server verdict from a request that got no
+   *  answer, because only the first proves the schedule was not created. `job`
+   *  is the name the user typed, so the report can say which schedule it was. */
+  onSubmitError: (message: string, confirmed: boolean, job?: string) => void
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const { t } = useTranslation()
+  const submitRef = useRef<(() => void) | null>(null)
+  return (
+    <DialogContent maxWidth={720} className="max-h-[86vh]">
+      <DialogHeader>
+        <DialogTitle className="truncate">
+          {t('pages.membersPage.new_schedule_for', { name: member })}
+        </DialogTitle>
+      </DialogHeader>
+      <DialogBody className="flex flex-col gap-4">
+        {/* `agents=[]` / `defaultAgent=""` are unread under `lockedAgent`, which
+            renders the crew as a fixed value instead of a selector — the same
+            call shape the crew editor's wake pane uses. */}
+        <JobForm
+          layout="vertical"
+          agents={[]}
+          defaultAgent=""
+          lockedAgent={member}
+          /* Unconditional: JobForm withholds `member_id` for the default
+             crew itself, since the backend refuses `"default"` as a V1
+             identity — so that crew's schedules run on Global V1 memory. */
+          memberId={member}
+          /* This drawer says "member" throughout, so the pinned-value hint
+             does too. A host flag, not derived from `memberId`: the crew
+             editor binds identity the same way and keeps its own noun. */
+          memberNoun
+          providerAgent={agentTemplate}
+          onSaved={onSaved}
+          externalSubmit
+          submitRef={submitRef}
+          onSavingChange={onSavingChange}
+          onSubmitError={onSubmitError}
+          onDirtyChange={onDirtyChange}
+        />
+      </DialogBody>
+      {/* Between the scrollable body and the footer, so it is ALWAYS visible and
+          the button row never moves. Inside the body it scrolled out of view on a
+          long form; beside the buttons it reflowed the row on the very click that
+          starts the save, moving both controls under the pointer mid-gesture.
+          This strip is the only placement with neither fault.
+
+          Deliberately not muted: this is the single consequence a reader has to
+          weigh before dismissing, so it takes the warning colour rather than the
+          quietest text in the dialog. */}
+      {saving && (
+        <div className="shrink-0 border-t border-border bg-warn-subtle px-5 py-2">
+          <span className="text-[11.5px] text-warn-fg" data-testid="member-schedule-inflight">
+            {t('pages.membersPage.schedule_close_wont_cancel')}
+          </span>
+        </div>
+      )}
+      {/* While the create is in flight the exit is still offered, but it stops
+          claiming to cancel: the button says Close, and the strip above says the
+          schedule may still be created. Saying so is what the earlier lock was
+          reaching for — a user who is told cannot be misled — and it costs none
+          of the harm that refusing the exit did. */}
+      <DialogFooter>
+        <div className="flex items-center gap-2">
+          <Btn onClick={onClose} data-testid="member-schedule-dismiss">
+            {saving ? t('pages.membersPage.close') : t('pages.membersPage.cancel')}
+          </Btn>
+          <SendBtn onClick={() => submitRef.current?.()} disabled={saving} data-testid="member-schedule-submit">
+            <SaveCreateLabel isEdit={false} saving={saving} />
+          </SendBtn>
+        </div>
+      </DialogFooter>
+    </DialogContent>
+  )
+}
+
 export default function MembersPage() {
   const { t } = useTranslation()
   const navigate = useNavigate()
@@ -440,7 +564,9 @@ export default function MembersPage() {
   const slotsLoaded = useAppSelector((s) => s.dashboard.slotsLoaded)
   const liveRunning = useMemo(() => {
     const byKey: Record<string, boolean> = {}
-    for (const s of liveSlots) if (s.mode === 'member') byKey[s.key] = !!s.running
+    for (const s of liveSlots) {
+      if (s.mode === 'member') byKey[s.key] = !!(s.running || s.subagents_running)
+    }
     return byKey
   }, [liveSlots])
   const isRunning = useCallback(
@@ -599,9 +725,10 @@ export default function MembersPage() {
     },
     [mutateStar],
   )
-  // Display order before the search filter — this is what "the first member"
-  // means for the default-open below, so a typed filter never changes which
-  // member a fresh visit lands on. The ORDER is committed per MEMBERSHIP and
+  // Display order before the search filter — this is the roster the rows
+  // render from and the list `resolveDefaultMember` searches for a remembered
+  // member, so a typed filter never changes the order or which member a
+  // return visit restores. The ORDER is committed per MEMBERSHIP and
   // per chosen SORT, not per refetch: the roster query refetches on every
   // server refresh frame, on window focus and on staleness, and re-sorting
   // when a last_active_ts advances would move rows under the cursor mid-click
@@ -967,6 +1094,131 @@ export default function MembersPage() {
         : [],
     [active, wakeTokens],
   )
+  // Create-a-schedule dialog. Holds the member NAME it was opened for, not a
+  // bare flag: the dialog binds the job to one member, so it must keep naming
+  // the member it was opened for even if the roster moves underneath it —
+  // re-pointing it at whoever is open now would file the schedule against
+  // somebody the form never claimed. It deliberately does NOT close when the
+  // open member changes: with the name latched that close prevents nothing and
+  // would discard whatever had been typed, with no confirm.
+  //
+  // Dismissal is NEVER refused, and that is a deliberate reversal of two earlier
+  // revisions. A POST cannot be un-sent, so no amount of locking makes "cancel"
+  // true; each attempt to enforce it bought a fresh defect instead — a window
+  // with no exit while a request hung, a silent Escape that read as frozen, and
+  // an escaped request whose late callback closed a NEWER dialog and took its
+  // draft. What the user actually needs is not to be misled, so the dialog says
+  // in words that closing will not cancel the create, and a late completion is
+  // made HARMLESS rather than impossible: see `schedGen`.
+  const [schedFor, setSchedFor] = useState('')
+  const [schedSaving, setSchedSaving] = useState(false)
+  const schedMember = useMemo(
+    () => members.find((m) => m.name === schedFor),
+    [members, schedFor],
+  )
+  // One generation per OPEN, so a callback captured by an abandoned dialog can
+  // be told from the live one. An in-flight create outlives its dialog, and its
+  // `onSaved` still points here; without this, that late success closed whatever
+  // dialog happened to be open and discarded its draft. A stale generation may
+  // still refresh the job list — that is only ever correct, the schedule really
+  // was created — but it may not touch dialog state.
+  const schedGen = useRef(0)
+  // Bumped on open AND on close, so "is this callback from the dialog currently
+  // on screen?" is one comparison and never a second flag that can disagree. A
+  // dismissed dialog is stale by construction — which is what lets a late
+  // failure be recognised as belonging to a form the user can no longer see.
+  const closeSchedNow = useCallback(() => {
+    schedGen.current += 1
+    setSchedDirty(false)
+    setSchedFor('')
+  }, [])
+  // Opening does NOT touch `schedErrors`. An earlier revision cleared the
+  // member's retained failure reports here, on the theory that a new attempt
+  // supersedes the old verdicts — but each report is a past event with its own
+  // dismiss control (see the list below), and a fresh dialog is not an
+  // acknowledgement of any of them. Wiping the lot on open silently took the
+  // reports the user had not yet read; the only exit a report has is its own
+  // dismiss.
+  const openSchedFor = useCallback((member: string) => {
+    schedGen.current += 1
+    setSchedSaving(false)
+    setSchedDirty(false)
+    setSchedFor(member)
+  }, [])
+  // Whether the form holds typed work, so a dismissal GESTURE (Escape, a click
+  // on the overlay) can ask before destroying it — the crew editor's discard
+  // confirm, which this surface otherwise diverged from. Keyed on dirtiness and
+  // not on open-ness: a confirm over an untouched form trains people to click
+  // through the one that guards real work.
+  const [schedDirty, setSchedDirty] = useState(false)
+  const [schedConfirmDiscard, setSchedConfirmDiscard] = useState(false)
+  // Browser Back is the one exit this page cannot intercept with a component:
+  // it arrives with no gesture to guard, so the shell has to be armed BEFORE the
+  // press. `usePublishNavigationStake` does that, and the registered guard is
+  // what the shell asks on every wired in-app exit. Both read the same
+  // dirtiness, so the two can never disagree about whether there is anything to
+  // lose. A native confirm is deliberate: the answer must be synchronous, which
+  // a rendered dialog cannot be.
+  //
+  // Two surfaces therefore guard one stake — the rendered dialog for gestures
+  // this page owns, this native prompt for Back. They read the SAME two catalog
+  // keys, concatenated in the same order the dialog stacks them, so the words a
+  // user sees are identical either way; only the chrome differs, and that
+  // difference is the browser's, not a choice. Keep them on these keys: two
+  // spellings of one stake is what would erode the guard.
+  const schedLeaveGuard = useCallback(
+    () => !schedDirty || window.confirm(
+      `${t('pages.membersPage.discard_schedule')} ${t('pages.membersPage.discard_schedule_body')}`,
+    ),
+    [schedDirty, t],
+  )
+  useRegisterNavigationLeaveGuard(schedLeaveGuard)
+  usePublishNavigationStake(schedDirty)
+  // The two above cover every exit the SHELL owns — wired in-app navigation and
+  // browser Back. A reload, a tab close, or navigating the browser off the
+  // dashboard entirely destroys the same draft, and none of that passes through
+  // the shell: `beforeunload` is the only thing the platform offers there. Same
+  // idiom, for the same reason, as PromptsTab, MemoryTab and ArtifactDetailPage.
+  // Keyed on dirtiness, not open-ness, like the guards above: a warning over an
+  // untouched form would nag on every reload of a clean page.
+  useEffect(() => {
+    if (!schedDirty) return
+    const warn = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = '' }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [schedDirty])
+  // A create that failed AFTER its dialog was dismissed. The form's own inline
+  // error cannot be seen once it is unmounted, and this is precisely the case
+  // that must be reported: the footer told the user the schedule might still be
+  // created, so silence would leave them believing a schedule exists that does
+  // not.
+  //
+  // Keyed BY MEMBER, for two reasons that a single slot got wrong in turn. This
+  // block is drawn for whichever member is open, so a bare message followed the
+  // reader to the next member and read as that member's failure. And nothing
+  // serialises these: two dismissed creates can be in flight at once, so a
+  // single slot let the second failure overwrite the first and lose it.
+  // The value carries `confirmed` alongside the message: a server that ANSWERED
+  // decided, so the schedule was not created, but a request that never got an
+  // answer proves nothing — the POST may have been applied. Reporting the second
+  // as the first states a fact the page cannot know.
+  //
+  // A LIST per member, not one slot: nothing serialises dismissed creates, so
+  // two can fail for the same member and both verdicts are owed. Each entry
+  // carries its own id so one notice can be dismissed without taking its
+  // sibling — a past event is reported once, and reported individually — and
+  // the job name the user typed, so two notices under one member read as two
+  // schedules rather than one failure said twice.
+  const schedErrSeq = useRef(0)
+  const [schedErrors, setSchedErrors] = useState<Record<string, Array<{ id: number; message: string; confirmed: boolean; job?: string }>>>({})
+  const schedErrorList = schedErrors[activeMemberName]
+  // One rule for every way out, so the gesture paths and the footer button
+  // cannot disagree. Mid-flight the exit is immediate — the footer already says
+  // what closing does — and a dirty form asks first.
+  const closeSchedDialog = useCallback(() => {
+    if (schedDirty && !schedSaving) { setSchedConfirmDiscard(true); return }
+    closeSchedNow()
+  }, [schedDirty, schedSaving, closeSchedNow])
   const { todayCount, weekCount, todayFloorTs, weekFloorTs } = useMemo(() => {
     const midnight = new Date()
     midnight.setHours(0, 0, 0, 0)
@@ -1014,12 +1266,19 @@ export default function MembersPage() {
 
   // Mounting a member thread IS reading it, but nothing on this page moves
   // `chat.activeSlot` (that transition belongs to the Sessions page's
-  // switchSlot, the only other markSlotRead caller), so the websocket
-  // unread-marker keeps flagging this slot even while the user is looking at
-  // it. Drain it here instead: once when the thread opens, and again every
-  // time a live message re-flags the mounted thread. Without this the rail
-  // badge is permanent — no code path clears a live member slot's unread
-  // until the slot itself is deleted.
+  // switchSlot, the only other markSlotRead caller). Two things follow:
+  //
+  // 1. The websocket unread-marker must learn about the open thread another
+  //    way, or it flags every message that lands in it. It reads
+  //    `viewedThread` beside `chat.activeSlot`; the visible-view effect below
+  //    registers the mounted thread there. Before this, each arrival was
+  //    flagged and drained a render later, and both writes relayed to the
+  //    parent dashboard's crew tab -- a badge that lit and vanished on every
+  //    message.
+  // 2. A flag that was set while the thread was NOT on screen (closed, or
+  //    this window hidden) still has to be drained when it opens or is
+  //    revealed. Without this the rail badge is permanent -- no code path
+  //    clears a live member slot's unread until the slot itself is deleted.
   const dispatch = useAppDispatch()
   const activeSlotUnread = useAppSelector(
     (s) => !!activeSlot && s.dashboard.unreadSlots.includes(activeSlot),
@@ -1057,6 +1316,21 @@ export default function MembersPage() {
       emitSlotRead(activeSlot, activeSlotLastTs)
     }
   }, [activeSlot, activeSlotUnread, pageVisible, activeSlotLastTs, dispatch])
+  // Tell the unread-marker which thread is on screen, for exactly as long as
+  // it is: registered while the thread is mounted AND this window is visible
+  // and focused, retired on switch, hide, blur and unmount. A hidden window's
+  // open thread therefore badges like any other slot, and the read effect
+  // above drains it on reveal -- same visibility bar for both directions.
+  useEffect(() => {
+    if (!activeSlot || !pageVisible) return
+    setViewedThreadSlot(activeSlot)
+    return () => {
+      // Like switchSlot, flush before retiring the view so its trailing read
+      // timer cannot outlive it and clear a later, unseen message's badge.
+      flushSlotRead(activeSlot)
+      clearViewedThreadSlot(activeSlot)
+    }
+  }, [activeSlot, pageVisible])
 
   // Per-row unread marker: the rail badge says "1", this says WHICH member.
   // Keyed the same way isRunning resolves a member's slot (thread-endpoint
@@ -1240,31 +1514,43 @@ export default function MembersPage() {
         setGone(null)
         return
       }
-      if (urlMember) {
-        // Switching between members while one is open REPLACES the entry, so
-        // the page holds one history entry however many members are visited
-        // and Back leaves it in one press — the Sessions sidebar's rule.
+      if (urlMember || !isMobile) {
+        // Switching between members while one is open REPLACES the entry, and
+        // so does opening one above md, where the roster and the thread sit
+        // side by side and an open is not a navigation step. Either way the
+        // page holds one history entry however many members are visited and
+        // Back leaves it in one press — the Sessions sidebar's rule. The
+        // breakpoint is named directly because the desktop half used to ride
+        // on `urlMember` always being set by the arrival auto-open: a fresh
+        // visit with nothing remembered now leaves the URL bare (#11763), and
+        // that first click must still replace.
         setSearchParams({ [MEMBER_PARAM]: m.name }, { replace: true })
         return
       }
-      // Entering a thread from the roster (below md, where no member is open)
-      // is a step in a two-level navigation, so it is PUSHED. The state marks
-      // the entry as pushed from this page's roster, which is what lets the
-      // below-md back button pop instead of replace.
+      // Entering a thread from the roster below md — the one place where the
+      // roster IS the page and no member is open — is a step in a two-level
+      // navigation, so it is PUSHED. The state marks the entry as pushed from
+      // this page's roster, which is what lets the below-md back button pop
+      // instead of replace.
       setSearchParams({ [MEMBER_PARAM]: m.name }, { state: { fromRoster: true } })
     },
-    [activeName, urlMember, activate, setSearchParams],
+    [activeName, urlMember, isMobile, activate, setSearchParams],
   )
 
   // URL -> open member. Once the roster is in: a URL that names a member
   // opens it; a URL that names none (a fresh visit, the sidebar entry, a
-  // reload) is REPLACED with the remembered member, else the first row — so
-  // the page never lands on the empty column, and the URL always says what
-  // is on screen. A URL naming a member that is gone (deleted or renamed)
-  // takes the same fallback, with a one-line notice above the thread naming
-  // the swap — the user asked for someone specific, and a silently mounted
-  // other thread is the misroute this page exists to prevent. Below md the
-  // page is a two-level list->detail navigation: no `?member=` IS the
+  // reload) is REPLACED with the remembered member if one is still on the
+  // roster, so returning users land back on the conversation they left. A
+  // fresh visit with NOTHING remembered does NOT auto-open the first row —
+  // the page stays on the roster with the empty column's 'Pick a member'
+  // pane, so the user chooses instead of being primed on whichever row the
+  // sort floated to the top (#11763). A URL naming a member that is gone
+  // (deleted or renamed) falls back to the remembered member if present, with
+  // a one-line notice above the thread naming the swap — the user asked for
+  // someone specific, and a silently mounted other thread is the misroute
+  // this page exists to prevent; with nothing remembered it returns to the
+  // roster with the notice rather than standing in the first row. Below md
+  // the page is a two-level list->detail navigation: no `?member=` IS the
   // roster, so no auto-open there (same rule as SidePanelLayout's remembered
   // tab), and a gone member in the URL returns to the roster instead of
   // bouncing the phone user into a different member's thread.
@@ -1309,8 +1595,38 @@ export default function MembersPage() {
       }
       return
     }
+    // Desktop, URL names no member (or names a gone one): restore the
+    // remembered member if it is still on the roster. A fresh visit with
+    // NOTHING remembered no longer opens the first row — there is no member
+    // the user chose, so the page lands on the roster with the empty column's
+    // 'Pick a member' pane (the same rule the phone already follows: no
+    // `?member=` IS the roster). Auto-opening whichever row the 'recent' sort
+    // floated to the top primed the user to believe it was the member they
+    // asked for, which is the #11763 friction; the sort itself is left as-is.
     const target = resolveDefaultMember(safeGetItem(LAST_MEMBER_KEY), orderedMembers)
-    if (!target) return
+    if (!target) {
+      // Named a gone member but nothing remembered to stand in for them: say
+      // where they went above the roster (shown: '' marks the roster variant
+      // of the notice, as below md) and clear the URL back to the bare list.
+      if (urlMember) {
+        setGone((prev) =>
+          prev && prev.name === urlMember && prev.shown === '' ? prev : { name: urlMember, shown: '' },
+        )
+        setSearchParams({}, { replace: true })
+      }
+      // Nothing to open means nothing may STAY open — the same clear the
+      // below-md branch does. A member can be open with nothing remembered:
+      // the write that remembers it is `safeSetItem`, which returns false when
+      // storage is denied, and then `safeGetItem` reads null. Returning to a
+      // bare `/members` from there (the crew editor's exit, the rail's Crew
+      // Members row) would otherwise leave the previous thread standing over a
+      // URL that names no one, next to the roster's 'Pick a member' pane.
+      if (activeName) {
+        activeNameRef.current = ''
+        setActiveName('')
+      }
+      return
+    }
     if (urlMember) {
       setGone((prev) =>
         prev && prev.name === urlMember && prev.shown === target.name
@@ -1353,14 +1669,20 @@ export default function MembersPage() {
         <div className={LIST_HEADER_CLS}>
           {/* pl-1.5 is the sidebar's title inset when no rail toggle sits
               before it; the page icon leads the title where the sidebar's
-              reads bare, because this header names a page, not a pane. */}
+              reads bare, because this header names a page, not a pane.
+              The icon is the same two-ghost brand mark the nav rail draws
+              for this page (`components/CrewMemberMark.tsx`), so the rail
+              row and the page it opens name the thing with one glyph. */}
           <div className="flex items-center gap-1.5 min-w-0 flex-1 pl-1.5">
-            <Users size={15} className="lucide-inline text-muted shrink-0" />
+            <CrewMemberMark size={15} className="inline-block text-muted shrink-0" />
             <h1 className={LIST_TITLE_CLS}>{t('pages.membersPage.title')}</h1>
           </div>
           {/* Adding a member IS creating a crew, and the crew manager is the
               only write path — so this is a navigation, not an inline form.
-              It lands ON the create form, not on the crew list (#9513). */}
+              It lands ON the create form, not on the crew list (#9513).
+              A bare `Plus`, not `UserPlus`: the page icon beside it already
+              says "members", and a person-figure here would be the one
+              Lucide person on a page whose members are drawn as ghosts. */}
           <button
             onClick={() => navigate(CREW_CREATE_PATH)}
             className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
@@ -1368,7 +1690,7 @@ export default function MembersPage() {
             title={t('pages.membersPage.add_member')}
             data-testid="member-add"
           >
-            <UserPlus size={15} />
+            <Plus size={15} />
           </button>
         </div>
         <div className={`px-4 pb-2 ${ROW_STATUS_CLS} text-muted`} data-testid="member-count">
@@ -1539,9 +1861,12 @@ export default function MembersPage() {
           />
         </div>
         {gone && gone.shown === '' && (
-          /* Below md a stale link lands on the roster; this is where the
-             answer to "where did they go" has to live. Same tone as the
-             thread-side notice. */
+          /* The roster is the answer surface when there is no thread to stand
+             in the gone member's place: below md a stale link always lands
+             here, and on desktop a gone `?member=` with nothing remembered
+             now does too (#11763) rather than mounting a stranger's thread.
+             This is where the answer to "where did they go" has to live. Same
+             tone as the thread-side notice. */
           <div className="px-4 py-1.5 text-[13px] text-warn" role="status" data-testid="member-gone-roster-notice">
             {t('pages.membersPage.member_gone_roster', { name: gone.name })}
           </div>
@@ -1562,7 +1887,7 @@ export default function MembersPage() {
                 className="mt-2 inline-flex items-center gap-1 text-[11.5px] px-2 py-1 rounded border border-border hover:bg-accent/40"
                 data-testid="member-empty-cta"
               >
-                <UserPlus size={12} className="lucide-inline" />
+                <Plus size={12} className="lucide-inline" />
                 {t('pages.membersPage.add_member')}
               </button>
             </li>
@@ -1693,9 +2018,28 @@ export default function MembersPage() {
                   <span className={`block ${ROW_TITLE_CLS} font-semibold text-text truncate`}>{m.name}</span>
                   {/* Last-message preview, like a session row — presence
                       already rides the avatar dot, so a textual Idle/Working
-                      label said nothing the dot did not. */}
-                  <span className={`block ${ROW_STATUS_CLS} text-muted truncate`}>
-                    {m.last_message || '\u00a0'}
+                      label says nothing the dot does not. A "Stopped" chip
+                      leads the preview when the thread's NEWEST event is a
+                      Stop press: the server skips the stop card's JSON, so the
+                      preview is the last conversational line, which reads as
+                      ongoing work on a thread the user has stopped — the chip
+                      is the honest marker over it. It is localized HERE, not
+                      sent as a word from the server, whose preview is computed
+                      without the client's locale. The chip is `shrink-0` so
+                      the preview, not the label, is what truncates. The server
+                      flag is false once a newer real message lands, so the chip
+                      cannot outlive the stop. */}
+                  <span className={`flex items-center gap-1 ${ROW_STATUS_CLS} text-muted min-w-0`}>
+                    {m.last_message_stopped && (
+                      <span
+                        className="inline-flex items-center gap-0.5 shrink-0 font-medium text-danger"
+                        data-testid="member-stopped-indicator"
+                      >
+                        <Square size={9} fill="currentColor" className="lucide-inline" aria-hidden="true" />
+                        {t('pages.membersPage.stopped_indicator')}
+                      </span>
+                    )}
+                    <span className="block truncate min-w-0">{m.last_message || '\u00a0'}</span>
                   </span>
                 </span>
                 {/* Unread marker on the row's right edge — the IM convention
@@ -1986,6 +2330,8 @@ export default function MembersPage() {
           narrow ones make it an overlay the header button opens, with the
           panel's own close control, on the chat page's dock motion. */}
       {active && (() => {
+          const activeLiveSlot = liveSlots.find((slot) => slot.key === slotKeyOf(active))
+          const delegatedOnly = activeLiveSlot?.subagents_running && !activeLiveSlot.running
           const summaryBody = (
             <div className="px-3 py-3" data-testid="member-crew-summary" aria-label={t('pages.membersPage.crew_summary')}>
           {/* Identity + live status line — working now, or the last time
@@ -1996,7 +2342,9 @@ export default function MembersPage() {
             <span className="text-[13px] font-semibold truncate">{active.name}</span>
             <span className="text-[11px] truncate ml-auto shrink-0" data-testid="member-summary-status">
               {isRunning(active) ? (
-                <span className="text-ok">{t('pages.membersPage.drawer_working')}</span>
+                <span className="text-ok">{t(delegatedOnly
+                  ? 'pages.membersPage.drawer_delegated_working'
+                  : 'pages.membersPage.drawer_working')}</span>
               ) : active.last_active_ts ? (
                 <span className="text-muted">{timeAgo(active.last_active_ts)}</span>
               ) : null}
@@ -2378,10 +2726,37 @@ export default function MembersPage() {
               )}
             </div>
           )}
-          <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5 flex items-center">
+          <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5 flex items-center gap-1">
             <span className="flex-1">{t('pages.membersPage.wake_sources')}</span>
-            {/* Read-only view; managing schedules stays on the Schedule page
-                (same jump idiom as the crew editor's wake pane). */}
+            {/* The one write this block offers: a new schedule bound to THIS
+                member, so the common case does not require finding the member
+                again on another page. Editing an existing one still lives on
+                the Schedule page (the jump beside it), which is where a job's
+                logs, secrets and delete already are.
+
+                LABELLED, unlike its neighbour, because the two do different
+                things — create here vs leave the page — and two bare 12px icons
+                side by side are told apart only by their tooltips. The words
+                also carry the sibling crew editor's own idiom (`<Plus/>` plus
+                "New schedule") onto this surface.
+
+                WITHHELD while the list is empty: the empty state offers the same
+                action in words, and two copies of one action at the same moment
+                is a reader pausing to work out whether they differ. The empty
+                state's is the one that survives, because that is where a reader
+                who has never made a schedule is looking. */}
+            {(wakeJobs.length > 0 || wakeHooks.length > 0 || patrolState === 'active') && (
+              <button
+                onClick={() => openSchedFor(active.name)}
+                className="inline-flex items-center gap-1 rounded px-1 py-0.5 hover:bg-accent/40 text-muted hover:text-text"
+                data-testid="member-wake-create"
+              >
+                <Plus size={12} className="lucide-inline" aria-hidden="true" />
+                <span className="text-[10.5px] font-normal">{t('pages.membersPage.new_schedule')}</span>
+              </button>
+            )}
+            {/* Managing an existing schedule stays on the Schedule page (same
+                jump idiom as the crew editor's wake pane). */}
             <button
               onClick={() => navigate('/schedule')}
               className="inline-flex items-center p-0.5 rounded hover:bg-accent/40 text-muted hover:text-text"
@@ -2392,6 +2767,66 @@ export default function MembersPage() {
               <ExternalLink size={12} className="lucide-inline" />
             </button>
           </div>
+          {/* A create whose dialog was dismissed mid-flight and then FAILED. The
+              footer had told the user it might still be created, so its failure
+              has to land somewhere; the block that would have listed it is the
+              honest place. Shown ONLY under the member it belongs to, and naming
+              them and the schedule, so switching members cannot make one
+              member's failure read as another's, and two failures under one
+              member read as two schedules. Dismissible, because it reports a
+              past event rather than a current state. What else it carries
+              depends on whether the server ANSWERED: a create that reached the
+              server and was refused is exactly the case where the reason ("cron
+              store is read-only", a validation refusal) is worth showing and
+              handing to the agent — unlike the sibling read errors, the user
+              cannot retry their way to an explanation. A request that got no
+              answer has no server words to show, only a transport failure
+              ("Failed to fetch") that explains nothing the sentence does not,
+              so it renders the sentence alone. */}
+          {schedErrorList?.map((schedError) => (
+            <div className="mb-4" key={schedError.id}>
+              <ErrorNotice
+                /* BLOCK, not inline: this notice carries a title, the server's
+                   reason, a hand-off and a dismiss, and the inline row squeezed
+                   all four into a 432px panel — the title wrapped to three lines
+                   with the reason crushed beside it. Stacked, each part gets its
+                   own line. */
+                variant="block"
+                testId="member-schedule-late-error"
+                /* CONFIRMED: the RAW server error is the `message`, and the
+                   context goes in the `title`. `askAgent` recovers structured
+                   context (endpoint, status, backend `code`) by matching that
+                   string against the error journal, so wrapping it in a
+                   translated sentence — as an earlier revision did — silently
+                   degraded the hand-off to prose. Splitting them also reads
+                   better: the outcome is the heading and the server's own words
+                   sit under it.
+
+                   UNCONFIRMED: the sentence IS the whole report, so it takes the
+                   one slot `ErrorNotice` requires. No `title` above it — that
+                   split exists to set a heading apart from raw server words, and
+                   there are none worth showing. No `askAgent` — the hand-off's
+                   journal match is keyed on a server reason, and a request that
+                   never got one has nothing for the agent to look up. */
+                askAgent={schedError.confirmed}
+                title={schedError.confirmed
+                  ? t('pages.membersPage.schedule_create_failed', { member: activeMemberName, job: schedError.job })
+                  : undefined}
+                message={schedError.confirmed
+                  ? schedError.message
+                  : t('pages.membersPage.schedule_create_no_answer', { member: activeMemberName, job: schedError.job })}
+                onDismiss={() => setSchedErrors((prev) => {
+                  // Only this entry: a sibling failure is its own past event,
+                  // and dismissing one report must not silence another.
+                  const kept = (prev[activeMemberName] ?? []).filter((e) => e.id !== schedError.id)
+                  const next = { ...prev }
+                  if (kept.length === 0) delete next[activeMemberName]
+                  else next[activeMemberName] = kept
+                  return next
+                })}
+              />
+            </div>
+          ))}
           {!wakeLoaded ? (
             <div className="mb-4 space-y-1.5" data-testid="member-wake-loading" aria-hidden>
               <div className="h-3 rounded bg-accent/40 animate-pulse" />
@@ -2406,7 +2841,20 @@ export default function MembersPage() {
               />
             </div>
           ) : wakeJobs.length === 0 && wakeHooks.length === 0 && patrolState !== 'active' ? (
-            <div className="text-[11px] text-muted mb-4">{t('pages.membersPage.wake_none')}</div>
+            <div className="text-[11px] text-muted mb-4">
+              {t('pages.membersPage.wake_none')}{' '}
+              {/* The header's 12px icon is the wrong place to LEARN this exists,
+                  and an empty state is exactly where a reader is asking "so how
+                  do I add one?" — so the empty case carries the action in
+                  words, the way the crew editor's own pane labels its Plus. */}
+              <button
+                onClick={() => openSchedFor(active.name)}
+                className="underline decoration-dotted underline-offset-2 hover:text-text"
+                data-testid="member-wake-create-empty"
+              >
+                {t('pages.membersPage.new_schedule')}
+              </button>
+            </div>
           ) : (
             <ul className="list-none m-0 p-0 mb-4 space-y-1.5" data-testid="member-wake-sources">
               {/* An active patrol IS a wake source — the one this member set
@@ -2484,18 +2932,18 @@ export default function MembersPage() {
                       ? t('pages.kiroCrewAgentsPage.memory_binding_mismatch')
                       : t('pages.kiroCrewAgentsPage.memory_binding_unavailable')}
             </span>
-            <Btn onClick={() => {
-              const destination = activeMemory === 'global' || activeMemory === 'private'
-                ? `/settings/overview?view=memory&store=${encodeURIComponent(active.name === 'default' ? 'default' : String(active.memory_store))}`
-                : `${CREW_MANAGER_PATH}&crew=${encodeURIComponent(active.name)}`
-              leave(() => navigate(destination), destination)
-            }}>
-              {activeMemory === 'global' || activeMemory === 'private'
-                ? t('pages.kiroCrewAgentsPage.manage_private_memory')
-                : activeMemory === 'legacy'
-                  ? t('pages.membersPage.setup_in_crew_manager')
+            {activeMemory !== 'legacy' && (
+              <Btn onClick={() => {
+                const destination = activeMemory === 'global' || activeMemory === 'private'
+                  ? `/settings/overview?view=memory&store=${encodeURIComponent(active.name === 'default' ? 'default' : String(active.memory_store))}`
+                  : `${CREW_MANAGER_PATH}&crew=${encodeURIComponent(active.name)}`
+                leave(() => navigate(destination), destination)
+              }}>
+                {activeMemory === 'global' || activeMemory === 'private'
+                  ? t('pages.kiroCrewAgentsPage.manage_private_memory')
                   : t('pages.kiroCrewAgentsPage.open_crew_manager')}
-            </Btn>
+              </Btn>
+            )}
           </div>
           {/* One exit, into the crew manager (the only writer), landing on
               THIS member's editor — the same destination as the header face,
@@ -2601,7 +3049,7 @@ export default function MembersPage() {
                        handed the window width (`fillWidth`) so it fills the
                        scrim; on a tablet-width window the panel keeps its own
                        (resizable, persisted) width against the dimmed chat. */
-                    : 'fixed top-safe-offset-[42px] bottom-safe left-safe right-safe z-40 flex justify-end bg-bg/60 backdrop-blur-sm'}
+                    : 'fixed top-safe-offset-[42px] bottom-safe left-safe right-safe z-40 flex justify-end bg-bg/60 backdrop-blur-xs'}
                   style={panelHidden ? { display: 'none' } : undefined}
                   onClick={beside ? undefined : (e) => { if (e.target === e.currentTarget) closeOverlay() }}
                   data-testid="member-side-panel"
@@ -2637,6 +3085,98 @@ export default function MembersPage() {
             </AnimatePresence>
           )
         })()}
+      {/* Page root, not inside the summary body: the panel unmounts on a tab
+          switch and would take a half-typed schedule with it. */}
+      <Dialog
+        open={!!schedFor}
+        /* Every way out funnels through one rule (`closeSchedDialog`): Escape, a
+           click outside, the built-in close control and the footer button alike.
+           Nothing is ever REFUSED here — a POST cannot be un-sent, so the dialog
+           says so instead of pretending to cancel — but a dismissal that would
+           destroy typed work asks first. */
+        onOpenChange={next => { if (!next) closeSchedDialog() }}
+      >
+        {!!schedFor && (() => {
+          // Captured once per open. Every callback this dialog hands out is
+          // stamped with it, so a create that outlives the dialog can be told
+          // from the live one when it finally answers.
+          const gen = schedGen.current
+          return (
+            <MemberScheduleDialog
+              key={`${schedFor}#${gen}`}
+              member={schedFor}
+              /* Undefined while the roster is refetching — the form then offers
+                 the global model list rather than that template's, which is a
+                 narrower field, never a wrong binding: `member` is what the job
+                 is filed under. */
+              agentTemplate={schedMember?.kiro_agent}
+              saving={schedSaving}
+              onSavingChange={(v) => { if (gen === schedGen.current) setSchedSaving(v) }}
+              onDirtyChange={(d) => { if (gen === schedGen.current) setSchedDirty(d) }}
+              /* Reported only for a dialog that is GONE: a live form renders its
+                 own error inline, and duplicating it in the block below would
+                 say the same thing twice. */
+              /* Reported in the member's own Wake sources block — the place the
+                 promise was made. It is NOT also pushed to the bell feed: that
+                 row is client-only, and `fetchNotifications.fulfilled` replaces
+                 `state.items` wholesale on every reconnect, so it would vanish
+                 on the next socket blip while claiming to be the durable copy.
+                 A report that survives leaving the page needs the SERVER to
+                 emit it; until then this page does not pretend otherwise, and
+                 the limitation is stated in the PR description and #10307. */
+              onSubmitError={(msg, confirmed, job) => {
+                if (gen === schedGen.current) return
+                setSchedErrors((prev) => ({
+                  ...prev,
+                  // Appended, never assigned: a second dismissed create for the
+                  // SAME member can fail while the first's notice still stands,
+                  // and overwriting would silently lose one verdict.
+                  [schedFor]: [...(prev[schedFor] ?? []), { id: ++schedErrSeq.current, message: msg, confirmed, job }],
+                }))
+              }}
+              onClose={closeSchedDialog}
+              onSaved={() => {
+                // ALWAYS, whichever generation reports it: the schedule really
+                // was created, so the shared job-list key must refresh — the
+                // wake block, the composer's watch popover and the Schedule
+                // page all read it.
+                queryClient.invalidateQueries({ queryKey: cronJobsQuery.queryKey })
+                // Dialog state, only for the dialog still on screen. A create
+                // the user closed out from under keeps running, and its late
+                // success used to close whatever dialog had replaced it and
+                // discard that draft.
+                if (gen === schedGen.current) { setSchedSaving(false); closeSchedNow() }
+              }}
+            />
+          )
+        })()}
+      </Dialog>
+      {/* Nested over the schedule dialog, so `z-[110]` clears its `z-[101]` —
+          the same stacking the Schedule page's delete confirm uses. Only ever
+          armed for a DIRTY form, and the destructive choice is the one that
+          needs the deliberate click. */}
+      <Dialog open={schedConfirmDiscard} onOpenChange={next => { if (!next) setSchedConfirmDiscard(false) }}>
+        <DialogContent maxWidth={380} className="z-[110]">
+          <DialogHeader>
+            <DialogTitle>{t('pages.membersPage.discard_schedule')}</DialogTitle>
+          </DialogHeader>
+          <DialogBody>
+            <p className="text-[12.5px] text-muted">{t('pages.membersPage.discard_schedule_body')}</p>
+          </DialogBody>
+          <DialogFooter>
+            <Btn onClick={() => setSchedConfirmDiscard(false)}>
+              {t('pages.membersPage.keep_editing')}
+            </Btn>
+            <Btn
+              danger
+              data-testid="member-schedule-discard"
+              onClick={() => { setSchedConfirmDiscard(false); closeSchedNow() }}
+            >
+              {t('pages.membersPage.discard')}
+            </Btn>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -2097,6 +2097,8 @@ class TestRecordIsAlwaysWritable:
         assert sdk.get(run_id) is not None
         # Bookkeeping was NOT skipped: the key is free, so a new start with the
         # same key begins a new run rather than adopting a finished one.
+        # A terminal record can precede release of the live entry and dedupe key.
+        _wait_until(lambda: run_id not in sdk.cancelling_and_live_ids()[1])
         second = sdk.start("weird", dedupe_key="k")
         assert second != run_id
         _wait_terminal(sdk, second)

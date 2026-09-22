@@ -77,6 +77,9 @@ from kiro_crew.instances.constants import (
 )
 from kiro_crew.instances.constants import DEFAULT_MAX_RECOVERY_ATTEMPTS as _MAX_RECOVERY
 from kiro_crew.instances.constants import DEFAULT_MINT_TIMEOUT_SECS as _DEFAULT_MINT_TIMEOUT_SECS
+from kiro_crew.instances.constants import (
+    DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS as _MODELS_CAPABILITY_PROXY_TIMEOUT,
+)
 from kiro_crew.instances.constants import DEFAULT_PROBE_FAILURE_THRESHOLD as _PROBE_FAILS
 from kiro_crew.instances.constants import DEFAULT_PROBE_INTERVAL_SECS as _PROBE_INTERVAL
 from kiro_crew.instances.constants import (
@@ -133,7 +136,7 @@ from kiro_crew.instances.validation import (
     validate_ssm_run_as,
     validate_ssm_target,
 )
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import redact
 from kiro_crew.sel import _HMAC_KEY_MIN_BYTES as _SEL_HMAC_KEY_MIN_BYTES
 from kiro_crew.sel import sel, sel_hmac_key_path
 
@@ -325,8 +328,11 @@ def _sanitize_banner(text: str, *, anchor: str | None = None) -> str:
     removed the phrase, the head slice is unchanged.
     """
     cleaned = _ANSI_CSI_RE.sub("", text)
-    cleaned = redact_credentials(cleaned)[0]
-    cleaned = redact_exfiltration_urls(cleaned)[0]
+    # Canonical exfiltration-then-credentials composition: the URL pass keys
+    # partly on query length and replaces the whole URL, so a credential pass
+    # run ahead of it can shorten a `?token=<long>` query below that threshold
+    # and leave the destination and payload parameters on the wire.
+    cleaned = redact(cleaned)
     if len(cleaned) <= _BANNER_DETAIL_MAX_CHARS:
         return cleaned
     if anchor:
@@ -482,6 +488,16 @@ def _build_ssm_tunnel_argv(
     features can never drift on the SSM document/parameter shape.
     """
     return cloud_ssm.build_port_forward_argv(ssm_target, remote_port, local_port, profile, region)
+
+
+class _RecoverySuperseded(Exception):
+    """A self-heal rebuild found the tunnel generation moved mid-flight.
+
+    Raised by :meth:`SshTunnelManager._rebuild` when its epoch-gated install
+    is refused, and caught in :meth:`SshTunnelManager._recover`: the recovery
+    must stand down entirely — falling through to the next tier instead would
+    re-mint against a world the recovery has already been superseded in.
+    """
 
 
 class _SshTunnel:
@@ -1168,14 +1184,20 @@ class SshTunnelManager:
         # write, and recovery refuses to run for an instance named in it — which
         # closes the window instead of racing it with a retry loop.
         self._reconfiguring: set[str] = set()
-        # Generation counter per instance, bumped every time a tunnel is INSTALLED.
+        # Generation counter per instance, bumped every time a tunnel is
+        # INSTALLED and every time one is torn down (_teardown_locked): both
+        # events end the generation a slow unlocked mint or rebuild ran for.
         # A mint runs without the lock, so the tunnel it was minted for can be torn
         # down and replaced while it is in flight; `instance_id in self._tunnels` is
         # then true again and cannot tell the generations apart. The stamp can:
         # a token is stored only if the tunnel it belongs to is still the current
-        # one. This covers every mint path, including the request-driven
-        # `refresh_token()` the embedded dashboard calls, which is not a task in
-        # `_refresh_tasks` and so cannot be cancelled by name.
+        # one. Coverage, mint path by mint path: connect() mints inside its
+        # critical section, so nothing can replace the tunnel mid-mint and it
+        # needs no stamp; _refresh_token_once — and refresh_token(), the
+        # request-driven path the embedded dashboard calls, which delegates to
+        # it and is not a task in `_refresh_tasks`, so it cannot be cancelled by
+        # name — compares the stamp under the lock before its store; the
+        # self-heal tier-2 re-mint does the same before its store.
         self._tunnel_epoch: dict[str, int] = {}
         # Proactive token refresh: per-instance refresh task + the mint timestamp
         # / ttl so the TTL-remaining can be surfaced (Stage 6).
@@ -1885,11 +1907,25 @@ class SshTunnelManager:
         self._tokens.pop(instance_id, None)
         self._recover_attempts.pop(instance_id, None)
         self._last_error.pop(instance_id, None)
+        # A teardown ends the generation: a slow unlocked mint or rebuild in
+        # flight captured the pre-teardown stamp, and this bump is what lets
+        # the epoch compares at their store/record sites refuse the result —
+        # membership alone reads true again as soon as anything reinstalls.
+        self._tunnel_epoch[instance_id] = self._tunnel_epoch.get(instance_id, 0) + 1
         # Awaited, not just signalled: a refresh already inside its mint would
         # otherwise finish afterwards and store a token for a tunnel this teardown
         # has already removed. Ordered after the stop for the same reason as the
         # token itself — a rejected edit must leave the live tunnel intact.
         await self._cancel_token_refresh_and_wait(instance_id)
+        # A parked self-heal is deliberately NOT drained here, although it has
+        # the same shape of hazard. Draining would await _cancel_recovery under
+        # the lock we hold, and unlike the refresh loop a recovery's
+        # cancellation can be swallowed — _SshTunnel.stop() suppresses
+        # CancelledError around its child-task awaits — after which the
+        # survivor parks on THIS lock and the gather never returns. The
+        # surviving recovery is harmless instead: the epoch bump above makes
+        # its generation stamp stale, so tier 2's store refuses the token and
+        # _mark_recovered unwinds the rebuild instead of recording it.
         # Clear the lazy-reconnect hint AND the recorded local port together
         # (one atomic write). local_port must return to the unallocated
         # sentinel so the now-free port is not treated as reserved forever,
@@ -2022,6 +2058,13 @@ class SshTunnelManager:
         """Tear down all tunnels (gateway shutdown). Leaves registry hints intact
         so lazy reconnect can revive the last-active instance next startup."""
         async with self._lock:
+            # End every generation FIRST, before any await below: cancellation
+            # of an in-flight self-heal can be swallowed inside
+            # _SshTunnel.stop(), and a survivor that still saw its expected
+            # stamp would reinstall a child after this cleanup. With the stamp
+            # moved, its gated install and record refuse instead.
+            for instance_id in list(self._tunnels):
+                self._tunnel_epoch[instance_id] = self._tunnel_epoch.get(instance_id, 0) + 1
             # Cancel any in-flight self-heal so it can't resurrect a tunnel
             # after shutdown.
             for task in list(self._recovery_tasks):
@@ -2079,8 +2122,14 @@ class SshTunnelManager:
             return
         await self._recover(instance_id)
 
-    async def _rebuild(self, inst: Instance, params: _TransportParams, local_port: int) -> bool:
+    async def _rebuild(
+        self, inst: Instance, params: _TransportParams, local_port: int, expected_epoch: int
+    ) -> _SshTunnel | None:
         """Build + start a fresh tunnel for *inst*, replacing the live one.
+
+        Returns the installed tunnel when its start succeeds, else ``None`` —
+        the object (not a bare bool) so the recovery can tell ITS install from
+        one that raced in during the unlocked awaits (see _mark_recovered).
 
         Stops the existing tunnel first so its child is terminated and the
         local forward port is released before we spawn the replacement. Without
@@ -2088,6 +2137,18 @@ class SshTunnelManager:
         and keeps holding the port, so every replacement fails
         ``ExitOnForwardFailure`` while ``_port_reachable`` is still satisfied by
         the orphan — the tight respawn loop this method otherwise produced.
+
+        The install itself is gated, under the manager lock, on the stamp
+        still reading *expected_epoch*: ``old.stop()`` is an unlocked await, so
+        a concurrent ``connect()`` can install a live replacement (or a
+        ``disconnect`` can end the generation) while it runs, and an ungated
+        install would overwrite that replacement without stopping it — an
+        orphaned child holding its port, untracked. On refusal the tunnel
+        object is discarded unstarted (no process exists yet) and
+        :class:`_RecoverySuperseded` is raised so the recovery stands down.
+        Stopping ``old`` first is safe on every path: each caller reaches this
+        method synchronously from the section that verified the stamp, so
+        ``old`` is always the generation the recovery owns.
         """
         old = self._tunnels.get(inst.id)
         if old is not None:
@@ -2104,14 +2165,51 @@ class SshTunnelManager:
             on_exit=self._on_tunnel_exit,
             **params.tunnel_kwargs(),
         )
-        self._tunnels[inst.id] = tunnel
-        # A self-heal reinstall is a new generation too: a mint in flight against
-        # the tunnel this one replaces must not land on it.
-        self._tunnel_epoch[inst.id] = self._tunnel_epoch.get(inst.id, 0) + 1
-        return await tunnel.start()
+        async with self._lock:
+            if self._tunnel_epoch.get(inst.id, 0) != expected_epoch:
+                raise _RecoverySuperseded(inst.id)
+            self._tunnels[inst.id] = tunnel
+            # A self-heal reinstall is a new generation too: a mint in flight
+            # against the tunnel this one replaces must not land on it.
+            self._tunnel_epoch[inst.id] = expected_epoch + 1
+        started = await tunnel.start()
+        # start() is an unlocked await with a window BEFORE the child spawns
+        # (argv building). A disconnect or connect landing in that window
+        # stops this tunnel while it has no process — a no-op — and then
+        # untracks it, so the spawn lands afterwards with ours as the only
+        # live handle. Revalidate under the lock and reap our own child when
+        # displaced; after start() returns, any later displacer's stop() finds
+        # the process and this window is closed.
+        async with self._lock:
+            superseded = (
+                self._tunnels.get(inst.id) is not tunnel
+                or self._tunnel_epoch.get(inst.id, 0) != expected_epoch + 1
+            )
+        if superseded:
+            with contextlib.suppress(Exception):
+                await tunnel.stop()
+            raise _RecoverySuperseded(inst.id)
+        return tunnel if started else None
 
-    async def _mark_recovered(self, instance_id: str) -> None:
-        """Reset the attempt counter and persist the hints, under lock, iff tracked.
+    async def _mark_recovered(
+        self, instance_id: str, mine: _SshTunnel, expected_epoch: int
+    ) -> None:
+        """Record *mine* as the recovered tunnel iff its generation is current.
+
+        ``mine.start()`` is an unlocked await, so the world can move between
+        the gated install (see :meth:`_rebuild`) and this record: a
+        ``connect()`` replaces *mine* (stopping it), or a ``disconnect`` tears
+        it down — either way the record this write would make is about a
+        tunnel that is not current, and persisting ``was_connected=True`` over
+        a disconnect's ``False`` would silently revive, across restarts, an
+        instance the user turned off. *expected_epoch* is the Phase 1 stamp
+        plus the installs this recovery made itself; teardown bumps the stamp
+        too, so any interleaved install OR teardown reads as a mismatch and
+        the record is refused. Nothing needs unwinding on refusal: every
+        displacing path stops the tunnel it displaces, so *mine* is already
+        down and untracked.
+
+        Reset the attempt counter and persist the hints, under lock, iff tracked.
 
         A rebuild replaced the tunnel child, so the recorded forwarder
         identity (``forwarder_pid`` + ``forwarder_start`` + the
@@ -2145,6 +2243,9 @@ class SshTunnelManager:
         async with self._lock:
             tunnel = self._tunnels.get(instance_id)
             if tunnel is None:
+                return
+            if tunnel is not mine or self._tunnel_epoch.get(instance_id, 0) != expected_epoch:
+                logger.info("Discarding a superseded self-heal rebuild for %s", instance_id)
                 return
             self._recover_attempts[instance_id] = 0
             await self._persist_hint(
@@ -2194,13 +2295,29 @@ class SshTunnelManager:
                 return
 
             local_port = current.status.local_port or inst.local_port
+            # Which tunnel generation this recovery found. There is no await
+            # between this block and tier 1's rebuild, so tier 2 can bind its
+            # store to the ONE bump that a failed tier-1 rebuild is guaranteed
+            # to make (see the store below).
+            epoch = self._tunnel_epoch.get(instance_id, 0)
 
         # Phase 2 — slow remote I/O WITHOUT the lock.
         # Tier 1 — rebuild tunnel, reuse existing token.
         logger.info("Self-heal tier 1 (rebuild tunnel) for %s [attempt %d]", instance_id, attempts)
-        if await self._rebuild(inst, params, local_port):
-            await self._mark_recovered(instance_id)
-            logger.info("Self-heal tier 1 succeeded for %s", instance_id)
+        try:
+            rebuilt = await self._rebuild(inst, params, local_port, expected_epoch=epoch)
+        except _RecoverySuperseded:
+            # A connect or disconnect moved the generation mid-rebuild. Not a
+            # tier failure: falling through to tier 2 would re-mint against a
+            # world this recovery has been superseded in.
+            logger.info("Self-heal for %s stood down: superseded mid-rebuild", instance_id)
+            return
+        if rebuilt is not None:
+            # The rebuild's install is the one bump expected past the Phase 1
+            # stamp; anything else means the world moved mid-rebuild and
+            # _mark_recovered unwinds instead of recording.
+            await self._mark_recovered(instance_id, rebuilt, epoch + 1)
+            logger.info("Self-heal tier 1 finished for %s", instance_id)
             return
 
         # Tier 2 — re-mint the dashboard token, then rebuild.
@@ -2213,11 +2330,35 @@ class SshTunnelManager:
         async with self._lock:
             if instance_id not in self._tunnels:
                 return  # disconnected while minting — discard
+            if self._tunnel_epoch.get(instance_id, 0) != epoch + 1:
+                # This mint ran for the generation tier 1 installed, which is
+                # exactly ONE bump past the Phase 1 stamp: a failed tier-1
+                # rebuild always installs (and bumps for) its replacement
+                # before start() reports failure, and every path that raises
+                # instead never reaches this store. Any other value means a
+                # tunnel this recovery never saw was installed meanwhile (the
+                # operator disconnected and reconnected while the slow remote
+                # I/O was in flight) — membership alone cannot see that, the
+                # NEW generation satisfies it. Storing the result would hand
+                # the embedded dashboard a credential the current remote never
+                # issued, and the rebuild below would replace the current
+                # tunnel using this recovery's stale record. Same stamp check
+                # as _refresh_token_once's store; the +1 is tier 2's own
+                # install sitting between the capture and the compare.
+                logger.info("Discarding a superseded self-heal mint for %s", instance_id)
+                return
             self._store_token(instance_id, token, inst.ttl)
             self._schedule_token_refresh(instance_id)
-        if await self._rebuild(inst, params, local_port):
-            await self._mark_recovered(instance_id)
-            logger.info("Self-heal tier 2 succeeded for %s", instance_id)
+        try:
+            rebuilt = await self._rebuild(inst, params, local_port, expected_epoch=epoch + 1)
+        except _RecoverySuperseded:
+            logger.info("Self-heal for %s stood down: superseded mid-rebuild", instance_id)
+            return
+        if rebuilt is not None:
+            # epoch + 2: tier 1's failed install and this rebuild's own are
+            # the two bumps this recovery made itself.
+            await self._mark_recovered(instance_id, rebuilt, epoch + 2)
+            logger.info("Self-heal tier 2 finished for %s", instance_id)
         else:
             logger.warning("Self-heal failed for %s even after re-mint", instance_id)
 
@@ -2701,7 +2842,13 @@ class SshTunnelManager:
                     else "capability_no_credential"
                 ),
             }
-        timeout = aiohttp.ClientTimeout(total=_CAPABILITY_PROXY_TIMEOUT)
+        # /api/models is the one read whose cold path runs bounded subprocess
+        # work on the peer (~15s worst case), so it gets its own budget; the
+        # four cheap reads keep the short one. See both constants for sizing.
+        total = (
+            _MODELS_CAPABILITY_PROXY_TIMEOUT if path == "/api/models" else _CAPABILITY_PROXY_TIMEOUT
+        )
+        timeout = aiohttp.ClientTimeout(total=total)
         reminted = False
         for _attempt in range(2):
             try:

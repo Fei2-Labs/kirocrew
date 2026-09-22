@@ -25,13 +25,13 @@ import unittest.mock
 from pathlib import Path
 
 import pytest
-from member_memory_helpers import patch_private_memory_supported
 from test_chat_runner_coverage import _complete, _drive, _runner_state, _set_stream, _slot
 
 from kiro_crew.acp.types import EVENT_TEXT_CHUNK
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat_runner import _eager_spawn
+from kiro_crew.member_memory_auth import bind_private_session_store
 from kiro_crew.memory_stores import provision_member_memory
 from kiro_crew.providers.base import LLMEvent
 
@@ -65,11 +65,35 @@ def _config(tmp_path: Path, *, crew_model: str = "") -> KiroCrewConfig:
     return cfg
 
 
+def _grant_researcher(cfg: KiroCrewConfig, slot_key: str = "chat-cov-1") -> None:
+    """Write the member's private session grant, as an owner-gated route would.
+
+    A turn only confirms a grant that already exists; these turns exercise
+    model selection, not admission, so the grant is written up front.
+    """
+    bind_private_session_store(f"dashboard:{slot_key}", cfg.agents["researcher"].memory_store)
+
+
+def _pin_sync_accessors(client) -> None:
+    """Give the provider double's remaining SYNC accessors sync stand-ins.
+
+    ``_runner_state`` pins the context-usage trio; the turn also reads
+    ``mcp_session_report``, ``available_models`` and the inner client's
+    ``pop_pending_oauth_requests`` without ``await``. Left as ``AsyncMock``
+    children each returns a coroutine nobody awaits, reported at garbage
+    collection against whichever later test triggers it.
+    """
+    client.mcp_session_report = unittest.mock.MagicMock(return_value=None)
+    client.available_models = unittest.mock.MagicMock(return_value=[])
+    client.client.pop_pending_oauth_requests = unittest.mock.MagicMock(return_value=[])
+
+
 def _turn_state(tmp_path: Path):
     builder = unittest.mock.MagicMock()
     builder.ensure_store = unittest.mock.AsyncMock(return_value=object())
     builder.build_message.return_value = ("fixture context", None)
     state, client = _runner_state(tmp_path, context_builder=builder)
+    _pin_sync_accessors(client)
     _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="hi"), _complete()])
     return state, client
 
@@ -84,7 +108,7 @@ def _runner_config(tmp_path, monkeypatch):
     """Serve the real config object to every ``KiroCrewConfig.load()`` in the turn."""
     # These turns use a fake provider and exercise model selection. Supply only
     # the host capability result; member provisioning and binding remain real.
-    patch_private_memory_supported(monkeypatch)
+    pass  # Member routing does not depend on OS isolation.
 
     def _install(cfg: KiroCrewConfig):
         patcher = unittest.mock.patch.object(
@@ -136,7 +160,9 @@ class TestRunChatDefaultModel:
 
     @pytest.mark.asyncio
     async def test_crew_pin_outranks_the_global_default(self, tmp_path, _runner_config):
-        _runner_config(_config(tmp_path, crew_model=CREW_PIN))
+        cfg = _config(tmp_path, crew_model=CREW_PIN)
+        _runner_config(cfg)
+        _grant_researcher(cfg)
         state, _client = _turn_state(tmp_path)
         slot = _slot()
         slot.agent = "researcher"
@@ -148,7 +174,9 @@ class TestRunChatDefaultModel:
 
     @pytest.mark.asyncio
     async def test_explicit_slot_pin_is_untouched(self, tmp_path, _runner_config):
-        _runner_config(_config(tmp_path, crew_model=CREW_PIN))
+        cfg = _config(tmp_path, crew_model=CREW_PIN)
+        _runner_config(cfg)
+        _grant_researcher(cfg)
         state, _client = _turn_state(tmp_path)
         slot = _slot()
         slot.agent = "researcher"
@@ -294,6 +322,7 @@ class TestEagerSpawnDefaultModel:
     async def test_eager_session_starts_on_the_global_default(self, tmp_path, _runner_config):
         _runner_config(_config(tmp_path))
         state, _client = _runner_state(tmp_path)
+        _pin_sync_accessors(_client)
         slot = _slot()
         state._slots[slot.key] = slot
         state.sessions.release = unittest.mock.MagicMock()
@@ -317,6 +346,7 @@ class TestEagerSpawnDefaultModel:
         """
         _runner_config(_config(tmp_path))
         state, _client = _runner_state(tmp_path)
+        _pin_sync_accessors(_client)
         slot = _slot()
         state._slots[slot.key] = slot
         state.sessions.release = unittest.mock.MagicMock()
@@ -333,3 +363,90 @@ class TestEagerSpawnDefaultModel:
         assert _session_model(state) is None
         assert slot.model == ""
         assert seen["thread"] != threading.get_ident()
+
+
+class TestSessionOpenedRecordsTheAllocationsSelection:
+    """``session/opened.model_requested`` names the ALLOCATION's selection.
+
+    The turn that observes a session is not always the one that allocated it. An
+    eager allocation can outlive a config change, so re-resolving the selection at
+    the first turn writes a model that session never used -- into an append-only
+    entry nothing rewrites. These turns capture the kwarg the emitter receives, so
+    they fail if the runner goes back to resolving it per turn.
+    """
+
+    @staticmethod
+    def _capture():
+        return unittest.mock.patch.object(
+            chat_runner.crew_log_emit, "on_session_opened", unittest.mock.MagicMock()
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_allocating_turn_records_its_own_selection(self, tmp_path, _runner_config):
+        _runner_config(_config(tmp_path))
+        state, _client = _turn_state(tmp_path)
+        slot = _slot()
+        assert slot._session_requested_model is None
+
+        with self._capture() as opened:
+            await _drive(state, slot)
+
+        assert slot._session_requested_model == GLOBAL_DEFAULT
+        assert opened.call_args.kwargs["model_requested"] == GLOBAL_DEFAULT
+
+    @pytest.mark.asyncio
+    async def test_a_prewarmed_claim_keeps_the_allocations_selection(
+        self, tmp_path, _runner_config
+    ):
+        """The regression: a claim of a pre-warmed session must not re-resolve.
+
+        An eager allocation arms a ``resumed=True`` observation for the real turn,
+        so this is the shape a prewarmed first turn sees. The config default has
+        moved since that allocation; the entry must still name what was allocated.
+        """
+        _runner_config(_config(tmp_path))
+        state, client = _turn_state(tmp_path)
+        state.sessions.get_or_create = unittest.mock.AsyncMock(return_value=(client, False, True))
+        slot = _slot()
+        slot._session_requested_model = "model-the-allocation-chose"
+
+        with self._capture() as opened:
+            await _drive(state, slot)
+
+        assert slot._session_requested_model == "model-the-allocation-chose"
+        assert opened.call_args.kwargs["model_requested"] == "model-the-allocation-chose"
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_allocation_replaces_a_dead_sessions_selection(
+        self, tmp_path, _runner_config
+    ):
+        """``is_new`` means THIS call allocated, so its own selection is the truth.
+
+        A value left by a session that died without a teardown must not outlive it
+        and be reported as this session's provenance.
+        """
+        _runner_config(_config(tmp_path))
+        state, _client = _turn_state(tmp_path)
+        slot = _slot()
+        slot._session_requested_model = "model-of-a-session-that-is-gone"
+
+        with self._capture() as opened:
+            await _drive(state, slot)
+
+        assert slot._session_requested_model == GLOBAL_DEFAULT
+        assert opened.call_args.kwargs["model_requested"] == GLOBAL_DEFAULT
+
+    @pytest.mark.asyncio
+    async def test_a_re_attach_with_no_provenance_records_nothing(self, tmp_path, _runner_config):
+        """Absent beats inferred: the allocating process is gone."""
+        _runner_config(_config(tmp_path))
+        state, client = _turn_state(tmp_path)
+        state.sessions.get_or_create = unittest.mock.AsyncMock(return_value=(client, False, True))
+        slot = _slot()
+        assert slot._session_requested_model is None
+
+        with self._capture() as opened:
+            await _drive(state, slot)
+
+        assert slot._session_requested_model is None
+        assert opened.call_args.kwargs["model_requested"] == ""

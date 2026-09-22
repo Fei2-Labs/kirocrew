@@ -1014,6 +1014,7 @@ _MANAGED_SERVER_SUBCOMMANDS = {
     "kirocrew-computer": "mcp-computer",
     "kirocrew-dashboard": "mcp-dashboard",
     "kirocrew-work": "mcp-work",
+    "kirocrew-crew-log": "mcp-crew-log",
 }
 _MANAGED_SERVER_NAMES = set(_MANAGED_SERVER_SUBCOMMANDS)
 
@@ -1026,6 +1027,7 @@ _MANAGED_SERVER_TOOL_MODULES = {
     "kirocrew-computer": "kiro_crew.mcp_computer",
     "kirocrew-dashboard": "kiro_crew.mcp_dashboard",
     "kirocrew-work": "kiro_crew.mcp_work",
+    "kirocrew-crew-log": "kiro_crew.mcp_crew_log",
 }
 
 
@@ -1052,7 +1054,13 @@ _MANAGED_SERVER_TOOL_MODULES = {
 #: argument actually handed to the shim. That check imports the modules in the
 #: TEST process, where running package code is the point rather than a hazard.
 _MANAGED_SERVERS_CALLER_AWARE: frozenset[str] = frozenset(
-    {"kirocrew-core", "kirocrew-cron", "kirocrew-dashboard", "kirocrew-work"}
+    {
+        "kirocrew-core",
+        "kirocrew-cron",
+        "kirocrew-dashboard",
+        "kirocrew-work",
+        "kirocrew-crew-log",
+    }
 )
 
 #: Managed servers that ADVERTISE the capability but are deliberately withheld
@@ -1157,13 +1165,14 @@ def _fix_stale_managed_command(name: str, spec: dict) -> None:
     source of truth for the managed invocation. That handles every layout:
     a standalone ``bin/kirocrew`` (POSIX) / ``Scripts\\kirocrew.exe`` (Windows
     pip install) console script when one resolves, the Windows bundle's
-    ``bin\\kirocrew.cmd`` shim (unwrapped to ``<root>\\python.exe -B -P -s -m
-    kiro_crew <sub>``), and otherwise the ``<interpreter> -B -m kiro_crew
-    <sub>`` fallback. Both ``command`` AND ``args``
-    are rewritten — the fallback needs ``["-m", "kiro_crew", <sub>]``, so
-    re-resolving the command alone (the old behavior) silently dropped the args
-    and spawned a bare ``kirocrew`` that isn't on PATH (Windows: ``command not
-    found: kirocrew``; the built-in cron/core tools then never load).
+    ``bin\\kirocrew.cmd`` shim (unwrapped to ``<root>\\python.exe -P -s -m
+    kiro_crew <sub>``), and otherwise the ``<interpreter> [-s] -m kiro_crew
+    <sub>`` fallback. Both ``command`` AND ``args`` are rewritten — the fallback
+    needs its optional isolation prefix plus ``["-m", "kiro_crew", <sub>]``,
+    so re-resolving the command
+    alone (the old behavior) silently dropped the args and spawned a bare
+    ``kirocrew`` that isn't on PATH (Windows: ``command not found: kirocrew``;
+    the built-in cron/core tools then never load).
     """
     subcommand = _MANAGED_SERVER_SUBCOMMANDS.get(name)
     if subcommand is None:
@@ -1192,24 +1201,6 @@ def _fix_stale_managed_command(name: str, spec: dict) -> None:
         spec["args"] = args
 
 
-def _module_invocation_without_safe_path(args: list[str]) -> bool:
-    """True when *args* run ``-m kiro_crew`` with no ``-P`` ahead of the ``-m``.
-
-    Keyed on the flags, never on a fixed prefix position: interpreter flags are
-    additive (``-B`` pins bytecode policy for a child whose
-    ``PYTHONPYCACHEPREFIX`` was stripped, see
-    :func:`kiro_crew.agent._kirocrew_mcp_invocation`), and a positional
-    ``args[:2]`` test silently starts answering False — i.e. "safe" — the first
-    time one is prepended. Only ``-P``/``PYTHONSAFEPATH`` keeps the child's CWD
-    off ``sys.path``, so its absence is what disqualifies a module invocation
-    from the first-party carve-out.
-    """
-    for i, arg in enumerate(args):
-        if arg == "-m":
-            return args[i + 1 : i + 2] == ["kiro_crew"] and "-P" not in args[:i]
-    return False
-
-
 def _is_first_party_managed_argv(
     name: str, command: str | None, args: list[str], env: dict[str, str] | None
 ) -> bool:
@@ -1219,12 +1210,8 @@ def _is_first_party_managed_argv(
     managed NAME alone is deliberately not enough: only agent-config entries are
     force-re-resolved through :func:`_fix_stale_managed_command`, so a row
     introduced from an mcp.json scope could carry user-config command text under
-    a managed name. That force-re-resolve is also why the equality needs no
-    tolerance for a shape change across an upgrade: :func:`list_servers` runs it
-    over every agent-config managed row before any probe target exists, so an
-    already-written ``kirocrew.json`` carrying the previous argv is rewritten to
-    the running install's shape in the same pass rather than compared against
-    it. Requiring equality against the freshly re-resolved invocation (:func:`kiro_crew.agent._kirocrew_mcp_invocation`, the single
+    a managed name. Requiring equality against the freshly re-resolved
+    invocation (:func:`kiro_crew.agent._kirocrew_mcp_invocation`, the single
     source of truth) makes "the argv is derived inside this package" a checked
     property rather than an assumption — any customized command or args compares
     unequal and keeps the full fail-close + opt-in behavior.
@@ -1255,14 +1242,17 @@ def _is_first_party_managed_argv(
         logger.debug("managed MCP invocation resolution failed", exc_info=True)
         return False
     expected_command, expected_args = invocation
-    # Refuse the interpreter fallback (`<python> [-B] -m kiro_crew <sub>`):
-    # `python -m` prepends the child's CWD to sys.path (this package supports
-    # 3.10, so `-P`/PYTHONSAFEPATH cannot be assumed), and the probe child
-    # inherits the gateway's cwd — a planted `kiro_crew/` tree there would
-    # shadow the installed package and run unconfined. Only a resolved
-    # console-script binary, whose entrypoint imports from its own install, or
-    # the bundle's `-P`-pinned unwrap qualifies.
-    if _module_invocation_without_safe_path(expected_args):
+    # Refuse the interpreter fallback with or without its conditional ``-s``:
+    # neither form removes the child's CWD from sys.path, so a planted
+    # ``kiro_crew/`` tree in the gateway's cwd could still shadow the installed
+    # package and run unconfined. Only a resolved console-script binary, whose
+    # entrypoint imports from its own install, qualifies. Keep recognizing both
+    # fallback forms defensively.
+    if expected_args[:2] == ["-m", "kiro_crew"] or expected_args[:3] == [
+        "-s",
+        "-m",
+        "kiro_crew",
+    ]:
         return False
     return (
         command == expected_command
@@ -2686,6 +2676,13 @@ def _commands_diverged(source_cmd: str, agent_cmd: str) -> bool:
     /home/user/.local/bin/deep-research) while mcp.json stores the
     short name (deep-research). These refer to the same binary and
     should not trigger a sync.
+
+    That basename comparison is a "same program" guess with no liveness in it,
+    so it holds only while the resolved path still names a runnable file. An
+    agent entry pinned to a version-stamped absolute path keeps its basename
+    after the directory that held it is removed; reporting that pin as unchanged
+    leaves the server to fail at spawn time with no earlier warning. A pin that
+    does not resolve is therefore divergence.
     """
     if source_cmd == agent_cmd:
         return False
@@ -2707,10 +2704,48 @@ def _commands_diverged(source_cmd: str, agent_cmd: str) -> bool:
     # so a resolved-vs-short pair authored on POSIX would spuriously read as
     # diverged and trigger an endless re-sync.
     if _names_a_location(agent_cmd) and _basenames_match(agent_cmd, source_cmd):
-        return False
+        # Only the AGENT side is probed for liveness. mcp.json holds what the
+        # user authored; the agent entry holds what some past resolution pinned,
+        # so only the pin can rot on its own. Probing the source instead would
+        # keep re-proposing a sync that re-resolves the same absent name every
+        # pass, which is the endless re-sync this branch was added to prevent.
+        return _pinned_command_missing(agent_cmd)
     if _names_a_location(source_cmd) and _basenames_match(source_cmd, agent_cmd):
         return False
     return True
+
+
+def _pinned_command_missing(cmd: str) -> bool:
+    """True when *cmd* pins an absolute path that cannot be executed now.
+
+    Probed only when *cmd* is ROOTED IN A NAMED VOLUME on this host, which is
+    narrower than :func:`_names_a_location` in the two ways that matter:
+
+    * A path in the other OS's spelling is not this host's to judge. POSIX
+      rejects ``C:\\tools\\srv`` on its own, since ``posixpath.isabs`` is False
+      for it.
+    * ``ntpath.isabs`` accepts a DRIVELESS root -- ``\\tools\\srv``, and a POSIX
+      ``/usr/bin/srv`` in an ``mcp.json`` carried onto Windows -- which resolves
+      against whichever drive happens to be current, so the filesystem cannot
+      answer for it either. The resolver never writes one (``shutil.which``
+      returns a drive-qualified path there), so a driveless agent command is an
+      authored spelling rather than a pin, and calling it stale would re-sync a
+      portable config on every pass.
+
+    The test is the resolver's own, ``isfile`` plus ``X_OK``, as
+    ``agent._resolve_command`` applies it to an absolute command -- deliberately
+    not ``shutil.which``, which can report a perfectly good file as unresolvable
+    inside a user-namespace sandbox. Asking a different question than the writer
+    would let this report a live pin as gone and re-sync it forever, which is the
+    failure the basename comparison exists to avoid. Nothing here searches
+    ``PATH``, so no unrelated binary of the same name can vouch for a pin that
+    is gone.
+    """
+    if not os.path.isabs(cmd):
+        return False
+    if platform_compat.IS_WINDOWS and not ntpath.splitdrive(cmd)[0]:
+        return False
+    return not (os.path.isfile(cmd) and os.access(cmd, os.X_OK))
 
 
 def _envs_agree(agent_env: dict, source_env: dict) -> bool:

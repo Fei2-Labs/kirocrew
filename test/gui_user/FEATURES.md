@@ -26,7 +26,7 @@ under `scenarios/` says how the lane checks it.
 
 | | Total | smoke | nightly | native-only | needs-secret | excluded |
 |---|---|---|---|---|---|---|
-| **All features** | 268 | 42 | 165 | 12 | 27 | 22 |
+| **All features** | 269 | 42 | 166 | 12 | 27 | 22 |
 | Chat sessions (`chat`) | 26 | 3 | 19 | 0 | 2 | 2 |
 | Side panel tabs (`side-panel`) | 4 | 1 | 3 | 0 | 0 | 0 |
 | Terminal panel (`terminal`) | 3 | 0 | 3 | 0 | 0 | 0 |
@@ -34,7 +34,7 @@ under `scenarios/` says how the lane checks it.
 | Routing & redirects (`navigation`) | 10 | 0 | 10 | 0 | 0 | 0 |
 | Top bar (`topbar`) | 3 | 0 | 3 | 0 | 0 | 0 |
 | Search everywhere & command palette (`search`) | 1 | 1 | 0 | 0 | 0 | 0 |
-| Crew Members (`members`) | 2 | 0 | 2 | 0 | 0 | 0 |
+| Crew Members (`members`) | 3 | 0 | 3 | 0 | 0 | 0 |
 | Agent capabilities (crews, templates, skills, prompts, steering, hooks, workflows) (`capabilities`) | 14 | 2 | 12 | 0 | 0 | 0 |
 | Connections (MCP servers & services) (`connections`) | 2 | 1 | 0 | 0 | 1 | 0 |
 | Memory, lessons & usage (`memory`) | 6 | 1 | 4 | 0 | 1 | 0 |
@@ -63,7 +63,7 @@ under `scenarios/` says how the lane checks it.
 | Security & governance (`security`) | 10 | 1 | 9 | 0 | 0 | 0 |
 | Developer tools (`developer`) | 12 | 0 | 12 | 0 | 0 | 0 |
 
-Priorities: P0 10 · P1 35 · P2 162 · P3 61. Deduped from 387 raw records.
+Priorities: P0 10 · P1 36 · P2 162 · P3 61. Deduped from 387 raw records.
 
 ## Chat sessions (`chat`)
 
@@ -163,6 +163,7 @@ Priorities: P0 10 · P1 35 · P2 162 · P3 61. Deduped from 387 raw records.
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
 | P0 | `members-crew-members` | As a crew operator, I want a durable DM thread per member with a docked side panel (Crew summary, activity by day, worker sessions, auto-patrol status) and a filterable roster, so that I can supervise each crew in one place. | `/members` | rich | nightly | 6 |
+| P1 | `members-private-memory-keeps-thread` | As a crew operator, I want a member's direct-message thread to survive leaving and returning to the member, so that our earlier conversation and the member's ability to answer are not lost. | `/settings` | rich | nightly | 8 |
 | P2 | `sidebar-crew-members-create-menu-entry` | As a user, I want the Crew Members menu entry to open the page or the setting that enables it, so that I can find the feature either way. | `/chat` | minimal | nightly | 3 |
 
 ## Agent capabilities (crews, templates, skills, prompts, steering, hooks, workflows) (`capabilities`)
@@ -429,7 +430,7 @@ Priorities: P0 10 · P1 35 · P2 162 · P3 61. Deduped from 387 raw records.
 
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
-| P2 | `developer-agent-backend` | As a developer, I want to see which agent harness backend is live and whether Kiro prerequisites are met, so that I know what turns run on. | `/developer` | minimal | nightly | 2 |
+| P2 | `developer-agent-backend` | As a developer, I want to see which agent harness backend is live, what each harness can and cannot do, and whether Kiro prerequisites are met, so that I know what turns run on before I choose a harness. | `/developer` | minimal | nightly | 3 |
 | P2 | `developer-archive` | As a developer, I want a consolidated session archive browser, so that I can inspect compacted history. | `/developer` | sessions-long-history | nightly | 3 |
 | P2 | `developer-config` | As a developer, I want raw Kiro Crew and agent config editors, so that I can fix a setting no panel exposes. | `/developer` | minimal | nightly | 3 |
 | P2 | `developer-debug-tools` | As a developer, I want diagnostic overlays such as the chat scroll inspector, so that I can debug layout issues. | `/developer` | sessions-a-few | nightly | 3 |

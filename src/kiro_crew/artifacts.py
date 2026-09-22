@@ -51,6 +51,7 @@ from typing import List as _List
 from kiro_crew import hooks
 from kiro_crew.artifact_source import is_verifiable_root
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
+from kiro_crew.constants import ARTIFACT_MAX_CONTENT_BYTES
 from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API compatibility
     WebAppArchitecture,
     WebAppCost,
@@ -63,6 +64,7 @@ from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API 
 from kiro_crew.metrics.events import ARTIFACTS_CREATED, emit_counter
 from kiro_crew.publish_provider import DEFAULT_PROVIDER
 from kiro_crew.security import is_sensitive_path
+from kiro_crew.slugs import slug_hash_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +80,11 @@ MAX_VERSIONS = 50
 #: HTML reports, CSVs) routinely exceed 1 MiB — at 1 MiB clone/pull would
 #: silently fail on exactly the shared-HTML artifacts bidirectional sync
 #: targets. 25 MiB is large enough to bring those down locally while still
-#: refusing truly unbounded content. Keep in lockstep with
-#: ``validation.ARTIFACT_CONTENT_MAX`` (the MCP tool-arg cap) so a save's limit
-#: doesn't depend on its entry path — guarded by a regression test.
-MAX_CONTENT_BYTES = 26_214_400  # 25 MiB
+#: refusing truly unbounded content. Owned by
+#: ``constants.ARTIFACT_MAX_CONTENT_BYTES`` (a leaf) so
+#: ``validation.ARTIFACT_CONTENT_MAX`` -- the MCP tool-arg cap -- reads the same
+#: name without importing this module; re-exported here for the store's callers.
+MAX_CONTENT_BYTES = ARTIFACT_MAX_CONTENT_BYTES
 
 #: Maximum length of human-readable name / description fields.
 MAX_NAME_LEN = 200
@@ -561,7 +564,8 @@ def _now_iso() -> str:
 def slugify(name: str) -> str:
     """Normalize a free-form name into a URL-safe slug.
 
-    Falls back to ``"artifact"`` if the input contains no slug-safe characters.
+    Falls back to ``artifact-<hash of the input>`` if the input contains no
+    slug-safe characters, so distinct non-ASCII names derive distinct slugs.
     Truncated to 80 characters.
     """
     if not isinstance(name, str):
@@ -573,8 +577,8 @@ def slugify(name: str) -> str:
     text = _SLUG_NORMALIZE_RE.sub("-", text)
     text = text.strip("-")
     if not text:
-        return "artifact"
-    return text[:80].rstrip("-") or "artifact"
+        return slug_hash_fallback(name, "artifact")
+    return text[:80].rstrip("-") or slug_hash_fallback(name, "artifact")
 
 
 def _validate_slug(slug: str) -> str:
@@ -710,9 +714,7 @@ def is_document_path(path: str) -> bool:
 # are lost -- and every consumer surfaces this as a soft warning, never a
 # rejection.
 _HARDCODED_COLOR_RE = re.compile(
-    r"[:=(\s\"']#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\b"
-    r"|\brgba?\("
-    r"|\bhsla?\(",
+    r"[:=(\s\"']#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\b" r"|\brgba?\(" r"|\bhsla?\(",
     re.IGNORECASE,
 )
 
@@ -846,7 +848,7 @@ def _strip_session_scope(key: str) -> str:
     """
     prefix = "dashboard:"
     if key.startswith(prefix):
-        return key[len(prefix):]
+        return key[len(prefix) :]
     from kiro_crew.history import _safe_key
     from kiro_crew.messaging.link import is_channel_session_key
 
@@ -1326,9 +1328,7 @@ class ArtifactStore:
         if not data:
             raise ArtifactValidationError("image bytes are empty")
         if len(data) > MAX_CONTENT_BYTES:
-            raise ArtifactValidationError(
-                f"image exceeds {MAX_CONTENT_BYTES} bytes ({len(data)})"
-            )
+            raise ArtifactValidationError(f"image exceeds {MAX_CONTENT_BYTES} bytes ({len(data)})")
         name = _validate_name(name)
         source = _validate_source(source)
         description = _validate_description(description)
@@ -1713,9 +1713,7 @@ class ArtifactStore:
             # worse than reading through one, so the same fd-pinned gate the
             # read side uses applies here: O_NOFOLLOW open first, then hardlink
             # / regular-file / real-path / sensitive checks on that descriptor.
-            if not hooks.safe_write_file_nolink(
-                str(p), content, within_root=str(containing)
-            ):
+            if not hooks.safe_write_file_nolink(str(p), content, within_root=str(containing)):
                 logger.warning(
                     "source_path %r refused by the descriptor-pinned write gate", source_path
                 )
@@ -2093,12 +2091,9 @@ class ArtifactStore:
         candidates = [art for art in self.list() if self._is_sweepable_auto_widget(art)]
         if len(candidates) <= keep:
             return 0
-        # ``list()`` sorts by ``updated_at`` alone, which is not a total order:
-        # two widgets registered in the same microsecond tie-break by directory
-        # scan order, making WHICH of them gets deleted nondeterministic. Re-sort
-        # on ``(updated_at, slug)`` so the kept/dropped boundary is stable and
-        # testable. Kept local to the sweep — ``list()``'s ordering is shared with
-        # the library UI and is not this change's to redefine.
+        # ``list()`` already sorts on ``(updated_at, slug)``, so the kept/dropped
+        # boundary is stable. Re-sorting here is belt-and-braces: this sweep DELETES,
+        # so it must not inherit an ordering assumption from a caller-supplied list.
         candidates.sort(key=lambda a: (a.updated_at, a.slug), reverse=True)
         # Newest-first, so everything past `keep` is the oldest tail.
         deleted = 0
@@ -2427,7 +2422,14 @@ class ArtifactStore:
             if pinned is not None and bool(art.pinned) is not pinned:
                 continue
             results.append(art)
-        results.sort(key=lambda a: a.updated_at, reverse=True)
+        # ``updated_at`` alone is not a total order: it is microsecond ISO, so two
+        # artifacts written inside one microsecond carry the identical stamp, and a
+        # stable sort then leaves the tie to directory scan order -- "newest first"
+        # becomes whatever the filesystem enumerated first, which differs per
+        # platform. Windows CI failed ``test_artifacts_handlers`` on exactly that.
+        # ``slug`` makes the order total, and every caller (the library UI, the MCP
+        # list tool, the pruning sweep) gets the same answer on every host.
+        results.sort(key=lambda a: (a.updated_at, a.slug), reverse=True)
         return results
 
     def migrate_kinds(self, *, apply: bool = False) -> _List[dict[str, Any]]:

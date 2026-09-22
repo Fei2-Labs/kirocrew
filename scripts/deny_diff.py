@@ -103,9 +103,13 @@ from pathlib import Path
 #: subprocess call, not part of the CLI a caller composes.
 _WORKER_FLAG = "--_classify-worker"
 
-#: Row kinds the seed may carry. Only ``shell`` is classifiable -- see the module
-#: docstring.
-_KINDS = frozenset({"shell", "flow", "cron"})
+#: Row kinds the seed may carry. Only ``shell`` is classifiable HERE -- see the
+#: module docstring. A ``test`` row is a pytest selector the security conductor's
+#: own ``verify_fix.py`` runs; this gate counts it as non-shell and skips it, the
+#: same as ``flow`` and ``cron``. It is listed so a corpus carrying one loads:
+#: an unknown kind is a hard ``DenyDiffError``, which would fail this gate on a
+#: row that is none of its business.
+_KINDS = frozenset({"shell", "test", "flow", "cron"})
 
 #: Platform selectors a row may declare.
 _PLATFORMS = frozenset({"any", "posix", "windows"})
@@ -120,7 +124,7 @@ _PLATFORMS = frozenset({"any", "posix", "windows"})
 #: would otherwise reach this file, so the differential would keep passing while
 #: quietly covering less of the product than it says.
 _TIERS: tuple[tuple[str, str], ...] = (
-    ("sensitive-path", "is_sensitive_path"),
+    ("sensitive-path", "sensitive_path_refusal"),
     ("sensitive-bash", "is_sensitive_bash_command"),
     ("exfil", "audit_bash_exfiltration"),
     ("deny-rules", "is_denied"),
@@ -152,6 +156,16 @@ _INHERITED_HOME_OVERRIDE_ENV_VARS = (
     # OpenCode's credential home follows the XDG data directory; a relocated token
     # must not reach the classification child any more than a default one does.
     "XDG_DATA_HOME",
+    # pi's whole agent directory, credential store included, follows this one.
+    "PI_CODING_AGENT_DIR",
+    # goose's file-based secret store follows the XDG config directory, which is a
+    # different one from the data directory above: on that harness the config home
+    # is where the secret lives.
+    "XDG_CONFIG_HOME",
+    # DeepSeek Harness relocates its WHOLE home, credential store included, from one
+    # variable. Same reasoning as the entry above, and the source test pins this tuple
+    # against the harness declarations so a new override cannot be forgotten here.
+    "DSH_HOME",
 )
 
 

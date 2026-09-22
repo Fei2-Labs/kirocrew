@@ -22,7 +22,7 @@ Paths below are relative to `src/kiro_crew/`.
 | Hook results and event names | `hooks.py` | `HOOK_PASSTHROUGH` / `HOOK_REPLY` / `HOOK_MODIFY` / `HOOK_INJECT_CONTEXT`, the tool verdicts `TOOL_ALLOW` / `TOOL_AUTO_APPROVE` / `TOOL_DENY`, and `HOOK_EVENT_*` / `HOOK_EVENTS`. |
 | Memory paths and dir names | `memory.py` | `WORKSPACE_DIR_NAME`, `MEMORY_DIR_NAME`, `HISTORY_DIR_NAME`, `PREFERENCES_FILE`, `PROJECTS_FILE`, `INDEX_DB_FILE` (the FTS index *name* only — which directory a given store's index sits in is store policy, owned by `memory_stores.memory_index_path_for`). |
 | Named memory stores | `memory_stores.py` | `MEMORY_STORES_DIR_NAME`, `DEFAULT_MEMORY_STORE`, `MEMORY_DB_FILE` (the vector-store filename, which `vector_memory._DB_FILE` aliases rather than restating), `MEMORY_STORE_NAME_MAX`, `_STORE_NAME_RE`, `_WINDOWS_RESERVED_BASENAMES`; the tree's host-local entries `MEMBER_API_KEY_FILE`, `MEMBER_BACKUPS_DIR_NAME`, `EXECUTION_LOGS_DIR_NAME`, `STORE_BACKUP_DIR_NAME` (which `memory_backup.BACKUP_DIR_NAME` aliases), and the layout predicates `is_host_local_store_state` / `named_store_product_file` the snapshot and export read. A stdlib-only LEAF module, so `security.py` can build its sensitive-path fence from `MEMORY_STORES_DIR_NAME` without a cycle. |
-| Lesson limits | `learn.py` | `_LESSONS_FILE`, `_MAX_LESSONS_IN_CONTEXT`, `_MAX_LESSONS_TOTAL` (prune oldest past the total). |
+| Lesson limits | `learn.py` | `_LESSONS_FILE`, `_MAX_LESSONS_TOTAL` (prune oldest past the total). |
 | Cron limits | `cron.py` | `_CRONS_FILE`, `_STORE_VERSION`, `_MIN_INTERVAL_SECS`, `_JOB_TIMEOUT_SECS`, `_TIMER_POLL_SECS`, `_AUTO_PAUSE_THRESHOLD`, the reaper intervals, the skip-date horizon, the store file-lock timeouts, and the hourly/daily jitter caps. |
 | Session and transcript limits | `history.py` | `SESSIONS_DIR_NAME`, `ARCHIVE_RETENTION_DAYS`, the JSONL rotation pair `_SESSION_MAX_BYTES` (2 MB) / `_SESSION_KEEP_LINES`, the file-lock timeouts, and the search caps (`SEARCH_MIN_CHARS`, `_SEARCH_SCAN_WINDOW`, `_TITLE_BOOST`). |
 | Context budgets | `context.py` | `_CONTEXT_BUDGET_BASE` plus one `_budget(fraction)` cap per block (history, preferences, projects, lessons, semantic, episodic, skills, steering, compressed history, preamble headroom). Budgets are expressed as FRACTIONS of the base, so read them there rather than quoting a byte figure. |
@@ -36,7 +36,7 @@ Paths below are relative to `src/kiro_crew/`.
 | Embed cache | `embeddings.py` | `_EMBED_CACHE_MAX` (128 entries, keyed by text plus model id; the comment there carries the memory arithmetic). |
 | Bytecode-cache GC limits | `pycache_gc.py` | `PYCACHE_MAX_AGE_DAYS`, `PYCACHE_MAX_TOTAL_BYTES`, `PYCACHE_GC_INTERVAL_SECS` (the `<data home>/cache/pycache` TTL, size cap, and periodic-sweep cadence). |
 | Slack UX strings and pacing | `slack/handler.py` | `_THINKING`, `_CURSOR`, `_NO_RESPONSE`, `_STATUS_WORKING`, `_TRUNCATION_MARKER`, plus `_EDIT_INTERVAL`, `_APPROVAL_TIMEOUT`, `_SLACK_SECTION_TEXT_LIMIT`, the stall thresholds and the phase debounce. |
-| Cross-cutting shared constants | `constants.py` | `KIROCREW_SPAWNED_ENV`, `ENV_TRUTHY`, `CHAT_TURN_TIMEOUT`, `COMPACT_WAIT_TIMEOUT_SECS` (one budget, shared by manual and automatic compaction), the `[OPTIONS:]` parse regexes, `DATA_WARNING`, `BANNER`. |
+| Cross-cutting shared constants | `constants.py` | `KIROCREW_SPAWNED_ENV`, `ENV_TRUTHY`, `CHAT_TURN_TIMEOUT`, `COMPACT_WAIT_TIMEOUT_SECS` (one budget, shared by manual and automatic compaction), the `[OPTIONS:]` parse regexes, `DATA_WARNING`, `BANNER`, `MAX_BANNER_CHARS` and `ARTIFACT_MAX_CONTENT_BYTES` (bounds `validation.py` — a leaf — must read without importing the service module that enforces them; `artifacts.MAX_CONTENT_BYTES` re-exports the latter). |
 | Gateway shutdown budget | `gateway_shutdown_budget.py` | Gateway cooperative timeout, service-manager signal margin, and the derived systemd/launchd stop deadline. |
 | Process-wide shutdown signal | `__init__.py` | `shutdown_event`. Background loops `await shutdown_event.wait()` with a timeout instead of a plain `asyncio.sleep`, so they wake instantly on Ctrl-C. |
 | Base agent config | `config/defaults.json` | `tools`, `allowedTools`, `resources`, `hooks`, model. Packaged as package data, so editing it needs no code change. |
@@ -109,8 +109,11 @@ committing:
 python3 scripts/check_black_formatting.py && python3 scripts/check_subprocess_encoding.py
 COMMENT_HISTORY_BASE_REF=origin/main python3 scripts/check_comment_history.py && isort src/kiro_crew test
 flake8 src/kiro_crew test && mypy src/kiro_crew
-python -m pytest
+python3 scripts/local-gate.py
 ```
+
+The last line runs the tests related to your diff, not the full suite -- that is
+CI's job (`local-gate.py --full` exists for a human who wants it locally).
 
 `black --check` cannot be run bare: 1,420 files under `src/` and `test/` predate
 any enforcement, so a repo-wide run reformats ~95,800 lines. Those files are

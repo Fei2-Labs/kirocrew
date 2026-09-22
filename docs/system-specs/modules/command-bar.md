@@ -26,8 +26,32 @@ write that flips `enabled`), is what delivers the launcher to them; see app-kit-
 What makes the app worth existing is a single invariant: **the first page issues no network
 request.** The palette it replaces ran an unindexed scan over the sessions corpus on every
 keystroke, so fast typing could stall unrelated streaming. Command Bar's root carries only
-locally-known rows — commands, app destinations, system settings — and searching sessions is a
+locally-known rows — commands, app destinations, system settings — and every corpus search is a
 view the reader ENTERS, so the expensive work is explicit and chosen.
+
+Three such views exist: session search, artifact search, and folder search. The artifacts view
+asks `GET /api/artifacts?q=<query>` and nothing else — no `content=1`, no `snippet=1` — so the
+server matches NAMES only (`name_contains` in `api_artifacts_list`) and never opens a stored
+body. Searching what is INSIDE an artifact is a later change, and it is a change to that one
+request.
+
+The folders view is the cheapest of the three, and its shape follows from that. Its corpus is
+the folder tree the sidebar already holds under `['chat-folders']`, so a keystroke costs a local
+filter rather than a request: it has no minimum query length, where the two views above each
+hold their first characters back, and no row cap, because the count is the reader's own filing
+rather than a corpus that grows on its own. Entering the view pays for at most one folder read,
+on a cold cache. The folder list used to be spread through the root as its own group instead —
+demoted and capped while the query was empty, so the feature read as missing, and competing with
+commands once it was not.
+
+That corpus lives in THIS app (`apps/command-bar/foldersProvider.ts`), and the host palette
+carries no Folders tab. Reaching a folder by name is a launcher capability, so the launcher owns
+it: the alternative is two implementations of the same gesture, one in the app and one in the
+surface the app replaces, differing over ranking and reveal and answering to nobody. The corpus
+is hook-free for the same reason the session and artifact engines are — the React-Query fetch and
+the `usePaletteActions` route change are wired in `CommandBarOverlay`, which is the only thing
+holding this app's seams. It still renders the host's `Result` row contract, because forking the
+row shape would fork the Enter matrix with it.
 
 ## Responsibilities
 
@@ -37,10 +61,10 @@ view the reader ENTERS, so the expensive work is explicit and chosen.
    and cap each group
 3. **Ranking** — fuzzy match against the live query plus a frecency boost, so habit surfaces
    without out-ranking a clearly better string match
-4. **Scopes** — enter a sub-surface (today: session search) as a navigation state, with its own
-   engine loaded on entry
-5. **Fallback** — when the root cannot answer, offer the row that carries the query into the
-   sessions view rather than reporting "no results"
+4. **Scopes** — enter a sub-surface (today: session search, artifact name search, and folder
+   search) as a navigation state, with its own engine loaded on entry
+5. **Fallback** — when the root cannot answer, offer the rows that carry the query into the
+   sessions view and the artifacts view rather than reporting "no results"
 
 ## The overlay seam
 
@@ -91,7 +115,9 @@ that.
   learned it. `view` is named separately from its group because it opens a surface instead of
   acting and closing.
 - `PER_GROUP_LIMIT = 6` caps each group so one group cannot push the others off the page.
-  **Known gap:** rows past the cap are dropped silently.
+  **Known gap:** rows past the cap are dropped silently. The artifacts view does not share that
+  gap — it renders a `+N more` line under its list, outside the listbox so it cannot become an
+  option that Enter does nothing with — and that line is the shape to copy when this one is closed.
 - `idleDemote` sorts a row to the end of its group while the query is EMPTY, at a cost sized
   to lose to a single real use. The empty-query order is frecency, so on a cold install every
   score is zero and the alphabet alone decides what the launcher opens on. It is DERIVED, not
@@ -129,6 +155,9 @@ that answer an older prefix.
 | Invariant | Where it would break |
 |---|---|
 | the root issues no request | a provider constructed at mount can subscribe a query even when the root never calls it |
+| the artifacts view matches NAMES only | a `content=1` or `snippet=1` param turns each entry into a read of every stored body |
+| the artifacts fallback row issues no request while it is merely OFFERED | offering a way into the corpus becomes a scan on every keystroke, which is the cost this app exists to avoid |
+| the artifacts row cap names its remainder, from OUTSIDE the listbox | a silent slice reads as "these are all of them"; a counted row inside the listbox is an option Enter cannot act on |
 | the root ranks from the live query | a debounced read discards a fast-entered query |
 | `aria-modal` and the focus trap travel together | a dialog that traps nothing while claiming modality |
 | the `apps` query is a pure cache consumer (`enabled: false`) | a second identical fetch per open |
@@ -335,6 +364,10 @@ being installed, not on this app's name, and it lists the other default-off buil
 ## Deliberately not here
 
 - **Session search on the root.** Removed on purpose; it is the cost the app exists to avoid.
+- **Artifact CONTENT search.** The artifacts view matches names only. Reading bodies means
+  `snippet=1` on every entry, and a snippet response then needs a payload budget, a sort
+  guarantee and somewhere to put "more results" — a contract to design against a response shape
+  that does not exist yet, not a parameter to add.
 - **Quicklinks.** A group with no writer was removed rather than shipped empty.
 - **A default-on launcher.** Flipping the default and deleting the legacy palette is a separate
   change, after the remaining corpora become apps with their own scopes.

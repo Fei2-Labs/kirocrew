@@ -23,7 +23,10 @@ from typing import Any
 
 import pytest
 
+from conftest import make_dir_link
+from kiro_crew import agent_discovery
 from kiro_crew.mcp_gateway import rewriter
+from kiro_crew.mcp_gateway.hashing import expand_stub_flags
 from kiro_crew.mcp_gateway.rewriter import (
     _FINGERPRINT_NAME,
     overlay_ready,
@@ -80,8 +83,6 @@ def test_rewrite_agents_signature_is_pinned_to_fingerprint_inputs() -> None:
 #   * STALE only          -> the read is gone; prune the entry.
 _AMBIENT_READ_ALLOWLIST = frozenset(
     {
-        # Baked into every overlay ``command``; fingerprinted as "python".
-        ("_build_stub_entry", "sys.executable"),
         # The fingerprint builder reading its own declared inputs.
         ("_rewrite_inputs_fingerprint", "os.environ:PATH"),
         ("_rewrite_inputs_fingerprint", "os.environ:PATHEXT"),
@@ -611,6 +612,101 @@ def test_socket_and_work_dir_change_invalidates(
     assert rewrite_counter["n"] == before + 4
 
 
+def test_pre_casing_schema_forces_regeneration(
+    tmp_path: Path, rewrite_counter: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Schema 5 overlays can embed the PATHEXT spelling and must be rebuilt."""
+    _mk_tree(tmp_path)
+    with monkeypatch.context() as patch:
+        patch.setattr(rewriter, "_FINGERPRINT_SCHEMA", 5)
+        _rewrite(tmp_path)
+    before = rewrite_counter["n"]
+    _rewrite(tmp_path)
+    assert rewrite_counter["n"] == before + 2
+
+
+def test_pre_cmd_safe_schema_forces_regeneration(
+    tmp_path: Path, rewrite_counter: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Schema 6 overlays can carry a spaced interpreter command that cmd.exe
+    quote-stripping destroys; an upgrade must rebuild them, not serve them."""
+    _mk_tree(tmp_path)
+    with monkeypatch.context() as patch:
+        patch.setattr(rewriter, "_FINGERPRINT_SCHEMA", 6)
+        _rewrite(tmp_path)
+    before = rewrite_counter["n"]
+    _rewrite(tmp_path)
+    assert rewrite_counter["n"] == before + 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows executable casing")
+@pytest.mark.parametrize("transient_settings_fault", [False, True])
+@pytest.mark.parametrize("rename_command", [False, True])
+def test_windows_casing_is_revalidated_on_cached_and_kept_overlays(
+    tmp_path: Path,
+    rewrite_counter: dict[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+    transient_settings_fault: bool,
+    rename_command: bool,
+) -> None:
+    """A case-only binary rename changes dispatch even when which stays identical."""
+    real_bin_dir = tmp_path / "Real Bin"
+    real_bin_dir.mkdir()
+    bin_dir = tmp_path / "Linked Bin"
+    make_dir_link(bin_dir, real_bin_dir)
+    filename = "casing-mcp.exe"
+    exe = real_bin_dir / filename
+    exe.touch()
+    expected = bin_dir / filename
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("PATHEXT", ".EXE")
+    src = _mk_tree(tmp_path, n_agents=1, with_env=False)
+    spec_path = src / "agent-0.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    spec["mcpServers"]["srv"]["command"] = "casing-mcp"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    first = _rewrite(tmp_path)
+    overlay = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
+    written = json.loads(overlay.read_text(encoding="utf-8"))
+    flags = expand_stub_flags(written["mcpServers"]["srv"]["args"])
+    assert flags[flags.index("--target-command") + 1] == str(expected)
+    before = rewrite_counter["n"]
+    if rename_command:
+        filename = "CASING-mcp.exe"
+        exe = exe.rename(exe.with_name(filename))
+        expected = bin_dir / filename
+    with _settings_unreadable() if transient_settings_fault else contextlib.nullcontext():
+        second = _rewrite(tmp_path)
+    assert rewrite_counter["n"] == before + int(rename_command)
+    if not rename_command:
+        # A transient keep reports no rewrites, but still publishes its targets.
+        assert second[1] == first[1]
+    written = json.loads(overlay.read_text(encoding="utf-8"))
+    flags = expand_stub_flags(written["mcpServers"]["srv"]["args"])
+    assert flags[flags.index("--target-command") + 1] == str(expected)
+
+
+def test_effective_user_site_policy_change_invalidates(
+    tmp_path: Path,
+    rewrite_counter: dict[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mk_tree(tmp_path, n_agents=1, with_env=False)
+    monkeypatch.setattr(rewriter.platform_compat, "is_bundled_interpreter", lambda: False)
+    monkeypatch.setattr(rewriter.platform_compat.site, "ENABLE_USER_SITE", True)
+    _rewrite(tmp_path)
+    overlay = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
+    first_args = json.loads(overlay.read_text())["mcpServers"]["srv"]["args"]
+    assert first_args[:2] == ["-m", rewriter._STUB_MODULE]
+
+    before = rewrite_counter["n"]
+    monkeypatch.setattr(rewriter.platform_compat.site, "ENABLE_USER_SITE", False)
+    _rewrite(tmp_path)
+    assert rewrite_counter["n"] == before + 1, "a user-site policy change must not serve cache"
+    second_args = json.loads(overlay.read_text())["mcpServers"]["srv"]["args"]
+    assert second_args[:3] == ["-s", "-m", rewriter._STUB_MODULE]
+
+
 def test_path_env_change_invalidates(
     tmp_path: Path, rewrite_counter: dict[str, int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -721,16 +817,19 @@ def test_transient_agent_read_failure_keeps_the_previous_overlay(
     assert sidecars_before  # _mk_tree declares env, so sidecars exist
 
     _bump_mtime(src / "agent-1.json")  # invalidate so the next call rewrites
-    real_read = Path.read_text
+    # Specs are read through the hardened gate (``agent_discovery``'s
+    # ``safe_read_file_bytes``), which reports an unreadable file as ``None``;
+    # the strict reader turns that into the transient ``OSError`` handled here.
+    real_read = agent_discovery.safe_read_file_bytes
     fail = {"on": True}
-    victim_src = src / "agent-1.json"
+    victim_src = (src / "agent-1.json").resolve()
 
-    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
-        if fail["on"] and self == victim_src:
-            raise OSError("transient I/O error")
-        return real_read(self, *args, **kwargs)
+    def flaky(raw: str) -> bytes | None:
+        if fail["on"] and Path(raw) == victim_src:
+            return None
+        return real_read(raw)
 
-    monkeypatch.setattr(Path, "read_text", flaky)
+    monkeypatch.setattr(agent_discovery, "safe_read_file_bytes", flaky)
     _rewrite(tmp_path)
     fail["on"] = False
 
@@ -1010,7 +1109,7 @@ def test_unresolved_bare_command_is_reprobed_and_install_invalidates(
     _rewrite(tmp_path)
     assert rewrite_counter["n"] == before + 1  # probe disagreed -> full rewrite
     overlay = json.loads((tmp_path / "mcp-gateway" / "agents" / "agent-0.json").read_text())
-    args = overlay["mcpServers"]["srv"]["args"]
+    args = expand_stub_flags(overlay["mcpServers"]["srv"]["args"])
     i = args.index("--target-command")
     # normcase: which() may report a differently-cased/slashed spelling on
     # Windows than pathlib's str().
@@ -1129,15 +1228,18 @@ def test_transient_source_read_failure_is_not_cached(
     """A file that stats fine but fails to READ must not freeze an incomplete
     output set: readability can return without the stat signature changing."""
     _mk_tree(tmp_path)
-    real_read = Path.read_text
+    # Agent specs are read through the hardened gate; ``None`` from it is the
+    # transient read failure the rewriter keeps the previous overlay for.
+    real_read = agent_discovery.safe_read_file_bytes
     fail = {"on": True}
 
-    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
-        if fail["on"] and self.name == "agent-0.json" and "agents" in self.parts:
-            raise OSError("transient I/O error")
-        return real_read(self, *args, **kwargs)
+    def flaky(raw: str) -> bytes | None:
+        p = Path(raw)
+        if fail["on"] and p.name == "agent-0.json" and "agents" in p.parts:
+            return None
+        return real_read(raw)
 
-    monkeypatch.setattr(Path, "read_text", flaky)
+    monkeypatch.setattr(agent_discovery, "safe_read_file_bytes", flaky)
     _rewrite(tmp_path)
     fail["on"] = False
 
@@ -1364,12 +1466,14 @@ def test_disabling_sharing_is_not_deferred_by_a_settings_read_failure(
     _mk_tree(tmp_path, n_agents=1)
     _rewrite(tmp_path)  # healthy pass with sharing ON
     overlay = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
-    assert "--poolable" in json.loads(overlay.read_text())["mcpServers"]["srv"]["args"]
+    assert "--poolable" in expand_stub_flags(
+        json.loads(overlay.read_text())["mcpServers"]["srv"]["args"]
+    )
 
     with _settings_unreadable():
         _rewrite(tmp_path, pooling_enabled=False)  # operator turns sharing OFF
 
-    args = json.loads(overlay.read_text())["mcpServers"]["srv"]["args"]
+    args = expand_stub_flags(json.loads(overlay.read_text())["mcpServers"]["srv"]["args"])
     assert "--poolable" not in args, "an explicit policy change must not be deferred"
 
 
@@ -1496,7 +1600,7 @@ def test_a_vanished_target_binary_refuses_the_keep(
     _rewrite(tmp_path)
 
     overlay = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
-    args = json.loads(overlay.read_text())["mcpServers"]["srv"]["args"]
+    args = expand_stub_flags(json.loads(overlay.read_text())["mcpServers"]["srv"]["args"])
     assert os.path.normcase(args[args.index("--target-command") + 1]) == (
         os.path.normcase(str(exe))
     )

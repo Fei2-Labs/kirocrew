@@ -35,7 +35,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kiro_crew.run_coordinator import MemoryRunCoordinator
 from kiro_crew.subagent import SubagentInfo, SubagentManager
 
 
@@ -44,7 +43,6 @@ def _make_manager(max_concurrent: int = 4) -> SubagentManager:
         sessions=MagicMock(),
         ctx_builder=MagicMock(),
         max_concurrent=max_concurrent,
-        coordinator=MemoryRunCoordinator(),
     )
     mgr._fire_event = AsyncMock()
     mgr._write_tombstone = MagicMock()

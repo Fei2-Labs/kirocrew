@@ -9,7 +9,7 @@ in [theming-contract](theming-contract.md); user-facing strings are in
 ## The stack
 
 React 18, Redux Toolkit, React Query (`@tanstack/react-query`), React Router v7,
-Framer Motion, Tailwind CSS 3, Lucide React, DOMPurify, highlight.js, Monaco,
+Framer Motion, Tailwind CSS 4, Lucide React, DOMPurify, highlight.js, Monaco,
 TypeScript, Vite 8. Read the pins from `website/package.json` rather than this list.
 
 Prefer the library already here over a new dependency. Every addition is bytes in a
@@ -22,6 +22,14 @@ transitions do not compose.
 Chrome, Firefox, Safari and Edge. Use standard Web APIs only, and guard the
 browser-specific ones (`typeof Notification !== 'undefined'`): an unguarded API
 throws at module scope, so the page renders blank rather than degrading.
+
+Text inside a React-rendered subtree (react-markdown output, the chat bubbles,
+the markdown preview) is painted with the CSS Custom Highlight API
+(`CSS.highlights` + `Range`, styled by `::highlight()`), never by inserting a
+`<mark>` around it: splitting a React-owned text node breaks the next React
+commit that touches it. The API needs Chrome/Edge 105, Safari 17.2 or Firefox
+140; older browsers paint no highlight, while match counting and stepping to
+the current match keep working (`utils/domHighlight.ts`).
 
 ## Shared components
 
@@ -72,8 +80,14 @@ Other shared modules:
   `TypewriterText.tsx`
 
 `src/kirocrew-ui/index.ts` re-exports the subset that apps may import as
-`@kirocrew/ui`. Adding a primitive there makes it app-facing API, so add
+`@kirocrew/app-sdk/ui`. Adding a primitive there makes it app-facing API, so add
 deliberately.
+
+`src/app-sdk/ChatEmbed.tsx` keeps its composer markup small but delegates draft
+behavior to `app-sdk/useComposerDraft`. Its textarea attaches the hook's
+`textareaRef`, so `Enter` sends, `Shift+Enter` inserts a newline, IME commits do
+not send, and the draft grows to the shared 240px cap before scrolling. Do not
+reimplement those key or sizing rules inside the component.
 
 Stories for these primitives live in `src/stories/` and render them in isolation
 under every theme (`npm run storybook`); see
@@ -294,18 +308,24 @@ the selected store is global and the surface is not private. The narrow form
 stacks its inputs and submit button; its draft joins the store-switch guard,
 pending submission disables the fields, and an error retains them for retry.
 
-Private recall presents the returned fact and experience snippets as compact
+Member-scoped recall presents the returned fact and experience snippets as compact
 evidence cards. Exact serialized model context and source diagnostics live in
 the collapsed Source and retrieval details disclosure. Rules have their own
 indicator and full context there; fact snippets do not represent the rules
 included in recall. The disclosure accepts the recall API's structured copy
 origin as well as the record browser's serialized origin.
 
-Before a legacy member opts into private V2, a confirmation dialog explains that
-the next chat starts a fresh conversation and the member cannot switch back to V1.
-Only its explicit create action submits the request; Cancel keeps the existing
-binding. Prior conversations and V1 data remain. The Crew Manager notice
-distinguishes new members from existing V1 members. A disabled Manage memory
+Memory V2 uses member-scoped language (成员记忆 in Chinese), without a lock badge
+or a promise of confidentiality between members. Database errors remain distinct
+from embedding-model errors; configured and active models, keyword and vector
+status, reload/rebuild confirmations, checkpoint failure evidence, and counts
+with their actual units remain visible.
+
+Only explicit member creation initializes an empty Memory V2 database. Existing
+members retain their current memory; edits offer no provisioning or migration
+action. An unavailable member database remains an error and requires restoring
+its backup. The Crew Manager notice distinguishes new members from existing
+members. A disabled Manage memory
 action shows its unsaved-changes reason as visible helper text for keyboard and
 touch users. Member status distinguishes an explicitly
 different configured owner from an unavailable or unverified binding. Unavailable
@@ -401,12 +421,73 @@ Two habits belong to the same concern:
 - Do NOT add a new CSS `@keyframes`. The existing ones in `index.css` back
   specific low-level effects (skeleton pulse, caret blink, indeterminate
   progress); a new component animation goes through Framer Motion.
+- **Hover PAINTS; it never moves or resizes.** A hover state may change colour,
+  border, brightness or shadow, but not `scale` or `translate` — growing a row
+  under the cursor nudges its neighbours and reads as a layout change rather
+  than "you are pointing at this". Press feedback (`whileTap`, `active:scale-*`)
+  is fine: that answers an action the user took. A selected-state scale applied
+  by STATE is an indicator, not a hover effect. A hover *rotation* is out of
+  scope — it leaves the element's box where it is.
+  - Removing a hover transform is only half the job: check the control still has
+    SOME hover cue. On a small swatch or dot the scale is often the only one, and
+    taking it away leaves a clickable thing that answers nothing.
+  - Pick the cue by what the element can actually show. `brightness` is a no-op
+    on a `transparent` fill (tint the border instead), and a class-based cue
+    cannot beat an inline `style`, so an element whose colour is animated needs
+    its cue on a property nothing animates.
+  - **A hover cue must not reuse a colour the control uses for its SELECTED
+    state — differ in colour, not merely strength.** A dimmer shade of the
+    selected colour still reads as "selected" at a glance (a bright or accent
+    mark is selection-grammar whatever its exact lightness), so hover must paint
+    in a genuinely different colour, not a fainter one. The colour swatches show
+    this: selection speaks in `--text-strong` (a near-white border) and
+    `--accent` (a border or `ring-1 ring-accent`), so their hover cue paints in
+    a neutral `--muted` outline — which is neither, and the lightest neutral
+    token with enough contrast on the darkest fill — and the memory-record card
+    hovers to `border-border-strong`, never its accent selected border. Where
+    selection is an offset accent ring, the hover outline must also CLEAR it
+    geometrically (`outline-offset:-3px` insets the line inside the fill) rather
+    than sit at the ring's radius and mask it; do this structurally, not with an
+    `:not([aria-pressed])` guard that silently misses a selected swatch marked
+    by a conditional class alone. This is the same lesson as the left rail,
+    where a full-strength `bg-bg-hover` read as selection and was fixed by
+    weakening it to `/60` — applied to colour rather than strength.
+  - `src/test/hoverNoScale.guard.test.ts` enforces this and names the fix in its
+    failure message. Deliberate exceptions live in that file's ALLOWLIST with a
+    written reason.
 
 ## Styling
 
-Tailwind CSS with the custom theme in `tailwind.config.js`, and
-`darkMode: ['selector', '[data-theme="dark"]']`, so dark mode is driven by the
-`data-theme` attribute rather than the OS media query alone.
+Tailwind CSS 4, configured in CSS rather than a JavaScript config file. Two
+files own it:
+
+- `src/tailwind-theme.css` — the utility ↔ token bridge. Every `--color-*`,
+  `--radius-*`, `--shadow-*`, `--font-*` and `--animate-*` theme key maps a
+  utility (`bg-accent`, `rounded-md`, `shadow-sm`, `font-mono`, `animate-rise`) to
+  the runtime design token of the same stem, so `text-muted/40` renders a
+  translucent `var(--muted)`. It also declares the `dark:` variant
+  (`@custom-variant dark ([data-theme="dark"] …)`, so dark mode follows the
+  `data-theme` attribute rather than the OS media query alone), keeps `hover:` an
+  ungated `:hover` so touch devices still reach hover-revealed controls, and
+  emits the iOS safe-area utilities (`p-safe`, `top-safe-offset-*`, …) as
+  `@utility` blocks. Adding a utility for a new token means adding one
+  `--color-<token>: var(--<token>)` line here; `scripts/check-phantom-classes.mjs`
+  compiles against this file to catch a utility whose token was never declared.
+- `src/index.css` — the entry. It imports Tailwind's theme and Preflight into
+  their cascade layers and emits `@tailwind utilities` UNLAYERED (see the header
+  comment there: the component CSS below it was written against v3's unlayered
+  utilities and must keep competing with them on plain specificity), lists the
+  template sources with `@source`, and restores three v3 Preflight defaults as
+  token-backed base rules (default border colour `var(--border)`, placeholder
+  colour `var(--muted)`, `cursor: pointer` on enabled buttons).
+
+The build runs through `@tailwindcss/vite`; there is no PostCSS config. A
+downstream edition's sources are added to the content scan by
+`editionExtensionPlugin` in `vite.config.ts`, which swaps the
+`/* @kirocrew-edition-source */` marker in `index.css` for an `@source` line.
+Utility names follow Tailwind v4: `outline-hidden` (not `outline-none`) is the
+accessible outline suppressor, `backdrop-blur-xs` is the 4px blur, and the
+`shadcn/ui` primitives animate through `tw-animate-css`.
 
 Colors come from CSS custom properties defined in `src/index.css`, including the
 semantic roles `--aim`, `--clarify`, and the `--diff-*` family. Never a hardcoded
@@ -473,3 +554,46 @@ against `location.pathname` only, so a multi-segment, query, or hash route would
 register and then never resolve. The same constraint and the reasoning behind it
 are in [extension-seams](extension-seams.md), which covers registering routes and
 icons from a downstream edition instead of editing the seed maps.
+
+## Crew capability drafts
+
+The Crew editor has an independent Capabilities rail pane with MCP, Tools,
+Auto-approved and Skills categories. It stays mounted while hidden so both its
+local draft and its signed server preview survive rail changes. Its footer owns
+Discard draft and Review/save; the generic crew save cannot discard a capability
+draft. Closing or opening chat asks before losing that draft. A capability
+request in progress holds dismissal. Dirty and busy state reach the parent in
+layout effects, before paint, so an immediate Escape after pasting cannot close
+against an older clean state. Browser unload also warns about the draft.
+Opening the embedded editor writes an explicit `tab=crews` route, so a resize
+cannot replace its ancestry with the mobile root list. On narrow screens the
+member identity owns a full header row. The capability form scrolls independently
+above a non-overlapping footer. The horizontally scrollable category strip does
+not flex-shrink when an expanded transport form exceeds the pane height; all
+category labels retain their full height. Review shows values from the server's sanitized
+projected rows, never from secret-bearing local drafts. Source validation errors
+are distinct from provider loading failures.
+
+The editor reads and writes through `api/crewCapabilities.ts`, using the shared
+transport. Preview and save send the same explicit inheritance operations; save
+adds only the server-issued preview token. A stale version preserves the draft
+and requires reloading and reviewing against the new version. Save success never
+stands in for runtime application: runtime status comes from the server and
+active sessions are not promised a hot reload.
+
+The legacy template pane keeps its instant-save behavior for independent and
+shared definitions. Enrolled definitions direct model and skill edits to
+Capabilities instead. Reset and publish remain in the template pane but lock
+while a capability draft exists. A mask is never a literal replacement value.
+The form can keep unchanged secrets, select a configured connection, or replace the
+whole transport using a blank form. MCP set operations carry a complete transport
+plus RFC6901 `retain_paths` for unchanged `[REDACTED]` leaves. Each pointer keeps
+its original member/revision binding. Editing a hidden value removes that pointer;
+a typed mask without a retained pointer blocks preview. Hidden argument positions
+and hidden map keys cannot move until their values are replaced explicitly.
+Environment and HTTP header values remain password inputs. Managed transport
+fields use the row's authoritative `managed` flag, independently of the connection
+catalog; their supported enable switch sends only `disabled`. Absent prompt/model
+rows can be set, and model choices use the shared advertised-model query. Version
+hashes live in a collapsed details section rather than in the main status banner.
+Parent-change and impact previews use the server's redacted projection.

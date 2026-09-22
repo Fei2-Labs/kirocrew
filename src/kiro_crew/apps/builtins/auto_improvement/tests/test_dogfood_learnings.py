@@ -5083,11 +5083,20 @@ class TestRunStartupSharesTheCloneLock:
         )
 
         sup = runner_mod.RunSupervisor()
+        # The worker's exception is the test's signal, not noise: `build_profile` is stubbed
+        # to raise once startup gets past the checkout, so a captured `ValueError("stop")`
+        # proves the worker took the lock and ran to the stub after we released it. Left
+        # uncaught it would only surface as an unhandled-thread warning that never fails.
+        outcome: list[BaseException] = []
+
+        def _startup() -> None:
+            try:
+                sup._build_driver({"clone": "/tmp/x", "branch": "main"})
+            except BaseException as exc:  # asserted on below
+                outcome.append(exc)
+
         with commit_mod.clone_lock():
-            worker = threading.Thread(
-                target=lambda: sup._build_driver({"clone": "/tmp/x", "branch": "main"}),
-                daemon=True,
-            )
+            worker = threading.Thread(target=_startup, daemon=True)
             worker.start()
             # While WE hold the lock the worker must not reach the checkout. A generous
             # window: the failure mode is that it proceeds immediately.
@@ -5096,7 +5105,11 @@ class TestRunStartupSharesTheCloneLock:
                 "operator mutation held the clone lock"
             )
         worker.join(timeout=5.0)
+        assert not worker.is_alive(), "startup never finished after the lock was released"
         assert checked_out.is_set(), "startup never took the lock it was waiting for"
+        assert [type(e) for e in outcome] == [ValueError] and str(
+            outcome[0]
+        ) == "stop", f"startup stopped somewhere other than the profile-build stub: {outcome!r}"
 
     def test_the_lock_is_reentrant_so_nesting_cannot_deadlock(self) -> None:
         """`_build_driver` is also reached from `calibrate()`, which may already hold the
@@ -6654,12 +6667,19 @@ class TestTheMcpServerLaunchesOnEveryPlatform:
     review; the stronger fix comes from the repo's own precedent.
     """
 
-    def test_the_manifest_command_is_resolved_to_a_real_interpreter(self) -> None:
+    def test_the_manifest_command_is_resolved_to_a_real_interpreter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         import json
+        import site
         import sys
         from pathlib import Path
 
+        from kiro_crew import platform_compat
         from kiro_crew.apps import bridges
+
+        monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
+        monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: False)
 
         manifest = json.loads(
             (
@@ -6674,8 +6694,8 @@ class TestTheMcpServerLaunchesOnEveryPlatform:
         assert resolved["command"] == sys.executable, (
             f"the MCP command was not resolved to the running interpreter: {resolved['command']!r}"
         )
-        # The args must survive untouched — the module path is what makes it our server.
-        assert resolved["args"] == entry["args"]
+        # The module argv survives after the shared user-site isolation prefix.
+        assert resolved["args"] == ["-s", *entry["args"]]
 
     def test_a_non_python_command_is_left_alone(self) -> None:
         """Only a bare python launcher is substituted. An app that names `node` or an absolute

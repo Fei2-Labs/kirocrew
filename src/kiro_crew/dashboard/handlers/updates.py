@@ -32,10 +32,9 @@ from kiro_crew.config.loader import (
 from kiro_crew.dashboard.chat_utils import run_config_write
 from kiro_crew.dashboard.handlers._shared import read_capped_response
 from kiro_crew.dashboard.state import DashboardState, chat_message_frame
+from kiro_crew.dashboard.status_counts import cached_status_snapshot
 from kiro_crew.executors import subprocess_executor
-from kiro_crew.fork_version import base_version as fork_base_version
-from kiro_crew.fork_version import is_fork_build, peek_revision, strip_local
-from kiro_crew.fork_version import warm as warm_fork_revision
+from kiro_crew.gateway_restart import resolve_restart_launcher
 from kiro_crew.git_divergence import (
     UNREADABLE_TIMEOUT,
     DivergenceUnreadable,
@@ -72,7 +71,7 @@ from kiro_crew.platform.update_layout import detect_install_layout
 from kiro_crew.platform.update_layout import release_channel as _release_channel
 from kiro_crew.platform.update_layout import set_release_channel, wheel_update_command
 from kiro_crew.platform.update_provider import CommandProvider, resolve_provider
-from kiro_crew.platform_compat import reexec_python_module
+from kiro_crew.platform_compat import reexec_launcher, reexec_python_module
 from kiro_crew.safety_override import flush_breadcrumb_writes
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -218,10 +217,7 @@ def _display_version(version: str, channel: str) -> str:
     :func:`_display_local_version`, which additionally refuses to fold bytes the
     stable lane has never shipped -- see ``channel_move_pending``.
     """
-    # ``strip_local`` on the non-stable branch too: a fork build's local segment
-    # is identity, not release, and the raw string is what the chip renders.
-    # The fork half is surfaced separately (``fork_revision`` on the payload).
-    return base_version(version) if channel == "stable" else strip_local(version)
+    return base_version(version) if channel == "stable" else version
 
 
 def _channel_move_pending() -> bool:
@@ -348,17 +344,6 @@ def status_update_fields() -> dict[str, object]:
     available = _update_info.get("update_available")
     ahead = _update_info.get("commits_ahead")
     behind = _update_info.get("commits_behind")
-    # Bare sha, not the ``g``-prefixed display identifier: the payload carries
-    # DATA and the SPA composes the label, so the prefix and the dirty marker
-    # stay presentation and live in one place on that side.
-    #
-    # PEEK, never derive. This reader runs on the event loop (``/api/status``
-    # and the 5-second WebSocket push), and deriving spawns two git processes
-    # with a five-second timeout each. Until the update check's off-loop step
-    # has warmed it, the payload honestly reports "no fork revision" — which the
-    # SPA renders as no attribution — instead of stalling every session to find
-    # out.
-    fork_sha, fork_is_dirty = peek_revision() or ("", False)
     return {
         "update_available": available if isinstance(available, bool) else None,
         "update_can_apply": bool(_update_info.get("can_apply")),
@@ -430,20 +415,6 @@ def status_update_fields() -> dict[str, object]:
         # catch. Falls back to the raw version until a check has resolved the
         # channel (`_display_local_version` keys on it; only stable folds).
         "version_display": _display_local_version(),
-        # FORK IDENTITY. ``version``/``version_display`` carry UPSTREAM's base
-        # version, because that is what every comparison and every packaging
-        # manifest keys on — which leaves a fork build indistinguishable from
-        # the upstream build it forked, and an upstream install one minor ahead
-        # even reads as newer. These three fields are the other half, so a user
-        # asking "what am I running" gets both. Empty / False on an upstream
-        # build or an install with no derivable revision.
-        "upstream_base_version": fork_base_version(),
-        "fork_revision": fork_sha,
-        "fork_dirty": fork_is_dirty,
-        # Was an available upstream update withheld because this is a fork
-        # build? Lets the panel say so rather than render an unexplained
-        # "up to date" beside a newer upstream version. See _check_release_feed.
-        "update_fork_suppressed": bool(_update_info.get("fork_suppressed")),
     }
 
 
@@ -530,13 +501,7 @@ def _version_key(value: str) -> tuple[tuple[int, ...], int, int, int, int] | Non
     Release tuples are NOT padded here — comparing keys of different arity is the
     caller's job (:func:`_is_newer`), because padding depends on both sides.
     """
-    # A PEP 440 local segment carries no ordering information and MUST NOT
-    # reach the parser: ``_PEP440_RE`` is anchored, so ``0.5.0+fork.gb1234ab``
-    # falls through to the semver branch below, which reads the first integer
-    # out of the sha and ranks the build as prerelease 1234 of ``0.5.0`` —
-    # BELOW the bare release. A fork build would then be offered upstream's
-    # identical release as an update. See `fork_version.strip_local`.
-    text = strip_local(value)
+    text = str(value or "").strip()
     if not text:
         return None
     match = _PEP440_RE.match(text)
@@ -791,13 +756,6 @@ async def _run_update_check() -> None:
             # it must not run on the event loop, and every failure must still reach
             # the cache/error cleanup below.
             capability = await asyncio.get_running_loop().run_in_executor(None, derive_capability)
-            # Warm the fork revision in the same off-loop window, for BOTH
-            # lanes. It is a git spawn, so it cannot run on the loop — and the
-            # status payload only PEEKS the memo (see ``status_update_fields``),
-            # so this is what makes the About surface able to name the fork at
-            # all. Failure is already swallowed inside the derivation, which
-            # returns "no revision" rather than raising.
-            await asyncio.get_running_loop().run_in_executor(None, warm_fork_revision)
             if capability.defers:
                 reason = capability.unavailable_reason or ""
                 _set_update_info(
@@ -1208,27 +1166,7 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
         )
         return
 
-    # A FORK BUILD IS NEVER OFFERED AN UPSTREAM ARTIFACT ON THIS LANE.
-    #
-    # The release feed publishes UPSTREAM's bytes. Applying one to a fork
-    # install does not update it, it REPLACES it — the fork's divergence is
-    # uninstalled, silently, from a button labelled "Update". The verdict is
-    # therefore reported as "nothing to apply" while ``latest_version`` is still
-    # carried, so the panel can say what upstream has moved to without offering
-    # to install it. ``fork_suppressed`` rides the payload so the UI can explain
-    # the difference instead of showing a bare "up to date".
-    #
-    # Scoped to the FEED lane on purpose. ``_check_git_checkout`` fetches the
-    # install's OWN remote, which for a fork clone is the fork — that lane is
-    # already correct and is left alone.
-    # Offloaded: the first call may spawn git, and this coroutine runs on the
-    # event loop. Memoized after ``_do_update_check`` warmed it, so in practice
-    # this is a tuple read that pays one executor hop.
-    fork_suppressed = await asyncio.to_thread(is_fork_build)
-    if fork_suppressed:
-        available = False
-
-    extra: dict[str, object] = {"fork_suppressed": fork_suppressed}
+    extra: dict[str, object] = {}
     pub_date = manifest.get("pub_date")
     if isinstance(pub_date, str) and _PUB_DATE_RE.match(pub_date):
         extra["latest_pub_date"] = pub_date
@@ -1241,13 +1179,7 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
     # every failure degrades to the ordinary dismissible prompt. Offloaded —
     # verification shells out to openssl.
     floor = manifest.get("min_version")
-    if fork_suppressed and floor is not None:
-        # The floor's whole power is to make the prompt non-dismissible, and the
-        # only thing it can prompt toward here is the upstream artifact this
-        # lane refuses to offer a fork build. Honoring it would hold the
-        # dashboard hostage to an update that cannot legitimately be applied.
-        logger.debug("Fork build: ignoring the release feed's min_version floor")
-    elif isinstance(floor, str) and _MIN_VERSION_RE.match(floor):
+    if isinstance(floor, str) and _MIN_VERSION_RE.match(floor):
         if _is_newer(floor, _display_version(remote_version, channel)) is True:
             # A floor above the very version the feed offers demands an update
             # the feed cannot satisfy — inconsistent, so ignore it. The offered
@@ -1522,7 +1454,7 @@ async def _venv_pip_install(proj: str, state: DashboardState) -> bool:
 async def _restart_gateway(
     state: DashboardState, *, resolver: Callable[[], str] | None = None
 ) -> bool:
-    """Save state, close sessions, and exec the same Python process once.
+    """Save state, close sessions, and exec the selected gateway entry point once.
 
     Restart is a process-wide transition.  Two callers must never both drain
     sessions and race separate successors for the same listener/lock, so the
@@ -1535,23 +1467,28 @@ async def _restart_gateway(
     state._gateway_restart_in_progress = True
     try:
         state.push_update_progress("restarting", "Restarting server…")
-        # Resolved through the managed-venv stable link rather than taken from
-        # ``sys.executable``: after a shadow-venv promotion the cached path
-        # names the superseded versioned tree, and exec'ing it would restart
-        # the OLD version right after the update reported success. For every
-        # other install shape the resolver answers ``sys.executable``.
-        # Offloaded: the resolver walks the venv's sibling directory, which is
-        # synchronous filesystem I/O this loop must not wait on.
-        # Applying callers import the resolver before the install can replace
-        # their import tree. A plain restart has no apply, so load it here.
-        if resolver is None:
-            from kiro_crew.platform.wheel_engine import respawn_executable
-
-            resolver = respawn_executable
-        exe = await asyncio.to_thread(resolver)
-        if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
-            state.push_update_progress("error", "Cannot restart: invalid Python executable path")
+        # Resolve off-loop and before saving/draining. An explicit broken launcher
+        # must not fall back to the running bundle's interpreter and import path.
+        try:
+            launcher = await asyncio.to_thread(resolve_restart_launcher)
+        except (ValueError, OSError) as exc:
+            logger.warning("Gateway launcher unavailable: %s", exc)
+            state.push_update_progress("error", "Cannot restart: invalid gateway launcher path")
             return False
+        exe = None
+        if launcher is None:
+            # Applying callers load this resolver before the install can replace
+            # their import tree. A plain restart has no apply, so load it here.
+            if resolver is None:
+                from kiro_crew.platform.wheel_engine import respawn_executable
+
+                resolver = respawn_executable
+            exe = await asyncio.to_thread(resolver)
+            if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
+                state.push_update_progress(
+                    "error", "Cannot restart: invalid Python executable path"
+                )
+                return False
         # circular import: kiro_crew.dashboard.chat imports from
         # kiro_crew.dashboard.handlers (which re-exports this module), so this
         # must stay inline to avoid an import cycle at module load.
@@ -1589,7 +1526,10 @@ async def _restart_gateway(
         except Exception:
             logger.debug("Breadcrumb flush before restart failed", exc_info=True)
         await asyncio.sleep(0.5)
-        reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
+        if launcher is not None:
+            reexec_launcher(launcher, sys.argv[1:])
+        else:
+            reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
         return True
     finally:
         state._gateway_restart_in_progress = False
@@ -2266,13 +2206,14 @@ async def api_stream(request: web.Request) -> web.StreamResponse:
 
             data = json.dumps(
                 {
-                    # The SSE stream is the THIRD status emitter, and it was reading
-                    # the cache directly on a key this contract renamed — so it
-                    # published `False` unconditionally, and flattened the tri-state
-                    # while doing it (a check that never ran is not "no update").
-                    # `status_update_fields()` is the one reader; /api/status and the
-                    # WebSocket push already go through it.
-                    **state.status_snapshot(**status_update_fields()),  # type: ignore[arg-type]
+                    # The SSE stream is the THIRD status emitter. It routes the
+                    # lesson/cron counts through the ONE gateway-wide cache all
+                    # three emitters share (status_counts.cached_status_snapshot)
+                    # so they never compute inline on the event loop, and that
+                    # funnel joins in the update fields from
+                    # `status_update_fields()` itself — the one reader — so the
+                    # tri-state update fields are not flattened.
+                    **await cached_status_snapshot(state),
                     "version": _display_local_version(),
                 }
             )
@@ -2542,25 +2483,117 @@ async def _audit_update_event(
     await asyncio.to_thread(_write)
 
 
+async def _arm_packaged_app(request: web.Request) -> web.Response:
+    """Arm an update REQUEST for a packaged desktop install (dmg/appimage/deb/rpm/nsis).
+
+    Not a step-up. The managed-venv lane needs one because the gateway itself
+    performs the apply, so something has to prove a human authorised it. On a
+    packaged install the gateway performs nothing: the bytes belong to the
+    desktop app's updater, and the only control that starts it is the click in
+    Settings › About inside the app's own renderer. That click IS the approval.
+    So the record this writes is a nudge with context — which version, who
+    asked, when — and carries no nonce, no token, nothing an approval could
+    present. There is no gateway endpoint that turns it into an install, which
+    is what makes agent self-approval impossible by construction rather than by
+    fence: an agent can read its own request and gain nothing from doing so.
+
+    The requester may NAME a version (``{"version": "0.6.0"}``); absent, the
+    request is for whatever the feed offers. Display-only either way — the
+    app's updater decides what downloads, and the panel says when they differ.
+    """
+    from kiro_crew.platform.app_update_request import get_app_update_requests
+
+    if resolve_provider() is not None:
+        error = "updates on this host are managed by policy"
+        await _audit_update_event(request, operation="update.arm", outcome="denied", error=error)
+        return web.json_response(
+            {"error": error, "code": "arm_policy_managed", "governance": True}, status=409
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    version = ""
+    if isinstance(body, dict):
+        raw = body.get("version")
+        if raw is not None and not isinstance(raw, str):
+            return web.json_response(
+                {"error": "version must be a string", "code": "invalid_version"}, status=400
+            )
+        version = (raw or "").strip()
+    if version and _downgrade_target_below_min_version(version, _release_channel()):
+        error = "selected release is below the required minimum version"
+        await _audit_update_event(
+            request, operation="update.arm", outcome="denied", error=error, resources=f"v{version}"
+        )
+        return web.json_response(
+            {"error": error, "code": "arm_below_min_version", "governance": True}, status=409
+        )
+    # Who asked, for the panel. A session key names the agent conversation; a
+    # user mark names a dashboard login; neither is trusted for anything but
+    # display, so a spoofed value costs nothing.
+    requested_by = str(request.get("user") or request.headers.get("X-Session-Key") or "dashboard")[
+        :64
+    ]
+    req, is_new_ask = await asyncio.to_thread(
+        get_app_update_requests().arm, target_version=version, requested_by=requested_by
+    )
+    state: DashboardState = request.app["state"]
+    label = f"v{version}" if version else "the latest version"
+    if is_new_ask:
+        # The existing notification path: this is what reaches a chat-only
+        # user's bell, so their next visit to the app lands on the request.
+        # Once per distinct ask — a looping agent turn re-arming the same
+        # request must not ring the bell once per iteration.
+        state.notify(
+            "update",
+            "An agent requested an app update",
+            f"{requested_by} asked to update Kiro Crew to {label}. Approve it in Settings › About.",
+            url="/settings/about",
+        )
+    await _audit_update_event(
+        request,
+        operation="update.arm",
+        outcome="granted",
+        resources=f"{label} (app lane, by {requested_by})",
+    )
+    return web.json_response({"ok": True, **req.to_public(time.time())})
+
+
 async def api_update_arm(request: web.Request) -> web.Response:
     """POST /api/update/arm — arm a pending in-app update (SPA-callable).
 
-    Arming grants nothing: it records the request and writes the approval
-    nonce to a file only the host can read. The response NEVER carries the
-    nonce. Refused for every shape except the managed venv, when a downgrade
-    would cross below the active minimum-version floor, and when neither a
-    newer update nor a pending channel move is cached — an arm must name the
-    version the check reported, not whatever the feed happens to serve later (the apply
-    re-verifies against the signed manifest anyway).
+    Which lane the arm records is derived from the INSTALL SHAPE, through the
+    one derivation every update surface shares. A packaged desktop install gets
+    a nonce-free request that the app's own About panel turns into an install
+    with a human click (see :func:`_arm_packaged_app`). A managed venv gets the
+    step-up below.
+
+    Arming grants nothing on either lane. For the managed venv it records the
+    request and writes the approval nonce to a file only the host can read; the
+    response NEVER carries the nonce. Refused for every other shape, when a
+    downgrade would cross below the active minimum-version floor, and when
+    neither a newer update nor a pending channel move is cached — an arm must
+    name the version the check reported, not whatever the feed happens to
+    serve later (the apply re-verifies against the signed manifest anyway).
     """
     # Function-local: boot-path rule, same as _restart_gateway's import.
     from kiro_crew.platform import update_stepup
+    from kiro_crew.platform.update_capability import MANAGED_BY_ELECTRON, derive_capability
     from kiro_crew.platform.wheel_engine import running_from_managed_venv
+
+    # Offloaded: the derivation shells out to git and touches disk.
+    capability = await asyncio.to_thread(derive_capability)
+    if capability.managed_by == MANAGED_BY_ELECTRON:
+        return await _arm_packaged_app(request)
 
     if not await asyncio.to_thread(running_from_managed_venv):
         return web.json_response(
             {
-                "error": "in-app update applies only to the cli.sh managed-venv install",
+                "error": (
+                    "in-app update applies only to the cli.sh managed-venv install "
+                    "and the packaged desktop app"
+                ),
                 "code": "arm_wrong_shape",
             },
             status=409,
@@ -2610,15 +2643,78 @@ async def api_update_arm(request: web.Request) -> web.Response:
 
 
 async def api_update_arm_status(request: web.Request) -> web.Response:
-    """GET /api/update/arm — the armed request, SPA-safe projection."""
+    """GET /api/update/arm — the armed request, SPA-safe projection.
+
+    Either lane's record, whichever exists; arm dispatches on install shape so
+    at most one does. The packaged-app projection carries ``managed_by:
+    "electron"`` so the About panel can offer the in-app Install click rather
+    than the host command the managed-venv lane needs.
+    """
     from kiro_crew.platform import update_stepup
+    from kiro_crew.platform.app_update_request import get_app_update_requests
 
     # clear_expired=True: this runs inside the gateway, where the expiry
     # cleanup is serialized against arm under the module mutex.
     pending = await asyncio.to_thread(lambda: update_stepup.read_pending(clear_expired=True))
-    if pending is None:
+    if pending is not None:
+        return web.json_response({**update_stepup.public_view(pending), "managed_by": "kirocrew"})
+    requests = get_app_update_requests()
+    req = await asyncio.to_thread(requests.current)
+    if req is None:
         return web.json_response({"armed": False})
-    return web.json_response(update_stepup.public_view(pending))
+    # Policy is re-checked at PUBLISH, not only at arm. The record lives in a
+    # file an agent can write, so a request that would have been refused at arm
+    # — a policy-pinned host, a version below the floor — must not surface a
+    # card just because it arrived by another route. A refused record is also
+    # dropped, so the card does not flicker back on the next poll.
+    if resolve_provider() is not None or (
+        req.target_version
+        and _downgrade_target_below_min_version(req.target_version, _release_channel())
+    ):
+        await asyncio.to_thread(requests.clear)
+        await _audit_update_event(
+            request,
+            operation="update.arm",
+            outcome="denied",
+            error="request refused by update policy at publish",
+            resources=f"v{req.target_version or 'latest'} ({req.request_id})",
+        )
+        return web.json_response({"armed": False})
+    return web.json_response(req.to_public(time.time()))
+
+
+async def api_update_disarm(request: web.Request) -> web.Response:
+    """DELETE /api/update/arm?request_id=… — decline a packaged-app update request.
+
+    SPA-callable for the same reason arming is: it removes a nudge rather than
+    granting anything. Without it the About panel's request card would offer
+    only the control that installs, for the whole TTL, which is pressure and
+    not consent.
+
+    ``request_id`` is REQUIRED and names the request the panel SHOWED. Only that
+    request is removed: a click on a card rendering request A must not erase a
+    request B an agent made after the render, because B is a decision the user
+    has not seen. A stale id is not an error — the answer says what is live
+    now, and the panel's next poll renders it.
+
+    Packaged lane only. The managed-venv step-up's nonce file is a different
+    record with its own lifecycle and is not touched here.
+    """
+    from kiro_crew.platform.app_update_request import get_app_update_requests
+
+    request_id = request.query.get("request_id", "")
+    if not request_id:
+        return web.json_response(
+            {"error": "request_id is required", "code": "invalid_request_id"}, status=400
+        )
+    requests = get_app_update_requests()
+    removed = await asyncio.to_thread(requests.decline, request_id)
+    if removed:
+        await _audit_update_event(
+            request, operation="update.disarm", outcome="success", resources=request_id
+        )
+    still = await asyncio.to_thread(requests.current)
+    return web.json_response({"ok": True, "armed": still is not None, "dismissed": removed})
 
 
 async def api_update_approve(request: web.Request) -> web.Response:

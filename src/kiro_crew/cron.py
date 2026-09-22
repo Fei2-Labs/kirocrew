@@ -73,6 +73,13 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ──
 
+# Shown verbatim under the Schedule form's Save button, so it names the rule
+# and the next step rather than only the refusal.
+_CHAT_FOLDER_NEEDS_PERSISTENT = (
+    "Filing runs into a chat folder needs a persistent session: a stateless job "
+    "has no job-wide tab to file. Clear the chat folder, or keep the session."
+)
+
 # Table-driven string-field caps for the persistence chokepoint. Every
 # caller-supplied string field persisted by _build_job/_update_job_locked
 # is listed here with its cap matching the REST/MCP boundary schemas
@@ -89,6 +96,7 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     ("source_preset", MAX_SHORT_STRING),
     ("source_template_prompt", MAX_CRON_MESSAGE),
     ("folder_id", MAX_SHORT_STRING),
+    ("chat_folder_id", MAX_SHORT_STRING),
     ("session_key", MAX_SHORT_STRING),
     ("model", MAX_SHORT_STRING),
     ("command", 5000),
@@ -719,6 +727,7 @@ class CronJob:
     # These fields survive reload; omitted legacy records remain on V1.
     member_id: str = ""
     memory_store: str = ""
+    execution_context: dict[str, Any] | None = None
     approval_mode: str = ""  # "" (default/hook-based) | "auto" (auto-approve all tools)
     acked_items: list[str] = field(default_factory=list)
     created_by: str = ""  # Slack user ID of the creator (for DM fallback)
@@ -770,6 +779,32 @@ class CronJob:
     # benign (they self-heal on the job's next folder move).
     folder_id: str = ""
     model: str = ""  # per-job model override (canonical key or provider id); "" = inherit
+    # The CHAT (sidebar) folder the job's ``cron-{id}`` tab is filed into; "" =
+    # not filed, which is what every job predating the field keeps doing. Its
+    # run stamps and markers already make that one tab the job's timeline.
+    #
+    # Distinct from ``folder_id`` above, and the two are never interchangeable:
+    # ``folder_id`` groups the job's ROW on the Schedule page
+    # (``cron_folders.json``), while this names a folder in the chat sidebar's
+    # own tree (``folders.json``) and decides where the job's TAB lands. A job
+    # may carry either, both or neither, and one is never derived from the other.
+    #
+    # PERSISTENT jobs only: a stateless job (``persistent_session=False``) has
+    # no job-wide tab to file, so the store refuses the pair at save time rather
+    # than accepting a setting with no observable effect.
+    #
+    # Filing SUPPLEMENTS delivery, never replaces it: a run with a chat folder
+    # still reaches its Slack DM, its dashboard notification and its origin
+    # session exactly as it did before.
+    #
+    # CONTRACT for consumers, matching ``folder_id``'s: an id that does not
+    # match a folder in ``folders.json`` MUST be treated as "not filed". A chat
+    # folder can be deleted while a job still names it, and a dangling id must
+    # cost the tab its place in the sidebar and nothing else -- the run still
+    # delivers, and the skip is recorded once (see
+    # ``cron_inject.chat_folder_for_minted_tab``). A RENAME is a no-op: ids
+    # are stable, so the job follows the folder under its new name.
+    chat_folder_id: str = ""
     # Transient-retry telemetry for the LAST completed run. Both fields are
     # written in ONE place, `CronService._execute`, right after it stamps
     # `last_run_ts`: it reads the in-flight `_transient_attempts` counter the
@@ -1418,6 +1453,33 @@ def compute_next_run_ts(job: CronJob, now: float | None = None) -> float | None:
     return result
 
 
+def _next_cron_boundary_ts(job: CronJob, now: float) -> float | None:
+    """Return the immediate next cron boundary as a UTC epoch, ignoring skip_dates.
+
+    For TIMER ARMING only. It answers "when is the next minute this expression
+    matches" with a single ``croniter.get_next`` -- O(1), no ``skip_dates``
+    traversal -- so a job with many ``skip_dates`` cannot make the on-loop
+    re-arm walk up to ``_MAX_SKIP_DATE_LOOKAHEAD`` occurrences. ``skip_dates`` is
+    still enforced at fire time by :meth:`CronService._is_due`, so a wake that
+    lands on a skipped boundary is a cheap no-op that re-arms to the following
+    boundary. Returns ``None`` for a non-cron or invalid expression, or when the
+    boundary is non-finite, so the caller falls back to the poll interval.
+    """
+    sched = job.schedule
+    if sched.kind != "cron" or sched.cron_expr is None:
+        return None
+    try:
+        tz = _job_tz(job)
+        base = datetime.fromtimestamp(now, tz=tz)
+        nxt = croniter(sched.cron_expr, base).get_next(float)
+    except Exception:
+        logger.warning("Failed to compute next cron boundary for job %s", job.id, exc_info=True)
+        return None
+    if isinstance(nxt, float) and not math.isfinite(nxt):
+        return None
+    return nxt
+
+
 def _compute_next_run_ts_raw(job: CronJob, now: float | None = None) -> float | None:
     """Unchecked next-fire-time computation; see :func:`compute_next_run_ts`."""
     try:
@@ -1636,113 +1698,58 @@ def _is_representable_number(value: Any) -> bool:
 
 
 def resolve_cron_memory(job: CronJob, *, validate_memory_files: bool = True) -> tuple[str, str]:
-    """Resolve the durable member identity without changing legacy V1 jobs.
+    """Dispatch the job's captured execution, never its current display alias."""
+    from kiro_crew.execution_context import execution_from_record, validate_execution
+    from kiro_crew.memory_stores import memory_store_version, require_memory_store
 
-    The provider template never identifies a member. A newly-created job may
-    inherit its creator's recorded store; after first persistence its own
-    binding is authoritative even when the originating chat has been closed.
-    """
-    from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
-    from kiro_crew.memory_stores import require_memory_store
-
+    if job.execution_context is not None:
+        execution = execution_from_record({"execution_context": job.execution_context})
+        if validate_memory_files:
+            validate_execution(execution)
+        return execution.store.legacy_name, execution.template_id
     if not isinstance(job.member_id, str) or not isinstance(job.memory_store, str):
-        raise ValueError("memory_unavailable: scheduled memory identity is malformed")
-    if job.member_id:
-        cfg = KiroCrewConfig.load()
-        if job.member_id not in cfg.agents or job.member_id == "default":
-            raise ValueError(f"memory_unavailable: unknown Crew Member '{job.member_id}'")
-        bindings = resolve_agent_bindings(
-            cfg, job.member_id, validate_memory_files=validate_memory_files
-        )
-        if job.memory_store and job.memory_store != bindings.memory_store_name:
-            raise ValueError("memory_unavailable: scheduled member's memory binding changed")
-        store, agent = bindings.memory_store_name, job.agent_id or bindings.kiro_agent
-    elif job.memory_store:
-        store = require_memory_store(job.memory_store, require_directory=validate_memory_files)
-        agent = job.agent_id
-    else:
-        store, agent = "", job.agent_id
-    # Deterministic runners lack the member provider's protected runtime identity.
-    # Reject before persistence and again before dispatch, including imported jobs.
-    if (job.command or job.script) and store:
-        record = KiroCrewConfig.load().memory_stores.get(store)
-        if record and record.memory_version == 2:
-            raise ValueError(
-                "memory_unavailable: private Crew Member schedules require an agent task; "
-                "command and script jobs cannot use member memory"
-            )
-    return store, agent
+        raise ValueError("memory_unavailable: malformed schedule identity")
+    # A V2 schedule must carry the captured execution record: its member ID is
+    # an immutable database identity and cannot be reconstructed from a name.
+    # Older V1 schedules may still carry the historical member selector beside
+    # their explicit legacy store; keep dispatching that store instead of
+    # silently auto-pausing it after an upgrade.
+    if memory_store_version(job.memory_store) == 2 or (job.member_id and not job.memory_store):
+        raise ValueError("memory_unavailable: schedule has no canonical execution context")
+    store = (
+        require_memory_store(job.memory_store, require_directory=validate_memory_files)
+        if job.memory_store
+        else ""
+    )
+    return store, job.agent_id
 
 
 def bind_cron_memory(job: CronJob) -> None:
-    """Pin a new schedule to its creator or explicitly selected member."""
-    creator_store = ""
-    creator_cfg = None
-    if job.session_key:
-        from kiro_crew.config.loader import KiroCrewConfig
-        from kiro_crew.history import ConversationLog
-        from kiro_crew.member_memory_auth import read_private_session_store
-        from kiro_crew.memory_stores import require_memory_store
+    """Capture existing member or creator once inside the new job record."""
+    from dataclasses import replace
 
-        creator_cfg = KiroCrewConfig.load()
-        if job.session_key.startswith("subagent:"):
-            from kiro_crew.subagent_persistence import read_run_memory_store
+    from kiro_crew.execution_context import (
+        derive_execution,
+        execution_for_store,
+        read_session_execution,
+    )
 
-            creator_store = read_run_memory_store(
-                job.session_key.removeprefix("subagent:"), validate_memory_files=False
-            )
-        else:
-            protected = read_private_session_store(job.session_key)
-            if protected is not None:
-                # Protected assignment remains readable inside a sandbox whose
-                # private DB and transcripts are hidden. Dispatch checks files.
-                creator_store = require_memory_store(
-                    protected, config=creator_cfg, require_directory=False
-                )
-            else:
-                meta, readable = ConversationLog().get_metadata_status(job.session_key)
-                if not readable:
-                    raise ValueError(
-                        "memory_unavailable: originating session metadata is unreadable"
-                    )
-                store = meta.get("memory_store", "")
-                if not isinstance(store, str):
-                    raise ValueError("memory_unavailable: invalid originating memory binding")
-                creator_store = (
-                    require_memory_store(store, config=creator_cfg, require_directory=False)
-                    if store not in ("", "default")
-                    else ""
-                )
-                # Scheduling may run inside a member sandbox where the private
-                # directory is intentionally hidden. Classify the declaration
-                # from the same validated config rather than reopening its
-                # ownership manifest; dispatch validates the files before use.
-                record = creator_cfg.memory_stores.get(creator_store)
-                if creator_store and record and record.memory_version == 2:
-                    raise ValueError(
-                        "memory_unavailable: private schedules require a trusted member assignment"
-                    )
-        if not job.member_id:
-            if job.memory_store and job.memory_store != creator_store:
-                raise ValueError(
-                    "memory_unavailable: a schedule cannot change its creator's memory"
-                )
-            job.memory_store = creator_store
-    if job.member_id or job.memory_store:
-        job.memory_store, _ = resolve_cron_memory(job, validate_memory_files=False)
-        if creator_store:
-            assert creator_cfg is not None
-            record = creator_cfg.memory_stores.get(creator_store)
-            if record and record.memory_version == 2 and job.memory_store != creator_store:
-                raise ValueError(
-                    "memory_unavailable: a Crew Member can schedule only its own private memory"
-                )
-        if not job.member_id and job.memory_store:
-            from kiro_crew.config.loader import KiroCrewConfig
-
-            cfg = creator_cfg or KiroCrewConfig.load()
-            store_cfg = cfg.memory_stores[job.memory_store]
-            job.member_id = store_cfg.owner_member
+    if job.execution_context is not None:
+        resolve_cron_memory(job, validate_memory_files=False)
+        return
+    creator = read_session_execution(job.session_key) if job.session_key else None
+    execution = creator or execution_for_store(
+        job.memory_store, template_id=job.agent_id or "kirocrew"
+    )
+    if job.member_id:
+        execution = derive_execution(execution, target_member=job.member_id)
+    if execution.memory_mode != "persistent":
+        raise ValueError("Restricted sessions cannot create persistent schedules")
+    if job.agent_id:
+        execution = replace(execution, template_id=job.agent_id)
+    job.execution_context = execution.to_record()
+    job.member_id = execution.member_id or ""
+    job.memory_store = execution.store.legacy_name
 
 
 def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> CronJob:
@@ -1934,6 +1941,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         # strip a member binding and run the job unbound.
         member_id=_selector_str("member_id"),
         memory_store=_selector_str("memory_store"),
+        execution_context=j.get("execution_context"),
         approval_mode=_guard_str("approval_mode"),
         acked_items=j.get("acked_items", []),
         created_by=_guard_str("created_by"),
@@ -1953,6 +1961,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         minimal_context=j.get("minimal_context", False),
         hide_in_chat=j.get("hide_in_chat", False),
         folder_id=_guard_str("folder_id"),
+        chat_folder_id=_guard_str("chat_folder_id"),
         model=_guard_str("model"),
         last_retry_count=_guard_num("last_retry_count", 0),
         last_retry_run_ts=_guard_num("last_retry_run_ts", 0.0),
@@ -2295,7 +2304,10 @@ class CronService:
         if self._sessions:
             try:
                 await asyncio.wait_for(
-                    self._sessions.reset(session_key), timeout=_REAPER_RESET_TIMEOUT
+                    # Same class as ``cancel``: the reaper has given up on this run, so
+                    # its conversation is over and its sub-agent runs end with it.
+                    self._sessions.reset(session_key, ends_conversation=True),
+                    timeout=_REAPER_RESET_TIMEOUT,
                 )
             except asyncio.TimeoutError:
                 logger.warning("Reaper: reset hung for cron %s, attempting SIGKILL", job_id)
@@ -2503,7 +2515,10 @@ class CronService:
         if self._sessions and is_agent_job and not killed_proc:
             try:
                 await asyncio.wait_for(
-                    self._sessions.reset(session_key), timeout=_REAPER_RESET_TIMEOUT
+                    # The job is cancelled, so its conversation is over and its
+                    # sub-agent runs go with it -- not a recycle.
+                    self._sessions.reset(session_key, ends_conversation=True),
+                    timeout=_REAPER_RESET_TIMEOUT,
                 )
             except asyncio.TimeoutError:
                 logger.warning("Cancel: reset hung for cron %s, attempting SIGKILL", job_id)
@@ -2609,6 +2624,7 @@ class CronService:
         strict_schedule: bool = False,
         hide_in_chat: bool = False,
         folder_id: str = "",
+        chat_folder_id: str = "",
         command: str = "",
         script: str = "",
         agent_sequence: list[str] | None = None,
@@ -2669,6 +2685,7 @@ class CronService:
             strict_schedule=strict_schedule,
             hide_in_chat=hide_in_chat,
             folder_id=folder_id,
+            chat_folder_id=chat_folder_id,
             command=command,
             script=script,
             agent_sequence=agent_sequence,
@@ -2798,6 +2815,7 @@ class CronService:
         strict_schedule: bool = False,
         hide_in_chat: bool = False,
         folder_id: str = "",
+        chat_folder_id: str = "",
         command: str = "",
         script: str = "",
         agent_sequence: list[str] | None = None,
@@ -2855,6 +2873,7 @@ class CronService:
                 "member_id": member_id,
                 "created_by": created_by,
                 "folder_id": folder_id,
+                "chat_folder_id": chat_folder_id,
                 "session_key": session_key,
                 "model": model,
                 "command": command,
@@ -2863,6 +2882,8 @@ class CronService:
             },
             required=frozenset({"name", "message"}),
         )
+        if chat_folder_id and not persistent_session:
+            raise ValueError(_CHAT_FOLDER_NEEDS_PERSISTENT)
         if timeout_secs and not 1 <= int(timeout_secs) <= 86400:
             raise ValueError(f"timeout_secs must be within 1..86400, got {timeout_secs}")
         if timeout_secs and (command or script):
@@ -2920,6 +2941,7 @@ class CronService:
             strict_schedule=strict_schedule,
             hide_in_chat=hide_in_chat,
             folder_id=folder_id,
+            chat_folder_id=chat_folder_id,
             command=command,
             script=script,
             agent_sequence=list(agent_sequence) if agent_sequence else [],
@@ -2971,6 +2993,7 @@ class CronService:
         strict_schedule: bool = False,
         hide_in_chat: bool = False,
         folder_id: str = "",
+        chat_folder_id: str = "",
         command: str = "",
         script: str = "",
         agent_sequence: list[str] | None = None,
@@ -3021,6 +3044,7 @@ class CronService:
             strict_schedule=strict_schedule,
             hide_in_chat=hide_in_chat,
             folder_id=folder_id,
+            chat_folder_id=chat_folder_id,
             command=command,
             script=script,
             agent_sequence=agent_sequence,
@@ -3067,6 +3091,11 @@ class CronService:
         Offloads the lock/reload/mutate/save core to a worker thread, then
         re-arms the timer on the loop. Raises :class:`CronStoreBusy` (retryable)
         on sustained contention.
+
+        ``chat_folder_transition_out``: pass a dict to learn the folder
+        ``chat_folder_id`` held before this call replaced it. Filled under the
+        store's file lock, so it is atomic with the write; owned by the caller, so
+        concurrent callers cannot see or overwrite each other's answer.
         """
         job = await asyncio.to_thread(self._update_job_locked_kw, job_id, kwargs)
         if job is not None:
@@ -3095,6 +3124,21 @@ class CronService:
         # instead of resurrecting state the operator withdrew.
         expect_active = kwargs.pop("expect_secret_env", None)
         expect_active_pin = kwargs.pop("expect_secret_env_pin", None)
+        # Optional OUT-parameter, owned by the caller: a dict this pass fills with
+        # ``{"chat_folder_was": <prior folder, possibly "">}`` when the update
+        # actually changes ``chat_folder_id``.
+        #
+        # An out-parameter rather than a field on the job, and the distinction is
+        # the whole reason this exists. The dashboard must move the job's chat tab
+        # out of its previous folder, and may only do so when the tab is still
+        # sitting where this feature put it -- so it needs the PRIOR value, read
+        # atomically with the write that replaces it. Reading it with a separate
+        # query is a read-then-write race. Stamping it on the ``CronJob`` closes
+        # that race and opens another: ``self._jobs`` holds ONE object per job, so
+        # concurrent callers share the attribute and each one's answer is visible
+        # to, and clobberable by, the others. A dict the caller allocated is seen
+        # by that caller alone.
+        chat_folder_out = kwargs.pop("chat_folder_transition_out", None)
         with self._file_lock():
             self._sync_for_write()
             for job in self._jobs:
@@ -3122,6 +3166,19 @@ class CronService:
                 _validate_cron_string_fields(
                     {f: kwargs[f] for f, _ in _CRON_STRING_FIELD_CAPS if f in kwargs},
                 )
+                # Cross-field: only a persistent job has a job-wide tab to file,
+                # so a request that itself names a folder for a job this update
+                # leaves stateless is refused. Turning persistence off on a filed
+                # job is NOT refused: MCP/CLI ``cron_update`` exposes
+                # ``persistent_session`` without ``chat_folder_id``, so a refusal
+                # there would be a dead end; the assignment below clears the
+                # folder instead and reports it through the transition sink.
+                # Read the flag through the same coercion the assignment below
+                # applies, so the guard judges the value that gets stored.
+                if (kwargs.get("chat_folder_id") or "") and not bool(
+                    kwargs.get("persistent_session", job.persistent_session)
+                ):
+                    raise ValueError(_CHAT_FOLDER_NEEDS_PERSISTENT)
                 if (
                     "cron_expr" in kwargs
                     and kwargs["cron_expr"]
@@ -3292,6 +3349,30 @@ class CronService:
                     job.hide_in_chat = bool(kwargs["hide_in_chat"])
                 if "folder_id" in kwargs:
                     job.folder_id = kwargs["folder_id"] or ""
+                if "chat_folder_id" in kwargs:
+                    # Reported only on a REAL change: the caller moves a chat tab on
+                    # the strength of this, and the dashboard form submits the field
+                    # on every save, so "unchanged" must not read as "cleared".
+                    #
+                    # An empty prior value IS reported: filing a job that was unfiled
+                    # is the transition that puts an existing tab into its folder,
+                    # and the save is the one moment where that placement is asked
+                    # for explicitly (the mint files only a tab that did not exist).
+                    _chat_folder_next = kwargs["chat_folder_id"] or ""
+                    if chat_folder_out is not None and job.chat_folder_id != _chat_folder_next:
+                        chat_folder_out["chat_folder_was"] = job.chat_folder_id
+                    job.chat_folder_id = _chat_folder_next
+                elif (
+                    "persistent_session" in kwargs
+                    and not job.persistent_session
+                    and job.chat_folder_id
+                ):
+                    # Un-persisting takes the job-wide tab away, so the folder goes
+                    # with it: cleared here and reported exactly as an explicit
+                    # clear is, so the caller moves the tab the same way.
+                    if chat_folder_out is not None:
+                        chat_folder_out["chat_folder_was"] = job.chat_folder_id
+                    job.chat_folder_id = ""
                 if "model" in kwargs:
                     job.model = str(kwargs["model"] or "").strip()
                 if "secret_env" in kwargs and kwargs["secret_env"] is not None:
@@ -4172,33 +4253,57 @@ class CronService:
         """
         return await asyncio.to_thread(self._owner_keys_locked)
 
-    def enable_job(self, job_id: str, enabled: bool = True) -> bool:
+    def enable_job(
+        self, job_id: str, enabled: bool = True, *, expected_owner: str | None = None
+    ) -> bool:
         """Enable or disable a job by ID.
 
         Raises :class:`CronStoreBusy` on lock contention; see
         :meth:`enable_job_async` for the event-loop-safe variant.
         """
-        ok = self._enable_job_locked(job_id, enabled)
+        ok = (
+            self._enable_job_locked(job_id, enabled, expected_owner=expected_owner)
+            if expected_owner is not None
+            else self._enable_job_locked(job_id, enabled)
+        )
         if ok:
             self._arm_timer()
         return ok
 
-    async def enable_job_async(self, job_id: str, enabled: bool = True) -> bool:
+    async def enable_job_async(
+        self, job_id: str, enabled: bool = True, *, expected_owner: str | None = None
+    ) -> bool:
         """Event-loop-safe :meth:`enable_job`: the lock+save runs off the loop.
 
         Raises :class:`CronStoreBusy` (retryable) on sustained contention.
         """
-        ok = await asyncio.to_thread(self._enable_job_locked, job_id, enabled)
+        ok = (
+            await asyncio.to_thread(
+                self._enable_job_locked, job_id, enabled, expected_owner=expected_owner
+            )
+            if expected_owner is not None
+            else await asyncio.to_thread(self._enable_job_locked, job_id, enabled)
+        )
         if ok:
             self._arm_timer()
         return ok
 
-    def _enable_job_locked(self, job_id: str, enabled: bool = True) -> bool:
-        """Lock/reload/mutate/save core of :meth:`enable_job` (no timer work)."""
+    def _enable_job_locked(
+        self, job_id: str, enabled: bool = True, *, expected_owner: str | None = None
+    ) -> bool:
+        """Lock/reload/mutate/save core; app ownership is checked under the lock.
+
+        An SDK-side cached lookup cannot authorize a mutation after another
+        process has changed the store. Missing and foreign jobs both refuse
+        when an expected owner is supplied; ordinary host calls retain False
+        for a missing job.
+        """
         with self._file_lock():
             self._sync_for_write()
             for job in self._jobs:
                 if job.id == job_id:
+                    if expected_owner is not None and job.created_by != expected_owner:
+                        raise PermissionError("Cron job ownership violation")
                     job.user_paused = not enabled
                     job.enabled = enabled
                     # Re-enabling clears an execution auto-pause; without this a
@@ -4218,6 +4323,8 @@ class CronService:
                     self._save()
                     logger.info("%s cron job %s", "Enabled" if enabled else "Disabled", job_id)
                     return True
+            if expected_owner is not None:
+                raise PermissionError("Cron job ownership violation")
         return False
 
     def ack_job(self, job_id: str, summary: str) -> bool:
@@ -4396,18 +4503,16 @@ class CronService:
     def count_enabled_from_disk(self) -> int:
         """Count enabled jobs by reading ``crons.json`` directly — thread-safe.
 
-        Unlike :meth:`list_jobs` (which calls ``_sync()`` → ``_load()`` →
-        ``_arm_timer()``), this performs ONLY a read-only file parse. It never
-        mutates loop-owned state (``self._jobs``, ``self._last_mtime``) and
+        Unlike :meth:`list_jobs`, which serves the in-memory snapshot that the
+        loop-side timer refreshes, this performs ONLY a read-only file parse. It
+        never mutates loop-owned state (``self._jobs``, ``self._last_mtime``) and
         never touches the asyncio timer, so it is safe to invoke from a worker
         thread via ``asyncio.to_thread``.
 
-        This exists specifically for the dashboard WS status pusher, which needs
-        an enabled-job count off the event loop: routing ``list_jobs`` through a
-        worker thread would run ``_arm_timer()`` (which calls
-        ``asyncio.create_task``) with no running loop in that thread, raising
-        ``RuntimeError`` — and because ``_arm_timer`` cancels the existing timer
-        first, that would silently stop all scheduled jobs until restart.
+        This exists specifically for the dashboard status count refresh, which
+        needs an enabled-job count off the event loop that is current across
+        processes: a job added by the CLI or an MCP tool reaches the snapshot
+        only on the next timer tick, while this read sees it at once.
 
         Enabled semantics come from the shared ``_record_is_enabled`` predicate
         (the single owner used by ``_load`` too): a job is enabled when it is
@@ -4515,8 +4620,22 @@ class CronService:
             elif job.schedule.kind == "at" and job.schedule.at_ts:
                 delays.append(max(0.0, job.schedule.at_ts - now))
             elif job.schedule.kind == "cron":
-                # Poll every _TIMER_POLL_SECS for cron expressions
-                delays.append(_TIMER_POLL_SECS)
+                # Wake ON the next cron boundary (as `at`/`every` do), not on a
+                # flat poll whose phase is unrelated to the schedule -- a phase
+                # gap can straddle a cron's single matching minute and drop the
+                # occurrence, most visibly on low-frequency crons. Use the
+                # skip-free boundary helper: it is O(1), so a job with many
+                # skip_dates cannot make this on-loop re-arm traverse up to
+                # _MAX_SKIP_DATE_LOOKAHEAD occurrences. skip_dates is enforced at
+                # fire time by _is_due; a wake on a skipped boundary is a no-op
+                # that re-arms to the next one. _effective_delay() still caps the
+                # armed delay at _TIMER_POLL_SECS so an externally-added job is
+                # picked up within one poll.
+                cron_next = _next_cron_boundary_ts(job, now)
+                if cron_next is not None:
+                    delays.append(max(0.0, cron_next - now))
+                else:
+                    delays.append(_TIMER_POLL_SECS)
         return min(delays) if delays else None
 
     def _effective_delay(self) -> float:
@@ -4937,7 +5056,11 @@ class CronService:
                         finished_at=finished_at,
                         duration_ms=int((finished_at - exec_started_at) * 1000),
                         status=status,
-                        summary=(run_result or job.last_error or "")[:200],
+                        # Uncut on purpose: CronHistoryStore.append is the one
+                        # truncation site, applying the configured cap through
+                        # truncate_summary, which keeps URLs and the outcome
+                        # line. A slice here would cut ahead of both.
+                        summary=run_result or job.last_error or "",
                         trace=run_result or "",
                         error=job.last_error or "",
                     )
@@ -4966,7 +5089,8 @@ class CronService:
         """Return random jitter seconds based on schedule frequency.
 
         - strict_schedule=True or one-shot 'at' jobs: no jitter
-        - Sub-hourly (every < 3600s or cron with /, , or * in minute field): no jitter
+        - Sub-hourly (every < 3600s or cron whose parsed minute field fires
+          more than once per hour): no jitter
         - Hourly (every 3600–86399s or cron firing hourly): 0–5 min
         - Daily (every >= 86400s or cron firing daily): 0–59 min
         - Unrecognized cron patterns (fallback): 0–5 min
@@ -4984,11 +5108,19 @@ class CronService:
             else:
                 return 0.0  # sub-hourly jobs shouldn't be jittered
         if sched.kind == "cron" and sched.cron_expr:
+            # Ask croniter for the normalized minute set. Wildcard collapses
+            # to ["*"]; lists, ranges, steps, and their combinations expand
+            # and deduplicate, so cardinality reflects actual fires per hour.
+            try:
+                expanded, _ = croniter.expand(sched.cron_expr)
+                minute_values = expanded[0]
+            except (KeyError, TypeError, ValueError):
+                minute_values = []
+            if minute_values == ["*"] or len(minute_values) > 1:
+                return 0.0
+
             parts = sched.cron_expr.split()
             if len(parts) == 5:
-                # Sub-hourly cron (minute field has / or , or is wildcard): no jitter
-                if "/" in parts[0] or "," in parts[0] or parts[0] == "*":
-                    return 0.0
                 # Single literal hour (e.g., "0 3 * * *") = truly daily/weekly
                 if parts[1].isdigit():
                     return random.uniform(0, _JITTER_DAILY_MAX)
@@ -6028,6 +6160,7 @@ class CronService:
                     "agent_id": j.agent_id,
                     "member_id": j.member_id,
                     "memory_store": j.memory_store,
+                    "execution_context": j.execution_context,
                     "approval_mode": j.approval_mode,
                     "acked_items": j.acked_items,
                     "created_by": j.created_by,
@@ -6047,6 +6180,7 @@ class CronService:
                     "minimal_context": j.minimal_context,
                     "hide_in_chat": j.hide_in_chat,
                     "folder_id": j.folder_id,
+                    "chat_folder_id": j.chat_folder_id,
                     "model": j.model,
                     "last_retry_count": j.last_retry_count,
                     "last_retry_run_ts": j.last_retry_run_ts,

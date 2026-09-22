@@ -15,7 +15,6 @@ procedure it does not run.
 from __future__ import annotations
 
 import ast
-import functools
 import json
 import logging
 import os
@@ -23,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from source_corpus import parsed_candidates, source_texts
 
 from kiro_crew import agent
 from kiro_crew.agent_files import (
@@ -34,38 +34,36 @@ from kiro_crew.agent_files import (
     WORKER_AGENT_FILENAME,
 )
 
+# One xdist worker for the whole module: the four enumeration gates below share ONE read of
+# src/ (~1,550 files, 0.9 s and ~187 MB of text while it is warm), and under `--dist
+# loadgroup` an unmarked module is spread across workers -- so those four can land on four
+# workers, each paying the read again and each holding its own copy of the corpus at the
+# same time. Grouping keeps it single-copy per run; the copy itself is released at module
+# teardown by `conftest._release_source_corpus_after_module`.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_worker_agent")
 
-@functools.lru_cache(maxsize=1)
+
 def _package_sources() -> tuple[tuple[Path, str], ...]:
-    """Every ``kiro_crew`` module, read ONCE for the whole session.
+    """Every ``kiro_crew`` module except ``agent.py``, off the shared corpus read.
 
     Four enumeration tests below reason over the package, and one traversal serves all of
     them. A walk per test is thousands of small reads each -- seconds on Linux and far
     worse on the Windows shards, whose job budget is 40 minutes for a quarter of a
     100k-test suite. The rule-shaped assertions are what matter; repeating the traversal
     is not part of them.
+
+    The sharing is ``test/source_corpus.py``'s and NOT an ``lru_cache`` of our own,
+    because the text of the ~1,550 modules under ``src/`` is ~115 MB of retained ``str``
+    and only the corpus helper's copy can be released: ``test/conftest.py``'s
+    ``_release_source_corpus_after_module`` calls ``_clear_caches()`` at module teardown,
+    but a second tuple of ours holding those same ``str`` objects would keep every one of
+    them alive for the rest of the xdist worker's life, paid by every later test that
+    worker runs. So this stays uncached -- rebuilding a tuple of ~1,550 references costs
+    nothing measurable -- and the ``agent.py`` exclusion stays HERE with the gates rather
+    than in the shared helper, because which files a gate polices is that gate's contract
+    (and ``agent.py``, defining every name these gates hunt for, would match them all).
     """
-    from kiro_crew import agent as agent_mod
-
-    root = Path(agent_mod.__file__).resolve().parent
-    return tuple(
-        (path, path.read_text(encoding="utf-8"))
-        for path in sorted(root.rglob("*.py"))
-        if path.name != "agent.py"  # the definitions themselves
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def _package_tree(path: Path) -> "ast.Module":
-    """One module's AST, parsed once per session.
-
-    Per file rather than for the whole package: parsing every module eagerly costs more
-    than the walks this cache replaced. Callers prefilter on the TEXT first -- a file that
-    never mentions an identifier cannot reference it -- so only the handful of modules that
-    could match are parsed at all, and the AST is left doing the one job it is needed for:
-    telling a real reference apart from a mention in a docstring.
-    """
-    return ast.parse(dict(_package_sources())[path])
+    return tuple((path, text) for path, text in source_texts() if path.name != "agent.py")
 
 
 @pytest.fixture()
@@ -156,9 +154,10 @@ def test_the_worker_prompt_says_only_decision_is_an_instruction(specs):
     assert "user message" in lowered
 
 
-def test_the_worker_prompt_carries_the_verbosity_placeholder(specs):
-    """Without the token the dashboard verbosity setting never reaches this agent."""
-    assert "{{VERBOSITY_BLOCK}}" in specs[WORKER_AGENT_FILENAME]["prompt"]
+def test_the_worker_prompt_does_not_carry_the_retired_verbosity_token(specs):
+    """Reply style arrives as session-context chrome for every agent; a token
+    left here would reach the model as a literal."""
+    assert "{{VERBOSITY_BLOCK}}" not in specs[WORKER_AGENT_FILENAME]["prompt"]
 
 
 def test_the_worker_prompt_says_done_is_a_claim(specs):
@@ -916,8 +915,15 @@ def test_the_work_server_is_exempt_from_that_exclusion(worker_from_installed_def
 
 def test_the_unassignable_set_is_derived_from_the_registry(monkeypatch):
     """Derived rather than listed, so an opt-in server added tomorrow is withheld by
-    default instead of reaching the worker until somebody notices."""
-    assert agent._worker_unassignable_servers() == frozenset({"kirocrew-dashboard"})
+    default instead of reaching the worker until somebody notices.
+
+    ``kirocrew-crew-log`` is the case that exercised it: a read-only opt-in server
+    added later, withheld from the mirror with no edit here beyond widening this
+    assertion. A worker has no use for another session's crew log -- its own channel
+    to its conductor is the work ledger."""
+    assert agent._worker_unassignable_servers() == frozenset(
+        {"kirocrew-dashboard", "kirocrew-crew-log"}
+    )
     monkeypatch.setitem(
         agent._MANAGED_MCP_SERVERS,
         "kirocrew-hypothetical",
@@ -1648,16 +1654,19 @@ def test_every_spawn_path_goes_through_the_freshness_gate():
 
     materialize = {}
     fresh = {}
-    for path, source in _package_sources():
-        # Text prefilter, then AST for the candidates only. A module whose text never
-        # mentions the name cannot reference it, and the AST is what tells a call site
-        # apart from a docstring mention.
-        names = [
-            n for n in ("ensure_agent_materialized", "require_fresh_derived_spec") if n in source
-        ]
-        tree = _package_tree(path) if names else None
-        materialize[path] = _refs(tree, "ensure_agent_materialized") if tree else 0
-        fresh[path] = _refs(tree, "require_fresh_derived_spec") if tree else 0
+    # Text prefilter, then AST for the candidates only. A module whose text never mentions
+    # either name cannot reference it, so a file the corpus does not yield scores 0 for
+    # both -- what the old `tree = None` branch recorded -- and the AST is left doing the
+    # one job it is needed for: telling a real reference apart from a docstring mention.
+    # `parsed_candidates` yields one tree at a time and retains none, so the ASTs do not
+    # outlive the loop the way a per-path AST cache here did.
+    for path, _source, tree in parsed_candidates(
+        require_any=("ensure_agent_materialized", "require_fresh_derived_spec")
+    ):
+        if path.name == "agent.py":  # the definitions themselves, not a spawn path
+            continue
+        materialize[path] = _refs(tree, "ensure_agent_materialized")
+        fresh[path] = _refs(tree, "require_fresh_derived_spec")
 
     callers = {p for p, n in materialize.items() if n}
     assert callers, "no spawn path calls the materialization self-heal at all"
@@ -1730,10 +1739,13 @@ def test_the_gate_is_not_inside_a_try_at_any_spawn_site():
     gates = ("require_fresh_derived_spec", "require_unchanged_derived_spec")
     offenders: list[str] = []
     checked: set[str] = set()
-    for path, source in _package_sources():
-        if not any(gate in source for gate in gates):
+    # Same narrowed read as the enumeration above: only a file whose text spells one of
+    # the gates can hold a `try` around a call to it, and the tree is dropped after each
+    # file instead of being retained per path.
+    for path, _source, tree in parsed_candidates(require_any=gates):
+        if path.name == "agent.py":  # the definitions themselves, not a spawn site
             continue
-        for node in ast.walk(_package_tree(path)):
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Try):
                 continue
             names = {
@@ -1919,6 +1931,7 @@ def test_a_re_derive_during_the_hosts_own_pre_spawn_work_does_not_kill_the_sessi
     rt._work_dir = tmp_path / "wd"
     rt._model = None
     rt._sandbox_mode = "auto"
+    rt._member_context = False
     # ``_harness`` is a cached property over the backend, so the stub is installed
     # through the cache slot the runtime itself fills.
     rt._harness_resolved = _EditingHarness()
@@ -2732,24 +2745,56 @@ def test_the_client_bracket_judges_the_snapshot_its_own_spawn_captured(monkeypat
 def test_every_set_mode_send_goes_through_the_one_bracketed_helper():
     """A ``set_mode`` naming an agent is a load of that agent's spec, so it needs the
     same bracket the spawn has -- and there is exactly ONE body that provides it. Both
-    session-start paths (create and resume) call it; neither sends the mode method
-    itself. A protocol written twice is two protocols the moment one copy is edited, so
-    the pin is on the single helper plus the rule that nothing else sends the method."""
+    session-start paths (create and resume) reach it; no body on either path sends the
+    mode method itself. A protocol written twice is two protocols the moment one copy is
+    edited, so the pin is on the single helper plus the rule that nothing else sends the
+    method. Activation may sit in a body the entry point hands off to -- ``create_session``
+    finishes in ``_finish_create_session``, which the late-adoption collector calls too --
+    so the walk FOLLOWS the ``self`` calls instead of naming one method."""
     import ast
     import inspect
     import textwrap
 
     from kiro_crew.acp import runtime as runtime_mod
 
+    def _tree(fn):
+        return ast.parse(textwrap.dedent(inspect.getsource(fn)))
+
+    def _handoffs(fn):
+        return {
+            n.func.attr
+            for n in ast.walk(_tree(fn))
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "self"
+        }
+
+    def _sends_the_mode(fn):
+        return any(
+            isinstance(n, ast.Call)
+            and any(isinstance(a, ast.Name) and a.id == "METHOD_SET_MODE" for a in n.args)
+            for n in ast.walk(_tree(fn))
+        )
+
     helper = runtime_mod.AcpRuntime._activate_mode_bracketed
-    for method in (runtime_mod.AcpRuntime.create_session, runtime_mod.AcpRuntime.load_session):
-        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
-        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-        assert (
-            "METHOD_SET_MODE" not in names
-        ), f"{method.__qualname__} sends set_mode itself instead of through the helper"
-        assert helper.__name__ in attrs, f"{method.__qualname__} does not activate via the helper"
+    for entry in (runtime_mod.AcpRuntime.create_session, runtime_mod.AcpRuntime.load_session):
+        on_path: set[str] = set()
+        pending = [entry.__name__]
+        while pending:
+            name = pending.pop()
+            fn = getattr(runtime_mod.AcpRuntime, name, None)
+            if name in on_path or not inspect.isfunction(fn):
+                continue
+            on_path.add(name)
+            pending.extend(_handoffs(fn))
+        assert helper.__name__ in on_path, f"{entry.__qualname__} does not activate via the helper"
+        senders_on_path = sorted(
+            n for n in on_path if _sends_the_mode(getattr(runtime_mod.AcpRuntime, n))
+        )
+        assert senders_on_path == [
+            helper.__name__
+        ], f"{entry.__qualname__} sends set_mode outside the helper: {senders_on_path}"
 
     # The whole module SENDS the method from exactly one place: the helper. The
     # transport's own method-name table (a dict literal mapping the constant to a
@@ -2837,7 +2882,7 @@ def test_a_revocation_between_the_payload_build_and_activation_is_caught(tmp_pat
     revoked = json.loads(json.dumps(_DEFAULT_SPEC_ON_DISK))
     revoked["mcpServers"].pop("builder-mcp")
 
-    async def _payload(agent_name, *, member_dispatch=False):
+    async def _payload(agent_name, *, member_dispatch=False, session_key=""):
         # The projection's gate, then the payload built from what it verified -- spec A.
         snapshot = agent.require_fresh_derived_spec(agent_name, str(tmp_path / "wd"))
         # The revocation lands AFTER the definition is registered and BEFORE activation.
@@ -2951,6 +2996,7 @@ class _FakeHandle:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.drained = False
+        self.native_context_documents = {}
 
     def store_session_config(self, resp):
         return None
@@ -2991,6 +3037,8 @@ def _runtime_for_create_session(monkeypatch, tmp_path, sent, terminated):
     rt._agent = "kirocrew"
     rt._crew_agent = "kirocrew"
     rt._work_dir = tmp_path / "wd"
+    rt._member_context = False
+    rt._native_launch_sources = {}
     rt._mcp_gateway_overlay = None
     rt._agent_capabilities = {}
     rt._session_queues = {}
@@ -3010,7 +3058,7 @@ def _runtime_for_create_session(monkeypatch, tmp_path, sent, terminated):
         sent.append(method)
         return resp
 
-    async def _kas_custom_agents(agent, *, member_dispatch=False):
+    async def _kas_custom_agents(agent, *, member_dispatch=False, session_key=""):
         # The kiro backend builds no wire surface, so it carries no payload and no payload
         # snapshot -- which is what makes the set_mode line itself the consumed load.
         from kiro_crew.acp.harness import SessionExtras

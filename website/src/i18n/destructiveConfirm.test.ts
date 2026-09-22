@@ -200,6 +200,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'components.appstore.trustAppModal.on_cancel', // bare {{app}} #6016
   'components.appstore.trustAppModal.scope', // bare {{app}} #6016
   'components.appstore.trustAppModal.title', // bare {{app}} on the code-execution grant #5725
+  'pages.appDetailPage.session_approval_confirm_title', // bare {{name}} on the chat-control grant #11192
   'components.artifactFolderDeleteDialog.delete_folder', // already quoted; pin #5725
   'pages.artifactDeployPage.destroy_confirm',
   'pages.artifactDeployPage.recall_confirm',
@@ -218,6 +219,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'pages.schedulePage.cronFolders.confirm_delete_folder',
   'pages.schedulePage.delete_named_job', // ASCII quotes → locale pair #5725
   'pages.settings.remoteCrewPanel.confirm_delete_of', // was fully bare #4821
+  'pages.settings.remoteCrewPanel.confirm_cancel_remove', // instance operand on the armed cancel, quoted per locale
   'settings.secrets.delete_confirm',
   'settings.secrets.delete_managed_confirm',
   'pages.settings.securityPanel.trustedApps.revoke_confirm_title',
@@ -284,6 +286,10 @@ export const CONFIRM_OPERAND_KEY_EXEMPTIONS: Record<string, string> = {
     + 'mints itself (uuid4, never user-supplied text), and it already sits inside '
     + 'parentheses after the words "another install" -- so the risk glyph quotes exist '
     + 'to close, a crafted operand blending into the sentence, cannot arise here (#9554)',
+  'pages.settings.connectionsPanel.remove_confirm':
+    'the {{provider}} operand is a Connections registry display name (GitHub, Asana), '
+    + 'a fixed vendor brand never typed by a user, and the kind words "OAuth app" sit '
+    + 'next to it -- a brand name in glyph quotes would read as a user-supplied label',
 }
 
 function placeholdersIn(value: string): string[] {

@@ -773,6 +773,9 @@ class Permissions:
     network: bool = False
     memory: str = ""  # "", "app-scoped", or "shared"
     cron: bool = False
+    #: May send turns, choose response options, approve or deny pending tool
+    #: requests, and change approval modes for user-owned sessions.
+    sessionApproval: bool = False  # noqa: N815
     #: May spawn a background agent through the host's subagent manager.
     #: Declared rather than implicit so "which apps can start an agent" is
     #: auditable from the manifest instead of from an app's import graph.
@@ -803,6 +806,8 @@ class Permissions:
             d["memory"] = self.memory
         if self.cron:
             d["cron"] = True
+        if self.sessionApproval:
+            d["sessionApproval"] = True
         if self.spawn:
             d["spawn"] = True
         if self.jobs:
@@ -832,6 +837,7 @@ class Permissions:
             network=data.get("network") is True,
             memory=str(data.get("memory", "")),
             cron=data.get("cron") is True,
+            sessionApproval=data.get("sessionApproval") is True,  # noqa: N815
             spawn=data.get("spawn") is True,
             jobs=data.get("jobs") is True,
             exposeToApps=_granted_list(data.get("exposeToApps")),  # noqa: N815

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1108,7 +1109,12 @@ class TestFirstPrinciplesReview:
         # surface this lane exists to remove -- including "add a doc/RFC".
         contract = _fp_contract()
         assert "EVERY suggestion you emit must be a SUBTRACTION" in contract
-        assert "### Subtractions" in contract
+        # The subtraction rides on the item it shrinks -- a `Subtraction:` line
+        # under `### Not justified as shipped` -- so it is never a second
+        # section that says the finding again (see
+        # TestFirstPrinciplesOneStatementPerProblem).
+        assert "`Subtraction: <the exact symbol/field/file to DELETE, SHRINK, DEFER or" in contract
+        assert "### Subtractions" not in contract
         assert "### Suggestions" not in contract
         assert 'no "add an RFC"' in contract
 
@@ -4037,6 +4043,616 @@ class TestOpusTwoStageArchitecture:
         assert "--json-schema" not in _line_containing(workflow, "--allowedTools")
         assert "[OPUS-REVIEWED] $HEAD" in workflow
         assert "[BLOCK-MERGE] $HEAD" in workflow
+
+
+_CAPTURE_HEAD = "5bba265fbfef8cefb032663993213772debf8c6c"
+#: Strings planted in the execution-file fixtures that must NEVER reach the step's
+#: stdout or stderr on the failing branch: a tool argument, the private payload a
+#: tool returned (arbitrary text the reviewer read; the redactor is not what keeps
+#: it out of the log, the branch simply never prints it), and the model's own
+#: candidate text. Plain labelled sentinels on purpose: a credential-shaped value
+#: here would trip push protection and proves nothing this test needs.
+_CAPTURE_SENTINELS = (
+    "SENTINEL_TOOL_ARG_PATH",
+    "SENTINEL_TOOL_PAYLOAD",
+    "SENTINEL_PRIVATE_TOOL_RESULT",
+    "SENTINEL_RESULT_TEXT",
+    "SENTINEL_UNPARSEABLE",
+)
+_DIAG_KEYS = (
+    "exec_file",
+    "captured_bytes",
+    "result_messages",
+    "extracted_chars",
+    "marker_in_extracted",
+    "short_sha_marker_only",
+    "placeholder_marker",
+    "marker_in_assistant",
+    "compact_boundaries",
+    "permission_denials",
+    "denied_read",
+    "denied_grep",
+    "denied_glob",
+    "denied_bash",
+    "denied_other",
+)
+_DENIAL_KEYS = ("denied_read", "denied_grep", "denied_glob", "denied_bash", "denied_other")
+
+
+def _capture_messages(result_text: str) -> list[dict]:
+    """A transcript in the pinned action's shape: init, a tool round-trip, two
+    compaction boundaries, then the result message the extraction selects."""
+    return [
+        {"type": "system", "subtype": "init", "session_id": "s"},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/x/SENTINEL_TOOL_ARG_PATH"},
+                    }
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": "SENTINEL_PRIVATE_TOOL_RESULT SENTINEL_TOOL_PAYLOAD",
+                    }
+                ]
+            },
+        },
+        {"type": "system", "subtype": "compact_boundary"},
+        {"type": "system", "subtype": "compact_boundary"},
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "num_turns": 3,
+            "permission_denials": [
+                {"tool_name": "Bash", "tool_input": {"command": "cat /x/SENTINEL_TOOL_ARG_PATH"}},
+                {"tool_name": "Bash"},
+                {"tool_name": "TodoWrite"},
+            ],
+            "result": result_text,
+        },
+    ]
+
+
+def _exit_line_at(script: str, start: int) -> int:
+    """Offset of the first standalone `exit 1` LINE at or after `start`.
+
+    A substring search would stop inside a comment that merely mentions the exit."""
+    match = re.search(r"(?m)^\s*exit 1\s*$", script[start:])
+    assert match is not None, "no exit 1 line after the error"
+    return start + match.start()
+
+
+def _diag_values(output: str) -> dict[str, str]:
+    """Parse the one diagnostics line into its fixed keys; fail if absent."""
+    lines = [ln for ln in output.splitlines() if "discovery-capture-diagnostics" in ln]
+    assert len(lines) == 1, f"expected exactly one diagnostics line, got {lines!r}"
+    values = dict(tok.split("=", 1) for tok in lines[0].split()[1:])
+    assert set(values) == {"head", *_DIAG_KEYS}, sorted(values)
+    return values
+
+
+class TestOpusDiscoveryCaptureExecutes:
+    """Run the ACTUAL `Capture discovery candidates` step from both Opus lanes,
+    with the real jq and the real redaction, against execution files of every
+    shape the extraction accepts.
+
+    The structural tests above prove the failing branch exists and exits
+    nonzero; only executing the step proves the extraction still selects the
+    result on each accepted shape, that the cap fails rather than truncates,
+    and -- the property that matters most on this branch -- that the
+    diagnostics printed when the marker is missing carry NOTHING the model or a
+    tool wrote. A transcript echoes the diff and whatever `Read` returned, so a
+    diagnostic that quoted even its tail would be a payload leak on a public
+    repo. Every fixture therefore plants sentinel strings in exactly those
+    places and the assertion is over the whole of stdout and stderr.
+    """
+
+    LANES = ("claude-review.yml", "fork-opus-review.yml")
+
+    def _run(
+        self,
+        lane: str,
+        tmp_path: Path,
+        exec_file: "Path | None",
+        head: str = _CAPTURE_HEAD,
+        path_prefix: "Path | None" = None,
+    ) -> "subprocess.CompletedProcess[str]":
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None or shutil.which("perl") is None:
+            pytest.skip("the capture step needs Bash, jq and perl")
+        script = _step_script(_workflow(lane), "Capture discovery candidates")
+        step = tmp_path / "step.sh"
+        step.write_text(script, encoding="utf-8")
+        work = tmp_path / "work"
+        work.mkdir(exist_ok=True)
+        path = os.environ.get("PATH", "")
+        # A directory placed ahead of PATH lets a test substitute one utility
+        # (e.g. a BSD-shaped `wc`) while everything else stays the host's.
+        if path_prefix is not None:
+            path = f"{path_prefix}{os.pathsep}{path}"
+        env = _child_env(
+            {
+                "PATH": path,
+                # An unset EXEC_FILE is what the runner hands over when the action
+                # wrote no execution file at all.
+                "EXEC_FILE": "" if exec_file is None else str(exec_file),
+                "HEAD": head,
+                "MAX_CANDIDATE_BYTES": "200000",
+            }
+        )
+        # `bash -e`: the runner's default shell for a `run:` block without an
+        # explicit `shell:`; the step must behave under errexit, not only in a
+        # forgiving interactive Bash.
+        return subprocess.run(
+            [bash, "-e", str(step)],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=work,
+            env=env,
+            timeout=60,
+        )
+
+    @staticmethod
+    def _combined(result: "subprocess.CompletedProcess[str]") -> str:
+        return (result.stdout or "") + (result.stderr or "")
+
+    def _write(self, tmp_path: Path, name: str, payload: object, jsonl: bool = False) -> Path:
+        path = tmp_path / name
+        if jsonl:
+            assert isinstance(payload, list)
+            path.write_text("".join(json.dumps(m) + "\n" for m in payload), encoding="utf-8")
+        else:
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize("lane", LANES)
+    @pytest.mark.parametrize("shape", ["array", "object", "jsonl"])
+    def test_marker_present_passes_on_every_accepted_shape(
+        self, lane: str, shape: str, tmp_path: Path
+    ) -> None:
+        text = f"CANDIDATE 1 — a.py:1 — t\nEvidence: x\n[OPUS-DISCOVERY] {_CAPTURE_HEAD}"
+        messages = _capture_messages(text)
+        if shape == "object":
+            exec_file = self._write(tmp_path, "exec.json", messages[-1])
+        else:
+            exec_file = self._write(tmp_path, "exec.json", messages, jsonl=(shape == "jsonl"))
+        result = self._run(lane, tmp_path, exec_file)
+        assert result.returncode == 0, _proc_log(result)
+        captured = (tmp_path / "work" / ".review-candidates.md").read_text(encoding="utf-8")
+        # The result text -- and only the result text -- is what stage 2 gets.
+        assert captured.rstrip("\n").endswith(f"[OPUS-DISCOVERY] {_CAPTURE_HEAD}"), captured
+        assert "SENTINEL_TOOL_PAYLOAD" not in captured
+        assert "SENTINEL_TOOL_ARG_PATH" not in captured
+        # The success path prints the candidates as a tuning signal (unchanged)
+        # and never the diagnostics line, which belongs to the failing branch.
+        out = self._combined(result)
+        assert "stage 1 candidates" in out, _proc_log(result)
+        assert "discovery-capture-diagnostics" not in out, _proc_log(result)
+        assert "::error::" not in out, _proc_log(result)
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_missing_marker_fails_and_prints_only_fixed_shape_diagnostics(
+        self, lane: str, tmp_path: Path
+    ) -> None:
+        # A result that stops one line short: candidates, no marker.
+        text = "CANDIDATE 1 — a.py:1 — SENTINEL_RESULT_TEXT\nEvidence: SENTINEL_RESULT_TEXT"
+        exec_file = self._write(tmp_path, "exec.json", _capture_messages(text))
+        result = self._run(lane, tmp_path, exec_file)
+        assert result.returncode == 1, _proc_log(result)
+        out = self._combined(result)
+        assert "::error::Discovery produced no [OPUS-DISCOVERY] marker for " + _CAPTURE_HEAD in out
+        assert "stage 1 candidates" not in out, "the failing branch must not print candidates"
+        for sentinel in _CAPTURE_SENTINELS:
+            assert sentinel not in out, f"{lane}: {sentinel} leaked into the step output"
+        values = _diag_values(out)
+        assert values["head"] == _CAPTURE_HEAD
+        assert values["exec_file"] == "array"
+        assert values["result_messages"] == "1"
+        assert values["extracted_chars"] == str(len(text))
+        assert values["marker_in_extracted"] == "false"
+        assert values["short_sha_marker_only"] == "false"
+        assert values["placeholder_marker"] == "false"
+        assert values["compact_boundaries"] == "2"
+        assert values["permission_denials"] == "3"
+        # The fixture's three denials split by exact tool name; TodoWrite is
+        # not one of the four named tools, so it lands in `other`.
+        assert values["denied_bash"] == "2"
+        assert values["denied_other"] == "1"
+        for key in ("denied_read", "denied_grep", "denied_glob"):
+            assert values[key] == "0", (key, values[key])
+        # No assistant text block in this fixture carries the marker.
+        assert values["marker_in_assistant"] == "false"
+        # The candidate file is exactly the redacted result plus a newline, so
+        # its byte count is a number a reader can reconcile with the chars count.
+        captured = (tmp_path / "work" / ".review-candidates.md").read_bytes()
+        assert values["captured_bytes"] == str(len(captured))
+        # The error line precedes the diagnostics: a diagnostics failure can
+        # only ever lose the notice, never the verdict.
+        assert out.index("::error::") < out.index("::notice::discovery-capture-diagnostics")
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_marker_in_an_earlier_assistant_message_is_reported_not_rescued(
+        self, lane: str, tmp_path: Path
+    ) -> None:
+        """The prompt says the marker ends the LAST message. A model that writes
+        candidates plus the marker, then keeps working and closes with a short
+        note, leaves the extraction a final `.result` with no marker. The gate
+        must still fail (the file stage 2 would read has no marker, and nothing
+        may lift the marker out of an earlier message into it), and the
+        diagnostics must say the marker WAS written -- the one boolean that
+        separates this fixture from one with no marker in scanned assistant
+        text blocks. The assistant text is model output, so its sentinel must
+        stay out of the log like the rest."""
+        messages = _capture_messages("Re-checked the two call sites; SENTINEL_RESULT_TEXT")
+        messages.insert(
+            -1,
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "CANDIDATE 1 — a.py:1 — SENTINEL_ASSISTANT_TEXT\n"
+                                f"[OPUS-DISCOVERY] {_CAPTURE_HEAD}"
+                            ),
+                        }
+                    ]
+                },
+            },
+        )
+        exec_file = self._write(tmp_path, "exec.json", messages)
+        result = self._run(lane, tmp_path, exec_file)
+        assert result.returncode == 1, _proc_log(result)
+        out = self._combined(result)
+        assert "::error::Discovery produced no [OPUS-DISCOVERY] marker" in out
+        for sentinel in (*_CAPTURE_SENTINELS, "SENTINEL_ASSISTANT_TEXT"):
+            assert sentinel not in out, f"{lane}: {sentinel} leaked into the step output"
+        captured = (tmp_path / "work" / ".review-candidates.md").read_text(encoding="utf-8")
+        assert f"[OPUS-DISCOVERY] {_CAPTURE_HEAD}" not in captured, "must not be rescued"
+        assert "SENTINEL_ASSISTANT_TEXT" not in captured, "stage 2 gets the result only"
+        values = _diag_values(out)
+        assert values["marker_in_extracted"] == "false"
+        assert values["marker_in_assistant"] == "true"
+        assert values["result_messages"] == "1"
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_diagnostics_stay_one_token_per_key_under_a_padding_wc(
+        self, lane: str, tmp_path: Path
+    ) -> None:
+        """BSD `wc` (macOS) prints its count right-aligned in a padded field,
+        `     294` rather than `294`. Substituted raw into the diagnostics line
+        that padding split `captured_bytes=` from its value and every reader of
+        the line saw a token with no `=` (20 failures on the macOS CI matrix,
+        job 103815720826). The producer must normalise the number; the parser
+        stays strict, so a regression is a failure here and not a tolerated
+        shape. The control is deterministic on every host: a `wc` shim that pads
+        exactly as BSD does is placed ahead of PATH for the step only."""
+        bash = _bash()
+        real_wc = shutil.which("wc")
+        if bash is None or real_wc is None:
+            pytest.skip("no usable bash/wc on PATH")
+        shim_dir = tmp_path / "bsd-bin"
+        shim_dir.mkdir()
+        shim = shim_dir / "wc"
+        # BSD wc: each count in a right-aligned field of width 8 (one count
+        # here, so no trailing filename).
+        shim_lines = [
+            "#!/usr/bin/env bash",
+            f'out="$({shlex.quote(Path(real_wc).as_posix())} "$@")"',
+            "printf '%8s\\n' \"$out\"",
+        ]
+        shim.write_text("\n".join(shim_lines) + "\n", encoding="utf-8")
+        shim.chmod(0o755)
+        # The control really produces the platform shape.
+        probe = subprocess.run(
+            [bash, str(shim), "-c"],
+            input=b"abc",
+            capture_output=True,
+            check=True,
+            timeout=10,
+            cwd=tmp_path,
+        )
+        assert probe.stdout == b"       3\n", probe.stdout
+        text = "CANDIDATE 1 — a.py:1 — SENTINEL_RESULT_TEXT"
+        exec_file = self._write(tmp_path, "exec.json", _capture_messages(text))
+        result = self._run(lane, tmp_path, exec_file, path_prefix=shim_dir)
+        assert result.returncode == 1, _proc_log(result)
+        out = self._combined(result)
+        for sentinel in _CAPTURE_SENTINELS:
+            assert sentinel not in out, f"{lane}: {sentinel} leaked into the step output"
+        # Every token on the line is `key=value`; the strict parser enforces it.
+        values = _diag_values(out)
+        captured = (tmp_path / "work" / ".review-candidates.md").read_bytes()
+        assert values["captured_bytes"] == str(len(captured))
+        assert values["extracted_chars"] == str(len(text))
+        assert values["marker_in_extracted"] == "false"
+        # The transcript counts pass through `wc -w` too; padding must not turn
+        # them into unknowns.
+        assert values["result_messages"] == "1"
+        assert values["compact_boundaries"] == "2"
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_denials_are_counted_by_exact_tool_name_and_never_echoed(
+        self, lane: str, tmp_path: Path
+    ) -> None:
+        """`permission_denials` alone could not say WHICH tool the reviewer was
+        refused (4 denials on the run that lost its marker). The split counts
+        match `tool_name` exactly against the four tools the lane allows and
+        fold everything else into `other`: a name outside the four, a
+        lower-case variant, a non-string name, an entry with no name, and an
+        entry that is not an object at all. The five sum to the total. Tool
+        names and arguments are model-chosen text, so they are planted as
+        sentinels and must not reach stdout or stderr."""
+        messages = _capture_messages("CANDIDATE 1 — a.py:1 — SENTINEL_RESULT_TEXT")
+        messages[-1]["permission_denials"] = [
+            {"tool_name": "Read", "tool_input": {"file_path": "/x/SENTINEL_TOOL_ARG_PATH"}},
+            {"tool_name": "Grep", "tool_input": {"pattern": "SENTINEL_TOOL_ARG_PATH"}},
+            {"tool_name": "Glob"},
+            {"tool_name": "Bash", "tool_input": {"command": "wc -l SENTINEL_TOOL_ARG_PATH"}},
+            {"tool_name": "Bash"},
+            {"tool_name": "SENTINEL_TOOL_NAME"},
+            {"tool_name": "read"},
+            {"tool_name": 123},
+            {"tool_use_id": "no name here"},
+            "SENTINEL_TOOL_NAME as a bare string entry",
+        ]
+        exec_file = self._write(tmp_path, "exec.json", messages)
+        result = self._run(lane, tmp_path, exec_file)
+        assert result.returncode == 1, _proc_log(result)
+        out = self._combined(result)
+        assert "::error::Discovery produced no [OPUS-DISCOVERY] marker" in out
+        for sentinel in (*_CAPTURE_SENTINELS, "SENTINEL_TOOL_NAME"):
+            assert sentinel not in out, f"{lane}: {sentinel} leaked into the step output"
+        values = _diag_values(out)
+        assert values["permission_denials"] == "10"
+        assert values["denied_read"] == "1"
+        assert values["denied_grep"] == "1"
+        assert values["denied_glob"] == "1"
+        assert values["denied_bash"] == "2"
+        assert values["denied_other"] == "5"
+        assert sum(int(values[k]) for k in _DENIAL_KEYS) == int(values["permission_denials"])
+        # Still the same fail-closed outcome: no marker was rescued and the
+        # candidate file is exactly the result text plus a newline.
+        captured = (tmp_path / "work" / ".review-candidates.md").read_text(encoding="utf-8")
+        assert f"[OPUS-DISCOVERY] {_CAPTURE_HEAD}" not in captured
+        assert values["marker_in_extracted"] == "false"
+
+    @pytest.mark.parametrize("lane", LANES)
+    @pytest.mark.parametrize(
+        ("tail", "short_only", "placeholder"),
+        [
+            (f"[OPUS-DISCOVERY] {_CAPTURE_HEAD[:7]}", "true", "false"),
+            ("[OPUS-DISCOVERY] <HEAD_SHA>", "false", "true"),
+        ],
+    )
+    def test_near_miss_markers_still_fail_and_are_classified(
+        self, lane: str, tail: str, short_only: str, placeholder: str, tmp_path: Path
+    ) -> None:
+        """A short SHA or the literal placeholder is NOT the marker, and the gate
+        must say so; the diagnostics name which near miss it was, as booleans."""
+        text = "CANDIDATE 1 — a.py:1 — SENTINEL_RESULT_TEXT\n" + tail
+        exec_file = self._write(tmp_path, "exec.json", _capture_messages(text))
+        result = self._run(lane, tmp_path, exec_file)
+        assert result.returncode == 1, _proc_log(result)
+        out = self._combined(result)
+        for sentinel in _CAPTURE_SENTINELS:
+            assert sentinel not in out, f"{lane}: {sentinel} leaked into the step output"
+        values = _diag_values(out)
+        assert values["marker_in_extracted"] == "false"
+        assert values["short_sha_marker_only"] == short_only
+        assert values["placeholder_marker"] == placeholder
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_diagnostics_measure_the_extracted_text_not_the_last_result(
+        self, lane: str, tmp_path: Path
+    ) -> None:
+        """On a JSONL transcript the extraction's FIRST jq form emits one line per
+        record (`.result // ""`), so `out` is every result concatenated, empty
+        lines included. The diagnostics must describe that text -- the text the
+        marker grep saw -- not a re-derived "last result", which here would hide
+        the short-SHA near miss sitting in the earlier result."""
+        first = f"CANDIDATE 1 — a.py:1 — SENTINEL_FIRST\n[OPUS-DISCOVERY] {_CAPTURE_HEAD[:7]}"
+        second = "CANDIDATE 2 — b.py:2 — SENTINEL_RESULT_TEXT"
+        messages = _capture_messages(first)
+        messages.append(dict(messages[-1], result=second))
+        exec_file = self._write(tmp_path, "exec.jsonl", messages, jsonl=True)
+        result = self._run(lane, tmp_path, exec_file)
+        assert result.returncode == 1, _proc_log(result)
+        out = self._combined(result)
+        for sentinel in (*_CAPTURE_SENTINELS, "SENTINEL_FIRST"):
+            assert sentinel not in out, f"{lane}: {sentinel} leaked into the step output"
+        # What `jq -r '.result // ""'` produces for this file, then `$(...)`
+        # strips the trailing newline.
+        expected_out = "\n".join(m.get("result", "") for m in messages).rstrip("\n")
+        captured = (tmp_path / "work" / ".review-candidates.md").read_text(encoding="utf-8")
+        assert captured == expected_out + "\n", "the extraction itself must be unchanged"
+        values = _diag_values(out)
+        assert values["exec_file"] == "jsonl"
+        assert values["result_messages"] == "2"
+        assert values["extracted_chars"] == str(len(expected_out))
+        assert values["marker_in_extracted"] == "false"
+        # Last-result-only measurement would report false here.
+        assert values["short_sha_marker_only"] == "true"
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_marker_removed_by_redaction_is_reported_as_present_before_it(
+        self, lane: str, tmp_path: Path
+    ) -> None:
+        """The redactor rewrites `aws_session_token=<token>` to `[REDACTED]`, so a
+        marker glued to that key is destroyed before the grep. The gate still
+        fails (correct: the file stage 2 would read has no marker), and the
+        diagnostics must say the marker WAS in the extracted text -- that is the
+        one signal that separates "model never wrote it" from "capture lost it"."""
+        text = (
+            "CANDIDATE 1 — a.py:1 — SENTINEL_RESULT_TEXT\n"
+            f"aws_session_token=[OPUS-DISCOVERY] {_CAPTURE_HEAD}"
+        )
+        exec_file = self._write(tmp_path, "exec.json", _capture_messages(text))
+        result = self._run(lane, tmp_path, exec_file)
+        assert result.returncode == 1, _proc_log(result)
+        out = self._combined(result)
+        assert "::error::Discovery produced no [OPUS-DISCOVERY] marker" in out
+        for sentinel in _CAPTURE_SENTINELS:
+            assert sentinel not in out, f"{lane}: {sentinel} leaked into the step output"
+        captured = (tmp_path / "work" / ".review-candidates.md").read_text(encoding="utf-8")
+        assert f"[OPUS-DISCOVERY] {_CAPTURE_HEAD}" not in captured, "redaction should have hit"
+        assert "[REDACTED]" in captured
+        values = _diag_values(out)
+        assert values["marker_in_extracted"] == "true"
+        assert values["extracted_chars"] == str(len(text))
+        assert values["short_sha_marker_only"] == "false"
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_non_string_result_is_measured_as_the_json_the_extraction_emits(
+        self, lane: str, tmp_path: Path
+    ) -> None:
+        """`jq -r` renders a non-string `.result` as JSON text, and that text is
+        what lands in the candidate file; the diagnostics count that, not zero."""
+        messages = _capture_messages("placeholder")
+        messages[-1]["result"] = {"k": "SENTINEL_RESULT_TEXT"}
+        exec_file = self._write(tmp_path, "exec.json", messages)
+        result = self._run(lane, tmp_path, exec_file)
+        assert result.returncode == 1, _proc_log(result)
+        out = self._combined(result)
+        for sentinel in _CAPTURE_SENTINELS:
+            assert sentinel not in out, f"{lane}: {sentinel} leaked into the step output"
+        captured = (tmp_path / "work" / ".review-candidates.md").read_text(encoding="utf-8")
+        assert "SENTINEL_RESULT_TEXT" in captured, "the extraction renders the object as JSON"
+        values = _diag_values(out)
+        assert values["result_messages"] == "1"
+        # ASCII payload, untouched by redaction: file = out + newline.
+        assert values["extracted_chars"] == str(len(captured) - 1)
+        assert values["marker_in_extracted"] == "false"
+
+    @pytest.mark.parametrize("lane", LANES)
+    @pytest.mark.parametrize(
+        ("content", "shape"),
+        [
+            ("{not json SENTINEL_UNPARSEABLE", "unparseable"),
+            ("", "empty"),
+            ('"SENTINEL_UNPARSEABLE"', "other"),
+        ],
+    )
+    def test_malformed_execution_file_fails_closed_with_a_fixed_classification(
+        self, lane: str, content: str, shape: str, tmp_path: Path
+    ) -> None:
+        """jq's own parse error names the offending bytes; it must never surface.
+        The classification is one word from a closed set and every count reads
+        `unknown` rather than a guess."""
+        exec_file = tmp_path / "exec.json"
+        exec_file.write_text(content, encoding="utf-8")
+        result = self._run(lane, tmp_path, exec_file)
+        assert result.returncode == 1, _proc_log(result)
+        out = self._combined(result)
+        assert "SENTINEL_UNPARSEABLE" not in out, _proc_log(result)
+        assert "parse error" not in out, _proc_log(result)
+        assert "jq:" not in out, _proc_log(result)
+        values = _diag_values(out)
+        assert values["exec_file"] == shape
+        # The extraction produced nothing on every one of these, so the
+        # extracted-text measurements are real zeros, not unknowns.
+        assert values["extracted_chars"] == "0"
+        assert values["marker_in_extracted"] == "false"
+        if shape == "unparseable":
+            for key in (
+                "result_messages",
+                "compact_boundaries",
+                "permission_denials",
+                "marker_in_assistant",
+                *_DENIAL_KEYS,
+            ):
+                assert values[key] == "unknown", (key, values[key])
+        else:
+            assert values["result_messages"] == "0"
+            assert values["compact_boundaries"] == "0"
+            assert values["permission_denials"] == "0"
+            assert values["marker_in_assistant"] == "false"
+            for key in _DENIAL_KEYS:
+                assert values[key] == "0", (key, values[key])
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_absent_execution_file_fails_closed(self, lane: str, tmp_path: Path) -> None:
+        for exec_file in (None, tmp_path / "does-not-exist.json"):
+            result = self._run(lane, tmp_path, exec_file)
+            assert result.returncode == 1, _proc_log(result)
+            values = _diag_values(self._combined(result))
+            assert values["exec_file"] == "absent"
+            assert values["captured_bytes"] == "0"
+            assert values["result_messages"] == "unknown"
+            assert values["marker_in_assistant"] == "unknown"
+            for key in _DENIAL_KEYS:
+                assert values[key] == "unknown", (key, values[key])
+            assert values["extracted_chars"] == "0"
+
+    @pytest.mark.parametrize("lane", LANES)
+    def test_marker_present_but_over_cap_fails_not_truncates(
+        self, lane: str, tmp_path: Path
+    ) -> None:
+        filler = ("CANDIDATE 1 — a.py:1 — t\nEvidence: " + "x" * 90 + "\n") * 2100
+        text = filler + f"[OPUS-DISCOVERY] {_CAPTURE_HEAD}"
+        assert len(text.encode("utf-8")) > 200000
+        exec_file = self._write(tmp_path, "exec.json", _capture_messages(text))
+        result = self._run(lane, tmp_path, exec_file)
+        assert result.returncode == 1, _proc_log(result)
+        out = self._combined(result)
+        assert "over the 200000 limit" in out, _proc_log(result)
+        # Not the missing-marker branch: the marker WAS there, so no diagnostics.
+        assert "discovery-capture-diagnostics" not in out
+        assert "Discovery produced no [OPUS-DISCOVERY] marker" not in out
+        # The file is intact, not cut to the cap.
+        captured = (tmp_path / "work" / ".review-candidates.md").read_bytes()
+        assert len(captured) > 200000
+
+    def test_failing_branch_prints_no_file_content_by_construction(self) -> None:
+        """Structural companion to the execution tests: between the error and
+        the exit, the branch may echo fixed keys and validated tokens only."""
+
+        def _code(script: str) -> str:
+            start = script.index("::error::Discovery produced no [OPUS-DISCOVERY] marker")
+            end = _exit_line_at(script, start)
+            return "\n".join(
+                ln for ln in script[start:end].splitlines() if not ln.strip().startswith("#")
+            )
+
+        for lane in self.LANES:
+            branch = _code(_step_script(_workflow(lane), "Capture discovery candidates"))
+            # No command that copies file content onto the log, in command
+            # position (line start, pipe, separator or subshell) on any code line
+            # -- comments are stripped so prose cannot match, and `--arg head` /
+            # `head=` are arguments, not commands.
+            leak = re.search(r"(?m)(?:^|[|;(&]|\$\()\s*(cat|tail|head|sed|awk|less|more)\b", branch)
+            assert leak is None, f"{lane}: {leak.group(0)!r} in the failing branch"
+            # Every jq value passes through a shape validator before it is echoed.
+            for key in _DIAG_KEYS[2:]:
+                assert f"{key}=$(diag_" in branch, f"{lane}: {key} is echoed unvalidated"
+            assert "2>/dev/null" in branch, f"{lane}: jq stderr would name file bytes"
+            # The extracted text reaches jq over stdin, never as an argument.
+            assert '--arg head "$HEAD"' in branch, lane
+            assert "--arg" not in branch.replace(
+                '--arg head "$HEAD"', ""
+            ), f"{lane}: model text must not enter argv"
+            assert "printf '%s' \"${out-}\" | jq -rRs" in branch, lane
+        # Both lanes carry the identical branch, modulo their sync comment.
+        same, fork = (
+            _code(_step_script(_workflow(lane), "Capture discovery candidates"))
+            for lane in self.LANES
+        )
+        assert same == fork
 
 
 class TestClaudeReviewQualityDimensions:
@@ -8160,6 +8776,18 @@ class TestFirstPrinciplesProblemsFirstContract:
         assert 'calls\n   it "a gap"' in contract
         assert "framing contradicted by the diff" in contract
         assert 'a deleted pin recast as "a gap" with no' in contract
+        # A diff that deletes a comment reading "This deliberately supersedes
+        # the earlier ... pill spec" plus its pin tests, with a description that
+        # says nothing about it, is the same BLOCK case as one that mislabels
+        # the deletion: a trigger naming only the MISLABELLED form lets the
+        # UNMENTIONED form fall to the advisory tier. The only support that
+        # counts is evidence the pin was wrong -- not consistency with the
+        # other panel.
+        assert "SILENCE IS THE SAME CASE, NOT A LESSER ONE" in contract
+        assert "never mentions it" in contract
+        assert "does not even learn a decision was reversed" in contract
+        assert "and so is a deleted pin the description never\n  mentions" in contract
+        assert '"consistency", "symmetry" or "matches the other panel" is not it' in contract
 
     def test_an_unverified_premise_on_an_availability_path_is_the_block_case(self) -> None:
         # "When torn, choose CONCERNS" made BLOCK unreachable exactly where the
@@ -8171,7 +8799,7 @@ class TestFirstPrinciplesProblemsFirstContract:
         assert "ONLY where being wrong is REVERSIBLE" in contract
         assert 'Here "unclear" is the BLOCK case, not the CONCERNS case' in contract
         assert "the author can" in contract
-        assert "Do not soften this to a Watch item" in contract
+        assert "Do not soften this to a CONCERNS item" in contract
         # The carve-outs stay a CLOSED set -- now three: (a) availability
         # premise, (b) rider, (c) product shape without a recorded decision,
         # which is also this lane's only "cannot evaluate". An open-ended
@@ -8234,9 +8862,13 @@ class TestFirstPrinciplesProblemsFirstContract:
         # A finding with no statable resolution is what produced 31 of 57
         # unanswered CONCERNS: nothing told the author when they were done.
         contract = _fp_contract()
-        assert "Every Watch item AND every Blocker ends with one line" in contract
-        assert "`Clears when: <the concrete evidence or change that resolves it>`" in contract
-        assert "is not a finding; drop it" in contract
+        # Once on the item entry, once on the Blocker -- the two places a
+        # finding can appear -- and nowhere else, because there is nowhere else.
+        assert (
+            contract.count("`Clears when: <the concrete evidence or change that resolves it>`") == 2
+        )
+        assert "REQUIRED on every\nitem whose tag reaches CONCERNS" in contract
+        assert "is not a finding -- retag it or drop it" in contract
 
     def test_the_output_diet_tightened_and_kept_its_machine_read_lines(self) -> None:
         contract = _fp_contract()
@@ -8256,6 +8888,294 @@ class TestFirstPrinciplesProblemsFirstContract:
         assert "REPO CONTEXT: Kiro Crew is an open-source AI agent platform" in contract
         assert "DO NOT REASON FROM AN ASSUMED USER COUNT, in either direction" in contract
         assert "the AGENT is untrusted with respect to its own governance" in contract
+
+
+class TestFirstPrinciplesOneStatementPerProblem:
+    """A review that says the same three items three times -- under
+    `### Not justified as shipped`, again under `### Watch`, again under
+    `### Subtractions` -- runs to ~600 words against a 180-word cap and buries
+    the finding under the sections that restate it; a line of the model's own
+    narration above the verdict header adds noise at the top. Collapsing the
+    inventory does not fix that: the restating sections are what the template
+    asks for. So the item entry is the finding, its `Clears when:` and its
+    `Subtraction:` together, there is no later section, and the workflow
+    trims anything before the header and counts the words that remain."""
+
+    def test_the_item_entry_is_the_only_place_a_problem_appears(self) -> None:
+        contract = _fp_contract()
+        shape = contract.split("Output EXACTLY this shape")[1]
+        assert "that entry is the item's ONLY\nappearance outside the inventory" in contract
+        assert "there is no later section that\nsays it again" in contract
+        assert "Never write a Watch, Subtractions or Suggestions heading" in contract
+        assert "a second section that restates them\nis what buried the finding" in contract
+        # The two restating sections are gone from the emitted shape.
+        assert "### Watch" not in shape
+        assert "### Subtractions" not in shape
+        # What survives: the problems, the collapsed audit trail, the blockers.
+        assert (
+            shape.index("### Not justified as shipped")
+            < shape.index("### What this change ships")
+            < shape.index("### Blockers")
+        )
+        # Both per-item lines are named as lines ON the entry, not sections.
+        assert "`Clears when: <the concrete evidence or change that resolves it>` --" in shape
+        assert "`Subtraction: <the exact symbol/field/file" in shape
+        # A Blocker is evidence for an item already listed once, not a copy.
+        assert (
+            "the Blockers entry carries the evidence, not a\nsecond copy of the reason" in contract
+        )
+
+    def test_the_style_bans_narration_and_says_each_problem_once(self) -> None:
+        contract = _fp_contract()
+        assert "NO narration of your own process" in contract
+        assert "the verdict header is the FIRST byte of your last\nmessage" in contract
+        assert "Each problem is\nstated ONCE" in contract
+        assert "the\nworkflow counts them and flags an overrun" in contract
+
+    def test_the_rule_the_local_loop_parses_still_holds(self) -> None:
+        # The prepare-pr loop reads items out of `### Not justified as shipped`
+        # by bullet + continuation lines, so an entry shaped as the contract
+        # now asks (bullet, then indented `Clears when:` / `Subtraction:`)
+        # must yield ONE item carrying both lines, not three.
+        mod = _review_contract_module()
+        body = (
+            "First-Principles-Verdict: CONCERNS\n\n"
+            "**punchline**\n\n"
+            "### Not justified as shipped\n"
+            "- Item 4 — unjustified move: reinstates pills against SidePanel.tsx:1459.\n"
+            "  Subtraction: defer `panelTabStyles.ts`; keep `.side-tab-active`.\n"
+            "  Clears when: a linked report names who misread the fused tabs.\n"
+            "- Item 5 — undeclared: hide controls relabelled to X, description silent.\n\n"
+            "### What this change ships\n"
+            "<details><summary>Inventory (2 items) — 0 justified</summary>\n"
+            "1. pills — unjustified move\n2. X icon — undeclared\n</details>\n\n"
+            "[FIRST-PRINCIPLES-REVIEWED] abc\n"
+        )
+        items = mod.design_section_items(body)
+        assert [section for section, _ in items] == [
+            "Not justified as shipped",
+            "Not justified as shipped",
+        ]
+        first = items[0][1]
+        assert "Clears when: a linked report" in first
+        assert "Subtraction: defer `panelTabStyles.ts`" in first
+        assert "Item 5" not in first
+        # `Clears when:` is the entry's LAST line for a reason: CLEARS_WHEN_RE
+        # runs on the collapsed item and reads to its end, so a line after it
+        # would be swallowed into the clearance. The contract orders
+        # `Subtraction:` first, and the extracted clearance stays clean.
+        clears = mod.CLEARS_WHEN_RE.search(first)
+        assert clears is not None
+        assert clears.group(1).strip() == "a linked report names who misread the fused tabs."
+        assert "Subtraction" not in clears.group(1)
+        contract = _fp_contract()
+        shape = contract.split("Output EXACTLY this shape")[1]
+        assert shape.index("`Subtraction: <") < shape.index("`Clears when: <")
+        assert "It is the\nLAST line of the entry" in contract
+
+
+ALL_CONCERNS_LANES = tuple(name for name, *_ in CONCERNS_FORK_LANES) + tuple(
+    name for name, *_ in CONCERNS_SAME_LANES
+)
+LANE_HEADERS = {
+    "design": "Design-Verdict:",
+    "first-principles": "First-Principles-Verdict:",
+    "ux": "UX-Verdict:",
+}
+
+
+def _lane_header(name: str) -> str:
+    for key, header in LANE_HEADERS.items():
+        if key in name:
+            return header
+    raise AssertionError(name)
+
+
+class TestReviewLanesPublishOnlyTheReview:
+    """The six whole-design lanes capture the model's last message verbatim.
+    A model that narrates before the header ("All facts verified against the
+    base. Composing the final review.") ships that line to the PR above the
+    punchline. Each lane trims to its own header, and
+    each counts the prose outside the collapsed inventory so an overrun is a
+    visible annotation rather than a longer comment."""
+
+    def _capture_step(self, name: str) -> str:
+        workflow = _workflow(name)
+        # Whatever the step is called, the trim sits right after the
+        # execution_file capture and before the header is parsed.
+        start = workflow.index("select(.result != null) ] | (last.result")
+        end = workflow.index(f"grep -iE '^{_lane_header(name)}'", start)
+        return workflow[start:end]
+
+    def test_every_lane_trims_to_its_own_header(self) -> None:
+        for name in ALL_CONCERNS_LANES:
+            header = _lane_header(name)
+            block = self._capture_step(name)
+            assert f"if grep -qiE '^{header}' <<< \"$summary\"; then" in block, name
+            assert (
+                f"awk 'f || tolower($0) ~ /^{header.lower()}/ {{ f = 1; print }}' <<< \"$summary\""
+                in block
+            ), name
+            # Trim only when a header exists: an unparseable body must still
+            # reach the "returned no verdict header" path with its text intact.
+            assert "without one the text is left whole" in block, name
+            # No pipe upstream of a possibly-early exit, same as the digest.
+            assert "printf '%s\\n' \"$summary\" | awk" not in block, name
+
+    def test_every_lane_counts_the_prose_outside_the_inventory(self) -> None:
+        caps = {"first-principles": 180, "design": 150, "ux": 150}
+        for name in ALL_CONCERNS_LANES:
+            workflow = _workflow(name)
+            cap = next(v for k, v in caps.items() if k in name)
+            assert 'if [ "$verdict" != "UNKNOWN" ]; then' in workflow, name
+            assert (
+                "awk '/<details>/ { skip = 1 } !skip { print } /<\\/details>/ { skip = 0 }' <<< \"$summary\" | wc -w"
+                in workflow
+            ), name
+            assert f'if [ "${{words:-0}}" -gt {cap * 2} ]; then' in workflow, name
+            assert "over length::$words words outside the inventory" in workflow, name
+            assert f"the contract caps the review at ~{cap}." in workflow, name
+            # It is a warning: the verdict and the comment do not move.
+            block = workflow[workflow.index("over length::") :]
+            assert "exit 1" not in block[:400], name
+
+    def test_the_trim_and_count_execute_as_written(self, tmp_path: Path) -> None:
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the lanes are Bash")
+        # Run the FP lane's trim and count over a body with a narration line
+        # above the header and a long collapsed inventory below the finding.
+        capture = self._capture_step("first-principles-review.yml")
+        trim = capture[
+            capture.index("if grep -qiE") : capture.index("fi\n", capture.index("if grep -qiE")) + 3
+        ]
+        indent = len(trim) - len(trim.lstrip())
+        trim = "\n".join(line[indent:] if line.strip() else "" for line in trim.splitlines())
+        body = (
+            "All facts verified against the base. Composing the final review.\n\n"
+            "First-Principles-Verdict: CONCERNS\n\n**punchline**\n\n"
+            "### Not justified as shipped\n- Item 1 — unjustified move: one two three.\n\n"
+            "### What this change ships\n<details><summary>Inventory (9 items) — 5 justified</summary>\n"
+            + ("1. inventory words that must not count toward the cap\n" * 40)
+            + "</details>\n\n[FIRST-PRINCIPLES-REVIEWED] abc\n"
+        )
+        (tmp_path / "body.md").write_text(body, encoding="utf-8")
+        script = (
+            'summary="$(cat body.md)"\n'
+            + trim
+            + "\nprintf '%s\\n' \"$summary\" | head -n1\n"
+            + "awk '/<details>/ { skip = 1 } !skip { print } /<\\/details>/ { skip = 0 }' <<< \"$summary\" | wc -w | tr -d ' '\n"
+        )
+        result = subprocess.run(
+            [bash, "-euo", "pipefail", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        first_line, words = result.stdout.strip().splitlines()
+        assert first_line == "First-Principles-Verdict: CONCERNS"
+        # 40 inventory lines x 9 words would be 360 on their own; the count
+        # excludes them and lands on the ~20 words of prose.
+        assert int(words) < 40, words
+
+    def test_the_digest_publishes_the_not_justified_items(self, tmp_path: Path) -> None:
+        # The check-run summary / warning annotation reads `### Watch`, which
+        # First Principles does not emit; its items live under
+        # `### Not justified as shipped`, so the digest carries that section
+        # too -- in every lane, since the helper is pinned byte-identical.
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the digest helper is Bash")
+        body = tmp_path / "comment.md"
+        body.write_text(
+            "First-Principles-Verdict: CONCERNS\n\n"
+            "**pills reverse SidePanel.tsx:1459 on symmetry alone.**\n\n"
+            "### Not justified as shipped\n"
+            "- Item 4 — unjustified move: reinstates pills.\n"
+            "  Clears when: a report names who misread the fused tabs.\n\n"
+            "### What this change ships\n<details><summary>Inventory (1 items) — 0 justified</summary>\n"
+            "1. pills — unjustified move\n</details>\n\n"
+            "[FIRST-PRINCIPLES-REVIEWED] abc\n",
+            encoding="utf-8",
+        )
+        digest_fn = _shell_function(
+            _step_script(
+                _workflow("first-principles-review.yml"), "Post first-principles review summary"
+            ),
+            "concerns_digest",
+        )
+        script = (
+            digest_fn
+            + f'\nconcerns_digest "{body}" "First-Principles-Verdict:" "[FIRST-PRINCIPLES-REVIEWED]"\n'
+        )
+        result = subprocess.run(
+            [bash, "-euo", "pipefail", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        out = result.stdout
+        assert out.startswith("**pills reverse SidePanel.tsx:1459 on symmetry alone.**")
+        assert "### Not justified as shipped" in out
+        assert "Clears when: a report names who misread the fused tabs." in out
+        assert "### What this change ships" not in out
+        assert "<details>" not in out
+        assert "[FIRST-PRINCIPLES-REVIEWED]" not in out
+
+
+class TestDesignAndUxPunchlinesOpenWithTheProblem:
+    """Design and UX already report only problems by section, but their
+    punchline template asking for "the single most important takeaway" and,
+    on PASS, "why it's sound" yields CONCERNS punchlines of the shape `<what
+    is sound>, but <problem>` ("Sound overlay-plus-reservation design ...,
+    but"; "Fixed toggles and fullscreen are coherent and evidenced, but").
+    The reader stops at the comma. The First Principles form -- open
+    with the problem, PASS names the one thing to verify -- now applies to
+    all four copies."""
+
+    LANES = ("design-review.yml", "fork-design-review.yml", "ux-review.yml", "fork-ux-review.yml")
+
+    def _punchline_rule(self, name: str) -> str:
+        workflow = _workflow(name)
+        start = workflow.index("Then a blank line and ONE bold punchline")
+        return workflow[start : workflow.index("###", start)]
+
+    def test_the_punchline_opens_with_the_problem(self) -> None:
+        for name in self.LANES:
+            rule = _flat(self._punchline_rule(name))
+            assert "It OPENS with the problem" in rule, name
+            assert "problem first" in rule, name
+            assert "because the reader stops at the comma" in rule, name
+            if "ux" in name:
+                assert "never `<what works>, but <problem>`" in rule, name
+                assert "never why the experience holds" in rule, name
+            else:
+                assert "never `<what is sound>, but <problem>`" in rule, name
+                assert "never why the design is sound" in rule, name
+            # PASS is the one thing to verify, or nothing -- not praise.
+            assert "the ONE thing a human should still verify before merge" in rule, name
+            assert "`Nothing to check.`" in rule, name
+            assert "a reviewer that argues the author's case is not reviewing" in rule, name
+            # The old wording is gone in both lanes.
+            assert "the single most important takeaway" not in rule, name
+            assert "for PASS, why it's sound" not in rule, name
+            assert "for PASS, why the experience holds" not in rule, name
+
+    def test_same_repo_and_fork_copies_match(self) -> None:
+        for same, fork in (
+            ("design-review.yml", "fork-design-review.yml"),
+            ("ux-review.yml", "fork-ux-review.yml"),
+        ):
+            assert _flat(self._punchline_rule(same)) == _flat(self._punchline_rule(fork)), (
+                same,
+                fork,
+            )
 
 
 def _review_contract_module():
@@ -10826,3 +11746,227 @@ class TestPerHeadMonotonicFloor:
             )
             == 1
         )
+
+
+def _lane_jobs(lane: str) -> dict:
+    """The `jobs:` mapping of one workflow file under `.github/workflows`."""
+    return yaml.safe_load((WORKFLOWS / lane).read_text(encoding="utf-8"))["jobs"]
+
+
+def _blocking_endpoints(job: dict) -> "list[str] | None":
+    """The job's blocking-egress endpoint list, or None when it does not block."""
+    for step in job.get("steps") or ():
+        if "step-security/harden-runner" not in str(step.get("uses") or ""):
+            continue
+        settings = step.get("with") or {}
+        if settings.get("egress-policy") != "block":
+            return None
+        return str(settings.get("allowed-endpoints") or "").split()
+    return None
+
+
+class TestForkLaneBunEgress:
+    """The fork reviewers install bun from a GitHub *release asset*.
+
+    `anthropics/claude-code-action` runs `oven-sh/setup-bun`, which downloads
+    `https://github.com/oven-sh/bun/releases/download/...`. GitHub answers that
+    with a 302 to `release-assets.githubusercontent.com` -- a different host
+    from the `objects.githubusercontent.com` these allowlists already carry. A
+    lane that blocks egress without it does not fail at the model call: bun
+    never lands, the action's own script dies `bun: command not found`
+    (exit 127), the lane posts `review incomplete`, and because `PR Readiness`
+    aggregates these lanes, every fork PR goes red at once.
+
+    `workflow_run` lanes always execute the DEFAULT branch's copy of the yaml,
+    so a PR editing these files cannot exercise its own change. This test is
+    the only pre-merge guard the coupling has.
+    """
+
+    ENDPOINT = "release-assets.githubusercontent.com:443"
+    ACTION = "anthropics/claude-code-action"
+
+    @classmethod
+    def _runs_a_model(cls, job: dict) -> bool:
+        return any(cls.ACTION in str(step.get("uses") or "") for step in job.get("steps") or ())
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_every_model_job_allows_the_bun_release_asset_host(self, lane: str) -> None:
+        checked = 0
+        for name, job in _lane_jobs(lane).items():
+            if not self._runs_a_model(job):
+                continue
+            endpoints = _blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            checked += 1
+            assert self.ENDPOINT in endpoints, (
+                f"{lane} job {name!r} runs {self.ACTION} behind a blocking egress "
+                f"policy but does not allow {self.ENDPOINT}, so setup-bun's download "
+                "is refused and the step exits 127 instead of reviewing anything"
+            )
+        assert checked, f"{lane} has no blocking-egress {self.ACTION} job to check"
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_jobs_that_run_no_model_keep_the_narrower_allowlist(self, lane: str) -> None:
+        # Least privilege: only the job that actually downloads bun gets the
+        # host. `fork-security-scope-review.yml` blocks egress in four jobs and
+        # runs the model in exactly one, so a blanket per-file edit would widen
+        # three allowlists that fetch nothing but Actions artifacts.
+        for name, job in _lane_jobs(lane).items():
+            if self._runs_a_model(job):
+                continue
+            endpoints = _blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            assert self.ENDPOINT not in endpoints, (
+                f"{lane} job {name!r} runs no model and downloads no bun, so "
+                f"allowing {self.ENDPOINT} widens its egress for nothing"
+            )
+
+
+class TestForkLaneBubblewrapBootstrapEgress:
+    """The fork reviewers apt-install the sandbox their own settings turn on.
+
+    Setting `allowed_non_write_users` auto-enables `claude-code-action`'s
+    subprocess secret-scrub plus bubblewrap isolation, and the action bootstraps
+    that with `apt-get install bubblewrap socat`. On the ubuntu-latest image
+    `/etc/apt/apt-mirrors.txt` names the azure mirror first over plaintext http
+    and falls back to the two canonical hosts over https, so all three are on
+    the path of a single install.
+
+    Blocked, the install exits 7 before the model is ever reached, and the lane
+    reports `review incomplete` rather than a verdict. Failing closed is
+    correct -- the isolation is a security control, so running unsandboxed must
+    never be a silent fallback -- but the lane then cannot review at all, and the
+    advisory lanes publish that as a NEUTRAL check, so three reviewers stopped
+    reviewing every fork PR without turning anything red.
+
+    This is the whole-file guard: `workflow_run` lanes always execute the DEFAULT
+    branch's yaml, so a PR editing these files cannot exercise its own change.
+    The endpoints are asserted on the model job only, for the same least-privilege
+    reason as the bun release-asset host above.
+    """
+
+    ENDPOINTS = (
+        "azure.archive.ubuntu.com:80",
+        "archive.ubuntu.com:443",
+        "security.ubuntu.com:443",
+    )
+    ACTION = "anthropics/claude-code-action"
+
+    @classmethod
+    def _runs_a_model(cls, job: dict) -> bool:
+        return any(cls.ACTION in str(step.get("uses") or "") for step in job.get("steps") or ())
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_every_model_job_allows_the_bubblewrap_bootstrap_hosts(self, lane: str) -> None:
+        checked = 0
+        for name, job in _lane_jobs(lane).items():
+            if not self._runs_a_model(job):
+                continue
+            endpoints = _blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            checked += 1
+            missing = [host for host in self.ENDPOINTS if host not in endpoints]
+            assert not missing, (
+                f"{lane} job {name!r} runs {self.ACTION} behind a blocking egress "
+                f"policy but does not allow {missing}, so the bubblewrap bootstrap "
+                "apt-install is refused, the action exits 7 before any model call, "
+                "and the lane publishes `review incomplete` instead of a verdict"
+            )
+        assert checked, f"{lane} has no blocking-egress {self.ACTION} job to check"
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_jobs_that_run_no_model_keep_the_narrower_allowlist(self, lane: str) -> None:
+        # Least privilege, exactly as for the bun host: only a job that actually
+        # bootstraps the sandbox gets the package mirrors.
+        # `fork-security-scope-review.yml` blocks egress in four jobs and runs the
+        # model in one, so a blanket per-file edit would widen three allowlists
+        # that install nothing.
+        for name, job in _lane_jobs(lane).items():
+            if self._runs_a_model(job):
+                continue
+            endpoints = _blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            present = [host for host in self.ENDPOINTS if host in endpoints]
+            assert not present, (
+                f"{lane} job {name!r} runs no model and installs no sandbox, so "
+                f"allowing {present} widens its egress for nothing"
+            )
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_no_lane_allows_the_third_party_apt_repositories(self, lane: str) -> None:
+        # The runner image also preinstalls google-chrome and microsoft apt
+        # sources, and a blocked `apt-get update` reports them in the same wall
+        # of text as the ubuntu archive. Their failures are apt WARNINGS (`W:`),
+        # nothing these lanes install comes from them, and reading the log as a
+        # flat list of blocked hosts is the obvious way to widen the allowlist by
+        # two general-purpose vendor CDNs that belong nowhere near this lane.
+        forbidden = ("dl.google.com", "packages.microsoft.com")
+        for name, job in _lane_jobs(lane).items():
+            endpoints = _blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            for host in forbidden:
+                assert not any(entry.startswith(host) for entry in endpoints), (
+                    f"{lane} job {name!r} allows {host}, which only ever produced an "
+                    "apt warning; nothing this lane installs is served from it"
+                )
+
+
+class TestForkGptLaneMantleEgress:
+    """The GPT passes call Bedrock on the mantle host, not the runtime host.
+
+    The two review passes run a CLI configured with
+    `model_provider = "amazon-bedrock"`, whose provider posts to
+    `https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses` -- the URL a
+    real job log shows the lane calling. The classic
+    `bedrock-runtime.*.amazonaws.com` hosts in the allowlist do not cover it, so
+    under blocking egress each pass retries five times, ends
+    `Connection failed: error sending request`, and the lane fails closed with
+    `review incomplete` -- a separate failure from the bun one above, on the
+    same lane.
+
+    Only the job that configures that provider gets the host: the Opus, Design,
+    UX, First-Principles and Security-Scope lanes talk to Bedrock through the
+    runtime host and must not carry it.
+    """
+
+    ENDPOINT = "bedrock-mantle.us-east-1.api.aws:443"
+    PROVIDER = 'model_provider = "amazon-bedrock"'
+
+    @classmethod
+    def _configures_the_mantle_provider(cls, job: dict) -> bool:
+        return any(cls.PROVIDER in str(step.get("run") or "") for step in job.get("steps") or ())
+
+    def test_the_gpt_lane_model_job_allows_the_mantle_endpoint(self) -> None:
+        checked = 0
+        for name, job in _lane_jobs("fork-gpt-review.yml").items():
+            if not self._configures_the_mantle_provider(job):
+                continue
+            endpoints = _blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            checked += 1
+            assert self.ENDPOINT in endpoints, (
+                f"fork-gpt-review.yml job {name!r} points the review CLI at "
+                f"Bedrock's mantle endpoint behind a blocking egress policy but "
+                f"does not allow {self.ENDPOINT}, so both passes fail to connect "
+                "and the lane posts `review incomplete`"
+            )
+        assert checked, "fork-gpt-review.yml has no blocking-egress mantle job to check"
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_lanes_that_use_no_mantle_provider_keep_the_narrower_allowlist(self, lane: str) -> None:
+        for name, job in _lane_jobs(lane).items():
+            if self._configures_the_mantle_provider(job):
+                continue
+            endpoints = _blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            assert self.ENDPOINT not in endpoints, (
+                f"{lane} job {name!r} runs no mantle-backed model, so allowing "
+                f"{self.ENDPOINT} widens its egress for nothing"
+            )

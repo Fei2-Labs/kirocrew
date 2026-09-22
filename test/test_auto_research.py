@@ -3544,6 +3544,25 @@ class TestGrillSuggestedCycles:
         assert v["suggested_max_cycles"] == 4 + (4 + 2) // 3 + 1  # == 7
 
 
+def _install_fake_pool(app, pool) -> None:
+    """Replace the grill endpoint's LLM pool BEFORE the app starts.
+
+    The production ``on_startup`` hook builds a real ``LLMPool`` (which takes a
+    live-config subscription); hooks run in registration order, so this one
+    runs after it, shuts the real pool down and installs ``pool`` while the app
+    is still mutable. Writing ``app[...]`` once the test server has started is
+    deprecated by aiohttp and left the real pool's subscription alive.
+    """
+
+    async def _swap(app_) -> None:
+        real = app_.get("auto_research_llm_pool")
+        if real is not None:
+            await real.shutdown()
+        app_["auto_research_llm_pool"] = pool
+
+    app.on_startup.append(_swap)
+
+
 class TestGrillHTTP:
     @pytest.fixture
     def app(self, tmp_path: Path):
@@ -3582,8 +3601,8 @@ class TestGrillHTTP:
             async def shutdown(self) -> None:
                 pass
 
+        _install_fake_pool(app, _FakePool())
         async with TestClient(TestServer(app)) as c:
-            app["auto_research_llm_pool"] = _FakePool()
             r = await c.post(
                 "/api/apps/auto-research/grill/expand",
                 json={
@@ -3655,8 +3674,8 @@ class TestGrillHTTP:
             async def shutdown(self) -> None:
                 pass
 
+        _install_fake_pool(app, _FakePool())
         async with TestClient(TestServer(app)) as c:
-            app["auto_research_llm_pool"] = _FakePool()
             r = await c.post(
                 "/api/apps/auto-research/grill/expand",
                 json={

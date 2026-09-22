@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
+from source_corpus import repo_files_named, repo_root
 from yaml_helpers import load_with
 
 from kiro_crew import history
@@ -41,7 +41,6 @@ from kiro_crew.frontmatter import (
 )
 from kiro_crew.onboarding_import import _column0_activation_declared, _frontmatter
 from kiro_crew.skills import SkillsLoader
-from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 
 class _StringScalarLoader(yaml.SafeLoader):
@@ -868,48 +867,26 @@ class TestTheRepoSkillFileCorpus:
     # needs updating with it.
     NOT_VALID_YAML = frozenset(
         {
-            "src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/SKILL.md",
             "src/kiro_crew/builtin_skills/web-verify/SKILL.md",
         }
     )
 
-    @staticmethod
-    def _repo_root() -> Path:
-        return Path(__file__).resolve().parent.parent
-
     @classmethod
     def _skill_files(cls) -> list[tuple[str, str]]:
-        """Every SKILL.md git TRACKS, and only those.
+        """Every ``SKILL.md`` the checkout holds, generated trees excluded.
 
-        Asked of git rather than of the filesystem. An ``rglob`` over the
-        checkout reads the operator's machine: a dev box carries local skills
-        under the gitignored ``.kirocrew-dev/`` and a built desktop bundle under
-        ``website/electron/backend-dist/`` (whose vendored ``site-packages``
-        mirrors every shipped skill), so ``NOT_VALID_YAML`` became a claim about
-        whoever ran the suite instead of about what ships. A path-part deny list
-        cannot close that: the next ignored directory is unknowable, and
-        ``backend-dist`` already slipped past the ``"dist"`` entry because it is
-        not that path part.
-
-        ``test_the_corpus_is_actually_populated`` is the non-vacuity guard, so a
-        listing that comes back short fails loudly rather than passing empty.
+        Enumerated through ``source_corpus.repo_files_named`` rather than
+        ``rglob``, which also reaches into a nested worktree and reported ITS copy
+        of a shipped skill as the offender below. The generated-tree filter stays
+        here because that scope is this gate's contract, not the enumerator's.
         """
-        root = cls._repo_root()
-        listing = subprocess.run(
-            ["git", "ls-files", "-z", "--", "*SKILL.md"],
-            cwd=str(root),
-            capture_output=True,
-            check=True,
-            **UTF8_TEXT,
-        ).stdout
+        root = repo_root()
         out: list[tuple[str, str]] = []
-        for rel in sorted(part for part in listing.split("\0") if part):
-            path = root / rel
-            if not path.is_file():
-                # Tracked but absent from the worktree (a sparse checkout, or a
-                # deletion staged in a pending merge). Not this test's subject.
+        for path in repo_files_named("SKILL.md"):
+            rel = path.relative_to(root)
+            if any(part in ("node_modules", "dist", "build") for part in rel.parts):
                 continue
-            out.append((rel, path.read_text(encoding="utf-8")))
+            out.append((rel.as_posix(), path.read_text(encoding="utf-8")))
         return out
 
     @staticmethod
@@ -1109,7 +1086,12 @@ class TestChompingCannotFlipAnActivationFlag:
         calls = re.findall(r"self\._repo_scope_satisfied\(([^,]+),", src)
         assert len(calls) >= 3, calls
         for call in calls:
-            assert call.strip() in {"scope", 'str(s["repo_scope"])'}, call
+            assert call.strip() in {
+                "scope",
+                'meta["repo_scope"]',
+                'str(s["repo_scope"])',
+                'str(row["repo_scope"])',
+            }, call
 
     def test_the_raw_value_really_does_carry_the_breaks(self) -> None:
         # Guard the test above against becoming vacuous: it only proves anything while at

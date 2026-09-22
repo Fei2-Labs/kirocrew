@@ -18,6 +18,7 @@ from typing import Any, Callable, cast
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.agent_sdk.drivers.acp_vocab import NATIVE_CHILD_NOT_RESUMABLE
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser.command_bus import (
     DEFAULT_COMMAND_TIMEOUT_MS,
@@ -41,11 +42,13 @@ from kiro_crew.config.loader import (
 from kiro_crew.constants import CHANNEL_SEND_NAMESPACES
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.dashboard.channel_folders import (
+    CHANNEL_CONFIG_SECTIONS,
     channel_restart_required,
     clean_session_folder,
     ensure_channel_folder,
     stored_folder_name,
 )
+from kiro_crew.dashboard.channel_slots import backfill_channel_folder
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_utils import (
     CRON_NOTIFICATION_KIND,
@@ -89,17 +92,17 @@ from kiro_crew.platform_compat import IS_MACOS
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.slack.format import build_options_blocks, extract_options
 from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
-from kiro_crew.spawn_warm import warm_project_agents_for_spawn
-from kiro_crew.subagent import (
-    _subagent_default_model,
-    dedicated_child_factory_kwargs,
-    effort_applied_note,
-    effort_drop_reason,
-    parent_live_harness,
+from kiro_crew.solo_spawn import (
+    SOLO_SPAWN_REFUSED_CODE,
+    delegation_refusal,
+    parent_work_supported,
+    solo_spawn_difference,
+    solo_spawn_question,
 )
+from kiro_crew.spawn_warm import warm_project_agents_for_spawn
+from kiro_crew.subagent import effort_applied_note, effort_drop_reason
 from kiro_crew.subagent_command_authority import (
     AuthorityConflict,
-    AuthorityOutcomeUncertain,
     AuthorityUnavailable,
     CommandIdentity,
 )
@@ -165,12 +168,7 @@ _HEX_ID_RE = re.compile(r"^[0-9a-f]+$")
 def _validated_command_identity(
     body: dict[str, Any], operation: str, *, require_run_id: bool
 ) -> tuple[str, str, str, str] | None:
-    """Validate an additive command identity and recompute its semantic hash.
-
-    Old authenticated callers send none of these fields and remain on the
-    compatibility path. A partially identified request fails closed because it
-    cannot be made safe to replay after an uncertain response.
-    """
+    """Validate command identity and recompute its semantic payload hash."""
     present = {name for name in _COMMAND_IDENTITY_FIELDS if body.get(name)}
     run_id = str(body.get("run_id", "") or "")
     if not present and not run_id:
@@ -197,29 +195,8 @@ def _validated_command_identity(
 
 def _command_identity_response(exc: Exception) -> web.Response:
     code = str(exc) or "invalid_command_identity"
-    if code in {"idempotency_conflict", "identity_conflict"}:
-        return web.json_response({"error": code, "code": code}, status=409)
-    return web.json_response({"error": code, "code": code}, status=400)
-
-
-def _authority_failure_response(exc: Exception) -> web.Response:
-    if isinstance(exc, AuthorityConflict):
-        code = str(exc) or "idempotency_conflict"
-        return web.json_response({"error": code, "code": code}, status=409)
-    if isinstance(exc, AuthorityOutcomeUncertain):
-        return web.json_response(
-            {
-                "error": str(exc) or "execution outcome is uncertain",
-                "code": "coordinator_outcome_uncertain",
-                "transport_error": True,
-                "counted": True,
-            },
-            status=503,
-        )
-    return web.json_response(
-        {"error": str(exc) or "run coordinator unavailable", "code": "coordinator_unavailable"},
-        status=503,
-    )
+    status = 409 if code in {"idempotency_conflict", "identity_conflict"} else 400
+    return web.json_response({"error": code, "code": code}, status=status)
 
 
 def _read_text_or_none(path: Path) -> str | None:
@@ -253,46 +230,78 @@ _SPAWN_REJECTED_CODE = "spawn_rejected"
 async def _spawn_scope_refusal(
     request: web.Request, *, claimed_session: str | None = None
 ) -> web.Response | None:
-    """Refuse a private member's access to a run outside its own memory store.
-
-    The run is the route's ``{agent_id}``; owner and non-private callers pass.
-    Applied to the per-run ``api_spawn_*`` routes by the guard table at the
-    bottom of this module, and called directly where the caller's claimed
-    parent session has to be checked as well.
-    """
+    """Keep run controls with their originating session, regardless of target member."""
     scope, refusal = await internal_memory_scope(
         request, "spawn.access", claimed_session=claimed_session
     )
     if refusal is not None or scope is None:
         return refusal
+    caller = request.headers.get("X-Session-Key", "")
     state = request.app["state"]
-    try:
-        if state.subagents and scope == await asyncio.to_thread(
-            state.subagents._inherited_memory_store, request.match_info["agent_id"]
-        ):
-            return None
-    except (OSError, ValueError):
-        pass
+    run_id = request.match_info["agent_id"]
+    info = state.subagents.get(run_id) if state.subagents else None
+    record = None if info is not None else await asyncio.to_thread(read_state, run_id)
+    parent = (
+        info.parent_session_key if info is not None else (record or {}).get("parent_session_key")
+    )
+    if parent == caller or caller == f"subagent:{run_id}":
+        return None
     _sel().log_api_access(
         caller="internal",
         operation="spawn.access",
         outcome="denied",
-        source="member_memory",
-        error="The requested run is outside the member's private memory.",
+        source="subagent",
+        error="The run belongs to another originating session.",
     )
     return web.json_response({"error": "not found", "code": "task_scope_denied"}, status=404)
+
+
+async def _spawn_request_memory_mode(
+    state: DashboardState, request: web.Request, parent: str
+) -> str:
+    from kiro_crew.dashboard.handlers._shared import resolve_session_memory_mode
+    from kiro_crew.messaging.privacy_mode import strictest
+
+    parent_mode = await resolve_session_memory_mode(state, parent)
+    caller = request.headers.get("X-Session-Key", "")
+    caller_mode = (
+        parent_mode if caller == parent else await resolve_session_memory_mode(state, caller)
+    )
+    return strictest((parent_mode, caller_mode)) or "persistent"
+
+
+def _command_authority_or_none(state: "DashboardState") -> Any | None:
+    """The keyed-command authority, or None once it is not wired.
+
+    The fork's ``run_coordinator`` is superseded by upstream's ``taskq``
+    (rfc-overload-resilience supersedes rfc-durable-run-coordinator), so
+    ``SubagentManager`` no longer carries ``command_authority``. A keyed caller
+    must therefore be told the keyed path is unavailable -- reaching for the
+    attribute directly raises ``AttributeError`` inside the handler and answers a
+    500 to a request that is merely unsupported. ``getattr`` for the same reason
+    ``api_spawn_command_lookup`` already uses it.
+    """
+    return getattr(getattr(state, "subagents", None), "command_authority", None)
+
+
+def _keyed_path_unavailable() -> web.Response:
+    """503 for a keyed request on a build whose authority is retired."""
+    return web.json_response(
+        {
+            "error": "keyed command execution is not available on this build",
+            "code": "coordinator_unavailable",
+        },
+        status=503,
+    )
 
 
 async def api_spawn(request: web.Request) -> web.Response:
     """POST /api/spawn — spawn a subagent.
 
-    Invariant: every error returned after ``state.subagents.spawn`` actually
-    COUNTED the submission must include ``counted: true``. The manager counts
-    submissions on entry; omitting the flag would make ``spawn_run`` reconcile
-    the member again and could close a batch wave early. The converse matters
-    just as much: reporting the flag for a rejection that never reached the
-    counter tells the reconcile to skip a member nobody submitted, and the wave
-    closes one short. ``info.counted`` is the authority, not the call site.
+    Invariant: every error returned after ``state.subagents.spawn`` is called
+    must include ``counted: true``. The manager counts submissions on entry;
+    omitting the flag would make ``spawn_run`` reconcile the member again and
+    could close a batch wave early.
     """
     state: DashboardState = request.app["state"]
     if not state.subagents:
@@ -305,6 +314,30 @@ async def api_spawn(request: web.Request) -> web.Response:
         command_identity = _validated_command_identity(body, "spawn", require_run_id=True)
     except ValueError as exc:
         return _command_identity_response(exc)
+    if command_identity is not None:
+        command_id, idempotency_key, _payload_hash, _payload_json = command_identity
+        identity = CommandIdentity(str(body["run_id"]), command_id, idempotency_key)
+        authority = _command_authority_or_none(state)
+        if authority is None:
+            return _keyed_path_unavailable()
+        try:
+            info = await authority.spawn(
+                identity,
+                str(body.get("task", "")),
+                agent=str(body.get("agent", "") or ""),
+            )
+        except (AuthorityConflict, AuthorityUnavailable) as exc:
+            return _authority_failure_response(exc)
+        response: dict[str, object] = {
+            "id": info.id,
+            "task": str(body.get("task", "")),
+            "status": "spawned",
+            "command_id": command_id,
+            "idempotency_key": idempotency_key,
+        }
+        if info.done and info.error:
+            return web.json_response({"error": info.error, "counted": True}, status=400)
+        return web.json_response(response)
     try:
         cleaned = validate_tool_args(
             {
@@ -323,6 +356,11 @@ async def api_spawn(request: web.Request) -> web.Response:
                 # below unreachable: the block, its unknown_crew refusal and its
                 # store resolution all ran off a value that was always None.
                 "crew": body.get("crew", ""),
+                # Why one task is spawned alone (solo gate). Listed for the same
+                # reason as ``crew``: an unlisted field is dropped, not refused.
+                "solo_reason": body.get("solo_reason", ""),
+                "solo_details": body.get("solo_details", ""),
+                "target_member": body.get("target_member", ""),
             },
             SPAWN_RUN_SCHEMA,
         )
@@ -337,11 +375,21 @@ async def api_spawn(request: web.Request) -> web.Response:
             {"error": "parent_session must be a string", "code": "invalid_parent_session"},
             status=400,
         )
-    caller_store, refusal = await internal_memory_scope(
+    _, refusal = await internal_memory_scope(
         request, "spawn.create", claimed_session=parent_session
     )
     if refusal is not None:
         return refusal
+    try:
+        admitted_mode = await _spawn_request_memory_mode(state, request, parent_session)
+    except (OSError, ValueError):
+        return web.json_response(
+            {
+                "error": "The originating session's memory mode is unavailable.",
+                "code": "memory_unavailable",
+            },
+            status=409,
+        )
     # approval_mode and silent are HTTP API parameters passed by the SDK,
     # NOT MCP tool arguments from the LLM.  The LLM's spawn_run tool
     # (mcp_core.py) does not expose these params — they are added by the
@@ -364,99 +412,124 @@ async def api_spawn(request: web.Request) -> web.Response:
     if not isinstance(keep, bool):
         keep = str(keep).lower() in ("true", "1", "yes")
     agent = cleaned.get("agent") or ""
-    # DELEGATION TO A NAMED CREW. Resolved once, here, through the shared
-    # binding resolver -- the store must never be derived from `agent`, which
-    # holds a kiro-cli template id and would answer `default` for exactly the
-    # crew that configured otherwise, silently, toward the operator's own memory.
-    #
-    # An unknown crew is REFUSED rather than degraded. Everywhere else an
-    # unresolvable store falls back to the global one, which is the safe
-    # direction; here it is the unsafe one: the caller's whole reason for naming
-    # a crew is to keep this task inside that crew's memory, so quietly running
-    # it against the operator's store is the leak the parameter exists to
-    # prevent. Fail loudly and let the caller pick a real crew.
-    crew = cleaned.get("crew") or ""
-    child_memory_store = ""
-    if crew:
-        from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
+    from kiro_crew.dashboard.handlers._shared import member_request_scope
+    from kiro_crew.execution_context import (
+        ExecutionContext,
+        MemoryStoreRef,
+        derive_execution,
+        read_session_execution,
+    )
 
-        try:
-            _cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        except Exception:
-            return web.json_response(
-                {"error": "cannot read the crew roster", "code": "crew_unresolvable"}, status=503
-            )
-        if crew not in _cfg.agents:
-            return web.json_response(
-                {
-                    "error": f"unknown crew '{crew}'",
-                    "code": "unknown_crew",
-                    "available": ", ".join(sorted(_cfg.agents)) or "(none)",
-                },
-                status=400,
-            )
-        try:
-            _b = await asyncio.to_thread(resolve_agent_bindings, _cfg, crew)
-        except (OSError, ValueError) as exc:
-            return web.json_response({"error": str(exc), "code": "memory_unavailable"}, status=409)
-        child_memory_store = _b.memory_store_name
-        if crew != "default" and not _cfg.agents[crew].triggers.strip():
-            return web.json_response(
-                {
-                    "error": f"Crew Member '{crew}' has not enabled delegated tasks.",
-                    "code": "crew_delegation_disabled",
-                },
-                status=409,
-            )
-        # The crew's template too: a crew is its memory AND its harness, and
-        # honouring one without the other hands the task a persona the operator
-        # did not bind to that work. An explicit `agent` still wins -- a caller
-        # naming both is overriding deliberately.
-        agent = agent or _b.kiro_agent
-    elif parent_session:
-        from kiro_crew.context import store_of_session
-
-        try:
-            child_memory_store = await asyncio.to_thread(
-                store_of_session, state.conversation_log, parent_session
-            )
-            if parent_session.startswith("subagent:"):
-                child_memory_store = await asyncio.to_thread(
-                    state.subagents._inherited_memory_store,
-                    parent_session.removeprefix("subagent:"),
-                )
-        except (OSError, ValueError) as exc:
-            return web.json_response({"error": str(exc), "code": "memory_unavailable"}, status=409)
-    from kiro_crew.context import require_memory_delegation
-
-    if caller_store is not None and child_memory_store != caller_store:
-        _sel().log_api_access(
-            caller="internal",
-            operation="spawn.create",
-            outcome="denied",
-            source="member_memory",
-            error="The requested delegation changes the member's private memory.",
-        )
+    crew = cleaned.get("target_member") or cleaned.get("crew") or ""
+    if (
+        cleaned.get("target_member")
+        and cleaned.get("crew")
+        and cleaned["target_member"] != cleaned["crew"]
+    ):
         return web.json_response(
-            {
-                "error": "A Crew Member can delegate only within its own private memory.",
-                "code": "memory_unavailable",
-            },
-            status=409,
+            {"error": "Conflicting target members", "code": "invalid_target_member"}, status=400
         )
     try:
-        await asyncio.to_thread(
-            require_memory_delegation,
-            state.conversation_log,
-            parent_session,
-            child_memory_store,
+        caller = await member_request_scope(request)
+        parent_execution = caller.execution
+        if parent_execution is None and parent_session:
+            parent_execution = await asyncio.to_thread(read_session_execution, parent_session)
+        if parent_execution is None:
+            parent_execution = ExecutionContext(
+                None, MemoryStoreRef("default"), "template", agent or "kirocrew"
+            )
+        config = await asyncio.to_thread(KiroCrewConfig.load) if crew else None
+        if crew and config is not None and crew not in config.agents:
+            return web.json_response(
+                {"error": "The target member does not exist.", "code": "unknown_member"},
+                status=404,
+            )
+        if crew and config is not None and not config.agents[crew].triggers.strip():
+            return web.json_response(
+                {
+                    "error": "The target member has not enabled delegated tasks.",
+                    "code": "crew_delegation_disabled",
+                },
+                status=403,
+            )
+        admitted_execution = derive_execution(
+            parent_execution,
+            target_member=crew or None,
+            config=config,
+            requested_mode=admitted_mode,
         )
+        child_memory_store = admitted_execution.store.legacy_name
     except (OSError, ValueError) as exc:
-        return web.json_response({"error": str(exc), "code": "memory_unavailable"}, status=409)
+        return web.json_response(
+            {"error": str(exc), "code": "member_identity_unavailable"}, status=409
+        )
     max_turns = cleaned.get("max_turns") or 0
     cwd = cleaned.get("cwd") or ""
     model = cleaned.get("model") or ""
     reasoning_effort = cleaned.get("reasoning_effort") or ""
+    # SOLO GATE, gateway half. ``solo`` is a transport-layer marker only the
+    # MCP spawn tools send for a one-task call (the SDK and apps never do, so
+    # they are never gated). The tool side already refused a solo call that
+    # named nothing; this half catches the one that named the parent's OWN
+    # agent / model / crew to get past it. Pre-spawn, so never ``counted``.
+    solo = body.get("solo", False)
+    if not isinstance(solo, bool):
+        solo = str(solo).lower() in ("true", "1", "yes")
+    solo_reason = cleaned.get("solo_reason") or ""
+    solo_details = cleaned.get("solo_details") or ""
+    can_work = parent_work_supported(state, parent_session)
+    reason_error = delegation_refusal(solo_reason, solo_details)
+    if solo_reason == "parent_parallel" and not can_work:
+        reason_error = (
+            "Error: parent_parallel requires a dashboard-owned parent turn. "
+            "This caller must yield immediately; do the work directly instead."
+        )
+    if reason_error:
+        _sel().log_api_access(
+            caller="internal",
+            operation="spawn.solo",
+            outcome="denied",
+            source="solo_gate",
+            resources=parent_session,
+            error=reason_error,
+        )
+        return web.json_response(
+            {"error": reason_error, "code": SOLO_SPAWN_REFUSED_CODE}, status=400
+        )
+    if solo and not solo_reason:
+        ground = solo_spawn_difference(state, parent_session, agent=agent, model=model, crew=crew)
+        if not ground:
+            _sel().log_api_access(
+                caller="internal",
+                operation="spawn.solo",
+                outcome="denied",
+                source="solo_gate",
+                resources=parent_session,
+                error="names only the parent's own agent/model/crew",
+            )
+            return web.json_response(
+                {"error": solo_spawn_question(), "code": SOLO_SPAWN_REFUSED_CODE},
+                status=400,
+            )
+        # Let through on a difference: audited like the reason arm, with the
+        # ground, so no gate outcome is invisible after the fact.
+        _sel().log_api_access(
+            caller="internal",
+            operation="spawn.solo",
+            outcome="allowed",
+            source="solo_gate",
+            resources=f"{parent_session} differs={ground}",
+        )
+    elif solo:
+        # The reason is the caller's own claim; recording it is what makes a
+        # habit of lone spawns visible after the fact.
+        _sel().log_api_access(
+            caller="internal",
+            operation="spawn.solo",
+            outcome="allowed",
+            source="solo_gate",
+            resources=f"{parent_session} reason={solo_reason} source=model_claim",
+        )
     # Batch/wave identity (transport-layer params from spawn_run MCP, like
     # approval_mode/silent above): validated inline, bounded, never LLM-schema.
     batch_id = str(body.get("batch_id", "") or "")[:32]
@@ -470,36 +543,33 @@ async def api_spawn(request: web.Request) -> web.Response:
     # on-loop, cache-only agent validation inside spawn() is a hit.
     if agent:
         await warm_project_agents_for_spawn(state, cwd)
-    spawn_kwargs = {
-        "parent_session_key": parent_session,
-        "agent": agent,
-        "max_turns": max_turns,
-        "cwd": cwd,
-        "model": model or None,
-        "reasoning_effort": reasoning_effort,
-        "approval_mode": approval_mode or None,
-        "silent": silent,
-        "batch_id": batch_id,
-        "batch_total": batch_total,
-        "keep": keep,
-        "include_memory": cleaned.get("include_memory", True) is not False,
-        "include_lessons": cleaned.get("include_lessons", True) is not False,
-        "include_project": cleaned.get("include_project", True) is not False,
-        "memory_store": child_memory_store,
-    }
-    if command_identity is None:
-        info = state.subagents.spawn(task, **spawn_kwargs)
-    else:
-        command_id, idempotency_key, _payload_hash, _payload_json = command_identity
-        identity = CommandIdentity(
-            run_id=str(body["run_id"]),
-            command_id=command_id,
-            idempotency_key=idempotency_key,
-        )
-        try:
-            info = await state.subagents.command_authority.spawn(identity, task, **spawn_kwargs)
-        except (AuthorityConflict, AuthorityUnavailable) as exc:
-            return _authority_failure_response(exc)
+    info = await _spawn_on_loop(
+        state,
+        task,
+        parent_session_key=parent_session,
+        agent=agent,
+        max_turns=max_turns,
+        cwd=cwd,
+        model=model or None,
+        reasoning_effort=reasoning_effort,
+        approval_mode=approval_mode or None,
+        silent=silent,
+        batch_id=batch_id,
+        batch_total=batch_total,
+        delegation=(
+            {"reason": solo_reason, "details": solo_details, "source": "model_claim"}
+            if solo_reason or solo_details
+            else None
+        ),
+        keep=keep,
+        include_memory=cleaned.get("include_memory", True) is not False,
+        include_lessons=cleaned.get("include_lessons", True) is not False,
+        include_project=cleaned.get("include_project", True) is not False,
+        memory_store=child_memory_store,
+        crew=crew,
+        _memory_mode=admitted_mode,
+        _execution_context=admitted_execution.to_record(),
+    )
     if not info:
         # Reached mgr.spawn (submission COUNTED at the top of spawn()) but
         # refused for capacity — tell the client so it does NOT reconcile
@@ -521,72 +591,61 @@ async def api_spawn(request: web.Request) -> web.Response:
         # differently — spawn_run stops re-posting a name already refused. Every
         # other rejection reports the generic code, matching the sibling
         # /continue handler below.
-        #
-        # ``counted`` is reported ONLY when the submission really was counted: a
-        # rejection that never reached the counter must not tell spawn_run's
-        # reconcile to skip the member, or the wave closes one short.
-        # Two dict LITERALS rather than one hoisted local: the error-code gate
-        # can only read a `code` key it can see statically, and a body built up
-        # in a variable lands in its `opaque_body` bucket -- the shape the
-        # ratchet caps precisely so hoisting is not an escape hatch.
-        if bool(getattr(info, "counted", True)):
-            return web.json_response(
-                {
-                    "error": info.error,
-                    "code": info.error_code or _SPAWN_REJECTED_CODE,
-                    "counted": True,
-                },
-                status=400,
-            )
         return web.json_response(
-            {"error": info.error, "code": info.error_code or _SPAWN_REJECTED_CODE},
+            {
+                "error": info.error,
+                "code": info.error_code or _SPAWN_REJECTED_CODE,
+                "counted": True,
+            },
             status=400,
         )
-    resp: dict[str, object] = {"id": info.id, "task": task, "status": "spawned"}
+    resp: dict[str, object] = {
+        "id": info.id,
+        "task": task,
+        "status": "spawned",
+        "parent_work_supported": can_work,
+    }
     # Server-side effort verdict: only this side knows the model the factory's
     # effort gate will see (explicit per-call value, else the subagent role
     # pin, else the session chain for the effective agent — a crew's pin, else
     # a non-sentinel global). Additive, optional key — reporting only, never
     # changes whether the spawn happened.
     if reasoning_effort:
-        sessions = getattr(state, "sessions", None)
-        # Mirror _run_inner's agent inheritance so the verdict judges the same
-        # agent the session will actually use.
-        verdict_agent = agent or (
-            sessions.get_agent(parent_session) if parent_session and sessions else ""
-        )
-        verdict_backend, advertised = parent_live_harness(
-            sessions,
-            parent_session or "",
-        )
+        # Read the allocation-owned namespace on the loop. A reporting failure
+        # cannot undo the submission or turn an unknown selection into "auto".
+        selection: tuple[str, str] | None
+        try:
+            selection = (
+                ("template", agent)
+                if agent
+                else (
+                    ("member", crew)
+                    if crew
+                    else (
+                        state.sessions.get_agent_selection(parent_session)
+                        if parent_session
+                        else ("template", "")
+                    )
+                )
+            )
+        except Exception:
+            selection = None
 
         def _effort_verdict() -> tuple[str, str]:
-            preferred_model = model or _subagent_default_model()
-            if verdict_backend is None:
-                verdict_model = preferred_model
-            else:
-                child_kwargs = dedicated_child_factory_kwargs(
-                    parent_backend=verdict_backend,
-                    advertised=advertised,
-                    preferred_model=preferred_model,
-                )
-                verdict_model = str(child_kwargs.get("model", "") or "")
-            d = effort_drop_reason(
-                verdict_model,
-                reasoning_effort,
-                verdict_agent,
-                verdict_backend,
-                model_pin_resolved=verdict_backend is not None,
-            )
+            if (
+                not isinstance(selection, tuple)
+                or len(selection) != 2
+                or selection[0] not in ("template", "member")
+                or not isinstance(selection[1], str)
+                or (selection[0] == "member" and not selection[1])
+            ):
+                return "", ""
+            kind, verdict_agent = selection
+            claim = verdict_agent if kind == "member" else ""
+            d = effort_drop_reason(model, reasoning_effort, verdict_agent, crew_agent=claim)
             if d:
                 return d, ""
-            return "", effort_applied_note(
-                verdict_model,
-                reasoning_effort,
-                verdict_agent,
-                verdict_backend,
-                model_pin_resolved=verdict_backend is not None,
-            )
+            return "", effort_applied_note(model, reasoning_effort, verdict_agent, crew_agent=claim)
 
         # The resolvers read config and glob ~/.kiro/agents — file I/O that
         # must not run on the gateway event loop (the same reason
@@ -599,10 +658,55 @@ async def api_spawn(request: web.Request) -> web.Response:
     if keep:
         # The conversation id is the FIRST run's id: spawn_continue targets it.
         resp["conversation"] = info.id
-    if command_identity is not None:
-        resp["command_id"] = command_identity[0]
-        resp["idempotency_key"] = command_identity[1]
     return web.json_response(resp)
+
+
+async def _spawn_on_loop(state: "DashboardState", task: str, **kwargs: Any) -> Any:
+    """Spawn from an async handler WITHOUT blocking the loop on the task store.
+
+    ``SubagentManager.spawn_async`` writes the durable row on the store's
+    writer thread and only then starts the run (write-before-ack, off-loop).
+    A manager without that entry -- a test double -- is spawned synchronously,
+    which is the pre-queue behaviour those doubles model.
+    """
+    import inspect
+
+    subagents = state.subagents
+    assert subagents is not None  # every caller checked ``state.subagents`` first
+    spawn_async = getattr(subagents, "spawn_async", None)
+    if inspect.iscoroutinefunction(spawn_async):
+        return await spawn_async(task, **kwargs)
+    return subagents.spawn(task, **kwargs)
+
+
+async def _continue_on_loop(state: "DashboardState", conv_id: str, task: str, **kwargs: Any) -> Any:
+    """:func:`_spawn_on_loop` for continuations: ``continue_conversation_async``
+    writes the durable row off-loop; a double without it continues synchronously."""
+    import inspect
+
+    subagents = state.subagents
+    assert subagents is not None
+    continue_async = getattr(subagents, "continue_conversation_async", None)
+    if inspect.iscoroutinefunction(continue_async):
+        return await continue_async(conv_id, task, **kwargs)
+    return subagents.continue_conversation(conv_id, task, **kwargs)
+
+
+def _native_child_refusal(state: "DashboardState", conversation_id: str) -> str | None:
+    """Typed reason when *conversation_id* is a harness-native child of a live
+    session (kiro-cli ``use_subagent`` / KAS subtask), else None."""
+    probe = getattr(state.subagents, "native_child_resume_refusal", None)
+    if not callable(probe):
+        return None
+    try:
+        reason = probe(conversation_id)
+    except Exception:  # noqa: BLE001 - advisory lookup
+        return None
+    # A typed refusal is a str with the known prefix; anything else (a test
+    # double's attribute, a stray object) is not a refusal.
+    if isinstance(reason, str) and reason.startswith(NATIVE_CHILD_NOT_RESUMABLE):
+        return reason
+    return None
 
 
 async def api_spawn_continue(request: web.Request) -> web.Response:
@@ -623,10 +727,6 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    try:
-        command_identity = _validated_command_identity(body, "continue", require_run_id=True)
-    except ValueError as exc:
-        return _command_identity_response(exc)
     task = str(body.get("task", "") or "").strip()
     if not task:
         return web.json_response({"error": "task is required", "code": "task_required"}, status=400)
@@ -634,6 +734,16 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
     refusal = await _spawn_scope_refusal(request, claimed_session=parent_session)
     if refusal is not None:
         return refusal
+    try:
+        admitted_mode = await _spawn_request_memory_mode(state, request, parent_session)
+    except (OSError, ValueError):
+        return web.json_response(
+            {
+                "error": "The originating session's memory mode is unavailable.",
+                "code": "memory_unavailable",
+            },
+            status=409,
+        )
     agent = str(body.get("agent", "") or "")
     model = str(body.get("model", "") or "")
     try:
@@ -646,36 +756,17 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
     # `continue_conversation` is synchronous. Doing it here keeps the gateway
     # responsive even when the recorded path lives on a stalled mount.
     resumed_cwd = await asyncio.to_thread(state.subagents.recorded_cwd, conv_id)
-    if command_identity is None:
-        info = state.subagents.continue_conversation(
-            conv_id,
-            task,
-            parent_session_key=parent_session,
-            agent=agent,
-            model=model or None,
-            max_turns=max_turns,
-            cwd=resumed_cwd,
-        )
-    else:
-        command_id, idempotency_key, _payload_hash, _payload_json = command_identity
-        identity = CommandIdentity(
-            run_id=str(body["run_id"]),
-            command_id=command_id,
-            idempotency_key=idempotency_key,
-        )
-        try:
-            info = await state.subagents.command_authority.continue_conversation(
-                identity,
-                conv_id,
-                task,
-                parent_session_key=parent_session,
-                agent=agent,
-                model=model or None,
-                max_turns=max_turns,
-                cwd=resumed_cwd,
-            )
-        except (AuthorityConflict, AuthorityUnavailable) as exc:
-            return _authority_failure_response(exc)
+    info = await _continue_on_loop(
+        state,
+        conv_id,
+        task,
+        parent_session_key=parent_session,
+        agent=agent,
+        model=model or None,
+        max_turns=max_turns,
+        cwd=resumed_cwd,
+        _memory_mode=admitted_mode,
+    )
     if not info:
         return web.json_response(
             {
@@ -687,18 +778,95 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
     if info.done and info.error:
         if info.error.startswith("conversation_busy"):
             return web.json_response({"error": info.error, "code": "conversation_busy"}, status=409)
+        if info.error.startswith(NATIVE_CHILD_NOT_RESUMABLE):
+            # A harness-native child of a live session: the lever that exists
+            # is the parent, so the refusal is a conflict, not a lookup miss.
+            return web.json_response(
+                {"error": info.error, "code": NATIVE_CHILD_NOT_RESUMABLE}, status=409
+            )
         if info.error.startswith("conversation_gone"):
             return web.json_response({"error": info.error, "code": "conversation_gone"}, status=404)
         return web.json_response({"error": info.error, "code": _SPAWN_REJECTED_CODE}, status=400)
-    response: dict[str, object] = {
-        "id": info.id,
-        "conversation": conv_id,
-        "status": "spawned",
-    }
-    if command_identity is not None:
-        response["command_id"] = command_identity[0]
-        response["idempotency_key"] = command_identity[1]
+    return web.json_response({"id": info.id, "conversation": conv_id, "status": "spawned"})
+
+
+_HEX_ID_RE = re.compile(r"^[0-9a-f]+$")
+
+
+def _authority_failure_response(exc: Exception) -> web.Response:
+    # Lazy: subagent_command_authority pulls in run_coordinator, which is being
+    # retired in favor of taskq (see the fork-sync task doc). Importing it at
+    # module scope would make a broken run_coordinator dependency chain take
+    # the whole dashboard down with it.
+    from kiro_crew.subagent_command_authority import AuthorityConflict, AuthorityOutcomeUncertain
+
+    if isinstance(exc, AuthorityConflict):
+        code = str(exc) or "idempotency_conflict"
+        return web.json_response({"error": code, "code": code}, status=409)
+    if isinstance(exc, AuthorityOutcomeUncertain):
+        return web.json_response(
+            {
+                "error": str(exc) or "execution outcome is uncertain",
+                "code": "coordinator_outcome_uncertain",
+                "transport_error": True,
+                "counted": True,
+            },
+            status=503,
+        )
+    return web.json_response(
+        {"error": str(exc) or "run coordinator unavailable", "code": "coordinator_unavailable"},
+        status=503,
+    )
+
+
+async def api_spawn_command_lookup(request: web.Request) -> web.Response:
+    """Resolve a keyed command after an uncertain mutation response."""
+    state: DashboardState = request.app["state"]
+    if not state.subagents:
+        return web.json_response(
+            {"found": False, "error": "subagents not available", "code": "subagents_unavailable"},
+            status=503,
+        )
+    idempotency_key = request.match_info["idempotency_key"]
+    if len(idempotency_key) != 32 or _HEX_ID_RE.fullmatch(idempotency_key) is None:
+        return web.json_response(
+            {"found": False, "error": "invalid idempotency key", "code": "invalid_idempotency_key"},
+            status=400,
+        )
+    authority = getattr(state.subagents, "command_authority", None)
+    if authority is None:
+        return web.json_response(
+            {
+                "found": False,
+                "error": "command authority unavailable",
+                "code": "coordinator_unavailable",
+            },
+            status=503,
+        )
+    from kiro_crew.subagent_command_authority import AuthorityUnavailable
+
+    try:
+        response = await authority.lookup_response(idempotency_key)
+    except AuthorityUnavailable as exc:
+        return _authority_failure_response(exc)
+    if response is None:
+        return web.json_response(
+            {"found": False, "error": "command not found", "code": "command_not_found"},
+            status=404,
+        )
     return web.json_response(response)
+
+
+async def api_spawn_clear(request: web.Request) -> web.Response:
+    """DELETE /api/spawn — clear all completed subagents."""
+    state: DashboardState = request.app["state"]
+    if not state.subagents:
+        return web.json_response({"ok": True})
+    done_ids = [a.id for a in state.subagents.all_agents if a.done]
+    for aid in done_ids:
+        state.subagents._agents.pop(aid, None)
+        state.subagents._tasks.pop(aid, None)
+    return web.json_response({"ok": True, "cleared": len(done_ids)})
 
 
 async def api_spawn_steer(request: web.Request) -> web.Response:
@@ -719,45 +887,44 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    try:
-        command_identity = _validated_command_identity(body, "steer", require_run_id=False)
-    except ValueError as exc:
-        return _command_identity_response(exc)
     message = str(body.get("message", "") or "").strip()
     if not message:
         return web.json_response(
             {"error": "message is required", "code": "message_required"}, status=400
         )
+    try:
+        command_identity = _validated_command_identity(body, "steer", require_run_id=False)
+    except ValueError as exc:
+        return _command_identity_response(exc)
     mode = str(body.get("mode", "") or "interrupt").strip()
     if mode not in ("interrupt", "follow_up"):
         return web.json_response(
             {"error": "mode must be 'interrupt' or 'follow_up'", "code": "invalid_mode"},
             status=400,
         )
-    if command_identity is None:
-        if mode == "follow_up":
-            ok, detail = await state.subagents.follow_up_run(agent_id, message)
-        else:
-            ok, detail = await state.subagents.steer_run(agent_id, message)
-    else:
-        identity = CommandIdentity(
-            run_id="",
-            command_id=command_identity[0],
-            idempotency_key=command_identity[1],
-        )
+    if command_identity is not None:
+        identity = CommandIdentity(agent_id, command_identity[0], command_identity[1])
+        authority = _command_authority_or_none(state)
+        if authority is None:
+            return _keyed_path_unavailable()
         try:
             if mode == "follow_up":
-                ok, detail = await state.subagents.command_authority.follow_up(
-                    identity, agent_id, message
-                )
+                ok, detail = await authority.follow_up(identity, agent_id, message)
             else:
-                ok, detail = await state.subagents.command_authority.steer(
-                    identity, agent_id, message
-                )
+                ok, detail = await authority.steer(identity, agent_id, message)
         except (AuthorityConflict, AuthorityUnavailable) as exc:
             return _authority_failure_response(exc)
+    elif mode == "follow_up":
+        ok, detail = await state.subagents.follow_up_run(agent_id, message)
+    else:
+        ok, detail = await state.subagents.steer_run(agent_id, message)
     if not ok:
         if detail == "not_found":
+            native = _native_child_refusal(state, agent_id)
+            if native is not None:
+                return web.json_response(
+                    {"error": native, "code": NATIVE_CHILD_NOT_RESUMABLE}, status=409
+                )
             return web.json_response({"error": detail, "code": "not_found"}, status=404)
         if detail.startswith("not_running"):
             return web.json_response({"error": detail, "code": "not_running"}, status=409)
@@ -771,13 +938,10 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
                 headers={"Retry-After": "5"},
             )
         return web.json_response({"error": detail, "code": "steer_failed"}, status=502)
-    queued = mode == "follow_up" or detail.startswith("follow_up")
     response: dict[str, object] = {
         "id": agent_id,
-        "status": "follow_up_queued" if queued else "steered",
+        "status": "follow_up_queued" if mode == "follow_up" else "steered",
     }
-    if queued and detail.startswith("follow_up"):
-        response["reason"] = detail
     if command_identity is not None:
         response["command_id"] = command_identity[0]
         response["idempotency_key"] = command_identity[1]
@@ -797,64 +961,12 @@ async def api_spawn_release(request: web.Request) -> web.Response:
             status=503,
         )
     conv_id = request.match_info["agent_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
-    try:
-        command_identity = _validated_command_identity(body, "release", require_run_id=False)
-    except ValueError as exc:
-        return _command_identity_response(exc)
-    if command_identity is None:
-        ok, detail = state.subagents.release_conversation(conv_id)
-    else:
-        identity = CommandIdentity(
-            run_id="",
-            command_id=command_identity[0],
-            idempotency_key=command_identity[1],
-        )
-        try:
-            ok, detail = await state.subagents.command_authority.release(identity, conv_id)
-        except (AuthorityConflict, AuthorityUnavailable) as exc:
-            return _authority_failure_response(exc)
+    ok, detail = state.subagents.release_conversation(conv_id)
     if not ok:
         if detail.startswith("conversation_busy"):
             return web.json_response({"error": detail, "code": "conversation_busy"}, status=409)
         return web.json_response({"error": detail, "code": "conversation_gone"}, status=404)
-    response: dict[str, object] = {"conversation": conv_id, "status": "released"}
-    if command_identity is not None:
-        response["command_id"] = command_identity[0]
-        response["idempotency_key"] = command_identity[1]
-    return web.json_response(response)
-
-
-async def api_spawn_command_lookup(request: web.Request) -> web.Response:
-    """Resolve a keyed command after an uncertain mutation response."""
-
-    state: DashboardState = request.app["state"]
-    if not state.subagents:
-        return web.json_response(
-            {"found": False, "error": "subagents not available", "code": "subagents_unavailable"},
-            status=503,
-        )
-    idempotency_key = request.match_info["idempotency_key"]
-    if len(idempotency_key) != 32 or _HEX_ID_RE.fullmatch(idempotency_key) is None:
-        return web.json_response(
-            {"found": False, "error": "invalid idempotency key", "code": "invalid_idempotency_key"},
-            status=400,
-        )
-    try:
-        response = await state.subagents.command_authority.lookup_response(idempotency_key)
-    except AuthorityUnavailable as exc:
-        return _authority_failure_response(exc)
-    if response is None:
-        return web.json_response(
-            {"found": False, "error": "command not found", "code": "command_not_found"},
-            status=404,
-        )
-    return web.json_response(response)
+    return web.json_response({"conversation": conv_id, "status": "released"})
 
 
 async def api_spawn_lost(request: web.Request) -> web.Response:
@@ -1121,15 +1233,20 @@ async def api_spawn_list(request: web.Request) -> web.Response:
     if refusal is not None:
         return refusal
     agents = []
+    caller = request.headers.get("X-Session-Key", "")
     for info in state.subagents.all_agents:
-        if scope is not None and info.memory_store != scope:
+        if (
+            scope is not None
+            and info.parent_session_key != caller
+            and caller != f"subagent:{info.id}"
+        ):
             continue
         entry: dict[str, object] = {
             "id": info.id,
             "task": _redact(info.task),
             "done": info.done,
             "parent": info.parent_session_key,
-            "agent": info.agent,
+            "agent": info.agent or info.crew,
             "started": info.started,
         }
         if info.done:
@@ -1195,13 +1312,24 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
             {"error": f"only failed agents can be retried (outcome={old.outcome})"},
             status=409,
         )
+    execution = old.execution_context
+    if execution is None:
+        from kiro_crew.subagent_persistence import read_run_execution
+
+        try:
+            execution = await asyncio.to_thread(read_run_execution, old.id)
+        except (OSError, ValueError) as exc:
+            return web.json_response(
+                {"error": f"memory_unavailable: {exc}", "code": "memory_unavailable"}, status=400
+            )
     # Same validated warm as the primary spawn handler. old.cwd was validated
     # at the ORIGINAL spawn, but the allowlist may have changed since (and a
     # gateway restart leaves the cache cold), so it is re-checked against the
     # current config before any discovery read.
     if old.agent:
         await warm_project_agents_for_spawn(state, old.cwd or "")
-    info = state.subagents.spawn(
+    info = await _spawn_on_loop(
+        state,
         old._raw_task or old.task,
         parent_session_key=old.parent_session_key,
         agent=old.agent,
@@ -1215,6 +1343,7 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         silent=old.silent,
         # A retry must see the SAME context scope as the run it replaces —
         # otherwise the retried agent is a different experiment.
+        delegation=dict(old.delegation),
         include_memory=old.include_memory,
         include_lessons=old.include_lessons,
         include_project=old.include_project,
@@ -1222,6 +1351,10 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         # the global store, so the failure mode is "retrying a delegation leaks
         # it" -- and a retry is exactly when nobody re-reads the scope.
         memory_store=old.memory_store,
+        crew=old.crew,
+        app=execution.app,
+        _memory_mode=execution.memory_mode,
+        _execution_context=execution.to_record(),
     )
     if not info:
         return web.json_response(
@@ -1236,6 +1369,31 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
     """DELETE /api/spawn/{agent_id} — cancel a running subagent or remove a finished one."""
     state: DashboardState = request.app["state"]
     agent_id = request.match_info["agent_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        command_identity = _validated_command_identity(body, "cancel", require_run_id=False)
+    except ValueError as exc:
+        return _command_identity_response(exc)
+    if command_identity is not None and state.subagents:
+        identity = CommandIdentity(agent_id, command_identity[0], command_identity[1])
+        authority = _command_authority_or_none(state)
+        if authority is None:
+            return _keyed_path_unavailable()
+        try:
+            cancelled = await authority.cancel(identity, agent_id)
+        except (AuthorityConflict, AuthorityUnavailable) as exc:
+            return _authority_failure_response(exc)
+        return web.json_response(
+            {
+                "ok": True,
+                "cancelled": cancelled,
+                "command_id": command_identity[0],
+                "idempotency_key": command_identity[1],
+            }
+        )
     # Handle native kiro-cli subagents (native:* IDs not in SubagentManager)
     if agent_id.startswith("native:") and hasattr(state, "_native_cards"):
         card_info = getattr(state, "_native_cards", {}).get(agent_id)
@@ -1290,43 +1448,14 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
             )
             return web.json_response({"ok": True, "cancelled": True})
         return web.json_response({"error": "not found"}, status=404)
-    if not state.subagents:
-        return web.json_response(
-            {"error": "subagents not available", "code": "subagents_unavailable"}, status=503
-        )
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
-    try:
-        command_identity = _validated_command_identity(body, "cancel", require_run_id=False)
-    except ValueError as exc:
-        return _command_identity_response(exc)
-    if command_identity is None:
-        if agent_id not in state.subagents._agents:
-            return web.json_response({"error": "not found"}, status=404)
-        cancelled = await state.subagents.cancel(agent_id)
-    else:
-        identity = CommandIdentity(
-            run_id="",
-            command_id=command_identity[0],
-            idempotency_key=command_identity[1],
-        )
-        try:
-            cancelled = await state.subagents.command_authority.cancel(identity, agent_id)
-        except (AuthorityConflict, AuthorityUnavailable) as exc:
-            return _authority_failure_response(exc)
+    if not state.subagents or agent_id not in state.subagents._agents:
+        return web.json_response({"error": "not found"}, status=404)
+    cancelled = await state.subagents.cancel(agent_id)
     if not cancelled:
         # Already done — just remove from list
         state.subagents._agents.pop(agent_id, None)
         state.subagents._tasks.pop(agent_id, None)
-    response: dict[str, object] = {"ok": True, "cancelled": cancelled}
-    if command_identity is not None:
-        response["command_id"] = command_identity[0]
-        response["idempotency_key"] = command_identity[1]
-    return web.json_response(response)
+    return web.json_response({"ok": True, "cancelled": cancelled})
 
 
 async def api_spawn_stop_all(request: web.Request) -> web.Response:
@@ -2528,7 +2657,9 @@ async def api_send_message(request: web.Request) -> web.Response:
         )
 
     # Validate format first, then redact (#2)
-    if target_channel and not CHANNEL_ID_RE.match(target_channel):
+    if target_channel and (
+        len(target_channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(target_channel)
+    ):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     if target_user and not USER_ID_RE.match(target_user):
         return web.json_response({"error": "invalid user ID format"}, status=400)
@@ -2751,6 +2882,11 @@ async def api_send_message(request: web.Request) -> web.Response:
                                 slot,
                                 wrapped,
                                 _directive_user_origin=False,
+                                # Structural provenance for the session ledger:
+                                # the queued twin above carries
+                                # CRON_NOTIFICATION_KIND, and this branch is the
+                                # same injector dispatching directly.
+                                _turn_actor="cron",
                             ),
                         )
                         slot.task = task
@@ -3845,19 +3981,31 @@ async def api_browser_install_start(request: web.Request) -> web.Response:
                     # operator with a bare "failed" -- which cannot tell a
                     # registry auth error apart from a blocked download, the two
                     # cases the panel renders this string to explain.
-                    # Redacted before it reaches the panel. npm failures routinely
-                    # quote the command's own environment back at you: a registry
-                    # line carrying `_authToken=`, or a proxy URL with inline
-                    # credentials. This string is rendered verbatim in Settings and
-                    # is the thing an operator screenshots into a bug report, so it
-                    # goes through the same two-pass redaction as every other
-                    # external surface.
+                    # Redacted before it reaches the panel. Step stderr is already
+                    # scrubbed at the source (browser_cli.install._step runs the
+                    # npm-aware redactor on it), but the `error` fallback and the
+                    # exception arm below are composed HERE and never pass through
+                    # _step. This call re-runs the same npm-aware redactor
+                    # (redact_install_output: the shared two-pass PLUS the npm
+                    # shapes such as a bare `_authToken=`) so all three carriers
+                    # get identical coverage -- the module-local _redact runs only
+                    # the shared pair and would let an npm registry line through.
                     detail = first.get("stderr") or first.get("error") or "failed"
-                    state._browser_install_error = _redact(
+                    state._browser_install_error = browser_cli_install.redact_install_output(
                         f"{first.get('name', 'install')}: {str(detail).strip()}"
                     )[:2000]
             except Exception as exc:  # noqa: BLE001 - surfaced to the operator
-                state._browser_install_error = _redact(str(exc))[:2000]
+                # Redact the FULL text, then truncate: any pre-redaction cut can
+                # split a credential so its `@` anchor is gone, no pattern
+                # matches, and npm-line compression pulls the surviving fragment
+                # into the 2000-char display window. Pinned by
+                # test_a_credential_straddling_a_pre_redaction_cut_is_still_masked.
+                # Unbounded input cannot reach this arm in practice: install._run
+                # reports subprocess failures as return codes rather than raising
+                # with output, and every raise site carries a short message.
+                state._browser_install_error = browser_cli_install.redact_install_output(str(exc))[
+                    :2000
+                ]
 
         state._browser_install_task = asyncio.create_task(_run())
     return await api_browser_install_get(request)
@@ -3917,12 +4065,16 @@ async def api_browser_engine_install(request: web.Request) -> web.Response:
             failed = [] if result.get("ok") or not steps else steps[-1:]
             if failed:
                 first = failed[0]
-                state._browser_install_error = _redact(
+                # npm-aware redactor, same reasoning as the CLI install above.
+                state._browser_install_error = browser_cli_install.redact_install_output(
                     f"{first.get('name', 'install-browser')}: "
                     f"{first.get('stderr') or first.get('error') or 'failed'}"
                 )[:2000]
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator
-            state._browser_install_error = _redact(str(exc))[:2000]
+            # Redact the full text, then truncate; see the CLI install above.
+            state._browser_install_error = browser_cli_install.redact_install_output(str(exc))[
+                :2000
+            ]
 
     state._browser_install_task = asyncio.create_task(_run())
     return await api_browser_install_get(request)
@@ -4251,6 +4403,87 @@ async def api_slack_manifest(request: web.Request) -> web.Response:
             "create_url": create_url,
         }
     )
+
+
+async def api_channel_folder_backfill(request: web.Request) -> web.Response:
+    """POST /api/channel-folders/backfill - file a channel's EXISTING conversations.
+
+    One endpoint for all channels rather than one per channel: the namespace
+    arrives in the body and the work is byte-identical for every one of them, so
+    ten copies would be ten places for the eligibility guard to drift apart.
+
+    Loopback-only, matching the config saves it sits beside. It writes no
+    credential and no config, so that is not inherited reasoning: it bulk-moves
+    conversations with no collective undo, and a remote caller can neither see
+    the sidebar it rearranges nor put anything back.
+
+    Answers 200 with the report even when nothing moved, because "nothing to do"
+    is a normal outcome the panel has to render (and ``reason`` says which kind
+    it was). A 4xx is reserved for a request that was never actionable.
+    """
+    caller = request.get("user", "dashboard")
+
+    def _deny(msg: str, code: str, status: int = 400) -> web.Response:
+        # The ``code`` rides in the dict LITERAL beside the message, which is what
+        # makes the body machine-readable at any status: the panel renders `error`,
+        # while a caller that needs to branch reads `code` rather than matching on
+        # prose that translation or rewording can change under it.
+        _sel().log_api_access(
+            caller=caller,
+            operation="channel.folder.backfill",
+            outcome="denied",
+            source="dashboard",
+            error=msg,
+        )
+        return web.json_response({"error": msg, "code": code}, status=status)
+
+    if not is_direct_local_request(request):
+        # Deliberately NOT the neighbouring panels' wording ("read-only from
+        # remote sessions"). This endpoint's own button says "File existing
+        # sessions", meaning chat conversations, so a refusal that says
+        # "sessions" meaning LOGIN sessions puts one word for two different
+        # things on one card -- a blind reader could not tell which was meant.
+        #
+        # It is also a whole sentence naming the remedy, not a fragment: a
+        # reader who does not already know what "the local machine" is has
+        # nothing to act on, which is a dead end rather than a refusal.
+        # The `code` is unchanged, so nothing machine-readable moves with this.
+        return _deny(
+            "Filing runs only on the computer that hosts this dashboard. "
+            "Open the dashboard there and click again.",
+            "read_only_remote",
+            status=403,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return _deny("invalid JSON", "invalid_json")
+    if not isinstance(body, dict):
+        return _deny("body must be an object", "invalid_body")
+    raw_namespace = body.get("namespace")
+    if not isinstance(raw_namespace, str):
+        return _deny("namespace must be text", "namespace_invalid")
+    namespace = raw_namespace.strip().lower()
+    # Closed set, checked here rather than left to the config read: the namespace
+    # selects a config section and stamps a folder, and an unrecognised one must
+    # be a refusal the caller can see, not a silently empty pass.
+    if namespace not in CHANNEL_CONFIG_SECTIONS:
+        return _deny("unknown channel", "unknown_channel")
+    state = request.app.get("state")
+    if state is None:
+        return _deny("dashboard state unavailable", "state_unavailable", status=503)
+
+    report = await backfill_channel_folder(state, namespace)
+    _sel().log_api_access(
+        caller=caller,
+        operation="channel.folder.backfill",
+        outcome="ok",
+        source="dashboard",
+        # The count, not the keys: a session key names a channel conversation and
+        # the audit log is not the place to enumerate which ones a user filed.
+        resources=f"{namespace}:{len(report['moved'])}",
+    )
+    return web.json_response(report)
 
 
 async def api_slack_config_get(request: web.Request) -> web.Response:
@@ -6431,13 +6664,10 @@ async def api_imessage_config_get(request: web.Request) -> web.Response:
 
 async def api_imessage_config_save(request: web.Request) -> web.Response:
     """PUT /api/imessage/config — persist the iMessage config (config.json)."""
-    # `_atomic_json_write` stays function-local, and NOT for the rule's
-    # circular-import reason -- there is no cycle here (verified by importing
-    # both orders). It is imported this way at seven sites in this module, six of
-    # them pre-existing, so hoisting only this one would turn those six into F811
-    # redefinitions of a module-scope name and drag six unrelated call sites into
-    # this PR. Hoisting all seven belongs in its own change.
-    from kiro_crew.agent import _atomic_json_write  # noqa: F811
+    from kiro_crew.config.loader import (  # noqa: F811
+        ConfigReadError,
+        update_config_locked,
+    )
 
     caller = request.get("user", "dashboard")
 
@@ -6519,57 +6749,79 @@ async def api_imessage_config_save(request: web.Request) -> web.Response:
     # under the repo-wide config lock (read fresh, merge only the imessage
     # section, write atomic), so a concurrent save by another settings handler
     # is never overwritten by a stale snapshot taken before the lock.
+    #
+    # Through ``update_config_locked``, not ``_atomic_json_write``: it holds an
+    # advisory lock on the sidecar ``<path>.lock`` for the entire read-modify-write,
+    # so a concurrent ``kirocrew config set`` in ANOTHER PROCESS cannot land between
+    # our read and our write. ``_get_config_lock()`` serializes writers inside this
+    # process only, and loader.py names that combination the required path for a
+    # config.json mutation.
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
     applied: list[str] = []
     async with _get_config_lock():
         path = config_path()
+        session_folder = ""
+
+        def _apply_staged(fresh: dict) -> dict | None:
+            """Merge the staged iMessage fields into the config read inside the lock.
+
+            Returns ``None`` when nothing changed, which tells
+            ``update_config_locked`` to skip the write -- preserving the previous
+            behaviour of not touching config.json on a no-op save.
+            """
+            nonlocal applied, session_folder
+            if not isinstance(fresh.get("imessage"), dict):
+                fresh["imessage"] = {}
+            imessage_cfg = fresh["imessage"]
+
+            # Reduce staged fields to actual changes against the fresh read so
+            # restart_required stays truthful on no-op saves.
+            changes: dict[str, object] = {}
+            if "enabled" in staged and staged["enabled"] != bool(
+                imessage_cfg.get("enabled", False)
+            ):
+                changes["enabled"] = staged["enabled"]
+            if "allowed_handles" in staged and staged["allowed_handles"] != imessage_cfg.get(
+                "allowed_handles", []
+            ):
+                changes["allowed_handles"] = staged["allowed_handles"]
+            for key, default in (("service", "imessage"), ("db_path", "")):
+                if key in staged and staged[key] != str(imessage_cfg.get(key, default) or default):
+                    changes[key] = staged[key]
+            if "session_folder" in staged and staged["session_folder"] != str(
+                imessage_cfg.get("session_folder", "") or ""
+            ):
+                changes["session_folder"] = staged["session_folder"]
+            applied = list(changes.keys())
+
+            imessage_cfg.update(changes)
+            # Read AFTER the merge and inside the lock: the folder below must be
+            # created for the value that was actually committed, not for a
+            # pre-merge snapshot.
+            session_folder = str(imessage_cfg.get("session_folder", "") or "")
+            return fresh if changes else None
+
+        # Shield + drain so a cancellation arriving mid-write cannot
+        # release the config lock while the worker thread is still
+        # replacing the file (interleaved-write race).
+        _cfg_write_task_im: asyncio.Task[dict] = asyncio.ensure_future(
+            asyncio.to_thread(functools.partial(update_config_locked, path, mutate=_apply_staged))
+        )
         try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except Exception:
+            await asyncio.shield(_cfg_write_task_im)
+        except asyncio.CancelledError:
+            await asyncio.gather(_cfg_write_task_im, return_exceptions=True)
+            raise
+        except ConfigReadError:
             message = "config.json is corrupt"
             _audit_denial(message)
             return web.json_response({"error": message, "code": "config_corrupt"}, status=500)
-        if not isinstance(data.get("imessage"), dict):
-            data["imessage"] = {}
-        imessage_cfg = data["imessage"]
-
-        # Reduce staged fields to actual changes against the fresh read so
-        # restart_required stays truthful on no-op saves.
-        changes: dict[str, object] = {}
-        if "enabled" in staged and staged["enabled"] != bool(imessage_cfg.get("enabled", False)):
-            changes["enabled"] = staged["enabled"]
-        if "allowed_handles" in staged and staged["allowed_handles"] != imessage_cfg.get(
-            "allowed_handles", []
-        ):
-            changes["allowed_handles"] = staged["allowed_handles"]
-        for key, default in (("service", "imessage"), ("db_path", "")):
-            if key in staged and staged[key] != str(imessage_cfg.get(key, default) or default):
-                changes[key] = staged[key]
-        if "session_folder" in staged and staged["session_folder"] != str(
-            imessage_cfg.get("session_folder", "") or ""
-        ):
-            changes["session_folder"] = staged["session_folder"]
-        applied = list(changes.keys())
-
-        if changes:
-            imessage_cfg.update(changes)
-            # Shield + drain so a cancellation arriving mid-write cannot
-            # release the config lock while the worker thread is still
-            # replacing the file (interleaved-write race).
-            _cfg_write_task_im: asyncio.Task[None] = asyncio.ensure_future(
-                asyncio.to_thread(_atomic_json_write, path, data)
-            )
-            try:
-                await asyncio.shield(_cfg_write_task_im)
-            except asyncio.CancelledError:
-                await asyncio.gather(_cfg_write_task_im, return_exceptions=True)
-                raise
 
         # Create the configured session folder now, on this user-initiated save,
         # so the reconcile path never has to write the folder store. Best-effort:
         # a failure leaves conversations unfiled until the next save.
-        _folder_name = stored_folder_name(imessage_cfg.get("session_folder"))
+        _folder_name = stored_folder_name(session_folder)
         if _folder_name:
             _state = request.app.get("state")
             if _state is not None:
@@ -6577,7 +6829,7 @@ async def api_imessage_config_save(request: web.Request) -> web.Response:
                     _state,
                     "imessage",
                     _folder_name,
-                    relabel="session_folder" in changes,
+                    relabel="session_folder" in applied,
                 )
 
     _sel().log_api_access(
@@ -7503,18 +7755,3 @@ guard_owner_surface_routes(
         )
     },
 )
-
-
-async def api_spawn_clear(request: web.Request) -> web.Response:
-    """DELETE /api/spawn — clear all completed subagents."""
-    state: DashboardState = request.app["state"]
-    if not state.subagents:
-        return web.json_response({"ok": True})
-    done_ids = [a.id for a in state.subagents.all_agents if a.done]
-    for aid in done_ids:
-        state.subagents._agents.pop(aid, None)
-        state.subagents._tasks.pop(aid, None)
-    return web.json_response({"ok": True, "cleared": len(done_ids)})
-
-
-# ── Sessions / Notifications ──

@@ -15,6 +15,7 @@ from kiro_crew.context import ui_language_tag
 from kiro_crew.context_management import extract_plan_metadata, rephrase_plan
 from kiro_crew.dashboard.chat_folder_suggest import maybe_suggest_folder
 from kiro_crew.dashboard.chat_utils import (
+    effective_session_key,
     slot_history_key,
 )
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE, DashboardState, _ChatSlot
@@ -928,8 +929,16 @@ def _validate_title_reply(
 async def _generate_title_via_kiro(
     state: DashboardState,
     messages: list[dict[str, Any]],
+    *,
+    session_key: str = "",
 ) -> str:
-    """Generate a title using the shared background kiro-cli session."""
+    """Generate a title using the shared background kiro-cli session.
+
+    ``session_key`` names the session this call is charged to, so the spend lands
+    in that session's crew log as well as the usage store. It is optional because
+    the title's own correctness does not depend on it: a caller that cannot name
+    the owner still gets a title, and the crew log simply records nothing.
+    """
 
     # Off-loop: the config read behind _ui_language() is synchronous file IO
     # (see its docstring + AUTOSDE no-blocking-call-on-event-loop). Both callers
@@ -945,7 +954,13 @@ async def _generate_title_via_kiro(
     # Run titling on a fast/cheap model via the shared background one-liner
     # helper. Best-effort: on any error it returns "" and we fall through to the
     # heuristic fallback title.
-    text = await run_bg_oneliner(state.sessions, prompt, model=_TITLE_MODEL)
+    text = await run_bg_oneliner(
+        state.sessions,
+        prompt,
+        model=_TITLE_MODEL,
+        crew_log_kind="title",
+        crew_log_session_key=session_key,
+    )
     title = _validate_title_reply(text)
     if not title:
         logger.info("Title generation returned SKIP/empty — topic not clear yet")
@@ -958,20 +973,28 @@ async def _generate_refreshed_title(
     state: DashboardState,
     messages: list[dict[str, Any]],
     current_title: str,
+    *,
+    session_key: str = "",
 ) -> str:
     """Ask the background session whether *current_title* still fits.
 
     Returns the replacement title, or ``""`` when the model answered KEEP/SKIP,
     produced prose, or errored — every one of which means "leave the title
     alone". Same ``_bg`` one-liner path, model, redaction and shape validation
-    as the initial titling.
+    as the initial titling, and the same optional ``session_key`` charging.
     """
     ui_language = await asyncio.to_thread(_ui_language)
     prompt = _build_refresh_prompt(messages, current_title, ui_language=ui_language)
     if not prompt:
         return ""
     logger.debug("Title refresh prompt (%d chars)", len(prompt))
-    text = await run_bg_oneliner(state.sessions, prompt, model=_TITLE_MODEL)
+    text = await run_bg_oneliner(
+        state.sessions,
+        prompt,
+        model=_TITLE_MODEL,
+        crew_log_kind="title",
+        crew_log_session_key=session_key,
+    )
     title = _validate_title_reply(text)
     if not title:
         logger.info("Title refresh returned KEEP/SKIP/empty — keeping current title")
@@ -1119,7 +1142,9 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
 
     cancelled = False
     try:
-        title = await _generate_title_via_kiro(state, messages)
+        title = await _generate_title_via_kiro(
+            state, messages, session_key=effective_session_key(slot)
+        )
         logger.info("Auto-title: kiro returned %r for slot %s", title, slot.key)
         # RACE GUARD: an explicit title (manual rename / manual generate) may
         # have landed while we awaited generation. Keep it and discard ours.
@@ -1259,7 +1284,9 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
                 slot.key,
             )
             return
-        title = await _generate_refreshed_title(state, list(slot.messages), slot.title)
+        title = await _generate_refreshed_title(
+            state, list(slot.messages), slot.title, session_key=effective_session_key(slot)
+        )
         if not title:
             # KEEP/SKIP/prose/error — the current title stands.
             return
@@ -1317,7 +1344,9 @@ async def api_chat_slot_generate_title(request: web.Request) -> web.Response:
         # auto-title path (which passes the full list and wants the opening
         # messages) is unaffected.
         convo = [m for m in slot.messages if m.get("role") in _TITLE_PROMPT_ROLES]
-        title = await _generate_title_via_kiro(state, convo[-_TITLE_PROMPT_WINDOW:])
+        title = await _generate_title_via_kiro(
+            state, convo[-_TITLE_PROMPT_WINDOW:], session_key=effective_session_key(slot)
+        )
     except Exception:
         logger.debug("Title generation failed for slot %s", name, exc_info=True)
         title = _fallback_title_from_messages(slot.messages)

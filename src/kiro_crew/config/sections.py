@@ -35,6 +35,7 @@ from kiro_crew.computer_use.types import (
 from kiro_crew.computer_use.types import DEFAULT_SCREENSHOT_MAX_PX as _CU_DEFAULT_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import DEFAULT_TEXT_LIMIT as _CU_DEFAULT_TEXT_LIMIT
 from kiro_crew.config.resolution import _OBSERVED_DEGRADED_SECTIONS, DEGRADED_TAILSCALE
+from kiro_crew.constants import DEFAULT_SUBAGENT_MAX_TURNS as _DEFAULT_SUBAGENT_MAX_TURNS
 from kiro_crew.constants import SUBAGENT_TIMEOUT_MAX as _SUBAGENT_TIMEOUT_MAX
 from kiro_crew.constants import SUBAGENT_TIMEOUT_MIN as _SUBAGENT_TIMEOUT_MIN
 from kiro_crew.constants import SUBAGENT_TIMEOUT_SECS as _SUBAGENT_TIMEOUT_SECS
@@ -229,6 +230,28 @@ def coerce_fallback_model(raw: object) -> str:
     if s.lower() == "auto":
         return "auto"
     return model_registry.to_provider_id(s, "acp") or "auto"
+
+
+def coerce_refusal_fallback_model(raw: object) -> str:
+    """Normalize the content-filter fallback model (agent.refusal_fallback_model).
+
+    Same three shapes as :func:`coerce_fallback_model` but with the OPPOSITE
+    junk default: ``""`` (the default) disables the feature — a refusal then
+    surfaces exactly as it does today — so absent/junk input (``None``,
+    non-string) and an id the registry maps to ``""`` all collapse to ``""``
+    (off), never to a silently-enabled value. ``"auto"`` means "retry on the
+    model the provider's refusal envelope recommends, when it names one"; a
+    concrete id is normalized through :func:`model_registry.to_provider_id`
+    for the ``acp`` provider.
+    """
+    if raw is None or not isinstance(raw, str):
+        return ""
+    s = raw.strip()
+    if not s:
+        return ""
+    if s.lower() == "auto":
+        return "auto"
+    return model_registry.to_provider_id(s, "acp") or ""
 
 
 def _safe_int(value: object, default: int, lo: int | None = None, hi: int | None = None) -> int:
@@ -863,6 +886,21 @@ class AgentConfig:
             "silent.",
         ),
     )
+    refusal_fallback_model: str = field(
+        default="",
+        metadata=_meta(
+            "Refusal fallback model",
+            "Model the current message is retried on ONCE when the active "
+            "model's content filter declines it (refusal / CONTENT_FILTERED). "
+            "Empty ('', the default) disables the retry: the refusal card "
+            "surfaces exactly as before. A concrete model id (as advertised "
+            "by the provider, e.g. 'claude-opus-4.8') retries that single "
+            "message on it and restores the primary model on the next turn; "
+            "'auto' retries on the model the provider's refusal envelope "
+            "recommends, when it names one. The retry is announced in chat — "
+            "never silent — and a refusal from the fallback too is terminal.",
+        ),
+    )
     reasoning_effort: str = field(
         default="",
         metadata=_meta(
@@ -1225,11 +1263,250 @@ class AgentConfig:
         metadata=_meta(
             "Posture Admission Gate",
             "While available memory is at or below resource_critical_gb, defer "
-            "scheduled cron firings to the next tick and refuse new subagent "
-            "spawns until memory frees. Manually triggered cron runs, in-flight "
-            "subagents, and direct chat turns are never gated; an unreadable "
-            "probe admits (fail-open). Set false to make the critical posture "
-            "advisory-only.",
+            "scheduled cron firings to the next tick and defer new subagent "
+            "spawns (they stay queued in the task store and are re-checked "
+            "after admit_wait_secs) until memory frees. Manually triggered cron "
+            "runs, in-flight subagents, and direct chat turns are never gated; "
+            "an unreadable probe admits (fail-open). Set false to make the "
+            "critical posture advisory-only.",
+        ),
+    )
+    task_queue_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Durable Task Queue",
+            "Persist every accepted subagent spawn to $KIROCREW_HOME/tasks/tasks.db "
+            "before its id is returned, so accepted work survives a gateway crash "
+            "and memory pressure defers a spawn instead of refusing it. Set false "
+            "to fall back to the in-memory spawn queue for one release; tasks.db "
+            "is left in place and unread.",
+        ),
+    )
+    task_dispatch_window: int = field(
+        default=64,
+        metadata=_meta(
+            "Task Dispatch Window",
+            "Maximum number of queued spawns the gateway keeps in memory at once; "
+            "the rest wait as rows in tasks.db and are read in FIFO order as the "
+            "window drains. 2000 accepted tasks are 2000 rows and this many "
+            "Python objects. Clamped to 1..4096.",
+            restart=True,
+        ),
+    )
+    task_store_journal_mode: str = field(
+        default="auto",
+        metadata=_meta(
+            "Task Store Journal Mode",
+            "SQLite journal mode for tasks.db: 'auto' picks WAL only on a volume "
+            "DETECTED local, and DELETE both on a detected network filesystem and "
+            "when detection cannot tell -- WAL needs local shared memory, which "
+            "SMB/NFS does not provide, so an undecidable volume takes the slower "
+            "correct mode rather than risking the store. 'wal' or 'delete' force "
+            "one and skip the detection, so a local disk whose mount table is "
+            "unreadable keeps WAL by declaring it. Unknown values read as 'auto'.",
+            restart=True,
+        ),
+    )
+    admit_wait_secs: int = field(
+        default=30,
+        metadata=_meta(
+            "Admit Wait (seconds)",
+            "How long an admitted task may wait for its resources before it goes "
+            "back to queued, and how long a spawn deferred by the memory posture "
+            "gate waits before it is re-checked. Clamped to 1..3600.",
+            restart=True,
+        ),
+    )
+    start_collect_timeout_secs: int = field(
+        default=300,
+        metadata=_meta(
+            "Start Collect Timeout (seconds)",
+            "After a session start times out, how long the start collector keeps "
+            "the task in 'recovering' to adopt a late session/new response before "
+            "the start is retried. Reserved for the session-start gate; clamped "
+            "to 10..3600.",
+            restart=True,
+        ),
+    )
+    lane_weights: dict[str, int] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Lane Weights",
+            "Per-lane weight overrides for the task dispatcher, keyed by lane "
+            "(a root session key, or 'system'). Unlisted lanes weigh 1. Values "
+            "are clamped to 1..64. Weights shape the share of picks, never a hard cap: a "
+            "lane with nothing pending costs the others nothing.",
+        ),
+    )
+    child_reserve: int = field(
+        default=1,
+        metadata=_meta(
+            "Child Reserve",
+            "Execution slots a top-level (depth-0) task may never take while a "
+            "nested task is queued or a parent is waiting on its children. Only "
+            "children and resuming parents may use them, so a fleet of parents "
+            "can never hold every slot with no child able to start; while a "
+            "parent waits, an adaptive cap is also lifted to at least "
+            "adaptive_floor + child_reserve (never above max_subagents). 0 "
+            "disables the reserve. Clamped to 0..8.",
+        ),
+    )
+    recovery_backoff_base_secs: float = field(
+        default=2.0,
+        metadata=_meta(
+            "Recovery Backoff Base (seconds)",
+            "First retry delay of the shared recovery ladder (tool call, backend, "
+            "ACP runtime) and of a coordinated dependency wait; each further "
+            "attempt doubles it with jitter. One schedule for every layer, so "
+            "layers never retry in lock-step; snapshotted once at gateway start. "
+            "The gateway-daemon supervisor keeps its own pinned floor. "
+            "Clamped to 0.1..60.",
+            restart=True,
+        ),
+    )
+    recovery_backoff_max_secs: float = field(
+        default=120.0,
+        metadata=_meta(
+            "Recovery Backoff Cap (seconds)",
+            "Longest delay between two recovery attempts on the shared ladder or "
+            "a dependency wait; a server-stated retry hint is honoured up to this "
+            "cap. Snapshotted once at gateway start. Clamped to 1..3600 and never "
+            "below the base.",
+            restart=True,
+        ),
+    )
+    session_start_concurrency: int = field(
+        default=2,
+        metadata=_meta(
+            "Session Start Concurrency",
+            "How many ACP session/new requests may be outstanding at once per "
+            "gateway event loop (the SessionStartGate). session/new blocks while "
+            "the backend initializes the session's MCP servers, so a burst of "
+            "subagent starts on one shared runtime slows every start until the "
+            "budget is hit; queued starts wait in FIFO order and their queue time "
+            "is not counted against the start budget or the startup watchdog. A "
+            "fixed bound, not adaptive: the adaptive loop is the MCP gateway spawn "
+            "gate and the execution-cap controller. Clamped to 1..64.",
+            restart=True,
+        ),
+    )
+    adaptive_concurrency: bool = field(
+        default=True,
+        metadata=_meta(
+            "Adaptive Concurrency",
+            "Run the adaptive concurrency controller: a runtime execution cap "
+            "beneath max_subagents (the ceiling, never written) that halves on "
+            "corroborated host pressure (event-loop lag, low memory, fd/process "
+            "counts, attributable start timeouts, slow starts on several MCP "
+            "servers) and earns +1 back per clean window, plus the same shaping "
+            "for the MCP gateway daemon's spawn gate. A fresh gateway starts at "
+            "min(max_subagents, adaptive_initial) and earns its way up. Set false "
+            "to run at the user cap only.",
+        ),
+    )
+    adaptive_concurrency_mode: str = field(
+        default="aimd",
+        metadata=_meta(
+            "Adaptive Concurrency Mode",
+            "'aimd': multiplicative decrease / additive increase with pause-and-"
+            "probe. 'fixed': both caps pinned at their initial values -- a plain "
+            "semaphore -- the one-flip reversal if the controller is seen to "
+            "oscillate.",
+            enum=["aimd", "fixed"],
+        ),
+    )
+    adaptive_floor: int = field(
+        default=1,
+        metadata=_meta(
+            "Adaptive Floor",
+            "Lowest execution cap the controller may shrink to under sustained "
+            "pressure (a pause takes new grants to 0 temporarily). Clamped to "
+            "1..64.",
+        ),
+    )
+    adaptive_initial: int = field(
+        default=4,
+        metadata=_meta(
+            "Adaptive Initial Cap",
+            "Execution cap a fresh gateway starts at, bounded by max_subagents. "
+            "Healthy work and queued demand let the controller raise it; see "
+            "adaptive_slow_start for growth rules. Clamped to 1..64.",
+        ),
+    )
+    adaptive_slow_start: bool = field(
+        default=True,
+        metadata=_meta(
+            "Adaptive Slow Start",
+            "Until the gateway first meets corroborated host pressure, let the "
+            "execution cap DOUBLE per clear 5-second window (on one completion "
+            "and real demand) instead of climbing +1 per clear 30-second window, "
+            "bounded by max_subagents and by what this host's memory and CPU "
+            "size the cap at. The first pressure ends slow start for the life "
+            "of the process. Set false to climb +1 per clear 30-second window "
+            "from the start. Slow start earns an increase on one completion plus "
+            "real demand; congestion avoidance earns each +1 after one full wave "
+            "of the CURRENT cap completes (at most 20 runs). Alternatively, "
+            "fresh stream progress with queued work and measured headroom can "
+            "earn one probe slot per clear window without a completion; this "
+            "never earns doubling or relaxes the initialization gate.",
+        ),
+    )
+    controller_sample_secs: int = field(
+        default=5,
+        metadata=_meta(
+            "Controller Sample Interval (seconds)",
+            "How often the adaptive controller samples the host and the spawn "
+            "gate. Clamped to 1..300.",
+        ),
+    )
+    dependency_max_attempts: int = field(
+        default=20,
+        metadata=_meta(
+            "Dependency Max Attempts",
+            "Coordinated retries a dependency scope gets before every task "
+            "waiting on it is failed with the reason. One probe per attempt for "
+            "the whole scope, not one per waiting task. Clamped to 1..1000.",
+        ),
+    )
+    dependency_wait_deadline_secs: int = field(
+        default=3600,
+        metadata=_meta(
+            "Dependency Wait Deadline (seconds)",
+            "Wall-clock ceiling a task may wait on one dependency scope before "
+            "it is failed with the reason; 0 disables the clock and leaves only "
+            "the attempts cap. Clamped to 0..86400.",
+        ),
+    )
+    dependency_wake_per_tick: int = field(
+        default=0,
+        metadata=_meta(
+            "Dependency Wake Per Tick",
+            "How many waiting tasks a recovered dependency releases per wake "
+            "tick, after the single probe that confirms recovery. 0 = the "
+            "current effective admission capacity, so a recovered dependency "
+            "never replays every waiter at once. Clamped to 0..4096.",
+        ),
+    )
+    dependency_wake_spacing_secs: float = field(
+        default=1.0,
+        metadata=_meta(
+            "Dependency Wake Spacing (seconds)",
+            "Pause between wake ticks while a recovered dependency's waiters are "
+            "released in capacity-sized batches. Clamped to 0..60.",
+        ),
+    )
+    interactive_command_policy: str = field(
+        default="cancel",
+        metadata=_meta(
+            "Interactive Command Policy",
+            "What the tool-stall watchdog does when a stalled shell command is "
+            "classified as waiting for input (a pager, editor, REPL or confirm "
+            "prompt). 'cancel' ends that tool call non-lethally and re-drives the "
+            "turn with a non-interactive hint; 'wait' announces a waiting_input "
+            "status once and keeps the turn open for real input, bounded by the "
+            "turn's own ceiling. Neither ever answers the prompt itself. Read "
+            "when a session handle is created and on config hot-apply.",
+            enum=["cancel", "wait"],
         ),
     )
     workflow_run_timeout_secs: int = field(
@@ -1353,15 +1630,21 @@ class AgentConfig:
         ),
     )
     subagent_spawn_stagger_secs: float = field(
-        default=2.0,
+        default=0.25,
         metadata=_meta(
             "SubAgent Spawn Stagger (seconds)",
             "Delay between successive subagent spawns (initial fill and queued "
-            "drain) to bound cold-start CPU/memory spikes.",
+            "drain) to bound cold-start CPU/memory spikes. Starts stay "
+            "serialized; the interval only decides how fast a wide fan-out "
+            "fills. Raise it if this "
+            "host or the model provider is the bottleneck -- a spawn still has "
+            "to clear spawn_min_memory_gb and the host budget, and the adaptive "
+            "controller cuts the cap on real pressure, so this is a smoothing "
+            "interval rather than the memory guard.",
         ),
     )
     subagent_max_turns: int = field(
-        default=100,
+        default=_DEFAULT_SUBAGENT_MAX_TURNS,
         metadata=_meta("SubAgent Max Turns", "Default tool-call budget per subagent."),
     )
     subagent_timeout_secs: int = field(
@@ -1469,6 +1752,9 @@ class AgentConfig:
         # Same defensive coercion for the throttle-fallback model: normalize to
         # ""/"auto"/acp id, so consumers can trust the stored shape.
         self.fallback_model = coerce_fallback_model(self.fallback_model)
+        # And for the content-filter fallback model — same shapes, junk
+        # collapses to "" (off) rather than "auto".
+        self.refusal_fallback_model = coerce_refusal_fallback_model(self.refusal_fallback_model)
 
     def resolve_model(self, role: str) -> str:
         """Effective model id for a task ``role`` — INDEPENDENT of the chat model.
@@ -1811,6 +2097,14 @@ class MemoryConfig:
             "modification nanoseconds and change nanoseconds. An empty list means unverified.",
         ),
     )
+    embed_rebuild_generation: str = field(
+        default="",
+        metadata=_meta(
+            "Embedding Rebuild Generation",
+            "Managed explicit-apply request identity. Stores acknowledge it only after "
+            "invalidating their previous vectors; empty preserves ordinary upgrade behavior.",
+        ),
+    )
     embed_model_legacy_ids: list[str] = field(
         default_factory=list,
         metadata=_meta(
@@ -1876,21 +2170,13 @@ class MemoryConfig:
         default=365,
         metadata=_meta("History Max Days", "Maximum days of history to retain."),
     )
-    private_provisioning_enabled: bool = field(
-        default=True,
-        metadata=_meta(
-            "New Private Memory",
-            "Allow creating private V2 member stores and explicit V1-to-V2 setup. "
-            "Turn off to pause provisioning; existing V2 execution, management "
-            "and isolation continue.",
-        ),
-    )
     backup_enabled: bool = field(
         default=True,
         metadata=_meta(
             "Automatic Memory Backups",
-            "Take a daily rotating copy of each active member V2 store. Global and "
-            "named V1 backups remain manual. This does not delete active memories.",
+            "Take a daily rotating copy of every active memory store: the default "
+            "store, named V1 stores and member V2 stores. This does not delete active "
+            "memories.",
         ),
     )
     backup_keep: int = field(
@@ -3032,9 +3318,13 @@ class DashboardConfig:
             "Terminal panel configuration. Set enabled=false to hide the CLI panel in the dashboard.",
             # Declared sub-keys become first-class schema entries
             # (dashboard.terminal.<key>) so Settings controls can reference
-            # them by configKey. The field stays a plain dict — undeclared
-            # keys (max_sessions, completion.commands, cwd) remain valid via
-            # additionalProperties and round-trip untouched.
+            # them by configKey and `kirocrew config set` accepts them on a
+            # config that has never written one (the CLI's key check consults
+            # SCHEMA_REGISTRY - see cli_config._declared_entry). `enabled` needs
+            # no declaration for that: it rides on the default_factory below, so
+            # it is always in the document that check walks. The field stays a
+            # plain dict, so a key added by a future release still round-trips
+            # untouched via additionalProperties.
             properties={
                 "shell": {
                     "type": "string",
@@ -3047,9 +3337,29 @@ class DashboardConfig:
                         ),
                     },
                 },
-                # Only `enabled` is declared; `completion.commands` (the
-                # subcommand-probe allowlist) stays an undeclared key, so the
-                # object is left open the same way `terminal` itself is.
+                "max_sessions": {
+                    "type": "integer",
+                    "default": 12,
+                    "x-meta": {
+                        "label": "Max terminal sessions",
+                        "help": (
+                            "Ceiling on concurrent terminal sessions across every chat, "
+                            "server-wide. Each chat's activity bar caps its own terminals "
+                            "below this; a session beyond the ceiling is refused."
+                        ),
+                    },
+                },
+                "cwd": {
+                    "type": "string",
+                    "default": "",
+                    "x-meta": {
+                        "label": "Default working directory",
+                        "help": (
+                            "Directory a terminal opens in when the chat passes no project "
+                            "directory of its own. Empty = $HOME."
+                        ),
+                    },
+                },
                 "completion": {
                     "type": "object",
                     "additionalProperties": True,
@@ -3067,6 +3377,28 @@ class DashboardConfig:
                                     "Show the completion popup while typing in the "
                                     "Terminal tab. Off = no popup; the shell's own Tab "
                                     "completion still works."
+                                ),
+                            },
+                        },
+                        # Left open like `completion` itself: a typed
+                        # `additionalProperties` would flatten into a
+                        # `commands.*` registry entry, which is not reachable
+                        # from the dataclass hierarchy the schema mirrors. The
+                        # values are protocol names and a value that is not one
+                        # is ignored by `terminal_commands.protocol_for`.
+                        "commands": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "default": {},
+                            "x-meta": {
+                                "label": "Completion protocol overrides",
+                                "help": (
+                                    "Re-point an already-allowlisted command at a different "
+                                    'completion protocol, e.g. {"docker": "cobra"}. It can '
+                                    "only change the protocol of a command the release "
+                                    "already knows - it cannot add one, because the "
+                                    "allowlist is the set of tools whose probe argv is "
+                                    "known to be inert."
                                 ),
                             },
                         },
@@ -3318,6 +3650,10 @@ class DashboardConfig:
 
 @dataclass
 class KiroCrewAgentConfig:
+    member_id: str = field(
+        default="",
+        metadata=_meta("Member ID", "Immutable identity assigned when member memory is created."),
+    )
     kiro_agent: str = field(
         default="",
         metadata=_meta("Kiro Agent", "Kiro agent name (modeId for session/set_mode)."),
@@ -3448,13 +3784,19 @@ class WorkspaceConfig:
 
 @dataclass
 class MemoryStoreConfig:
+    owner_member_id: str = field(
+        default="",
+        metadata=_meta("Owner Member ID", "Immutable member identity stored in this database."),
+    )
     owner_member: str = field(
         default="",
-        metadata=_meta("Owner Member", "The sole Crew Member owning this private memory store."),
+        metadata=_meta(
+            "Owner Member", "Display label of the Crew Member owning this memory store."
+        ),
     )
     memory_version: int = field(
         default=1,
-        metadata=_meta("Memory Version", "1 for existing memory; 2 for private member memory."),
+        metadata=_meta("Memory Version", "1 for existing memory; 2 for member memory."),
     )
     description: str = field(
         default="",
@@ -3487,6 +3829,36 @@ class ExternalRegistryConfig:
         default="main",
         metadata=_meta("Branch", "Git branch to read from."),
     )
+    label: str = field(
+        default="",
+        metadata=_meta(
+            "Label",
+            "Display name shown instead of the registry id (e.g. 'Community apps' "
+            "for the id 'community'). DISPLAY ONLY: the id in `name` stays the "
+            "identity every cache path and every installed app's `_registry` tag "
+            "is keyed by, so a label change never moves an app or re-fetches an "
+            "index. Empty means the id is shown as-is. Setting it HERE has no "
+            "effect, for the same reason `trust` does not: this file is "
+            "agent-writable, so only a build-pinned row may claim one.",
+        ),
+    )
+    review: str = field(
+        default="",
+        metadata=_meta(
+            "Review",
+            "How thoroughly the listings in this registry were reviewed before "
+            "being published, which is what the UI tells the user. 'curated' "
+            "means the owning team reviewed each listing; 'community' means "
+            "contributors listed apps after a lighter review, so nothing here is "
+            "vetted; empty (the default) makes no claim either way and renders "
+            "exactly as it did before this field existed. It changes NO security "
+            "posture: `trust` alone selects the credential posture for cloning, "
+            "so a 'curated' registry at the untrusted index tier still clones "
+            "credential-free. Setting it HERE has no effect (see `label`): only a "
+            "build-pinned row may claim a tier.",
+            enum=["", "curated", "community"],
+        ),
+    )
     trust: str = field(
         default="index",
         metadata=_meta(
@@ -3515,24 +3887,26 @@ class SkillsConfig:
             "Each match injects that skill's full content, unless the skill sets "
             "inject_on_trigger: false (pointer-only; requires max_triggered > 0 to "
             "have any effect). Defaults to 0 (disabled): the agent discovers skills "
-            "from the Available Skills index and reads them on demand via cat, "
-            "$skillname, or skill_search. Set to a positive integer to re-enable "
+            "from a short name/purpose index and skill_search using short keywords. "
+            "Search loads confined project bodies safely; $skillname loads a named skill. "
+            "Set to a positive integer to re-enable "
             "per-turn word-overlap trigger matching.",
         ),
     )
-    # ── Lazy skill injection (opt-in, like MCP prewarm) ──
+    # ── Skill index mode ──
     lazy_load: bool = field(
-        default=False,
+        default=True,
         metadata=_meta(
             "Lazy Skill Injection",
-            "When true, the session-start skills block injects only a usage-ranked "
-            "top-K of on-demand skills (bounded by its own section budget) and leaves "
-            "the long tail discoverable via the skill_search tool / $skillname / "
-            "triggers; each context section also gets its own independent char cap so "
-            "the global ceiling becomes their sum (~190k) and a large skills set can "
-            "never crowd out memory/lessons. Disabled by default (0-impact upgrade, "
-            "like prewarm_count=0): off means the legacy full skills dump under a "
-            "single shared 165k budget — unchanged behavior.",
+            "When true (the default), show a bounded usage-ranked index of on-demand "
+            "skills, each with its path, plus a line naming the families the index "
+            "leaves out. Set to false for the shorter entry that names only the eight "
+            "hottest skills and points at skill_search for the rest. Both modes use the "
+            "same Crew background budget, independent of model window size, and neither "
+            "applies to an agent with its own skill:// mapping, which gets a bounded "
+            "directory of mapped skills with complete search, paginated listing and exact "
+            "reads on demand. Required pinned instructions share an explicit startup "
+            "capacity; explicit loading and trigger gates are preserved.",
         ),
     )
     # ── Auto skill creation ──
@@ -4490,6 +4864,7 @@ class ResolvedBindings:
     memory_store_name: str
     effective_memory_config: dict
     kiro_agent: str
+    execution_context: object | None = None
     # The Kiro Crew agent's own default model, "" when it pins none. Ranks below
     # a per-session pick and above the bound kiro agent's pin / the global
     # agent.model fallback. Defaulted so existing keyword constructions and
@@ -4508,6 +4883,12 @@ class ResolvedBindings:
     # to that alias's target instead — reintroducing the advertised-vs-answering
     # mismatch. An alias key round-trips to itself.
     resolved_alias: str = ""
+    # Positive selection provenance. A later discovered member with the same
+    # name must not change a conversation that selected the provider template.
+    selection_kind: str = ""
+    # Revision observed before resolution: "" means no protected record;
+    # None means no observation was made. Only automatic publication uses it.
+    selection_revision: str | None = None
 
     def same_dispatch_binding(self, other: "ResolvedBindings") -> bool:
         """Whether two resolutions name the SAME dispatch target.
@@ -4520,9 +4901,14 @@ class ResolvedBindings:
         field that changes what answers a turn — the kiro agent, workspace,
         memory store, and model — and deliberately not ``resolved_alias``
         (two names resolving to one alias's target ARE the same binding) or
+        ``selection_kind`` (the namespace is retained separately for later
+        resolution; identical current targets may still share a slot) or
+        ``selection_revision`` (a publication guard, not a dispatch target) or
         ``requested_resolved``/``effective_memory_config`` (the former is
         request metadata the caller checks separately; the latter is derived
         from ``memory_store_name`` plus global config shared by both sides).
+        ``execution_context`` carries the admitted session's identity and mode;
+        session selection checks those separately before comparing these targets.
         """
         return (
             self.kiro_agent == other.kiro_agent
@@ -4838,6 +5224,100 @@ class McpGatewayConfig:
             "agents with ~S servers each need N*S slots. Bounded by design: idle "
             "backends drain after idle_timeout_secs, so steady-state RAM tracks real "
             "concurrency, not this ceiling.",
+            restart=True,
+        ),
+    )
+    spawn_concurrency_initial: int = field(
+        default=4,
+        metadata=_meta(
+            "Spawn Concurrency",
+            "How many MCP backend spawn+initialize windows the broker runs at once, "
+            "across every server and session (pooled, private and respawned alike). "
+            "Further spawns wait their turn in FIFO order and the waiting stub is "
+            "kept informed, so a burst of new sessions cold-starts its servers a few "
+            "at a time instead of forking hundreds of processes against one disk. "
+            "This is the starting value the adaptive controller moves between "
+            "spawn_concurrency_min and spawn_concurrency_max. Distinct from "
+            "max_backends, which bounds how many backends stay RESIDENT.",
+            restart=True,
+        ),
+    )
+    spawn_concurrency_min: int = field(
+        default=1,
+        metadata=_meta(
+            "Spawn Concurrency Floor",
+            "Lowest value the adaptive controller may cut spawn concurrency to "
+            "under host pressure. At least 1: something always makes progress.",
+            restart=True,
+        ),
+    )
+    spawn_concurrency_max: int = field(
+        default=8,
+        metadata=_meta(
+            "Spawn Concurrency Ceiling",
+            "Highest value the adaptive controller may raise spawn concurrency to "
+            "when spawns keep succeeding without pressure.",
+            restart=True,
+        ),
+    )
+    spawn_queue_wait_secs: int = field(
+        default=600,
+        metadata=_meta(
+            "Spawn Queue Wait",
+            "Longest a session's stub is held in the broker's spawn queue before it "
+            "is refused for capacity. The default matches the stub's own reconnect "
+            "budget (a constant, mcp_gateway/stub.py _RECONNECT_TOTAL_BUDGET_SECS): "
+            "for that long kiro-cli's transport stays open and the server's tools "
+            "stay listed. This is a ceiling on the wait, never the wait itself -- "
+            "the daemon waits the smaller of this and the budget the stub asked "
+            "for, less a margin, so the refusal always reaches a stub that is still "
+            "listening. Raising this above 600 therefore buys a queued stub no "
+            "extra wait, because what the stub asked for caps it first; raise that "
+            "constant to wait longer. A spent wait is reported to the session as a "
+            "typed error naming the class and a retry hint, never as a crashed "
+            "server.",
+            restart=True,
+        ),
+    )
+    initialize_timeout_secs: int = field(
+        default=10,
+        metadata=_meta(
+            "Initialize Timeout",
+            "Seconds a freshly spawned backend has to answer its first MCP "
+            "initialize once the session sends it. A backend that stays silent is "
+            "failed and reaped so its slot frees; the broker holds the spawn "
+            "permit for this same window. Raise it for servers whose startup is "
+            "legitimately slow (large runtimes, remote resolution).",
+            restart=True,
+        ),
+    )
+    host_budget_max_procs: int = field(
+        default=0,
+        metadata=_meta(
+            "Host Budget: Processes",
+            "Ceiling on MCP backend processes the broker is answerable for on this "
+            "host -- pooled, private and the per-session exec a stub runs when the "
+            "broker cannot serve it, charged identically. 0 (default) derives it "
+            "from available memory at broker start, never below max_backends.",
+            restart=True,
+        ),
+    )
+    host_budget_max_rss_mb: int = field(
+        default=0,
+        metadata=_meta(
+            "Host Budget: Memory (MiB)",
+            "Ceiling on the summed per-backend memory estimate the broker admits. "
+            "0 (default) leaves memory to the process ceiling above.",
+            restart=True,
+        ),
+    )
+    host_budget_max_fds: int = field(
+        default=0,
+        metadata=_meta(
+            "Host Budget: Descriptors",
+            "Ceiling on the file descriptors the broker itself holds for backends "
+            "(three pipes each). 0 (default) derives it from the broker's own "
+            "open-file limit, leaving room for stub connections.",
             restart=True,
         ),
     )
@@ -5220,6 +5700,257 @@ class InstancesConfig:
                 _DEFAULT_PROBE_FAILS,
             )
             object.__setattr__(self, "probe_failure_threshold", _DEFAULT_PROBE_FAILS)
+
+
+# Sampling bucket bounds, as a percentage of sessions. 0 admits nothing, 100
+# admits everything; both the parse below and the gate clamp to this range rather
+# than treating an out-of-range value as a second way to disable the seam.
+DECISION_BUCKET_MIN = 0
+DECISION_BUCKET_MAX = 100
+
+DECISION_PROVIDER_ENDPOINT_DEFAULT = "https://api.typesafe.ai/v1/systemone"
+DECISION_PROVIDER_MODEL_DEFAULT = "jev-latest"
+
+# How much PRIOR CONVERSATION one decision may carry, as a char budget rather than
+# a message count, because what it bounds is the size of the request that leaves
+# the machine -- a count bounds neither.
+#
+# The default is 0, and that is the whole point: consent is recorded against what
+# the owner reviewed, and the text they reviewed says the message excerpt and the
+# candidate descriptions leave the machine. Shipping prior turns under that
+# standing grant would widen egress with no new choice, so an owner who wants the
+# conversation sent raises this themselves.
+DECISION_HISTORY_BUDGET_DEFAULT = 0
+
+
+@dataclass
+class DecisionProviderConfig:
+    """Where the System One provider lives and what one call may cost."""
+
+    endpoint: str = field(
+        default=DECISION_PROVIDER_ENDPOINT_DEFAULT,
+        metadata=_meta(
+            "Endpoint",
+            "Full URL of the evaluation endpoint. Override only to point at a "
+            "compatible proxy — the request and response field names are fixed by "
+            "the TypeSafe API, not by this setting.",
+        ),
+    )
+    api_key: str = field(
+        default="secret://TYPESAFE_API_KEY",
+        metadata=_meta(
+            "API Key",
+            "The provider credential reference. Only 'secret://TYPESAFE_API_KEY' is "
+            "honoured: it reads that one entry from the dashboard secrets vault "
+            "(Settings › Secrets), so no key is ever stored in config.json. A literal "
+            "key here is NOT used, and no other vault entry is readable through this "
+            "field, because config.json is agent-writable. With no usable key the "
+            "seam logs a row saying so and returns None — it never sends an empty "
+            "bearer credential.",
+            sensitive=True,
+        ),
+    )
+    model: str = field(
+        default=DECISION_PROVIDER_MODEL_DEFAULT,
+        metadata=_meta(
+            "Model",
+            "Provider model id. 'jev-latest' is TypeSafe's flagship System One model. "
+            "Letters, digits, dots, dashes and underscores, up to 64 characters; "
+            "anything else is refused before a request is sent, because this field "
+            "travels in the request and config.json is agent-writable.",
+        ),
+    )
+    timeout_ms: int = field(
+        default=1000,
+        metadata=_meta(
+            "Timeout (ms)",
+            "Total budget for one decision, in milliseconds. Exceeding it logs "
+            "error='timeout' and returns None, so this is the ceiling the seam "
+            "adds to the path it sits in — not a target. Values at or below zero "
+            "are floored to 1ms rather than disabling the timeout.",
+        ),
+    )
+
+
+@dataclass
+class DecisionsConfig:
+    """Decision seam (``src/kiro_crew/decisions/``). Off by default.
+
+    There is deliberately NO ``enabled`` field here. The switch that lets
+    conversation state leave the machine is an authorization, not a preference,
+    and ``config.json`` is writable by an auto-approved agent shell -- so it lives
+    on the KEYSTONE leaf ``decisions_consent.json`` (``decisions.consent``), the
+    same placement as ``computer_use.json`` and ``aws_service_consent.json``. This
+    section carries only the knobs that grant nothing on their own: the sampling
+    share, the prior-conversation budget (0 by default, so raising it is a choice),
+    and the provider. There is no per-point arm and no shadow mode: one point ships
+    (``skills.select``).
+
+    Every field is hot-applied (no ``restart=True`` anywhere): the gate reads the
+    live snapshot per call, so a bucket change takes effect on the next decision
+    without a gateway restart.
+    """
+
+    bucket: int = field(
+        default=DECISION_BUCKET_MAX,
+        metadata=_meta(
+            "Bucket (%)",
+            "Percentage of sessions the seam fires for, 0-100, decided by a hash "
+            "of the session key so a session is consistently in or out. 0 fires "
+            "for nobody, 100 for everybody. Out-of-range numbers are clamped; a "
+            "value that is not a whole number reads as 0 (nobody sampled), never "
+            "as everybody. To switch the seam off, withdraw consent in Settings > "
+            "Developer > Feature Previews, not a zero bucket.",
+        ),
+    )
+    history_budget_chars: int = field(
+        default=DECISION_HISTORY_BUDGET_DEFAULT,
+        metadata=_meta(
+            "History budget (chars)",
+            "How many characters of PRIOR conversation one decision may carry, on "
+            "top of the current message. Earlier user and assistant turns are added "
+            "newest-first until this many characters are spent and the last one is "
+            "clipped to fit; tool output is never sent. The default is 0 -- no prior "
+            "turns -- because consent is recorded against the text the owner "
+            "reviewed, which names the message excerpt and the candidate "
+            "descriptions; raising this widens what leaves the machine, so it is a "
+            "choice rather than an upgrade. A negative value reads as 0.",
+        ),
+    )
+    provider: DecisionProviderConfig = field(
+        default_factory=DecisionProviderConfig,
+        metadata=_meta("Provider", "Where decisions are sent and what they may cost."),
+    )
+
+    @classmethod
+    def from_raw(cls, section: object) -> "DecisionsConfig":
+        """Build from a raw ``decisions`` dict -- the ONE parse site.
+
+        Lives here rather than in the loader because the bucket bounds are
+        declared a few lines above, and a normalizer that read them from another
+        module would need those names re-exported across a frozen module boundary
+        (``test_config_module_boundaries``).
+
+        Every value is NORMALIZED rather than validated-and-rejected: this
+        section gates a seam that is off by default, so the fail-closed reading
+        of any unreadable value is the default, and a hand-edited config.json
+        must not stop the gateway booting.
+
+        Accepts whatever ``json.loads`` produced, including ``None`` and a
+        non-dict, for the same reason ``ResourceLimitsConfig.from_raw`` does. A
+        config carrying the earlier ``preview``/``points``/``enabled`` spelling
+        is read for its bucket and provider only: consent is never inferred from
+        ``config.json``, whatever key it carries, because that file is what the
+        keystone exists to keep the decision out of.
+        """
+        if not isinstance(section, dict):
+            return cls()
+
+        raw_provider = section.get("provider")
+        raw_provider = raw_provider if isinstance(raw_provider, dict) else {}
+
+        def _text(key: str, default: str) -> str:
+            """A non-empty stripped string, else *default*.
+
+            An empty or blank value resolves to the DEFAULT rather than to ``""``:
+            the implementation falls back to the documented endpoint and model
+            anyway, so storing ``""`` would leave the saved config disagreeing
+            with what is in force -- the same reason ``bucket`` is clamped here.
+            """
+            raw = raw_provider.get(key)
+            return raw.strip() if isinstance(raw, str) and raw.strip() else default
+
+        provider = DecisionProviderConfig(
+            endpoint=_text("endpoint", DecisionProviderConfig.endpoint),
+            api_key=_text("api_key", DecisionProviderConfig.api_key),
+            model=_text("model", DecisionProviderConfig.model),
+            timeout_ms=_safe_int(
+                raw_provider.get("timeout_ms", DecisionProviderConfig.timeout_ms),
+                DecisionProviderConfig.timeout_ms,
+            ),
+        )
+
+        return cls(
+            # Clamped here as well as in the gate. The gate clamps because it
+            # must never trust a value it did not parse; clamping here is what
+            # makes the SAVED config say what is in force, so an operator who
+            # wrote 500 sees 100 come back rather than a number that behaves as
+            # 100 while reading as 500.
+            #
+            # ABSENT reads as the default (every session); MALFORMED reads as 0.
+            # The two must not share a fallback: this number decides how much
+            # conversation state leaves the machine, so a hand-edit that fails to
+            # parse must fail closed to "nobody", never open to "everybody".
+            bucket=_safe_int(
+                section.get("bucket", DECISION_BUCKET_MAX),
+                DECISION_BUCKET_MIN,
+                DECISION_BUCKET_MIN,
+                DECISION_BUCKET_MAX,
+            ),
+            # Unreadable reads as the DEFAULT, which for this key is 0 -- the same
+            # direction a malformed bucket takes, because both decide how much
+            # conversation leaves the machine and neither may fail open. Floored at
+            # 0 so a negative number cannot read as unbounded.
+            history_budget_chars=_safe_int(
+                section.get("history_budget_chars", DECISION_HISTORY_BUDGET_DEFAULT),
+                DECISION_HISTORY_BUDGET_DEFAULT,
+                0,
+            ),
+            provider=provider,
+        )
+
+
+@dataclass
+class MonitoringConfig:
+    """Which side justifies itself when a session picks a monitoring path.
+
+    Two paths can watch the same pull request today and NEITHER is gated. The
+    probe-gated structured monitor (``monitor_watch``) and the per-interval
+    prompt loop (``monitor_start``) are both armable on a stock install, and
+    ``GET /api/monitors`` answers ``enabled`` from whether the service object
+    exists rather than from any key, so there has never been a switch that
+    turns the structured engine on or off.
+
+    What is genuinely unsettable is which of the two an arming takes, and the
+    reason is that no code chooses: the choice is made by the model reading the
+    two tool descriptions. So this section is read exactly where those
+    descriptions are built -- ``mcp_tools/control.py::schemas()`` -- and
+    nowhere else. That is the honest extent of it, and the help text below says
+    so rather than implying an enforcement this key does not have.
+    """
+
+    prefer_structured_arming: bool = field(
+        default=False,
+        metadata=_meta(
+            "Prefer the structured monitor when arming",
+            "Which side has to justify itself before a supported pull request is "
+            "watched. Off, the default and the shipped wording: the structured "
+            "monitor monitor_watch is admissible only once the caller has "
+            "satisfied itself that the objective is fully determined by typed "
+            "provider facts, a judgement that leans to the prompt loop whenever "
+            "the caller is unsure. On: a supported pull request is enough, and "
+            "the prompt loop monitor_start becomes the exception that needs its "
+            "own reason. Both positions send evidence the typed provider cannot "
+            "observe -- comments, advisory review findings -- to the prompt loop, "
+            "so this moves the burden rather than swapping two defaults. What it "
+            "changes is the text those two descriptions give the agent: it does "
+            "not refuse either tool and cannot guarantee which one the agent "
+            "picks. Neither path is gated by this key -- both are armable with it "
+            "off -- so turning it on grants no new unattended capability. The "
+            "value is read afresh every time the tool list is built, so no "
+            "gateway restart is needed; a session already open keeps the tool "
+            "list it was given, so the change reaches the next session. Two "
+            "things to know before turning it on. The structured path observes "
+            "typed provider facts only -- lifecycle, checks, mergeability, "
+            "review decision, review threads -- and not generic comments or "
+            "advisory review findings, so an objective that depends on reading "
+            "those still needs the prompt loop. And this key is reversible but "
+            "an already-armed structured monitor is not: stopping one records a "
+            "retained USER_STOP outcome that refuses a re-arm, so moving such a "
+            "session to the prompt loop needs its owner to clear that record in "
+            "the dashboard's monitor popover first.",
+        ),
+    )
 
 
 @dataclass

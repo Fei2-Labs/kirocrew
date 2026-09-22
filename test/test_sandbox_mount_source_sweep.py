@@ -1657,9 +1657,11 @@ class TestLauncherStagingSitesArePrefixed:
         tree = ast.parse(script)  # string-template edits must keep it parseable
 
         staging = self._staging_calls(tree)
-        # The template always emits all three staging sites (per-dir empties,
-        # per-file empties, SSH shadow); the level varies the DATA, not the code.
-        assert len(staging) == 3
+        # The template always emits all four staging sites (per-dir empties,
+        # per-file empties, SSH shadow, and the private-window stage that holds
+        # a window's real contents while its parent is masked); the level varies
+        # the DATA, not the code.
+        assert len(staging) == 4
         for call in staging:
             prefix_kw = next((k for k in call.keywords if k.arg == "prefix"), None)
             assert prefix_kw is not None, ast.dump(call)
@@ -1667,15 +1669,14 @@ class TestLauncherStagingSitesArePrefixed:
             assert prefix_kw.value.id == "_src_prefix"
 
     @pytest.mark.parametrize("level", ["strict", "cc", "standard"])
-    def test_every_tempfile_call_has_a_known_staging_or_journal_role(self, level: str):
+    def test_every_tempfile_call_has_a_known_staging_role(self, level: str):
         """Closed over ALL tempfile.mkdtemp/mkstemp calls, however spelled.
 
         The staging-site assertion above keys on ``dir=_tmpfs_src``, which a
         future positional ``mkdtemp(_tmpfs_src)`` or ``dir=_tmpfs_src or
         None`` would evade — silently re-opening the unprefixed-orphan class.
         Mount staging must carry the pid-bearing ``_src_prefix`` or the probe's
-        literal prefix. The parent also publishes one atomic namespace journal
-        inside the protected binding directory, outside the staging roots.
+        literal prefix.
         """
         tree = ast.parse(_build_launcher_script(level))
         calls = [
@@ -1687,52 +1688,8 @@ class TestLauncherStagingSitesArePrefixed:
             and node.func.value.id == "tempfile"
             and node.func.attr in ("mkdtemp", "mkstemp")
         ]
-        assert len(calls) == 5  # three staging sites, tmpfs probe, parent journal
-        journals = [
-            call
-            for call in calls
-            if any(
-                keyword.arg == "dir"
-                and isinstance(keyword.value, ast.Name)
-                and keyword.value.id == "_namespace_dir"
-                for keyword in call.keywords
-            )
-        ]
-        assert len(journals) == 1
-        journal = journals[0]
-        assert journal.func.attr == "mkstemp"
-        assert not journal.args
-        assert {keyword.arg for keyword in journal.keywords} == {"dir", "suffix"}
-        suffix = next(keyword.value for keyword in journal.keywords if keyword.arg == "suffix")
-        assert isinstance(suffix, ast.Constant) and suffix.value == ".tmp"
-        # The journal is written by the trusted parent, never a new unprefixed
-        # staging call in the child that owns the mounts.
-        parent = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.left, ast.Name)
-            and node.test.left.id == "pid"
-            and len(node.test.ops) == 1
-            and isinstance(node.test.ops[0], ast.Gt)
-        )
-        assert journal in {node for statement in parent.body for node in ast.walk(statement)}
-        directory = next(
-            node.value
-            for statement in parent.body
-            for node in ast.walk(statement)
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "_namespace_dir"
-                for target in node.targets
-            )
-        )
-        assert isinstance(directory, ast.Constant)
-        assert Path(directory.value).parts[-2:] == ("member-memory-bindings", "pids")
+        assert len(calls) == 5  # four staging sites and the tmpfs probe
         for call in calls:
-            if call is journal:
-                continue
             prefix_kw = next((k for k in call.keywords if k.arg == "prefix"), None)
             assert prefix_kw is not None, ast.dump(call)
             ok_name = isinstance(prefix_kw.value, ast.Name) and prefix_kw.value.id == "_src_prefix"

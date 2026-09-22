@@ -782,7 +782,6 @@ async def test_bare_app_path_is_spa_shell_request(path: str, method: str) -> Non
     ), f"{method} {path} should be a SPA shell request (browser refresh must work)"
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path",
     [

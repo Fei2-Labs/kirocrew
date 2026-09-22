@@ -43,10 +43,12 @@ in the **same commit** when you change what it documents.
 | `acp/`, kiro-cli transport, providers | [acp-client](docs/system-specs/modules/acp-client.md) + [providers](docs/system-specs/modules/providers.md) |
 | picking or defaulting a model anywhere | [model-selection](docs/system-specs/common/model-selection.md) + [model-fallback](docs/system-specs/modules/model-fallback.md) |
 | adding or adapting an agent harness (BYO, KAS, claude) | [harness-parity](docs/system-specs/modules/harness-parity.md) (invariants) + [harness-parity-gate](docs/ci/harness-parity-gate.md) (CI) |
+| an agent spec: `agent_discovery.py`, `agent_spec_format.py`, `agent.py`'s spec writers, `acp/kas_agents.py`, or any field a spec carries | [agent-spec-fields](src/kiro_crew/docs/agent-spec-fields.md) (what each field does, per backend) + [agent-host-contract](docs/system-specs/modules/agent-host-contract.md) (the per-harness table) |
 | the publicly selectable Claude backend | [claude-code-provider](docs/system-specs/modules/claude-code-provider.md) |
 | sessions, slots, session keys, PIDs | [session](docs/system-specs/modules/session.md) + [history](docs/system-specs/modules/history.md) |
 | session summaries, the chat summary panel, intent extraction | [session-summary](docs/system-specs/modules/session-summary.md) |
 | memory, embeddings, vectors, lessons, skills, hooks | [memory-skills-hooks](docs/system-specs/modules/memory-skills-hooks.md) |
+| `context.py`, `context_blocks.py`, what reaches the model's context | [context-management](docs/architecture/context-management.md) |
 | MCP servers or tools (adding, changing, statelessness) | [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
 | artifacts, companion chat | [artifacts](docs/system-specs/modules/artifacts.md) |
@@ -61,12 +63,16 @@ in the **same commit** when you change what it documents.
 | themes | [themes](docs/system-specs/modules/themes.md) + [theming-contract](website/docs/theming-contract.md) |
 | anything under `website/` | [`website/AGENTS.md`](website/AGENTS.md) |
 | user-facing strings, dates, numbers, sort order | [i18n-catalog](website/docs/i18n-catalog.md) (authoring) + [i18n-gates](docs/ci/i18n-gates.md) (CI) |
-| tests: flakes, hangs, speed, memory, fixtures, sharding, side effects, host state (`~/.kiro`, `Path.home()`, the systemd user manager), conftest isolation, `monkeypatch.undo()`, env-var leaks, host-dependent tests (Windows, Python 3.13, per-user tools), what `TMPDIR` must not be | [testing-conventions](docs/system-specs/common/testing-conventions.md) + the [writing-tests](src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md) skill; frontend and Electron tests: [website/docs/testing.md](website/docs/testing.md) |
+| tests: flakes, hangs, speed, memory, fixtures, sharding, side effects, host state (`~/.kiro`, `Path.home()`, the systemd user manager), conftest isolation, `monkeypatch.undo()`, env-var leaks, host-dependent tests (Windows, Python 3.13, per-user tools, version-manager shims), spawning a real child or reaping one, `.worktrees/` in a repo-wide scan, what `TMPDIR` must not be, what a worker costs, collection-time probes that build a singleton, a `MagicMock` the code converts with `int()`, sizing a ReDoS / complexity guard | [testing-conventions](docs/system-specs/common/testing-conventions.md) + the [writing-tests](src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md) skill; frontend and Electron tests: [website/docs/testing.md](website/docs/testing.md) |
 | browser E2E | [e2e-gate](docs/ci/e2e-gate.md) |
 | proving a worktree change against an isolated running gateway | [worktree-verification-recipes](docs/guides/worktree-verification-recipes.md) |
 | CI, PR flow, review gates, commit messages | [ci-and-reviews](docs/ci/ci-and-reviews.md) + [CONTRIBUTING.md](CONTRIBUTING.md) |
 | constants, comments, lint, code style, the brand name | [code-style](docs/system-specs/common/code-style.md) |
 | connections, connectors, an external account link | [connections](docs/system-specs/modules/connections.md) |
+| the connector campaign's manifest schema or work-stream DAG | [connector-capability-manifest](docs/system-specs/modules/connector-capability-manifest.md) |
+| the GitHub connector's operation data or wire parsing (pagination, rate limits, error mapping) | [connector-github](docs/system-specs/modules/connector-github.md) |
+| `connections/vendors/microsoft/graph/`, the Microsoft Graph runtime base (locator, payload shaping, `@odata.nextLink` paging) | [microsoft-graph-runtime](docs/system-specs/modules/microsoft-graph-runtime.md) |
+| `connections/vendors/zoom/` — Zoom identity/paging/processing/errors contract logic | [connector-zoom](docs/system-specs/modules/connector-zoom.md) |
 | a POSIX call: locks, signals, PIDs, chmod, RSS | [platform-compat](docs/system-specs/common/platform-compat.md) + [windows-install](docs/guides/windows-install.md) |
 | injected `[Cron notification]` / `[Subagent completion event]` | [injected-messages](docs/system-specs/common/injected-messages.md) |
 | build, install, dev mode | [CONTRIBUTING.md](CONTRIBUTING.md) + [install](docs/guides/install.md) |
@@ -107,6 +113,10 @@ Detail and rationale: [security](docs/system-specs/modules/security.md),
   pin, not a regex, is what keeps the ceiling un-disableable. One residual worth
   carrying: `sel_hmac.key` is `VISIBLE`, so the SEL audit key has no OS fence; closing
   that means moving its in-sandbox reader behind the gateway, never another matcher.
+  An ENFORCED harness is the one exception — `tool_gate`'s credential mask keeps that
+  leaf, and the other credential-bearing crew leaves, from a foreign child
+  (`sandbox._CREW_CHILD_WITHHELD_LEAVES`), which is why the features whose
+  in-sandbox readers need them do not work there.
 - **Governance is `POLICY ∩ PROFILE`, tightest-wins**, enforced at Kiro Crew's OWN
   PreToolUse gate even when the kiro agent config granted the call. The evaluator
   is scope-name-agnostic, so adding a scope is a `SCOPE_CATALOG` data change, never
@@ -133,6 +143,22 @@ Detail and rationale: [security](docs/system-specs/modules/security.md),
   already covers it. Add a table entry only when the subject is genuinely a shell
   command line and the OS sandbox does not hold the path (#7441 went four rounds
   of `command`/`exec -a`/`nice`/`env -i`/`timeout`/`busybox` before restructuring).
+- **The sandbox's SCOPE is the operator's to widen, never yours.** What
+  `sandbox.py` seals, masks or no-follow pins decides which of the operator's own
+  files their agent can still reach, so a widening they did not ask for surfaces
+  days later as work that stopped, with no record that anyone chose to lose it.
+  Never add a seal, mask or refusal a task did not ask for, never tighten a fence
+  past the threat the change names, and never harden merely because a review round
+  said "spelling Y reaches it too" — a review comment is not authorization, and
+  #12103 spent eleven rounds on one span that way. Cite the seal that fails on a
+  path the change already touches, or keep the code and rebut. The same holds when
+  you are the REVIEWER: asking for a wider fence is outside what review decides.
+  An added invariant ships with its own data in the SAME commit, and an
+  import-time one silences its own witness — #11556 asserted over five sealed
+  leaves carrying wording for two, which made `import kiro_crew.sandbox` raise on
+  main and failed every backend test at COLLECTION, including
+  `test_every_strict_leaf_of_either_shape_is_covered_by_the_delegated_guard`,
+  the test written to catch exactly that gap.
 - **Computer use is deliberately NOT governed**: it is one operator opt-in on the
   keystone `computer_use.json`. Never add `computer_use.*` scopes, capability rows,
   approval ordinals or pointer permits. Its refusals run **in band** on
@@ -214,8 +240,13 @@ from the suffix rule: [release](docs/build/release.md).
 ```bash
 python3 scripts/check_black_formatting.py && python3 scripts/check_subprocess_encoding.py && isort src/kiro_crew test
 flake8 src/kiro_crew test && mypy src/kiro_crew
-python -m pytest
+python3 scripts/local-gate.py
 ```
+
+`local-gate.py` runs the tests related to your diff on both surfaces with a
+bounded worker count; the full suite is CI's job and never runs locally unless a
+human passes `--full`. See
+[prepare-pr](src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/references/gate-floor.md).
 
 - **On macOS, run `mypy --platform linux src/kiro_crew`.** Without it a local run
   reports errors you did not cause and MISSES the Linux-only errors CI fails on, so

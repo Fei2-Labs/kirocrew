@@ -515,7 +515,6 @@ line-ref	docs/request-for-change/rfc-session-tag-change-event.md	chat_tags.py:60
 line-ref	docs/request-for-change/rfc-session-tag-change-event.md	chat_tags.py:902
 line-ref	docs/request-for-change/rfc-session-tag-change-event.md	chat_tags.py:980
 line-ref	docs/request-for-change/rfc-session-tag-change-event.md	dashboard/handlers/hooks.py:307
-line-ref	docs/request-for-change/rfc-session-tag-change-event.md	events/kinds.py:40
 line-ref	docs/request-for-change/rfc-session-tag-change-event.md	hooks.py:3671-3690
 line-ref	docs/request-for-change/rfc-session-tag-change-event.md	hooks.py:3761
 line-ref	docs/request-for-change/rfc-session-tag-change-event.md	hooks.py:3939

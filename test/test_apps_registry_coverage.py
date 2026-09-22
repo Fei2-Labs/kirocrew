@@ -16,6 +16,8 @@ git, npm, or pip. All filesystem work happens under ``tmp_path`` with
 from __future__ import annotations
 
 import asyncio
+import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
@@ -48,6 +50,34 @@ def cache_dir(tmp_path, monkeypatch):
     cache.mkdir(parents=True)
     monkeypatch.setattr(registry, "_manifest_cache_dir", lambda: cache)
     return cache
+
+
+@pytest.fixture()
+def pip_importable(monkeypatch):
+    """Pin the gateway interpreter as one that HAS a ``pip`` module.
+
+    ``_run_app_build`` decides whether to plan a Python build by probing
+    ``importlib.util.find_spec("pip")`` on the RUNNING interpreter. That reads
+    the host's own packaging, not the fixture tree: a venv created by ``uv`` or
+    ``--without-pip`` has no ``pip`` module, so the branch soft-skips and every
+    "the pip command is planned" assertion fails there while passing on a
+    stdlib venv. Tests asserting the planned command take this fixture; the
+    soft-skip contract is pinned separately with the opposite answer.
+    """
+    import site
+
+    from kiro_crew import platform_compat
+
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: False)
+    real_find_spec = importlib.util.find_spec
+
+    def _with_pip(name, *args, **kwargs):
+        if name == "pip":
+            return importlib.machinery.ModuleSpec("pip", loader=None)
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(registry.importlib.util, "find_spec", _with_pip)
 
 
 class _FakeProc:
@@ -1994,36 +2024,44 @@ class TestRunAppBuild:
         assert spawned == [["/usr/bin/npm", "install"]]
 
     @pytest.mark.asyncio
-    async def test_requirements_only_uses_the_requirements_file(self, tmp_path, monkeypatch):
+    async def test_requirements_only_uses_the_requirements_file(
+        self, tmp_path, monkeypatch, pip_importable
+    ):
         (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [[sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]]
+        assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "-r", "requirements.txt"]]
 
     @pytest.mark.asyncio
-    async def test_pyproject_installs_the_project(self, tmp_path, monkeypatch):
+    async def test_pyproject_installs_the_project(
+        self, tmp_path, monkeypatch, pip_importable
+    ):
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [[sys.executable, "-m", "pip", "install", "."]]
+        assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
-    async def test_setup_py_installs_the_project(self, tmp_path, monkeypatch):
+    async def test_setup_py_installs_the_project(
+        self, tmp_path, monkeypatch, pip_importable
+    ):
         (tmp_path / "setup.py").write_text("from setuptools import setup\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [[sys.executable, "-m", "pip", "install", "."]]
+        assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
-    async def test_missing_path_pip_does_not_skip_the_python_build(self, tmp_path, monkeypatch):
+    async def test_missing_path_pip_does_not_skip_the_python_build(
+        self, tmp_path, monkeypatch, pip_importable
+    ):
         """The Python build runs via ``sys.executable -m pip`` — the gateway's own
         interpreter — so a host with no pip anywhere on PATH must still build."""
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: None)
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [[sys.executable, "-m", "pip", "install", "."]]
+        assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
     async def test_desktop_bundled_interpreter_never_runs_pip(self, tmp_path, monkeypatch):

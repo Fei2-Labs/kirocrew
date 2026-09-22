@@ -32,7 +32,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from dashboard_owner_helpers import as_owner
-from tmpdir_helpers import short_tmp_base
+from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew.browser_cli import launcher
 
@@ -91,6 +91,35 @@ SANDBOX_STDERR = (
     "  ]\n"
     "}\n"
 )
+#: Chromium's sandbox-failure line on each platform it runs on, plus the
+#: near-misses the remedy must stay off. Linux's is the one inside
+#: :data:`SANDBOX_STDERR`; the macOS pair is from an Apple-Silicon crash log a
+#: user reported, where both lines appear together and either alone has to be
+#: enough. The second macOS param carries a different errno, so the match cannot
+#: go back to the whole line.
+SANDBOX_PHRASINGS = (
+    pytest.param(
+        "[pid=1467368][err] [0909/101519.013904:FATAL:zygote_host_impl_linux.cc(129)] "
+        "No usable sandbox! If you want to live dangerously and need an immediate "
+        "workaround, you can try using --no-sandbox.",
+        True,
+        id="linux-no-usable-sandbox",
+    ),
+    pytest.param(
+        "sandbox initialization failed: Operation not permitted",
+        True,
+        id="macos-sandbox-initialization-failed",
+    ),
+    pytest.param("Failed to initialize sandbox.", True, id="macos-failed-to-initialize"),
+    pytest.param(
+        "sandbox initialization failed: Permission denied",
+        True,
+        id="macos-other-errno",
+    ),
+    pytest.param("No usable Sandbox!", False, id="control-wrong-case"),
+    pytest.param("Chromium sandboxing failed!", False, id="control-no-phrasing"),
+)
+
 #: Measured against a live gateway whose launch config names a bogus executable:
 #: the message line carries the object-dump opener on its tail.
 MISSING_EXECUTABLE_STDERR = (
@@ -555,6 +584,33 @@ class TestErrorText:
             "/nonexistent/chrome]"
         )
 
+    @pytest.mark.parametrize(("sandbox_line", "expect_remedy"), SANDBOX_PHRASINGS)
+    def test_the_remedy_follows_every_platform_phrasing_and_nothing_else(
+        self, sandbox_line: str, expect_remedy: bool
+    ):
+        """A Mac's wording is not Linux's, and the operator needs the same advice.
+
+        Each param is one launch failure's stderr with that platform's sandbox
+        line in it; the two controls are a case-shifted near-miss and Chromium's
+        generic header, neither of which names the cause.
+        """
+        stderr = (
+            "Error: Daemon pid=1467353: Daemon process exited with code 1\n"
+            "[TargetClosedError2: Target page, context or browser has been closed\n"
+            "Browser logs:\n" + sandbox_line + "\n"
+        )
+        fake, _calls = _runs([LIST_ABSENT, (1, "", stderr)])
+        with patch.object(launcher, "_run_cli", fake):
+            result = launcher.open_url(URL, "chat-1")
+        assert result.ok is False
+        error = result.error or ""
+        # The CLI's own words survive either way.
+        assert sandbox_line in error
+        if expect_remedy:
+            assert error.endswith(launcher.SANDBOX_REMEDY)
+        else:
+            assert launcher.SANDBOX_REMEDY not in error
+
     def test_remedy_is_not_appended_to_unrelated_failures(self):
         fake, _calls = _runs(
             [LIST_ABSENT, (1, "", "Error: Chromium distribution 'chrome' is not found at /opt/x")]
@@ -712,7 +768,7 @@ class TestReveal:
         # regardless of TMPDIR: the conftest's redirected tempfile base (and
         # pytest's own tmp_path) can themselves be long enough to overflow
         # sun_path when the run's TMPDIR is deep, which makes bind() fail.
-        root = Path(tempfile.mkdtemp(prefix="pw-", dir=short_tmp_base()))
+        root = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "pw-", dir=short_tmp_base()))
         # Strict cleanup, registered the moment the directory exists: a socket
         # file left behind would be a real leak, not one to ignore.
         request.addfinalizer(lambda: shutil.rmtree(root))

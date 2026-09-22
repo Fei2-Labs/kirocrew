@@ -14,6 +14,7 @@ import {
   type PinnedPromptState,
 } from '../../utils/pinnedPrompt'
 import { attachUserScrollIntent } from '../../utils/searchScroll'
+import { glideDurationMs, runConvergingGlide } from '../../utils/convergingGlide'
 
 export interface UsePinnedPromptOptions {
   /** The transcript scroll container. Rows inside it carry `data-display-index`. */
@@ -35,11 +36,11 @@ export interface UsePinnedPromptOptions {
  * or the scroller's own top edge when there is no header); `pinCardRef` goes on
  * the rendered `PinnedPrompt` card so the push geometry can measure it.
  *
- * Jumping back to the pinned prompt is host-specific — a virtualized transcript
- * must mount the target first, an unvirtualized one can glide straight to the
- * row — so the hook exposes `pinnedJumpChrome` (the landing inset, solved from
- * the live banner geometry) plus `jumpToPinnedPromptInPlace`, the unvirtualized
- * glide, and lets a virtualized host supply its own jump.
+ * Jumping back to the pinned prompt needs the host's virtualizer — the target
+ * row may not be mounted — so the hook exposes `pinnedJumpChrome` (the landing
+ * inset, solved from the live banner geometry) plus `jumpToPinnedPromptInPlace`,
+ * which takes the host's `mountIndex` / `estimateRowTop` steer and drives one
+ * converging glide from them.
  */
 export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }: UsePinnedPromptOptions) {
   const displayItemsRef = useRef<DisplayItem[]>([])
@@ -109,13 +110,29 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
       ? el.querySelector(`[data-display-index="${nextIdx}"]`) as HTMLElement | null
       : null
     const nextTop = nextEl ? nextEl.getBoundingClientRect().top : null
-    // Measure the live card when it is mounted, and otherwise fall back to the
-    // last SETTLED collapsed height PinnedPrompt reported: the push threshold
-    // below has to be decidable even while nothing is mounted, or dropping the
-    // banner would zero the height, zero the push, re-mount it, and oscillate at
-    // frame rate.
-    const measured = pinCardRef.current?.getBoundingClientRect().height ?? 0
-    const bannerH = measured > 0 ? measured : pinCollapsedHRef.current
+    // The SETTLED resting height, never the live card rect.
+    //
+    // The card grows past its resting size in two states — the hover peek
+    // (PINNED_RESTING_LINES -> PINNED_PREVIEW_LINES) and the expansion — and
+    // `peek` is itself gated on `pushUp <= 0`. Reading the live rect here
+    // therefore closed a cycle: the peek grows the card, the taller card
+    // lengthens `pinPushTravel`, the longer travel makes `push` positive for any
+    // incoming prompt sitting between the resting and peeked travels, a positive
+    // push closes the peek, the card shrinks back, `push` returns to 0, and the
+    // peek reopens under the still-resting pointer. The card flipped between its
+    // one-line and three-line heights for as long as the pointer stayed put.
+    //
+    // The resting height is what this geometry was always documented to use:
+    // `pinHandoffY` above already derives from it, PinnedPrompt's own `peek`
+    // comment says "`pinHandoffY` and `pinPushTravel` are derived from the
+    // RESTING height", and PINNED_RESTING_LINES says a card growing after it
+    // mounts "can never invalidate the pin that mounted it". This read was the
+    // one place that was not true.
+    //
+    // No fallback is needed for an unmounted card: `pinCollapsedHRef` is seeded
+    // with DEFAULT_PINNED_CARD_H and only ever written from PinnedPrompt's
+    // `!expanded && !peek` report, so it is always known and always settled.
+    const bannerH = pinCollapsedHRef.current
     const push = computePinPush(bannerH, foldY, nextTop)
     // Fully pushed out: DROP the banner instead of rendering it clipped to
     // nothing. A tall incoming prompt holds this state for its whole length (it
@@ -184,56 +201,59 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
   }, [scrollerRef])
 
   /**
-   * Jump back to the pinned prompt on an UNVIRTUALIZED transcript (every row
-   * is mounted, so the target's rect is readable right away — split-view panes
-   * and the Members DM thread). The same self-driven converging glide the main
-   * chat uses for its near jump: each frame re-derives the destination from
-   * LIVE geometry (row rect + the banner currently pinned), so the banner swap
-   * mid-glide — the previous turn's card pinning as this one un-pins — moves
-   * the landing instead of stranding it. A native smooth scroll would be
-   * cancelled by the follow controller's re-pin writes; owning every frame's
-   * write makes the glide uncancellable. User scroll intent aborts it.
-   * A virtualized host (ChatPage) must not use this: its target row may be
-   * unmounted spacer, which is why it keeps its own mount-then-scroll jump.
+   * Jump back to the pinned prompt with one self-driven converging glide over
+   * the host's virtualized transcript. `steer` is the host's virtualizer:
+   * `mountIndex` preserves the current window for a far target so the glide
+   * has rows to travel over, and `estimateRowTop` supplies the height-index
+   * estimate until the row mounts. Every frame prefers live geometry, so row
+   * measurement and the banner swap refine the landing; a frame with neither a
+   * mounted row nor an estimate yields no goal (see runConvergingGlide). User
+   * scroll intent aborts the glide, and owning each frame's write prevents
+   * follow-controller writes from cancelling it.
    */
-  const jumpRafRef = useRef(0)
   const jumpCancelRef = useRef<(() => void) | null>(null)
-  const jumpToPinnedPromptInPlace = useCallback((target: number) => {
-    cancelAnimationFrame(jumpRafRef.current)
+  const jumpToPinnedPromptInPlace = useCallback((
+    target: number,
+    steer: {
+      mountIndex: (index: number, opts?: { unionOnly?: boolean }) => boolean
+      estimateRowTop: (index: number) => number | null
+    },
+  ) => {
     jumpCancelRef.current?.()
     const sc0 = scrollerRef.current
     if (!sc0) return
-    // Land at the head of the target's consecutive prompt run (a steer pair, a
-    // subagent fan-out) so the row on the hand-off line is a non-prompt and the
-    // previous turn's banner survives the landing — see jumpAnchorIdx.
+    // Land at the head of the target's consecutive prompt run (a steer sent
+    // before any output, a double-send) so the row on the hand-off line is a
+    // non-prompt and the previous turn's banner survives the landing — see
+    // jumpAnchorIdx.
     const anchor = jumpAnchorIdx(displayItemsRef.current, target)
+    steer.mountIndex(anchor, { unionOnly: true })
     const rowEl = (): HTMLElement | null =>
       scrollerRef.current?.querySelector(`[data-display-index="${anchor}"]`) as HTMLElement | null
-    if (!rowEl()) return
-    let cancelled = false
-    const detach = attachUserScrollIntent(sc0, () => { cancelled = true })
-    jumpCancelRef.current = () => { cancelled = true; detach() }
-    const GLIDE_MS = 450
-    const t0 = performance.now()
-    const from = sc0.scrollTop
+    const goal = (): number | null => {
+      const sc = scrollerRef.current
+      if (!sc) return null
+      const row = rowEl()
+      const rowTop = row
+        ? sc.scrollTop + (row.getBoundingClientRect().top - sc.getBoundingClientRect().top)
+        : steer.estimateRowTop(anchor)
+      if (rowTop == null) return null
+      return Math.max(0, Math.min(sc.scrollHeight - sc.clientHeight, rowTop - pinnedJumpChrome()))
+    }
+    const first = goal()
+    if (first == null) return
     const reduced = typeof window.matchMedia === 'function'
       && window.matchMedia('(prefers-reduced-motion: reduce)').matches
-    const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3)
-    const glide = () => {
-      if (cancelled) { detach(); return }
-      const sc = scrollerRef.current
-      const row = rowEl()
-      if (!sc || !row) { detach(); jumpCancelRef.current = null; return }
-      const liveTarget = sc.scrollTop
-        + (row.getBoundingClientRect().top - sc.getBoundingClientRect().top)
-        - pinnedJumpChrome()
-      const goal = Math.max(0, Math.min(sc.scrollHeight - sc.clientHeight, liveTarget))
-      const t = reduced ? 1 : Math.min(1, (performance.now() - t0) / GLIDE_MS)
-      sc.scrollTop = from + (goal - from) * easeOutCubic(t)
-      if (t >= 1) { detach(); jumpCancelRef.current = null; return }
-      jumpRafRef.current = requestAnimationFrame(glide)
-    }
-    jumpRafRef.current = requestAnimationFrame(glide)
+    const detach = attachUserScrollIntent(sc0, () => { jumpCancelRef.current?.() })
+    const cancelGlide = runConvergingGlide({
+      goal,
+      read: () => scrollerRef.current?.scrollTop ?? 0,
+      write: (top) => { const sc = scrollerRef.current; if (sc) sc.scrollTop = top },
+      durationMs: glideDurationMs(first - sc0.scrollTop),
+      reduced,
+      onEnd: () => { detach(); jumpCancelRef.current = null },
+    })
+    jumpCancelRef.current = cancelGlide
   }, [pinnedJumpChrome, scrollerRef])
 
   return {

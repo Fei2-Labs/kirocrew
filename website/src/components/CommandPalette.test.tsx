@@ -587,6 +587,28 @@ describe('CommandPalette — keyboard & activation', () => {
     expect(await screen.findByText('Session Result')).toBeInTheDocument()
   })
 
+  it('offers NO folders scope — reaching a folder by name belongs to the Command Bar app', async () => {
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+
+    // "fold" uniquely prefixes nothing here. If a Folders provider is ever put
+    // back into this host, the hint label appears and Tab adopts the scope — and
+    // this assertion is the thing that says so, because the feature would then
+    // have two implementations (this one and `apps/command-bar/foldersProvider`)
+    // free to disagree about ranking and about what a reveal does.
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'fold' } })
+    await waitFor(() => expect(H.allProvider.search).toHaveBeenCalled())
+    expect(screen.queryByText('Folders')).toBeNull()
+
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Tab' })
+    })
+
+    // No scope was adopted: the query still reads as an unscoped search.
+    expect(screen.queryByPlaceholderText('Search folders…')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Search everywhere' })).toHaveValue('fold')
+  })
+
   it('a Tab the IME guard declines does not adopt the scope or clear the query', async () => {
     render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
     await screen.findByText('Recent Session')

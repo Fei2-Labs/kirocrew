@@ -70,18 +70,11 @@ class TestConductorInstaller:
         assert data["name"] == "kirocrew-conductor"
         assert "work item" in data["prompt"]
 
-    def test_prompt_carries_the_verbosity_placeholder(self, tmp_path, monkeypatch):
-        """The conductor is a custom agent, so it gets its OWN prompt.
-
-        ``build_message`` reads a custom agent's prompt from its spec instead of
-        ``config/prompt.md``, and ``_resolve_prompt_templates`` only expands the
-        token where it appears. Without the token here the user's
-        ``dashboard.verbosity`` setting silently never reaches this agent, so
-        every conductor turn answers at ``default`` length no matter what the
-        person picked. Pinned, not commented, because the omission is invisible.
-        """
+    def test_prompt_does_not_carry_the_retired_verbosity_token(self, tmp_path, monkeypatch):
         data = self._install(tmp_path, monkeypatch)
-        assert "{{VERBOSITY_BLOCK}}" in data["prompt"]
+        # Reply style now arrives as session-context chrome for every
+        # agent; a token left here would reach the model as a literal.
+        assert "{{VERBOSITY_BLOCK}}" not in data["prompt"]
 
     def test_prompt_drives_patrol_with_monitor_start_not_wait(self, tmp_path, monkeypatch):
         """A patrol round outlives a turn, so the loop must own the turn boundary.
@@ -177,6 +170,7 @@ class TestConductorInstaller:
         for verb in (
             "chat_folder_tree",
             "chat_folder_create",
+            "chat_folder_file_self",
             "session_create",
             "session_read_message",
         ):
@@ -195,6 +189,7 @@ class TestConductorInstaller:
         assert dashboard == {
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
+            "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
         }
@@ -591,6 +586,7 @@ class TestConductorInstaller:
             "@kirocrew-core/ask_question",
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
+            "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
             "@kirocrew-work/work_ledger_read",
@@ -628,6 +624,7 @@ class TestConductorInstaller:
         ]
         dashboard_resources = [
             "kirocrew-dashboard/chat_folder_create",
+            "kirocrew-dashboard/chat_folder_file_self",
             "kirocrew-dashboard/chat_folder_tree",
             "kirocrew-dashboard/session_create",
             "kirocrew-dashboard/session_read_message",
@@ -756,6 +753,7 @@ class TestConductorInstaller:
             "@kirocrew-core/ask_question",
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
+            "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
             "@kirocrew-work/work_ledger_read",
@@ -851,6 +849,58 @@ class TestConductorInstaller:
         # legitimate mention of the tool elsewhere in the skill must not fail a
         # pin whose intent is only that the precreation step stay deleted.
         assert "1. `chat_folder_create`" not in text, "no folder-precreation dispatch step"
+
+    def test_skill_files_the_conductor_itself_under_the_goal(self):
+        """The conductor sits INSIDE the goal's folder, beside its workers.
+
+        The live shape this pins away from: workers filed under the goal while
+        the conductor's own session floats at the top level, so the person has
+        nothing that groups a goal's sessions with the session driving them.
+        The opening plan turn files the conductor with ``chat_folder_file_self``
+        — the verb that writes only the caller's own placement and so never
+        prompts — and the skill must name it there, not leave it to the model
+        to discover.
+        """
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        opening = text.split("### Round 0")[1].split("### Dispatch a round")[0]
+        assert "`chat_folder_file_self`" in opening, "the plan turn must file the conductor"
+        # The auto-approved list must say it never prompts, or a patrol cycle
+        # with nobody at the keyboard would be told to expect one.
+        assert "`chat_folder_file_self` (it writes only your own placement)" in text
+
+    def test_skill_files_each_worker_under_a_per_agent_subfolder(self):
+        """Dispatch files a worker at ``<goal folder>/<agent>``, not the goal root.
+
+        One heading per goal, the conductor directly under it, and one subfolder
+        per agent kind holding that agent's sessions — so the tree reads as
+        goal / who / what, and a nested conductor's own subtree nests under the
+        ``kirocrew-conductor`` subfolder instead of flattening into its parent's.
+        """
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        dispatch = text.split("### Dispatch a round")[1].split("### Patrol")[0]
+        assert "`<goal folder>/<agent>`" in dispatch, "dispatch must name the per-agent path"
+        assert "kirocrew-worker`" in dispatch, "the example must show a real agent segment"
+        # Still the atomic create: the subfolder rides the create's own
+        # ``folder`` argument, never a second move step.
+        assert "2. `session_create`" in dispatch
+
+    def test_pr_checks_seed_may_name_the_prepare_pr_skill_by_path(self):
+        """A ``pr_checks`` seed can point the worker at prepare-pr's SKILL.md.
+
+        ``kirocrew-worker`` is a custom agent: ``_skills_injection_plan`` gives it
+        no catalog and no trigger matching, so however a seed is worded nothing
+        auto-loads ``prepare-pr`` in the worker session. The conductor naming the
+        file is the only route. Pinned as an OPTIONAL hint, not a mandate: a user
+        who does not want prepare-pr must not have it forced on every worker.
+        """
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        dispatch = text.split("### Dispatch a round")[1].split("### Patrol")[0]
+        flat = " ".join(dispatch.split())
+        assert "`<crew-home>/skills/kirocrew-dev/prepare-pr/SKILL.md`" in flat
+        assert "may name the PR procedure" in flat
+        # Optional, by design.
+        assert "Optional" in flat
+        assert "must read" not in flat and "MUST read" not in flat
 
 
 class _proc:

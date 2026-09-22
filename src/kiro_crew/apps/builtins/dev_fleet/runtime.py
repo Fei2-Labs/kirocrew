@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.dev_fleet import npm_preflight, sync_runner
@@ -118,7 +118,7 @@ def _find_cli() -> list[str]:
     ``__main__`` also performs the SSL-cert / UTF-8-console setup that must run
     before ``kiro_crew.cli`` is imported, so it is the only correct ``-m`` entry.
     """
-    return [sys.executable, "-m", "kiro_crew"]
+    return platform_compat.isolated_python_argv("-m", "kiro_crew")
 
 
 # Git hardening injected as ENVIRONMENT (same precedence as `git -c`, which
@@ -437,8 +437,16 @@ async def _run_cmd(
     env: dict | None = None,
     timeout: int = 30,
     mode: str = "standard",
+    pre_spawn: Callable[[], Awaitable[str | None]] | None = None,
 ) -> tuple[int, str, str]:
     """Run a subprocess asynchronously, return (returncode, stdout, stderr).
+
+    ``pre_spawn`` is a last gate evaluated AFTER sandbox preparation and IMMEDIATELY
+    before the child is spawned — the spawn is the only await that follows it. It
+    returns ``None`` to proceed or a reason to refuse (``(-1, "", reason)``). The
+    worktree removal passes its lease renewal here, so "the gateway still excludes
+    a cutover from this worktree" is proven with nothing of unbounded duration —
+    the preparation hop included — left between the proof and the mutation.
 
     Every spawn routes through ``sandboxed_spawn_argv`` (OS isolation +
     credential-scrubbed env): these commands run against agent-influenced
@@ -454,7 +462,11 @@ async def _run_cmd(
     # PATH begins with agent-writable dirs, where a planted git/gh shim
     # would otherwise run with workflow credentials on every auto-refresh.
     if cmd and "/" not in cmd[0]:
-        trusted = _trusted_bin(cmd[0])
+        # A cache miss stats and resolves candidates under _TRUSTED_PATH: filesystem
+        # work, so it hops off the loop like the preparation step below.
+        trusted = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _trusted_bin, cmd[0]
+        )
         if trusted is None:
             return -1, "", (f"{_UNRESOLVED_TOOL_PREFIX}{cmd[0]!r} in {_TRUSTED_PATH}")
         cmd = [trusted, *cmd[1:]]
@@ -473,6 +485,15 @@ async def _run_cmd(
     except RuntimeError as exc:
         # Fail closed: no sandbox backend and unsandboxed exec not opted in.
         return -1, "", f"sandbox unavailable: {exc}"
+    if pre_spawn is not None:
+        refusal = await pre_spawn()
+        if refusal is not None:
+            if cleanup:
+                try:
+                    os.unlink(cleanup)
+                except OSError:
+                    pass
+            return -1, "", refusal
     try:
         proc = await create_subprocess_limited(
             *cmd,

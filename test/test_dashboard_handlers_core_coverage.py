@@ -2052,6 +2052,19 @@ class TestAdvertisedModelGuards:
 
 
 class TestLocalToken:
+    @pytest.fixture
+    def verified_owner_process(self, monkeypatch) -> None:
+        from kiro_crew import member_memory_auth as auth
+
+        peer_pid = 12345
+        monkeypatch.setattr(auth, "_request_peer_pid", lambda _request: peer_pid)
+        monkeypatch.setattr(
+            auth.platform_compat,
+            "get_process_start_id",
+            lambda pid: "synthetic-start" if pid == peer_pid else None,
+        )
+        monkeypatch.setattr(auth, "_verified_host_process", lambda pid: pid == peer_pid)
+
     @pytest.mark.asyncio
     async def test_non_loopback_is_refused(self, monkeypatch, fake_sel) -> None:
         monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: False)
@@ -2084,7 +2097,7 @@ class TestLocalToken:
 
     @pytest.mark.asyncio
     async def test_issues_credential_with_requested_ttl_and_embed_claim(
-        self, monkeypatch, fake_sel
+        self, monkeypatch, fake_sel, verified_owner_process
     ) -> None:
         monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
         minted: dict = {}
@@ -2107,7 +2120,130 @@ class TestLocalToken:
         assert minted["extra"] == {"embed_parent_port": "5476"}
 
     @pytest.mark.asyncio
-    async def test_bad_embed_port_is_dropped(self, monkeypatch, fake_sel) -> None:
+    async def test_unix_peer_match_with_valid_secret_issues_a_token(
+        self, monkeypatch, fake_sel, verified_owner_process
+    ) -> None:
+        """A kernel-verified same-uid AF_UNIX peer is admitted.
+
+        The pod's `mint_token` connects over the pod's private unix socket,
+        where ``request.remote`` is EMPTY -- the loopback test alone 403s the
+        transport that is strictly harder to reach than loopback TCP. The
+        positive `check_peer_is_self` MATCH plus the unchanged secret check
+        must mint.
+        """
+        from kiro_crew.mcp_gateway.socketsec import PeerCredResult
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.token_auth.request_is_unix_socket", lambda _r: True
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.core.check_peer_is_self",
+            lambda _s: PeerCredResult.MATCH,
+        )
+        monkeypatch.setattr(core_mod, "generate_token", lambda *a, **k: "issued-value")
+        resp = await core_mod.api_token_local(
+            _req(remote="", app={"local_secret": "right"}, headers={"X-Local-Secret": "right"})
+        )
+        assert resp.status == 200
+        assert json.loads(resp.body)["token"] == "issued-value"
+
+    @pytest.mark.asyncio
+    async def test_unix_peer_still_needs_the_secret(self, monkeypatch, fake_sel) -> None:
+        """Unix admission is a TRANSPORT gate: the secret check is unchanged.
+
+        A MATCH peer with the wrong secret is refused at the SECRET check
+        ("invalid secret"), not the transport check ("loopback only") -- which
+        also pins that the admitted request reached past the transport gate.
+        """
+        from kiro_crew.mcp_gateway.socketsec import PeerCredResult
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.token_auth.request_is_unix_socket", lambda _r: True
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.core.check_peer_is_self",
+            lambda _s: PeerCredResult.MATCH,
+        )
+        resp = await core_mod.api_token_local(
+            _req(remote="", app={"local_secret": "right"}, headers={"X-Local-Secret": "wrong"})
+        )
+        assert resp.status == 403
+        assert json.loads(resp.body)["error"] == "invalid secret"
+
+    @pytest.mark.asyncio
+    async def test_unix_peer_uid_mismatch_is_refused_even_with_the_secret(
+        self, monkeypatch, fake_sel
+    ) -> None:
+        """A foreign-uid unix peer is refused BEFORE the secret is considered.
+
+        MISMATCH means the kernel positively identified another principal on
+        our socket -- exactly when the 0700-home directory gate has failed and
+        denying matters most. Deny-by-default: transport refusal even though
+        the request carries the correct secret.
+        """
+        from kiro_crew.mcp_gateway.socketsec import PeerCredResult
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.token_auth.request_is_unix_socket", lambda _r: True
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.core.check_peer_is_self",
+            lambda _s: PeerCredResult.MISMATCH,
+        )
+        resp = await core_mod.api_token_local(
+            _req(remote="", app={"local_secret": "right"}, headers={"X-Local-Secret": "right"})
+        )
+        assert resp.status == 403
+        assert json.loads(resp.body)["error"] == "loopback only"
+        assert fake_sel.log_api_access.call_args.kwargs["resources"] == "non-loopback"
+
+    @pytest.mark.asyncio
+    async def test_unix_peer_unverifiable_is_refused_even_with_the_secret(
+        self, monkeypatch, fake_sel
+    ) -> None:
+        """Failure to verify the peer is never conflated with permission.
+
+        UNVERIFIABLE (no mechanism, non-AF_UNIX family, syscall failure) must
+        refuse -- a platform without a peer-credential mechanism never silently
+        widens this token_auth-bypassed endpoint.
+        """
+        from kiro_crew.mcp_gateway.socketsec import PeerCredResult
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.token_auth.request_is_unix_socket", lambda _r: True
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.core.check_peer_is_self",
+            lambda _s: PeerCredResult.UNVERIFIABLE,
+        )
+        resp = await core_mod.api_token_local(
+            _req(remote="", app={"local_secret": "right"}, headers={"X-Local-Secret": "right"})
+        )
+        assert resp.status == 403
+        assert json.loads(resp.body)["error"] == "loopback only"
+
+    @pytest.mark.asyncio
+    async def test_valid_secret_without_verified_owner_process_is_refused(
+        self, monkeypatch, fake_sel
+    ) -> None:
+        from kiro_crew import member_memory_auth as auth
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        monkeypatch.setattr(auth, "_request_peer_pid", lambda _request: None)
+        minted = MagicMock()
+        monkeypatch.setattr(core_mod, "generate_token", minted)
+        resp = await core_mod.api_token_local(
+            _req(app={"local_secret": "right"}, headers={"X-Local-Secret": "right"})
+        )
+        assert resp.status == 403
+        assert json.loads(resp.body)["code"] == "member_owner_token_refused"
+        assert fake_sel.log_api_access.call_args.kwargs["resources"] == "unverified-owner-process"
+        minted.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bad_embed_port_is_dropped(
+        self, monkeypatch, fake_sel, verified_owner_process
+    ) -> None:
         monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
         minted: dict = {}
 

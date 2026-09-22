@@ -1087,8 +1087,10 @@ describe('MarkdownPanel — authoring an inline comment', () => {
     const onSubmitComments = vi.fn()
     mountPanel({ content: BODY, onSubmitComments })
     const box = await selectInPreview('beta')
-    // The selection is highlighted while the input has focus.
-    expect(document.querySelector('mark')?.textContent).toBe('beta')
+    // The selection is highlighted while the input has focus — via the
+    // highlight registry, never by wrapping preview text in <mark> elements.
+    expect(highlightRegistry.get('mc-annotate')?.[0]?.toString()).toBe('beta')
+    expect(document.querySelector('mark')).toBeNull()
 
     fireEvent.change(box, { target: { value: 'needs a citation' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
@@ -1102,7 +1104,7 @@ describe('MarkdownPanel — authoring an inline comment', () => {
     const stored = JSON.parse(localStorage.getItem('mc-comment-drafts') || '{}')
     expect(stored['/tmp/notes.md'][0]).toMatchObject({ anchor: 'beta', text: 'needs a citation', line: 3, column: 7 })
     // The highlight goes with the open box.
-    expect(document.querySelector('mark')).toBeNull()
+    expect(highlightRegistry.has('mc-annotate')).toBe(false)
   })
 
   it('sends every pending comment to the chat and clears the drafts', async () => {
@@ -1148,7 +1150,7 @@ describe('MarkdownPanel — authoring an inline comment', () => {
     await waitFor(() => expect(screen.queryByLabelText('Comment on the selected text')).toBeNull())
     expect(document.querySelector('[data-comment-id]')).toBeNull()
     // The highlight is lifted and the panel itself did not treat Escape as close.
-    expect(document.querySelector('mark')).toBeNull()
+    expect(highlightRegistry.has('mc-annotate')).toBe(false)
     expect(screen.getByText(/alpha beta gamma/)).toBeInTheDocument()
   })
 
@@ -1225,7 +1227,7 @@ describe('MarkdownPanel — authoring an inline comment', () => {
     const again = await screen.findByRole('dialog')
     fireEvent.click(within(again).getByRole('button', { name: 'Discard comment' }))
     await waitFor(() => expect(screen.queryByLabelText('Comment on the selected text')).toBeNull())
-    expect(document.querySelector('mark')).toBeNull()
+    expect(highlightRegistry.has('mc-annotate')).toBe(false)
   })
 
   it('an inactive tab hides its composer without discarding the draft', async () => {
@@ -1306,12 +1308,12 @@ describe('MarkdownPanel — authoring an inline comment', () => {
       onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
       onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} />, { wrapper })
     await selectInPreview('beta')
-    expect(document.querySelector('mark')?.textContent).toBe('beta')
+    expect(highlightRegistry.get('mc-annotate')?.[0]?.toString()).toBe('beta')
     rerender(<MarkdownPanel embedded filePath="/tmp/other.md" content={BODY}
       onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
       onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} />)
     await waitFor(() => expect(screen.queryByLabelText('Comment on the selected text')).toBeNull())
-    expect(document.querySelector('mark')).toBeNull()
+    expect(highlightRegistry.has('mc-annotate')).toBe(false)
   })
 })
 

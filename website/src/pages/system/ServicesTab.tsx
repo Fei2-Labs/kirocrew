@@ -21,6 +21,7 @@ import InfoTip from '../../components/InfoTip'
 import McpGatewayCard from '../McpGatewayCard'
 import type { AcpBackendsPayload } from '../overview/AcpBackendCard'
 import HostRuntimeCard from './HostRuntimeCard'
+import TasksCapacityCard from './TasksCapacityCard'
 import { fmtNumber, fmtPercent, fmtUnit } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import type { SystemData } from '../../types'
@@ -177,7 +178,7 @@ export default function ServicesTab() {
   const acpBackendsPreview = usePreviewFlag(PREVIEW_ACP_BACKENDS)
   const { data: acpBackends } = useQuery<AcpBackendsPayload>({
     queryKey: ['acp-backends', { probe: true }],
-    queryFn: () => api.acpBackends({ probe: true }) as Promise<AcpBackendsPayload>,
+    queryFn: () => api.acpBackends({ probe: true }) as unknown as Promise<AcpBackendsPayload>,
     // No fetch when the row is hidden: the endpoint is owner-only, and an
     // unrendered request would add cost or log a refusal for no visible control.
     enabled: acpBackendsPreview,
@@ -334,6 +335,10 @@ export default function ServicesTab() {
 
       {/* Host runtime — self-hides outside the Windows desktop shell */}
       <HostRuntimeCard />
+
+      {/* Durable task queue + effective concurrency — the capacity the
+          services above are serving right now */}
+      <TasksCapacityCard />
     </>
   )
 }

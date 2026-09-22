@@ -168,8 +168,24 @@ _TESTS = textwrap.dedent("""
 
 
 def _run_inner_pytest(tmp_path, env, *args):
+    # The inner session loads the root conftest, whose ``pytest_configure`` points
+    # the platform temp dir at ``/tmp`` on Darwin. Left to its default, the inner
+    # basetemp would then be the SHARED ``/tmp/pytest-of-<user>`` -- the same tree
+    # the outer run and every concurrent xdist worker prune at startup -- and any
+    # ``garbage-*`` left there by an unrelated run surfaces in THIS process's output
+    # as an ``(rm_rf) error removing`` warning. An explicit basetemp under the outer
+    # test's tmp_path is used verbatim (no ``gettempdir()`` lookup, no sibling
+    # pruning), so the inner output only ever describes the inner run.
     return subprocess.run(
-        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            f"--basetemp={tmp_path / 'inner-basetemp'}",
+            *args,
+        ],
         cwd=tmp_path,
         env=env,
         capture_output=True,

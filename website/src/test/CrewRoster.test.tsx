@@ -278,7 +278,7 @@ describe('crew roster — memory ownership notice', () => {
      while a match on incidental words would keep passing after the disclosure
      itself was dropped. The assertions below are about STRUCTURE — one
      page-level notice, two per-binding tips. */
-  const NOTICE = i18nT('pages.kiroCrewAgentsPage.bindings_preview_notice')
+  const NOTICE = i18nT('pages.kiroCrewAgentsPage.bindings_member_memory_notice')
   const TIP = i18nT('pages.kiroCrewAgentsPage.bindings_preview_info')
 
   /* The view choice persists to localStorage, so a test here that switches to
@@ -307,7 +307,7 @@ describe('crew roster — memory ownership notice', () => {
     expect(screen.getAllByText(NOTICE)).toHaveLength(1)
   })
 
-  it('keeps workspace guidance and describes the current V1 memory before opt-in', async () => {
+  it('keeps workspace guidance and explains that existing V1 memory stays unchanged', async () => {
     await renderRoster()
     const sheet = await openEditor('oncall')
     gotoPane(sheet, 'place')
@@ -315,8 +315,8 @@ describe('crew roster — memory ownership notice', () => {
     // so the page-level notice is not readable from here — the tooltip is the
     // only place this caveat reaches a user who is mid-edit.
     expect(within(sheet).getAllByTitle(TIP)).toHaveLength(1)
-    const memory = within(sheet).getByText(/This member uses its current memory \(V1\)\./)
-    expect(memory).toHaveTextContent(/^This member uses its current memory \(V1\)\.$/)
+    const memory = within(sheet).getByText(/This member keeps its current memory \(V1\)\./)
+    expect(memory).toHaveTextContent(/^This member keeps its current memory \(V1\)\. Member memory \(V2\) is only available when creating a new crew member\.$/)
     expect(within(sheet).queryByText(/This member cannot return to its previous memory/)).toBeNull()
   })
 
@@ -576,7 +576,7 @@ describe('crew editor — opening', () => {
     // Create mode has no crew to edit yet, so the bindings start on the defaults.
     expect(within(sheet).getByRole('combobox', { name: 'Workspace' })).toHaveTextContent('default')
     expect(within(sheet).queryByRole('combobox', { name: 'Memory Store' })).not.toBeInTheDocument()
-    expect(within(sheet).getByText(/own empty private memory/i)).toBeInTheDocument()
+    expect(within(sheet).getByText(/empty member memory/i)).toBeInTheDocument()
     // The Agent Template is the exception: it has NO safe default, because
     // pre-filling the built-in made a new crew an alias for the default agent.
     expect(within(sheet).getByRole('combobox', { name: 'Agent Template' }))
@@ -1034,6 +1034,10 @@ describe('crew editor — appearance pack round-trip', () => {
     workspace: 'oncall',
     memory_store: 'oncall-mem',
     model: 'claude-opus-5',
+    // The `sounds` key is a legacy one: a pack ships its own per-state audio, so
+    // the crew record has no cue to hold and nothing in this build reads it. It
+    // still rides back out on a save, because an unrelated edit is not the user
+    // asking to delete a value the previous release let them set.
     avatar: { kind: 'pack', id: 'aurora-fox', sounds: { done: 'chime' } },
   }
 
@@ -1059,7 +1063,9 @@ describe('crew editor — appearance pack round-trip', () => {
       'aurora',
       expect.objectContaining({
         triggers: 'pager',
-        // The id AND the sounds — the reaction layer rides on a pack too.
+        // Verbatim: the id this build reads, and the legacy cue it does not.
+        // The pack's own files are still its art and its audio -- the retired
+        // key plays nothing, it is merely not destroyed by a trigger edit.
         avatar: { kind: 'pack', id: 'aurora-fox', sounds: { done: 'chime' } },
       }),
     )
@@ -1192,6 +1198,108 @@ describe('crew editor — appearance pack round-trip', () => {
     expect(body.avatar).toEqual({
       kind: 'ghost',
       traits: { ...seededTraits('oncall'), eyes: 'wink' },
+    })
+  })
+})
+
+describe('crew editor — ghost reaction round-trip', () => {
+  /* A ghost crew whose reactions were authored in the builder. The editor has to
+     LOAD them: while the reaction layer was not part of the draft, an unrelated
+     save wrote the record back without it. */
+  const REACTING_CREW = {
+    name: 'radar',
+    kiro_agent: 'oncall-agent',
+    workspace: 'oncall',
+    memory_store: 'oncall-mem',
+    model: 'claude-opus-5',
+    avatar: { kind: 'ghost', motions: { done: 'nod' }, sounds: { done: 'chime' } },
+  }
+
+  const saveWithATrigger = async (name: string) => {
+    const sheet = await openEditor(name)
+    gotoPane(sheet, 'routing')
+    fireEvent.change(within(sheet).getByRole('textbox', { name: 'Triggers' }), {
+      target: { value: 'pager' },
+    })
+    fireEvent.click(within(sheet).getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalled())
+    return mockApi.updateKirocrewAgent.mock.calls.at(-1)?.[1] as Record<string, unknown>
+  }
+
+  it('writes the reactions back when an unrelated field is saved', async () => {
+    mockApi.kirocrewAgents.mockResolvedValue({
+      agents: [DEFAULT_CREW, REACTING_CREW],
+      default_agent: 'kirocrew',
+    })
+    await renderRoster()
+    const body = await saveWithATrigger('radar')
+    expect(body.avatar).toEqual({
+      kind: 'ghost',
+      motions: { done: 'nod' },
+      sounds: { done: 'chime' },
+    })
+  })
+
+  it('reads a freshly opened reacting crew as having nothing pending', async () => {
+    mockApi.kirocrewAgents.mockResolvedValue({
+      agents: [DEFAULT_CREW, REACTING_CREW],
+      default_agent: 'kirocrew',
+    })
+    await renderRoster()
+    const sheet = await openEditor('radar')
+    expect(within(sheet).getByRole('button', { name: 'Save changes' })).toBeDisabled()
+  })
+
+  it('carries a legacy record\u2019s retired `expressions` through an unrelated save', async () => {
+    // The retirement is a RENDERING decision: the pickers are gone and nothing
+    // reads the key, but the editor rewrites the whole `avatar` record on any
+    // save -- so dropping it here would make a trigger edit the thing that
+    // deleted a customization from the previous release, with the user never
+    // having opened the avatar builder. It rides back out inert instead.
+    mockApi.kirocrewAgents.mockResolvedValue({
+      agents: [
+        DEFAULT_CREW,
+        {
+          ...REACTING_CREW,
+          avatar: {
+            kind: 'ghost',
+            motions: { done: 'nod' },
+            expressions: { done: { eyes: 'wink', mouth: 'grin' } },
+          },
+        },
+      ],
+      default_agent: 'kirocrew',
+    })
+    await renderRoster()
+    const body = await saveWithATrigger('radar')
+    expect(body.avatar).toEqual({
+      kind: 'ghost',
+      motions: { done: 'nod' },
+      expressions: { done: { eyes: 'wink', mouth: 'grin' } },
+    })
+  })
+
+  it('carries a PICTURE crew\u2019s retired preset cue through an unrelated save', async () => {
+    // The case that made this a defect rather than tidiness: a picture crew
+    // saved on the previous release really does carry `sounds` (that release's
+    // builder wrote them), the notice explaining the retirement only appears if
+    // the avatar builder is OPENED, and a model or trigger edit rewrites the
+    // record -- so the loss would be both real and silent.
+    mockApi.kirocrewAgents.mockResolvedValue({
+      agents: [
+        DEFAULT_CREW,
+        {
+          ...REACTING_CREW,
+          avatar: { kind: 'image', v: 3, sounds: { done: 'chime', error: 'pop' } },
+        },
+      ],
+      default_agent: 'kirocrew',
+    })
+    await renderRoster()
+    const body = await saveWithATrigger('radar')
+    expect(body.avatar).toEqual({
+      kind: 'image',
+      sounds: { done: 'chime', error: 'pop' },
     })
   })
 })
@@ -1344,8 +1452,39 @@ describe('avatar editor entry — discoverability (issue #9103)', () => {
     expect(screen.getByTestId('location-search')).toHaveTextContent(/^\?member=staging$/)
   })
 
+  it.each([
+    ['memory unavailable', 409, '{"code":"member_memory_unavailable"}'],
+    ['template lineage', 409, '{"code":"lineage_unverifiable"}'],
+    ['foreign template', 409, '{"code":"foreign_private_copy"}'],
+    ['unknown code', 409, '{"code":"future_conflict"}'],
+    ['uncoded conflict', 409, '{"error":"Creation failed"}'],
+    ['malformed body', 409, 'not JSON'],
+    ['null body', 409, 'null'],
+    ['non-string code', 409, '{"code":409}'],
+    ['non-conflict status', 400, '{"code":"agent_exists"}'],
+  ])('preserves %s instead of reporting a duplicate member', async (_label, status, body) => {
+    const message = 'Creation is unavailable; retry after repairing the configuration.'
+    mockApi.createKirocrewAgent.mockRejectedValueOnce(new ApiError(status, message, body))
+    renderPage('/capabilities?tab=crews&new=1&from=members')
+    const sheet = await screen.findByRole('dialog', { name: 'Add crew member' })
+    const name = within(sheet).getByPlaceholderText('e.g. oncall')
+    fireEvent.change(name, { target: { value: 'staging' } })
+    const template = within(sheet).getByRole('combobox', { name: 'Agent Template' })
+    fireEvent.keyDown(template, { key: 'ArrowDown' })
+    fireEvent.click(await screen.findByRole('option', { name: 'oncall-agent' }))
+    fireEvent.click(within(sheet).getByRole('button', { name: 'Create member' }))
+    const err = await screen.findByTestId('crew-sheet-error')
+    expect(err).toHaveTextContent(message)
+    expect(err).not.toHaveTextContent('already exists')
+    expect(name).toHaveValue('staging')
+    expect(template).toHaveTextContent('oncall-agent')
+    expect(screen.getByRole('dialog', { name: 'Add crew member' })).toBeInTheDocument()
+    expect(screen.getByTestId('location-pathname')).toHaveTextContent('/capabilities')
+    expect(mockApi.createKirocrewAgent).toHaveBeenCalledTimes(1)
+  })
+
   it('a duplicate name from the Members roster is refused in the form\'s own word', async () => {
-    mockApi.createKirocrewAgent.mockRejectedValueOnce(new ApiError(409, "Agent 'staging' already exists", '{"error":"Agent \'staging\' already exists"}'))
+    mockApi.createKirocrewAgent.mockRejectedValueOnce(new ApiError(409, "Agent 'staging' already exists", '{"error":"Agent \'staging\' already exists","code":"agent_exists"}'))
     renderPage('/capabilities?tab=crews&new=1&from=members')
     const sheet = await screen.findByRole('dialog', { name: 'Add crew member' })
     const user = userEvent.setup()

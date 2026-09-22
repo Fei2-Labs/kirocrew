@@ -11,7 +11,7 @@ import pytest
 
 from kiro_crew import embeddings as emb
 from kiro_crew import executors as pools
-from kiro_crew.vector_memory import VectorMemoryStore
+from kiro_crew.vector_memory import VectorMemoryStore, open_member_database
 
 
 def test_same_name_size_weights_have_distinct_identity(tmp_path):
@@ -321,7 +321,7 @@ async def test_http_deadline_wraps_real_recall_handler(monkeypatch, cold_open):
                 await asyncio.Event().wait()
             finally:
                 finished.set()
-        return SimpleNamespace(recall=recall)
+        return SimpleNamespace(recall=recall, algorithm_version="v2")
 
     monkeypatch.setattr(memory_member, "resolve_requested_memory_store", resolve)
     monkeypatch.setattr(memory_member, "vector_memory_for_store", tier)
@@ -412,8 +412,9 @@ async def test_store_opened_after_apply_snapshot_before_config_gets_new_width(
 
     def initialize():
         global_store.init()
-        late = VectorMemoryStore(db_path=late_path, embedding_dim=2)
-        late.init()
+        late = open_member_database(
+            late_path, member_id="late", store_id="member-late", embedding_dim=2
+        )
         late.close()
 
     await asyncio.to_thread(initialize)

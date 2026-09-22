@@ -126,11 +126,14 @@ Every kind is additionally cross-checked against something outside its own text,
 so no kind's honesty rests on how its reason is worded. `mirror` needs a
 registered class and an `mcpServers` ruling of `delivered` or `translated`;
 `external` needs an importable module; `no-channel` needs a channel, a resolvable
-tracking pointer and an onboarding row; and `native` is checked against
-`agent_sdk/mcp_refs.py`, which has to know the same fact to resolve a `@server`
-ref at all — it satisfies a ref from the spec's OWN `mcpServers` for a
-spec-reading backend and from the wire array for every other. A declaration and
-the resolver acting on it may not diverge, in either direction. A selectable backend
+tracking pointer and an onboarding row; and `native` and `external` are checked
+against `agent_sdk/mcp_refs.py`, which has to know the same fact to resolve a
+`@server` ref at all — it satisfies a ref from the spec's OWN `mcpServers` for a
+backend whose spec servers reach the session off the wire
+(`ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE`: the harness reads the file itself, or Crew
+projects it down a channel that is not the array) and from the wire array for
+every other. A declaration and the resolver acting on it may not diverge, in
+either direction. A selectable backend
 whose projection was not written could previously sit under one name with an
 explanation of when it would be, and every check stayed green — which is the
 structural reason the same missing-tools defect shipped on four harnesses in a row.
@@ -149,8 +152,9 @@ structural reason the same missing-tools defect shipped on four harnesses in a r
    `AcpClient` at the mirror so the declaration and the wire agree.
 4. **The parity test then holds you to it** (`test/test_provider_mirrors.py`):
    one declaration per known and selectable id, `mirror` only with a class,
-   `mcpServers` ruled `delivered` or `translated` on a mirror, `native` only for an
-   id `agent_sdk/mcp_refs.py` resolves against the spec itself, a resolvable
+   `mcpServers` ruled `delivered` or `translated` on a mirror, `native` and
+   `external` only for an id `agent_sdk/mcp_refs.py` resolves against the spec
+   itself and every other kind only for one it resolves against the array, a resolvable
    `tracking`, an importable `projection`, and every concern answered with a
    reason.
 5. **The doctor row.** A selected `no-channel` backend prints one informational
@@ -161,9 +165,82 @@ structural reason the same missing-tools defect shipped on four harnesses in a r
    checks it. The declaration is what code reads; the onboarding table is what a
    human reads BEFORE writing any of this, so a gap recorded in only one of the
    two is a gap the next author misses.
+7. **Measure the adapter, in the lane.** Anything you learn by driving the real
+   adapter belongs in a guarded contract test, and those run in CI's `Real Adapter
+   Contract Tests` lane: it runs `npm ci` on the locked manifest in
+   `test/real_adapters/` and sets `KIROCREW_E2E_REQUIRE=1`, so an absent adapter
+   fails the lane instead of skipping it. Mark the new test `@pytest.mark.real_adapter`,
+   call the gate in its body, and add the adapter's exact version to that manifest
+   (then `npm install --package-lock-only` there and commit both files); a
+   measurement no lane runs is a measurement that stops being true without telling
+   anyone. Dependabot bumps the manifest weekly, and that bump PR's run of the lane
+   is where a new release's drift shows up -- re-measure there, never relax.
+8. **Fill the card.** Nothing to write — the section below is what the declaration
+   you just wrote already renders. Read it back as the operator will, because that
+   is the step that catches a kind or a reach you did not mean.
 
 The folder makes a mirror easy to find and easy to copy. The test is what asks
 the question. Both are needed — a folder alone is just a tidier place to forget.
+
+## Fill the card: what this declaration shows the operator
+
+Every field of the declaration above is read back to the person CHOOSING the
+backend. That is the last step of onboarding a harness here, and it costs nothing
+to write: the card is a projection
+(`src/kiro_crew/agent_sdk/backend_mcp_ability.py`), so a harness with a
+`PROJECTIONS` entry has a complete card and a harness without one has a card that
+says nothing rather than a card that is quietly wrong.
+
+It renders in two places, from one projection, and they carry DIFFERENT amounts of
+it — the card is narrower than the record on purpose:
+
+- **Developer > Agent Backend**, in the detail for the highlighted harness, and only
+  where switching costs the reader something: the deny reach as a rule with its
+  exception, and the spec settings that will not take effect. Not the projection KIND
+  — `native`/`mirror`/`external` names the route Crew takes, which no reader can act
+  on. Labels are keyed by `PerToolDeny` reach and by `Concern`, never by backend,
+  which is why a new harness needs no frontend edit and no locale edit.
+- **`kirocrew doctor`**, in two lines rather than a table: the ability card of the
+  harness IN USE — naming the withheld concerns by the key the agent spec itself
+  spells (`permissions.defaultMode`, not the card's machine id), because the reader
+  there is holding the file — and one sentence naming every harness where a tool-off
+  can withhold Crew's own control plane, which is the fact a chooser needs before
+  switching. The row
+  prints declared values; the sentence says what the `whole-server` reach COSTS,
+  because that consequence reaches Crew's own control plane and no reading of the
+  value supplies it. The full per-harness comparison is the panel's: it has the room,
+  and a row apiece on every terminal run is a section readers learn to skip.
+
+Six things reach the card, and one deliberately does not:
+
+The admission rule is one line: a fact reaches the CARD only where switching to this
+harness costs the reader a feature, adds a risk, or makes one of their own agent-file
+settings ineffective. Everything else the declaration knows is true, useful to a
+maintainer, and stays in `kirocrew doctor` and this file.
+
+| On the card | From | Reads as |
+|---|---|---|
+| **Not** the projection kind | `McpProjection.kind` | the route Crew takes — no feature lost, no risk taken, no setting of theirs stopped. `kirocrew doctor` states it |
+| The per-tool deny reach | `McpProjection.per_tool_deny` | what switching ONE tool off costs here — that tool, or the whole server |
+| Whether that reach costs a whole server | `COSTS_WHOLE_SERVER` in `backend_mcp_ability.py`, shipped beside the reach as `costs_whole_server` | which reaches earn the prominent slot, decided once for every surface rather than re-derived per renderer — true of `whole-server` and of `per-call`, which withholds any non-Crew server whole |
+| Whether it costs CREW's servers | `McpAbility.costs_control_plane` in `backend_mcp_ability.py`, read by the terminal report and not shipped | the narrower question: only `whole-server` takes `kirocrew-core` with it, which is what leaves a session unable to report back. `per-call` refuses per tool on Crew's own servers, so it costs a third-party server and not the channel |
+| Concerns ruled `withheld` | the mirror's `rulings()` | a settled decision that a part of the spec is not sent |
+| Concerns ruled `no-channel` | the mirror's `rulings()` | a gap the transport cannot carry yet, with an address recorded for it |
+| **Not** the `reason` prose | — | written for the reader of this folder, at this folder's length. A user-facing reason would be a NEW field every mirror fills in, not this one re-registered |
+
+Two facts an operator might expect are absent on purpose. **Transports** are not a
+per-backend constant and must not be rendered as one: they are read from the live
+session's `initialize` answer (`codex.drop_unadvertised_transports`), precisely so a
+released adapter that gains or drops one is not silently contradicted by a table.
+And the card is **advisory** — it does not refuse a selection. Per-tool MCP deny is
+not a requirement on every provider, so declaring the `whole-server` form before a
+session runs is the whole obligation; enforcing a per-call deny on a transport that
+has no per-call identity is not.
+
+`test/test_backend_mcp_ability.py` holds this: every selectable backend answers,
+every `Concern` is either on the card or recorded off it with a reason, and every
+kind and reach reaches a reader. A concern added to the vocabulary fails that test
+until somebody decides which of the two it is.
 
 ## Where the translation logic lives
 
@@ -217,11 +294,21 @@ a tool they switched off answers anyway.
 Codex is the reason this section exists. Its hook sat at `[]` behind a docstring
 that stated, as the one established constraint, that codex-acp answers `-32602`
 for the whole `session/new` when it meets a transport it does not advertise. A
-real adapter says otherwise: a malformed stdio element — and even an array member
-that is not an object — leaves `session/new` succeeding with that element
-dropped, while `sse` is the one fatal shape and fails with `-32600`. The fear was
-the wrong code AND the wrong scope, and it had been load-bearing for a whole
-harness's tool surface.
+real adapter answers by the element's SHAPE, and both answers are measured. A
+malformed stdio element — and even an array member that is not an object — leaves
+`session/new` succeeding with that element dropped. An `sse` element the adapter's
+own `mcpCapabilities` marks unsupported is refused with `-32600` when it is
+schema-complete (carrying its `headers` array, the shape Crew's translation
+emits), and the refusal fails the WHOLE `session/new`; the same element without
+`headers` falls to the untagged variant and leaves `session/new` succeeding with
+that server accepted and never wired, exactly as a deliberately meaningless
+`{"type": "nonsense-type"}` control does. So the fear was wrong in its code and
+its scope, and half-wrong in its direction — and the fail-OPEN half is the
+expensive one: a healthy session with a silently missing tool, which nothing
+downstream reports. Client-side transport narrowing is therefore both a defence
+against a fatal refusal AND the only guard that the array Crew sends is the array
+the adapter honours, and that argument had been load-bearing for a whole
+harness's tool surface in one direction only.
 
 So a new mirror's transport and environment rules are MEASURED. `codex.py` cites
 what was run and `test/test_codex_session_mcp.py` pins it against an installed

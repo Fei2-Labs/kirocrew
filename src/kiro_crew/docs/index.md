@@ -34,6 +34,7 @@ index, first-time setup, and connecting messaging channels.
 | [Memory](memory-and-learning.md) | Persistent preferences, project context, and learned corrections across sessions, plus per-session persistent / incognito / temporary memory modes |
 | [Task Runner](task-runner.md) | Autonomous multi-step execution from spec files: hand it a task, walk away |
 | [Research Lab](research-lab.md) | Autonomous multi-cycle research campaigns with scoping, adaptive agent execution, and exportable reports |
+| [Issue Radar Pipeline](issue-radar-pipeline.md) | Which step of automated triage every issue is sitting in, how long it has been there, and what each agent session cost |
 | [Dashboard](dashboard.md) | React web UI with multi-session chat, memory management, and live system metrics |
 | [Agent Questions](agent-questions.md) | Let an agent pause mid-turn and ask you a clickable multiple-choice question |
 | Chat Channels | DM-based chat with tool approval — [Slack](slack-integration.md), [Discord](discord-integration.md), [Telegram](telegram-integration.md), [Teams](teams-integration.md), [Webex](webex-integration.md), [WeCom](wecom-integration.md), [WeChat](weixin-integration.md), [iMessage](imessage-integration.md), [WhatsApp](whatsapp-integration.md), [Feishu](feishu-integration.md); per-channel capabilities in each guide |
@@ -45,6 +46,7 @@ index, first-time setup, and connecting messaging channels.
 | [Session Ledger](session-ledger.md) | A durable per-session record of goal, phase, and next step that survives context compaction |
 | [Browser Control](browser-control.md) | Drive a real web page from the dashboard's Browser panel: navigate, snapshot, click, type, screenshot |
 | [Computer Use](computer-use.md) | Read and drive native desktop applications through the accessibility layer; opt-in and off by default |
+| [Jev Decisions](decisions.md) | Let a small fast model choose the automatic skill for a sampled conversation, flag a risky tool call on its own card without changing any permission, fall back to what shipped whenever it cannot, and keep a basic log of the calls |
 
 ## Additional Features
 
@@ -114,6 +116,10 @@ gracefully rather than failing the turn.
 - [MCP Apps](mcp-apps.md): render interactive MCP tool output (diagrams, viewers,
   forms) in chat, the two gates that enable it, what a server must declare, and why
   output stays plain text otherwise
+- [Context management](https://github.com/kirodotdev/KiroCrew/blob/main/docs/architecture/context-management.md):
+  what goes into the model's context — first-turn block order, per-turn additions,
+  sub-agents, custom agents, and Crew mode. A contributor document in the
+  repository, not part of this installed package
 - [Settings deep links](settings-deeplink.md): answer "where is that setting?" with
   a link that opens the tab and flashes the control, from the generated
   `settings-registry.generated.json` in this directory

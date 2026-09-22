@@ -3,7 +3,9 @@
 
 Prints PR state + every CI check + advisory unresolved-thread count and returns
 an exit code that drives the poll loop. The aggregate ``PR Readiness`` status is
-authoritative when present; older PRs fall back to the full check rollup.
+one signal folded with the rows, never an override of them: its FAILURE blocks
+and its PENDING waits, but its green does not clear an observed failing or
+pending row, because its context name is a forgeable display string.
 Stdlib only; portable.
 
 Usage:  python3 pr_status.py [pr-number] [--readiness-context NAME]
@@ -28,10 +30,12 @@ Usage:  python3 pr_status.py [pr-number] [--readiness-context NAME]
 
 Exit codes:
    0  CLEAN     - open, non-draft, MERGEABLE, no CHANGES_REQUESTED, aggregate
-                  PR Readiness (or the legacy full rollup) passed, every
-                  reviewer stamp matches the current head, no [BLOCK-MERGE]
-                  marker for the current head, and a pull_request-event run
-                  exists for the current head (when the repo uses Actions)
+                  PR Readiness (or the legacy full rollup) passed with no
+                  observed failing row (a passed aggregate does not clear a
+                  failing row), every reviewer stamp matches the current head,
+                  no [BLOCK-MERGE] marker for the current head, and a
+                  pull_request-event run exists for the current head (when the
+                  repo uses Actions)
   10  RUNNING   - a required check is still queued/in-progress, or mergeability
                   has not been computed yet
   20  BLOCKED   - failing readiness, merge conflict, draft, CHANGES_REQUESTED,
@@ -67,20 +71,23 @@ class _NoBytecodeSourceLoader(importlib.machinery.SourceFileLoader):
         return None
 
 
-def _load_review_contract():
-    """Load the sibling contract without cwd, sys.path, or bytecode side effects."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_review_contract.py")
-    name = "_prepare_pr_review_contract"
+def _load_sibling(filename, name):
+    """Load a sibling script without cwd, sys.path, or bytecode side effects."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
     loader = _NoBytecodeSourceLoader(name, path)
     spec = importlib.util.spec_from_loader(name, loader)
     if spec is None:  # pragma: no cover - defensive
-        raise RuntimeError("cannot import prepare-pr review contract: " + path)
+        raise RuntimeError("cannot import prepare-pr sibling script: " + path)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
 
 
-_review_contract = _load_review_contract()
+_review_contract = _load_sibling("_review_contract.py", "_prepare_pr_review_contract")
+# Imported, never shelled out to: a subprocess would give this script a second
+# way to fail (PATH, interpreter, quoting) for information it already has the
+# code for, and the exit-code contract belongs to green_age.py's own CLI.
+_green_age = _load_sibling("green_age.py", "_prepare_pr_green_age")
 REVIEWED_STAMP_RE = _review_contract.REVIEWED_STAMP_RE
 BLOCK_MERGE_RE = _review_contract.BLOCK_MERGE_RE
 DEFAULT_MARKER_AUTHORS = _review_contract.DEFAULT_MARKER_AUTHORS
@@ -1155,6 +1162,34 @@ def head_run_exists(repo, head_sha):
     return False
 
 
+def probe_green_age(base, head_sha, pr):
+    """One line on whether this head's green still describes today's base.
+
+    INFORMATION, NEVER A GATE. The verdict is not passed to :func:`decide`, no
+    exit code depends on it, and any failure inside ``green_age`` degrades to an
+    "unavailable" line. A merger who is about to merge a ten-hour-old green needs
+    to know the base moved underneath it; a poll cycle that could not measure
+    that must not therefore call a red PR green, or a green one red.
+
+    The base defaults to ``main`` when the host did not report one, because the
+    line is advisory and a wrong default costs a wrong line, not a wrong verdict.
+    """
+    try:
+        return _green_age.summarize(
+            base=base or "main",
+            head=head_sha or "HEAD",
+            pr=str(pr or ""),
+            runner=run,
+        )
+    except Exception as exc:  # noqa: BLE001 - an advisory line may never raise
+        return {"ok": False, "reason": "probe failed ({})".format(type(exc).__name__)}
+
+
+def green_age_line(summary):
+    """The printed form of :func:`probe_green_age`, indented like its siblings."""
+    return "  " + _green_age.format_line(summary)
+
+
 def build_report(
     *,
     number,
@@ -1167,6 +1202,7 @@ def build_report(
     marker_eval,
     code,
     status,
+    green_age=None,
 ):
     """Build the --json report.
 
@@ -1218,6 +1254,11 @@ def build_report(
             "bot_comments_readable": bool(marker_eval.get("ok")),
             "elided_stamp_reviewers": sorted(marker_eval.get("elided") or []),
             "findings": dict(marker_eval.get("findings") or {}),
+            # Advisory, and deliberately OUTSIDE progress_key: the base moving is
+            # not this PR making progress, and on a repo that merges every couple
+            # of minutes a commit count in the key would reset the stall streak
+            # forever. The babysit trigger reads this field; the tripwire does not.
+            "green_age": dict(green_age or {"ok": False, "reason": "not measured"}),
             "stale_reviewers": sorted(marker_eval.get("stale") or []),
             "unresolved_threads": n_unresolved,
         },
@@ -1347,9 +1388,16 @@ def decide(
     if blocked_now:
         return 20, "STATUS: BLOCKED - " + "; ".join(blocked_now)
 
-    # Once published, the aggregate is authoritative over stale duplicate
-    # checks in the rollup. Legacy PRs without it still use the full rollup.
-    if readiness_kind == "running" or (readiness_kind is None and n_running > 0):
+    # An observed running lane keeps the round open regardless of the
+    # aggregate. The aggregate's context name is a forgeable display string, so
+    # if a passed aggregate could conclude the "still running" gate, a forged
+    # green posted while a real lane is still QUEUED/IN_PROGRESS would skip this
+    # branch and reach CLEAN before the real failure lands -- the same
+    # forged-green-to-CLEAN vector, moved into a timing window. So an observed
+    # running row means RUNNING on its own terms, and a failing aggregate is
+    # reported below. The aggregate subtracts neither a pending nor a failing
+    # row.
+    if readiness_kind == "running" or n_running > 0:
         return 10, "STATUS: RUNNING (round not complete)"
     if mergeable not in ("MERGEABLE", "CONFLICTING"):
         return 10, "STATUS: RUNNING (mergeability not yet computed: {})".format(
@@ -1357,9 +1405,17 @@ def decide(
         )
 
     reasons = []
+    # An observed failing row is authoritative on its own terms: a passed
+    # aggregate does not clear it. The aggregate's context name is a display
+    # string any status publisher on the pull request can set, so letting a
+    # green aggregate erase a failing row would let a forged green flip this
+    # tool to CLEAN over a real failure. So report a failing row whenever one
+    # exists, independent of the aggregate, and report a failing aggregate as
+    # its own reason. The aggregate subtracts no observed row -- neither a
+    # pending one (handled by the running gate above) nor a failing one here.
     if readiness_kind == "fail":
         reasons.append("{} reported action required".format(readiness_context))
-    elif readiness_kind is None and n_fail > 0:
+    if n_fail > 0:
         reasons.append("{} check(s) failed".format(n_fail))
     if n_checks == 0:
         # An empty rollup has two very different causes, and the reason chosen
@@ -1535,7 +1591,7 @@ def main(argv):
 
     fields = (
         "number,title,state,isDraft,mergeable,mergeStateStatus,"
-        "reviewDecision,url,headRefName,headRefOid,"
+        "reviewDecision,url,headRefName,headRefOid,baseRefName,"
         "body,closingIssuesReferences"
     )
     rc, out, _ = run(["gh", "pr", "view", pr, "--json", fields])
@@ -1775,6 +1831,11 @@ def main(argv):
         else:
             run_shown = "? (could not confirm)"
         print("  pull_request run for current head: " + run_shown)
+    # Whether that run's verdict still describes today's base. Printed beside the
+    # rollup because it qualifies the rollup: a green measured on a base that has
+    # since moved in this PR's own files is a green about a tree nobody has.
+    green_age = probe_green_age(d.get("baseRefName") or "", head_sha, d.get("number"))
+    print(green_age_line(green_age))
     print("=" * 54)
 
     code, status = decide(
@@ -1812,6 +1873,7 @@ def main(argv):
                     marker_eval=marker_eval,
                     code=code,
                     status=status,
+                    green_age=green_age,
                 ),
                 sort_keys=True,
                 separators=(",", ":"),

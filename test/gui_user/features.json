@@ -3,11 +3,11 @@
   "raw_record_count": 387,
   "counts": {
     "smoke": 42,
-    "nightly": 165,
+    "nightly": 166,
     "native-only": 12,
     "needs-secret": 27,
     "excluded": 22,
-    "total": 268
+    "total": 269
   },
   "priorities": {
     "P0": 10,
@@ -67,7 +67,7 @@
     },
     "members": {
       "smoke": 0,
-      "nightly": 2,
+      "nightly": 3,
       "native-only": 0,
       "needs-secret": 0,
       "excluded": 0
@@ -1976,6 +1976,37 @@
         "members-crew-members",
         "members-page-roster-and-thread",
         "members-roster-filter"
+      ],
+      "component": "website/src/pages/members/MembersPage.tsx"
+    },
+    {
+      "id": "members-private-memory-keeps-thread",
+      "feature": "members",
+      "title": "A member's DM thread survives leaving and returning; it keeps its history and still answers",
+      "user_story": "As a crew operator, I want a member's direct-message thread to survive leaving and returning to the member, so that our earlier conversation and the member's ability to answer are not lost.",
+      "start_url": "/settings",
+      "entry_path": "Settings > Developer > Feature Previews > enable Crew Members; Rail > Crew Members > Nova Sky > DM thread (send a message, get a reply) > leave to another rail item > back to Crew Members > Nova Sky > send again",
+      "preconditions": {
+        "seed": "rich",
+        "members": [
+          "nova-sky"
+        ],
+        "feature_flags": [
+          "mc-preview-crew"
+        ],
+        "notes": "The seeded member keeps its store; a member's memory is fixed at creation and its binding is immutable (PUT /api/agents changing memory_store returns 409 member_memory_immutable), so there is no store-switch control to touch. The check is that the DM thread persists across navigation and still answers on the fake ACP backend, which replies to both messages."
+      },
+      "runnable": "nightly",
+      "estimated_steps": 8,
+      "rationale": "Navigate-away-and-return flow over the DM thread with two model turns; the assertions that matter are pixel-level: the earlier bubble is still on screen after returning and no error bubble replaced the reply.",
+      "source": [
+        "website/src/pages/members/MembersPage.tsx",
+        "website/src/pages/KiroCrewAgentsPage.tsx",
+        "src/kiro_crew/members.py"
+      ],
+      "priority": "P1",
+      "merged_from": [
+        "members-private-memory-keeps-thread"
       ],
       "component": "website/src/pages/members/MembersPage.tsx"
     },
@@ -6466,7 +6497,7 @@
       "title": "Override sound per notification category",
       "user_story": "As a dashboard user, I want to choose a different sound for Approval or Cron notifications, so that I can tell them apart by ear.",
       "start_url": "/settings/notifications",
-      "entry_path": "Settings > Notifications > category selects (Agent replies, Approval, Cron, Subagent, Tasks, Webhook, Skills, Heartbeat)",
+      "entry_path": "Settings > Notifications > category selects (Conversation handoffs, Approvals and questions, Cron, Subagent, Tasks, Webhook, Skills, Heartbeat)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -7319,7 +7350,7 @@
       "id": "developer-agent-backend",
       "feature": "developer",
       "title": "Developer › Agent backend",
-      "user_story": "As a developer, I want to see which agent harness backend is live and whether Kiro prerequisites are met, so that I know what turns run on.",
+      "user_story": "As a developer, I want to see which agent harness backend is live, what each harness can and cannot do, and whether Kiro prerequisites are met, so that I know what turns run on before I choose a harness.",
       "start_url": "/developer",
       "entry_path": "Developer → agent-backend tab (?tab=agent-backend)",
       "preconditions": {
@@ -7328,15 +7359,17 @@
         "feature_flags": [
           "mc-dev-mode"
         ],
-        "notes": "Shows the fake ACP backend in the nightly harness. READ-ONLY: do not click the backend switch — changing the binding restarts sessions and detaches the harness's fake ACP backend."
+        "notes": "Shows the fake ACP backend in the nightly harness. The panel is a LIST of harnesses and a DETAIL for the highlighted one. Clicking a row only changes which detail is shown and is READ-ONLY and safe -- it is the intended way to read a harness. Do NOT click **Use <name>**: that is the switch, and changing the binding restarts sessions and detaches the harness's fake ACP backend. **Check again** is safe to press but it clears this gateway's cached resolution for that one harness, so prefer not to. The capability list is already open (it needs no disclosure now that one card renders at a time); only the operator notes are behind one, and opening that is read-only."
       },
       "runnable": "nightly",
-      "estimated_steps": 2,
-      "rationale": "Read-only status view is a useful harness confidence check (asserts the fake backend is what is live). one reader marked the record excluded because switching backends breaks the harness; that action is scoped out here rather than dropping the view, so the tier is nightly.",
+      "estimated_steps": 3,
+      "rationale": "Read-only status view is a useful harness confidence check (asserts the fake backend is what is live), and it now also carries the capability card for the highlighted harness -- available / not-available capability lines, the always-visible tool-approval and security lines, collapsed operator notes, and a row for a harness this build does not offer -- all projected from capability membership. Highlighting a row is not selecting it, so reading every harness's card is now a read-only walk; only the Use button switches. one reader marked the record excluded because switching backends breaks the harness; that action is scoped out here rather than dropping the view, so the tier is nightly. The card now also carries an MCP disclosure for the highlighted harness -- the projection kind in its summary, and behind it what switching one tool off costs here plus the parts of the agent spec this harness withholds or has no channel for -- projected from the mirror declarations. Opening it is read-only.",
       "source": [
         "docs/feature-map/README.md",
         "website/src/pages/developer/AgentBackendTab.tsx",
-        "website/src/pages/DeveloperPage.tsx"
+        "src/kiro_crew/agent_sdk/backend_cards.py",
+        "website/src/pages/DeveloperPage.tsx",
+        "src/kiro_crew/agent_sdk/backend_install.py"
       ],
       "priority": "P2",
       "merged_from": [
