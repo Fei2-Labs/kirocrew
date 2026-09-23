@@ -95,20 +95,23 @@ from kiro_crew.messaging.commands import (
     compact_unsupported_backend,
     compact_unsupported_reply,
     cron_command_reply,
+    note_user_stop,
     spawn_command_reply,
     task_command_reply,
 )
 from kiro_crew.messaging.dispatch import (
     admit_inbound_callback,
+    await_replay_gap,
     consume_reinjection,
     rearm_reinjection,
+    session_stop_generation,
     stop_reason_landed,
 )
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import canonical_key
-from kiro_crew.messaging.renderer import redaction_notice
+from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
@@ -132,8 +135,6 @@ from kiro_crew.safety_override import (
     yolo_policy_permits,
 )
 from kiro_crew.security import (
-    CREDENTIAL_REDACTION_TAGS,
-    EXFILTRATION_REDACTION_TAG_PREFIX,
     StreamRedactor,
     is_sensitive_path,
     redact,
@@ -762,6 +763,41 @@ _thread_projects: dict[str, str] = {}
 
 # Guard set for _hydrate_thread_overrides to avoid repeated I/O per session.
 _hydrated_sessions: set[str] = set()
+
+# Retries granted to a Slack turn abandoned after a TRANSIENT compaction failure
+# (a throttled or 5xx'd summarization call). Per message: the replay is a nested
+# ``handle_message`` call carrying the attempt number, so the budget travels
+# with the message and needs no per-thread state. Same count as the dashboard's
+# _COMPACTION_FAILED_RETRIES and for the same reason: a throttle still firing
+# after two session resets is not clearing, and every attempt costs the
+# summarization call again.
+_COMPACTION_FAILED_RETRIES = 2
+
+# Posted to the thread when the abandoned message is about to be replayed. Sent
+# directly, never through the turn's own reply path: the abandoned attempt
+# persists nothing and mirrors nothing, so the conversation log records the
+# message once, with the reply the replay produces.
+_COMPACTION_RETRY_NOTICE = "⟳ Compaction failed — retrying…"
+
+
+@dataclass(frozen=True)
+class _CompactionReplay:
+    """Why a ``handle_message`` call is running: it is replay ``attempt`` of a
+    message whose previous attempt was abandoned after a transient compaction
+    failure.
+
+    ``stop_gen_at_entry`` is the session manager's user-Stop count when the
+    FIRST attempt acquired its session, carried unchanged across attempts. The
+    replay compares against it right before it opens a prompt: any Stop issued
+    since -- on any surface, including one that landed while the key had no
+    live session between the reset and this attempt's acquire, which the caller
+    keeps recordable with ``open_replay_gap`` -- means the user does not want
+    this message run, and the replay ends without a turn.
+    """
+
+    attempt: int
+    stop_gen_at_entry: int
+
 
 # The privacy-mode machinery lives in ``messaging.privacy_mode`` so a second
 # channel gets the same trackers, the same durable flag and the same audit rather
@@ -1850,6 +1886,13 @@ async def _handle_slash_command(
     # ── !stop — defensive fallback (normally intercepted in events.py
     #    _route_message before handle_message is called) ──
     if cmd == "!stop":
+        # Recorded BEFORE the liveness check: a turn between its abandoned
+        # attempt and its compaction replay has no session at this moment, and
+        # the replay reads this record to stay dropped (``note_user_stop``).
+        # Against the thread's OWNING session -- a linked thread's turns run
+        # under the dashboard session that owns it, and that is the key the
+        # replay reads -- resolved the way the OPTIONS expiry below resolves it.
+        note_user_stop(sessions, sessions.get_session_for_thread(reply_ts) or session_key)
         has_session = sessions.has_session(session_key)
         if not has_session:
             sel().log_tool_invocation(
@@ -3108,6 +3151,7 @@ async def handle_message(
     from_trusted_bot: bool = False,
     channel_activation: str | None = None,
     had_voice_input: bool = False,
+    _compaction_replay: _CompactionReplay | None = None,
 ) -> None:
     """Route a Slack message through ACP with streaming and tool approval.
 
@@ -3122,6 +3166,14 @@ async def handle_message(
 
     *channel_agent* overrides the default agent for this channel (set via
     per-channel config in ``slack.channels``).
+
+    *_compaction_replay* is set only by this function itself, when it re-runs a
+    message whose previous attempt was abandoned after a transient compaction
+    failure (see the ``STOP_REASON_COMPACTION_FAILED`` branch). Every other
+    argument is passed through unchanged, so the replay resolves the same
+    session, keeps the same activation and pinning, and can still read the
+    attachment files the original text refers to -- their cleanup runs when the
+    OUTER call's task ends, after this nested call has returned.
     """
     Stats().inc_message_received()
     _t0 = time.monotonic()
@@ -3204,6 +3256,11 @@ async def handle_message(
         if hook_result.action == HOOK_REPLY:
             await slack.post_message(channel, hook_result.text, reply_ts)
             if conversation_log and not _is_slack_restricted(session_key):
+                # After the reply is posted but BEFORE the record is written:
+                # an older message in this thread may be between its reset and
+                # its compaction replay, and the transcript must show that turn
+                # first, as the thread does.
+                await await_replay_gap(sessions, session_key)
                 await save_conversation_turn_off_loop(
                     conversation_log,
                     session_key,
@@ -3418,6 +3475,12 @@ async def handle_message(
     # answer-carrying delivery below actually posts, so this records "the model
     # finished" separately from "the reader received the answer".
     _turn_completed_ok = False
+    _replayed = False  # set when a transient-compaction replay took over this message
+    # Set as the last statement of the turn body. A raise that skips it -- a
+    # cancellation landing in the post-compaction reset, after the model already
+    # completed -- never reaches the delivery region, so the ``finally`` must not
+    # defer the release to a ``_release_permit`` that will never run.
+    _body_completed = False
 
     # Set assistant thread status while we wait for the LLM to respond.
     # Defer start_stream until the first text chunk arrives so the user
@@ -3783,6 +3846,18 @@ async def handle_message(
             session_key, agent=_agent, channel_id=channel
         )
         _acquired = True
+        if _compaction_replay is not None:
+            # The gap the outer attempt opened stays open until this replay has
+            # settled and released its permit (the outer's ``finally`` closes it):
+            # a message admitted now would park on this session's semaphore,
+            # which a further retry's reset would pop from under it.
+            _stop_gen_at_entry = _compaction_replay.stop_gen_at_entry
+        else:
+            # The user's Stop count for this key at turn start; a replay of
+            # this message re-reads it before opening its prompt, so a Stop
+            # issued anywhere in between -- on any surface -- keeps the
+            # abandoned message dropped.
+            _stop_gen_at_entry = session_stop_generation(sessions, session_key)
         # Expire AGAIN now the turn is serialized — see the same call in
         # transport_dispatch. The pass earlier in this function runs before
         # `get_or_create` waits its turn, so two messages arriving together both
@@ -3836,6 +3911,13 @@ async def handle_message(
                 model_window=_model_window,
             )
 
+        # The user's message as it arrived. The block below may fold a
+        # cancelled-turn preamble into ``text`` for the model; a
+        # transient-compaction replay must re-run THIS value, so the nested call
+        # derives its own preamble (its own gate, its own one-shot flag) and
+        # persists what the user actually typed, not a preamble a previous
+        # attempt prepended.
+        _user_text = text
         # After a soft-cancel, kiro-cli drops the cancelled turn from its
         # conversation log — but the user+assistant text is persisted to our
         # local conversation_log. Re-inject just the cancelled turn as a
@@ -3961,6 +4043,21 @@ async def handle_message(
         if sessions.is_cancelled(session_key, msg_ts):
             logger.info("Message %s cancelled before LLM call — skipping", msg_ts)
             await slack.set_thread_status(channel, reply_ts, "")
+            return
+        # A replay must not run a message the user has stopped since its first
+        # attempt began. Same shape and same placement as the check above: the
+        # last look before the prompt opens.
+        if (
+            _compaction_replay is not None
+            and session_stop_generation(sessions, session_key) != _stop_gen_at_entry
+        ):
+            logger.info("Message %s stopped before its compaction replay — skipping", msg_ts)
+            await slack.set_thread_status(channel, reply_ts, "")
+            if _working_ts:
+                try:
+                    await slack.delete_message(channel, _working_ts)
+                except Exception:
+                    pass
             return
 
         # Lease-dispatch race gate: the session lease was taken by
@@ -4432,17 +4529,134 @@ async def handle_message(
             # still counts the prompt as in progress. Reset now (mirrors the
             # dashboard runner's needs_session_reset) or the NEXT message
             # collides with "prompt already in progress" and burns the busy
-            # recovery path. No re-queue: the compaction notice already told
-            # the user. The context-usage probe is skipped — compaction just
-            # failed and the session was torn down.
+            # recovery path. The context-usage probe is skipped — compaction
+            # just failed and the session was torn down.
+            #
+            # Opened BEFORE the reset pops the session: from that pop until the
+            # replay acquires its successor, a Stop would find no session and
+            # go unrecorded -- the window the replay's pre-prompt check exists
+            # for -- and a newer message for this key would claim the successor
+            # first and run ahead of the replay; the open gap makes any other
+            # task's claim wait. Closed when the replay has settled (the
+            # ``finally`` around the nested call), or right below when no
+            # replay is attempted.
+            sessions.open_replay_gap(session_key)
+            _reset_ok = True
             try:
                 await sessions.reset(session_key)
             except Exception:
+                _reset_ok = False
                 logger.debug(
                     "Failed to reset session %s after compaction failure",
                     session_key,
                     exc_info=True,
                 )
+            # Whether the abandoned message is replayed depends on WHY
+            # compaction failed, which is the verdict the ACP layer records. A
+            # compaction that overflowed the window fails again identically, so
+            # replaying it only burns the budget — the case the unconditional
+            # give-up was written for. A throttled or 5xx'd summarization call
+            # has nothing wrong with it, and dropping the message for it ends
+            # the turn on a backend hiccup the next attempt would clear.
+            _attempt = _compaction_replay.attempt if _compaction_replay is not None else 0
+            if (
+                _reset_ok
+                # Compared against True rather than read for truthiness: the
+                # retry must require a real verdict, so a provider that never
+                # set the attribute (or exposes an auto-created stand-in for
+                # it) cannot be read as "transient" by accident.
+                and getattr(client, "last_compaction_transient", False) is True
+                # Verbatim replay is only safe before anything landed in the
+                # thread — text or a tool card. Once output or a tool call has
+                # landed, re-sending could repeat a side effect, so an emitted
+                # turn keeps the give-up behaviour.
+                and not accumulated
+                and _task_counter == 0
+                and _attempt < _COMPACTION_FAILED_RETRIES
+            ):
+                logger.info(
+                    "Transient compaction failure in %s (attempt %d/%d) — "
+                    "replaying the abandoned message",
+                    session_key,
+                    _attempt + 1,
+                    _COMPACTION_FAILED_RETRIES,
+                )
+                # The replay is a nested call of this function with every
+                # argument unchanged, which is what makes it Slack's own
+                # replay: it resolves the same session, keeps the same
+                # activation and pinning, runs while this task still owns the
+                # attachment temp files, and needs no queue drain from whoever
+                # dispatched the original -- the interaction paths dispatch
+                # ``handle_message`` without one.
+                #
+                # This attempt's permit died with the session the reset popped;
+                # the successor's belongs to the replay, whose own ``finally``
+                # releases it, so this frame must not release again.
+                _acquired = False
+                _replayed = True
+                # The reset popped the session, so the replay cold-starts a NEW
+                # one whose first prompt carries the full session-start context
+                # anyway; re-arming the one-shot flag for this abandoned prompt
+                # would only make the turn after the replay inject it twice.
+                _needs_reinjection = False
+                # This attempt is over: stop its reaction ladder and stall
+                # watchdog now (idempotent, so the ``finally`` re-call is a
+                # no-op), and take down what it posted -- the Working block and
+                # a reasoning placeholder that a thinking-only attempt left
+                # above where the answer would have gone. The nested call posts
+                # its own.
+                status_ctrl.finalize(error=False)
+                for _ts in (_working_ts, thinking_ts):
+                    if _ts:
+                        try:
+                            await slack.delete_message(channel, _ts)
+                        except Exception:
+                            pass
+                _working_ts = None
+                thinking_ts = None
+                # Visible, not persisted: the abandoned attempt records nothing,
+                # so the conversation log carries this message exactly once,
+                # with the reply the replay produces.
+                try:
+                    await slack.post_message(channel, _COMPACTION_RETRY_NOTICE, reply_ts)
+                except Exception:
+                    logger.debug("Failed to post the compaction retry notice", exc_info=True)
+                try:
+                    await handle_message(
+                        slack,
+                        sessions,
+                        channel,
+                        _user_text,
+                        thread_ts,
+                        msg_ts,
+                        user_id,
+                        team_id=team_id,
+                        approval_mode=approval_mode,
+                        context_builder=context_builder,
+                        cron_service=cron_service,
+                        conversation_log=conversation_log,
+                        consolidator=consolidator,
+                        subagent_manager=subagent_manager,
+                        task_runner=task_runner,
+                        channel_agent=channel_agent,
+                        user_display_name=user_display_name,
+                        action_context=action_context,
+                        target_slot_name=target_slot_name,
+                        route_pinned=route_pinned,
+                        asker_key=asker_key,
+                        from_trusted_bot=from_trusted_bot,
+                        channel_activation=channel_activation,
+                        had_voice_input=had_voice_input,
+                        _compaction_replay=_CompactionReplay(
+                            attempt=_attempt + 1, stop_gen_at_entry=_stop_gen_at_entry
+                        ),
+                    )
+                finally:
+                    # The replay has settled and released its permit (or never
+                    # got there); a waiter admitted now finds an idle session.
+                    sessions.close_replay_gap(session_key)
+            else:
+                sessions.close_replay_gap(session_key)
         else:
             # Check context usage — fires background compaction at configured
             # threshold, never blocks. This runs AFTER ``_turn_completed_ok`` is
@@ -4462,6 +4676,7 @@ async def handle_message(
                     session_key,
                     exc_info=True,
                 )
+        _body_completed = True
 
     except AcpTimeoutError as e:
         _had_error = True
@@ -4519,10 +4734,25 @@ async def handle_message(
         # and mutates that same state while this turn is still deciding its own
         # verdict, corrupting the breaker. On every error path accounting already
         # ran inside the ``except`` blocks above, so the permit is released now.
-        _release_deferred = _acquired and _turn_completed_ok
+        # A raise that left the body after the model completed (``_body_completed``
+        # still False) is released now too: nothing below this ``finally`` runs.
+        _release_deferred = _acquired and _turn_completed_ok and _body_completed
         if _acquired and not _release_deferred:
             sessions.release(session_key)
             _acquired = False
+        # A replay gap this attempt opened must not outlive it: a cancellation
+        # landing in the reset (``!stop`` cancels the handler task) skips every
+        # close inside the try, and a gap left open makes every later claim on
+        # this key wait forever. Idempotent, and ordered after the release so a
+        # waiter admitted now finds an idle session; when the release is
+        # deferred past this ``finally`` the gap is deferred with it and
+        # ``_release_permit`` closes both. Probed with ``getattr`` because this
+        # line runs on EVERY turn, including the many focused session-manager
+        # doubles across the suite that predate the method.
+        if not _release_deferred:
+            _close_gap = getattr(sessions, "close_replay_gap", None)
+            if callable(_close_gap):
+                _close_gap(session_key)
         status_ctrl.finalize(error=_had_error)
 
     # Release the retained permit once delivery and accounting have run. Called
@@ -4536,6 +4766,19 @@ async def handle_message(
         if _acquired:
             sessions.release(session_key)
             _acquired = False
+            # The gap opened for a replay is held for as long as the permit is,
+            # so the deferred-release path closes it here, right after the
+            # release, and the ``finally`` above closes it on every other exit.
+            _close_gap = getattr(sessions, "close_replay_gap", None)
+            if callable(_close_gap):
+                _close_gap(session_key)
+
+    if _replayed:
+        # The nested call posted the reply, persisted the turn, booked its own
+        # verdict and cleared the thread status; this abandoned attempt has
+        # nothing of its own to show and holds no permit (the reset popped the
+        # session whose permit it held), so nothing is released here.
+        return
 
     # Structural release guarantee: delivery and accounting below can raise
     # on ANY step (a Slack send such as post_ephemeral, a conversation-log
@@ -4558,6 +4801,7 @@ async def handle_message(
         # yield is a landmine.
         _options_verdict_deferred = False  # set at the verdict step; read by both finallys
         _verdict_booked = not _turn_completed_ok  # model errors already booked
+        _title_pin_held: auto_title.RecordPin | None = None  # set under the permit
         # Bound before the first suspension point so the release finally can read
         # it on a cancellation landing at any await. Recomputed at the delivery
         # step below; the default False is correct for a cancellation BEFORE
@@ -4758,15 +5002,17 @@ async def handle_message(
         # artifact answers the question the user has -- "is what I am about to copy
         # still what the assistant wrote?" -- and stays correct wherever the
         # substitution happened (per-chunk, the StreamRedactor wire pass, the final
-        # render, or the post-decorator scan). Sum every tag the redactor can emit
-        # (`CREDENTIAL_REDACTION_TAGS`) so an encoded-credential-only reply is not
-        # missed.
+        # render, or the post-decorator scan). The shared ``count_redaction_tags``
+        # sums every tag the redactor can emit so an encoded-credential-only reply
+        # is not missed, and counts the exfiltration-URL tag by its prefix, because
+        # that tag interpolates the redacted domain and has no constant form to
+        # equality-compare. Kept as separate counts because the notice is worded
+        # by kind: the remedies differ (re-enter the secret vs re-check the URL).
         #
         # The thinking block (redacted separately below) adds to this SAME tally so a
         # single warning covers the turn if either the answer or the thinking was
         # rewritten -- one turn, one notice, never two identical warnings.
-        _cred_redactions = sum(clean_text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
-        _url_redactions = clean_text.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+        _cred_redactions, _url_redactions = count_redaction_tags(clean_text)
 
         # ── Review mode: ephemeral draft instead of public post ──
         if channel_activation == ACTIVATION_REVIEW:
@@ -4976,6 +5222,25 @@ async def handle_message(
         # returns — and books a failure if both fail. The permit stays held across
         # the intervening decorations (fast, best-effort) so the deferred verdict
         # is still written under it.
+        # Pin the record for the naming turn while the permit is still held. Every
+        # release below is followed by Slack round-trips before the auto-title block,
+        # and a queued turn that takes the released permit can delete this key's
+        # record and re-mint it in that span. A pin read down there reads the
+        # REPLACEMENT, the guard matches it, and the title generated from this turn
+        # names a conversation it never ran in. While the permit is held no other
+        # turn for this key runs, so the identity read here is the record this turn
+        # is about. The same cheap ``is_titled`` peek the block below uses gates it,
+        # so an already-named conversation pays no thread hop.
+        #
+        # A key whose record has not landed yet pins ABSENT here and is re-pinned
+        # below once this turn's own row is written: with no record there is nothing
+        # a replacement can be mistaken for, and the first exchange stays nameable.
+        if (
+            not _had_error
+            and not _is_slack_restricted(session_key)
+            and not auto_title.is_titled(session_key)
+        ):
+            _title_pin_held = await auto_title.pin_record(conversation_log, session_key)
         _options_verdict_deferred = bool(_turn_completed_ok and options and _answer_reached)
         if not _options_verdict_deferred:
             if _turn_completed_ok:
@@ -5039,8 +5304,9 @@ async def handle_message(
             # review-mode branch). Count the fully redacted text before it is
             # condensed -- condensing can truncate, which would drop a placeholder
             # from the count even though the credential was still rewritten.
-            _cred_redactions += sum(thinking_mrkdwn.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
-            _url_redactions += thinking_mrkdwn.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+            _thinking_creds, _thinking_urls = count_redaction_tags(thinking_mrkdwn)
+            _cred_redactions += _thinking_creds
+            _url_redactions += _thinking_urls
             thinking_block = _condense_thinking(thinking_mrkdwn)
             if thinking_ts:
                 try:
@@ -5351,14 +5617,46 @@ async def handle_message(
         # background task fails or returns SKIP, it unclaims the key so the next
         # message retries. A message arriving between claim and unclaim is
         # intentionally skipped (no duplicate).
-        if not _had_error and not _skip_writes and auto_title.try_claim(session_key):
-            track_background_task(
-                asyncio.create_task(
-                    _maybe_auto_title_slack(
-                        slack, sessions, channel, session_key, conversation_log, text, accumulated
+        if not _had_error and not _skip_writes and not auto_title.is_titled(session_key):
+            # The ``is_titled`` peek above is a cheap synchronous membership test on
+            # the same tracker ``try_claim`` checks below: once a key is claimed or
+            # titled the claim cannot be taken again, so without the peek the pin's
+            # thread hop would be paid and then discarded on every later message of
+            # every already-named conversation.
+            #
+            # Pin BEFORE claiming, and both before the task is scheduled. The pin
+            # read suspends on a thread, so claiming first would leave the claim
+            # held across that await with nothing scheduled yet to release it: a
+            # cancellation there (``!stop``) would strand it, and the claim is
+            # process-wide, so this key could not be auto-titled again until the
+            # gateway restarts. The pin still precedes ``create_task``, which is
+            # what closes the scheduling-tick window -- see ``pin_record``.
+            #
+            # The pin itself is the one taken under the permit, well above here:
+            # reading it at this point would sit after the release and after the
+            # Slack round-trips in between, which is the window a replacement
+            # record slips through. ABSENT is the one state worth re-reading, and
+            # only because a key with no record has no replacement to confuse:
+            # this turn's own row has landed by now, so the re-read is what makes a
+            # brand-new conversation nameable from its first exchange.
+            _title_pin = _title_pin_held
+            if _title_pin is None or _title_pin.state == auto_title.RECORD_ABSENT:
+                _title_pin = await auto_title.pin_record(conversation_log, session_key)
+            if auto_title.try_claim(session_key):
+                track_background_task(
+                    asyncio.create_task(
+                        _maybe_auto_title_slack(
+                            slack,
+                            sessions,
+                            channel,
+                            session_key,
+                            conversation_log,
+                            text,
+                            accumulated,
+                            pin=_title_pin,
+                        )
                     )
                 )
-            )
     finally:
         # If the verdict was deferred to the footer and this tail is torn down
         # (a raise or cancellation in a decoration) before the footer books it,
@@ -5387,8 +5685,14 @@ async def _maybe_auto_title_slack(
     conversation_log: ConversationLog | None,
     user_text: str,
     assistant_text: str,
+    *,
+    pin: auto_title.RecordPin,
 ) -> None:
-    """Generate and set a Slack thread title after the first response."""
+    """Generate and set a Slack thread title after the first response.
+
+    ``pin`` is captured by the CALLER before this task is scheduled, and is
+    required rather than defaulted -- see ``auto_title.pin_record``.
+    """
 
     async def _set_thread_title(title: str) -> None:
         await slack.set_thread_title(channel, session_key, title)
@@ -5399,6 +5703,7 @@ async def _maybe_auto_title_slack(
         session_key,
         user_text,
         assistant_text,
+        pin=pin,
         source="slack",
         resources=f"{channel}:{session_key}",
         set_channel_title=_set_thread_title,

@@ -158,6 +158,7 @@ from kiro_crew.dashboard.state import (
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
     DashboardState,
+    stage_boundary_for,
 )
 from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token
 from kiro_crew.dashboard.turn_dispatch import bounded_chat_turn, spawn_guarded_turn
@@ -243,6 +244,7 @@ from kiro_crew.messaging.link import (
     parse_session_key,
 )
 from kiro_crew.messaging.renderer import SilentRenderer, chunk_for_transport, display_safe
+from kiro_crew.messaging.spawn_approval_delivery import deliver_spawn_approval
 from kiro_crew.messaging.transport import InboundMessage, delivery_confirmed
 from kiro_crew.monitoring.completion import (
     MonitorCompletionHook,
@@ -347,6 +349,7 @@ from kiro_crew.subagent import (
     ToolApprovalCallback,
     _injection_notice_outcome,
     resolve_max_subagents,
+    stage_boundary_owner_for_run,
 )
 from kiro_crew.subagent_completion_meta import (
     OUTCOME_FAILED,
@@ -7832,21 +7835,148 @@ class GatewayOrchestrator:
                     if is_structured_monitor_loop(loop)
                     else self.dashboard_state.broadcast_ws
                 )
-                broadcast(
-                    "autonudge_state",
-                    {
-                        "event": event,
-                        "slot": loop.slot_key,
-                        "loop": loop_payload,
-                    },
-                )
+                _frame = {
+                    "event": event,
+                    "slot": loop.slot_key,
+                    "loop": loop_payload,
+                }
+
+                def _publish(frame: dict = _frame) -> None:
+                    broadcast("autonudge_state", frame)
+
+                # Per-member event log: a member's DM-slot patrol started or
+                # stopped. The log -- not the loop -- is what the Crew Members
+                # drawer reads for a patrol's stop REASON across a restart:
+                # `reconcile_members_at_startup` closes a log that still reads
+                # `armed` with no live loop as reason='interrupted', so a
+                # transition published BEFORE its append landed lets a crash in
+                # that window replace the real reason (`runtime_budget`, say)
+                # permanently, with nothing able to recover it. The append
+                # therefore runs FIRST and the publish follows it, which is what
+                # `persist-before-you-publish` requires of a state a record owns.
+                #
+                # Still queued on the ordered executor whether or not this is the
+                # serving thread: one queue is what orders a rapid start/stop, and
+                # an inline write from a non-loop caller could land ahead of an
+                # append already queued. So the publish is scheduled back onto the
+                # loop from that one worker, because `broadcast_ws` is loop-affine
+                # and a synchronous durability barrier on the observer would stall
+                # every concurrent session.
+                _publish_deferred = False
+                # Whether a DURABLE transition applies to this event at all. It is
+                # not the same question as `_publish_deferred`, and conflating the
+                # two is what published unpersisted state: a false
+                # `_publish_deferred` means "no worker will publish", which covers
+                # both "there was nothing to persist" (this path may publish) and
+                # "the append was REFUSED" (it must not).
+                _ledger_owns_frame = False
+                try:
+
+                    from kiro_crew import eventlog_hooks
+                    from kiro_crew.eventlog.types import PATROL_STARTED, PATROL_STOPPED
+
+                    _pslug = eventlog_hooks.member_slug_for_slot(loop.slot_key)
+                    _etype2: str | None = None
+                    _edata: dict = {}
+                    if event == "added":
+                        _etype2, _edata = PATROL_STARTED, {"slot_key": loop.slot_key}
+                    elif event in ("removed", "expired"):
+                        _reason = getattr(loop, "stopped_reason", None) or event
+                        _etype2, _edata = (
+                            PATROL_STOPPED,
+                            {"slot_key": loop.slot_key, "reason": _reason},
+                        )
+                    if _pslug is not None and _etype2 is not None:
+                        _ledger_owns_frame = True
+                        _pslug_s: str = _pslug
+                        _etype_s: str = _etype2
+                        try:
+                            _loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+                        except RuntimeError:
+                            # A non-loop caller: it was already publishing from
+                            # its own thread before this, so keep that shape
+                            # rather than drop the append to preserve it.
+                            _loop = None
+
+                        def _emit_patrol(
+                            slug: str = _pslug_s, etype: str = _etype_s, data: dict = _edata
+                        ) -> None:
+                            landed = False
+                            try:
+                                landed = bool(eventlog_hooks.emit(slug, None, etype, data))
+                            except Exception:
+                                logger.debug("patrol event-log emit failed", exc_info=True)
+                            if not landed:
+                                # NOT published. The frame would assert a transition
+                                # the ledger does not hold, and the ledger is what
+                                # the drawer reads for the stop reason after a
+                                # restart -- so publishing here is the
+                                # report-success-on-a-failed-write shape that
+                                # `persist-before-you-publish` forbids. The refusal
+                                # is not silent either: the log still reads `armed`,
+                                # and `reconcile_members_at_startup` closes exactly
+                                # that state with an explicitly terminal
+                                # `interrupted`, which is the state the rule asks a
+                                # failed transition to leave behind.
+                                logger.debug(
+                                    "patrol %s for %s was not persisted; frame withheld",
+                                    etype,
+                                    slug,
+                                )
+                                return
+                            # Published only AFTER the append landed, and from the
+                            # loop, because `broadcast_ws` is loop-affine.
+                            try:
+                                if _loop is not None:
+                                    _loop.call_soon_threadsafe(_publish)
+                                else:
+                                    _publish()
+                            except Exception:
+                                logger.debug("patrol publish failed", exc_info=True)
+
+                        _publish_deferred = eventlog_hooks.submit(_emit_patrol)
+                except Exception:
+                    logger.debug("patrol event-log hook failed", exc_info=True)
+                if not _publish_deferred and not _ledger_owns_frame:
+                    # Publish directly ONLY when this event has no durable meaning --
+                    # not a member slot, or a type the log does not record -- so there
+                    # is no ledger state for the frame to contradict.
+                    #
+                    # A refused queue deliberately falls through here without
+                    # publishing. `_publish_deferred` alone cannot tell a refusal
+                    # from "nothing to persist", and publishing on refusal asserts a
+                    # transition the ledger never received, which is what
+                    # `persist-before-you-publish` forbids. The state is not lost:
+                    # the log still reads `armed` and `reconcile_members_at_startup`
+                    # closes exactly that with an explicitly terminal `interrupted`.
+                    _publish()
 
         self.autonudge_svc = AutoNudgeService(
             base_dir=data_home(),
             on_fire=_fire,
             on_monitor_tick=_monitor_tick,
         )
-        controller = MonitorController(self.autonudge_svc, _fire_monitor)
+
+        def _monitor_owner_session_id(loop: NudgeLoop) -> str:
+            """The crew log unit the loop's owner slot is serving on, or ``""``.
+
+            The same resolver the session ledger uses: an exact registry read plus
+            an attribute read, no disk and no session state mutated by asking. A
+            slot with no live session answers ``""`` and the controller records
+            nothing for it -- a probe runs without a model turn and must not start
+            a session to file its result.
+            """
+            if self.dashboard_state is None:
+                return ""
+            from kiro_crew.crew_log.resolve import unit_for_session_key
+
+            return unit_for_session_key(self.dashboard_state.sessions, loop.slot_key)
+
+        controller = MonitorController(
+            self.autonudge_svc,
+            _fire_monitor,
+            owner_session_id=_monitor_owner_session_id,
+        )
         # Timers can complete while start() awaits store repair. Install the
         # observer first so that transition cannot fall between startup and
         # terminal replay.
@@ -8500,12 +8630,16 @@ class GatewayOrchestrator:
         # Subagents panel permanently empty for cron/channel-born sessions.
         _event_slot = subagent_event_slot
 
-        async def _broadcast_subagent_status(info: SubagentInfo, event: str) -> None:
+        async def _broadcast_subagent_status(
+            info: SubagentInfo,
+            event: str,
+            selected_slot_name: str = "",
+        ) -> None:
             """Broadcast subagent status change via WS for per-slot tracking."""
             if not self.dashboard_state:
                 return
             try:
-                slot = _event_slot(info.parent_session_key)
+                slot = selected_slot_name or _event_slot(info.parent_session_key)
                 agents = (
                     self.subagent_mgr.running_agents_for(info.parent_session_key)
                     if self.subagent_mgr
@@ -8542,7 +8676,7 @@ class GatewayOrchestrator:
             if not self.dashboard_state:
                 return
             _max_retrigger = 3
-            if slot._recovery_retrigger_count >= _max_retrigger:
+            if stage_boundary_for(slot).recovery_retrigger_count >= _max_retrigger:
                 logger.warning(
                     "Recovery retrigger cap (%d) reached for %s, dropping %d queued failures",
                     _max_retrigger,
@@ -8551,7 +8685,7 @@ class GatewayOrchestrator:
                 )
                 slot._pending_subagent_failures.clear()
                 return
-            slot._recovery_retrigger_count += 1
+            stage_boundary_for(slot).recovery_retrigger_count += 1
             slot._recovery_chat_triggered = True
             # Bound here rather than at module scope: this reads ``_run_chat`` from
             # ``dashboard.chat``, a different module than the top-level
@@ -8692,9 +8826,35 @@ class GatewayOrchestrator:
             # terminal WS event, orchestration accounting or a done/ok counter
             # bump would invent an agent that never ran.
             _flush_only = getattr(info, "_digest_flush_only", False) is True
+            parent_key = info.parent_session_key
+            _parent_slot_name = dashboard_slot_key(parent_key)
+            _boundary_owner = stage_boundary_owner_for_run(info)
+
+            def _boundary_completion_cancelled() -> bool:
+                return getattr(info, "_stage_boundary_cancelled", False) is True
+
+            _injection_slot = None
+            if self.dashboard_state and _parent_slot_name:
+                from kiro_crew.dashboard.handlers.messaging import (
+                    _stage_boundary_slot_for_parent,
+                )
+
+                _injection_slot = _stage_boundary_slot_for_parent(
+                    self.dashboard_state,
+                    parent_key,
+                    boundary_owner=_boundary_owner,
+                )
+                if _injection_slot is None and not _boundary_owner:
+                    _injection_slot = self.dashboard_state.get_slot(_parent_slot_name)
+            _completion_key = getattr(_injection_slot, "key", "")
+            _injection_slot_name = (
+                _completion_key
+                if isinstance(_completion_key, str) and _completion_key
+                else _event_slot(parent_key)
+            )
 
             if not _flush_only:
-                await _broadcast_subagent_status(info, "done")
+                await _broadcast_subagent_status(info, "done", _injection_slot_name)
                 # Wake anything waiting on this parent's wave (the autopilot
                 # stage loop) BEFORE the injection below, which can take
                 # minutes: ``info.done`` is already True by here — the terminal
@@ -8717,20 +8877,15 @@ class GatewayOrchestrator:
             title = f"Subagent `{info.id}` {emoji}"
 
             # ── Orchestration guard: track failures (only in orchestrator mode) ──
-            parent_key = info.parent_session_key
             guard_msg = ""
             try:
-                _is_orchestrator = False
-                _slot = None
-                # Stage limits are a property of the tab the orchestrator runs
-                # in, not of where its conversation started.
-                _parent_slot_name = dashboard_slot_key(parent_key)
-                if self.dashboard_state and _parent_slot_name:
-                    _slot = self.dashboard_state.get_slot(_parent_slot_name)
-                    _is_orchestrator = (
-                        _slot is not None and getattr(_slot, "mode", "") == "orchestrator"
-                    )
-                if _slot is not None and _is_orchestrator:
+                # Stage limits are a property of the selected tab the
+                # orchestrator runs in, not of its canonical parent name.
+                _is_orchestrator = (
+                    _injection_slot is not None
+                    and getattr(_injection_slot, "mode", "") == "orchestrator"
+                )
+                if _injection_slot is not None and _is_orchestrator:
                     from kiro_crew.context_management import (
                         MAX_STAGE_ESCALATIONS,
                         MAX_STAGE_ROUNDS,
@@ -8747,12 +8902,13 @@ class GatewayOrchestrator:
                     # landing on a cancelled slot whose tracker is absent
                     # is bounded accounting noise (the stage loop itself
                     # stays latched and cannot advance).
-                    if not getattr(_slot, "_orch_tracker", None):
-                        _slot._orch_tracker = OrchestrationTracker()
-                    tracker = _slot._orch_tracker
+                    if not getattr(_injection_slot, "_orch_tracker", None):
+                        _injection_slot._orch_tracker = OrchestrationTracker()
+                    tracker = _injection_slot._orch_tracker
                     if tracker.stopped:
                         logger.info("Orchestration stopped, ignoring subagent result %s", info.id)
-                        return
+                        if not _boundary_completion_cancelled():
+                            return
                     task_key = info.task[:80]
                     if _flush_only:
                         # No task ran — nothing to record. Recording it as a
@@ -8860,8 +9016,6 @@ class GatewayOrchestrator:
                 requested_model=info.requested_model or info.model or "",
                 resolved_model=info.resolved_model or "",
             )
-
-            parent_key = info.parent_session_key
 
             if _flush_only:
                 # The synthetic record has no result of its own. Its title/body
@@ -9010,7 +9164,7 @@ class GatewayOrchestrator:
                                 "batch_finished",
                                 {
                                     "batch_id": _batch_id,
-                                    "slot": _event_slot(parent_key),
+                                    "slot": _injection_slot_name,
                                     "total": bp["total"],
                                     "ok": bp["ok"],
                                     "err": bp["err"],
@@ -9019,6 +9173,12 @@ class GatewayOrchestrator:
                             )
                     except Exception:
                         logger.debug("batch_finished broadcast failed", exc_info=True)
+            if _boundary_completion_cancelled():
+                logger.info(
+                    "Subagent %s completion discarded after stage authority revocation",
+                    info.id,
+                )
+                return
             if _batch_id:
                 if _flush_only and bp["total"] <= 1:
                     # Single-member wave: nothing is ever held, and falling
@@ -9227,15 +9387,13 @@ class GatewayOrchestrator:
             # Channel, no tab → channel thread + dashboard notification
             # Cron/no parent  → dashboard notification only
 
-            _slot_name = dashboard_slot_key(parent_key)
-            if _slot_name and self.dashboard_state:
+            _slot_name = _injection_slot_name
+            if _parent_slot_name and self.dashboard_state:
                 # Route the result through _run_chat for full streaming, tool
                 # call visibility, and proper lifecycle. A channel-born tab
                 # runs on the channel's own session, so the turn's mirror
                 # carries the reply back to the thread — the raw-injection path
                 # below is for parents with no tab to stream into.
-                _injection_slot = self.dashboard_state.get_slot(_slot_name)
-
                 # Redact LLM-generated output before any external surface
                 announce, _ = redact_exfiltration_urls(announce)
                 announce, _ = redact_credentials(announce)
@@ -9298,6 +9456,33 @@ class GatewayOrchestrator:
                     # is delivered. try/finally so a CancelledError can't leak it.
                     _injection_slot._subagent_deliveries_inflight += 1
                     try:
+                        if getattr(_injection_slot, "_in_stage_execution", False) is True:
+                            # The Python stage controller owns this boundary. It
+                            # waits for terminal reports, then drains completion
+                            # entries in order before capturing or advancing.
+                            # Launching here would race that capture; waiting on
+                            # slot.task can wait on the controller itself.
+                            _injection_slot.queue_append(
+                                announce,
+                                kind=SUBAGENT_COMPLETION_KIND,
+                                meta=stage_boundary_for(_injection_slot).tag_meta(
+                                    {SUBAGENT_COMPLETION_META_KEY: sub_meta},
+                                    owner=stage_boundary_owner_for_run(info),
+                                ),
+                            )
+                            self._defer_queued_delivery(
+                                _injection_slot,
+                                announce,
+                                info,
+                                flush_only=_flush_only,
+                            )
+                            self.dashboard_state.push_slots_update()
+                            logger.info(
+                                "Subagent %s → queued for Autopilot stage in %s",
+                                info.id,
+                                _slot_name,
+                            )
+                            return
                         if _injection_slot_busy(_injection_slot):
                             # Slot is busy (or an injection is dispatched but
                             # not yet started) — wait for that task to finish,
@@ -9316,6 +9501,13 @@ class GatewayOrchestrator:
                                 except Exception:
                                     pass  # Task failed — slot is now idle
 
+                            if _boundary_completion_cancelled():
+                                logger.info(
+                                    "Subagent %s completion discarded after stage "
+                                    "authority revocation",
+                                    info.id,
+                                )
+                                return
                             # Re-check: another injection may have claimed the slot
                             # during the await above.
                             if _injection_slot_busy(_injection_slot):
@@ -9346,7 +9538,10 @@ class GatewayOrchestrator:
                                 _injection_slot.queue_append(
                                     announce,
                                     kind=SUBAGENT_COMPLETION_KIND,
-                                    meta={SUBAGENT_COMPLETION_META_KEY: sub_meta},
+                                    meta=stage_boundary_for(_injection_slot).tag_meta(
+                                        {SUBAGENT_COMPLETION_META_KEY: sub_meta},
+                                        owner=stage_boundary_owner_for_run(info),
+                                    ),
                                 )
                                 # Queuing is not delivery. The announce promises
                                 # result paths the parent can read on demand, but
@@ -9559,6 +9754,13 @@ class GatewayOrchestrator:
                             )
                         else:
                             msg = announce
+                        if _boundary_completion_cancelled():
+                            logger.info(
+                                "Subagent %s completion discarded after stage "
+                                "authority revocation",
+                                info.id,
+                            )
+                            return
                         response = await asyncio.wait_for(
                             _inject_with_retry(client, msg, parent_key, _inject_label),
                             timeout=INJECTION_TIMEOUT,
@@ -9930,6 +10132,19 @@ class GatewayOrchestrator:
         async def _spawn_approve(
             request_id: str, description: str, parent_session_key: str = ""
         ) -> bool:
+            # Channel-side delivery FIRST. A spawn parented on
+            # a live channel conversation (Telegram, …) is best answered where the
+            # human already is, with that channel's own Approve/Deny/Trust
+            # keyboard. The seam returns True/False when the channel surfaced the
+            # prompt and got a press; None means no channel hook owns this session,
+            # or the hook could not surface it here — either way, fall through to
+            # the unchanged Slack-DM/dashboard gate below (which still raises
+            # SpawnApprovalUnreachable when no surface is attached).
+            channel_decision = await deliver_spawn_approval(
+                request_id, description, parent_session_key
+            )
+            if channel_decision is not None:
+                return channel_decision
             event = LLMEvent(kind="permission_request", request_id=request_id, title=description)
             return await _approve_spawn_gate(event, parent_session_key)
 
@@ -10086,6 +10301,20 @@ class GatewayOrchestrator:
                 logger.warning("Failed to send orphan notification to Slack DM: %s", exc)
             return delivered
 
+        def _report_failure_boundary(parent: str, owner: str) -> object | None:
+            if self.dashboard_state is None:
+                return None
+            from kiro_crew.dashboard.handlers.messaging import (
+                _stage_boundary_slot_for_parent,
+            )
+
+            slot = _stage_boundary_slot_for_parent(
+                self.dashboard_state,
+                parent,
+                boundary_owner=owner,
+            )
+            return stage_boundary_for(slot) if slot is not None else None
+
         self.subagent_mgr = SubagentManager(
             sessions=self.sessions,
             ctx_builder=self.ctx_builder,
@@ -10107,6 +10336,7 @@ class GatewayOrchestrator:
             # that yield is ``run()``'s memory barrier. Hold the pump until
             # ``_start_subagent_dispatch_after_memory_ready`` opens it.
             defer_queue_dispatch=True,
+            stage_boundary_for_scope=_report_failure_boundary,
         )
         # A parent that ends takes its children with it, on every backend. The
         # session lifecycle owns the boundary and drives both halves at each of its
@@ -11547,6 +11777,14 @@ class GatewayOrchestrator:
         if cleanup_tasks:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
+        # AFTER the gather, not beside cancel_all() above: cancel_all() is what stops
+        # the runs that still write to the durable task queue, so closing the store
+        # before it finishes would pull the connection out from under them. Off-loop,
+        # because ``close()`` is synchronous and waits for the store's writer lock --
+        # on the loop that stalls shutdown behind an in-flight executor write.
+        if self.subagent_mgr:
+            await asyncio.to_thread(self.subagent_mgr.close)
+
         await asyncio.to_thread(self._stop_memory_startup)
 
     # ------------------------------------------------------------------
@@ -11772,11 +12010,47 @@ class GatewayOrchestrator:
         ``respawn`` is loaded before apply can replace the environment. If the
         pre-fence drain cannot finish, retain it and retry the restart in five
         minutes with admission reopened; never force through accepted work.
+
+        The interpreter is established BEFORE any of that. When it is missing, this
+        returns without saving, fencing or draining, because an exec that cannot
+        succeed must not be reached after every session has been closed.
         """
         logger.info("Update applied, preparing a callback-safe gateway restart")
         self._pending_update_respawn = respawn
         launcher = await asyncio.to_thread(resolve_restart_launcher)
         exe = await asyncio.to_thread(respawn) if launcher is None else None
+        # Off-loop for the same reason as the two resolvers above: both predicates
+        # are metadata syscalls against a pathname this process does not control,
+        # and an interpreter on a stalled network mount would freeze every gateway
+        # task -- including the heartbeat -- rather than one restart.
+        usable = launcher is not None
+        if not usable and exe:
+            usable = await asyncio.to_thread(platform_compat.execv_target_available, exe)
+        if not usable:
+            # No usable interpreter: the apply pruned the tree this process was
+            # running from. RETURN BEFORE saving, fencing or draining. Reaching
+            # the exec with no interpreter closes every session first and then
+            # raises ENOENT. Admission itself does come back --
+            # ``_finish_auto_update_apply`` resumes it -- but the sessions
+            # ``close_all()`` tore down do not, and ``_pending_update_respawn``
+            # is cleared just before the exec, so nothing retries: what survives
+            # is a gateway with no sessions, running a different version from the
+            # install on disk. Deferring here keeps the sessions instead, and
+            # ``_pending_update_respawn`` stays set so
+            # ``_retry_pending_update_restart`` finishes the update once an
+            # operator repairs the install.
+            self._update_apply_deferred = True
+            logger.error(
+                "Update applied but restart deferred: no usable interpreter. "
+                "Restore the interpreter and this retries itself -- the retry "
+                "re-resolves it, so no configuration change is needed."
+            )
+            if self.dashboard_state:
+                self.dashboard_state.push_update_progress(
+                    "restarting",
+                    "Update applied — restart needs a usable interpreter",
+                )
+            return
         if self.dashboard_state:
             self.dashboard_state.push_update_progress("restarting", "Preparing safe restart…")
             from kiro_crew.dashboard.chat import save_all_slots_to_history
@@ -11831,10 +12105,19 @@ class GatewayOrchestrator:
         await self._drain_update_callback_work(timeout=None)
         logger.info("Update callback drain complete, restarting gateway")
         self._pending_update_respawn = None
-        if launcher is not None:
-            platform_compat.reexec_launcher(launcher, sys.argv[1:])
-        else:
-            platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
+        # The exec is past the point of no return: the guard above removed the
+        # reachable failures, but only the kernel can refuse the image itself
+        # (wrong architecture, truncated, replaced since the check). Returning
+        # from here is what strands the gateway, so hand that outcome to the
+        # exec seam's own fatal partner instead of unwinding into the update
+        # coordinator, which logs and loops with every session already closed.
+        try:
+            if launcher is not None:
+                platform_compat.reexec_launcher(launcher, sys.argv[1:])
+            else:
+                platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
+        except OSError:
+            await platform_compat.exit_after_failed_restart_exec(launcher or exe)
 
     async def _check_for_updates_legacy(self) -> None:
         """Legacy update check — the existing layout-aware logic."""
@@ -13439,6 +13722,36 @@ class GatewayOrchestrator:
         # process takes over.
         await self._init_autonudge()
 
+        # Per-member event-log startup reconcile. Runs AFTER AutoNudge is
+        # constructed (it consults live loops to decide patrol closers) and
+        # after slot restoration: member slots are rehydrated lazily on demand
+        # rather than eagerly at boot, so ``state._slots`` here holds whatever
+        # the dashboard restored, and any driving.open slot not present is
+        # closed as interrupted. Off-loop (ensure/append are synchronous file
+        # IO) and best-effort — the helper swallows its own failures so a
+        # logging fault never blocks boot.
+        if self.dashboard_state is not None:
+            from kiro_crew import eventlog_hooks
+
+            async def _reconcile_members() -> None:
+                # Off-loop (ensure/append are synchronous file IO, and first-boot
+                # migration fsyncs per record) and best-effort. Run as a background
+                # task rather than an awaited boot step: it must not delay Slack
+                # availability or socket connect, and it is idempotent on reboot.
+                try:
+                    await asyncio.to_thread(
+                        eventlog_hooks.reconcile_members_at_startup,
+                        self._cfg,
+                        self.dashboard_state,
+                        self.autonudge_svc,
+                    )
+                except Exception:
+                    logger.debug("member event-log startup reconcile failed", exc_info=True)
+
+            # Retain a strong reference: a bare create_task is only weakly held,
+            # so the loop could garbage-collect it mid-run.
+            self._member_reconcile_task = asyncio.create_task(_reconcile_members())
+
         # Wire up event routing and interactive handlers
         init_interactions(self)
         # Awaited ON the loop, never offloaded whole: WSSocketModeClient's
@@ -13614,6 +13927,17 @@ class GatewayOrchestrator:
                 # for extra work before its os._exit is a handler that may not
                 # get there.
                 cleanup_orphaned_sessions(narrow_with_leaders=False)
+                # Same reason as the log queue below: os._exit skips atexit, so the
+                # member event log's own drain hook never runs. Synchronous because
+                # a signal handler cannot await, and bounded inside the module for
+                # the same reason the log-queue drain is bounded here -- a wedged
+                # disk must delay this exit, never hold it.
+                try:
+                    from kiro_crew import eventlog_hooks
+
+                    eventlog_hooks.drain_for_shutdown()
+                except Exception:
+                    pass  # force exit must never be blocked by bookkeeping
                 # os._exit skips atexit, so the log queue's drain hook never
                 # runs — flush the queued gateway.log tail here, bounded so a
                 # wedged disk cannot hang the force exit.
@@ -13747,6 +14071,20 @@ class GatewayOrchestrator:
                 logger.warning("the session's log did not fully drain before exit")
         except Exception:  # noqa: BLE001 - shutdown must not raise
             logger.debug("the session's log drain failed during shutdown", exc_info=True)
+        # The member event log's queued appends, for the same reason and on the same
+        # terms. Its appends are ORDERED on one executor, so the tail sitting there
+        # at exit is the newest transitions -- a patrol stop, a slot close -- and
+        # they are exactly what a reader looks for after a restart. It registers an
+        # atexit hook of its own, which os._exit skips, so this is the only drain
+        # that runs on this path. Bounded inside the module and off-loop, like the
+        # drain above; calling it twice is a no-op.
+        try:
+            from kiro_crew import eventlog_hooks
+
+            if not await asyncio.to_thread(eventlog_hooks.drain_for_shutdown):
+                logger.warning("the member event log did not fully drain before exit")
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            logger.debug("the member event log drain failed during shutdown", exc_info=True)
         # This is a hard exit too: os._exit skips atexit, so the log queue's
         # drain hook never runs here either. Without this the whole shutdown
         # tail is lost -- including the "Graceful shutdown timed out" warning

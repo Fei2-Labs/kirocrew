@@ -29,6 +29,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import ctypes
+import ctypes.util
 import functools
 import hashlib
 import heapq
@@ -449,6 +450,64 @@ def _linux_x86_64_cpu_flags(
     return frozenset.intersection(*per_cpu)
 
 
+def _macos_x86_64_missing_cpu_flags() -> list[str] | None:
+    """Return CPU features required by the bundled macOS x86_64 llama.cpp runtime
+    that are absent on this host, or None if the feature list cannot be read.
+
+    Uses ``sysctlbyname`` to query ``machdep.cpu.features`` and
+    ``machdep.cpu.leaf7_features`` (the latter carries AVX2, BMI1/2, FMA).
+    Falls back to ``None`` (fail-closed) if the sysctl call fails.
+    """
+
+    libc_name = ctypes.util.find_library("c")
+    if libc_name is None:
+        return None
+    try:
+        libc = ctypes.CDLL(libc_name)
+    except OSError:
+        return None
+
+    def _sysctl_str(name: str) -> str:
+        # Two-call pattern: first call with NULL buffer to get required size.
+        # Avoids a fixed-size buffer that could truncate long feature strings.
+        size = ctypes.c_size_t(0)
+        libc.sysctlbyname(name.encode(), None, ctypes.byref(size), None, 0)
+        if size.value == 0:
+            return ""
+        buf = ctypes.create_string_buffer(size.value)
+        ret = libc.sysctlbyname(name.encode(), buf, ctypes.byref(size), None, 0)
+        if ret != 0:
+            return ""
+        return buf.value.decode("ascii", errors="replace").lower()
+
+    features = _sysctl_str("machdep.cpu.features")
+    leaf7 = _sysctl_str("machdep.cpu.leaf7_features")
+    if not features and not leaf7:
+        return None
+
+    # Normalise: macOS reports "AVX1.0" for AVX, "AVX2.0" for AVX2
+    combined = (features + " " + leaf7).lower()
+    combined = combined.replace("avx1.0", "avx").replace("avx2.0", "avx2")
+    present = set(combined.split())
+
+    # Map Linux flag names to what macOS sysctl reports
+    _MACOS_FLAG_MAP = {
+        "avx": "avx",
+        "avx2": "avx2",
+        "fma": "fma",
+        "bmi2": "bmi2",
+        "f16c": "f16c",
+        "sse3": "sse3",
+        "ssse3": "ssse3",
+    }
+    missing = sorted(
+        linux_name
+        for linux_name, macos_name in _MACOS_FLAG_MAP.items()
+        if macos_name not in present and linux_name in _LINUX_X86_64_REQUIRED_CPU_FLAGS
+    )
+    return missing if missing else []
+
+
 def verify_vendored_libs(root: Path | None = None) -> dict[str, list[str]]:
     """Report vendored native libs that :data:`_REQUIRED_VENDORED_LIBS` expects but are absent.
 
@@ -613,6 +672,30 @@ def _load_llama_class():
                     _LIB_PATH_ENV,
                 )
                 return None
+        if libs_dirname == "macos_x86_64":
+            _macos_flags = _macos_x86_64_missing_cpu_flags()
+            if _macos_flags is None:
+                logger.warning(
+                    "Cannot verify CPU compatibility for the bundled macOS x86_64 "
+                    "llama.cpp runtime. Refusing the native runtime because an "
+                    "unsupported instruction would terminate the gateway with SIGILL; "
+                    "memory falls back to keyword search. Set %s to use an "
+                    "operator-provided runtime.",
+                    _LIB_PATH_ENV,
+                )
+                return None
+            if _macos_flags is not None and _macos_flags:
+                logger.warning(
+                    "Bundled macOS x86_64 llama.cpp runtime requires CPU features "
+                    "%s; this host is missing %s. Refusing the native runtime because "
+                    "it would terminate the gateway with SIGILL; memory falls back to "
+                    "keyword search. Set %s to use a compatible operator-provided "
+                    "runtime.",
+                    ", ".join(sorted(_LINUX_X86_64_REQUIRED_CPU_FLAGS)),
+                    ", ".join(_macos_flags),
+                    _LIB_PATH_ENV,
+                )
+                return None
     # setdefault so an operator-provided override (e.g. a GPU build) wins.
     os.environ.setdefault(_LIB_PATH_ENV, str(libs_dir))
     _install_diskcache_stub()
@@ -666,13 +749,29 @@ def _embed_threads() -> int:
 
     Read from the RAW ``memory`` config section for the same reason the rest of
     this module does: the download thread and the backend factory must not pull
-    in the full config dataclass import graph. Explicit operator settings are
-    honoured up to the host's CPU count.
+    in the full config dataclass import graph.
+
+    An operator value OTHER than the declared :data:`_DEFAULT_EMBED_THREADS` is
+    honoured up to the host's CPU count. Default policy caps that default one
+    core BELOW the count instead, so a 2-vCPU host keeps a core for the event
+    loop rather than handing llama.cpp the whole box. It is a ceiling on the
+    default, not a replacement for it: a 16-core host still answers 4.
+
+    A raw value EQUAL to the default is default policy, not operator intent.
+    ``MemoryConfig.embedding_threads`` is a dataclass field defaulting to 4 and
+    ``KiroCrewConfig.save()`` publishes every field, so a fresh install's
+    ``config.json`` carries a 4 nobody typed; reading that as a choice would
+    hand the whole box to exactly the hosts this cap protects. The cost is that
+    4 cannot be pinned on a host with 4 or fewer cores -- any other number can.
     """
     raw = _read_memory_config().get("embedding_threads")
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
-        raw = _DEFAULT_EMBED_THREADS
-    return max(1, min(raw, os.cpu_count() or _DEFAULT_EMBED_THREADS))
+    cores = os.cpu_count()
+    requested = raw if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else 0
+    if requested and requested != _DEFAULT_EMBED_THREADS:
+        return max(1, min(requested, cores or _DEFAULT_EMBED_THREADS))
+    if cores is None:
+        return _DEFAULT_EMBED_THREADS
+    return max(1, min(_DEFAULT_EMBED_THREADS, cores - 1))
 
 
 def bulk_embed_threads() -> int:

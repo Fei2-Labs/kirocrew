@@ -2517,11 +2517,23 @@ def _learn(args: argparse.Namespace) -> None:
 
     jsonl_store = LessonStore()
     cfg = KiroCrewConfig.load()
+    action = getattr(args, "learn_action", None)
+    # Global persistence switch (memory.persistence_enabled): the CLI writes to
+    # the store directly (no HTTP), so it carries its own check mirroring the
+    # POST /api/lessons refusal. Refused ahead of the vector store because
+    # constructing and init-ing it creates or migrates memory.db, which a
+    # refused write must not do; list and remove still need that store, so the
+    # check is scoped to the add action.
+    if action == "add" and not cfg.memory.persistence_enabled:
+        print(
+            "Lesson NOT saved: persistent memory is disabled "
+            "(memory.persistence_enabled is false). Re-enable with: "
+            "kirocrew config set memory.persistence_enabled true"
+        )
+        return
     vs = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim)
     vs.init()
     try:
-        action = getattr(args, "learn_action", None)
-
         if action == "add":
             rule = args.rule
             category = args.category

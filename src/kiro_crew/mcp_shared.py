@@ -287,9 +287,10 @@ def _write_all(fd: int, payload: bytes) -> int:
 # limit. Eviction only costs a re-fetch on that session's next call.
 _EXCLUDED_TOOLS_CACHE_MAX = 256
 _excluded_tools_by_session: dict[str, set[str]] = {}
-# Two separate negative caches with different TTLs so the long-TTL
-# HTTP-error path doesn't keep fail-open active when only a brief
-# startup race triggered the failure.
+# Two separate negative caches with different TTLs because the two conditions get
+# OPPOSITE answers at ``tools/call``: the long HTTP-error window refuses, the short
+# startup-race window stays permissive, so a brief race must never be answered out
+# of the long window.
 _last_failure_time: float = 0.0  # gateway unreachable / non-404 HTTP error
 _last_startup_race_time: float = 0.0  # no session key or 404 — recovers fast
 # The identity the short window was opened FOR: ``""`` when no session key could be
@@ -304,12 +305,12 @@ _last_startup_race_key: str = ""
 _failure_count: int = 0
 # Long TTL applies only when the gateway is genuinely unreachable
 # (HTTP errors other than 404, connection refused, timeout).  Kept short
-# (60s) to keep the MCP-level fail-open window narrow:
-# longer windows widen the period during which non-kiro-cli MCP hosts
-# (Claude Code, custom hosts) — exactly the clients this defense-in-depth
-# layer is supposed to protect — bypass tool exclusions.  60s is enough
-# to debounce the 5s urlopen storm during a transient gateway outage but
-# keeps the fail-open window tight.
+# (60s) because this window is how long ``tools/call`` keeps REFUSING for a
+# session that has never resolved its policy: a longer one holds the refusal
+# well past the gateway's recovery, for the non-kiro-cli MCP hosts (Claude
+# Code, custom hosts) this layer is the only enforcement point for.  60s is
+# enough to debounce the 5s urlopen storm during a transient gateway outage
+# without outliving it.
 _NEGATIVE_CACHE_TTL: float = 60.0  # seconds
 # Short TTL for the benign startup-race cases (no session key resolvable,
 # or 404 "agent not resolved" because gateway hasn't registered the
@@ -856,10 +857,11 @@ def _resolve_tool_policy(
         # enumerated list, so reaching here means the gateway could not read the
         # policy -- never that it made a decision about this caller.
         #
-        # That single meaning is what a future decision to refuse on it would
-        # rest on; today it stays permissive for the measured reason recorded at
-        # ``_UNRESOLVED_REFUSES_CALL``. The LONG negative cache avoids repeated 5s
-        # urlopen blocks across many MCP servers while the gateway is down. That
+        # That single meaning is what the refusal recorded at
+        # ``_UNRESOLVED_REFUSES_CALL`` rests on: the exclusion set here is unknown,
+        # not empty. The LONG negative cache avoids repeated 5s urlopen blocks
+        # across many MCP servers while the gateway is down, and it also bounds how
+        # long the refusal lasts. That
         # cache is process-global, which is sound HERE and nowhere else: a gateway
         # this process cannot reach is unreachable for every session in it, so
         # there is no sibling the window wrongly affects.
@@ -871,7 +873,7 @@ def _resolve_tool_policy(
         if _failure_count <= _MAX_WARNING_FAILURES:
             logger.warning(
                 "Tool policy resolution failed (%s); this session's exclusions are "
-                "unknown and tool calls are NOT filtered for up to %.0fs",
+                "unknown and tool calls are REFUSED for up to %.0fs",
                 exc.__class__.__name__,
                 _NEGATIVE_CACHE_TTL,
                 exc_info=True,
@@ -904,7 +906,7 @@ def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
 #
 # The test is not how bad the reason sounds. It is whether the reason means ONE
 # thing, because a security decision derived from an ambiguous reason is wrong
-# for half the callers it hits. Two reasons qualify, and both mean "an operator
+# for half the callers it hits. Three reasons qualify, and each means "an operator
 # exclusion may exist and this system could not read it":
 #
 # * ``policy_unreadable`` -- the gateway found a spec for this session and could
@@ -917,20 +919,16 @@ def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
 #   separate so the refusal names the missing token, not the agents directory.
 #   A legitimate pooled backend never lands here: it is handed the token per
 #   frame in the caller block and ``_resolve_tool_policy`` sends it.
-# ``resolution_failed`` -- no usable answer, meaning nothing came back or a 5xx
-# said the gateway is broken -- is the one reason where this code says something
-# different from what the security argument alone would say, so the reason is
-# recorded here rather than left to a reader to reconstruct.
-#
-# On the argument, refusing is right: an operator exclusion may exist and the
-# process that holds it cannot answer for it. It was implemented that way and
-# measured, and the repository's real-MCP end-to-end lane refuses to run a
-# legitimate first tool call under it -- five heads with it refusing all fail that
-# lane, the two with it permissive both pass. So in this deployment a legitimate
-# call reaches this arm, which means refusing here does not cost an attacker a
-# tool call, it costs an ordinary caller every tool call. The window stays
-# permissive and audited until the reason a real call lands here is understood;
-# that is a gateway-side question, not one this read can answer.
+# * ``resolution_failed`` -- no usable answer reached this process: nothing came
+#   back, the gateway answered ``5xx`` to say it is broken, or the resolve itself
+#   raised. Every ``4xx`` returns before that arm, decided by status CLASS, so this
+#   reason means the policy could not be READ and never that the gateway made a
+#   decision about this caller. An operator exclusion may exist while the process
+#   holding it cannot answer for it, so the exclusion set is unknown rather than
+#   empty and the withheld deny stays withheld. The cost is bounded at both ends:
+#   a session that resolves its policy once is served from
+#   ``_excluded_tools_by_session`` and never reaches a failure path again, and for
+#   one that has not, the refusal lasts at most ``_NEGATIVE_CACHE_TTL``.
 #
 # The remaining reasons stay permissive because each covers a caller for whom no
 # operator exclusion is known to exist, or a class for which refusal is permanent
@@ -953,7 +951,9 @@ def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
 # silent -- which is what made this condition hard to find. Closing them needs
 # the 404 to distinguish registering from unmappable, which is a change to the
 # endpoint's contract rather than to this read.
-_UNRESOLVED_REFUSES_CALL = frozenset({"policy_unreadable", "identity_unattested"})
+_UNRESOLVED_REFUSES_CALL = frozenset(
+    {"policy_unreadable", "identity_unattested", "resolution_failed"}
+)
 
 
 def respond(req_id: Any, result: Any, error: dict | None = None) -> None:
@@ -1163,6 +1163,7 @@ def run_mcp_stdio_loop(
     call_tool_fn: Callable[[str, dict[str, Any]], str],
     *,
     advertise_caller_identity: bool = False,
+    error_prefix_is_error: bool = False,
 ) -> None:
     """Generic MCP stdio server loop — reads JSON-RPC from stdin, writes to stdout.
 
@@ -1202,6 +1203,7 @@ def run_mcp_stdio_loop(
             list_tools_fn,
             call_tool_fn,
             advertise_caller_identity=advertise_caller_identity,
+            error_prefix_is_error=error_prefix_is_error,
         )
     finally:
         set_internal_caller(_prior_caller)
@@ -1215,6 +1217,7 @@ def _run_stdio_dispatch_loop(
     call_tool_fn: Callable[[str, dict[str, Any]], str],
     *,
     advertise_caller_identity: bool = False,
+    error_prefix_is_error: bool = False,
 ) -> None:
     """Read/dispatch body of :func:`run_mcp_stdio_loop`.
 
@@ -1344,6 +1347,11 @@ def _run_stdio_dispatch_loop(
             tools = [t for t in tools if t.get("name") not in policy.excluded]
         return tools
 
+    def _tool_response(text: str) -> dict[str, Any]:
+        """Frame a tool result, flagging ``Error:`` prose when opted in."""
+        flagged = error_prefix_is_error and text.startswith("Error:")
+        return build_tool_response(text, is_error=flagged)
+
     def _run_tool(
         req_id: Any,
         tool_name: str,
@@ -1396,7 +1404,7 @@ def _run_stdio_dispatch_loop(
         # per request (a failed+late-cancel race must not emit two).
         with _result_lock:
             if not cancel_evt.is_set():
-                _result_box.append(build_tool_response(result_text))
+                _result_box.append(_tool_response(result_text))
                 if _tool_errored:
                     # Exception escaped call_tool_fn (may bypass its internal
                     # logging) -- audit the failure.
@@ -1670,6 +1678,24 @@ def _run_stdio_dispatch_loop(
                         f"that session. Refusing the call rather than ignoring an "
                         f"operator's exclusion list."
                     )
+                elif _policy.unresolved == "resolution_failed":
+                    # A DIFFERENT diagnosis and a different remedy from the branch
+                    # below, which is why it cannot share that text: the gateway was
+                    # never reached, so no agent spec is implicated and there is
+                    # nothing for the caller to edit. Sending them to the agents
+                    # directory would have them change healthy files to fix an
+                    # outage, and the edit they made would then be the real defect.
+                    _refusal = (
+                        f"Error: tool '{tool_name}' is unavailable because this "
+                        f"server could not reach the gateway to read session "
+                        f"{_policy_session}'s tool policy (resolution_failed): the "
+                        f"read got no answer, or the gateway answered that it is "
+                        f"broken. No agent spec is implicated and nothing needs "
+                        f"editing. Refusing the call rather than ignoring an "
+                        f"operator's exclusion list; the call succeeds on retry "
+                        f"within {_NEGATIVE_CACHE_TTL:.0f}s of the gateway "
+                        f"answering again."
+                    )
                 else:
                     _refusal = (
                         f"Error: tool '{tool_name}' is unavailable because this "
@@ -1680,7 +1706,7 @@ def _run_stdio_dispatch_loop(
                         f"operator's exclusion list; fix or remove the unreadable "
                         f"spec in the agents directory."
                     )
-                respond(req_id, build_tool_response(_refusal))
+                respond(req_id, _tool_response(_refusal))
             elif tool_name in _policy.excluded:
                 sel().log_tool_invocation(
                     session_key=_policy_session,
@@ -1692,9 +1718,7 @@ def _run_stdio_dispatch_loop(
                 )
                 respond(
                     req_id,
-                    build_tool_response(
-                        f"Error: tool '{tool_name}' is not available for this agent"
-                    ),
+                    _tool_response(f"Error: tool '{tool_name}' is not available for this agent"),
                 )
             elif not platform_compat.IS_POSIX:
                 # Windows: select.select() cannot poll sys.stdin (WinError
@@ -1718,7 +1742,7 @@ def _run_stdio_dispatch_loop(
                 finally:
                     set_current_caller(None)
                     set_current_tenant_nonce("")
-                respond(req_id, build_tool_response(result_text))
+                respond(req_id, _tool_response(result_text))
             else:
                 # Dispatch tool in worker thread so we can receive cancel notifications
                 _cancel_event = threading.Event()

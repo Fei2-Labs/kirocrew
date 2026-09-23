@@ -37,6 +37,7 @@
         "apps_trusted": [],
         "apps_trusted_local": [],
         "apps_trusted_repositories": {},
+        "apps_ui_stream_timeout_secs": 30,
         "jail": "auto",
         "dangerously_skip_permissions": false,
         "yolo_duration": "6h",
@@ -511,6 +512,20 @@
       "defaultValue": null
     },
     {
+      "path": "agent.apps_ui_stream_timeout_secs",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "App UI Stream Timeout",
+      "help": "Total transfer deadline, in seconds, for ONE response body on the unauthenticated /apps/{name}/ui/ route. Clamped to 5..600; a value that is not a whole number loads as 30. Read per request, so an edit applies without a restart. There is no off switch: the route holds eight descriptor permits, and this deadline is what stops a client that quits draining its socket from holding one for as long as it stays connected — eight such clients would otherwise stop every app UI on the host. Raise it only when a real transfer on this host needs longer than the default allows.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 30
+    },
+    {
       "path": "agent.jail",
       "kind": "core",
       "type": "string",
@@ -602,7 +617,7 @@
       "sensitive": false,
       "tags": [],
       "label": "MCP Tool Search",
-      "help": "Load MCP tool specs on demand (search-and-call) instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. kiro-cli backend only. Deferral only starts once the specs cross tool_search_min_pct or tool_search_min_tokens; disabling reverts to sending full tool specs. No effect on an alternate ACP backend.",
+      "help": "Load MCP tool specs on demand (search-and-call) instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. kiro-cli backend only. Deferral only starts once the specs cross tool_search_min_pct or tool_search_min_tokens; disabling reverts to sending full tool specs. Kiro Crew's OWN servers are exempt and always send full specs, whatever this is set to: loading one mid-turn would change the tools list a thinking block's signature is bound to and the provider would reject the conversation. No effect on an alternate ACP backend.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
@@ -1171,11 +1186,11 @@
       "kind": "core",
       "type": "number",
       "required": false,
-      "deprecated": false,
+      "deprecated": true,
       "sensitive": false,
       "tags": [],
       "label": "SubAgent CPU Cost (cores)",
-      "help": "First-boot per-agent CPU-cost fallback (cores) used to auto-size the cap until a learned value accumulates.",
+      "help": "Deprecated and inert: the subagent cap is sized from host memory only, because over-committing memory is an unrecoverable OOM while over-committing CPU only slows work the adaptive controller already backs off from. Preserved on load and save so an existing config is not rewritten out from under the operator.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 1.0
@@ -1536,7 +1551,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Archive Retention (days)",
-      "help": "Days to keep compacted/rotated session archives before auto-cleanup. -1 disables cleanup (manage deletion manually).",
+      "help": "Days to keep compacted/rotated session archives before auto-cleanup. -1 disables cleanup (manage deletion manually). The same window collects a closed session's crew log, and with the crew log on that is where Issue Radar keeps each repository's shared skip memory and its crews' open work items.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 30,
@@ -1846,6 +1861,9 @@
         "history_max_days": 365,
         "backup_enabled": true,
         "backup_keep": 7,
+        "persistence_enabled": true,
+        "inject_memory": true,
+        "inject_lessons": true,
         "migrated": false
       }
     },
@@ -1889,7 +1907,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Embedding Threads",
-      "help": "CPU threads for an explicit memory query or user-started re-embedding. Defaults to 4; explicit settings are honoured up to the machine's core count. All memory stores share one model and inference worker. V2 message context does not run an embedding search; V1 retains its session-start retrieval.",
+      "help": "CPU threads for an explicit memory query or user-started re-embedding. Defaults to 4, capped one core below the machine's core count -- never below one thread, so a single-core host still embeds -- to leave the event loop a core wherever there is one to spare; 4 means that default, so pinning threads on a 4-core host takes another number. Any other setting is honoured up to the core count. All memory stores share one model and inference worker. V2 message context does not run an embedding search; V1 retains its session-start retrieval.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 4
@@ -2203,6 +2221,48 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 7
+    },
+    {
+      "path": "memory.persistence_enabled",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Persistence Enabled",
+      "help": "Global switch for persistent memory. Off: no automatic memory writes (lessons, consolidation extraction, task-runner lessons) and no stored memory/lessons injected into new sessions; within-conversation context is unaffected. Explicit dashboard edits and deletions stay available. An installed app's own ingestion sweep is out of scope and still writes app-scoped rows.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
+      "path": "memory.inject_memory",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Inject Memory Context",
+      "help": "Inject the stored memory block (preferences, the memory activity index and recent-session snippets) into new-session context. On-demand memory_recall is unaffected.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
+      "path": "memory.inject_lessons",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Inject Lessons Context",
+      "help": "Inject the learned-corrections and user-profile blocks into new-session context.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
     },
     {
       "path": "memory.migrated",
@@ -3007,6 +3067,7 @@
         "provider": "local",
         "model": "base",
         "language_code": "auto",
+        "polish": false,
         "streaming": true,
         "silence_ms": 700,
         "partial_interval_ms": 400,
@@ -3059,7 +3120,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Model",
-      "help": "Which speech model the local provider downloads and runs. Bigger is more accurate and a longer first-time download: `tiny` on a machine short of memory, `base` for everyone, `small` when accents or jargon are being misheard, `large-v3-turbo` for the best accuracy available.",
+      "help": "Which speech model the local provider downloads and runs. Bigger is more accurate and a longer first-time download: `tiny` on a machine short of memory, `base` for everyone, `small` when accents or jargon are being misheard, `large-v3-turbo` for the best accuracy available -- though on a CPU-only build it can recognise slower than you speak: an 11-second clip took 13.6 s on a 16-thread aarch64 CPU, 1.24x the audio. The Voice panel says so beside the choice when the build it measured has no acceleration.",
       "hasChildren": false,
       "enumValues": [
         "tiny",
@@ -3082,6 +3143,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "auto"
+    },
+    {
+      "path": "stt.polish",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "AI Cleanup",
+      "help": "After dictation finishes, have your configured model fix punctuation and capitalisation. Your WORDS are never changed: a reply that altered one is discarded, so the worst case is that nothing happens. Off by default because it sends the TRANSCRIPT (never the audio) to that model, so a local-only setup stays local-only until you turn this on.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "stt.streaming",
@@ -3778,7 +3853,8 @@
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {
-        "extra_path_dirs": []
+        "extra_path_dirs": [],
+        "honour_auto_approve": false
       }
     },
     {
@@ -3790,10 +3866,11 @@
       "sensitive": false,
       "tags": [],
       "label": "Extra MCP Binary Directories",
-      "help": "Additional directories to search for MCP server binaries, ahead of the built-in locations. Add one when a package manager installs its MCP launchers somewhere Kiro Crew does not know about: a server declared by bare name that resolves nowhere never starts, and the session just comes up short of tools. Each entry must be a single absolute directory (``~`` is expanded); anything else is ignored with a warning. These directories are prepended to the search path used by the MCP probe, the agent-config command resolver, and the broker's rewriter alike, so a binary found here is found everywhere. They do NOT join the search for the agent runtime itself, which must not be shadowable by a configured directory.",
+      "help": "Additional directories to search for MCP server binaries, ahead of the built-in locations. Add one when a package manager installs its MCP launchers somewhere Kiro Crew does not know about: a server declared by bare name that resolves nowhere never starts, and the session just comes up short of tools. Each entry must be a single absolute directory (``~`` is expanded); anything else is ignored with a warning. These directories are prepended to the search path used by the MCP probe, the agent-config command resolver, and the broker's rewriter alike, so a binary found here is found everywhere. They also join the PATH of the broker daemon and every pooled MCP backend it spawns, so a wrapper script found here can exec a bare tool name; the daemon reads this when it starts, so a change reaches it only once it is replaced. They do NOT join the search for the agent runtime itself, which must not be shadowable by a configured directory.",
       "hasChildren": true,
       "enumValues": null,
-      "defaultValue": []
+      "defaultValue": [],
+      "requiresRestart": true
     },
     {
       "path": "mcp.extra_path_dirs.*",
@@ -3808,6 +3885,21 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null
+    },
+    {
+      "path": "mcp.honour_auto_approve",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Honour MCP autoApprove",
+      "help": "Keep an ``autoApprove`` list no server spec declares -- one hand-added to ``mcp.json`` -- in the agent config Kiro Crew writes. Off by default, and off DROPS those verbs: such a tool is approved locally with no permission request, so no approval card is ever shown for it. A ceiling strips the key whatever this says; a verb a spec declares is kept either way. Applies at restart, when the spec is rebuilt, so turning it off does not retract a grant already in the file.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false,
+      "requiresRestart": true
     },
     {
       "path": "instances",
@@ -4038,11 +4130,20 @@
       "defaultValue": {
         "bucket": 100,
         "history_budget_chars": 0,
+        "model_route": {
+          "simple": "",
+          "medium": "",
+          "complex": ""
+        },
         "provider": {
           "endpoint": "https://api.typesafe.ai/v1/systemone",
           "api_key": "secret://TYPESAFE_API_KEY",
           "model": "jev-latest",
           "timeout_ms": 1000
+        },
+        "nudge_wake": {
+          "provider": "auto",
+          "llm_model": ""
         }
       }
     },
@@ -4073,6 +4174,38 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0
+    },
+    {
+      "path": "decisions.model_route",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Model per difficulty tier",
+      "help": "Which model answers a chat turn Jev put in each difficulty tier, for a session whose model is set to 'Auto (Jev)' in the chat model picker. Keys are the three tiers the question offers -- 'simple', 'medium', 'complex' -- and each value is a model id the provider advertises to your account, exactly as the chat model picker spells it. Every tier is EMPTY by default, which means inherit: the turn keeps the model its session is already on, and the decision is still recorded so you can see which tier Jev chose before you pin anything. No model id is named for you, because an id your account is not offered would fail on the first prompt. 'auto' means the same as empty. An id your account cannot run keeps the session's model too and records why in the decision log. Routing a turn to a dearer model costs more, which is why it happens only for a session whose owner picked 'Auto (Jev)' -- a manual model choice is never overridden.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "simple": "",
+        "medium": "",
+        "complex": ""
+      }
+    },
+    {
+      "path": "decisions.model_route.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "decisions.provider",
@@ -4148,6 +4281,51 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 1000
+    },
+    {
+      "path": "decisions.nudge_wake",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Wake judge",
+      "help": "Per-point settings for nudge.wake: which judge answers, and the model id for the small-model lane. The Jev lane still needs this point's consent scope on the Decisions card; the small-model lane needs no consent row, because it sends to the model provider your sessions already use, so picking it here is what runs it.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "provider": "auto",
+        "llm_model": ""
+      }
+    },
+    {
+      "path": "decisions.nudge_wake.provider",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Judge provider",
+      "help": "Which judge answers at nudge.wake: 'jev' (the System One model this card's consent switch covers), 'llm' (a small text-only model on the provider this machine already uses, no extra key needed), or 'auto' -- Jev when consent stands for it, otherwise the small model. Anything else reads as 'auto'. Choosing 'jev' without that consent sends nothing and every tick fires as it does today.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "auto"
+    },
+    {
+      "path": "decisions.nudge_wake.llm_model",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Judge model (LLM lane)",
+      "help": "The model id the 'llm' lane runs on, spelled as your provider advertises it. EMPTY INHERITS: the judge keeps the model its background agent already resolves, which is the default. A value that is not a short model id is ignored rather than sent.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
     },
     {
       "path": "watchdog",
@@ -5535,7 +5713,7 @@
         "whatsapp"
       ],
       "label": "Enabled",
-      "help": "Enable the WhatsApp channel (QR-linked personal account over the WhatsApp Web protocol). Pair a device from Settings > Channels; needs the 'whatsapp' dependency extra installed.",
+      "help": "Enable the WhatsApp channel (QR-linked personal account over the WhatsApp Web protocol). Pair a device from Settings > Messaging Channels; needs the 'whatsapp' dependency extra installed.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false

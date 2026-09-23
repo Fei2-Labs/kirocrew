@@ -60,6 +60,7 @@ contributed, and none of the three below reads the prefix at all.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from collections.abc import Iterable, Mapping
@@ -77,7 +78,13 @@ from kiro_crew.crew_log.projection import (
     log_origin,
     require_name,
 )
-from kiro_crew.crew_log.store import CrewLog, crew_log_dir, segment_first_seqs, segment_paths
+from kiro_crew.crew_log.store import (
+    CrewLog,
+    crew_log_dir,
+    log_exception_text,
+    segment_first_seqs,
+    segment_paths,
+)
 from kiro_crew.platform_compat import restrict_dir_to_owner
 
 logger = logging.getLogger(__name__)
@@ -100,7 +107,7 @@ CHECKPOINT_DIR: Final[str] = "projections"
 #: fenced from the agent. ``test_changing_what_a_fold_stores_forces_the_savepoint_
 #: version_to_move`` pins each fold's stored state, so forgetting the bump fails
 #: CI rather than shipping.
-CHECKPOINT_VERSION: Final[int] = 2
+CHECKPOINT_VERSION: Final[int] = 3
 
 #: Largest savepoint file this module reads or writes. Every fold's state is
 #: already bounded by construction (``crew-log-projection.md`` section 2), so this
@@ -348,12 +355,13 @@ def save(
         # and seq -- but the bundle must not claim a savepoint the folds that failed
         # do not have, or the next read would skip the write they are still owed.
         return bundle
-    return SessionProjections(
-        session_id=bundle.session_id,
-        last_seq=bundle.last_seq,
-        checkpoints=bundle.checkpoints,
-        origin=bundle.origin,
-        saved_seq=min(cp.last_seq for cp in bundle.checkpoints.values()),
+    # ``replace`` rather than a field-by-field rebuild: this function's only edit
+    # is ``saved_seq``, and naming the other fields here would silently drop any
+    # field it does not know about -- the caller's size and mtime stamps are what
+    # let its next no-growth poll skip the validating walk, and losing them here
+    # would charge one full-file read per savepoint write for nothing.
+    return dataclasses.replace(
+        bundle, saved_seq=min(cp.last_seq for cp in bundle.checkpoints.values())
     )
 
 
@@ -379,7 +387,7 @@ def _load_one(
         # written, and a cold fold is the answer.
         return None
     except Exception:  # pragma: no cover - a path refusal from the store's checks
-        logger.debug("crew log savepoint path refused for %s", name, exc_info=True)
+        log_exception_text(logger, logging.DEBUG, "crew log savepoint path refused for %s", name)
         return None
     if size > MAX_CHECKPOINT_BYTES:
         logger.debug("crew log savepoint %s is over the size cap; folding cold", path)
@@ -396,7 +404,9 @@ def _load_one(
         # checked above, so the cap does not stand in for this guard. It is also the
         # only unusable payload that survives being read -- the file stays on disk --
         # so an escape costs the session every later fold rather than one cold fold.
-        logger.debug("crew log savepoint %s unusable; folding cold", path, exc_info=True)
+        log_exception_text(
+            logger, logging.DEBUG, "crew log savepoint %s unusable; folding cold", path
+        )
         return None
     return _checkpoint_from(
         raw,
@@ -473,7 +483,9 @@ def _checkpoint_from(
     except Exception:
         # The fold surface's own validation refused the payload. Same answer as
         # every other unusable file.
-        logger.debug("crew log savepoint for %s refused by the fold surface", name, exc_info=True)
+        log_exception_text(
+            logger, logging.DEBUG, "crew log savepoint for %s refused by the fold surface", name
+        )
         return None
 
 
@@ -555,10 +567,14 @@ def _hold(handle: CrewLog) -> str | None:
             unit_id=handle.id,
         )
     except (CrewLogError, OSError):
-        logger.debug("crew log savepoint for %s not owned; skipping", handle.id, exc_info=True)
+        log_exception_text(
+            logger, logging.DEBUG, "crew log savepoint for %s not owned; skipping", handle.id
+        )
         return None
     except Exception:  # pragma: no cover - a path refusal from the store's checks
-        logger.debug("crew log savepoint lease refused for %s", handle.id, exc_info=True)
+        log_exception_text(
+            logger, logging.DEBUG, "crew log savepoint lease refused for %s", handle.id
+        )
         return None
 
 
@@ -618,15 +634,21 @@ def _ensure_dir(handle: CrewLog) -> Path | None:
         directory = checkpoint_dir(handle.kind, handle.id)
         directory.mkdir(mode=0o700, exist_ok=True)
     except OSError:
-        logger.debug("crew log savepoint directory unavailable for %s", handle.id, exc_info=True)
+        log_exception_text(
+            logger, logging.DEBUG, "crew log savepoint directory unavailable for %s", handle.id
+        )
         return None
     except Exception:  # pragma: no cover - a path refusal from the store's checks
-        logger.debug("crew log savepoint directory refused for %s", handle.id, exc_info=True)
+        log_exception_text(
+            logger, logging.DEBUG, "crew log savepoint directory refused for %s", handle.id
+        )
         return None
     try:
         restrict_dir_to_owner(directory)
     except OSError:
-        logger.debug("crew log savepoint directory not restricted: %s", directory, exc_info=True)
+        log_exception_text(
+            logger, logging.DEBUG, "crew log savepoint directory not restricted: %s", directory
+        )
     return directory
 
 
@@ -654,12 +676,14 @@ def _discard_if_unit_gone(handle: CrewLog, directory: Path) -> bool:
         try:
             child.unlink()
         except OSError:
-            logger.debug("crew log savepoint %s not removed", child, exc_info=True)
+            log_exception_text(logger, logging.DEBUG, "crew log savepoint %s not removed", child)
     for victim in (directory, directory.parent):
         try:
             victim.rmdir()
         except OSError:
-            logger.debug("crew log savepoint directory %s kept", victim, exc_info=True)
+            log_exception_text(
+                logger, logging.DEBUG, "crew log savepoint directory %s kept", victim
+            )
             break
     return True
 

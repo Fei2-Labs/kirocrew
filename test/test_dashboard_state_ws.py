@@ -996,18 +996,25 @@ class TestOwnerSourceStatusTransport:
     ) -> None:
         source_url = "https://github.com/acme/repo/pull/12"
 
-        def serialize_slots(
-            *, include_check_status: bool = False, dashboard_user: bool = False
-        ) -> list[dict]:
-            link = {"url": source_url, "provider": "github", "number": 12}
-            # Owner (include_check_status) sees status for any repo. A
-            # dashboard-user sees it for a KNOWN-public repo; this fixture treats
-            # dashboard_user=True as "public repo, show status".
-            if include_check_status or dashboard_user:
-                link.update({"ci": "passed", "state": "OPEN"})
-            return [{"key": "chat-1", "source_links": [link]}]
-
-        monkeypatch.setattr(state, "serialize_slots", serialize_slots)
+        # A REAL slot carrying the link, so the audience views are derived the
+        # way production derives them: one serialization pass, then only the
+        # ``source_links`` field re-projected per audience. The chip-status cache,
+        # repo visibility and the SEL audit writers are stubbed at their seams;
+        # this fixture treats the repo as KNOWN public, so the dashboard-user
+        # view shows status alongside the owner view.
+        slot = state.get_or_create_slot("chat-1")
+        slot.append("assistant", f"opened {source_url}", "msg")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.source_providers._session_card_chips_snapshot",
+            True,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.state._cached_check_status",
+            lambda url: {"ci": "passed", "state": "OPEN"} if url == source_url else None,
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.state._repo_is_public", lambda url: True)
+        monkeypatch.setattr("kiro_crew.dashboard.state._audit_public_status_grant", lambda url: None)
+        monkeypatch.setattr("kiro_crew.dashboard.state._audit_public_status_denied", lambda url: None)
         monkeypatch.setattr(state, "is_yolo_active", lambda: False)
         sent: list[tuple[object, dict]] = []
         monkeypatch.setattr(
@@ -1073,6 +1080,103 @@ class TestOwnerSourceStatusTransport:
             owner_messages[0]["governanceGeneration"]
             == dash_messages[0]["governanceGeneration"]
         )
+
+    def test_broadcast_serializes_each_slot_once_and_views_match_full_passes(
+        self, state: DashboardState, monkeypatch
+    ) -> None:
+        """The three audience frames come from ONE ``to_dict`` per slot.
+
+        Serializing the list once per audience re-ran the projection body
+        (markdown strip, credential redaction, options parse) three times per
+        slot on the event loop -- ~600 ms per broadcast on a real sidebar, which the adaptive
+        concurrency controller read as ``loop_lag`` pressure and cut the subagent
+        cap to its floor on an idle host. Pin the single pass, and pin that the
+        derived views are byte-for-byte what a full per-audience pass yields, so
+        the optimization can never ship a view that a full pass would not.
+        """
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        public_url = "https://github.com/acme/public/pull/1"
+        private_url = "https://github.com/acme/private/pull/2"
+        slot_a = state.get_or_create_slot("chat-a")
+        slot_a.append("assistant", f"opened {public_url}", "msg")
+        slot_b = state.get_or_create_slot("chat-b")
+        slot_b.append("assistant", f"opened {private_url} [OPTIONS: yes | no]", "msg")
+        state.get_or_create_slot("chat-c")  # no links at all
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.source_providers._session_card_chips_snapshot",
+            True,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.state._cached_check_status",
+            lambda url: {"ci": "passed", "state": "OPEN"},
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.state._repo_is_public", lambda url: url == public_url
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.state._audit_public_status_grant", lambda url: None)
+        monkeypatch.setattr("kiro_crew.dashboard.state._audit_public_status_denied", lambda url: None)
+        monkeypatch.setattr(state, "is_yolo_active", lambda: False)
+        monkeypatch.setattr(state, "_spawn_ws_send", lambda client, message: None)
+
+        # Reference: what three independent full passes produce.
+        expect_bare = state.serialize_slots()
+        expect_ws = state.serialize_slots(dashboard_user=True)
+        expect_owner = state.serialize_slots(include_check_status=True)
+        # Quick check on the fixture: the audiences really do differ, so equality
+        # below is not vacuous.
+        by_key = {d["key"]: d for d in expect_owner}
+        assert by_key["chat-b"]["source_links"][0]["ci"] == "passed"
+        assert "ci" not in {d["key"]: d for d in expect_ws}["chat-b"]["source_links"][0]
+        assert "ci" in {d["key"]: d for d in expect_ws}["chat-a"]["source_links"][0]
+        assert "ci" not in {d["key"]: d for d in expect_bare}["chat-a"]["source_links"][0]
+
+        calls: list[str] = []
+        real_to_dict = _ChatSlot.to_dict
+
+        def counting_to_dict(self, **kwargs):
+            calls.append(self.key)
+            return real_to_dict(self, **kwargs)
+
+        monkeypatch.setattr(_ChatSlot, "to_dict", counting_to_dict)
+
+        bare, ws, owner = state.serialize_slot_views(owner=True)
+        assert sorted(calls) == ["chat-a", "chat-b", "chat-c"]
+        assert bare == expect_bare
+        assert ws == expect_ws
+        assert owner == expect_owner
+
+        # No owner socket: the owner view is not built, and still one pass.
+        calls.clear()
+        bare2, ws2, owner2 = state.serialize_slot_views(owner=False)
+        assert sorted(calls) == ["chat-a", "chat-b", "chat-c"]
+        assert owner2 is None
+        assert (bare2, ws2) == (expect_bare, expect_ws)
+
+        # The broadcast itself goes through the single pass, with owner sockets
+        # registered.
+        class _FakeWs:
+            closed = False
+
+            def get(self, key, default=None):
+                return {"_is_dashboard_user": True}.get(key, default)
+
+        state.register_ws(_FakeWs(), owner=True)
+        calls.clear()
+        state.push_slots_update()
+        assert sorted(calls) == ["chat-a", "chat-b", "chat-c"]
+
+    def test_reproject_carries_over_payloads_without_a_live_slot(
+        self, state: DashboardState
+    ) -> None:
+        """A payload whose key is not a registered slot is passed through as-is.
+
+        Covers a slot closed between serialization and re-projection, and the
+        test fixtures that stub ``serialize_slots`` with bare dicts.
+        """
+        payloads = [{"key": "ghost", "source_links": [{"url": "x"}]}, {"key": "nolinks"}]
+        assert state._reproject_slots(payloads, dashboard_user=True) == payloads
+        assert state._reproject_slots(payloads, include_check_status=True) == payloads
 
     def test_owner_sockets_still_receive_non_slot_broadcasts(
         self, state: DashboardState, monkeypatch

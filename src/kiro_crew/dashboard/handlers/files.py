@@ -87,6 +87,7 @@ from kiro_crew.hooks import (
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import OutboundFile
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
+from kiro_crew.pdf_extract import PdfExtraction, extract_pdf_segments
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.sandbox import (
@@ -4910,11 +4911,11 @@ _GREP_MAX_DIRS_VISITED = 20_000
 
 #: Containers the document pass extracts. Their bytes hold no searchable plain
 #: text, so the text pass skips them and this pass owns them -- no file is
-#: reported twice. ``.pdf`` is deliberately ABSENT: ``pdfplumber`` exposes no
-#: length limit, so its extraction has no memory ceiling this process can
-#: enforce. Both engines then skip a PDF as binary. Restoring it needs a bounded
-#: extractor shared with the identical exposure in ``knowledge/readers.py``.
-_GREP_DOC_EXTS = frozenset({".docx", ".pptx", ".xlsx"})
+#: reported twice. ``.pdf`` is extracted in a memory-bounded child
+#: (``kiro_crew.pdf_extract``), never in this process: ``pdfplumber`` exposes no
+#: length limit, so the only ceiling that can precede its allocation is a kernel
+#: one on a process the gateway can afford to lose.
+_GREP_DOC_EXTS = frozenset({".docx", ".pdf", ".pptx", ".xlsx"})
 #: Largest document the pass will open. Extraction is CPU-bound parsing, so
 #: this is about parse cost, not read cost.
 _GREP_DOC_MAX_BYTES = 25 * 1024 * 1024
@@ -5442,12 +5443,27 @@ def _grep_xlsx_segments(data: bytes, path: str, deadline: float) -> _DocSegments
     return tuple(segments), whole
 
 
+def _grep_pdf_segments(data: bytes, path: str, deadline: float) -> PdfExtraction:
+    """Extract a PDF in the bounded child; the caller reads ``failure`` itself.
+
+    Returned rather than folded into ``_DocSegments`` because a PDF has a third
+    outcome the other formats do not: the child was stopped by its ceiling
+    (memory, CPU, the deadline). That is a document SKIPPED, counted like one
+    over the byte cap, not a parse that ended early -- and ``_grep_docs`` is
+    where skips are counted.
+    """
+    outcome = extract_pdf_segments(data, max_chars=_GREP_DOC_MAX_CHARS, deadline=deadline)
+    if outcome.resource_failure:
+        logger.warning("file_grep: PDF %s skipped: extractor %s", path, outcome.failure)
+    return outcome
+
+
 def _grep_doc_segments(data: bytes, path: str, ext: str, deadline: float) -> _DocSegments:
     """Extract already-authorized document bytes as ``(label, text)`` segments.
 
     The label stands in for a line number: ``slide 7`` for a deck, ``Sheet1 · row
-    12`` for a worksheet. A Word file gets an EMPTY label -- its paragraphs carry
-    no location a reader could navigate to.
+    12`` for a worksheet, ``page 3`` for a PDF. A Word file gets an EMPTY label --
+    its paragraphs carry no location a reader could navigate to.
 
     Parsers receive only ``BytesIO``, so none can reopen the path after the
     safe-read identity check. ``.docx``/``.pptx`` go through
@@ -5455,6 +5471,9 @@ def _grep_doc_segments(data: bytes, path: str, ext: str, deadline: float) -> _Do
     and entity expansion. Its text is requested one character PAST the cap:
     coming back longer is the only way to tell a document cut at the cap from one
     that ended there.
+
+    ``.pdf`` is not handled here: its extractor runs out of process and can be
+    STOPPED rather than merely cut short, which ``_grep_docs`` counts as a skip.
     """
     if ext == ".xlsx":
         return _grep_xlsx_segments(data, path, deadline)
@@ -5483,7 +5502,11 @@ def _grep_doc_segments(data: bytes, path: str, ext: str, deadline: float) -> _Do
 def _grep_docs(
     root: str, query: str, deadline: float, taken: int
 ) -> tuple[list[dict], int, bool]:
-    """Document pass: (hits, documents skipped for budget, truncated).
+    """Document pass: (hits, documents skipped, truncated).
+
+    A document is skipped when it is over the byte cap or when the PDF
+    extractor child was stopped by its ceiling (memory, CPU, the deadline) --
+    either way its text was never read, and the answer is marked partial.
 
     Runs AFTER the text pass inside the SAME deadline, so a tree of large
     documents can never slow a plain-text search down. ``skipped_docs`` is what
@@ -5533,7 +5556,20 @@ def _grep_docs(
             if len(data) > _GREP_DOC_MAX_BYTES:
                 skipped += 1
                 continue
-            segments, whole = _grep_doc_segments(data, full, ext, deadline)
+            if ext == ".pdf":
+                pdf = _grep_pdf_segments(data, full, deadline)
+                if pdf.resource_failure:
+                    # The child hit a ceiling: the document was not read, so it
+                    # is a skip AND the answer is partial. A parse the child
+                    # refused is a settled answer, like a workbook that is not a
+                    # zip, and yields no segments and no flag.
+                    skipped += 1
+                    doc_truncated = True
+                    continue
+                segments = pdf.segments
+                whole = pdf.failure is not None or not pdf.truncated
+            else:
+                segments, whole = _grep_doc_segments(data, full, ext, deadline)
             if not whole:
                 doc_truncated = True
             for label, text in segments:
@@ -7157,6 +7193,24 @@ def _probe_git_dir(base: str, env: dict) -> tuple[int, str]:
     return rc, stderr
 
 
+def _is_not_a_repo_verdict(probe_stderr: str) -> bool:
+    """True when a failed :func:`_probe_git_dir` is Git's own absence verdict.
+
+    This is the ONE classification contract the status and log routes share:
+    Git's English ``fatal: not a git repository`` line (the probe runs with
+    ``LC_ALL=C``) is confirmed absence and answers ``repo: false``. Every other
+    nonzero probe -- sandbox refusal, spawn failure, dubious ownership,
+    permission failure, timeout, kill, corrupt metadata -- is an operational
+    outage and answers 503, because an empty listing or an empty commit list is
+    exactly what a clean or unborn repository legitimately returns, so spelling
+    an outage that way is indistinguishable from a healthy answer.
+    """
+    return any(
+        line.lstrip().startswith("fatal: not a git repository")
+        for line in probe_stderr.lower().splitlines()
+    )
+
+
 def _run_git_bounded(
     args: list[str],
     cwd: str,
@@ -7658,10 +7712,7 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         # is not evidence that it is readable now.
         probe_rc, probe_err = _probe_git_dir(base, _env)
         if probe_rc != 0:
-            if any(
-                line.lstrip().startswith("fatal: not a git repository")
-                for line in probe_err.lower().splitlines()
-            ):
+            if _is_not_a_repo_verdict(probe_err):
                 return {"repo": False, "files": []}
             return {"_status_unavailable": True}
 
@@ -8406,14 +8457,22 @@ async def api_project_git_log(request: web.Request) -> web.Response:
             # panel can open them.
             "-c", "core.quotePath=false",
         ]
-        _env = {**os.environ, "GIT_ATTR_NOSYSTEM": "1"}
+        _env = {
+            **os.environ,
+            "GIT_ATTR_NOSYSTEM": "1",
+            # The probe's verdict match reads Git's English diagnostic.
+            "LC_ALL": "C",
+            "LANGUAGE": "C",
+        }
 
-        # Check if it's a repo
-        probe_rc, _probe_out, _ = _run_git_bounded(
-            [*_git_cmd, "rev-parse", "--git-dir"], cwd=base, env=_env, timeout=5,
-        )
+        # Same discovery boundary as the status route: Git's not-a-repository
+        # verdict is confirmed absence; any other probe failure is an outage,
+        # not an empty history.
+        probe_rc, probe_err = _probe_git_dir(base, _env)
         if probe_rc != 0:
-            return {"repo": False, "commits": []}
+            if _is_not_a_repo_verdict(probe_err):
+                return {"repo": False, "commits": []}
+            return {"_log_unavailable": True}
 
         # Same filter-driver refusal as the status handler (defense in depth:
         # ``git log`` does not run clean filters, but one uniform invariant --
@@ -8460,6 +8519,10 @@ async def api_project_git_log(request: web.Request) -> web.Response:
         return {"repo": True, "commits": commits}
 
     result = await asyncio.to_thread(_run)
+    # Same vanished-directory re-check as the status route: a project directory
+    # deleted between the isdir gate and the spawn is absence, not an outage.
+    if await asyncio.to_thread(_project_directory_absent, base):
+        return web.json_response({"repo": False, "commits": []})
     _log_refusal = result.pop("_log_filter_refused", "")
     if _log_refusal:
         return web.json_response(
@@ -8474,6 +8537,14 @@ async def api_project_git_log(request: web.Request) -> web.Response:
                 ),
                 "code": "git_log_filter_refused",
                 "cause": _log_refusal,
+            },
+            status=503,
+        )
+    if result.pop("_log_unavailable", False):
+        return web.json_response(
+            {
+                "error": "Couldn't read the commit history.",
+                "code": "git_log_unavailable",
             },
             status=503,
         )

@@ -23,7 +23,7 @@ from kiro_crew import crew_log as lg
 from kiro_crew import sandbox
 from kiro_crew.config import paths
 from kiro_crew.config.paths import data_home, ensure_data_home
-from kiro_crew.crew_log import CrewLog, CrewLogError, Ref, store
+from kiro_crew.crew_log import CrewLog, CrewLogError, Ref, lease, store
 from kiro_crew.security.paths import is_sensitive_path
 from kiro_crew.session_ledger import _store_name
 
@@ -425,6 +425,9 @@ def test_the_ownership_registry_is_the_documented_partition():
         "plan",
         "write",
         "ledger",
+        "object",
+        "radar",
+        "work",
     }
 
 
@@ -461,6 +464,9 @@ SESSION_VOCABULARY: tuple[str, ...] = (
     "subagent/failed",
     "write/dropped",
     "ledger/recorded",
+    "object/observed",
+    "radar/recorded",
+    "work/recorded",
 )
 
 
@@ -1227,6 +1233,81 @@ def test_a_malformed_interior_line_is_skipped_on_read_and_left_on_disk():
     assert '{"type":"activity/tick","seq":' in path.read_text(encoding="utf-8")
 
 
+def test_a_forward_gap_inside_one_file_reads_without_raising():
+    # Seq continuity is a boundary-only check by design: inside one file a
+    # missing seq is a damaged line the reader skips on purpose, so a record
+    # lost ENTIRELY must read the same way. This pins ``iter_from``'s
+    # non-advancing-seq refusal against ever widening into a contiguity check.
+    crew = _crew()
+    for index in range(3):
+        crew.append("activity/tick", {"i": index}, src="gateway")
+    path = lg.crew_log_path(lg.KIND_CREW, CREW)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    del lines[2]  # the seq-2 record is gone entirely: a pure forward gap
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert [entry.seq for entry in CrewLog.open(lg.KIND_CREW, CREW).iter_from()] == [1, 3]
+
+
+def test_a_duplicate_seq_is_refused_by_a_read_that_never_yields_it():
+    # The walked-entry guard, below the requested seq: the duplicate sits
+    # BEFORE the resume point, so the old code dropped it unexamined. The
+    # refusal must fire on what the read walks, not only on what it yields.
+    crew = _crew()
+    for index in range(2):
+        crew.append("activity/tick", {"i": index}, src="gateway")
+    path = lg.crew_log_path(lg.KIND_CREW, CREW)
+    raw = path.read_bytes()
+    last_line = raw.splitlines(keepends=True)[-1]
+    with open(path, "ab") as damaged:
+        damaged.write(last_line)  # byte-identical copy: seq 2 appears twice
+    crew.append("activity/tick", {"i": 2}, src="gateway")  # seq 3, past the damage
+
+    with pytest.raises(CrewLogError) as excinfo:
+        list(CrewLog.open(lg.KIND_CREW, CREW).iter_from(3))
+
+    assert excinfo.value.code == lg.CODE_BAD_DATA
+    assert excinfo.value.field == "seq"
+
+
+def test_a_strictly_backward_seq_is_refused_not_only_a_duplicate():
+    # The other half of "non-advancing": a copy of an OLD record at the tail,
+    # so the walked seq goes 1,2,3,1. A guard narrowed to equality (the shape
+    # "duplicate" invites) would let this through and reopen the silent-skip
+    # divergence for the stale-tail-copy case.
+    crew = _crew()
+    for index in range(3):
+        crew.append("activity/tick", {"i": index}, src="gateway")
+    path = lg.crew_log_path(lg.KIND_CREW, CREW)
+    first_record = path.read_bytes().splitlines(keepends=True)[1]  # [0] is the header
+    with open(path, "ab") as damaged:
+        damaged.write(first_record)  # seq 1 again, after seq 3: backward, not duplicate
+
+    with pytest.raises(CrewLogError) as excinfo:
+        list(CrewLog.open(lg.KIND_CREW, CREW).iter_from(4))
+
+    assert excinfo.value.code == lg.CODE_BAD_DATA
+    assert excinfo.value.field == "seq"
+
+
+def test_a_page_read_still_renders_a_unit_with_a_non_advancing_seq():
+    # Paging renders history for a human; refusing every intact line of a unit
+    # because one damaged line exists elsewhere in it would take the history
+    # away exactly when damage makes it most worth reading. ``strict_seq=False``
+    # is the rendering caller's contract; folds keep the refusing default.
+    crew = _crew()
+    for index in range(2):
+        crew.append("activity/tick", {"i": index}, src="gateway")
+    path = lg.crew_log_path(lg.KIND_CREW, CREW)
+    last_line = path.read_bytes().splitlines(keepends=True)[-1]
+    with open(path, "ab") as damaged:
+        damaged.write(last_line)  # seq 2 appears twice
+
+    seqs = [e.seq for e in CrewLog.open(lg.KIND_CREW, CREW).iter_from(1, strict_seq=False)]
+
+    assert seqs == [1, 2, 2]
+
+
 def test_a_blank_interior_line_is_skipped():
     crew = _crew()
     crew.append("activity/tick", {"i": 0}, src="gateway")
@@ -1554,6 +1635,30 @@ def _gone_unless(*live: str):
     children are still running, the way the real predicate reads the registry.
     """
     return lambda agent_id: agent_id not in live
+
+
+def test_repair_appends_nothing_to_a_tail_whose_seq_goes_backward():
+    # ``_scan_tail`` takes the newest line's seq, so a backward tail lowers the
+    # closers' first seq onto records that already exist -- a repair acting on
+    # such a file would AMPLIFY the damage (colliding seqs) before any reader
+    # refuses it. The repair fold must treat a non-advancing seq like any other
+    # record it cannot trust: refuse content repair, append zero bytes.
+    led = _session()
+    led.append("turn/started", {"turn": 1, "actor": "user", "depth": 0}, src="gateway")
+    led.append(
+        "tool/called",
+        {"turn": 1, "call_id": "tc-1", "name": "execute_bash", "server": "", "kind": ""},
+        src="acp",
+    )
+    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
+    opener_line = path.read_bytes().splitlines(keepends=True)[1]  # the seq-1 record
+    with open(path, "ab") as damaged:
+        damaged.write(opener_line)  # tail now reads 1,2,1 -- backward
+
+    before = path.read_bytes()
+    CrewLog.open(lg.KIND_SESSION, SESSION, repair=True)
+
+    assert path.read_bytes() == before
 
 
 def test_a_child_that_outlived_its_completed_turn_is_still_closed():
@@ -2019,6 +2124,16 @@ def test_a_chmod_refusing_filesystem_warns_once_not_once_per_append(monkeypatch,
     # The appends themselves still succeed: the restriction is best-effort.
     body = _log_bytes("session", "flood-check").decode("utf-8").splitlines()
     assert len([line for line in body if '"turn/started"' in line]) == 5
+    # The one warning carries the traceback as TEXT. It is raised inside
+    # ``CrewLog.append``, so an ``exc_info`` triple would hold the frame whose
+    # ``self`` is this handle -- and the captured record would then keep the
+    # handle, and its write lease, alive for the rest of the worker.
+    assert "Traceback (most recent call last)" in warnings[0].getMessage()
+    assert warnings[0].exc_info is None
+    lease_path = str(log.path.parent / lease.LEASE_FILE)
+    assert lease_path in lease._held, "the open handle should hold its lease"
+    del log
+    assert lease_path not in lease._held, "dropping the handle must release the lease at once"
 
 
 def test_an_already_restricted_directory_is_not_chmodded_again():

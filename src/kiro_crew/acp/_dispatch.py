@@ -979,6 +979,16 @@ class ToolCallIdentity:
     tool_name: str
     identity_trusted: bool
 
+    @property
+    def tool_identity_trusted(self) -> bool:
+        """Whether ``tool_name`` came from an adapter-authored identity channel.
+
+        ``classify_tool_call`` never populates ``tool_name`` from display titles
+        or inline permission payloads, so non-emptiness is provenance at this
+        classifier boundary. MCP pair provenance remains ``identity_trusted``.
+        """
+        return bool(self.tool_name)
+
 
 def _str_field(mapping: object, key: str) -> str:
     if not isinstance(mapping, dict):
@@ -1722,12 +1732,11 @@ def _build_tool_call_event(
         # LLM-authored title) -- see classify_tool_call for the sources.
         tool_name=_tool_name,
         mcp_server_name=_mcp_server_name,
-        # Earned only when an identity pair was actually extracted AND the
-        # classifier says the frame itself asserted that provenance. Upstream's
-        # ``identity.identity_trusted`` is the narrower of the two answers, so it
-        # is required in addition to the pair: a title-derived pair alone names a
-        # server without the frame having claimed it.
-        mcp_identity_trusted=bool(_mcp_server_name and _tool_name) and identity.identity_trusted,
+        # Earned only when an identity pair was actually extracted from such a
+        # source: a frame with no marker populates nothing and asserts no
+        # provenance.
+        tool_identity_trusted=identity.tool_identity_trusted,
+        mcp_identity_trusted=identity.identity_trusted,
         mcp_identity_ambiguous=_mcp_identity_ambiguous,
         diff_old_text=_diff_old_text,
         diff_path=_diff_path,

@@ -361,6 +361,45 @@ async def test_runtime_cancel_is_cancelled_not_completed():
 
 
 @pytest.mark.asyncio
+async def test_exhausted_stream_without_complete_is_not_marked_result_complete():
+    """A stream that dies between chunks must not be recorded as a finished result.
+
+    ``classify_stop_reason("")`` resolves to ``succeeded``, so a generator that
+    simply stops -- no EVENT_COMPLETE at all -- takes the success branch unless
+    the complete event is checked. The durable flag must reflect the missing
+    complete event, not the absent stop reason: nothing else on disk tells a
+    reader after a restart that ``result.txt`` holds a fragment.
+    """
+
+    def factory(msg: str, *a, **kw):
+        async def _gen():
+            yield _text("partial output ")
+            # ...and the stream dies here: no EVENT_COMPLETE, no stop reason.
+
+        return _gen()
+
+    mgr = _manager(_mock_sessions(factory))
+    events = _spy_events(mgr)
+    writes: list[tuple[str, dict]] = []
+    _orig = mgr._write_state_off_loop
+
+    async def _spy(info, what, **fields):
+        writes.append((what, fields))
+        return await _orig(info, what, **fields)
+
+    mgr._write_state_off_loop = _spy
+    info = await _spawn_and_wait(mgr)
+
+    # Everything observable about the run reads as a normal success...
+    assert info.outcome == "completed"
+    assert info.stop_class == STOP_CLASS_SUCCEEDED and info.partial is False
+    assert _done_event(events)["stop_class"] == STOP_CLASS_SUCCEEDED
+    # ...but the durable flag records that no complete event ever arrived.
+    result_writes = [w for what, w in writes if what == "result complete"]
+    assert result_writes and result_writes[-1] == {"result_complete": False}
+
+
+@pytest.mark.asyncio
 async def test_user_stop_keeps_the_neutral_record_contract():
     """A `cancelled` completion after the user's own Stop is neutral: error unset."""
     mgr_ref: dict = {}

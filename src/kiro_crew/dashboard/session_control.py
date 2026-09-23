@@ -67,6 +67,8 @@ from kiro_crew.execution_context import (
     MemoryStoreRef,
     bind_session_execution,
     read_session_execution,
+    read_vouched_session_execution,
+    refresh_vouched_session_execution,
     resolve_member_execution,
 )
 from kiro_crew.history import metadata_now_iso, transcript_stem
@@ -503,6 +505,81 @@ def member_dispatch_enabled() -> bool:
         logger.warning("member_dispatch: agent config section degraded — withdrawing member bypass")
         return False
     return bool(cfg.agent.member_dispatch)
+
+
+def member_admitted_to_scoped_surface(session_key: str, store: str) -> bool:
+    """Whether a scoped caller is a crew member reaching a member-open surface.
+
+    The ONE predicate the two surface gates that admit member callers share --
+    the session-control HTTP gate (``handlers/session_control.py``'s
+    ``_private_caller_refusal``) and the chat folder/tag gate
+    (``handlers/_shared.py``'s ``private_chat_route_refusal``) -- so the two
+    cannot drift on who a member is or when the surface is reachable for it.
+
+    A caller is admitted when BOTH hold:
+
+    * it is a crew member -- either an ``member-*`` DM slot key
+      (:func:`is_member_session_key`) OR an ordinary chat slot bound to a crew
+      member's private V2 store (:func:`_store_is_member_owned`, reading the
+      VERIFIED scope the gate already resolved); AND
+    * the surface is reachable for a member -- its own ``agent.member_dispatch``
+      bypass OR the global ``agent.session_control`` switch it otherwise falls
+      back under, since ``member_dispatch`` is a bypass ON TOP of the switch.
+
+    This is the surface-level, caller-independent reachability only. It never
+    decides which folders or sessions the admitted member may touch -- that
+    ownership fence is per-resource and lives with each route
+    (``member_owns_slot`` for filing/tagging, ``owner_app``/``folder_principal``
+    for the tree). All reads run off the loop and fail closed on an unreadable
+    config, so this gate can never open wider than the two switches behind it.
+    """
+    from kiro_crew.members import is_member_session_key
+
+    is_member = is_member_session_key(session_key) or _store_is_member_owned(store)
+    return is_member and (member_dispatch_enabled() or session_control_enabled())
+
+
+def member_owns_slot(state: "DashboardState", slot: Any, caller_key: str) -> bool:
+    """Whether *caller_key* (a member) may FILE or TAG *slot*.
+
+    The member analogue of the app path's ``_app`` / ``app_owns_transcript``
+    ownership check, and the SAME fence :func:`_caller_is_ownership_fenced`
+    draws for session-control targets, so a member reaches through the chat
+    folder/tag routes exactly the sessions it reaches through session-control
+    and no others:
+
+    * (a) its OWN session -- the slot whose slot key is the caller's own; and
+    * (b) a session it CREATED -- ``_created_by == <caller's slot key>``, the
+      value :func:`create_session` stamps on every child a member mints.
+
+    ``caller_key`` is the VERIFIED ``X-Session-Key`` the gate authorized on --
+    a SESSION key (``effective_session_key``, e.g. ``dashboard:chat-20-...``),
+    never a body value. :func:`create_session` stamps ``_created_by`` with a
+    SLOT key (``caller_slot_key(state, ...)``, e.g. ``chat-20-...``), so the two
+    live in DIFFERENT key spaces: a raw ``_created_by == caller_key`` compare
+    never matches a created child, because it compares a slot key to a session
+    key. Resolve the caller to its slot key ONCE through :func:`caller_slot_key`
+    (the same map :func:`create_session` writes the field through) and compare in
+    that one space: ``_created_by`` and the slot's own ``key`` are both slot
+    keys.
+
+    The ``effective_session_key(slot) == caller_key`` arm stays as a
+    session-space fallback: a channel-born slot whose key the live slot map
+    cannot resolve (``caller_slot_key`` returns ``""``) is still owned when its
+    session key IS the caller. Everything else is refused: the person's own
+    sessions, an app's sessions, and another member's sessions all fail every
+    arm.
+    """
+    if not caller_key or slot is None:
+        return False
+    resolved_slot_key = caller_slot_key(state, caller_key)
+    if resolved_slot_key:
+        created_by = getattr(slot, "_created_by", "")
+        if created_by and created_by == resolved_slot_key:
+            return True
+        if getattr(slot, "key", "") == resolved_slot_key:
+            return True
+    return effective_session_key(slot) == caller_key
 
 
 def _member_bypass(state: "DashboardState", caller_key: str) -> bool:
@@ -1002,6 +1079,7 @@ async def create_session(
     title: str = "",
     agent: str = "",
     folder_id: str = "",
+    caller_fenced: bool | None = None,
 ) -> dict[str, Any]:
     """Open a new session in the caller's workspace, persisted at birth.
 
@@ -1039,6 +1117,14 @@ async def create_session(
     every caller class the move path's app-ownership rule exists to stop is
     already refused above it -- an app-scoped caller cannot create a session at
     all (`app_scoped_caller`).
+
+    ``caller_fenced`` is the ownership-fence verdict the HTTP gate already settled
+    on the caller's VERIFIED scope, carried in for the same reason
+    ``authorize_target`` takes ``precomputed_ownership_fenced``: the inline
+    predicate re-derives member status from the MUTABLE config record, and this
+    coroutine suspends many times before it is consulted. ``None`` means "not
+    settled", and the fence is then evaluated inline. It is read by the
+    private-store authorization below and nothing else.
     """
     caller_key = caller_slot_key(state, caller_session_key)
     if not caller_key:
@@ -1081,6 +1167,14 @@ async def create_session(
         raise SessionControlError(
             "caller execution context is unavailable", code="memory_unavailable"
         ) from None
+
+    # This process's own word on the caller, snapshotted in the SAME breath as the
+    # record above so the two sources the own-store admission compares below are
+    # taken at one instant. Reading it down there instead would make a privacy
+    # change landing mid-resolution surface as a delegation refusal, when the
+    # re-gate further down exists precisely to name that case. A plain dict read
+    # under a lock, so it adds no suspension point here.
+    caller_vouched = read_vouched_session_execution(caller_memory_identity[0])
 
     if caller_execution is not None and caller_execution.memory_mode != "persistent":
         raise SessionControlError(
@@ -1239,6 +1333,106 @@ async def create_session(
         raise SessionControlError(
             "selected execution context is unavailable", code="memory_unavailable"
         ) from None
+
+    # ONE authorization for the child's PRIVATE binding, at the single point where
+    # every branch above has already produced its final route. A per-branch check
+    # is not equivalent: the selected-member branch, the inherited-agent branch
+    # and the caller-agent fallback all reach a member store, so a check on any
+    # one of them leaves the others open.
+    #
+    # A private member store is reachable on exactly two authorities:
+    #
+    # * the store is the caller's OWN, read from its protected execution record --
+    #   the same-store worker that is a private caller's own model. The record is
+    #   the only admissible input: `slot.agent` and `slot.memory_store` are
+    #   metadata a later write can change, and the SELECTION itself is a
+    #   caller-supplied string, so deriving authority from either lets the request
+    #   authorize itself by naming a member's agent.
+    # * the caller is the owner's own dashboard session, which is what "not
+    #   ownership-fenced" means. That is a shipped capability: an owner reopening
+    #   member conversations and dispatching member workers. It is preserved here.
+    #
+    # Refused, therefore, is every population `_caller_is_ownership_fenced`
+    # already treats as untrusted for the sessions it may reach: a cron slot, a
+    # member's DM slot naming a PEER member's agent, and anything either of them
+    # created -- the fenced caller's unfenced deputy the fence exists to catch.
+    # An app-token caller never arrives (`_require_internal` refuses it) and an
+    # app-scoped one cannot create at all, so the fence is the whole population.
+    #
+    # Fail-closed in both directions. An unbound caller has no own-store
+    # admission, so it needs the unfenced one. A fence verdict is only ever read
+    # as a REFUSAL here, so the mutable-record window the carried verdict exists
+    # to close can widen nothing: a record that stops saying "member" between the
+    # gate and this line turns a refusal into an admission the owner already has,
+    # never the reverse.
+    #
+    # The own-store admission needs TWO sources to agree, and neither alone is
+    # enough. `caller_execution` can come from the caller's own transcript record
+    # when this process holds no carrier, and that record is written by the very
+    # session being judged -- so on its own it answers "whose store is this?" with
+    # the subject's own claim. `read_vouched_session_execution` answers with what
+    # this process committed, which no session can write, but it can fall behind:
+    # several modules publish an execution record without going through
+    # `bind_session_execution`, so a legitimate reassignment can leave the vouched
+    # entry stale.
+    #
+    # Requiring agreement fails closed against both. A forged record cannot match
+    # a vouched entry it did not write. A stale vouched entry cannot match a record
+    # that has moved on. Only an identity this process itself committed, and that
+    # the record still carries, admits -- and a caller refused here is not
+    # refused outright, it simply falls through to the fence below, which an owner
+    # passes.
+    if child_execution.member_id is not None:
+        own_store_agreed = (
+            caller_execution is not None
+            and caller_execution.member_id is not None
+            and caller_execution.store == child_execution.store
+            and caller_vouched is not None
+            and caller_vouched.store == caller_execution.store
+        )
+        if own_store_agreed:
+            # Recency follows USE, not birth, so a later overflow at the cap drops
+            # an idle key rather than the member session still dispatching through
+            # it. Grants nothing: an absent key is a no-op and the value is not
+            # touched, so the only thing it changes is which entry is dropped.
+            refresh_vouched_session_execution(caller_memory_identity[0])
+        else:
+            # Off-loop: the inline predicate reads the config record. Only reached
+            # when the carried verdict is absent, and only for a private selection,
+            # so an ordinary create pays nothing.
+            fenced = (
+                caller_fenced
+                if caller_fenced is not None
+                else await asyncio.to_thread(_caller_is_ownership_fenced, state, caller_key)
+            )
+            if fenced:
+                # Server-side ONLY, and it says the one thing the caller's refusal
+                # must not: WHICH source failed. An operator reading this can tell
+                # authority this process never held or has since dropped (a restart,
+                # or cap churn -- the session re-binds and recovers) from a record
+                # that disagrees with what this process committed, which is the
+                # forgery shape the agreement exists to refuse. Names neither the
+                # store nor the member, so the log is not a second disclosure
+                # channel for what the refusal withholds.
+                if caller_vouched is None:
+                    cause = "this process holds no vouched identity for the caller"
+                elif (
+                    caller_execution is not None and caller_vouched.store != caller_execution.store
+                ):
+                    cause = "the caller's record disagrees with this process's vouched identity"
+                else:
+                    cause = "the caller's record does not name the selected store"
+                logger.warning("memory delegation refused for %s: %s", caller_key, cause)
+                # The delegation refusal, in the words and under the code this
+                # surface already uses for it, so a caller sees one refusal for the
+                # whole class. Deliberately says nothing about the store, the
+                # member, or why this caller is fenced: a refusal must not confirm
+                # which member owns the agent the caller guessed at.
+                raise SessionControlError(
+                    "cannot verify delegation within the caller's memory assignment",
+                    code="memory_delegation_denied",
+                    status=403,
+                )
 
     # SlotOrigin.USER, not SYSTEM: the visibility semantics must match an
     # ordinary session, because the point of creating it here is that the user
@@ -1535,7 +1729,10 @@ async def create_session(
                     from kiro_crew.memory_stores import UnknownMemoryStore
 
                     raise UnknownMemoryStore("Existing session context requires a new conversation")
-            bind_session_execution(session_key, child_execution)
+            # Establishing: this child's store came from the authorization above,
+            # not from any record the child or its caller can write, so this is one
+            # of the few publications entitled to vouch.
+            bind_session_execution(session_key, child_execution, vouch=True)
             log.update_metadata(session_key, metadata)
             birth_persisted = True
 

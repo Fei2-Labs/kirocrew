@@ -7,6 +7,7 @@ import logging as _logging
 import time as _time
 from typing import TYPE_CHECKING, Any
 
+from ..subagent_persistence import _agent_dir, _check_result_available
 from ._component import ManagerComponent
 
 _glue_logger = _logging.getLogger(__name__)
@@ -28,7 +29,6 @@ if TYPE_CHECKING:
         VERDICT_WORKING,
         LivenessOracle,
         SubagentInfo,
-        _agent_dir,
         _attributed_count,
         _proc_subtree_sample,
         _redact,
@@ -49,6 +49,24 @@ if TYPE_CHECKING:
         time,
         write_tombstone,
     )
+
+
+def tombstone_recovery_action(agent_id: str, state: dict) -> str:
+    """The terminal ``recovery_action`` for a tombstone: read it, or still notify.
+
+    ONE rule for every writer, so the two call sites cannot disagree.
+
+    A non-empty ``result.txt`` only means the provider emitted a token:
+    ``write_result_chunk`` appends per streamed chunk. The run records
+    ``result_complete`` when its stream reaches the complete event, so
+    without that flag these bytes are an opening sentence, not an answer.
+    """
+    has_result = _check_result_available(_agent_dir(agent_id) / "result.txt")
+    if not has_result:
+        return "notification_pending"
+    if not state.get("result_complete"):
+        return "partial_result"
+    return "result_available"
 
 
 class OrphanStallMonitor(ManagerComponent):
@@ -329,6 +347,10 @@ class OrphanStallMonitor(ManagerComponent):
         - PID alive → SIGKILL, tombstone (gateway_restart)
         - PID dead + result → tombstone (gateway_restart, delivered)
         - PID dead + no result → tombstone (gateway_restart, notification_pending)
+
+        A surviving ``result.txt`` is classified further: only a run that
+        recorded ``result_complete`` has a whole answer on disk, and anything
+        else is a fragment the restart cut off mid-turn.
         """
         try:
 
@@ -349,15 +371,8 @@ class OrphanStallMonitor(ManagerComponent):
                     continue  # tracked in current run, skip
                 try:
                     pid = state.get("pid")
-                    has_result = False
-                    try:
-
-                        rp = _agent_dir(agent_id) / "result.txt"
-                        has_result = rp.exists() and rp.stat().st_size > 0
-                    except OSError:
-                        pass
-
-                    recovery = "undeliverable"
+                    recovery = tombstone_recovery_action(agent_id, state)
+                    has_result = recovery != "notification_pending"
                     if pid and self._manager._is_pid_alive(pid):
                         # Use pid_recorded_at (when PID was actually written) instead of
                         # started (folder creation time) to avoid false negatives under load
@@ -374,11 +389,6 @@ class OrphanStallMonitor(ManagerComponent):
                                 )
                             except Exception:
                                 logger.debug("SEL audit failed for orphan %s", agent_id)
-                        recovery = "result_available" if has_result else "notification_pending"
-                    elif has_result:
-                        recovery = "result_available"
-                    else:
-                        recovery = "notification_pending"
 
                     try:
                         write_tombstone(
@@ -454,7 +464,27 @@ class OrphanStallMonitor(ManagerComponent):
         parent_session = state.get("parent_session", "")
         result_path = str(agent_dir_for_display(agent_id) / "result.txt")
 
-        if has_result:
+        if has_result and recovery == "partial_result":
+            msg = (
+                f"{SUBAGENT_COMPLETION_PREFIX}\n"
+                f"Agent `{agent_id}` ⚠️ cut off mid-turn by gateway restart\n"
+                f"Task: {task_preview}\n"
+                f"Partial output saved at: `{result_path}`\n"
+                f"It stops wherever the restart landed — read it as an unfinished "
+                f"fragment, not as the agent's answer."
+            )
+            # Same interrupted outcome as a whole result, but the note has to
+            # carry the difference: the wording above is all that stops a parent
+            # from acting on an opening sentence as though it were a finding.
+            row_meta = single_completion_meta(
+                agent_id=agent_id,
+                outcome=OUTCOME_INTERRUPTED,
+                task=task_preview,
+                note="cut off mid-turn by gateway restart",
+                requested_model=str(state.get("requested_model") or ""),
+                resolved_model=str(state.get("resolved_model") or ""),
+            )
+        elif has_result:
             msg = (
                 f"{SUBAGENT_COMPLETION_PREFIX}\n"
                 f"Agent `{agent_id}` ⚠️ orphaned by gateway restart\n"

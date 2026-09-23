@@ -98,6 +98,7 @@ import NotificationsPage from './pages/NotificationsPage'
 const SessionsPage = lazy(() => import('./pages/SessionsPage'))
 import NotificationDetailPanel from './components/notifications/NotificationDetailPanel'
 import NotificationFeed from './components/notifications/NotificationFeed'
+import NotificationBanner from './components/notifications/NotificationBanner'
 import LogsPage from './pages/LogsPage'
 import HooksPage from './pages/HooksPage'
 import WebhooksPage from './pages/WebhooksPage'
@@ -560,7 +561,21 @@ function BadgeIndicator({ count, collapsed, label }: { count: number; collapsed:
   const ariaLabel = `${count} ${label}`
   return collapsed
     ? <span className="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full z-10" role="status" aria-label={ariaLabel} />
-    : <span className="absolute right-2 top-1/2 -translate-y-1/2 bg-accent text-accent-fg text-[12px] font-bold px-1 py-[2px] rounded-full min-w-[18px] text-center inline-block leading-[12px]" aria-label={ariaLabel}>{count}</span>
+    // Expanded: IN FLOW, not `absolute right-2`. The row's other right-edge
+    // occupant is the hover/focus shortcut hint, which is an in-flow span — so an
+    // absolutely-positioned badge sat ON TOP of it and a row with an unread count
+    // advertised a chord the badge covered ("Sessions ⌥C" read as "Sessions (1)"
+    // with a sliver of the modifier glyph showing). In flow the two are siblings
+    // in the row's flex line and cannot overlap at any count width.
+    //
+    // `title` names what the number IS, for sighted users: a bare pill beside a
+    // bare bot glyph does not say what either counts, and the fix above makes the
+    // two reliably co-visible. It carries the LABEL ALONE, not `ariaLabel` — the
+    // label is a plural phrase, so "1 unread conversations" would be visibly
+    // wrong at count 1, and the count is already rendered in the pill an inch
+    // away. `aria-label` keeps the count because a screen reader gets no pill.
+    // The update dot (App.tsx) likewise carries different title and aria strings.
+    : <span className="shrink-0 bg-accent text-accent-fg text-[12px] font-bold px-1 py-[2px] rounded-full min-w-[18px] text-center inline-block leading-[12px]" title={label} aria-label={ariaLabel}>{count}</span>
 }
 
 /** Sub-agent activity belongs in the expanded rail, where the bot icon and
@@ -570,7 +585,15 @@ function BadgeIndicator({ count, collapsed, label }: { count: number; collapsed:
 function ActivityIndicator({ count, collapsed, label }: { count: number; collapsed: boolean; label: string }) {
   if (count <= 0 || collapsed) return null
   const ariaLabel = `${count} ${label}`
-  return <span className="absolute right-8 top-1/2 -translate-y-1/2 flex items-center gap-1 text-[11px] text-accent" role="status" aria-label={ariaLabel}>
+  return <span className="shrink-0 flex items-center gap-1 text-[11px] text-accent" role="status" title={label} aria-label={ariaLabel}>
+    {/* Size and spacing are main's. A 12px glyph was tried here to make the mark
+        identify its own count at a glance, and a reader of the rendered frames
+        still could not tell what it depicted -- so it bought nothing and cost the
+        row's last pixel of label width (the Sessions label fits in exactly 61px;
+        12px takes 62 and clips it to "Sessions" minus two characters). What this
+        glyph depicts is a question about the rail's iconography rather than about
+        the overlap, so it is left to the follow-up rather than guessed at here.
+        The `title` carries the naming for a user who hovers. */}
     <Bot size={11} className="animate-pulse" aria-hidden />
     {count}
   </span>
@@ -600,13 +623,16 @@ function runStateLabel(state: AppRunState | undefined): string {
  * exactly where "is that job still going?" has to be answerable without opening
  * the app, which is the whole point of having it.
  *
- * Placed in a corner the count badge does not use. `BadgeIndicator` takes
- * `top-1 right-1` collapsed and the `right-2` pill expanded; `ActivityIndicator`
- * takes `right-8` expanded, and exactly one surface in the registry carries an
- * `activitySelector` to render it -- `chat` (Sessions), a Main-group HOST
- * surface. A host surface row never carries an `appName`, so it never receives
- * this mark, and an app row never receives an activity count. The two cannot
- * meet on one icon regardless of what an app is called.
+ * Shares the row's flex line with the other two indicators rather than claiming
+ * a corner of its own. An earlier revision placed each mark at a fixed offset
+ * the others were assumed not to use, which is only true while every one of them
+ * stays the width it was assumed to be -- a count pill grows with its digits.
+ * Siblings in one flex line cannot overlap at any width, so the arrangement no
+ * longer rests on an assumption about anyone's size. Independently of geometry,
+ * exactly one surface in the registry carries an `activitySelector` -- `chat`
+ * (Sessions), a Main-group HOST surface. A host surface row never carries an
+ * `appName`, so it never receives this mark, and an app row never receives an
+ * activity count: those two cannot meet on one row regardless.
  *
  * Colour alone does not carry the state. `running` is a filled dot inside a wide
  * halo ring, `error` is a plain solid fill, and `success` is HOLLOW -- a ring
@@ -630,13 +656,18 @@ function RunStateIndicator({ state, collapsed, label }: { state: AppRunState | u
     : state === 'error'
       ? 'bg-danger'
       : 'bg-transparent ring-1 ring-ok'
-  const position = collapsed ? 'bottom-1 right-1' : 'right-8 top-1/2 -translate-y-1/2'
-  return <span
-    className={`absolute ${position} w-2 h-2 rounded-full z-10 ${shape}`}
-    role="status"
-    aria-label={label}
-    title={label}
-  />
+  // Collapsed: absolute in the icon's own corner, where there is no flex line to
+  // join and no chord to cover. Expanded: IN FLOW with the other two right-edge
+  // indicators. Keeping this one `absolute right-8` while the count pill moved
+  // into the line would have left exactly the bug this change exists to fix, one
+  // component over: an app row renders this mark AND an `appBadges`-driven pill,
+  // and a 2-3 digit pill reaches left past 32px to sit under it. Flex items
+  // cannot overlap, so joining the line closes it for this mark too rather than
+  // relying on the pill staying narrow. `z-10` goes with the absolute arm: an
+  // in-flow sibling needs no stacking order to avoid a box it cannot intersect.
+  return collapsed
+    ? <span className={`absolute bottom-1 right-1 w-2 h-2 rounded-full z-10 ${shape}`} role="status" aria-label={label} title={label} />
+    : <span className={`shrink-0 w-2 h-2 rounded-full ${shape}`} role="status" aria-label={label} title={label} />
 }
 
 /**
@@ -647,7 +678,7 @@ function RunStateIndicator({ state, collapsed, label }: { state: AppRunState | u
  * prior two-pipeline behavior without leaving per-id branches in the
  * renderer.
  */
-function NavBadge({ navId, collapsed, appBadges, runState }: { navId: string; collapsed: boolean; appBadges: Record<string, number>; runState?: AppRunState }) {
+export function NavBadge({ navId, collapsed, appBadges, runState }: { navId: string; collapsed: boolean; appBadges: Record<string, number>; runState?: AppRunState }) {
   const surface = getBuiltinSurface(navId)
   // selectSurfaceBadgeCount caches per-navId so this stays referentially
   // stable across renders inside a `.map()`.
@@ -758,7 +789,11 @@ function useNavTip<T extends HTMLElement>(enabled: boolean) {
   return { tip, tipOn, rowRef, showTip, hideTip, dismissTip }
 }
 
-function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride, onClick, navId, pressed }: {
+/** Exported for `capture/nav-badge-chord.tsx`, which measures the row's
+ *  right-edge geometry in a real browser — the one check that can see the
+ *  badge-over-chord overlap this row's unit tests can only pin structurally
+ *  (happy-dom computes no layout). Same seam `UpdateOverlay` is exported on. */
+export function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride, onClick, navId, pressed }: {
   path: string; label: string; icon: React.ReactNode; active: boolean; collapsed: boolean; badge?: React.ReactNode; onClickOverride?: () => void; onClick?: () => void; navId?: string
   /** Set on rows that TOGGLE a surface rather than navigate (e.g. the docked
    *  terminal). `active` only paints the row; without aria-pressed a screen
@@ -831,7 +866,6 @@ function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride,
       // attribute is the non-visual route rather than a duplicate of one.
       aria-keyshortcuts={shortcut?.ariaKeyshortcuts}
     >
-      {badge}
       {iconEl}
       {/* `aria-label` carries the FULL label: this span is `whitespace-nowrap overflow-hidden`, so
           a translation longer than the rail is silently cut off with no way to read it. Surfaced by
@@ -873,6 +907,13 @@ function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride,
           {shortcut.chord}
         </span>
       )}
+      {/* LAST in the flex line, so the expanded unread/activity indicators sit to
+          the RIGHT of the chord above rather than over it. Order matters only for
+          the in-flow expanded indicators: every caller-supplied badge (the dev
+          dot, the update dot) and the collapsed dot are absolutely positioned
+          against the row, so they render where they always did regardless of
+          where in the children they appear. */}
+      {badge}
       {collapsed && tip && createPortal(
         <div
           className={`fixed flex items-center gap-2.5 pl-3 pr-3 rounded-md bg-card border border-border shadow-lg text-text text-sm font-medium z-[9999] pointer-events-none whitespace-nowrap transition-opacity duration-150 ${tipOn ? 'opacity-100' : 'opacity-0'}`}
@@ -1102,8 +1143,9 @@ function NotificationsBellButton() {
    *
    * `scrim: null` because the sheet's column scrim is its own CHILD and travels
    * with it; there is no separate backdrop to fade in lockstep. Safe against
-   * registerDrawerTargets' projection precondition because nothing under
-   * `components/notifications/` imports framer-motion at all.
+   * registerDrawerTargets' projection precondition because nothing rendered
+   * INSIDE the sheet uses framer-motion (`NotificationBanner` does, but it is
+   * portalled beside the sheet, never within it).
    */
   useEffect(() => registerDrawerTargets(sheetX, {
     panel: () => sheetRef.current,
@@ -1152,6 +1194,14 @@ function NotificationsBellButton() {
     animateDrawer(sheetX, 0)
     recordEvent('notifications_open', { source: 'topbar' })
   }, [sheetX, parkedOffset])
+
+  // The banner's "open on this note" path: the same open as the bell, then
+  // the selection — one state owner, so the popover's auto-ack effect and its
+  // detail panel work for a banner tap exactly as for a row tap.
+  const openPanelOn = useCallback((ts: string) => {
+    openPanel()
+    setSelectedTs(ts)
+  }, [openPanel])
 
   // See NC_CLOSE_BACKSTOP_MS: `animateDrawer`'s arrival callback owns the
   // unmount, and this only rescues a phase that never heard back at all.
@@ -1209,9 +1259,16 @@ function NotificationsBellButton() {
     return () => { document.removeEventListener('pointerdown', onPointerDown); document.removeEventListener('keydown', onKey) }
   }, [open, selectedTs, closePanel])
 
-  // Auto-mark-read when opening a notification's detail
+  // Auto-mark-read when opening a notification's detail -- ONCE per
+  // selection. A rejected ack flips the row back to unread
+  // (`ackNotification.rejected`), and re-asking on that flip would loop the
+  // request forever; the detail panel's own "Mark read" is the retry.
+  const autoAckedTsRef = useRef<string | null>(null)
   useEffect(() => {
-    if (selected && !selected.acked) dispatch(ackNotification(selected.ts))
+    if (!selected) { autoAckedTsRef.current = null; return }
+    if (selected.acked || autoAckedTsRef.current === selected.ts) return
+    autoAckedTsRef.current = selected.ts
+    dispatch(ackNotification(selected.ts))
   }, [selected, dispatch])
 
   return (
@@ -1333,6 +1390,18 @@ function NotificationsBellButton() {
           )}
           </ErrorBoundary>
         </div>,
+        document.body
+      )}
+      {/* Live-arrival banner. Portalled like the sheet so a transformed
+          ancestor in the top bar cannot capture its `fixed` positioning; it
+          borrows the bell for its exit vector and this component's open/select
+          mechanics rather than holding any selection of its own. */}
+      {createPortal(
+        <NotificationBanner
+          bellRef={bellRef}
+          popoverOpen={phase !== 'closed'}
+          onOpenNote={openPanelOn}
+        />,
         document.body
       )}
     </div>
@@ -3465,8 +3534,8 @@ export default function App() {
           the strip it was summoned by, so hover and clicks land on the chrome's own
           surface handlers and the strip never has to resize or opt out of
           hit-testing — a hit target that changes under a resting pointer is what
-          made this flicker open/closed indefinitely. `focus-peek-strip` carries `-webkit-app-region:no-drag`, which
-          is load-bearing on the TOP one: Electron injects a 42px drag bar on
+          made this flicker open/closed indefinitely. `.focus-peek-top` / `.focus-peek-rail`
+          (index.css) carry `-webkit-app-region:no-drag`, which is load-bearing on the TOP one: Electron injects a 42px drag bar on
           document.body, and an ordinary div inside it becomes a window-drag
           region whose hover never reaches React. */}
       {focusActive && (
@@ -3475,14 +3544,14 @@ export default function App() {
             ref={topPeekTrigger}
             data-testid="focus-peek-top"
             aria-hidden="true"
-            className="focus-peek-strip focus-peek-top absolute left-0 right-0 top-0 z-[61]"
+            className="focus-peek-top absolute left-0 right-0 top-0 z-[61]"
             {...topPeek.triggerProps}
           />
           <div
             ref={railPeekTrigger}
             data-testid="focus-peek-rail"
             aria-hidden="true"
-            className="focus-peek-strip focus-peek-rail absolute left-0 bottom-0 z-[61]"
+            className="focus-peek-rail absolute left-0 bottom-0 z-[61]"
             // Starts below the top strip so the two tile the corner rather than
             // overlapping, where whichever won would be arbitrary.
             style={{ top: FOCUS_INSET }}
@@ -3590,7 +3659,12 @@ export default function App() {
             as a fourth grid child: `.topbar` declares exactly three tracks, so a
             bare sibling would be auto-placed into `.tb-right` and land inside the
             readout capsule's cluster. Two controls, which is the ceiling
-            website/AUTOSDE.yaml's max-two-buttons-per-row sets. */}
+            website/AUTOSDE.yaml's max-two-buttons-per-row sets.
+
+            `data-topbar-overlay` is read by the crew-pin capture harnesses
+            (website/scripts/capture-crew-pin-chips.mjs, record-crew-pin-chips.mjs,
+            capture-crew-chip-shrink.mjs) to find this cell; nothing in src/
+            reads it any more. Keep it. */}
         {!isMobile && (
           <div data-topbar-overlay className="flex items-center gap-1.5 min-w-0">
           <button

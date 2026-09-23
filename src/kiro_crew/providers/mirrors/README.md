@@ -22,7 +22,7 @@ every backend needs one." That sentence is what this folder is.
 ## Runtime guard
 
 A mirror is the fix for one backend. `agent_sdk/mcp_refs.py` is the detector, so a
-fourth occurrence cannot be silent. At the one point where the
+fourth occurrence cannot be silent. At each point where the
 `session/new` / `session/load` `mcpServers` array is final — spec projection plus
 the gateway's broker stubs — `acp/mcp_ref_guard.py` compares the spec's `@server`
 refs against what the session is actually about to receive, and logs ONE structured
@@ -32,11 +32,11 @@ gateway is on. It also records them on the session's MCP report
 a different claim, because a server nothing configured has no row there to be
 missing from.
 
-Its runtime reach is `AcpClient`'s composition — kiro-cli, claude, codex. **KAS
-composes its array on `AcpRuntime` and never reaches that call site**, so a KAS
-session's refs are checked only by `kirocrew doctor`; wiring the second transport is
-a separate change, and claiming "every backend" here would be the same unexamined
-claim this folder exists to stop.
+The runtime guard is installed at both final-array composition points:
+`AcpClient._guard_unresolved_mcp_refs` and
+`AcpRuntime._guard_unresolved_mcp_refs`. Both use the same resolver and record
+`unresolved_refs` on the session report, so KAS and the shared-runtime paths are
+covered as well as direct client sessions.
 
 The resolver sits in the SDK rather than in the ACP layer because the question is
 not an ACP question: spec in, wire array in, backend id in, refs out. That is what
@@ -49,8 +49,9 @@ configuration fact, and the complaint about this defect class was that it was
 invisible, not that it was tolerated. Two rules keep it from crying wolf — kiro-cli
 reads the spec itself via `--agent`, so its refs resolve against the spec's own
 `mcpServers` rather than the (deliberately empty) wire array; and `@builtin` and
-bare tool names are not server refs. Until codex has a mirror, the warning fires
-for every codex session that references a server, which is the guard being right.
+bare tool names are not server refs. Backends without a complete spec projection
+still receive the same non-fatal diagnostic when an `@server` reference is
+unresolved.
 
 ## What a mirror must do
 
@@ -95,7 +96,7 @@ documented cause of the `hooks` regression: see `UNSUPPORTED_SPEC_KEYS` in
 `acp/kas_agents.py`, whose comment states the rule this vocabulary generalises —
 *no slot on the wire is not no such capability in the backend*.
 
-## The four projection kinds
+## The five projection kinds
 
 A disposition answers "what happens to this concern"; a **kind** answers the prior
 question, "how does anything reach this backend at all?". Every backend id this
@@ -108,11 +109,12 @@ test can read.
 | `mirror` | a mirror in this folder projects it; must have a class in `MIRRORS` | `reason` |
 | `external` | Crew projects it, from a module outside this folder | `reason`, `projection`, `tracking` |
 | `no-channel` | no transport this backend advertises can carry Crew's servers | `reason`, `channel`, `tracking` |
+| `broker-only` | the shared broker reaches the backend, but the agent spec's own servers and per-tool deny set do not | `reason`, `tracking` |
 
 `no-channel` is the only kind under which a session legitimately holds none of
 Crew's tools, and it is the one the prose form could not distinguish from a
 backlog item. A paragraph can explain a gap without ever giving it an address, and
-a gap with no address is indistinguishable from a decision — so the two kinds that
+a gap with no address is indistinguishable from a decision — so the three kinds that
 are not finished states are required to be ADDRESSABLE, by the constructor rather
 than by a reviewer. `channel` names what would have to exist; `projection` names
 the module a reader goes to; `tracking` is an issue URL or a repo-relative
@@ -126,7 +128,8 @@ Every kind is additionally cross-checked against something outside its own text,
 so no kind's honesty rests on how its reason is worded. `mirror` needs a
 registered class and an `mcpServers` ruling of `delivered` or `translated`;
 `external` needs an importable module; `no-channel` needs a channel, a resolvable
-tracking pointer and an onboarding row; and `native` and `external` are checked
+tracking pointer and an onboarding row; `broker-only` needs a resolvable tracking
+pointer; and `native` and `external` are checked
 against `agent_sdk/mcp_refs.py`, which has to know the same fact to resolve a
 `@server` ref at all — it satisfies a ref from the spec's OWN `mcpServers` for a
 backend whose spec servers reach the session off the wire
@@ -286,8 +289,9 @@ a tool they switched off answers anyway.
 | `kas` | `external` | — | `acp/kas_agents.py` (+ `acp/kas_permissions.py`), travelling as `_meta.kiro.customAgents`. The most complete projection of any backend, down a real channel — what is outstanding is only WHERE the code sits, and the RFC schedules that as a pure relocation of its own so a live harness's projection is not moved and changed in one diff |
 | `opencode` | `mirror` | `whole-server` | `opencode.py`, wire face only — the `session/new` array is its whole channel, because Crew's one config write there (the permission routing) MERGES with the user's config and declaring a server in both channels double-mounts it. `hooks` is its one open `no-channel` disposition. This entry read `no-channel` until the claim was MEASURED: its `initialize` advertises `http` and `sse` and no stdio, which was taken as a refusal — but ACP's `McpCapabilities` has only those two fields, so no conforming agent can advertise stdio and the array carries them fine. The stdio `type` tag the shared translator emits is DROPPED here rather than left to the adapter to discard: its mapping branches on whether `type` is present, so a tag surviving a schema change would be routed as a remote server and fail the whole `session/new`. `disabledTools` is honoured by withholding the server it narrows — and unlike codex that includes Crew's own control plane, because codex's exemption for it rests on a per-call refusal keyed on `rawInput.server`/`tool` that this harness does not emit. The cost is paid only by an operator who narrowed the control plane deliberately |
 | `copilot` | `no-channel` | — | SELECTABLE here, so this is a decision and not a gap. Its routing is `PERMISSION_REQUEST`: it asks Kiro Crew per tool call, so the PreToolUse gate sees the operations themselves. The `session/new` array is the channel a projection would use. |
-| `goose` | `no-channel` | — | KNOWN but outside `BASELINE_SELECTABLE_BACKENDS`, so no build offers it. It is also the one backend `_spec_session_mcp_delivery` withholds Crew's control plane from BY NAME. |
-| `pi` | `no-channel` | — | KNOWN but outside `BASELINE_SELECTABLE_BACKENDS`, so there is no session to configure yet — the same gap claude had. `PERMISSION_REQUEST` routing, so it would inherit copilot's shape. |
+| `pi` | `no-channel` | — | `pi-acp` accepts the session array but does not forward it to the pi process, so the session receives none of Crew's tools; the required channel and tracking pointer are declared in `registry.py` |
+| `goose` | `mirror` | `whole-server` | `goose.py`, wire face only — a live adapter round trip proves stdio tools are reachable; narrowed servers are withheld whole until a per-tool projection exists |
+| `deepseek` | `broker-only` | — | the shared broker's stdio stubs are reachable, but the agent spec's own servers and per-tool deny set are not projected; `registry.py` tracks the missing projection |
 
 ## Verify against the adapter, not against the last mirror
 

@@ -39,6 +39,7 @@ def test_all_caps_at_reference_window_equal_module_constants():
     assert caps.projects == ctx._MEMORY_PROJECTS_CAP
     assert caps.memory_history == ctx._MEMORY_HISTORY_CAP
     assert caps.lessons == ctx._LESSONS_CAP
+    assert caps.lessons_startup == ctx._LESSONS_STARTUP_CAP
     assert caps.semantic == ctx._SEMANTIC_MEMORY_CAP
     assert caps.episodic == ctx._EPISODIC_MEMORY_CAP
     assert caps.skills == ctx._SKILLS_CAP

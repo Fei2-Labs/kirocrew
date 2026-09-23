@@ -6,7 +6,7 @@ A session's crew log is an append-only file (`crew-log-core.md`). Every view of 
 is a FOLD: `status`, `usage`, `timeline`, `tools`, `approvals` and `class` -- the
 session side panel of the RFC's section 5 table, plus the one fold a READER of
 another unit's log consults rather than a panel. This module is those five advertised folds, the internal `class` fold, the
-slot-keyed `ledger` fold, the two read routes that serve them, and the frame that
+slot-keyed `ledger`, `radar` and `work` folds, the two read routes that serve them, and the frame that
 pushes a fold when the file grows.
 
 The split it implements is RFC NFR-2: the backend folds and cuts pages, the
@@ -14,14 +14,15 @@ frontend renders and pages and never folds. A client that folded the log would
 need the whole file to show one number.
 
 The five panel folds each read ONE session unit and are the set the growth push
-sends, so `PROJECTION_NAMES` holds those five. The `ledger` fold is keyed by a
-SLOT rather than by one unit: a slot owns one ACP session id at a time, so the
-work it accrues over its life is spread across a unit per id it ran under, and
-answering for it means joining them. `SLOT_PROJECTION_NAMES` holds `ledger` and
-is kept OUT of `PROJECTION_NAMES` for that reason -- the growth push and the side
-panel address a session, and pushing a slot-wide value under one session's id
-would report a partial answer as the whole one. `FOLD_NAMES` is the union of the
-two, and the import-time registry check compares a requested name against it.
+sends, so `PROJECTION_NAMES` holds those five. A fold in `SLOT_PROJECTION_NAMES` is
+keyed by a SLOT rather than by one unit: a slot owns one ACP session id at a time,
+so the state it accrues over its life is spread across a unit per id it ran under,
+and answering for it means joining them. `SLOT_PROJECTION_NAMES` holds `ledger`,
+`radar` and `work`, and those names are kept OUT of
+`PROJECTION_NAMES` for that reason -- the growth push and the side panel address a
+session, and pushing a slot-wide value under one session's id would report a partial
+answer as the whole one. `FOLD_NAMES` is the union of the two, and the import-time
+registry check compares a requested name against it.
 
 Scope: the SESSION kind. The crew-kind projections (`roster`, `activity`,
 `board`, `budget`, ...) are out of scope here because the crew kind has no writer
@@ -168,24 +169,38 @@ and its one caller asks the registry for it by name.
 | `approvals` | Requests matched to decisions by `approval_id`: pending, decided, the decision tally, the last decision. No emitter writes these types yet; the fold is against the declared shape. |
 | `class` (INTERNAL -- not advertised, not pushed) | What KIND of session this log belongs to, over the log's WHOLE LIFE: the memory mode, the owning app, and whether the conversation was ever published to a channel. Each of those three is held at the most RESTRICTIVE value the log ever recorded, from the `class` object on the log's first `session/opened` plus every later `session/class` move, so a session published to a channel for one turn keeps reading as channel-published after the link is dropped -- that turn's content is still in this log. It also carries `workspace`, which folds differently because it is an IDENTITY rather than a restriction: there is no more-restrictive workspace to keep, so the FIRST one stated is held and a later different one sets `workspace_moved`, which is itself the restrictive fact -- a log whose content spans two workspaces is owned by neither. `recorded` says a class was stated at all and `complete` says the history has a beginning, and a reader deciding an authorization question refuses on either being false. The only fold whose consumer is a READER of another unit rather than a panel, which is why it is held restrictive rather than current: a fold that reported the present value would answer a question nobody asks of a log. |
 
-### The slot-keyed ledger fold
+### The slot-keyed folds
 
 | projection | what it answers |
 |---|---|
 | `ledger` | The session work ledger's state record: goal, phase, resumable next step, rejected approaches, artifact pointers, and a bounded event tail. It interprets only `ledger/recorded` and renders the ten fields every reader of that record expects (`session-work-ledger.md`). |
+| `radar` | An Issue Radar crew's ledger: its work items (newest progress first), a bounded tail of progress lines, its own passes for the repository's shared skip index, and the per-item history of phase entries. It interprets only `radar/recorded` and renders the shapes the crew page, the fabric and the `issue_radar_crew_read` tool already expect (`apps/builtins/issue_radar/backend/crew_ledger_spec.md`). |
+| `work` | The conductor work board: its header, items, bindings, worker reports and bounded per-item event tails. It interprets only `work/recorded`; entries naming another board are excluded. |
 
-This fold is the module's ONE exception to FR-4, and it is stated rather than
-assumed, because a reader has to know which kind of fold it holds. A slot owns one
-ACP session id at a time rather than for its whole life, so the record it answers
-for is spread over a unit per id the slot ran under. `fold_slot_checkpoint` folds
-those units oldest first, RE-BASING the seq guard at each one: a seq is comparable
-only within one file, so the second unit's entries all sit at or below the first
-unit's seq, and `advance` would refuse the whole file as a re-fold. The state
-carries forward across the boundary while the seq restarts. `fold_slot` renders the
-result. The units it joins are still exactly one slot's own, so nothing reads across
-slots.
+A slot-keyed fold is the module's stated exception to "one fold, one unit", and it
+is stated rather than assumed, because a reader has to know which kind of fold it
+holds. A slot owns one ACP session id at a time rather than for its whole life, so
+the record it answers for is spread over a unit per id the slot ran under.
+`fold_slot_checkpoint` folds those units oldest first, RE-BASING the seq guard at
+each one: a seq is comparable only within one file, so the second unit's entries all
+sit at or below the first unit's seq, and `advance` would refuse the whole file as a
+re-fold. The state carries forward across the boundary while the seq restarts.
+`fold_slot` renders the result for the ledger's and the work board's routes; the radar
+fold's owner (the crew store) renders the checkpoint itself, since it also advances it
+over the entry it is appending. The returned `last_seq` belongs to the newest unit
+folded.
 
-`session_units_for_slot` supplies that list. It names the units whose HEADER can be
+How far a fold reaches differs by fold, and only the `work` board reaches past one
+slot. The `ledger` and `radar` folds join exactly one slot's own units -- the radar
+fold's one cross-crew read, the repository's skip index, is a union the app makes OVER
+per-crew folds, not a fold that reads another slot's units. A board's writes are made
+by the conductor AND by each worker bound to it, each into its own log, so the `work`
+fold answers whole only when those units are folded together; which units those are is
+decided from the board's own recorded bindings rather than from the reader's request.
+
+Unit selection belongs to the fold: `read_slot_projection` asks `_slot_units_for_fold`
+for the list before folding, and a fold with no rule of its own gets
+`session_units_for_slot`. It names the units whose HEADER can be
 PROVED to belong to the store holding it, ordered by the header's `createdAt` and
 then by unit id so a tie is stable -- which is the order the units were opened in,
 and therefore the order their entries happened in, so a later update wins over an
@@ -193,24 +208,65 @@ earlier one. A caller that cannot tolerate a clock's ordering re-orders the list
 itself: the ledger's `crew_log_units` applies its own append-order log and drops the
 units a permanent delete excluded before folding, because a backward clock step
 would otherwise apply a retired session's goal over a later one's
-(`session-work-ledger.md`). `read_slot_projection` is the slot-keyed read, and
-`slot_of_session` resolves a session-addressed request to the slot recorded in that
-session's header: the header rather than a session mapping, because it is written
-once inside the fenced tree and cannot be made to name another conversation's slot.
+(`session-work-ledger.md`); the radar fold's owner keeps the order the crew RECORDED
+into its units and pins the crew's LIVE unit last, for the same reason. `read_slot_projection`
+is the slot-keyed read the `ledger` and `work` routes use, and `slot_of_session` resolves a
+session-addressed request to the slot recorded in that session's header: the header
+rather than a session mapping, because it is written once inside the fenced tree and
+cannot be made to name another conversation's slot. The radar fold takes no generic
+read route: this module folds it for its owner and the owner serves it, so no reader
+can be handed the listing as stored without the owner's ordering.
 
 A reader that folds on every loop wake would re-walk the whole log each time, since
 the fold interprets only its own entry type but still reads every line to find it.
-So the ledger's caller keeps the checkpoint per slot and advances it over what
-arrived since, through this module's own `advance`. A changed unit list, a newest
-unit whose seq went backwards, or a cold cache each force a full rebuild, because
-each would otherwise be a wrong answer rather than a slow one.
+So each owner keeps the checkpoint (per slot for the ledger, per crew for the radar
+fold, per board for the work ledger) and advances it over what arrived since, through
+this module's own `advance`.
+A changed unit list, a unit whose seq went backwards, growth in any unit but the
+newest, or a cold cache each force a full rebuild, because each would otherwise be a
+wrong answer rather than a slow one.
+
+The radar fold's own rules, applied to the bytes as the writer applies them to a
+request: an entry naming a crew other than the fold's first is left out (every unit
+of one slot belongs to one crew); an entry identical to the item's LAST applied
+update is applied once (a retry re-stamped later), while an identical update after
+intervening ones is a new update and applies; a name in the entry's `clear` list
+empties that field before the same entry's set fields apply; consecutive crew-level
+sweeps coalesce; a crew-level kind with a number, or a number-less entry with an
+item kind, is dropped; the FIRST pass recorded on a number stands; each CI member and
+the label count are re-bounded to the record tool's own limits; and a `carried`
+entry re-states a pre-projection record with its own stamps (a rejected approach it
+already lists is not appended again), while a carried pass on an issue the crew never
+worked records the row and no work item.
+
+The `work` fold extends the conductor's own units with worker units discovered
+from recorded bindings. `_work_units` scans the conductor units for
+`work/recorded` entries whose action is `bind`, whose `slot` is the board being
+folded, and whose non-empty `worker_session_key` names a worker slot. Every unit
+proved for those worker slots is appended after the conductor units, with unit ids
+de-duplicated. `_work_step` filters every retained entry by the bound board slot,
+so a worker unit shared by several boards contributes only entries that name this
+board.
+
+`_Fold.bind_slot` is the optional fourth fold operation. The `work` fold registers
+`_work_bind_slot`, and `fold_slot_checkpoint` invokes it before the first entry.
+The board identity therefore comes from the reader's slot rather than from the
+first entry, which may be a nested conductor's report to its parent board. The
+`ledger` fold does not require a slot binding in its retained state.
+
+`also_slots` is a reader-supplied supplement to the fold-owned unit set. Each
+supplemental slot's proved units is appended after the owned units, with the same
+unit-id de-duplication. The work-ledger rebuild supplies cached worker bindings and
+slots whose own logs already carry entries naming the board; these sources recover
+a worker bound before the board's recorded `bind` entry existed. Supplemental
+slots never replace or reorder the fold-owned units.
 
 ## 4. Reads
 
 | route | answers |
 |---|---|
 | `GET /api/sessions/{id}/crew-log?from=&to=` | The entries in a seq range, oldest first, with every `ref` on the page resolved (FR-4). |
-| `GET /api/sessions/{id}/crew-log/projection/{name}` | One fold's `value` and the `seq` it folded through. A name in `SLOT_PROJECTION_NAMES` is served from the same route: the slot is resolved from that session's own header first, and the fold then joins every unit the slot ran under. A session whose slot cannot be proved gets the empty fold, never another slot's. |
+| `GET /api/sessions/{id}/crew-log/projection/{name}` | One fold's `value` and the `seq` it folded through. A slot-keyed name this route serves (`ledger`) is resolved to the slot recorded in that session's own header first, and the fold then joins every unit the slot ran under; a session whose slot cannot be proved gets the empty fold, never another slot's. A slot-keyed fold served by its OWNER (`radar`) is refused here (400 `unknown_projection`, the answer an unregistered name gets): folding the one unit this route addresses would serve a part of the record as the whole. |
 | `GET /api/sessions/{id}/crew-log/projections` | Every fold, keyed by name, from ONE resolution and ONE pass over the unit, so a caller showing them together cannot be handed a mix from two units. Each fold keeps its own `seq`, which differs by design: an entry advances the folds it belongs to and leaves the rest. |
 
 **The BATCH read answers two things the folds cannot.** A fold says what it holds;
@@ -234,8 +290,13 @@ retired id. `SessionMap.get` repairs or removes an entry it judges stale, so
 consulting it would make a panel READ mutate session state, which is the reason
 `crew_log/resolve.py` documents for never touching it. And a retired unit belongs
 to a session this slot no longer is: presenting its totals here would imply a
-whole-life figure, which needs the lineage pointer (`session/opened.data.previous`)
-and a fold that follows it -- neither exists yet (§8).
+whole-life figure. Both halves a whole-life figure needs now exist -- the lineage
+pointer `session/opened.data.previous`, and `session_tree.fold_slot_chain`, which
+walks it newest unit first, bounded, cycle-guarded and held to one slot -- but this
+route calls neither, so what it reports is still what is addressable. Joining the
+folds those ids name is the remaining step, and it must read the walk's own `ended`
+reason: only `first` means the chain reached the slot's first unit, so any other
+reason totals PART of a life and must not be presented as the whole of one (§8).
 
 `writes_drained` -- whether the emitter owed nothing when the fold was taken. An
 append is handed to a queue and the entry point returns, so a turn can END with its
@@ -288,10 +349,12 @@ of those folds the CURRENT record and not the retired one -- totals drop, and
 nothing in the answer says why. A key whose session was torn down and not
 re-created resolves to nothing and reads back the empty fold at seq 0, which is the
 same answer a session with no entries gets; the difference is not observable from
-here. A reader that must span a slot's retired units needs the lineage pointer
-(`session/opened.data.previous`) and a fold that follows it, which this module does
-not do. The dashboard panel states the limit in its own footer rather than implying
-a whole-life total.
+here. A reader that must span a slot's retired units has the lineage pointer
+(`session/opened.data.previous`) and the fold that follows it
+(`session_tree.fold_slot_chain`); this module calls neither, and folding one unit
+and reading nothing else is the property FR-4 pins on it, so the join belongs to a
+caller above it rather than here. The dashboard panel states the limit in its own
+footer rather than implying a whole-life total.
 
 Those two are the BROWSER's door: cookie auth, keyed on a session id the dashboard
 already holds. A second, unit-keyed door serves the `kirocrew-crew-log` MCP server
@@ -521,10 +584,12 @@ can tell exactly what happened. Only `turn/completed` closes a turn.
 ## 6. The session tree -- the one fold across logs
 
 Every fold above reads its own unit's file and nothing else (FR-4). Two readers
-look across logs, and they read the SAME recorded edge for different questions:
-the session tree here, and the dispatch fence in section 5. The `session_create`
-edge is recorded on the CHILD (`crew-log-core.md` section 5), so "which session
-opened which" is not in any one log.
+look across logs for the PARENT edge, and they read the SAME recorded edge for
+different questions: the session tree here, and the dispatch fence in section 5.
+The `session_create` edge is recorded on the CHILD (`crew-log-core.md` section 5),
+so "which session opened which" is not in any one log. A SECOND edge, on a
+different axis, is recorded on the same entry and walked by the same module --
+subsection 6.1.
 
 The tree (`crew_log/session_tree.py`) folds EVERY log and keys the result by
 SLOT, because it answers "what does the whole tree look like" for a display, and
@@ -683,6 +748,66 @@ never as a native `title`: a keyboard or touch reader sees no tooltip, and this
 row has nothing else that says it. The table re-checks the edge it is handed --
 a key naming no row in the payload, or a chain returning to its own start --
 because a table must never fail to paint on a payload it did not produce.
+
+### 6.1 The succession walk -- one slot's own chain of logs
+
+The same first entry carries a second edge, and the two are on different axes.
+`parent {slot, sid?}` is PARENTHOOD between two slots, above. `previous {sid}` is
+SUCCESSION between two logs of ONE slot: a slot owns one ACP session id at a time
+rather than for its whole life, so a supersede -- a restart whose `session/load`
+does not re-attach, a reset, an agent, model or effort switch, a compaction, a
+provider swap -- gives that slot a new log under a new id, and the new log names the
+one it replaced (`crew-log-emitter.md`, `session-types.md`).
+
+Parenthood is keyed by slot and folded over the whole collection. Succession is
+keyed by ACP session id and WALKED from one log backwards, because what it answers
+is the ORDER a slot's logs came in, which a slot-keyed fold cannot express: every
+log of one slot folds to the same key.
+
+`session_tree.fold_slot_chain(records, head_sid)` is that walk, pure over the same
+`OpenedRecord`s the tree folds, and `SessionTree.chain` is the scanner entry point.
+It answers a `SlotChain`: the slot, its logs newest first starting with `head_sid`,
+the reason it stopped, and the id it could not follow.
+
+**Three constraints, each of which can end the walk.** It visits at most
+`SLOT_CHAIN_CAP` logs; it never visits an id twice; and it steps only onto a log
+whose immutable header slot equals the slot it started on. That last one is the
+reader's own enforcement of what the edge means, not a re-check of the emitter's.
+The id reaches the emitter from an agent-writable mapping, and logs written before
+that check existed are still on disk, so a walk that followed a foreign edge would
+join another slot's turns, costs and approvals into this slot's whole-life figure --
+a wrong answer presenting itself as a complete one.
+
+**The end reason is the load-bearing field**, because the ids alone cannot say
+whether they are a slot's whole life: a chain cut short looks exactly like a
+complete one. Exactly one reason holds, which is why it is one field and not a set
+of flags. `first` reached the slot's first log and is the ONLY complete answer.
+`missing` means the cited log answered no record -- retention took it, or its header
+was refused -- which is the ordinary way an old chain ends. `foreign` means the
+cited log exists and names another slot, so the step was refused; it is the one
+reason that reports damage rather than age. `cycle` means the cited log is already
+on the walk, reachable only through forged or damaged records. `cap` means the bound
+was reached. `unknown` means the log the walk was ASKED to start from answered no
+usable record, so there is no slot to walk.
+
+**Completeness travels with the answer.** `SessionTree.chain` returns a
+`ChainReading` pairing the walk with the scan's own `incomplete`, for the reason
+`TreeReading` is a pair and with a sharper consequence: a predecessor the scan never
+admitted -- past `TREE_UNIT_CAP`, or a unit whose bytes faulted -- is absent from
+the records, so the walk reports `missing` for a log that is on disk and readable.
+The walk cannot tell those apart; only the scan can.
+
+**Order comes from the edges, never from a timestamp.** `header.createdAt` is wall
+clock, so a backward step across a restart gives the newer log the earlier stamp and
+two creates inside one millisecond tie. The edge inverts in neither case, which is
+why it was recorded.
+
+One gap is inherited rather than introduced, and the walk cannot detect it: an
+allocation whose replay is still pending does not publish its fresh id over the
+mapping, so two successive logs can cite one predecessor and the log between them is
+cited by nobody. It is tracked with the rest of the supersede work in #12148. No
+shipped route calls this walk yet; closing a superseded log's own interrupted turn
+and tool calls is a WRITE into another log and is tracked there too.
 
 ## 7. Savepoints on disk
 

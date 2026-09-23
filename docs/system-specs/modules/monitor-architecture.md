@@ -582,6 +582,19 @@ will try to read the subject out of it and find only alert timestamps.
 The document is rewritten whole and atomically, so it is a snapshot rather than
 a log. Anything that needs a history needs its own append-only file.
 
+The subject's own history has one: the owner session's crew log. When the service
+publishes an observation whose fingerprint differs from the one it held, the
+delivery controller appends one `object/observed` entry -- producer `probe`, the
+kind, the subject's full URL, the fingerprint and the canonical snapshot verbatim --
+into the log of the session the monitor was armed from
+(`crew-log-core.md`, `docs/reference/crew-log/session-types.md`). Once per change
+of fingerprint, never per poll, and independent of the wake decision, because the
+record is about the subject rather than about what the engine chose to do about it.
+A failed read, an observation taken under a superseded configuration generation,
+and a slot with no live session each append nothing; the persistence-only shadow
+path has no owner session and appends nothing either. The state document is
+unchanged by this: the history lives in the log, not beside the bookkeeping.
+
 ### 6. Driver
 
 A driver decides when a tick happens. Two are supported, and the difference
@@ -933,15 +946,30 @@ Both are properties of the engine rather than of the key, and both are what an
 operator is actually buying, so the key's help text names them.
 
 **Half of a review-ready objective is invisible to the typed provider.** A
-structured observation carries lifecycle, checks, mergeability, review decision
-and review-thread counts, and nothing else; `docs/architecture/mcp.md` states the
-same boundary from the tool's side ("requests that need comments or advisory
-findings route directly to the finite legacy tool whose agent turn can inspect
-them"). On this repository that is not a corner case: a pull request reaches
-`readiness: passed` only once every non-PASS whole-design verdict carries a
-disposition, and those verdicts live in comment bodies. A green typed board and an
-unanswered advisory finding are indistinguishable to a probe, which is why the
-prompt loop keeps `gate=false` for that evidence in both positions of this key.
+structured observation carries lifecycle, checks, mergeability, review decision,
+review-thread counts and a digest over the PR-level comment bodies, and nothing
+else; `docs/architecture/mcp.md` states the same boundary from the tool's side
+("requests that need comments or advisory findings route directly to the finite
+legacy tool whose agent turn can inspect them"). On this repository that is not a
+corner case: a pull request reaches `readiness: passed` only once every non-PASS
+whole-design verdict carries a disposition, and those verdicts live in comment
+bodies. The digest wakes the owner when such a body changes, but a green typed
+board with an unanswered advisory finding whose text never changed is still
+indistinguishable to a probe, which is why the prompt loop keeps `gate=false` for
+that evidence in both positions of this key.
+
+The PR-level comment-body digest is carried as one condition,
+`review_comment_bodies:<digest>`, with severity `WAKE` and `resets_on` `NEVER`:
+a comment belongs to the conversation, not to the commit under review, so a
+force-push must not replay it. The digest is inside the KEY rather than only the
+brief, because the engine dedupes per condition key and a stable key with a
+changing brief would be masked and never wake again -- a bot rewrites its verdict
+in place, so `created_at` does not move and only a digest over the bodies sees the
+change. An empty digest carries no condition, and the provider emits an empty
+digest on an incomplete comment read, so a page that keeps failing cannot wake the
+owner forever. Each comment body is reduced to a fixed-width fingerprint at the
+point of retention, so what the probe keeps does not scale with how much a
+reviewer wrote and no body text survives into the condition key.
 
 **An armed structured monitor is not freely swappable, though the key is.**
 Flipping the key back restores the previous wording on the next tool-list build

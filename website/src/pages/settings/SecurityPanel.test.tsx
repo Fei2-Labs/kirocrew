@@ -1908,6 +1908,51 @@ describe('SecurityPanel — rule search', () => {
     expect(screen.getByLabelText(PINNED_DESC)).toBeInTheDocument()
   })
 
+  it('the raw category KEY matches the whole category (aws-destructive)', async () => {
+    // The display label is "Aws Destructive"; the id-shaped spelling users copy
+    // from config and audit logs is `aws-destructive`. Both must land.
+    const box = await renderRules()
+    fireEvent.change(box, { target: { value: 'aws-destructive' } })
+
+    expect(await screen.findByLabelText(TOGGLE_DESC)).toBeInTheDocument()
+    expect(screen.getByLabelText(PINNED_DESC)).toBeInTheDocument()
+    expect(screen.getByText(/2 \/ 2 rules/)).toBeInTheDocument()
+  })
+
+  it('a full rule id matches exactly that rule', async () => {
+    const box = await renderRules()
+    fireEvent.change(box, { target: { value: 'aws-destructive-ec2-terminate-instances' } })
+
+    expect(await screen.findByLabelText(PINNED_DESC)).toBeInTheDocument()
+    expect(screen.queryByLabelText(TOGGLE_DESC)).not.toBeInTheDocument()
+  })
+
+  it('a dotted <category>.<slug> id spelling matches the same rule', async () => {
+    const box = await renderRules()
+    fireEvent.change(box, { target: { value: 'aws-destructive.ec2-terminate-instances' } })
+
+    expect(await screen.findByLabelText(PINNED_DESC)).toBeInTheDocument()
+    expect(screen.queryByLabelText(TOGGLE_DESC)).not.toBeInTheDocument()
+  })
+
+  it('an id fragment matches every rule whose id contains it', async () => {
+    // `cfn-delete-stack` appears only in the id: the description says
+    // "CloudFormation" and the pattern says "cloudformation", neither "cfn".
+    const box = await renderRules()
+    fireEvent.change(box, { target: { value: 'cfn-delete' } })
+
+    expect(await screen.findByLabelText(TOGGLE_DESC)).toBeInTheDocument()
+    expect(screen.queryByLabelText(PINNED_DESC)).not.toBeInTheDocument()
+  })
+
+  it('custom patterns match on their id too', async () => {
+    const box = await renderRules()
+    fireEvent.change(box, { target: { value: 'user-2' } })
+
+    expect(await screen.findByText(NOTED_PATTERN)).toBeInTheDocument()
+    expect(screen.queryByText(USER_PATTERN)).not.toBeInTheDocument()
+  })
+
   it('the category badge keeps the SHIPPED denominator while filtered', async () => {
     // The load-bearing assertion of this feature: a filter must never make the
     // gate read as smaller than it is. Showing "1/1" for a single hit inside a

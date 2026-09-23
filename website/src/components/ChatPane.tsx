@@ -25,6 +25,7 @@ import ChatFooter from '../pages/chat/ChatFooter'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
+import { useJevAutoSend } from '../pages/chat/useJevAutoSend'
 import type { DisplayItem } from '../pages/chat/types'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from './AgentDropdownList'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
@@ -42,6 +43,7 @@ import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
@@ -399,7 +401,10 @@ export default function ChatPane({
   useEffect(() => { setFollowUpPicked(new Set()) }, [followUpOptionsKey, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
   // with the page and no extra request is made for a pane.
-  const { data: dashCfg } = useQuery<{ quick_send?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
+  const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
+  // Whether the split send button may offer `Auto (Jev)`: the fleet ceiling and
+  // the owner's consent, both the gateway's answers (see useJevAutoSend).
+  const jevAutoConsented = useJevAutoSend()
   // Follow-up bar layout: the same persisted setting ChatPage reads, kept live
   // the same way (ChatPage.tsx's reload listener) — a pane is long-lived, so a
   // one-shot read would leave it on the old layout after the user changes the
@@ -480,12 +485,31 @@ export default function ChatPane({
   const hiddenModelIds = hiddenModelsQ.data
   const modelPickerConfigured = useModelPickerConfigured()
   const availableModels = effectiveModels
+  // Same two reads and the same fail-closed rule as ChatPage: a split pane is
+  // another view of the same sessions, so it offers the same row or the picker
+  // would disagree with itself about whether routing is available. The dashboard
+  // config comes from this component's EXISTING observer (widened above) rather
+  // than a second one on the same key.
+  const jevConsentQ = useQuery({
+    queryKey: ['decisionsConsent'],
+    queryFn: () => api.getDecisionsConsent(),
+    retry: false,
+  })
+  // Not offered for a remote-bound session, for the reason ChatPage states: its
+  // turns run on the peer and never reach the routing hook.
+  const jevRouteOn =
+    jevRouteOffered(dashCfg, jevConsentQ.data, !!paneSlot) && !paneRemoteCrew.isRemote
+  const jevRouteLabel = i18nT('pages.chatPage.model_auto_jev_description')
   const modelPickerModels = useMemo(
-    () => filterInteractiveModels(effectiveModels, hiddenModelIds, [
-      paneSlot?.model || '',
-      paneSlot?.served_model || '',
-    ]),
-    [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model],
+    () => withJevRoute(
+      filterInteractiveModels(effectiveModels, hiddenModelIds, [
+        paneSlot?.model || '',
+        paneSlot?.served_model || '',
+      ]),
+      jevRouteOn,
+      jevRouteLabel,
+    ),
+    [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model, jevRouteOn, jevRouteLabel],
   )
   const modelDD = useFilteredDropdown(modelPickerModels)
   // Picker anchors: keep each portaled menu glued to the ChatInput chip that
@@ -570,7 +594,15 @@ export default function ChatPane({
           const r = await api.chatSlotModel(slotKey, name)
           return r?.model ?? name
         },
-        (value) => dispatch(updateSlot({ key: slotKey, model: value })))
+          // The routing flag is written from the REQUEST, not from the response's
+          // `model`: the gateway resolves the sentinel to `auto`, so the stored
+          // model cannot tell a routed pick from a plain Auto one. Written on
+          // every pick, because picking a concrete model is what clears it.
+        (value) => dispatch(updateSlot({
+          key: slotKey,
+          model: value,
+          jev_route: name === JEV_ROUTE_MODEL,
+        })))
     } catch (e) {
       // Same failure surface as switchAgent above: the shared notice toast,
       // plus the in-pane notice (the toast alone would be the only report of
@@ -910,7 +942,7 @@ export default function ChatPane({
   // kiro-cli's steer channel is TEXT-ONLY, so attachments ride as ChatPage's
   // steer sends them — inlined by prepareSendPayload (images as markdown, other
   // files as `[attached_file N]` tokens), the same wire shape doSend now uses.
-  const doSteer = useCallback(() => {
+  const doSteer = useCallback((opts?: { auto?: boolean }) => {
     // Nothing to inject into: busy purely because background sub-agents are
     // still running (the parent turn already ended). Same intent — act on
     // this now — so start a real turn through the normal send path with the
@@ -949,7 +981,11 @@ export default function ChatPane({
     // Cleared HERE (not in ChatInput) so text and attachments clear atomically.
     setInput('')
     setPendingFiles([])
-    void sendTurn({ message: txt, slot: slotKey, steer: true, meta: steerMeta }).then((receipt) => {
+    // `auto` hands the steer-or-queue choice to the gateway for this message
+    // (`decisions/points/message_steer.py`); the receipt policy below is unchanged,
+    // because a decided send still comes back as a steer's `dispatched` or a
+    // queue's `queued`.
+    void sendTurn({ message: txt, slot: slotKey, steer: opts?.auto === true ? 'auto' : true, meta: steerMeta }).then((receipt) => {
       // Receipt policy, owned once in chat-core (issue #9457) -- the same
       // rulings as ChatPage's steerMutation. applySteerReceipt decides WHICH
       // ruling; the adapter below is this pane's HOW.
@@ -1200,6 +1236,9 @@ export default function ChatPane({
           // Split-view panes leave --mc-input-width UNSET so ChatInput keeps
           // its own fallback — byte-for-byte the pre-prop behavior.
           ...(followContentWidth ? { '--mc-input-width': CONTENT_WIDTH[chatConfig.contentWidth].input } : {}),
+          // Unlike content width, message font size is not a follow/independent
+          // choice per pane — it is one reading preference, so every pane gets it.
+          '--mc-message-font-size': `${chatConfig.messageFontSize}px`,
         } as React.CSSProperties}
       >
         {!frameless && (
@@ -1286,6 +1325,7 @@ export default function ChatPane({
                 images={pinnedState.images}
                 bodyBeyondPreview={pinnedState.bodyBeyondPreview}
                 pushUp={pinnedState.push}
+                liveH={pinnedState.liveH}
                 bannerH={pinnedState.bannerH}
                 expanded={pin.pinExpanded}
                 onToggleExpanded={() => setPinExpanded(p => !p)}
@@ -1295,6 +1335,7 @@ export default function ChatPane({
                 })}
                 cardRef={pin.pinCardRef}
                 onCollapsedHeight={pin.onPinCollapsedHeight}
+                scrollTranscriptBy={pin.scrollTranscriptBy}
               />
             </div>
           )}
@@ -1575,6 +1616,10 @@ export default function ChatPane({
           // `steer-only` host gets a plain send that steers.
           canSteer={busy}
           onSteer={doSteer}
+          // AND a turn actually running: `busy` also covers a slot whose
+          // sub-agents are still working, where the send starts a fresh turn and
+          // there is no running turn for the point to decide about.
+          jevAutoAvailable={jevAutoConsented && running}
           busyMode={busyMode}
           autoFocusKey={slotKey}
           agentName={paneAgentName}
@@ -1588,6 +1633,9 @@ export default function ChatPane({
           agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
           modelName={shownModel}
           modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
+          // See ChatPage: the slot's RAW model, because `shownModel` substitutes
+          // the served id and would hide every routed turn.
+          modelIsJevRouted={jevRouteOn && isUnpinnedModel(paneSlot?.model)}
           contextPct={contextPct}
           contextUsedTokens={contextTokens?.used}
           contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
@@ -1760,7 +1808,7 @@ export default function ChatPane({
               </div>
             )}
             <div role="listbox" aria-label={i18nT('components.chatPane.model_list')} className="overflow-y-auto max-h-[280px]">
-              <ModelDropdownList models={modelDD.filtered} activeModel={shownModel} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
+              <ModelDropdownList models={modelDD.filtered} activeModel={jevRouteShownModel(shownModel, paneSlot)} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
             </div>
             {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
               modelDD.setOpen(false)

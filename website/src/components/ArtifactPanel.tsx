@@ -72,8 +72,11 @@ const STACKED_SIDEBAR_STYLE: React.CSSProperties = { maxHeight: 280, minHeight: 
 
 /** Submit-to-chat bar with an optional "Add instruction" affordance. The
  *  free-form note is threaded through as the `extraPrompt` arg only when the
- *  toggle is open, and cleared after submit. */
-function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = true }: {
+ *  toggle is open, and cleared after submit.
+ *
+ *  Exported so the standalone artifact page can put the SAME bar in the comments
+ *  sidebar's footer, rather than growing a second one that drifts. */
+export function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = true }: {
   count: number; submitting: boolean; onSubmit: (extraPrompt?: string) => void
   /** Bleed to the panel edges (non-fullscreen, inside the negative-margin
    *  content wrapper). Fullscreen uses its own padding, so omit it there. */

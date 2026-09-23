@@ -21,6 +21,10 @@ from typing import Any
 from urllib.parse import urlencode
 
 from kiro_crew import mcp_core
+from kiro_crew.lesson_validation import (
+    LESSON_APPLIES_INSTRUCTION,
+    LESSON_REFUSED_AT_CAPACITY,
+)
 from kiro_crew.validation import (
     LEARN_ADD_SCHEMA,
     LESSON_LIST_LIMIT,
@@ -133,6 +137,11 @@ def schemas() -> list[dict[str, Any]]:
                             "durable preference that should always apply. Omitted "
                             "means it applies everywhere."
                         ),
+                    },
+                    "applies": {
+                        "type": "string",
+                        "enum": ["always", "on_topic"],
+                        "description": LESSON_APPLIES_INSTRUCTION,
                     },
                 },
                 "required": ["rule", "category"],
@@ -282,6 +291,12 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
     repo_scope = args.get("repo_scope", "")
     if repo_scope:
         payload["repo_scope"] = repo_scope
+    # Forwarded only when the model stated it. An omitted value leaves the row
+    # unstated rather than asserting a tier on the model's behalf, which is the
+    # one thing no caller here may do: the tier records the user's intent.
+    applies = args.get("applies", "")
+    if applies:
+        payload["applies"] = applies
     d = mcp_core._post("/api/lessons", payload)
     err_val = d.get("error")
     if err_val:
@@ -351,6 +366,16 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
             "wording that shares few significant words with it can coexist."
         )
     if outcome == "refused":
+        if reason == LESSON_REFUSED_AT_CAPACITY:
+            return (
+                f"Lesson was NOT saved{scope_note}: the lesson store is at its row "
+                "cap and every retained row outranks this one, so nothing was stored "
+                "and the correction is not in effect. The wording is not the problem "
+                "-- rewording it will not help. Free a row with learn_remove (read "
+                "the store with learn_list first) and re-submit, or tell the user the "
+                "store is full."
+                f"{lost}"
+            )
         if reason == "volatile_session_fact":
             return (
                 "Error: volatile_session_fact: lesson was NOT saved. Runtime model "
@@ -464,7 +489,10 @@ def learn_list(name: str, args: dict[str, Any]) -> str:
             if le.get("withheld_reason") == "volatile_session_fact"
             else ""
         )
-        lines.append(f"[{le.get('category', '?')}] {le['rule']}{withheld}{_scope_suffix(le)}")
+        lines.append(
+            f"[{le.get('category', '?')}] {le['rule']}{withheld}"
+            f"{_applies_suffix(le)}{_scope_suffix(le)}"
+        )
     text = "\n".join(lines)
     if len(text) > _LIST_RENDER_BUDGET:
         # ``sanitize_response`` cuts the TAIL of a response over the cap, and
@@ -520,6 +548,26 @@ def _window_int(value: Any, default: int) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return default
+
+
+def _applies_suffix(row: dict[str, Any]) -> str:
+    """Mark a row filed as a past finding; render nothing for a standing rule.
+
+    Only ``on_topic`` is marked, because it is the only tier that changes whether
+    the row arrives: a standing rule and an untiered row are both injected every
+    session, so marking one of those two and not the other would show a
+    difference the injection path does not make. Rendering the common case bare
+    is the same policy ``_scope_suffix`` uses for a global row.
+
+    This exists because the overflow notices point the reader HERE. A rule the
+    model misfiled as a finding stops arriving on unrelated sessions, and without
+    this marker the listing the notice recommends is the one place that cannot
+    show why -- leaving re-tiering (remove plus re-add with the right tier)
+    impossible to even diagnose.
+    """
+    if row.get("applies") == "on_topic":
+        return " (applies: on_topic)"
+    return ""
 
 
 def _scope_suffix(row: dict[str, Any]) -> str:

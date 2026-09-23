@@ -1,9 +1,12 @@
-# Setting up a Remote Instance on EC2
+# Setting up Remote Crew on an EC2 instance
 
 You run the Kiro Crew gateway on an EC2 box and drive it from your laptop. The
-gateway always binds **loopback only**, so you reach it through a tunnel — either
-an **SSH tunnel** or an **AWS SSM Session Manager** tunnel. This page covers both,
-plus the EC2-specific gotchas people actually hit (from `kirocrew doctor`).
+gateway binds **loopback by default**, so you reach it through a tunnel — either
+an **SSH tunnel** or an **AWS SSM Session Manager** tunnel. (`KIROCREW_BIND` is
+the explicit, container-oriented bind override described in the linked remote
+guide.)
+This page covers both, plus the EC2-specific gotchas people actually hit (from
+`kirocrew doctor`).
 
 > Installing the gateway itself (host requirements, packages, running it as a
 > service, moving your state over) is covered in
@@ -22,7 +25,7 @@ plus the EC2-specific gotchas people actually hit (from `kirocrew doctor`).
 | Best when | you already SSH to the box | the box has zero SSH ingress (the hardened default) |
 
 Both end at the same loopback gateway and both are managed identically once
-registered in **Settings → Remote Instances**.
+registered in **Settings → Remote Crew**.
 
 ## Way 1 — SSH tunnel
 
@@ -36,8 +39,8 @@ registered in **Settings → Remote Instances**.
    Then open `http://localhost:5476`. Run `kirocrew token` on the box to mint the
    sign-in URL. (Full details, including a non-default port, in
    [remote-and-mobile.md](remote-and-mobile.md#ssh-tunnel-laptop).)
-2. To let the dashboard manage it, add it in **Settings → Remote Instances → Add remote
-   instance → Connection method = SSH tunnel**, giving the **SSH host / alias** and the
+2. To let the dashboard manage it, add it in **Settings → Remote Crew → Add remote
+   crew → Connection method = SSH tunnel**, giving the **SSH host / alias** and the
    **remote port**.
 
 ## Way 2 — AWS SSM Session Manager (no inbound SSH)
@@ -49,7 +52,7 @@ port, no SSH key.
 - **Automated (recommended):** the one-command launcher provisions a box, installs
   the gateway, and registers it over SSM for you — see
   [cloud-instance-ssm-vs-ssh.md](cloud-instance-ssm-vs-ssh.md).
-- **Manual (a box you already have):** **Settings → Remote Instances → Add remote instance →
+- **Manual (a box you already have):** **Settings → Remote Crew → Add remote crew →
   Connection method = AWS SSM Session Manager**, then fill **SSM target** (the EC2
   instance id `i-…`, or an SSM managed-instance id `mi-…`), optional **AWS profile**
   / **AWS region** / **Remote user**, and the **Remote port** (the gateway's real
@@ -78,9 +81,9 @@ spawn — fails closed. Pick one:
 
   Then restart the gateway.
 - **Or opt into unsandboxed execution (trades isolation — only on a box you
-  trust).** Run `kirocrew setup` (it offers this interactively), or set
-  `agent.sandbox_allow_unsandboxed_exec: true` in `~/.kiro/crew/config.json`, then
-  restart the gateway. This lets agent subprocesses run without any sandbox.
+  trust).** Run `kirocrew setup` (it offers this interactively), or run
+  `kirocrew config set agent.sandbox_allow_unsandboxed_exec true`, then restart
+  the gateway. This lets agent subprocesses run without any sandbox.
 
 ### Gateway/pods die on logout: "linger disabled"
 
@@ -168,7 +171,7 @@ port into the CSRF allowlist — see
 - **`ffmpeg: not found`**: only needed for speech-to-text. Install ffmpeg into
   `/usr/local/bin` (a location Kiro Crew searches; it's not in the AL2023 repos),
   or fetch a decoder from the dashboard Speech-to-Text card
-  (Settings > Voice, then Download now).
+  (Settings → Speech-to-Text, then Download now).
 - **`Vector Memory … vendored runtime failed to load`** — the in-process embedding
   runtime couldn't load its shared library on this host; memory falls back
   gracefully and keeps working. Safe to ignore unless you specifically rely on

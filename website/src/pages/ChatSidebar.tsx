@@ -1,7 +1,7 @@
 import { useState, useRef, useReducer, useEffect, useLayoutEffect, memo, useMemo, useCallback, useId, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 import { LayoutGroup, AnimatePresence, motion } from 'framer-motion'
-import { Plus, X, Pin, Monitor, Eye, EyeOff, VenetianMask, Ghost, FolderPlus, MessageSquare, MessageSquarePlus, MessagesSquare, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, GripVertical, Zap, Check, Copy, List, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Repeat, Server } from 'lucide-react'
+import { Plus, X, Pin, Monitor, Eye, EyeOff, VenetianMask, Ghost, FolderPlus, MessageSquare, MessageSquarePlus, MessagesSquare, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, CornerDownRight, GripVertical, Zap, Check, Copy, List, ListTree, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Repeat, Server } from 'lucide-react'
 import GithubLogo from '../components/icons/GithubLogo'
 import GitlabLogo from '../components/icons/GitlabLogo'
 import { FolderBody } from '../components/FolderBody'
@@ -9,7 +9,7 @@ import ErrorNotice, { ErrorNoticeMenuItem } from '../components/ErrorNotice'
 import JiraLogo from '../components/icons/JiraLogo'
 import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import FolderGlyph from '../components/FolderGlyph'
-import { DndContext, closestCenter, pointerWithin, useDroppable, useDndContext, DragOverlay, MeasuringStrategy, type DragEndEvent, type DragStartEvent, type DragOverEvent, type CollisionDetection } from '@dnd-kit/core'
+import { DndContext, closestCenter, pointerWithin, useDroppable, useDndContext, DragOverlay, MeasuringStrategy, type DragEndEvent, type DragStartEvent, type DragOverEvent, type CollisionDetection, type Collision } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy, useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -24,30 +24,31 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuIte
 import { ContextMenu, ContextMenuTrigger, ContextMenuContent } from '../components/ui/context-menu'
 import { offlineProps } from '../utils/offline'
 import { switchSlot, createSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, clearSlotReveal, selectSidebarSubagentCounts, selectSidebarApprovalCounts, selectSidebarWorkflowActive, selectSidebarWorkflowActiveKeys, selectSidebarAutomationRunningKeys, selectAutomationForSlot } from '../store/chatSlice'
-import { sseSlotTitle, setSidebarOrder, slotIsRemoteBound } from '../store/dashboardSlice'
+import { sseSlotTitle, setSidebarOrder, slotIsRemoteBound, fetchSlots } from '../store/dashboardSlice'
 import { useDigitModifierHeld, jumpLabelFor, IS_MAC } from '../hooks/useKeyboardShortcuts'
 import { api, SEARCH_MIN_CHARS } from '../api/client'
 import { ApiError } from '../api/apiError'
 import { errMessage } from '../utils/thunkError'
 import { findReport, type ErrorReport } from '../utils/errorReport'
-import { computeReorderedFolders } from '../utils/reorderFolders'
+import { computeSiblingReorder } from '../utils/reorderFolders'
 import { computeRecentRank, recencyTintShadow, clampTintCount } from '../utils/recencyTint'
 import { computeActiveSubtree, folderIsHidden, folderOffersHide } from '../utils/folderVisibility'
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
 import { highlightText } from '../utils/highlightText'
 import { boardCollapseKey, boardColumnFromDroppableId, loadBoardFolderCollapse, persistBoardOverride, persistClearFolderOverrides, clearFolderOverrides } from '../utils/boardFolderCollapse'
 import { slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
-import { toolStatusLabel } from '../utils/toolStatusLabel'
+import { toolStatusLabel, type ToolStatusDetail } from '../utils/toolStatusLabel'
 import { sessionRefBlockReason, type SessionRefBlockReason } from '../utils/sessionRefs'
 import { SearchInput, Input, Btn, IconButton, IconButtonGroup } from '../components/ui'
 import SimpleSelect from '../components/SimpleSelect'
 import FolderConfigModal from '../components/FolderConfigModal'
 import ModelDropdownList from '../components/ModelDropdownList'
-import { useAvailableModels } from '../hooks/useAvailableModels'
+import { useAvailableModelsQuery } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useDndSensors } from '../hooks/useDndSensors'
 import { useSessionPalette } from '../hooks/useSessionPalette'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
+import { ancestorsOf, buildLineage, descendantsOf, orphanCitation } from '../lib/sessionLineage'
 import useMoveUndo from '../hooks/useMoveUndo'
 import { useSelectInstance } from '../hooks/useSelectInstance'
 import { useReducedMotion } from '../hooks/useReducedMotion'
@@ -64,7 +65,7 @@ import { useDocumentImeLatch, useImeGuard } from '../hooks/useImeGuard'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import ResizeHandle from '../components/ResizeHandle'
-import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FILTER_MENU_LABEL_CLS, FILTER_MENU_CONTENT_CLS } from '../components/SearchFilterBar'
+import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FilterMenuLabel, FilterMenuContent } from '../components/SearchFilterBar'
 import { LIST_SHELL_CLS, LIST_HEADER_CLS, LIST_TITLE_CLS, LIST_BODY_CLS, ROW_BOX_CLS, ROW_IDLE_CLS, ROW_ACTIVE_CLS, ROW_META_CLS, ROW_TITLE_CLS, ROW_STATUS_CLS } from '../components/listShell'
 import { safeSetItem } from '../utils/safeStorage'
 import { PINNED_SESSION_ORDER_CHANGED_EVENT, PINNED_SESSION_ORDER_KEY, movePinnedSession, persistPinnedSessionOrder, readPinnedSessionOrder, reconcilePinnedSessionOrder } from '../utils/pinnedSessionOrder'
@@ -239,22 +240,50 @@ function isOpenInTabModifierClick(e: React.MouseEvent): boolean {
  *  keeps one identity while the query has no data. */
 const NO_TAGS: ChatTag[] = []
 
-/** Translate a slot's running-status line. The status `text` is stored as a raw
- *  English literal by the websocket layer (a plain `.ts` module the i18n codemod
- *  never scans), so it must be localized at render time. The two fixed phases
- *  (`thinking`/`streaming`) map to catalog keys; a `tool` phase or a
- *  server-supplied status carries its own dynamic text and is passed through.
- *
- *  A `tool` phase honors the user's `simplifiedToolNames` preference (purpose vs
- *  raw tool title) via toolStatusLabel, so the row agrees with the inline tool
- *  pill in the transcript rather than always showing the purpose. */
-function slotStatusText(detail: { kind?: string; text?: string; toolName?: string } | undefined, simplifiedToolNames: boolean, uiLang: string): string {
-  if (detail?.kind === 'streaming') return i18nT('pages.chatSidebar.streaming')
-  if (detail?.kind === 'thinking' && detail.text === 'Thinking…') return i18nT('pages.chatSidebar.thinking')
+/** A slot's running-status line. Every phase resolves through toolStatusLabel:
+ *  the fixed phases (`thinking`/`streaming`) carry no copy in the store and map
+ *  to catalog keys at render time, a server-supplied status (also
+ *  `kind: 'thinking'`, with its own `label`) is passed through, and a `tool`
+ *  phase honors the user's `simplifiedToolNames` preference (purpose vs raw tool
+ *  title), so the row agrees with the inline tool pill in the transcript rather
+ *  than always showing the purpose. The generic copy covers whatever resolves to
+ *  nothing (an `idle` phase caught before the slot list refreshes). */
+function slotStatusText(detail: ToolStatusDetail | undefined, simplifiedToolNames: boolean, uiLang: string): string {
   return toolStatusLabel(detail, simplifiedToolNames, uiLang) || i18nT('pages.chatSidebar.thinking')
 }
 
 /** Sortable wrapper for a folder block — enables drag-to-reorder */
+/**
+ * Whether the pointer sits in the nest band of a collided folder's HEADER.
+ *
+ * Anchored to the MEASURED header height, not a constant. The droppable rect
+ * spans the whole folder BLOCK (header + expanded body), so a fraction of
+ * `rect.height` would balloon the nest zone on an expanded folder. The header is
+ * the block's first child; its real height differs by layout — list headers
+ * (text-sm py-1.5) are taller than board headers (text-[12px] py-1) — so a
+ * single px constant that fit one layout mis-sized the other (the board
+ * over-nest bug). Reading the header rect makes the middle-60% band correct for
+ * both. Falls back to `FOLDER_HEADER_DROP_BAND`, clamped to the block, if the
+ * node is unavailable (e.g. before first measure).
+ *
+ * A drag with no pointer coordinates (keyboard / synthetic activation) has no
+ * band: there is no "where on the row" for it to answer, so it is never a nest.
+ *
+ * Shared by both folder branches of `sidebarCollision` so root and nested rows
+ * disambiguate reorder from re-parent by the same rule — the asymmetry #10428
+ * reported was a nested row having only one of the two gestures at all.
+ */
+function isFolderNestBandHit(args: Parameters<CollisionDetection>[0], collision: Collision): boolean {
+  if (!args.pointerCoordinates) return false
+  const rect = collision?.data?.droppableContainer?.rect?.current
+  if (!rect) return false
+  const node = collision?.data?.droppableContainer?.node?.current
+  const headerEl = node?.firstElementChild as HTMLElement | null
+  const headerH = headerEl?.getBoundingClientRect().height
+    || Math.min(rect.height, FOLDER_HEADER_DROP_BAND)
+  return isFolderNestBand(args.pointerCoordinates.y - rect.top, headerH)
+}
+
 /**
  * Folder reordering and session-to-folder assignment share one DndContext but
  * want different collision behavior:
@@ -271,17 +300,30 @@ export const sidebarCollision: CollisionDetection = (args) => {
     type?: string
     nested?: boolean
     subtree?: string[]
+    siblings?: readonly string[]
     pinned?: boolean
     container?: string
   } | undefined
   const activeType = activeData?.type
   if (activeType === 'folder') {
     const subtree = new Set(activeData?.subtree ?? [])
+    // The ring this drag may re-order within: the rows sharing its container.
+    // Every folder row — root and nested — is a `folder` droppable, so without
+    // this a closest-center fallback could resolve to a row in a DIFFERENT
+    // container; that is a re-parent gesture, and routing it to the reorder path
+    // renumbers nothing, which reads as the drag having been ignored. Absent
+    // (drag data predating the field), every folder row stays eligible, which is
+    // what the root lane did when it was the only sortable level.
+    const siblings = activeData?.siblings
+    const reorderContainers = args.droppableContainers.filter(c => {
+      if ((c.data?.current as { type?: string } | undefined)?.type !== 'folder') return false
+      return siblings ? siblings.includes(String(c.id)) : true
+    })
     if (activeData?.nested) {
-      // Nested subfolder drag: the gesture is re-parenting, not reordering.
-      // Target the innermost folder-drop zone under the pointer (or the root
-      // lane to move to top level), excluding the dragged folder's own
-      // subtree so it can never be dropped into itself or a descendant.
+      // Nested subfolder drag: BOTH gestures, same as a root row. Target the
+      // innermost folder-drop zone under the pointer (or the root lane to move to
+      // top level), excluding the dragged folder's own subtree so it can never be
+      // dropped into itself or a descendant.
       // Innermost = leaf-first by DOM containment: the root lane is every
       // folder's ancestor with a viewport-sized box, so pointerWithin's
       // box-size ranking would resolve a pointer on a tall expanded folder to
@@ -292,11 +334,35 @@ export const sidebarCollision: CollisionDetection = (args) => {
         return d?.type === 'folder-drop' && !(d.folderId && subtree.has(d.folderId))
       })
       const within = pointerWithinDeepest({ ...args, droppableContainers: dropContainers })
+      // The thirds rule, consulted only when the innermost zone under the pointer
+      // belongs to a SIBLING: the middle band of that header re-parents INTO it,
+      // its edges and everything below fall through to the sibling reorder. A
+      // pointer on any other container's header is unambiguous — there is no
+      // reorder to fall through to there — so it stays a re-parent at every
+      // offset, exactly as it did before nested rows were reorderable.
+      const innermost = within[0]
+      const innermostId = (innermost?.data?.droppableContainer?.data?.current as { folderId?: string | null } | undefined)?.folderId
+      if (innermost && innermostId && siblings?.includes(innermostId)
+        && !isFolderNestBandHit(args, innermost)) {
+        return closestCenter({ ...args, droppableContainers: reorderContainers })
+      }
       // A pointer drag outside every drop zone deliberately has NO target
       // (releasing there keeps the current parent). A drag WITHOUT pointer
-      // coordinates (keyboard / synthetic activation) has no such "outside",
-      // so it degrades to closestCenter rather than resolving to nothing.
+      // coordinates (keyboard / synthetic activation) has no such "outside", so
+      // it degrades to closestCenter -- and it must degrade to the SIBLING RING,
+      // not to the folder-drop zones. A keyboard drag has no "where on the row",
+      // so it can never land in a nest band; resolving it against folder-drop
+      // makes every keyboard drop a re-parent, which would leave a keyboard user
+      // with exactly the harm #10428 reports (an order only an agent can set)
+      // while the row walks its ring on screen. The root branch already lands
+      // here for the same reason: its whole thirds block is gated on
+      // `args.pointerCoordinates`, so a keyboard root drag falls straight to
+      // `closestCenter(reorderContainers)`. This is that same line, one level
+      // down. Without a sibling ring (drag data predating the field) there is no
+      // reorder to offer, so it keeps the folder-drop resolution it had when
+      // re-parent was a nested row's only gesture.
       if (within.length || args.pointerCoordinates) return within
+      if (siblings) return closestCenter({ ...args, droppableContainers: reorderContainers })
       return closestCenter({ ...args, droppableContainers: dropContainers })
     }
     // Root folder drag: two gestures share the drag, disambiguated by where
@@ -323,32 +389,14 @@ export const sidebarCollision: CollisionDetection = (args) => {
       })
       const within = pointerWithin({ ...args, droppableContainers: dropContainers })
       const first = within[0]
-      const rect = first?.data?.droppableContainer?.rect?.current
-      if (rect) {
-        // Anchor the nest band to the MEASURED header height, not a constant.
-        // The droppable rect spans the whole folder BLOCK (header + expanded
-        // body), so a fraction of rect.height would balloon the nest zone on an
-        // expanded folder. The header is the block's first child; its real
-        // height differs by layout — list headers (text-sm py-1.5) are taller
-        // than board headers (text-[12px] py-1) — so a single px constant that
-        // fit one layout mis-sized the other (the board over-nest bug). Reading
-        // the header rect makes the middle-60% band correct for both. Falls back
-        // to FOLDER_HEADER_DROP_BAND, clamped to the block, if the node is
-        // unavailable (e.g. before first measure).
-        const node = first?.data?.droppableContainer?.node?.current
-        const headerEl = node?.firstElementChild as HTMLElement | null
-        const headerH = headerEl?.getBoundingClientRect().height
-          || Math.min(rect.height, FOLDER_HEADER_DROP_BAND)
-        const offsetY = args.pointerCoordinates.y - rect.top
-        if (isFolderNestBand(offsetY, headerH)) {
-          return [first]
-        }
+      // Anchor the nest band to the MEASURED header height, not a constant —
+      // isFolderNestBandHit owns that reasoning, and the nested branch above
+      // reads it the same way.
+      if (first && isFolderNestBandHit(args, first)) {
+        return [first]
       }
     }
-    const folderContainers = args.droppableContainers.filter(
-      c => (c.data?.current as { type?: string } | undefined)?.type === 'folder'
-    )
-    return closestCenter({ ...args, droppableContainers: folderContainers })
+    return closestCenter({ ...args, droppableContainers: reorderContainers })
   }
   // Session drag. Containment first, leaf-first by DOM containment: the root
   // lane is the folders' ancestor but its border box is only viewport-sized
@@ -625,8 +673,8 @@ function DisclosureChevron({ open, size, className = '' }: { open: boolean; size
   return <ChevronRight size={size} className={`shrink-0 transition-transform duration-200 ${open ? 'rotate-90' : ''} ${className}`.trimEnd()} />
 }
 
-function SortableFolderBlock({ folder, subtree, renderFolderBlock }: { folder: ChatFolder; subtree?: readonly string[]; renderFolderBlock: (f: ChatFolder, depth: number, visited?: Set<string>, dragHandleProps?: React.HTMLAttributes<HTMLElement>, forceCollapsed?: boolean) => React.ReactNode[] }) {
-  const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: folder.id, data: { type: 'folder', subtree } })
+function SortableFolderBlock({ folder, subtree, siblings, renderFolderBlock }: { folder: ChatFolder; subtree?: readonly string[]; siblings?: readonly string[]; renderFolderBlock: (f: ChatFolder, depth: number, visited?: Set<string>, dragHandleProps?: React.HTMLAttributes<HTMLElement>, forceCollapsed?: boolean) => React.ReactNode[] }) {
+  const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: folder.id, data: { type: 'folder', subtree, siblings } })
   const style = { transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1, position: 'relative' as const }
   // The whole folder header is the drag handle (pointer + touch): dragging the
   // row reorders the folder — no grip, consistent with session-card drag. Only
@@ -640,6 +688,54 @@ function SortableFolderBlock({ folder, subtree, renderFolderBlock }: { folder: C
   return (
     <div ref={setNodeRef} style={style} className="relative" data-folder-sortable={folder.id}>
       {renderFolderBlock(folder, 0, undefined, listeners as unknown as React.HTMLAttributes<HTMLElement>, isDragging)}
+    </div>
+  )
+}
+
+/**
+ * Sortable wrapper for a NESTED subfolder row — the same wrapper
+ * `SortableFolderBlock` is for a root row, one level down.
+ *
+ * A nested row was a bare draggable until #10428, which made its ONLY possible
+ * outcome a re-parent: with no sortable id it registered no reorder target and
+ * appeared in no sibling ring, so a person could be shown an order an agent had
+ * set with `chat_folder_move`'s `before` / `after` and had no way to change it.
+ * Registering it here closes that, and it closes it by reusing the root path
+ * rather than adding a second one: the gesture, the collision band, the
+ * renumber and the endpoint are all the ones root rows already use.
+ *
+ * `siblings` is the ring this row may move within, which is what keeps the two
+ * levels from bleeding into each other. Every folder row is now a `folder`
+ * droppable, so without it a drag's closest-center fallback could resolve to a
+ * row in a different container — a reorder gesture that renumbers nothing,
+ * which reads as the drag having been ignored.
+ *
+ * `disabled` while renaming, matching the bare-draggable behaviour it replaces:
+ * a drag started on a text input would steal the caret.
+ */
+function SortableSubfolderBlock({ folder, depth, visited, subtree, siblings, disabled, renderFolderBlock }: {
+  folder: ChatFolder
+  depth: number
+  visited: ReadonlySet<string>
+  subtree?: readonly string[]
+  siblings?: readonly string[]
+  disabled?: boolean
+  renderFolderBlock: (f: ChatFolder, depth: number, visited?: Set<string>, dragHandleProps?: React.HTMLAttributes<HTMLElement>, forceCollapsed?: boolean) => React.ReactNode[]
+}) {
+  const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: folder.id,
+    disabled,
+    data: { type: 'folder', nested: true, subtree, siblings },
+  })
+  const style = { transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1 }
+  return (
+    <div ref={setNodeRef} style={style} data-subfolder-sortable={folder.id}>
+      {/* A CLONE of the ancestor path, never the caller's own set. This render
+       *  is deferred and re-invoked (StrictMode, `isDragging` flips), and
+       *  `renderFolderBlock` MUTATES the set it is handed — so sharing it would
+       *  make the second invocation hit the cycle guard, render the subfolder as
+       *  `[]`, and the folder would vanish mid-drag. */}
+      {renderFolderBlock(folder, depth, new Set(visited), listeners as unknown as React.HTMLAttributes<HTMLElement>, isDragging)}
     </div>
   )
 }
@@ -700,6 +796,23 @@ interface Slot {
   key: string
   title?: string
   running: boolean
+  /**
+   * The session that OPENED this one through `session_create`, or null when nobody
+   * did. Comes straight off the slots broadcast (`_attach_slot_parents`).
+   *
+   * `slot` is this session's own citation, read from its crew log, and survives
+   * everything. `key` is the creator's row key IN THIS PAYLOAD -- so a bare slot key
+   * here, matching `Slot.key` -- and is null when the creator is not running or the
+   * records formed a cycle. A row can therefore cite a creator it cannot nest under,
+   * which is the orphan the conductor lane marks with a muted prefix.
+   */
+  parent?: { slot?: string; key?: string | null } | null
+  /** Present and true while the gateway's lineage projection is still seeding for the
+   *  current store, which makes THIS frame's `parent` provisional rather than final.
+   *  Absent on an ordinary frame, and absent when there is nothing to wait for (the
+   *  crew log is off), so it never asks a client to come back for an answer that will
+   *  not change. */
+  lineage_pending?: boolean
   /** Peer OWNERSHIP, present ONLY on a row sourced from a connected remote
    *  instance's live slot list (see `useInstanceSessions`). Absent on every local
    *  slot, so a consumer tests presence to decide whether the local-only
@@ -1578,6 +1691,16 @@ interface SessionRowProps {
   scope: string
   navScope: string
   holdContainer: string
+  /** The conductor lane's three additions, and ONLY when that lane renders the row.
+   *
+   *  They are passed INTO the row rather than wrapped around it. A wrapper that put
+   *  the chevron and the counts beside the card narrowed the card itself: its title
+   *  truncated early, its own divider (inset to the content x) stopped short of the
+   *  row, and the counts landed in the column the top line keeps for the timestamp.
+   *  Handed in here, the row is byte-identical to the flat lane's plus the indent,
+   *  the chevron, and a count cluster sitting immediately left of the time --
+   *  which is what `ChatSidebar.laneCardParity.test.tsx` holds it to. */
+  conductor?: ConductorRowExtras
   isActive: boolean
   connected: boolean
   isOut: boolean
@@ -1773,7 +1896,7 @@ function compareLocalPinnedThenSort(
  *  is subscribed to HERE, slot-scoped, so a background event re-renders only
  *  the row it belongs to. */
 const SessionRow = memo(function SessionRow({
-  slot: s, showDivider, scope, navScope, holdContainer, isActive, connected, isOut, isPinned, isUnread, isRunning,
+  slot: s, showDivider, scope, navScope, holdContainer, conductor, isActive, connected, isOut, isPinned, isUnread, isRunning,
   recent, recentTintCount, subagentCount, subagentApprovalCount, digitBadge,
   isRenaming, renamingHere, renameValue, revealFlash, dragInFlight, activeDraggedKey, activeDraggedPinnedIndex, pinnedOrderIndex, pinnedReorderEnabled, onPinnedKeyboardReorder, rowAnimEnabled,
   defaultAgent, mode, isMobile, colorMode, installedAgents, tagById, paletteColors, boost, boostFor,
@@ -1837,12 +1960,82 @@ const SessionRow = memo(function SessionRow({
   // shallowEqual because the map is rebuilt per run event; the primitives only
   // change when THIS slot's runs do.
   const wf = useAppSelector(st => selectSidebarWorkflowActive(st)[normalizeRunSessionKey(localSlotKey)], shallowEqual)
+    // The conductor lane's count cluster, built HERE so it can sit inside the card's
+    // own meta group. The lane hands over numbers and renders none of this itself,
+    // which is what keeps one card implementation across every lane.
+    const conductorMeta = conductor && (
+      conductor.childCount > 0
+      || conductor.aggregate != null
+      || conductor.orphanOf != null
+      || conductor.citesParent != null
+      || conductor.depth > CONDUCTOR_MAX_INDENT_DEPTH
+    ) ? (
+      <>
+        {conductor.depth > CONDUCTOR_MAX_INDENT_DEPTH && (
+          // Past the indent cap the rows stop stepping right, so the level is carried
+          // as a number rather than lost. Prefixed with a middot so it is not read as
+          // one more count: it sits in the same cluster as the child and aggregate
+          // numbers, and a bare digit there says nothing about which kind it is.
+          <span className="text-muted tabular-nums shrink-0"
+            title={i18nT('pages.chatSidebar.nesting_depth', { depth: conductor.depth })}
+            data-testid={`conductor-depth-${rowIdentity}`}>&middot;{conductor.depth}</span>
+        )}
+        {conductor.orphanOf != null && (
+          <span className="inline-flex items-center text-muted shrink-0"
+            title={i18nT('pages.chatSidebar.opened_by_closed_session', { slot: conductor.orphanOf })}
+            data-orphan-of={conductor.orphanOf}
+            data-testid={`conductor-orphan-${rowIdentity}`}>
+            <CornerDownRight size={11} className="lucide-inline"
+              aria-label={i18nT('pages.chatSidebar.opened_by_closed_session', { slot: conductor.orphanOf })} />
+          </span>
+        )}
+        {conductor.orphanOf == null && conductor.citesParent != null && (
+          // Same glyph, different fact: this creator is open, the lane just is not
+          // nesting right now (search flattens every match to one level). Without it a
+          // flattened child looks exactly like a session nobody opened.
+          <span className="inline-flex items-center text-muted shrink-0"
+            title={i18nT('pages.chatSidebar.opened_by_session', { slot: conductor.citesParent })}
+            data-cites-parent={conductor.citesParent}
+            data-testid={`conductor-cites-parent-${rowIdentity}`}>
+            <CornerDownRight size={11} className="lucide-inline"
+              aria-label={i18nT('pages.chatSidebar.opened_by_session', { slot: conductor.citesParent })} />
+          </span>
+        )}
+        {conductor.childCount > 0 && (
+          <span className="text-muted tabular-nums shrink-0"
+            title={i18nT('pages.chatSidebar.sessions_this_one_opened')}
+            data-testid={`conductor-child-count-${rowIdentity}`}>{conductor.childCount}</span>
+        )}
+        {/* Each aggregate count carries the SAME glyph its children show on their own
+         *  rows, so the two read as the same fact at two zoom levels. Tint alone
+         *  distinguished them before, which is invisible to a colour-blind reader and
+         *  gone entirely in a high-contrast theme. The child count above stays plain:
+         *  it has no per-child glyph to echo. */}
+        {conductor.aggregate != null && conductor.aggregate.needsYou > 0 && (
+          <span className="inline-flex items-center gap-0.5 px-1 rounded bg-accent-subtle text-accent tabular-nums shrink-0"
+            title={i18nT('pages.chatSidebar.needs_your_answer')}
+            data-testid={`conductor-needs-you-${rowIdentity}`}>
+            <MessageCircleQuestionMark size={10} className="lucide-inline shrink-0" aria-hidden />
+            {conductor.aggregate.needsYou}
+          </span>
+        )}
+        {conductor.aggregate != null && conductor.aggregate.running > 0 && (
+          <span className="inline-flex items-center gap-0.5 px-1 rounded bg-bg-hover text-muted tabular-nums shrink-0"
+            title={i18nT('pages.chatSidebar.running_session', { count: conductor.aggregate.running })}
+            data-testid={`conductor-running-${rowIdentity}`}>
+            <Loader2 size={10} className="lucide-inline shrink-0 animate-spin" aria-hidden />
+            {conductor.aggregate.running}
+          </span>
+        )}
+      </>
+    ) : null
+
     // Flat view shares the tree's layoutId namespace so Framer Motion treats a
     // row as the SAME element across the view toggle and animates it from its
     // tree position into the flat lane (and back). Safe: the two views are
     // ternary branches — never mounted simultaneously — so IDs can't collide.
     // Behavior stays keyed on the real scope.
-    const layoutScope = scope === 'flat' ? 'list' : scope
+    const layoutScope = scope === 'flat' || scope === 'conductor' ? 'list' : scope
     // List and flat rows use dnd-kit. Board columns retain native HTML5 drag
     // because a card drop there changes status-column membership.
     //
@@ -2417,6 +2610,13 @@ const SessionRow = memo(function SessionRow({
         {({ setNodeRef: setPinnedDropRef, isOver: isPinnedDropOver }) => (
       <motion.div ref={setPinnedDropRef} layout={rowAnimEnabled ? 'position' : false} layoutId={rowAnimEnabled ? `slot-${layoutScope}-${rowIdentity}` : undefined}
         data-slot-key={s.key}
+        {...(conductor ? {
+          // On the OUTERMOST row element, which is the card plus its divider. Same
+          // marker and same meaning as before the lane stopped wrapping the card:
+          // this row is nested under the session that opened it.
+          'data-conductor-depth': conductor.depth,
+          ...(conductor.depth > 0 ? { 'data-testid': 'conductor-nested-row' } : {}),
+        } : {})}
         initial={rowAnimEnabled ? { opacity: 0, x: -12 } : false}
         animate={{ opacity: 1, x: 0 }}
         transition={{ layout: { type: 'spring', stiffness: 500, damping: 35 }, opacity: { duration: 0.2 }, x: { duration: 0.2 } }}>
@@ -2625,6 +2825,40 @@ const SessionRow = memo(function SessionRow({
            *  contributed nothing to the content column, so removing it moves no x —
            *  see ChatSidebar.folderAlignment.test.tsx, which still asserts the
            *  row's `pl-3.5` is the content column's whole left offset. */}
+          {/* The conductor lane's indent and chevron, INSIDE the row. Two reasons they
+           *  are here rather than in a wrapper around the card: the divider is a
+           *  sibling of this row, so it keeps spanning the full width at every depth;
+           *  and the card keeps the row's whole width, so its title truncates and its
+           *  hover controls sit exactly where they do in every other lane. */}
+          {conductor && conductor.depth > 0 && (
+            <span aria-hidden="true" className="shrink-0"
+              data-conductor-indent={Math.min(conductor.depth, CONDUCTOR_MAX_INDENT_DEPTH)}
+              style={{ width: `${Math.min(conductor.depth, CONDUCTOR_MAX_INDENT_DEPTH) * 14}px` }} />
+          )}
+          {conductor && (conductor.childCount > 0 ? (
+            <button
+              type="button"
+              className="mt-2.5 mr-0.5 w-4 h-4 shrink-0 rounded flex items-center justify-center border-none bg-transparent text-muted hover:text-text cursor-pointer"
+              // Both stopped, like the row's other inner controls: this button owns the
+              // press, and the row's own click would otherwise switch session as well.
+              onMouseDown={e => e.stopPropagation()}
+              onClick={e => { e.stopPropagation(); conductor.onToggle() }}
+              title={conductor.expanded
+                ? i18nT('pages.chatSidebar.collapse_sessions_this_one_opened')
+                : i18nT('pages.chatSidebar.expand_sessions_this_one_opened')}
+              aria-label={conductor.expanded
+                ? i18nT('pages.chatSidebar.collapse_sessions_this_one_opened')
+                : i18nT('pages.chatSidebar.expand_sessions_this_one_opened')}
+              aria-expanded={conductor.expanded}
+              data-testid={`conductor-chevron-${rowIdentity}`}
+            >
+              <DisclosureChevron open={conductor.expanded} size={12} />
+            </button>
+          ) : (
+            // Keeps a childless row's card aligned with its siblings' rather than
+            // shifted left by the missing chevron.
+            <span className="mt-2.5 mr-0.5 w-4 h-4 shrink-0" aria-hidden="true" />
+          ))}
           <div className="flex-1 min-w-0 overflow-hidden">
             <div className={`session-agent-label ${ROW_META_CLS} font-semibold truncate flex items-center gap-1 ${agentColor}`}>
               {/* Plain keyed span, deliberately unanimated: 200+ per-row
@@ -2783,8 +3017,13 @@ const SessionRow = memo(function SessionRow({
                *  both read as a stutter. Folder membership is carried by the tree
                *  itself in folder view; in flat view the row's own context menu
                *  still names it. */}
-              {slotActivityTs(s) || isPinned ? (
+              {slotActivityTs(s) || isPinned || conductorMeta ? (
                 <span className="ml-auto inline-flex items-center gap-1 shrink-0">
+                  {/* FIRST in the group, so it sits immediately left of the timestamp
+                   *  and the timestamp keeps the position it has in every other lane.
+                   *  Inside the card's own meta group rather than beside the card:
+                   *  outside it, this cluster occupied the column the time uses. */}
+                  {conductorMeta}
                   {slotActivityTs(s) && <span className="text-muted font-normal shrink-0">{fmtRelativeTime(slotActivityTs(s))}</span>}
                   {/* Last in the row: the pin is a state marker, not a label, so
                    *  it sits after the text that reads left-to-right rather than
@@ -2996,8 +3235,101 @@ export const SORT_LABEL_KEY: Record<SortKey, string> = {
   'name-asc': 'pages.chatSidebar.sort_name_asc',
   'name-desc': 'pages.chatSidebar.sort_name_desc',
 }
-/** Flat view ("explode chats out of folders") persistence key. */
+/** Flat view ("explode chats out of folders") persistence key.
+ *
+ *  LEGACY. Superseded by `SIDEBAR_LANE_LS_KEY`, and still read once at mount so a
+ *  user who had flat view on keeps it: see `readStoredLane`. Still WRITTEN by the
+ *  folder-create path, which turns flat view off, because a build that rolls back
+ *  must not strand that user in a lane they were moved out of.
+ */
 const FLAT_VIEW_LS_KEY = 'mc-sidebar-flat-view'
+
+/**
+ * Which session lane the list renders. One persisted preference, three values.
+ *
+ * `tree` is the folder hierarchy. `flat` explodes every chat out of its folder into
+ * one recency-sorted lane. `conductor` nests each session under the session that
+ * OPENED it (`session_create`), which is a different axis from folders entirely: a
+ * conductor and the workers it spawned are one unit of work wherever their folders
+ * put them.
+ *
+ * An enum rather than two booleans because the lanes are mutually exclusive, and two
+ * independent flags would have a fourth state ("flat AND conductor") that means
+ * nothing and that every render site would have to decide about.
+ */
+type SidebarLane = 'tree' | 'flat' | 'conductor'
+
+/** Lane preference. Replaces the `FLAT_VIEW_LS_KEY` boolean. */
+const SIDEBAR_LANE_LS_KEY = 'mc-sidebar-lane'
+
+/** How many levels of conductor nesting still step the row to the right.
+ *
+ *  Lineage depth has no ceiling -- a conductor that opens a conductor nests as far as
+ *  the work does -- and each level costs 14px of a sidebar that is 320px at its
+ *  narrowest. Left uncapped, a deep chain walks the card off the right edge until the
+ *  title is unreadable. Past this depth the rows stop stepping and the level is shown
+ *  as a number instead, which keeps the information without the geometry. */
+const CONDUCTOR_MAX_INDENT_DEPTH = 6
+
+/** What the conductor lane adds to a session row, and nothing more.
+ *
+ *  Every field is a fact the LANE knows and the row cannot: how deep this row sits,
+ *  how many sessions it opened, whether those are hidden right now, and what its
+ *  subtree is asking for while they are. The row renders them; it derives none of
+ *  them, so the flat lane's row and this one stay the same component with the same
+ *  data. */
+interface ConductorRowExtras {
+  /** 0 for a root. Indents the row; capped at `CONDUCTOR_MAX_INDENT_DEPTH`. */
+  depth: number
+  /** Direct children. 0 renders no chevron and no count. */
+  childCount: number
+  expanded: boolean
+  onToggle: () => void
+  /** The collapsed subtree's asks, or null while it is open -- an open conductor's
+   *  children show their own, and both at once would count a session twice. */
+  aggregate: { needsYou: number; running: number } | null
+  /** The creator this row cites but could not nest under, because it has closed. */
+  orphanOf: string | null
+  /** The creator this row cites while the lane is NOT nesting it -- search flattens
+   *  every match to one level, so a child would otherwise be indistinguishable from a
+   *  session nobody opened. Distinct from `orphanOf`: that creator is gone, this one
+   *  is present and simply not above this row right now, and the two must not share a
+   *  tooltip that claims the session closed. */
+  citesParent?: string | null
+}
+
+/** Which conductor rows the user has expanded, as a JSON array of root keys. */
+const CONDUCTOR_EXPANDED_LS_KEY = 'mc-sidebar-conductor-expanded'
+
+/**
+ * The persisted lane, migrating the boolean this replaced.
+ *
+ * A stored `'1'` under the old key was flat view ON, so that user opens in `flat`
+ * rather than being silently reset to the tree. The new key wins whenever it holds a
+ * value this build recognises: an unknown string is treated as absent rather than
+ * refused, because the only honest reading of a lane name from a future build is
+ * "not one of mine".
+ */
+function readStoredLane(): SidebarLane {
+  const stored = localStorage.getItem(SIDEBAR_LANE_LS_KEY)
+  if (stored === 'tree' || stored === 'flat' || stored === 'conductor') return stored
+  return localStorage.getItem(FLAT_VIEW_LS_KEY) === '1' ? 'flat' : 'tree'
+}
+
+/** The expanded conductor roots, or an empty set when the value is unusable. */
+function readConductorExpanded(): Set<string> {
+  try {
+    const raw = localStorage.getItem(CONDUCTOR_EXPANDED_LS_KEY)
+    if (!raw) return new Set()
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return new Set()
+    return new Set(parsed.filter((k): k is string => typeof k === 'string' && k !== ''))
+  } catch {
+    // Collapsed-by-default is the documented default, so an unreadable value costs
+    // the user one re-expand rather than an error they cannot act on.
+    return new Set()
+  }
+}
 
 import { SIDEBAR_MIN, SIDEBAR_MAX } from './chat/sidebarWidth'
 export { SIDEBAR_MIN, SIDEBAR_MAX } from './chat/sidebarWidth'
@@ -3618,10 +3950,26 @@ function ChatSidebar({
   // recency-sorted list, for working temporally across many folders ("what's
   // the latest?"). Pure view projection — folder membership is untouched, and
   // toggling back restores the folder tree exactly as it was.
-  const [flatView, setFlatView] = useState(() => localStorage.getItem(FLAT_VIEW_LS_KEY) === '1')
-  const toggleFlatView = useCallback(() => {
-    setFlatView(v => { const next = !v; safeSetItem(FLAT_VIEW_LS_KEY, next ? '1' : '0'); return next })
+  const [lane, setLane] = useState<SidebarLane>(readStoredLane)
+  /** Derived, so every existing `flatView` read site keeps its exact meaning. */
+  const flatView = lane === 'flat'
+  const conductorView = lane === 'conductor'
+  /** Change the lane AND remember it. The ordinary path. */
+  const setLanePersisted = useCallback((next: SidebarLane) => {
+    setLane(next)
+    safeSetItem(SIDEBAR_LANE_LS_KEY, next)
+    // The legacy key is kept in step so a rollback to a build that only reads it
+    // lands the user in the same lane rather than a surprising one.
+    safeSetItem(FLAT_VIEW_LS_KEY, next === 'flat' ? '1' : '0')
   }, [])
+  /** Change the lane for THIS VISIT only, leaving the preference alone. Used by the
+   *  folder reveal, which has to leave a lane that renders no folder rows without
+   *  rewriting which lane the user opens the app in. */
+  const setLaneForVisit = useCallback((next: SidebarLane) => { setLane(next) }, [])
+  /** Back-compat shim for the reveal effect, which only ever turns flat view OFF. */
+  const setFlatView = useCallback((on: boolean) => {
+    if (!on) setLaneForVisit('tree')
+  }, [setLaneForVisit])
   const [activeFilters, setActiveFilters] = useState<Set<SessionFilterKey>>(() => {
     const initialFilters = new Set<SessionFilterKey>()
     for (const filterDef of SESSION_FILTERS) { if (localStorage.getItem(filterDef.storageKey) === '1') initialFilters.add(filterDef.key) }
@@ -3997,14 +4345,33 @@ function ChatSidebar({
   // Per-instance id: ChatPage mounts a mobile-drawer sidebar and a desktop one, so a
   // literal id would collide and point one panel's checkbox at the other's label.
   const bulkSkipRunningLabelId = useId()
-  const bulkModelOptions = useAvailableModels({ enabled: bulkModelOpen })
+  const bulkModelsQuery = useAvailableModelsQuery({ enabled: bulkModelOpen })
+  const bulkModelOptions = bulkModelsQuery.data
+  // The roster failed to load when EITHER flag is up. The ACP adapter never
+  // rejects: a 503 / network error / empty response resolves with the last-good
+  // cached list or Auto alone and marks the provider degraded, so `isError`
+  // alone would stay false through every real failure and the panel would show
+  // a one-entry list as if that were the whole catalog. Same pair Settings >
+  // Chat reads for its model selects.
+  const bulkModelsFailed = bulkModelsQuery.isError || bulkModelsQuery.isDegraded
+  // The pick counts only while the roster still lists it. A degraded roster is
+  // the last-good CACHED list, so a model can be picked from it, Retry can then
+  // succeed with a roster that no longer carries that model, and nothing else
+  // would unpick it: the backend accepts any non-registry id, so Switch would
+  // reset every session onto a model kiro-cli then refuses. Derived, not
+  // stored, so there is no window between the roster changing and the pick
+  // being cleared in which Switch could still fire with the stale id.
+  const bulkModelPick = useMemo(
+    () => (bulkModelOptions.some(m => m.name === bulkModel) ? bulkModel : ''),
+    [bulkModelOptions, bulkModel],
+  )
   const bulkRunningCount = useMemo(() => localSlots.filter(s => s.running).length, [localSlots])
   // Count only slots that would actually change: model differs from the target
   // (the backend leaves already-on-target slots as `unchanged`), minus running
   // slots when skipping. Keeps the "Switch N" label + disable guard honest.
   const bulkAffectedCount = useMemo(() => {
-    return localSlots.filter(s => (s.model ?? '') !== bulkModel && (!bulkSkipRunning || !s.running)).length
-  }, [localSlots, bulkModel, bulkSkipRunning])
+    return localSlots.filter(s => (s.model ?? '') !== bulkModelPick && (!bulkSkipRunning || !s.running)).length
+  }, [localSlots, bulkModelPick, bulkSkipRunning])
   const bulkModelMutation = useMutation({
     // 'auto' goes on the wire verbatim (not collapsed to ''): '' doubles as the
     // "never chosen" state that every reader re-resolves to the agent template's
@@ -4102,7 +4469,7 @@ function ChatSidebar({
 
   // ── Stale-session collapse ─────────────────────────────────────────────────
   // Sessions idle past the threshold collapse behind a per-container
-  // "Dormant sessions (N)" expander row, independently at every tree level (each
+  // "N dormant sessions hidden" expander row, independently at every tree level (each
   // folder body + the ungrouped root). Pinned, focused, running and
   // needs-input sessions are exempt: collapsing de-noises settled work, it is
   // never a place where live or deliberately-kept rows can disappear.
@@ -4228,19 +4595,32 @@ function ChatSidebar({
     const open = staleExpanded.has(containerId)
     const regionId = `stale-rows-${containerId}`
     const lblId = `stale-lbl-${containerId}`
-    const countId = `stale-count-${containerId}`
     const ctxId = `stale-ctx-${containerId}`
+    // One pluralised sentence carries the count AND says where the rows went,
+    // so a folder badge of "2" over one visible row plus "1 dormant session
+    // hidden" visibly adds up. A bare noun + count pill read as a category,
+    // not as "the rest are in here" (gui-user-test friction on this row).
+    const count = staleSlots.length
+    const label = open
+      ? i18nT('pages.chatSidebar.stale_collapse_row_shown', { count })
+      : i18nT('pages.chatSidebar.stale_collapse_row_hidden', { count })
+    // The threshold is otherwise only named in the sort/filter menu; the same
+    // compact window label ("7d") ties the row back to that setting.
+    const windowLabel = formatRecentWindow(staleCollapseMs)
+    const hint = open
+      ? i18nT('pages.chatSidebar.stale_collapse_row_hint_open', { window: windowLabel })
+      : i18nT('pages.chatSidebar.stale_collapse_row_hint', { window: windowLabel })
     return (
       <Fragment key={`stale-${containerId}`}>
-        {/* aria-labelledby composes the visible label + count badge + a
-            visually-hidden container name, so AT announces "Dormant sessions
-            3 <folder>" — an aria-label would drop the count (it overrides
-            button contents) and re-pluralizing it per locale is exactly the
-            concatenation trap the i18n rules ban. */}
+        {/* aria-labelledby composes the visible sentence + a visually-hidden
+            container name, so AT announces "1 dormant session hidden <folder>"
+            — an aria-label would override the button contents and re-composing
+            it per locale is exactly the concatenation trap the i18n rules ban. */}
         <button type="button"
           aria-expanded={open}
           aria-controls={regionId}
-          aria-labelledby={`${lblId} ${countId} ${ctxId}`}
+          aria-labelledby={`${lblId} ${ctxId}`}
+          title={hint}
           data-testid={`stale-expander-${containerId}`}
           onClick={() => setStaleExpanded(prev => {
             const next = new Set(prev)
@@ -4249,8 +4629,7 @@ function ChatSidebar({
           })}
           className="w-full flex items-center gap-1.5 px-3 py-0.5 rounded-md text-[11px] leading-4 text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
           <DisclosureChevron open={open} size={11} />
-          <span id={lblId}>{i18nT('pages.chatSidebar.stale_collapse_row')}</span>
-          <span id={countId} className="px-1 rounded-full bg-bg-hover text-[10px] tabular-nums">{staleSlots.length}</span>
+          <span id={lblId} className="tabular-nums">{label}</span>
           <span id={ctxId} className="sr-only">{containerName
             ? i18nT('pages.chatSidebar.stale_collapse_ctx_in_name', { name: containerName })
             : i18nT('pages.chatSidebar.stale_collapse_row_ungrouped')}</span>
@@ -5157,6 +5536,61 @@ function ChatSidebar({
   )
   const flatLaneActive = !boardLaneActive && flatView && folders.length > 0
 
+  /**
+   * Does any visible row actually have a creator that is also on screen?
+   *
+   * The conductor lane is only OFFERED when the answer is yes. A lane that renders
+   * exactly the flat list, with a chevron nowhere, is a dead position in the toggle
+   * cycle -- and the crew log can legitimately be off, in which case no row will ever
+   * carry a parent. Read off `filteredSlots`, the same list the lane renders, so the
+   * toggle never offers a lane the current filters have emptied of edges.
+   */
+  // While the gateway reports its lineage projection as still seeding, this frame's
+  // `parent` values are provisional. The seed deliberately does not broadcast when it
+  // lands (it would either write the slots coalescer's clock or add a frame, and both
+  // are load-bearing there), so the recovery is a READ repeated from here. It matters
+  // most on an IDLE gateway: with nothing running, no further frame is coming, and an
+  // unnested cold start would otherwise persist until the user happened to act.
+  //
+  // Backed off 2s/4s/8s and abandoned after ~30s, because this is a cosmetic catch-up,
+  // not a correctness loop: a seed that has not landed by then is not going to be fixed
+  // by asking again, and a sidebar polling forever is worse than one that nests late.
+  const lineagePending = useMemo(
+    () => localSlots.some(s => s.lineage_pending === true),
+    [localSlots],
+  )
+  useEffect(() => {
+    if (!lineagePending) return
+    let cancelled = false
+    let attempt = 0
+    const started = Date.now()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const tick = () => {
+      if (cancelled || Date.now() - started > 30_000) return
+      dispatch(fetchSlots())
+      attempt += 1
+      // 2s, 4s, 8s, then hold at 8s until the 30s budget runs out.
+      timer = setTimeout(tick, Math.min(2000 * 2 ** attempt, 8000))
+    }
+    timer = setTimeout(tick, 2000)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [lineagePending, dispatch])
+
+  const lineageAvailable = useMemo(
+    () => filteredSlots.some(s => s.parent?.key != null || s.parent?.slot),
+    [filteredSlots],
+  )
+  // Gated on `lineageAvailable` as well as the board, and the reason is the toggle:
+  // it renders only when more than one lane is available, so with a persisted
+  // conductor preference, no edges and no folders the cycle holds `tree` alone, the
+  // button is not drawn at all, and an ungated lane would render a layout the user has
+  // no control to leave. Falling back is the safe direction -- the lane returns by
+  // itself the moment any row carries a creator again.
+  const conductorLaneActive = !boardLaneActive && conductorView && lineageAvailable
+
   // Scroll memory for the session lane. Collapsing the sessions sidebar (or
   // closing the mobile drawer) UNMOUNTS ChatSidebar — OverlayDrawer gates its
   // children on `open` — so the lane remounted at the top and a user who had
@@ -5169,7 +5603,7 @@ function ChatSidebar({
   // and out of scope here. See useLaneScrollMemory.
   const laneScrollRef = useRef<HTMLDivElement | null>(null)
   const laneScrollMemory = useLaneScrollMemory(
-    boardLaneActive ? null : `chat-sidebar-lane:${flatLaneActive ? 'flat' : 'tree'}`,
+    boardLaneActive ? null : `chat-sidebar-lane:${conductorLaneActive ? 'conductor' : flatLaneActive ? 'flat' : 'tree'}`,
     laneScrollRef,
   )
 
@@ -5183,7 +5617,7 @@ function ChatSidebar({
       && (el.dataset.sessionScope ?? '') === pin.scope
       && el.closest('[inert]') === null)
     if (!live) releaseHoverPin()
-  }, [filteredSlots, boardLaneActive, flatLaneActive, orderedColumns, releaseHoverPin])
+  }, [filteredSlots, boardLaneActive, flatLaneActive, conductorLaneActive, orderedColumns, releaseHoverPin])
 
   // The folder filter goes inert while searching, in BOTH views: a query must
   // reach every match, so an unchecked folder can never become a search dead
@@ -5333,6 +5767,162 @@ function ChatSidebar({
       return !(fid && filterHiddenSubtree.has(fid))
     })
   }, [filteredSlots, folderFilterActive, filterHiddenSubtree, slotFolders])
+
+  // ── conductor lane ───────────────────────────────────────────────────────
+  //
+  // Nests each session under the session that OPENED it. A different axis from
+  // folders: a conductor and the workers it spawned are one unit of work wherever
+  // their folders put them, and today they scatter through a recency-sorted list.
+
+  /**
+   * The lineage tree over the rows this lane renders.
+   *
+   * Built from `flatSlots` -- the flat lane's own ordered list -- so root order AND
+   * sibling order are the flat lane's order, with no comparator of its own. A second
+   * comparator would make the two lanes disagree about the same two sessions for no
+   * reason a user could see.
+   *
+   * Only computed while the lane is active: cheap, but still per-render work for a
+   * view nobody is looking at.
+   */
+  const lineage = useMemo(() => {
+    if (!conductorLaneActive) return null
+    // The tree is keyed by `sessionRowIdentity`, not by raw slot key: this list mixes
+    // local rows with rows federated from a peer, and the two namespaces collide on
+    // deterministic keys. Keyed raw, one of a colliding pair replaces the other -- a
+    // session disappears and its twin renders twice.
+    //
+    // A citation needs the same care from the other direction. `parent.key` is a bare
+    // slot key in the key space of the CHILD's own gateway, so the creator is the row
+    // carrying that key with the SAME origin. Resolving through this index rather than
+    // composing the qualified form keeps that format the server's alone, and makes a
+    // peer row unable to nest under a local row whose key merely matches.
+    //
+    // Nested by origin rather than keyed on one joined string: there is then no
+    // separator, so no peer id or slot key containing it can be read as the wrong pair.
+    const byOrigin = new Map<string | undefined, Map<string, string>>()
+    for (const s of flatSlots) {
+      let inOrigin = byOrigin.get(s.peer_id)
+      if (inOrigin === undefined) {
+        inOrigin = new Map<string, string>()
+        byOrigin.set(s.peer_id, inOrigin)
+      }
+      inOrigin.set(s.key, sessionRowIdentity(s))
+    }
+    return buildLineage(flatSlots, {
+      identityOf: sessionRowIdentity,
+      parentIdentityOf: s => {
+        const cited = s.parent?.key
+        if (cited == null) return null
+        return byOrigin.get(s.peer_id)?.get(cited) ?? null
+      },
+    })
+  }, [conductorLaneActive, flatSlots])
+
+  /**
+   * Which conductor rows are open. COLLAPSED by default, and persisted.
+   *
+   * Collapsed is the default that makes the lane worth having: a conductor with
+   * fourteen workers should read as one row with a count, not as fifteen rows the
+   * user has to skim past. The set is keyed by row key and survives a reload, because
+   * a user who opened a conductor to watch its workers has not finished watching them.
+   */
+  const [conductorExpanded, setConductorExpanded] = useState<Set<string>>(readConductorExpanded)
+  const persistConductorExpanded = useCallback((next: Set<string>) => {
+    safeSetItem(CONDUCTOR_EXPANDED_LS_KEY, JSON.stringify(Array.from(next)))
+  }, [])
+  const toggleConductorExpanded = useCallback((key: string) => {
+    setConductorExpanded(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      persistConductorExpanded(next)
+      return next
+    })
+  }, [persistConductorExpanded])
+
+  /**
+   * Open every ancestor of *key* so a nested row becomes visible.
+   *
+   * The conductor-lane counterpart of `expandFolderAncestors`, and needed for the same
+   * reason: revealing a row three levels down is pointless if the two rows above it
+   * are collapsed. Persisted like any other expand -- a reveal is a real navigation,
+   * not a peek.
+   *
+   * Reads the tree through a REF so this callback's identity never changes: it is a
+   * dependency of the reveal effect, and a new identity on every slots broadcast would
+   * re-run that effect continuously.
+   */
+  const lineageParentsRef = useRef<Map<string, string>>(new Map())
+  lineageParentsRef.current = lineage?.parentOf ?? lineageParentsRef.current
+  const expandConductorAncestors = useCallback((key: string) => {
+    setConductorExpanded(prev => {
+      const chain = ancestorsOf(key, lineageParentsRef.current)
+      if (chain.length === 0 || chain.every(k => prev.has(k))) return prev
+      const next = new Set(prev)
+      for (const k of chain) next.add(k)
+      persistConductorExpanded(next)
+      return next
+    })
+  }, [persistConductorExpanded])
+
+  /**
+   * The lanes that can actually render something, in cycle order.
+   *
+   * `tree` always can. `conductor` needs at least one edge -- the crew log can be off,
+   * and then no row will ever carry a parent, so the lane would be the flat list with
+   * a chevron nowhere. `flat` needs folders, which is the pre-existing rule. Offering
+   * a lane that renders identically to another is a dead position in the cycle, and the
+   * user has to press through it.
+   */
+  const availableLanes = useMemo<SidebarLane[]>(() => {
+    const out: SidebarLane[] = ['tree']
+    // Gated on the board too. `conductorLaneActive` is `!boardLaneActive && ...`, so
+    // with a board configured the lane cannot render and the press would change only
+    // the button's icon -- a position in the cycle that visibly does nothing. Flat is
+    // different and stays offered: it has a real in-column meaning.
+    if (lineageAvailable && !boardLaneActive) out.push('conductor')
+    if (folders.length > 0) out.push('flat')
+    return out
+  }, [lineageAvailable, boardLaneActive, folders.length])
+
+  /** Where the next press goes. The button's copy is derived from THIS rather than
+   *  from the current lane: the control's job is to say what it will do, and naming
+   *  the lane you are already in sends a screen-reader user somewhere else.
+   *
+   *  Advanced from the lane actually RENDERED, which is not always the stored one. A
+   *  stored lane whose conditions went away (a board got configured, the edges or the
+   *  folders went) is not in `availableLanes`, and indexing it directly gives -1, whose
+   *  successor is position 0 -- `tree`, the very thing already on screen. That is the
+   *  no-op this derivation exists to avoid, so an unavailable stored lane advances from
+   *  `tree` instead and the press lands somewhere visibly different. */
+  const nextLane = useMemo<SidebarLane>(() => {
+    const effective: SidebarLane = availableLanes.includes(lane) ? lane : 'tree'
+    const at = availableLanes.indexOf(effective)
+    return availableLanes[(at + 1) % availableLanes.length]
+  }, [availableLanes, lane])
+
+  /** The toggle's tooltip and aria-label: what the next press DOES.
+   *
+   *  Recomputed per render rather than memoized on purpose -- the strings come from
+   *  `i18nT`, and a memo keyed on the lane alone would keep serving the previous
+   *  language's copy after a switch. */
+  const laneSwitchLabel = nextLane === 'conductor'
+    ? i18nT('pages.chatSidebar.switch_to_conductor_view_nested_by_creator')
+    : nextLane === 'flat'
+      ? (boardLaneActive
+        ? i18nT('pages.chatSidebar.switch_to_flat_view_hide_folders_in_board_columns')
+        : i18nT('pages.chatSidebar.switch_to_flat_view_all_chats_without_folders'))
+      : (boardLaneActive
+        ? i18nT('pages.chatSidebar.show_folders_in_board_columns')
+        : i18nT('pages.chatSidebar.switch_to_folder_view'))
+
+  /** The single header button: tree -> conductor -> flat -> tree, skipping any lane
+   *  that cannot render. Named for what it does now; there is no segmented control,
+   *  because the sidebar's chrome stays Raycast-plain. */
+  const cycleLane = useCallback(() => {
+    setLanePersisted(nextLane)
+  }, [nextLane, setLanePersisted])
 
   // The order the chat-jump/cycle shortcuts should follow — the rows AS
   // RENDERED, read back from the DOM after every commit. Reading the render
@@ -5580,8 +6170,12 @@ function ChatSidebar({
     if (activeId === overId) return
     // Read latest from cache to avoid stale-closure ordering on rapid successive drags
     const current = queryClient.getQueryData<ChatFolder[]>(['chat-folders']) ?? []
-    const rootOnly = current.filter(f => !f.parent_id)
-    const changes = computeReorderedFolders(rootOnly, activeId, overId)
+    // Scoped to the dragged folder's own container, not to the root lane: a
+    // nested subfolder is reorderable among its siblings too, and `order` is a
+    // per-container index either way. The helper refuses a target outside that
+    // container, so a cross-container drop reaching here renumbers nothing --
+    // that gesture is a re-parent and the collision layer routes it as one.
+    const changes = computeSiblingReorder(current, activeId, overId)
     if (!changes.length) return
     // Snapshot the pre-drag order of exactly the rows this drag renumbers, so a
     // rejected write can be rolled back field-scoped rather than by restoring a
@@ -5816,6 +6410,17 @@ function ChatSidebar({
       setStaleExpanded(prev => (prev.has(container) ? prev : new Set(prev).add(container)))
     }
     if (slot.folder_id) expandFolderAncestors(slot.folder_id)
+    // Same need, the other axis: in the conductor lane the target may sit inside a
+    // collapsed conductor (and inside one collapsed inside another), and the retry
+    // loop below would scroll to a row that never rendered. Unconditional rather than
+    // gated on the lane being active -- a reveal arriving while the user is in the
+    // tree lane should leave the conductor lane already open at the right place for
+    // when they switch back, and for a row with no creator it is a no-op.
+    //
+    // Takes the ORIGIN-QUALIFIED identity for the same reason `runReveal` does below:
+    // the conductor tree is keyed that way, so a raw slot key would miss the row (or,
+    // on a collision, name the peer's).
+    expandConductorAncestors(sessionRowIdentity(slot))
     // Targeted by the `session` row marker (the ORIGIN-QUALIFIED identity), not
     // `data-slot-key`. Once peer rows are merged into this list the raw slot
     // key is no longer a unique namespace — a remote row with a byte-identical
@@ -5824,7 +6429,7 @@ function ChatSidebar({
     // session could scroll to the peer's row instead. `slot` above is resolved
     // from the LOCAL `slots` prop, so its identity is the right target.
     runReveal('session', key, sessionRowIdentity(slot))
-  }, [revealRequest, dispatch, localSlots, revealBlockingFilters, expandFolderAncestors, runReveal, isStaleExempt, slotFolders, staleCollapseMs, sortKey])
+  }, [revealRequest, dispatch, localSlots, revealBlockingFilters, expandFolderAncestors, expandConductorAncestors, runReveal, isStaleExempt, slotFolders, staleCollapseMs, sortKey])
   // ── Reveal a FOLDER row ───────────────────────────────────────────────────
   // The folder twin of the session reveal above, driven by the command launcher's
   // Folders group and the palette's Folders tab ("search a folder, land on it").
@@ -6042,12 +6647,20 @@ function ChatSidebar({
     } | undefined
     if (a?.type === 'folder') {
       if (a.nested) {
-        // Nested subfolder drag = re-parent: into the folder-drop target, or
-        // to the top level when dropped on the root lane (folderId null).
-        // moveFolderByDrag itself no-ops on the folder's current parent, so a
-        // drop resolving to it (easy to hit now that a tall parent's whole
-        // block is a reachable target) costs no write.
-        if (o?.type === 'folder-drop') moveFolderByDrag(active.id as string, o.folderId ?? null)
+        // Nested subfolder drag, both gestures. A folder-drop hit is the
+        // re-parent: into that folder, or to the top level when dropped on the
+        // root lane (folderId null). moveFolderByDrag itself no-ops on the
+        // folder's current parent, so a drop resolving to it (easy to hit now
+        // that a tall parent's whole block is a reachable target) costs no write.
+        if (o?.type === 'folder-drop') {
+          moveFolderByDrag(active.id as string, o.folderId ?? null)
+          return
+        }
+        // Otherwise a sortable hit (over.id = a sibling's folder id) = reorder
+        // among siblings, the same call the root lane makes. reorderFolders
+        // renumbers only the dragged folder's own container and refuses a target
+        // outside it, so a stray resolution is a no-op rather than a wrong move.
+        reorderFolders(active.id as string, over.id as string)
         return
       }
       // Root folder drag: a folder-drop hit only occurs via the header-band
@@ -6484,7 +7097,11 @@ function ChatSidebar({
     }).length
     // Board-view folders become sortable only when a drag handle is supplied
     // (root folders wrapped in SortableColumnFolder). Subfolders render without
-    // it (parity with list view, where only root folders reorder). Disabled
+    // one, so a board subfolder is not directly draggable at all — neither
+    // reordered nor re-parented. That is NOT parity with the list view, which
+    // has always given a nested row a drag (re-parent before #10428, reorder as
+    // well after it); giving the board lane the same gesture needs a handle this
+    // path does not pass down, so it stays a separate piece of work. Disabled
     // while renaming in THIS column (rename is per-column via editScope) so
     // the inline input stays usable.
     const draggable = !!dragHandleProps && !(editingId === folder.id && editScope === columnId)
@@ -6749,7 +7366,7 @@ function ChatSidebar({
   }, [])
 
   let sessionRowOrderStamp = 0
-  const renderSessionRow = (s: Slot, _indent: number, showDivider: boolean, scope = 'list', navScope = scope, holdContainer = navScope) => {
+  const renderSessionRow = (s: Slot, _indent: number, showDivider: boolean, scope = 'list', navScope = scope, holdContainer = navScope, conductor?: ConductorRowExtras) => {
     // Every per-slot lookup below is keyed by LOCAL slot key, and a peer key can
     // be byte-identical to a local one, so each is masked on `isPeer` rather than
     // trusted to miss. Note this is peer OWNERSHIP: a remote-EXECUTED local slot
@@ -6765,7 +7382,7 @@ function ChatSidebar({
         onAdoptPeerSession={adoptPeerSession}
         adoptPending={isPeer && !!adoptPending[rowIdentity]}
         adoptError={isPeer ? (adoptErrors[rowIdentity] || '') : ''}
-        showDivider={showDivider} scope={scope} navScope={navScope} holdContainer={holdContainer}
+        showDivider={showDivider} scope={scope} navScope={navScope} holdContainer={holdContainer} conductor={conductor}
         isActive={isActiveRow(s)} connected={connected} isOut={!isPeer && poppedOut.has(s.key)}
         isPinned={!isPeer && pinned.has(s.key)} isUnread={!isPeer && unreadSet.has(s.key)}
         isRunning={isPeer ? s.running === true : runningSet.has(s.key)}
@@ -6893,8 +7510,8 @@ function ChatSidebar({
   /**
    * While the search box narrows the list, does this folder's subtree still put
    * ANYTHING on screen? Answered without rendering, because the render cannot
-   * answer it: a nested block's `[]` is returned from inside `DndDraggable`'s own
-   * children function, which runs after `childNodes.push` has already committed
+   * answer it: a nested block's `[]` is returned from inside the subfolder
+   * wrapper's own render, which runs after `childNodes.push` has already committed
    * the wrapper — so `childNodes.length > 0` reads true for a subtree that draws
    * nothing, and both the drop gate and the header count believed it.
    *
@@ -7278,36 +7895,40 @@ function ChatSidebar({
     visited.add(folder.id)
     const childSlots = filteredSlots.filter(s => localSlotFolder(s, slotFolders) === folder.id)
     const childNodes: React.ReactNode[] = []
-    // Nested subfolders are plain draggables (not sortables): dragging one
-    // re-parents it — drop on another folder to move inside, or on the root
-    // lane to move to the top level. The subtree ids ride along in the drag
-    // data so collision detection can exclude self/descendants as targets.
+    // Nested subfolders are sortables, exactly as root folders are: dragging one
+    // either re-orders it among its siblings (drop on a sibling's edges or body)
+    // or re-parents it (drop on the middle band of another folder's header, or on
+    // the root lane to move it to the top level). Both gestures are the ones the
+    // root lane already has -- see SortableSubfolderBlock for why a nested row
+    // could previously only re-parent. The subtree ids ride along in the drag data
+    // so collision detection can exclude self/descendants as targets, and the
+    // sibling ids so a reorder cannot resolve into another container.
     //
     // `drawableChildFolders`, not a raw parent_id filter: while the list is
     // narrowed a child whose subtree draws nothing must be skipped HERE, before
-    // the push. The nested render returns `[]` from inside DndDraggable's
-    // children function, which runs long after this push, so a wrapper committed
-    // now can never be taken back — and `childNodes.length` is what the drop gate
-    // below and the header count both read.
-    for (const cf of drawableChildFolders(folder)) {
+    // the push. The nested render returns `[]` from inside the wrapper's own
+    // render, which runs long after this push, so a wrapper committed now can
+    // never be taken back -- and `childNodes.length` is what the drop gate below
+    // and the header count both read.
+    //
+    // One SortableContext per PARENT, holding exactly that parent's drawable
+    // children: `order` is a per-container index, so the ring a drag may move
+    // within is one container's children and nothing else. It renders no DOM of
+    // its own, so the row geometry the alignment guides pin is untouched.
+    const childFolderRows = drawableChildFolders(folder)
+    if (childFolderRows.length) {
+      const siblingIds = childFolderRows.map(f => f.id)
       childNodes.push(
-        <DndDraggable key={`subfolder-drag-${cf.id}`} id={cf.id}
-          data={{ type: 'folder', nested: true, subtree: [...(folderSubtrees.get(cf.id) ?? collectFolderSubtreeIds(folders, cf.id))] }}
-          disabled={editingId === cf.id}>
-          {({ setNodeRef, listeners, isDragging }) => (
-            <div ref={setNodeRef} style={{ opacity: isDragging ? 0.5 : 1 }}>
-              {/* This children function runs during DndDraggable's OWN render —
-               *  deferred and re-invoked (StrictMode, isDragging flips). Pass a
-               *  CLONE of the ancestor path: sharing the mutated `visited` set
-               *  makes the second invocation hit the cycle guard and render the
-               *  subfolder as [] (folder vanishes; drags die at drag-start).
-               *  The source collapses while dragging (same UX as root-folder
-               *  reorder); the layout shift this causes is compensated by the
-               *  drag-scoped droppable re-measure polling on the DndContext. */}
-              {renderFolderBlock(cf, depth + 1, new Set(visited), listeners as unknown as React.HTMLAttributes<HTMLElement>, isDragging)}
-            </div>
-          )}
-        </DndDraggable>
+        <SortableContext key={`subfolder-ring-${folder.id}`} items={siblingIds} strategy={verticalListSortingStrategy}>
+          {childFolderRows.map(cf => (
+            <SortableSubfolderBlock key={`subfolder-drag-${cf.id}`} folder={cf}
+              depth={depth + 1} visited={visited}
+              subtree={[...(folderSubtrees.get(cf.id) ?? collectFolderSubtreeIds(folders, cf.id))]}
+              siblings={siblingIds}
+              disabled={editingId === cf.id}
+              renderFolderBlock={renderFolderBlock} />
+          ))}
+        </SortableContext>
       )
     }
     // Bottom of THIS container's folder list: announce what the filter is
@@ -7766,7 +8387,7 @@ function ChatSidebar({
                  *  the Crew Members page's: the landing is what is unfinished, since the
                  *  created session opens in that crew's pane and the local list
                  *  does not yet show live remote sessions. Toggle lives in
-                 *  Settings > Remote Instances. */}
+                 *  Settings > Remote Crew. */}
                 {remoteCrewChatPreview && warmCrews.length > 0 && (() => {
                   const crewRows = warmCrews.map(c => (
                     <DropdownMenuItem key={c.id} data-testid={`new-chat-on-crew-${c.id}`}
@@ -7914,8 +8535,29 @@ function ChatSidebar({
         <div className="mx-2 mb-2 p-3 rounded-lg bg-bg border border-border shadow-md text-sm animate-rise">
           <div className="font-medium text-text-strong mb-2"><Cpu size={14} className="lucide-inline" /> {i18nT('pages.chatSidebar.switch_all_sessions')}</div>
           <div className="text-muted text-[12px] mb-2">{i18nT('pages.chatSidebar.pick_a_model_for_every_session_switching_a_sessi')} <span className="text-danger">{i18nT('pages.chatSidebar.resets_its_conversation')}</span>.</div>
+          {bulkModelsFailed && (
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+              {/* No hand-off: the chosen bulkModel/skipRunning selection is unsaved,
+                  and the navigation would discard it. Retry stays in the panel.
+                  Its own row above the listbox, wrapping the Retry button under
+                  the notice when the sidebar is too narrow for both: an inline
+                  notice sharing a fixed row collapses to one character per line
+                  at sidebar width, and the Cancel/Switch row below is already at
+                  the two-button limit. */}
+              <ErrorNotice
+                className="flex-1 min-w-[12rem]"
+                message={i18nT('pages.chatSidebar.model_list_failed')}
+                testId="bulk-model-roster-error"
+              />
+              <Btn
+                className="text-[12px] px-3 py-1 shrink-0"
+                disabled={bulkModelsQuery.isFetching}
+                onClick={() => bulkModelsQuery.refetch()}
+              >{i18nT('pages.chatSidebar.retry')}</Btn>
+            </div>
+          )}
           <div ref={bulkListRef} role="listbox" aria-label={i18nT('pages.chatSidebar.model_list')} tabIndex={-1} onKeyDown={bulkOnListKeyDown} className="max-h-[220px] overflow-y-auto rounded-md border border-border bg-bg-elevated p-1 mb-2 outline-hidden">
-            <ModelDropdownList models={bulkModelOptions} activeModel={bulkModel} onSelect={setBulkModel} />
+            <ModelDropdownList models={bulkModelOptions} activeModel={bulkModelPick} onSelect={setBulkModel} />
           </div>
           {bulkRunningCount > 0 && (
             <label className="flex items-center gap-2 text-[12px] text-muted mb-2 cursor-pointer">
@@ -7935,7 +8577,7 @@ function ChatSidebar({
           <ErrorNotice message={bulkModelError} className="mb-2" testId="bulk-model-error" />
           <div className="flex items-center gap-2 justify-end">
             <Btn className="text-[12px] px-3 py-1" onClick={() => { setBulkModelOpen(false); setBulkModel(''); setBulkModelError('') }}>{i18nT('pages.chatSidebar.cancel')}</Btn>
-            <Btn className="text-[12px] px-3 py-1 bg-accent text-accent-fg hover:bg-accent-hover" disabled={!bulkModel || bulkAffectedCount === 0 || bulkModelMutation.isPending} onClick={() => { setBulkModelError(''); bulkModelMutation.mutate({ model: bulkModel, skipRunning: bulkSkipRunning }) }}>{bulkModelMutation.isPending ? i18nT('pages.chatSidebar.switching') : i18nT('pages.chatSidebar.switch_session', { count: bulkAffectedCount })}</Btn>
+            <Btn className="text-[12px] px-3 py-1 bg-accent text-accent-fg hover:bg-accent-hover" disabled={!bulkModelPick || bulkAffectedCount === 0 || bulkModelMutation.isPending} onClick={() => { setBulkModelError(''); bulkModelMutation.mutate({ model: bulkModelPick, skipRunning: bulkSkipRunning }) }}>{bulkModelMutation.isPending ? i18nT('pages.chatSidebar.switching') : i18nT('pages.chatSidebar.switch_session', { count: bulkAffectedCount })}</Btn>
           </div>
         </div>
       )}
@@ -7962,29 +8604,54 @@ function ChatSidebar({
         clearLabel={i18nT('pages.chatSidebar.clear_search')}
         value={slotFilter}
         onChange={setSlotFilter}
-        trailingCount={folders.length > 0 ? 2 : 1}
+        trailingCount={availableLanes.length > 1 ? 2 : 1}
         trailing={(
           <>
-            {/* Flat-view toggle only makes sense when folders exist — without
-             *  them the list is already flat. */}
-            {folders.length > 0 && (
+            {/* ONE button cycling tree -> conductor -> flat, skipping any lane that
+             *  cannot render (see `availableLanes`). Deliberately not a segmented
+             *  control: the sidebar's chrome stays Raycast-plain, so the icon shows
+             *  the lane you are IN and the copy names where the next press goes.
+             *  Hidden entirely when only the tree is available, which is the
+             *  pre-existing "no folders, nothing to flatten" case. */}
+            {availableLanes.length > 1 && (
             <button
               type="button"
-              className={`relative w-6 h-6 rounded flex items-center justify-center cursor-pointer transition-colors border-none ${flatView ? 'text-accent bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'}`}
-              onClick={toggleFlatView}
-              /* With a board configured the toggle flattens INSIDE each column
-               * rather than producing the single flat lane, so the copy must
-               * not promise "all chats without folders" (one combined list). */
-              title={flatView
-                ? (boardLaneActive ? i18nT('pages.chatSidebar.show_folders_in_board_columns') : i18nT('pages.chatSidebar.back_to_folder_view'))
-                : (boardLaneActive ? i18nT('pages.chatSidebar.flat_view_hide_folders_in_board_columns') : i18nT('pages.chatSidebar.flat_view_all_chats_without_folders'))}
-              aria-label={flatView
-                ? (boardLaneActive ? i18nT('pages.chatSidebar.show_folders_in_board_columns') : i18nT('pages.chatSidebar.switch_to_folder_view'))
-                : (boardLaneActive ? i18nT('pages.chatSidebar.switch_to_flat_view_hide_folders_in_board_columns') : i18nT('pages.chatSidebar.switch_to_flat_view_all_chats_without_folders'))}
-              aria-pressed={flatView}
+              className={`relative w-6 h-6 rounded flex items-center justify-center cursor-pointer transition-colors border-none ${lane !== 'tree' ? 'text-accent bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'}`}
+              onClick={cycleLane}
+              /* Both strings describe the ACTION and are derived from `nextLane`, not
+               * from the lane in view: this is the feature's only entry point, so a
+               * label naming the current lane tells every user -- and every screen
+               * reader -- that the press goes somewhere it does not.
+               *
+               * With a board configured the toggle flattens INSIDE each column rather
+               * than producing the single flat lane, so the copy must not promise
+               * "all chats without folders" (one combined list). */
+              title={laneSwitchLabel}
+              aria-label={laneSwitchLabel}
+              /* NOT `aria-pressed`. This cycles three positions, and a boolean would
+               * announce the same "pressed" for conductor and for flat -- two different
+               * states told apart by nothing a screen reader hears. The lane in view is
+               * named instead, which is the fact a reader actually wants. */
+              data-lane={lane}
+              data-next-lane={nextLane}
               data-testid="flat-view-toggle"
             >
-              <List size={14} />
+              {/* Crossfaded rather than hard-swapped. One persistent button showing two
+                * different drawings on press reads as two different buttons -- a blind
+                * read of this control reported exactly that confusion -- and a short
+                * dissolve is what says "the same button changed" instead. */}
+              <AnimatePresence mode="wait" initial={false}>
+                <motion.span
+                  key={conductorView ? 'conductor' : 'list'}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.12 }}
+                  className="flex items-center justify-center"
+                >
+                  {conductorView ? <ListTree size={14} /> : <List size={14} />}
+                </motion.span>
+              </AnimatePresence>
             </button>
             )}
             <DropdownMenu open={filterSortOpen} onOpenChange={setFilterSortOpen}>
@@ -7995,12 +8662,8 @@ function ChatSidebar({
                   badge={filterCounts['unread']}
                 />
               </DropdownMenuTrigger>
-              {/* max-w keeps the menu inside a phone viewport. Radix sizes the
-                  popper wrapper to `max-content`, so the inline pickers' caption
-                  sentences (a phone renders them here instead of in a flyout)
-                  would otherwise stretch the menu past the screen edge. */}
-              <DropdownMenuContent align="end" className={FILTER_MENU_CONTENT_CLS}>
-                <DropdownMenuLabel className={FILTER_MENU_LABEL_CLS}>{i18nT('pages.chatSidebar.filter')}</DropdownMenuLabel>
+              <FilterMenuContent align="end">
+                <FilterMenuLabel>{i18nT('pages.chatSidebar.filter')}</FilterMenuLabel>
                 {SESSION_FILTERS.map(filterDef => {
                   const active = activeFilters.has(filterDef.key)
                   const slotCount = filterCounts[filterDef.key] ?? 0
@@ -8151,7 +8814,7 @@ function ChatSidebar({
                   )
                 })}
                 <DropdownMenuSeparator />
-                <DropdownMenuLabel className={FILTER_MENU_LABEL_CLS}>{i18nT('pages.chatSidebar.sort_by')}</DropdownMenuLabel>
+                <FilterMenuLabel>{i18nT('pages.chatSidebar.sort_by')}</FilterMenuLabel>
                 {SORT_OPTIONS.map(o => (
                   <DropdownMenuItem
                     key={o.value}
@@ -8263,9 +8926,9 @@ function ChatSidebar({
                 {tagFilterRows.length > 0 && (
                   <>
                     <DropdownMenuSeparator />
-                    <DropdownMenuLabel className={FILTER_MENU_LABEL_CLS}>
+                    <FilterMenuLabel>
                       {i18nT('pages.chatSidebar.tags')}
-                    </DropdownMenuLabel>
+                    </FilterMenuLabel>
                     {tagFilterRows.map(({ tag: t, count, selected }) => (
                       <DropdownMenuItem
                         key={t.id}
@@ -8362,7 +9025,7 @@ function ChatSidebar({
                     )}
                   </>
                 )}
-              </DropdownMenuContent>
+              </FilterMenuContent>
             </DropdownMenu>
           </>
         )}
@@ -8552,7 +9215,135 @@ function ChatSidebar({
             testId="instance-sessions-error"
           />
         )}
-        {flatLaneActive ? (
+        {conductorLaneActive ? (
+          // Conductor lane: every session nested under the session that OPENED it.
+          //
+          // The row is the EXISTING session card, unchanged — agent label, time,
+          // title, preview, PR chips, loop status, tags, needs-you. The lane adds
+          // three things and nothing else: indentation per depth, a chevron with a
+          // child count on a card that has children, and that subtree's aggregated
+          // badges while the card is collapsed. No compact row design: a nested
+          // session is the same object as a top-level one and reads the same.
+          //
+          // Search flattens it, the way the flat lane does: a query must reach every
+          // match, so a match three levels down inside a collapsed conductor cannot be
+          // hidden behind a chevron the user would have to guess at.
+          //
+          // DnD is off, like the flat lane's row order: position here is a function of
+          // who opened whom, so there is nothing a drop inside the lane could land on.
+          <motion.div ref={laneScrollRef} onScroll={laneScrollMemory.onScroll} layoutScroll={rowAnimEnabled} className={`${LIST_BODY_CLS} flex flex-col`} style={{ scrollbarWidth: 'none' }} data-testid="conductor-view-lane">
+            {folderCreateError && renderFolderCreateError(folderCreateError.folderId, folderCreateError.columnId)}
+            {(() => {
+              const tree = lineage
+              if (!tree) return null
+              const searching = slotFilter.trim() !== ''
+              // Keyed by identity, exactly as `lineage` is: a raw-key map would let a
+              // federated peer row overwrite the local row it collides with, so one
+              // session would vanish and the other would render twice.
+              const byKey = new Map(flatSlots.map(s => [sessionRowIdentity(s), s] as const))
+              const rows: Array<{ id: string; slot: Slot; depth: number; childCount: number; expanded: boolean; orphanOf: string | null; citesParent?: string | null; aggregate: { needsYou: number; running: number } | null }> = []
+
+              /** Does this row want the user? The same two signals the row itself
+               *  renders as a dot or a subtitle, so a collapsed conductor's badge and
+               *  its children's badges can never disagree. */
+              // Both predicates are derived from the state the CHILD ROWS themselves
+              // render from, because the collapsed aggregate claims to be the same fact
+              // at a coarser zoom: a count that disagrees with the glyphs it stands for
+              // is worse than no count. `runningSet` is the widened signal -- own turn,
+              // a live workflow, or a loop -- so a workflow-active child is counted the
+              // way its own row is drawn, and a subagent awaiting approval is an ask
+              // even though the slot itself carries no `pending_approval`.
+              const isRunning = (s: Slot) =>
+                isPeerRow(s) ? s.running === true : runningSet.has(s.key)
+              const wantsUser = (s: Slot) =>
+                !!(
+                  s.pending_approval
+                  || s.needs_input
+                  || (subagentApprovalCounts[s.key] || 0) > 0
+                  || (unreadSet.has(s.key) && !isRunning(s))
+                )
+
+              const emit = (key: string, depth: number) => {
+                const slot = byKey.get(key)
+                if (!slot) return
+                const kids = tree.children.get(key) ?? []
+                const expanded = conductorExpanded.has(key)
+                const subtree = kids.length > 0 && !expanded
+                  ? descendantsOf(key, tree.children)
+                  : []
+                rows.push({
+                  id: key,
+                  slot,
+                  depth,
+                  childCount: kids.length,
+                  expanded,
+                  orphanOf: orphanCitation(slot, tree.parentOf.get(key) ?? null),
+                  // Only a COLLAPSED conductor aggregates: while it is open its
+                  // children show their own badges, and showing both would count the
+                  // same session twice on one screen.
+                  aggregate: subtree.length > 0
+                    ? {
+                      needsYou: subtree.filter(k => { const c = byKey.get(k); return c ? wantsUser(c) : false }).length,
+                      running: subtree.filter(k => { const c = byKey.get(k); return c ? isRunning(c) : false }).length,
+                    }
+                    : null,
+                })
+                if (!expanded) return
+                for (const kid of kids) emit(kid, depth + 1)
+              }
+
+              if (searching) {
+                // Flattened: every match at depth 0, in the lane's order, with no
+                // chevrons. Matches the flat lane's answer to the same question.
+                for (const s of flatSlots) {
+                  // The cited creator rides along even though the lane is not nesting:
+                  // flattened, a child is otherwise indistinguishable from a root.
+                  rows.push({ id: sessionRowIdentity(s), slot: s, depth: 0, childCount: 0, expanded: false, orphanOf: null, citesParent: s.parent?.slot ?? null, aggregate: null })
+                }
+              } else {
+                for (const key of tree.roots) emit(key, 0)
+              }
+
+              return rows.map((row, i) => {
+                const next = i < rows.length - 1 ? rows[i + 1] : null
+                const isActive = isActiveRow(row.slot)
+                const showDivider = next != null && !isActive && !isActiveRow(next.slot)
+                return (
+                  <Fragment key={row.id}>
+                    {/* NO WRAPPER. The row is rendered exactly as the flat lane renders
+                     *  it, and the lane's three additions are handed INTO it (see
+                     *  `ConductorRowExtras`). Wrapping the card in a flex column with
+                     *  the chevron and counts beside it narrowed the card: its title
+                     *  truncated early, its own divider stopped short of the row, and
+                     *  the counts took the column the top line keeps for the time. */}
+                    {renderSessionRow(row.slot, row.depth, showDivider, 'conductor', 'conductor', 'conductor', {
+                      depth: row.depth,
+                      childCount: row.childCount,
+                      expanded: row.expanded,
+                      onToggle: () => toggleConductorExpanded(row.id),
+                      aggregate: row.aggregate,
+                      orphanOf: row.orphanOf,
+                      citesParent: row.citesParent ?? null,
+                    })}
+                  </Fragment>
+                )
+              })
+            })()}
+            {flatSlots.length === 0 && (
+              <div className="px-3 py-4 text-[12px] text-muted">{i18nT('pages.chatSidebar.no_sessions_match')}</div>
+            )}
+            {flatSlots.length > 0 && lineage != null && lineage.children.size === 0 && (
+              // Not an error state: the crew log may be off, or nothing has opened
+              // anything yet. The lane still shows every session -- it just has no
+              // nesting to show, and says so instead of looking broken.
+              <div className="px-3 py-2 text-[11px] text-muted select-none" data-testid="conductor-lane-empty-note">
+                {i18nT('pages.chatSidebar.no_conductor_sessions_yet')}
+              </div>
+            )}
+            {renderHiddenReveal('conductor', allHiddenFolders, 0)}
+            {renderOlderSessionsHint('conductor')}
+          </motion.div>
+        ) : flatLaneActive ? (
           // Flat view: every chat exploded out of its folder into one lane.
           // Removes only the folder rendering hierarchy — sort, pin priority,
           // filters, and search all apply as usual (filteredSlots). No folder
@@ -8678,7 +9469,7 @@ function ChatSidebar({
                 {({ setNodeRef }) => (
                   <div ref={setNodeRef} className="flex flex-col flex-1 min-h-0">
                     <SortableContext items={rootFolderIds} strategy={verticalListSortingStrategy}>
-                      {visibleRootFolders.map(f => <SortableFolderBlock key={f.id} folder={f} subtree={[...(folderSubtrees.get(f.id) ?? collectFolderSubtreeIds(folders, f.id))]} renderFolderBlock={renderFolderBlock} />)}
+                      {visibleRootFolders.map(f => <SortableFolderBlock key={f.id} folder={f} subtree={[...(folderSubtrees.get(f.id) ?? collectFolderSubtreeIds(folders, f.id))]} siblings={rootFolderIds} renderFolderBlock={renderFolderBlock} />)}
                     </SortableContext>
                     {/* Bottom of the ROOT folder list. For a top-level hide this
                      *  is the sidebar's own bottom, which is exactly the "single
@@ -8807,7 +9598,7 @@ function ChatSidebar({
                 // Board column is a drag-and-drop drop zone (column reorder + session
                 // card drop); mouse-only drag handlers, so scope-disable the rule.
                 // eslint-disable-next-line jsx-a11y/no-static-element-interactions
-                <div key={col.id} data-testid={`column-${col.id}`} className="flex flex-col flex-1 min-w-[220px] bg-card border border-border rounded-md overflow-hidden"
+                <div key={col.id} data-testid={`column-${col.id}`} className="flex flex-col flex-1 min-w-0 bg-card border border-border rounded-md overflow-hidden" style={{ minWidth: orderedColumns.length > 1 ? '220px' : undefined }}
                   onDragOver={e => {
                     const types = e.dataTransfer.types
                     // Accept column reorder on the entire column surface
@@ -9195,7 +9986,7 @@ function ChatSidebar({
                   ((s.title || '') + s.key).toLowerCase().includes(historyFilter.toLowerCase())
                 // Additive rather than a boolean OR: here the backend result IS the
                 // source list, so filtering `history` instead would drop backend-only hits.
-                // Remote instance sessions are NOT merged here: they are the peer's
+                // Remote crew sessions are NOT merged here: they are the peer's
                 // LIVE slots and join the live sessions list above. Merging them into
                 // history as well would render each remote row twice.
                 const filteredHistory = (() => {

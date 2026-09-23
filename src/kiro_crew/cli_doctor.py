@@ -85,8 +85,19 @@ from kiro_crew.embeddings import (
     resolve_custom_model,
     verify_vendored_libs,
 )
-from kiro_crew.extras import install_hint
-from kiro_crew.kiro_cli import mcp_governance_may_apply, resolve_kiro_cli
+from kiro_crew.extras import (
+    pip_install_channel_available,
+    pip_install_command,
+    pip_install_command_for,
+)
+from kiro_crew.kiro_cli import (
+    PATH_ONLY_INSTALL_NOTE,
+    SPEC_PERMISSIONS_MIN_VERSION,
+    installed_kiro_cli_version,
+    mcp_governance_may_apply,
+    resolve_kiro_cli,
+    spec_permissions_supported,
+)
 from kiro_crew.mcp_cleanup import ALWAYS_ON_BIN_MCP_SERVERS as _ALWAYS_ON_MCPS
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS as _MANAGED_MCPS
 from kiro_crew.mcp_cleanup import OPT_IN_BIN_MCP_SERVERS as _OPT_IN_MCPS
@@ -1927,6 +1938,7 @@ _STRICT_IDENTITY_SERVERS = (
     "kirocrew-dashboard",
     "kirocrew-work",
     "kirocrew-crew-log",
+    "kirocrew-debug",
 )
 
 
@@ -3819,6 +3831,12 @@ def _report_kas_backend(issues: list[str]) -> None:
     # probe rejected -- that is exactly the one worth seeing.
     if identity_line:
         print(f"  crew vault:  {identity_line}")
+    # Before the help probe, not after: the row reads ``--version``, which is a
+    # different spawn from ``acp --help``, so a failed help probe establishes
+    # nothing about it. The early ``return`` below is for the ENGINE rows alone;
+    # letting it swallow this row would hide a withheld auto-approve on exactly
+    # the host where kiro-cli is misbehaving.
+    _report_kas_spec_permissions(issues)
     help_text = _kas_relay_help(binary)
     if help_text is None:
         # The probe itself failed, so nothing is known either way. Advisory: a
@@ -3853,6 +3871,42 @@ def _report_kas_backend(issues: list[str]) -> None:
             f"  token:       ➖ {entitlement_label(ACP_BACKEND_KAS)} "
             "(see the sign-in rows above)"
         )
+
+
+def _report_kas_spec_permissions(issues: list[str]) -> None:
+    """Whether this kiro-cli can carry the spec ``permissions`` block KAS reads.
+
+    The block is how Crew's auto-approve list reaches KAS's policy engine, and it
+    is written only when the installed kiro-cli accepts the field: that binary
+    validates specs with serde ``deny_unknown_fields``, so a release predating the
+    field refuses the WHOLE spec and drops every Crew MCP server from the session.
+    Withholding it is the smaller loss, but it IS a loss, and this is the only
+    place it is visible. Reported inside the KAS block rather than
+    beside the model rows because it costs nothing until KAS is the selected
+    backend -- which is exactly when this block prints.
+    """
+    version = installed_kiro_cli_version()
+    if spec_permissions_supported(version):
+        print("  auto-approve: ✅ spec `permissions` block written (KAS reads it)")
+        return
+    floor = ".".join(str(part) for part in SPEC_PERMISSIONS_MIN_VERSION)
+    if version is None:
+        # Not "too old": the version could not be read at all, most often because
+        # kiro-cli resolves only through PATH and the probe spawns pinned paths
+        # only. The writer withholds a NEW block here but keeps one already on
+        # disk, so the remedy is to make the binary probeable, not to update it.
+        print("  auto-approve: ⚠️  spec `permissions` block not seeded: kiro-cli version unknown")
+        print(f"               ({PATH_ONLY_INSTALL_NOTE}). A block already on disk is kept.")
+        issues.append("kiro-cli version unknown, so the KAS `permissions` block is not seeded")
+        return
+    shown = ".".join(str(part) for part in version)
+    print(f"  auto-approve: ❌ withheld: this kiro-cli ({shown}) refuses the field")
+    print("               It validates specs with deny_unknown_fields, so writing " "`permissions`")
+    print("               would make the whole spec unreadable and drop every Kiro " "Crew MCP")
+    print(f"               server. Fix: update kiro-cli to {floor} or newer. If the spec")
+    print("               already carries the block, `kirocrew setup --agent-only --clean`")
+    print("               rebuilds it without the key.")
+    issues.append("kiro-cli is too old to carry the KAS `permissions` block")
 
 
 def _doctor_agents_janitor(issues: list[str], sweep_backups: bool) -> None:
@@ -4110,7 +4164,7 @@ def _doctor_whatsapp(cfg: KiroCrewConfig, issues: list[str]) -> None:
     if not wa.enabled:
         print("  status:      ⏭  not enabled (optional)")
         print("  setup:       run 'kirocrew setup --whatsapp', or enable it from")
-        print("               the dashboard (Settings → Channels → WhatsApp)")
+        print("               the dashboard (Settings → Messaging Channels → WhatsApp)")
         return
 
     if neonize_available():
@@ -4135,7 +4189,7 @@ def _doctor_whatsapp(cfg: KiroCrewConfig, issues: list[str]) -> None:
         # make progress.
         print("  session:     ⚠️  not paired yet, so the channel starts unpaired")
         print(f"               Expected store: {store}")
-        print("               Pair from the dashboard (Settings → Channels → WhatsApp)")
+        print("               Pair from the dashboard (Settings → Messaging Channels → WhatsApp)")
 
     groups = [g for g in (wa.groups or []) if isinstance(g, dict) and str(g.get("jid", "")).strip()]
     if groups:
@@ -4607,7 +4661,8 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  deps:        ✅ websockets, slack_sdk, aiohttp available")
         except ImportError:
             print("  deps:        ❌ missing modules (websockets/slack_sdk/aiohttp)")
-            print("               Fix: pip install -e .")
+            if pip_install_channel_available():
+                print(f"               Fix: {pip_install_command_for('-e', '.')}")
             issues.append("python deps")
 
     # SQLite FTS5 — required by memory + knowledge full-text search. On macOS
@@ -4620,8 +4675,12 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  sqlite fts5: ✅ available")
         else:
             print("  sqlite fts5: ❌ missing (memory/knowledge search will fail)")
-            print("               Fix: pip install pysqlite3-binary, or use a")
-            print("               Python whose SQLite was built with FTS5.")
+            # Only the pip half is gated. Where that command cannot run, using a
+            # different Python IS the remaining fix, so it stays visible in
+            # exactly the case the gate hides the command.
+            if pip_install_channel_available():
+                print(f"               Fix: {pip_install_command_for('pysqlite3-binary')}")
+            print("               Or use a Python whose SQLite was built with FTS5.")
             issues.append("sqlite fts5")
     except Exception as exc:  # pragma: no cover - defensive
         print(f"  sqlite fts5: ⚠️  could not check ({exc})")
@@ -4691,8 +4750,21 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     except ImportError:
         print(
             "  faiss:       ⏹ not installed (optional) — episodic recall uses "
-            "the stdlib fallback; `pip install faiss-cpu` to accelerate it"
+            "the stdlib fallback; installing faiss-cpu accelerates it"
         )
+        # The command names THIS interpreter, not a bare `pip`. On a packaged or
+        # minimal install the gateway's python is not what a bare `pip` resolves
+        # to -- it may not be on PATH under that name at all -- so the wheel
+        # lands somewhere this process never imports from, and the next doctor
+        # run prints the identical advice with no sign the install missed.
+        #
+        # Printed only where that command can actually run. On the bundled
+        # desktop interpreter it would write into the code-signed bundle, which
+        # breaks later launches and is discarded on the next app update, so
+        # naming it there is worse advice than naming nothing. The dashboard's
+        # install card offers no command in the same state.
+        if pip_install_channel_available():
+            print(f"               Install: {pip_install_command_for('faiss-cpu')}")
 
     _custom = resolve_custom_model()
     if _custom is not None:
@@ -4792,7 +4864,11 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  transcribe:  ✅ amazon_transcribe importable (optional)")
         except ImportError:
             print("  transcribe:  ⏹ optional cloud STT not installed")
-            print(f"               Install: {install_hint('voice-aws')}")
+            # Same reasoning as the faiss line above: this process imports the
+            # package, so the command has to name this interpreter, and it is
+            # printed only where that command can actually run.
+            if pip_install_channel_available():
+                print(f"               Install: {pip_install_command('voice-aws')}")
 
         try:
             import boto3  # noqa: F401
@@ -4800,7 +4876,8 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  boto3:       ✅ importable (optional)")
         except ImportError:
             print("  boto3:       ⏹ optional AWS SDK not installed")
-            print(f"               Install: {install_hint('voice-aws')}")
+            if pip_install_channel_available():
+                print(f"               Install: {pip_install_command('voice-aws')}")
 
     # Apple's on-device speech is a host capability rather than an install, so the
     # only useful thing to print is the reason it cannot run. Reaching a not-ok
@@ -4882,7 +4959,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         print("  status:      ⚠️  channel roster unavailable")
     if rows and not any(row.enabled for row in rows):
         print("  status:      ⏭  none enabled (optional)")
-        print("  setup:       connect one from the dashboard's Settings > Channels")
+        print("  setup:       connect one from the dashboard's Settings > Messaging Channels")
     for row in rows:
         if not row.enabled:
             continue
@@ -4903,7 +4980,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print(f"  {name + ':':12} ❌ enabled but missing {missing}")
             print(
                 "               The channel will not start. Set it in "
-                "Settings > Channels, or in ~/.kiro/crew/.env"
+                "Settings > Messaging Channels, or in ~/.kiro/crew/.env"
             )
             issues.append(f"{name}: missing {missing}")
 

@@ -3,7 +3,7 @@
 ## Overview
 
 Dev Fleet is a builtin App Store app (`kiro_crew/apps/builtins/dev_fleet/`) for
-managing KiroCrew feature worktrees (git worktrees of the main repo) and their isolated
+managing Kiro Crew feature worktrees (git worktrees of the main repo) and their isolated
 pod test instances. It runs as a managed app backend SUBPROCESS: an aiohttp server on the
 backend-assigned port, reached only through the gateway proxy. Every proxied request
 carries an HMAC signature (`X-KiroCrew-Proxy: <ts>:<hmac>` over
@@ -78,7 +78,7 @@ repository adopted as the main checkout would have its worktrees listed and Pull
 rebase and worktree-removal git commands run inside it. Tiers 1–2 skip the test *during
 discovery* because the user named that path — a typo must surface as an error against it
 rather than be silently replaced by a discovered checkout — but the path is still validated
-once at startup, and `_repo()` — the single accessor every git argv and path build goes
+once, on the attempt that resolves it, and `_repo()` — the single accessor every git argv and path build goes
 through — then raises `RepoUnreadable` naming it. The gate lives in the accessor rather than
 in worktree discovery because sync and the background refresher reach git without passing
 through discovery, and `pull --ff-only` plus `pip install -e` inside an unrelated repository
@@ -105,6 +105,50 @@ When no tier resolves, `MAIN_REPO` is `""` — never a synthesized path. Discove
 produces a red "Discovery Error" naming a directory the user never chose, which reads as a
 broken app rather than an unanswered question.
 
+That unresolved state is retried, not latched. `ensure_main_repo_discovered()` records
+"done" only once a checkout RESOLVED, and `/fleet` calls
+`worktree_ops._ensure_repo_resolved()` per poll, so an operator who writes
+`dev_fleet.repo_path` while the gateway is running gets a fleet on the next poll rather
+than after a restart. A resolved install returns at a truthiness guard before any await,
+so the retry costs nothing once there is a fleet to serve. An unresolved one re-runs tiers
+2 and 5 on the subprocess executor and spawns no subprocess, because `_load_fallback_repos`
+and `_upstream_remote` both decline before reaching git while `_repo()` raises; the
+credential-helper warm is guarded by its own `None` sentinel, so its two `git config` calls
+stay once-per-process.
+
+Only tier 2 self-heals. `_load_dev_fleet_cfg` re-reads `config.json` on every call, whereas
+tier 1 is read off this process's own environment, which no outside shell can change, so
+setting `KIROCREW_DEVFLEET_REPO` still requires a restart and the setup card names the two
+routes separately. A resolved path that FAILS the marker test latches too, and renders the
+`RepoUnreadable` banner naming the path and the remedy. That latch is reopened by
+`_invalid_resolution_is_stale` once the configured string changes: because tier 2 is
+re-read per call, an operator who corrects a typo would otherwise meet exactly the frozen
+banner this chain removes for the not-found case. The test compares against the string the
+latching attempt read rather than against `MAIN_REPO`, which is the `_resolve_primary_checkout`
+form of it, so a path that needed rewriting does not read as changed on every poll; a valid
+resolution still returns at its first guard with no await, and an env-set path cannot change
+inside one process, so neither pays for the reopening. Reopening also requires the config
+read itself to have succeeded. An unreadable or half-written `config.json` yields the same
+empty string as one naming no path, so reopening on that difference would send discovery to
+the INFERRED tiers and latch a checkout the operator never named while their own setting sat
+in a file this process merely failed to read, and every later git call would target it.
+`_load_dev_fleet_cfg_checked` reports whether every file present parsed, and only a whole
+read can say the operator's answer changed; a parseable file carrying no `repo_path` is an
+answer rather than a gap, so that case still reopens. The attempt then takes ONE checked
+read and hands it to `_discover_main_repo` rather than letting that function read tier 2
+again, because two reads of one file can disagree: the staleness test could see a whole
+corrected path and reopen while a second read returned the empty string and sent
+discovery to the INFERRED tiers. That latch passes the marker test, so it is VALID and
+therefore final, nothing re-resolves it and only a restart clears it. A partial read
+publishes nothing at all and the next poll retries against a settled file. Every
+global the chain writes is a function of the current attempt alone, including the
+invalid-path message, which an attempt that finds nothing clears rather than inherits —
+`MAIN_REPO` from one attempt beside an earlier attempt's verdict would hand `_repo()` a path
+whose markers were never checked. A late resolution also restarts the background refresher,
+which returns rather than idles when there is no usable checkout; leaving it stopped would serve a
+fleet whose rows never refresh again, so the setup card disappears and the page looks alive
+while nothing fetches (`test/test_dev_fleet_repo_reresolution.py`).
+
 Because `""` would make `git -C ""` operate on the backend's own working directory (and
 `Path("")` is `Path(".")`), no consumer reads the global directly: every site that runs git
 against the checkout or builds paths from it resolves it through the `_repo()` accessor,
@@ -112,7 +156,8 @@ which returns the path or raises `RepoNotConfigured`. Sites that deliberately de
 instead of failing catch it and say what the degraded answer is — upstream-remote
 resolution falls back to `origin`, build-pending detection reports nothing pending,
 fallback-remote loading leaves the list empty, sync refuses with its usual
-`{"ok": false}` shape, and the background refresher idles. Bare `MAIN_REPO` loads outside
+`{"ok": false}` shape, and the background refresher stops until a later resolution
+restarts it. Bare `MAIN_REPO` loads outside
 the accessor are limited to truthiness guards. An AST ratchet scans every Dev Fleet backend
 component (`test/test_dev_fleet_repo_accessor.py`) and permits the authoritative load only
 inside `repository._repo()`; helpers in every sibling module must route through that
@@ -192,11 +237,11 @@ backend's namespace. See *Make Live → Pointer file*.
 A second, deliberately small pod surface exists for AGENT sessions, served **in the
 gateway process** rather than by the backend subprocess (`agent_pod_api.py`).
 
-Why it is separate rather than a reuse of the proxied routes above: an agent session
-runs behind a sandbox with its own user namespace, so it cannot `connect(2)` the
-systemd user-bus socket that every pod verb needs, and `kirocrew pod up` in an agent
-shell fails with a bare `Permission denied`. The gateway is the process the sandbox
-launcher descends from, so it holds the host bus. The agent reaches these routes the
+Why it is separate rather than a reuse of the proxied routes above: on Linux, an agent
+session runs behind a sandbox with its own user namespace, so it cannot `connect(2)`
+the systemd user-bus socket that pod lifecycle verbs need, and `kirocrew pod up` in
+an agent shell fails with a bare `Permission denied`. The gateway is the process the
+sandbox launcher descends from, so it holds the host bus. The agent reaches these routes the
 way it reaches any tool — an MCP call, then loopback HTTP — with no D-Bus passthrough
 into the sandbox. The proxied `/apps/dev-fleet/api/*` routes cannot serve this: they
 require a dashboard cookie or token, which an agent does not hold, and admitting an
@@ -214,7 +259,8 @@ Contract:
 - **Gated on the app being enabled** (`_require_enabled`), since routes are
   registered at startup and Dev Fleet ships `defaultEnabled: false`.
 - **No operator opt-in and no per-call approval, deliberately.** A pod runs the code
-  in a git worktree an agent can write, started by the user systemd manager, so it
+  in a git worktree an agent can write, started by the per-user service manager
+  (systemd `--user` on Linux or launchd on macOS), so it
   executes outside the agent's sandbox. That reachability is Kiro Crew's DOCUMENTED
   posture rather than something these routes introduce: `security.md`, under "Scoped
   user-bus locator forward", records that sandboxed agent shells legitimately run
@@ -274,7 +320,9 @@ in-gateway read and lease routes admit only Dev Fleet's own backend token.
 
 ## Input Validation
 
-- `name` parameter is validated against the discovered worktree set before any operation
+- `name` parameter is validated against the discovered worktree set before any operation.
+  The agent surface's `pod down` also accepts a missing checkout only when this
+  repository retains the matching git worktree record (see *Pod identity guard*).
 - Ambiguous worktree names (multiple checkouts with same basename) return HTTP 400
 - `force` must be a boolean when provided
 - Main worktree removal is always refused regardless of force flag
@@ -412,6 +460,29 @@ running" bug, issue #220). As defence-in-depth, `_pod_up` and `_pod_down` both
 re-check `runtime.active_names` after the CLI returns and fail closed
 (`pod not active after start` / `pod still active after shutdown`) — a CLI exit 0
 is never taken as proof of the state change, in either direction.
+
+### Pod identity guard
+
+Pod names are global basenames while Dev Fleet scopes worktrees to `MAIN_REPO`,
+so every pod verb first runs `_pod_checkout_guard`. It resolves the name to this
+repo's worktree, reads the pod's pinned `CHECKOUT` strictly, and refuses when the
+pin names a different checkout, carries no verifiable `CHECKOUT`, or is absent
+while a unit under that name is active. A matching pin proceeds, and so does no
+pin with no live unit. Every refusal is about identity: acting on a basename
+collision would stop another repository's pod or delete its HOME.
+
+A missing checkout is attributed only by git's retained worktree record for this
+repository. `repository._find_retained_worktree_path` includes a `prunable`
+record that normal discovery omits. When no record names the worktree, the agent
+surface refuses and the CLI `kirocrew pod down <name>` remains the remedy.
+
+For a retained record, `_pod_down` submits `_reclaim_pod_locked` to the
+subprocess executor. The helper runs under `pod_name_mutex`, re-reads the pin,
+and refuses unless it still matches the retained path. It also refuses when that
+path is back on disk, because a new pod may own the name. Pin attribution and
+teardown are one locked transaction, so a same-name pod cannot be accepted
+between the ownership decision and `stop_pod`. `up` requires a discovered
+checkout and never takes this missing-checkout path.
 
 ### Pod HOME reclamation on worktree removal
 
@@ -1576,8 +1647,9 @@ All user-visible output passes through `redact_credentials()` and
 The app declares `platform.os: ["macos", "linux", "windows"]` in `app.json`,
 because that is where it genuinely runs: the fleet view, PR status, commit and
 disk figures, Provision, Sync, Rebase and Prune are git and filesystem work with
-no systemd in them. Only the pod plane needs Linux; Make Live stages its pointer
-on every platform (only the automatic restart needs a drivable service manager).
+no service-manager dependency in them. The pod plane needs systemd `--user` on
+Linux or launchd on macOS; Windows has no supported pod backend. Make Live stages
+its pointer on every platform (only the automatic restart needs a drivable service manager).
 The app says so in the UI rather than in the manifest — a `highlights` line
 states the pod requirement, and `GET /api/fleet` carries the reason that renders
 as a banner.
@@ -1601,9 +1673,9 @@ things:
 | Flag | Meaning | True when |
 |---|---|---|
 | `_POD_IMPORTED` | the `kiro_crew.pod` modules imported, so its platform-neutral helpers are callable | the import succeeded (any platform) |
-| `_POD_AVAILABLE` | pods can actually **run** here | Linux **and** `systemctl` on PATH |
+| `_POD_AVAILABLE` | pods can actually **run** here | Linux with `systemctl` on PATH, or macOS with `launchctl` on PATH |
 
-Conflating the two used to report every worktree as "not built" off Linux, since
+Conflating the two used to report every worktree as "not built" on hosts without a runnable pod backend, since
 the `prov.has_venv` / `prov.has_dist` calls — plain filesystem checks — sat
 behind the pod-runnable gate. Build state is now computed on every platform.
 
@@ -1616,19 +1688,23 @@ offering controls that fail:
 | `pods_unavailable_reason` | the human-readable reason, or `null` when pods are available |
 
 Before this existed, the reason string was computed into `_POD_ERROR` and then
-**never read by anything** — a non-Linux user saw pod controls that silently
-failed with no explanation.
+**never read by anything** — a user on a host without a runnable pod backend saw
+pod controls that silently failed with no explanation.
 
 Per-platform behavior:
 
 - **Linux + systemd `--user`** — everything works.
-- **macOS / Windows / Linux without `systemctl`** — the Fleet view, per-branch PR
-  status, commit counts, disk usage, Provision, Sync (pull main + rebuild),
-  Rebase and Prune all work. The UI shows a notice carrying
+- **macOS + launchd** — pod lifecycle and the non-pod fleet actions work. macOS
+  pods have no enforced memory/CPU ceiling. Automatic Make Live additionally
+  requires the current LaunchAgent restart contract; otherwise it stages the
+  pointer and asks the operator to restart manually.
+- **Windows / macOS without `launchctl` / Linux without `systemctl`** — the Fleet
+  view, per-branch PR status, commit counts, disk usage, Provision, Sync (pull
+  main + rebuild), Rebase and Prune all work. The UI shows a notice carrying
   `pods_unavailable_reason` and hides the actions that cannot work: Spin up /
   Restart / Stop pod, Open, QA + video. Make Live and Provision are **not**
-  hidden — `kirocrew pod provision` does not touch systemd, so building a
-  worktree's venv + dist works anywhere; Make Live stages the pointer on any
+  hidden — `kirocrew pod provision` does not touch a service manager, so building
+  a worktree's venv + dist works anywhere; Make Live stages the pointer on any
   platform and reports `staged_only` when it cannot bounce the gateway itself.
 - **Make Live** — staging (pointer write) works on every platform. Automatic
   restart requires an active systemd `--user` unit or a current macOS

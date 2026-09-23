@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from conftest import requires_symlinks
-from kiro_crew import cli_doctor, cron
+from kiro_crew import cli_doctor, cron, extras
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_PI
 
 
@@ -1533,6 +1533,21 @@ class TestDoctorKas:
             cli_doctor.KiroCrewConfig, "load", classmethod(lambda cls: self._Cfg(backend))
         )
 
+    @pytest.fixture(autouse=True)
+    def _accepting_cli(self, monkeypatch):
+        """Pin the installed kiro-cli to one that accepts the spec ``permissions``
+        field, so the cases here stay about the relay and the engine.
+
+        Unpinned, the new auto-approve row would spawn the test host's own
+        kiro-cli -- absent on CI, which reads as refusing and appends an issue the
+        engine cases do not expect.
+        """
+        monkeypatch.setattr(
+            cli_doctor,
+            "installed_kiro_cli_version",
+            lambda: cli_doctor.SPEC_PERMISSIONS_MIN_VERSION,
+        )
+
     def _patch_vault(self, monkeypatch, holds: bool = False, detail: str | None = None) -> None:
         """Stub both vault probes so no test reads the developer's real vault.
 
@@ -1747,6 +1762,97 @@ class TestDoctorKas:
         assert host_auth.entitlement_label("kas") in out
         assert host_auth.ENTITLEMENT_HOST_IDENTITY_STORE not in out
         assert not hasattr(cli_doctor, "_kas_version_label")
+
+
+class TestTheKasBlockReportsAWithheldPermissionsField:
+    """The one place a withheld KAS auto-approve is visible.
+
+    The spec ``permissions`` block is how Crew's auto-approve list reaches KAS's
+    policy engine, and ``agent.py`` writes it only when the installed kiro-cli
+    accepts the field: an older release validates specs with
+    ``deny_unknown_fields``, so the key would make the whole spec unreadable and
+    drop every Crew MCP server. Withholding it is the smaller loss but still a
+    loss, so it is reported -- and only here, because it costs nothing until KAS
+    is the selected backend.
+    """
+
+    def _run(
+        self, monkeypatch, capsys, version, *, help_probe_fails: bool = False
+    ) -> tuple[str, list[str]]:
+        monkeypatch.setattr(
+            cli_doctor.KiroCrewConfig,
+            "load",
+            classmethod(lambda cls: type("C", (), {"agent": type("A", (), {"acp_backend": "kas"})()})()),
+        )
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
+        # A help text the engine probe is satisfied by, so the only issue any case
+        # here can append is the one the auto-approve row is responsible for.
+        # ``help_probe_fails`` swaps in the FAILED probe (``None``) instead.
+        help_text = (
+            None if help_probe_fails else f"--agent-engine <ENGINE>  {cli_doctor.KAS_RELAY_ENGINE}"
+        )
+        monkeypatch.setattr(cli_doctor, "_kas_relay_help", lambda _binary: help_text)
+        monkeypatch.setattr("kiro_crew.auth.bridge.vault_holds_identity", lambda: False)
+        monkeypatch.setattr("kiro_crew.auth.bridge.describe_vault_identity", lambda: None)
+        monkeypatch.setattr(cli_doctor, "installed_kiro_cli_version", lambda: version)
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        return capsys.readouterr().out, issues
+
+    def test_an_accepting_cli_reports_the_block_as_written(self, monkeypatch, capsys) -> None:
+        out, issues = self._run(monkeypatch, capsys, cli_doctor.SPEC_PERMISSIONS_MIN_VERSION)
+        assert "auto-approve: ✅" in out
+        assert issues == []
+
+    def test_a_refusing_cli_names_the_version_and_the_floor(self, monkeypatch, capsys) -> None:
+        """Both numbers, because the fix is "update past this floor"."""
+        floor = cli_doctor.SPEC_PERMISSIONS_MIN_VERSION
+        out, issues = self._run(monkeypatch, capsys, (floor[0], floor[1] - 1, 0))
+        assert "auto-approve: ❌" in out
+        assert f"{floor[0]}.{floor[1] - 1}.0" in out
+        assert ".".join(str(part) for part in floor) in out
+        assert "kiro-cli is too old to carry the KAS `permissions` block" in issues
+
+    def test_an_unknown_version_is_its_own_row_and_names_the_pin_remedy(
+        self, monkeypatch, capsys
+    ) -> None:
+        """Unknown is not "too old": the writer withholds a NEW block but keeps one
+        already on disk, and the remedy is a probeable binary, not an update."""
+        out, issues = self._run(monkeypatch, capsys, None)
+        assert "auto-approve: ⚠️" in out
+        assert "version unknown" in out
+        assert cli_doctor.PATH_ONLY_INSTALL_NOTE in out
+        assert "already on disk is kept" in out
+        assert "update kiro-cli" not in out
+        assert issues == ["kiro-cli version unknown, so the KAS `permissions` block is not seeded"]
+
+    def test_a_failed_help_probe_does_not_swallow_the_row(self, monkeypatch, capsys) -> None:
+        """``acp --help`` failing says nothing about ``--version``.
+
+        The engine rows return early when their probe fails; this row must not
+        ride on that return, or a withheld auto-approve is hidden on exactly the
+        host where kiro-cli is misbehaving.
+        """
+        floor = cli_doctor.SPEC_PERMISSIONS_MIN_VERSION
+        out, issues = self._run(
+            monkeypatch, capsys, (floor[0], floor[1] - 1, 0), help_probe_fails=True
+        )
+        assert "engine support unknown" in out
+        assert "auto-approve: ❌" in out
+        assert issues == ["kiro-cli is too old to carry the KAS `permissions` block"]
+
+    def test_the_row_is_silent_when_kas_is_not_the_backend(self, monkeypatch, capsys) -> None:
+        """A kiro-cli or Claude Code install loses nothing, so it hears nothing."""
+        monkeypatch.setattr(
+            cli_doctor.KiroCrewConfig,
+            "load",
+            classmethod(lambda cls: type("C", (), {"agent": type("A", (), {"acp_backend": ""})()})()),
+        )
+        monkeypatch.setattr(cli_doctor, "installed_kiro_cli_version", lambda: None)
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        assert "auto-approve:" not in capsys.readouterr().out
+        assert issues == []
 
 
 class TestPathLauncherOwnership:
@@ -2581,7 +2687,12 @@ class TestEffectiveModelSection:
         target = self._tmp / "protected.json"
         target.write_text(json.dumps({"model": "leaked-value"}), encoding="utf-8")
         (agents_dir / AGENT_FILENAME).symlink_to(target)
-        monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+        # The reader asks is_sensitive_canonical_path about the RESOLVED target
+        # (is_sensitive_path in agent_discovery gates only the project dir and
+        # the list_agents cache key), so the refusal is injected at that name.
+        monkeypatch.setattr(
+            agent_discovery, "is_sensitive_canonical_path", lambda p: str(target) in str(p)
+        )
         issues: list[str] = []
 
         cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
@@ -2820,7 +2931,7 @@ class TestWhatsAppSection:
 
         out = capsys.readouterr().out
         assert "not paired yet" in out
-        assert "Settings → Channels" in out
+        assert "Settings → Messaging Channels" in out
         assert issues == [], "an unpaired channel must not fail the preflight"
 
     def test_the_reported_store_is_the_path_the_gateway_opens(
@@ -2897,6 +3008,161 @@ class TestWhatsAppSection:
 
         source = inspect.getsource(cli_doctor._doctor)
         assert "_doctor_whatsapp(cfg, issues)" in source
+
+
+class TestFaissHint:
+    """The absent-faiss advice has to name the interpreter that would import it.
+
+    A bare ``pip install faiss-cpu`` resolves to whatever ``pip`` the user's
+    PATH offers, which on a packaged or minimal install is not the gateway's
+    python -- so the wheel lands where this process never imports from, and the
+    next doctor run prints the identical line with nothing saying the install
+    missed. The command itself is rendered by
+    ``extras.pip_install_command_for``, tested directly in ``test_extras.py``;
+    what is guarded here is that doctor calls it instead of embedding a literal.
+    ``_doctor()`` spawns subprocesses, probes the network and calls ``sys.exit``,
+    so its source is read rather than run -- the same approach the WhatsApp
+    call-site guard above takes.
+    """
+
+    def _source(self) -> str:
+        import inspect
+
+        return inspect.getsource(cli_doctor._doctor)
+
+    def test_the_hint_is_rendered_for_this_interpreter(self) -> None:
+        assert "pip_install_command_for('faiss-cpu')" in self._source()
+
+    def test_no_bare_pip_command_is_printed(self) -> None:
+        """The literal this section replaced. Kept as its own assertion because a
+        re-added bare form would sit happily beside the correct call."""
+        assert "`pip install faiss-cpu`" not in self._source()
+
+    def test_the_renderer_names_the_running_interpreter(self) -> None:
+        """Ties the call site to real output: whatever doctor prints for that
+        call carries this process's own interpreter."""
+        assert sys.executable in extras.pip_install_command_for("faiss-cpu")
+
+    def test_the_command_is_printed_only_where_it_can_run(self) -> None:
+        """The command names the gateway's own interpreter, so on the bundled
+        desktop build running it would write into the code-signed bundle, break
+        later launches and be discarded on the next app update. Naming it there
+        is worse than naming nothing, which is what the dashboard's own install
+        card does in the same state."""
+        source = self._source()
+
+        assert "if pip_install_channel_available():" in source
+        gate = source.index("if pip_install_channel_available():")
+        call = source.index("pip_install_command_for('faiss-cpu')")
+        assert gate < call, "the render must sit inside the guard, not beside it"
+
+    def test_the_bundled_interpreter_yields_no_install_channel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The behavioural half of the guard above, so the two cannot drift."""
+        monkeypatch.setattr(extras.platform_compat, "is_bundled_interpreter", lambda: True)
+
+        assert cli_doctor.pip_install_channel_available() is False
+
+
+class TestVoiceAwsHint:
+    """The optional AWS voice packages need the same treatment as faiss.
+
+    ``_doctor`` imports ``amazon_transcribe`` and ``boto3`` in this process, so a
+    bare ``pip install`` on those two lines misses for exactly the reason it
+    missed for faiss: it resolves to whatever ``pip`` the user's PATH offers, and
+    the wheel lands where this process never imports from. ``install_hint``'s own
+    docstring reserves the bare form for output "where the surrounding text
+    already says which environment is meant" and routes the copied-blind case to
+    ``pip_install_command`` -- which is what a doctor ``Install:`` line is.
+    """
+
+    def _source(self) -> str:
+        import inspect
+
+        return inspect.getsource(cli_doctor._doctor)
+
+    def test_both_voice_aws_lines_name_this_interpreter(self) -> None:
+        assert self._source().count("pip_install_command('voice-aws')") == 2
+
+    def test_no_bare_install_hint_remains_in_doctor(self) -> None:
+        """The form these two lines replaced. Asserted across the whole function,
+        so a re-added bare hint anywhere in doctor fails here rather than only at
+        the two sites this change touched."""
+        assert "install_hint(" not in self._source()
+
+    def test_the_renderer_names_the_running_interpreter(self) -> None:
+        """Ties the call sites to real output: voice-aws is a declared extra, so
+        the existing ``pip_install_command`` renders it."""
+        assert sys.executable in extras.pip_install_command("voice-aws")
+
+    def test_each_line_is_printed_only_where_it_can_run(self) -> None:
+        """Same bundled-interpreter hazard as the faiss line: naming the gateway's
+        interpreter there would write into the code-signed bundle. Both renders
+        must sit inside the guard, not beside it."""
+        lines = self._source().splitlines()
+        renders = [i for i, ln in enumerate(lines) if "pip_install_command('voice-aws')" in ln]
+
+        assert len(renders) == 2
+        for index in renders:
+            assert "if pip_install_channel_available():" in lines[index - 1]
+
+
+class TestDoctorPrintsNoBareInstallCommand:
+    """The invariant, asserted once over the whole function.
+
+    Every install command ``_doctor`` prints is for a module THIS process
+    imports, so a bare ``pip`` can resolve to an interpreter the gateway never
+    imports from, and the wheel lands out of reach. A per-site guard says
+    nothing about a site that does not exist yet, so the property is asserted
+    over the whole function instead: any printed line carrying a bare
+    ``pip install`` fails here.
+    """
+
+    def _source(self) -> str:
+        import inspect
+
+        return inspect.getsource(cli_doctor._doctor)
+
+    def test_no_printed_line_carries_a_bare_pip_install(self) -> None:
+        """Scoped to printed lines, so the surrounding code comments that mention
+        ``pip install -e`` in prose stay legal."""
+        offenders = [
+            line.strip()
+            for line in self._source().splitlines()
+            if "print(" in line and "pip install" in line
+        ]
+
+        assert offenders == []
+
+    def test_the_editable_install_fix_names_this_interpreter_and_is_gated(self) -> None:
+        lines = self._source().splitlines()
+        renders = [i for i, ln in enumerate(lines) if "pip_install_command_for('-e', '.')" in ln]
+
+        assert len(renders) == 1
+        assert "if pip_install_channel_available():" in lines[renders[0] - 1]
+
+    def test_the_fts5_fix_names_this_interpreter_and_is_gated(self) -> None:
+        lines = self._source().splitlines()
+        renders = [
+            i for i, ln in enumerate(lines) if "pip_install_command_for('pysqlite3-binary')" in ln
+        ]
+
+        assert len(renders) == 1
+        assert "if pip_install_channel_available():" in lines[renders[0] - 1]
+
+    def test_the_fts5_alternative_survives_the_gate(self) -> None:
+        """The one place gating must NOT hide the whole message. Where pip cannot
+        run, using a different Python is the only remaining fix, so that sentence
+        has to print in exactly the case the command is withheld. Checked by
+        indentation: the alternative sits outside the ``if``, not inside it."""
+        alternatives = [
+            ln
+            for ln in self._source().splitlines()
+            if "Or use a Python whose SQLite" in ln and ln.startswith(" " * 12 + "print(")
+        ]
+
+        assert len(alternatives) == 1, "the fts5 alternative must print unconditionally"
 
 
 class TestVenvDepsProbe:

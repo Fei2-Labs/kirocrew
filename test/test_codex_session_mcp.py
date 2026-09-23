@@ -52,6 +52,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
 )
+from kiro_crew.members import MEMBER_DISPATCH_SERVER
 from kiro_crew.providers.mirrors import Concern, Disposition, mirror_for
 from kiro_crew.providers.mirrors.codex import (
     CodexMirror,
@@ -493,15 +494,38 @@ class TestTheSessionArraySeam:
     plus the source-level pins that keep the split where it is.
     """
 
-    def test_codex_is_in_the_array_set_and_NOT_in_member_dispatch(self):
-        """One set this projection needs, and one it deliberately stays out of.
+    def test_codex_is_in_both_the_array_set_and_member_dispatch(self):
+        """The two sets this session's array depends on.
 
         Without the array set the session gets ``[]`` however good the mirror is.
-        Member dispatch is a different capability -- session control in a DM thread
-        -- and this PR does not add it, so the set is pinned in both directions.
+        Member dispatch is mounted onto that same array, but by the RUNTIME rather
+        than by this projection -- ``AcpRuntime.create_session`` appends the entry
+        after the mirror has run, because the dashboard server is identity-bound and
+        ``codex_withheld_servers`` therefore keeps the SPEC-described spelling of it
+        out of the translation below. Which sessions get that append is decided by
+        ``AcpProvider._member_session_key``, pinned in ``test_member_dispatch_mount``.
         """
         assert ACP_BACKEND_CODEX in ACP_BACKENDS_SESSION_MCP_ARRAY
-        assert ACP_BACKEND_CODEX not in ACP_BACKENDS_MEMBER_DISPATCH
+        assert ACP_BACKEND_CODEX in ACP_BACKENDS_MEMBER_DISPATCH
+
+    def test_the_spec_can_never_supply_the_dashboard_server_itself(self, agents_dir):
+        """Membership adds no way for the agent file to mount session control.
+
+        An agent spec that names ``@kirocrew-dashboard`` still gets it withheld: a
+        spec-described element carries no session identity and would answer
+        ``identity_unattested`` to every verb. So the only dashboard entry a codex
+        session can hold is the one the runtime builds with this session's key, and
+        adding codex to the dispatch set does not un-withhold the other kind.
+        """
+        _write_spec(
+            agents_dir,
+            servers={MEMBER_DISPATCH_SERVER: {"command": "/opt/kirocrew"}},
+            tools=[f"@{MEMBER_DISPATCH_SERVER}", "@kirocrew-core"],
+        )
+        projection = codex_projection("kirocrew")
+        names = [e["name"] for e in projection.params["mcpServers"]]
+        assert MEMBER_DISPATCH_SERVER not in names
+        assert MEMBER_DISPATCH_SERVER in codex_withheld_servers(frozenset())
 
     def test_the_session_array_carries_the_spec_and_the_control_plane(self, agents_dir):
         """The one assertion the whole mirror exists to make true.
@@ -1712,7 +1736,7 @@ for line in sys.stdin:
 
 
 def _run_driver_reaping_group(
-    argv: list[str], *, timeout: float
+    argv: list[str], *, timeout: float, cwd: "str | os.PathLike[str]"
 ) -> "subprocess.CompletedProcess[str]":
     """Run the out-of-process driver in its OWN process group and reap the group.
 
@@ -1733,6 +1757,10 @@ def _run_driver_reaping_group(
     ``taskkill /T`` on Windows, with the broadcast guard that keeps a reserved pgid
     from signalling every process this uid owns. A raw ``os.killpg`` here would be
     POSIX-only and unguarded.
+
+    ``cwd`` is required, not defaulted: a child inherits pytest's CWD (the
+    checkout) unless told otherwise, and every caller already owns a throwaway
+    directory the driver tree can run from.
     """
     from kiro_crew import platform_compat
 
@@ -1742,6 +1770,7 @@ def _run_driver_reaping_group(
         stderr=subprocess.PIPE,
         encoding="utf-8",
         errors="replace",
+        cwd=cwd,
         start_new_session=platform_compat.IS_POSIX,
         creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
     )
@@ -1833,7 +1862,7 @@ time.sleep(300)
         script = Path(w) / "parent.py"
         script.write_text(parent, encoding="utf-8")
         started = time.monotonic()
-        result = _run_driver_reaping_group([sys.executable, str(script)], timeout=5)
+        result = _run_driver_reaping_group([sys.executable, str(script)], timeout=5, cwd=w)
         # The bound is the control here, and the reap must not add a long second wait.
         assert time.monotonic() - started < 90
         grandchild = int((result.stdout or "").strip().splitlines()[0])
@@ -1919,6 +1948,7 @@ def test_real_codex_acp_accepts_the_crew_stdio_element():
             # could reap -- which is why the runner kills the whole process group
             # rather than the driver alone.
             timeout=540,
+            cwd=root / "work",
         )
         context = (
             f"driver exit: {result.returncode}\n"
@@ -2160,6 +2190,7 @@ def test_real_codex_acp_session_close_evicts():
         result = _run_driver_reaping_group(
             [sys.executable, str(driver), str(root), str(_ENTRY), shutil.which("node") or "node"],
             timeout=300,
+            cwd=root / "work",
         )
         context = (
             f"driver exit: {result.returncode}\n"
@@ -2196,6 +2227,205 @@ def test_real_codex_acp_session_close_evicts():
             "a second close on the same id errored; a double-terminate would fault\n" + context
         )
         assert m["fresh_after"], "session/new failed after the closes\n" + context
+
+
+_DEPTH_DRIVER = r"""
+import json, os, queue, subprocess, sys, threading, time
+
+root, entry, node, src_root, max_depth = sys.argv[1:6]
+max_depth = int(max_depth)
+sys.path.insert(0, src_root)
+from kiro_crew.acp.runtime import _iter_descendant_pids
+
+work = os.path.join(root, "work")
+env = dict(os.environ)
+env["CODEX_HOME"] = os.path.join(root, "codex_home")
+env["NO_BROWSER"] = "1"
+
+
+def reap(p):
+    for step in (p.terminate, p.kill):
+        try:
+            step()
+            p.communicate(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            return
+
+
+def pump(stream, q):
+    for line in stream:
+        q.put(line)
+    q.put(None)
+
+
+def cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    return [tok.decode("utf-8", "replace") for tok in raw.split(b"\0") if tok]
+
+
+p = subprocess.Popen(
+    [node, entry], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL, cwd=work, env=env, text=True, bufsize=1,
+)
+q = queue.Queue()
+threading.Thread(target=pump, args=(p.stdout, q), daemon=True).start()
+next_id = [0]
+
+
+def call(method, params):
+    next_id[0] += 1
+    rid = next_id[0]
+    p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n")
+    p.stdin.flush()
+    deadline = time.time() + 60
+    while True:
+        budget = deadline - time.time()
+        if budget <= 0:
+            return {"_timeout": True}
+        try:
+            line = q.get(timeout=budget)
+        except queue.Empty:
+            return {"_timeout": True}
+        if line is None:
+            return {"_eof": True}
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("id") == rid:
+            return msg
+
+
+out = {}
+try:
+    call("initialize", {"protocolVersion": 1, "clientCapabilities": {"fs": {}}})
+    new = call("session/new", {"cwd": work, "mcpServers": []})
+    out["new_error"] = new.get("error")
+    # The runtime's own bounded walk, one generation at a time: a pid's depth is the
+    # first bound it appears under, so the generation the constant names is measured
+    # by the same reader the recycle guard uses, not by a second tree walker.
+    depth_of = {}
+    for depth in range(max_depth + 1):
+        for pid in _iter_descendant_pids(p.pid, depth):
+            depth_of.setdefault(pid, depth)
+    cmdlines = {str(pid): cmdline(pid) for pid in depth_of}
+    hits = [pid for pid, argv in ((int(k), v) for k, v in cmdlines.items()) if argv and "app-server" in argv]
+    out["depth_pids"] = sorted(depth_of, key=depth_of.get)
+    out["app_server_found"] = bool(hits)
+    out["app_server_depth"] = depth_of[hits[0]] if hits else None
+    out["cmdlines"] = cmdlines
+finally:
+    reap(p)
+print(json.dumps(out))
+"""
+
+
+@pytest.mark.real_adapter
+def test_real_codex_acp_app_server_sits_at_core_rss_depth():
+    """ANTI-DRIFT GUARD for ``CodexHarness.CORE_RSS_DEPTH``.
+
+    The core-scope recycle guard measures RSS over ``CORE_RSS_DEPTH`` generations
+    below the adapter and holds that against ``CORE_RSS_CEILING_MB``. The scope
+    rests on one structural fact about the installed adapter: ``codex app-server``
+    is a DIRECT child of the Node process, one generation down, before any sandbox
+    wrapper. Every existing pin on the constant is static -- the contract test checks
+    it travels with its ceiling, the harness test checks the wrapper arithmetic, the
+    runtime test checks the depth is consumed -- so an adapter release that inserts a
+    launcher generation would move app-server OUT of the measured scope with nothing
+    red to say so: the probe would sum a flat ~100 MB of adapter forever, the
+    ceiling would never trip, and a genuine app-server leak would be invisible.
+    This is where that goes red.
+
+    Two claims:
+
+    1. ``codex app-server`` is reachable within ``CORE_RSS_DEPTH`` of the spawned
+       pid, walked by ``_iter_descendant_pids`` -- the reader the recycle guard
+       itself uses, so the test measures the guard's own scope and not a proxy.
+       That reader is the kernel's ``/proc`` child lists, so the pin is a Linux
+       fact and is gated on Linux the way the adapter itself is gated: through
+       ``require_real_adapter``, which skips a local run elsewhere and FAILS a
+       lane that declared the pin must run (``KIROCREW_E2E_REQUIRE=1``). A
+       ``skipif`` would restore the silence that gate exists to remove.
+    2. It sits at exactly ``CORE_RSS_DEPTH``. A plain spawn has
+       ``wrapper_generations=0``, so ``rss_depth == CORE_RSS_DEPTH`` and the constant
+       IS the generation; a refused ``session/new`` fails rather than skips, because
+       a silent skip is how a ratchet goes quiet.
+
+    The constant is asserted, not resolved from the live tree: a wrong constant must
+    fail here, not be quietly replaced by a runtime observation of a third-party
+    process tree. ``session/new`` is sent so the walk happens after app-server has
+    answered a request, not merely been forked. Same credential arrangement as the
+    sibling live tests: a fabricated key in a throwaway ``CODEX_HOME`` gets past the
+    auth check that fires before ``session/new``; nothing performs a model call.
+    """
+    _require_codex_acp(with_node=True)
+    require_real_adapter(
+        sys.platform == "linux",
+        what="the Linux /proc process tree the recycle guard's reader walks",
+        install="run the real-adapter lane on a Linux host",
+    )
+    src_root = Path(acp_runtime.__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
+        root = Path(w)
+        (root / "work").mkdir()
+        (root / "codex_home").mkdir()
+        (root / "codex_home" / "auth.json").write_text(
+            json.dumps({"OPENAI_API_KEY": "sk-not-a-real-key-" + "0" * 24}), encoding="utf-8"
+        )
+        driver = root / "drive_depth.py"
+        driver.write_text(_DEPTH_DRIVER, encoding="utf-8")
+        result = _run_driver_reaping_group(
+            [
+                sys.executable,
+                str(driver),
+                str(root),
+                str(_ENTRY),
+                shutil.which("node") or "node",
+                str(src_root),
+                str(CodexHarness.CORE_RSS_DEPTH),
+            ],
+            timeout=300,
+            cwd=root / "work",
+        )
+        context = (
+            f"driver exit: {result.returncode}\n"
+            f"stdout: {result.stdout[-3000:]}\nstderr: {result.stderr[-3000:]}"
+        )
+        try:
+            m = json.loads(result.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            pytest.fail("the codex-acp depth driver produced no measurement\n" + context)
+
+        # A refused credential is adapter drift, not "nothing to measure": the
+        # fabricated key exists to get past the auth check, and a ratchet that
+        # skipped here would go quiet on exactly the release this guard is for.
+        assert m.get("new_error") is None, (
+            f"session/new was refused ({m.get('new_error')!r}); the fabricated-credential "
+            "arrangement no longer reaches app-server -- re-measure before trusting the "
+            "depth pin\n" + context
+        )
+        assert "depth_pids" in m, "the process tree was not walked\n" + context
+
+        # 1. within scope.
+        assert m["app_server_found"] is True, (
+            f"no `codex app-server` within CORE_RSS_DEPTH={CodexHarness.CORE_RSS_DEPTH} of "
+            "the adapter; the core-scope recycle guard is measuring the wrong processes\n" + context
+        )
+        # 2. exactly the generation the constant names, compared against the
+        # constant itself so an edit to CORE_RSS_DEPTH that the tree does not
+        # justify goes red here.
+        assert m["app_server_depth"] == CodexHarness.CORE_RSS_DEPTH, (
+            f"`codex app-server` sits at depth {m['app_server_depth']}, not "
+            f"CORE_RSS_DEPTH={CodexHarness.CORE_RSS_DEPTH}; re-measure the constant against "
+            "this adapter release\n" + context
+        )
 
 
 @pytest.mark.real_adapter
@@ -2983,6 +3213,7 @@ def test_real_codex_acp_load_after_close_restores():
         result = _run_driver_reaping_group(
             [sys.executable, str(driver), str(root), str(_ENTRY), shutil.which("node") or "node"],
             timeout=900,
+            cwd=root / "work",
         )
         context = (
             f"driver exit: {result.returncode}\n"

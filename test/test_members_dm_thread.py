@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -31,10 +32,12 @@ from kiro_crew.config.loader import KiroCrewAgentConfig
 from kiro_crew.dashboard.chat_handlers import _history_key_for
 from kiro_crew.members import (
     DM_SLOT_MODE,
+    MEMBER_BRIEFING_MAX_CHARS,
     MemberSlugError,
     dm_binding_path,
     member_dir,
     member_slot_key,
+    members_root,
     read_dm_binding,
     write_dm_binding,
 )
@@ -141,6 +144,7 @@ class TestDmBinding:
 def _make_members_app(state) -> web.Application:
     from kiro_crew.dashboard.handlers.members import (
         api_member_activity,
+        api_member_briefing,
         api_member_thread,
         api_members,
     )
@@ -154,7 +158,9 @@ def _make_members_app(state) -> web.Application:
         # configured; set only when a test has not already chosen a caller, so
         # the non-owner and app-token cases can still pick their own.
         if "user" not in request:
-            request["user"] = "local-app"
+            # ``X-Test-User`` names a NON-owner caller (the dashboard_owner_helpers
+            # convention); absent, the caller is the standalone-local owner.
+            request["user"] = request.headers.get("X-Test-User", "local-app")
         return await handler(request)
 
     app = web.Application(middlewares=[_auth])
@@ -162,6 +168,7 @@ def _make_members_app(state) -> web.Application:
     app.router.add_get("/api/members", api_members)
     app.router.add_post("/api/members/{slug}/thread", api_member_thread)
     app.router.add_get("/api/members/{slug}/activity", api_member_activity)
+    app.router.add_get("/api/members/{slug}/briefing", api_member_briefing)
     return app
 
 
@@ -621,6 +628,11 @@ class TestMemberRoutes:
                 assert (await client.get("/api/members")).status == 404
                 assert (await client.post("/api/members/code-reviewer/thread")).status == 404
                 assert (await client.get("/api/members/code-reviewer/activity")).status == 404
+                briefing = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert briefing.status == 404
+                assert (await briefing.json()) == {"error": "not found", "code": "not_found"}
         assert not state._slots
 
     @pytest.mark.asyncio
@@ -759,7 +771,7 @@ class TestPinEnforcement:
         cfg.save()
         # No real provider or embedding process runs in this stream harness.
         # Keep private ownership and the protected session binding real.
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._maybe_auto_title", AsyncMock())
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.title_then_refresh", AsyncMock())
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.generate_session_summary", AsyncMock())
         monkeypatch.setattr(
             "kiro_crew.config.loader._materialized_kiro_agent",
@@ -1602,6 +1614,94 @@ class TestMemberActivityRoute:
         assert set(data["entries"][0]) == {"ts", "via", "project"}
 
     @pytest.mark.asyncio
+    async def test_the_read_never_asks_the_log_for_every_event(self, tmp_path):
+        """The allocation happens INSIDE `history`, so the caller must bound the ask.
+
+        With `limit=None` and a log past `MAX_RETAINED_EVENTS`, `history` builds every
+        event in the lifetime file into a list and reverses it before the caller sees
+        anything -- so no amount of care in this handler bounds it. The member log has
+        no rotation, so outgrowing the retained tail is ordinary ageing, and the
+        response it feeds shows `_ACTIVITY_LIMIT` rows.
+
+        The test above (1001 buried envelopes) proves paging still FINDS the records.
+        This one pins the reason paging exists: every ask carries a limit.
+        """
+        state = _make_state(tmp_path)
+        from unittest import mock
+
+        from kiro_crew.eventlog import service as svc_mod
+        from kiro_crew.eventlog import types as _types
+        from kiro_crew.members import record_activity, slug_for_name
+
+        assert record_activity(CREW, "dashboard_chat-1", "persistent", project="/repo", via="chat")
+        svc = svc_mod.get_service()
+        slug = slug_for_name(CREW)
+        for i in range(1001):
+            svc.append(slug, _types.MEMBER_MESSAGE, {"text": f"m{i}"})
+
+        asks: list[object] = []
+        real_history = type(svc).history
+
+        def _recording_history(self, slug_in, *, before=None, limit=None):
+            asks.append(limit)
+            return real_history(self, slug_in, before=before, limit=limit)
+
+        with _patched_config([CREW]):
+            with mock.patch.object(type(svc), "history", _recording_history):
+                async with TestClient(TestServer(_make_members_app(state))) as client:
+                    resp = await client.get(
+                        "/api/members/code-reviewer/activity", params={"member": CREW}
+                    )
+                    assert resp.status == 200
+                    data = await resp.json()
+
+        assert asks, "the endpoint did not read the log at all"
+        assert None not in asks, (
+            "the activity read asked for the whole log (limit=None); `history` then "
+            f"materialises the entire lifetime file before returning. asks={asks}"
+        )
+        assert all(
+            isinstance(a, int) and 0 < a <= 1000 for a in asks
+        ), f"an ask was not a small bounded page: {asks}"
+        # Still correct: the buried record is found despite the bounded asks.
+        assert len(asks) > 1, "1001 envelopes should have needed more than one page"
+        assert [e["project"] for e in data["entries"]] == ["/repo"]
+
+    @pytest.mark.asyncio
+    async def test_activity_survives_more_than_a_thousand_later_events(self, tmp_path):
+        """The cap applies to this member's ACTIVITY, not to a slice of the log.
+
+        One log carries config, binding, rules, message, slot and patrol events
+        beside activity records, and a colliding slug's log carries another exact
+        name's records too. Reading a fixed slice of the newest envelopes and
+        filtering afterwards therefore drops activity the drawer promises to show:
+        a member with a busy message history loses their whole timeline even though
+        the records are still in the log. The filter runs before any cap.
+        """
+        state = _make_state(tmp_path)
+        from kiro_crew.eventlog import types as _types
+        from kiro_crew.eventlog.service import get_service
+        from kiro_crew.members import record_activity, slug_for_name
+
+        assert record_activity(CREW, "dashboard_chat-1", "persistent", project="/repo", via="chat")
+        # Bury it behind more envelopes than the former read window held.
+        svc = get_service()
+        slug = slug_for_name(CREW)
+        for i in range(1001):
+            svc.append(slug, _types.MEMBER_MESSAGE, {"text": f"m{i}"})
+
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/activity", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert len(data["entries"]) == 1, f"activity was cut off by the envelope read: {data}"
+        assert data["entries"][0]["project"] == "/repo"
+        assert data["capped"] is False
+
+    @pytest.mark.asyncio
     async def test_colliding_slugs_do_not_mix_histories(self, tmp_path):
         """Two names sharing a slug share a log file, never a timeline.
 
@@ -1669,6 +1769,9 @@ class TestMemberActivityRoute:
 
         assert record_activity(CREW, "dashboard_chat-1", "persistent", via="chat")
         path = member_dir("code-reviewer") / ACTIVITY_FILE_NAME
+        # Only the LEGACY file lives in the member directory now -- the log moved
+        # under the fenced crew-log tree -- so nothing has created it yet.
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(f'\n{{"ts": "not-a-date", "member": "{CREW}", "via": "chat"}}\n')
             fh.write(f'\n{{"ts": 1735689600, "member": "{CREW}", "via": "chat"}}\n')
@@ -1726,6 +1829,350 @@ class TestMemberActivityRoute:
                 data = await resp.json()
         assert data["capped"] is True
         assert len(data["entries"]) == handler_mod._ACTIVITY_LIMIT
+
+
+# The briefing read fails CLOSED on platforms without O_NOFOLLOW (Windows) --
+# see read_member_briefing. Tests asserting briefing CONTENT through the
+# endpoint are therefore POSIX-only; the fail-closed flag itself is what the
+# response's ``supported`` field carries on every platform.
+_requires_nofollow = pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW"),
+    reason="briefing reads fail closed without O_NOFOLLOW",
+)
+
+
+class TestMemberBriefingEndpoint:
+    """GET /api/members/{slug}/briefing — the panel's read-only Notes tab feed."""
+
+    @staticmethod
+    def _write_briefing(text: str):
+        from kiro_crew.members import member_briefing_path
+
+        path = member_briefing_path("code-reviewer")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_written_briefing_is_returned_with_its_mtime_and_path(self, tmp_path):
+        state = _make_state(tmp_path)
+        path = self._write_briefing("This week: crash-tagged issues first.\n")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["slug"] == "code-reviewer"
+        assert data["member"] == CREW
+        assert data["supported"] is True
+        assert data["text"] == "This week: crash-tagged issues first."
+        assert isinstance(data["updated_ts"], float)
+        assert abs(data["updated_ts"] - path.stat().st_mtime) < 5
+        # The response's field allowlist, pinned exactly: no file pointer --
+        # the panel offers no editor for an agent-written file.
+        assert set(data) == {
+            "slug",
+            "member",
+            "supported",
+            "text",
+            "updated_ts",
+            "redacted",
+            "truncated",
+        }
+        assert data["redacted"] is False
+        assert data["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_briefing_yet_is_empty_not_404(self, tmp_path):
+        """A fresh crewmate has no notes; that is the normal state, not an error."""
+        state = _make_state(tmp_path)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["text"] == ""
+        assert data["updated_ts"] is None
+        # No file, no pointer: an Edit on a "not on disk" placeholder could later
+        # save that stale buffer over notes the crewmate wrote in the meantime.
+
+    @pytest.mark.asyncio
+    async def test_unsupported_platform_fails_closed_for_text_and_stamp_alike(
+        self, tmp_path, monkeypatch
+    ):
+        """Where the read fails closed (no O_NOFOLLOW), the stamp must too.
+
+        A response that says ``supported: false`` with an empty text but a real
+        ``updated_ts`` would let the panel date notes it just said it cannot
+        read; the two fields travel together.
+        """
+        state = _make_state(tmp_path)
+        self._write_briefing("Notes the platform cannot read safely.\n")
+        # Both the handler (module attribute) and the mtime helper (module global)
+        # resolve the gate through kiro_crew.members at call time.
+        monkeypatch.setattr("kiro_crew.members.member_briefing_supported", lambda: False)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["supported"] is False
+        assert data["text"] == ""
+        assert data["updated_ts"] is None
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_symlinked_member_dir_never_reads_a_peer(self, tmp_path):
+        """A ``members/<slug>`` swapped for a symlink to a peer's directory is
+        refused by the pinned read: the text reads as no notes and the stamp is
+        ``null``, never the peer's file dated as this crewmate's."""
+
+        state = _make_state(tmp_path)
+        peer = members_root() / "peer"
+        peer.mkdir(parents=True)
+        (peer / "briefing.md").write_text("The peer's private notes.\n", encoding="utf-8")
+        link = members_root() / "code-reviewer"
+        link.symlink_to(peer, target_is_directory=True)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["text"] == ""
+        assert data["updated_ts"] is None
+        # The refused read yields no pointer at all -- least of all the peer's.
+
+    @pytest.mark.asyncio
+    async def test_colliding_slug_is_refused_not_shown_as_either_crewmates_notes(self, tmp_path):
+        """One briefing file per slug; two names on it belong to neither.
+
+        Rendering the shared file as one member's notes -- with an Edit that
+        saves over it -- would let the two crewmates overwrite each other, so
+        the read is refused for BOTH names with a coded 409.
+        """
+        state = _make_state(tmp_path)
+        self._write_briefing("Whose notes are these?\n")
+        other = "Code_Reviewer"  # distinct exact name, same derived slug
+        with _patched_config([CREW, other]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                for name in (CREW, other):
+                    resp = await client.get(
+                        "/api/members/code-reviewer/briefing", params={"member": name}
+                    )
+                    assert resp.status == 409
+                    assert (await resp.json())["code"] == "briefing_slug_ambiguous"
+
+    @pytest.mark.asyncio
+    async def test_member_must_derive_the_slug_and_exist(self, tmp_path):
+        state = _make_state(tmp_path)
+        with _patched_config([CREW, OTHER]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                mismatch = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": OTHER}
+                )
+                assert mismatch.status == 400
+                assert (await mismatch.json())["code"] == "member_slug_mismatch"
+                gone = await client.get(
+                    "/api/members/nobody-here/briefing", params={"member": "nobody-here"}
+                )
+                assert gone.status == 404
+                assert (await gone.json())["code"] == "member_not_found"
+
+    @pytest.mark.asyncio
+    async def test_non_owner_dashboard_caller_is_refused_before_any_read(self, tmp_path):
+        """The briefing is the owner's to read, like the rules.
+
+        Any allowed Slack user can mint a dashboard session (``!dashboard``),
+        so the app-caller guard alone would hand a non-owner colleague the
+        crewmate's private notes. The owner gate answers first, so the refusal
+        costs no file IO -- the briefing on disk is never opened.
+        """
+        state = _make_state(tmp_path)
+        self._write_briefing("Owner-only working notes.\n")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                with patch(
+                    "kiro_crew.members.read_member_briefing_bounded",
+                    side_effect=AssertionError("read must not run for a non-owner"),
+                ):
+                    resp = await client.get(
+                        "/api/members/code-reviewer/briefing",
+                        params={"member": CREW},
+                        headers={"X-Test-User": "colleague"},
+                    )
+                assert resp.status == 403
+                assert (await resp.json())["code"] == "owner_only"
+
+    @pytest.mark.asyncio
+    async def test_invalid_slug_is_refused_before_any_file_io(self, tmp_path):
+        state = _make_state(tmp_path)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                bad = await client.get("/api/members/Bad_Slug!/briefing", params={"member": CREW})
+                assert bad.status == 400
+                assert (await bad.json())["code"] == "invalid_member_slug"
+
+    @pytest.mark.asyncio
+    async def test_member_param_is_required(self, tmp_path):
+        """The slug is lossy; the exact name is what the frontend keys its cache by."""
+        state = _make_state(tmp_path)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get("/api/members/code-reviewer/briefing")
+                assert resp.status == 400
+                assert (await resp.json())["code"] == "missing_member"
+                bad = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": "no spaces!"}
+                )
+                assert bad.status == 400
+                assert (await bad.json())["code"] == "missing_member"
+
+    @pytest.mark.asyncio
+    async def test_app_tokens_are_denied_like_every_member_surface(self, tmp_path):
+        state = _make_state(tmp_path)
+        self._write_briefing("secret plans")
+
+        @web.middleware
+        async def _as_app(request: web.Request, handler):
+            request["app"] = "some-app"
+            return await handler(request)
+
+        app = _make_members_app(state)
+        app.middlewares.insert(0, _as_app)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 404
+                assert (await resp.json()) == {"error": "not found", "code": "not_found"}
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_credentials_in_the_briefing_are_redacted_at_the_boundary(self, tmp_path):
+        """The briefing is an AGENT-written file; a token the crewmate pasted
+        into its own notes must not reach the browser verbatim."""
+        state = _make_state(tmp_path)
+        self._write_briefing("Deploy key for staging: AKIAIOSFODNN7EXAMPLE — rotate monthly.")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert "AKIAIOSFODNN7EXAMPLE" not in data["text"]
+        assert "rotate monthly" in data["text"]
+        # The flag is what lets the panel withhold Edit: the viewer's Save would
+        # otherwise write this redacted text over the original.
+        assert data["redacted"] is True
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_secret_straddling_the_cap_never_leaks_its_prefix(self, tmp_path):
+        """The redaction runs over the bounded buffer BEFORE the character
+        cap: a token the cap would split in two is matched whole and
+        replaced, so no plaintext prefix crosses the wire, and the cut then
+        drops the trailing split word so nothing ends mid-token."""
+        state = _make_state(tmp_path)
+        lead = "word " * ((MEMBER_BRIEFING_MAX_CHARS - 10) // 5)  # ends 10 chars short
+        self._write_briefing(lead + "AKIAIOSFODNN7EXAMPLE rest of the line\n" + "tail\n" * 40)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert "AKIA" not in data["text"]
+        assert "briefing truncated" in data["text"]
+        assert data["redacted"] is True
+        assert data["truncated"] is True
+        # The shown text never ends in the first half of a word.
+        shown = data["text"].split("\n[... briefing truncated")[0]
+        assert shown == shown.rstrip() and not shown.endswith("wor")
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_secret_past_the_read_bound_is_reported_as_truncated(self, tmp_path):
+        """A token past the bounded read is never seen, so ``redacted`` stays
+        false for it -- while the file viewer reads (and redacts) the whole
+        file and its Save would write the redacted tail back. ``truncated``
+        is the flag that lets the panel withhold Edit for that file too."""
+        state = _make_state(tmp_path)
+        self._write_briefing(
+            "y" * (MEMBER_BRIEFING_MAX_CHARS * 8) + "\nDeploy key: AKIAIOSFODNN7EXAMPLE\n"
+        )
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert "AKIA" not in data["text"]
+        assert "briefing truncated" in data["text"]
+        assert data["redacted"] is False
+        assert data["truncated"] is True
+
+    @_requires_nofollow
+    @pytest.mark.asyncio
+    async def test_redaction_that_shrinks_below_the_cap_shows_the_whole_briefing(self, tmp_path):
+        """The cap is judged on the REDACTED length: a briefing that only ran
+        past the cap before its placeholders shrank it is shown whole -- no
+        marker, no word dropped, ``truncated`` false."""
+        state = _make_state(tmp_path)
+        lead = "word " * ((MEMBER_BRIEFING_MAX_CHARS - 400) // 5)
+        # Ten 60-char keys (~610 chars) push the raw text past the cap; each
+        # collapses to a 22-char placeholder, so the redacted text fits.
+        keys = " ".join("ghp_" + ("A" * 56) for _ in range(10))
+        self._write_briefing(lead + keys + " last\n")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert "ghp_" not in data["text"]
+        assert data["text"].endswith("last")
+        assert "briefing truncated" not in data["text"]
+        assert data["redacted"] is True
+        assert data["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_successful_read_leaves_an_allowed_audit_row(self, tmp_path, monkeypatch):
+        """WHO read a crewmate's private notes matters as much as who was
+        refused (the rules read's posture): a denied-only trail cannot answer
+        "was this boundary disclosed"."""
+        state = _make_state(tmp_path)
+        self._write_briefing("Owner-only working notes.\n")
+        record: dict = {}
+
+        class _RecordingSel:
+            def log_api_access(self, **kwargs):
+                record["kwargs"] = kwargs
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: _RecordingSel())
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get(
+                    "/api/members/code-reviewer/briefing", params={"member": CREW}
+                )
+                assert resp.status == 200
+        assert record["kwargs"]["operation"] == "members.briefing.read"
+        assert record["kwargs"]["outcome"] == "allowed"
+        assert record["kwargs"]["source"] == "dashboard"
+        assert record["kwargs"]["resources"] == "slug=code-reviewer"
 
 
 class TestDenialAuditOffload:

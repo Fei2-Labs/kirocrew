@@ -43,16 +43,25 @@ from kiro_crew.dashboard import chat_runner  # isort: skip
 
 @pytest.fixture(autouse=True)
 def _generous_append_deadline(monkeypatch):
-    """Take the production append deadline off the critical path of this test.
+    """Take every production append deadline off the critical path of this test.
 
     The assertions read rows back off the day-file, so they depend on the real
-    writer beating ``platform_log_append._APPEND_TIMEOUT_SECONDS`` -- 0.5s, there
-    to stop an observation occupying a caller on lock contention. Raised, not
-    removed: a genuinely stuck lock still fails.
+    writer beating three budgets that exist to stop an observation occupying a
+    caller: ``platform_log_append._APPEND_TIMEOUT_SECONDS`` (0.5 s, lock
+    contention) and the two 50 ms ``asyncio.wait_for`` ceilings around the
+    off-loop append -- ``gate._LOG_BUDGET_SECS`` for the CALL row and
+    ``tool_risk.LOG_BUDGET_SECS`` for the OUTCOME row, whose expiry returns
+    ``None`` and leaves the card unannotated. The Windows shard lost the outcome
+    row's 50 ms on 14 unrelated heads in two days (``the card must carry the
+    annotation`` / ``a redacted argument is a question, not a refusal``), so the
+    chain under test was never reached. Raised, not removed: a genuinely stuck
+    writer still fails, by name, inside the suite's ``--timeout``.
     """
     from kiro_crew import platform_log_append
 
     monkeypatch.setattr(platform_log_append, "_APPEND_TIMEOUT_SECONDS", 10.0)
+    monkeypatch.setattr(core.gate, "_LOG_BUDGET_SECS", 20.0)
+    monkeypatch.setattr(tr, "LOG_BUDGET_SECS", 20.0)
 
 
 @pytest.fixture
@@ -236,6 +245,12 @@ async def test_revoking_the_tool_argument_scope_silences_the_whole_chain(tmp_pat
     )
     state, client = _runner(tmp_path)
     slot = _slot("chat-risk-e2e-unscoped")
+    # PINNED, so `model.route` does not also run on this turn and the assertion
+    # below can stay an exact whole-log comparison. A filter would have let any
+    # other point's unexpected row through unnoticed, which is the opposite of what
+    # this assertion is for. The pin is inert for this test: the tool-risk path
+    # reads the call, never the slot's model.
+    slot.model = "model-pinned-so-nothing-routes"
     state.is_yolo_active = MagicMock(return_value=False)
     _scripts(client, [_tool_call()])
 

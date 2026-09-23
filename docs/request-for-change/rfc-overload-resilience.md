@@ -1,6 +1,6 @@
 ---
 title: Overload resilience — durable task queue, admission before allocation, adaptive concurrency, layered recovery
-status: accepted
+status: partial
 revision: v3
 author: bolichen
 created: 2026-09-12
@@ -14,17 +14,15 @@ superseded-by: []
 ---
 # RFC: Overload resilience — durable task queue, admission before allocation, adaptive concurrency, layered recovery
 
-- Status: accepted (owner decision 2026-09-12 14:21: ONE PR, no design questions
-  back). Every design element ships in a single PR on branch
-  `fix/gatewayd-overload-liveness`, whose first slice (the gatewayd supervisor no
-  longer kills a daemon that is merely busy; the stub reconnect budget rises from
-  60s to 600s) is already on the branch and is treated as landed. The supervisor
-  half of that slice was solved on `main` by #10455's escalated probe while this
-  branch was in review, so this branch's own gate for it is SUBTRACTED rather
-  than shipped — see the slice-0 row in §12.
-  §12 names the internal waves; §13 records every decision with the
-  config flag that reverses it. §14 folds the owner's 2026-09-12 15:12 addendum
-  (unified waits, yielding, nested recovery) into the same PR.
+- Status: implemented on main in [#10521](https://github.com/kirodotdev/KiroCrew/pull/10521).
+  The shipped contracts are [`../system-specs/modules/taskq.md`](../system-specs/modules/taskq.md),
+  [`../system-specs/modules/adaptive-concurrency.md`](../system-specs/modules/adaptive-concurrency.md),
+  and the linked module specifications they reference. The durable task store,
+  admission and host budgets, session-start collection, adaptive controller,
+  recovery and wait states, TaskRunner/workflow adapters, API, and dashboard
+  surface all shipped in that PR. The dedicated-runtime parent checkpoint-pause
+  remains explicitly excluded by decision Q3. The delivery plan below is retained
+  as the historical pre-merge record.
 - Author: bolichen (Bolin Chen). Requirements: the 2026-09-12 spec
   (`overload-resilience/SPEC.md` in the crew workspace); code investigation
   `subagents/081a6e0a`; GPT-6 review `subagents/99cae534` (verdict REDESIGN, its
@@ -425,8 +423,19 @@ window and the `2.0s` stagger this RFC first proposed. Both were changed because
 the original pair could not reach a user's configured ceiling: a ×0.5 decrease
 fires on one lag spike while a flat 20-success bar at cap 1 needs twenty serial
 runs to earn cap 2, and a 2.0s stagger takes over two minutes to fill 64 slots
-even once the cap allows them. The climb is bounded by what the host's memory and
-CPU size the cap at, so a faster rule cannot exceed the machine. Doubling is
+even once the cap allows them. The climb is bounded by `user_max` alone, judged
+against the live pressure signals in each sample; it is NOT clamped to a figure
+predicted from past peak memory and CPU per agent. Such a prediction prices every
+slot at the busiest agent's burst (one build-heavy run at 20 cores and 9 GB) and
+pins a 32-core host with 96 GB free at the fresh-start cap for the life of the
+process, under a controller that sees only clean samples -- the loop exists so
+that many sessions can ask for many workers, be admitted up to the ceiling the
+user chose, and queue on real pressure rather than be refused for a guess. Memory
+over-commit is the one unrecoverable failure and is guarded live (the pressure
+line gates increases, the critical line cuts, the spawn gate defers cold starts
+that would breach `spawn_min_memory_gb` plus unobserved growth); CPU over-commit
+only slows work, which is the pressure the loop already backs off from, so CPU
+is not a sizing term for the auto ceiling either. Doubling is
 one-way per process: the first corroborated pressure or pause retires it and the
 controller stays in congestion avoidance for that process lifetime.
 

@@ -6,17 +6,103 @@ Member memory is routed by a captured record, not process ancestry or proof toke
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import sys
+import time
 from typing import Any
 
 from kiro_crew import platform_compat
+from kiro_crew.config.paths import config_dir
 from kiro_crew.execution_context import (
     bind_session_execution,
     execution_for_store,
     read_session_execution,
 )
 from kiro_crew.session_token_sig import verify_session_token
+
+logger = logging.getLogger(__name__)
+
+# Legacy per-pid member-memory binding records:
+# ``<crew home>/member-memory-bindings/pids/<pid>.json`` and
+# ``<pid>.namespace.json``. A removed routing path wrote one per agent process
+# and deleted none, and no sweep ever collected them, so they accumulate for the
+# install's life -- measured on an operator host at 165,975 files spanning nine
+# days and 24 MB of directory inode, of which 165,816 named no live process.
+# Nothing in this version writes the directory; this is the collector it never
+# had.
+_LEGACY_PID_BINDING_DIR = ("member-memory-bindings", "pids")
+_LEGACY_PID_BINDING_NAME_RE = re.compile(r"^(\d+)\.(?:json|namespace\.json)$")
+# A record is only ever removed when it is BOTH older than this AND names no
+# live process. Age alone would race a just-written record; a dead pid alone
+# would delete a record whose pid number has been recycled away from the process
+# that owns it while that owner is still running under a re-read. Requiring both
+# is what makes the prune safe against pid reuse in either direction.
+_LEGACY_PID_BINDING_MIN_AGE_SECS = 24 * 3600.0
+# Per-pass deletion budget. The first pass on a host that has accumulated for
+# weeks would otherwise be a six-figure unlink run inside one maintenance-pool
+# task; the sweep repeats on a bounded cadence, so a backlog drains over several
+# passes instead of monopolising one.
+_LEGACY_PID_BINDING_PRUNE_BUDGET = 2000
+
+
+def prune_legacy_member_pid_bindings(
+    *,
+    budget: int = _LEGACY_PID_BINDING_PRUNE_BUDGET,
+    min_age_secs: float = _LEGACY_PID_BINDING_MIN_AGE_SECS,
+) -> int:
+    """Delete aged per-pid binding records whose pid names no live process.
+
+    Blocking filesystem work: callers on an event loop MUST offload it (the
+    periodic sweep runs it on the maintenance executor). Returns the number of
+    records removed; 0 when the directory is absent, which is the normal state on
+    an install that never ran the path that wrote it.
+    """
+    root = config_dir().joinpath(*_LEGACY_PID_BINDING_DIR)
+    cutoff = time.time() - max(0.0, float(min_age_secs))
+    removed = 0
+    try:
+        scan = os.scandir(root)
+    except (OSError, ValueError):
+        return 0
+    with scan:
+        for entry in scan:
+            if removed >= max(0, int(budget)):
+                break
+            match = _LEGACY_PID_BINDING_NAME_RE.match(entry.name)
+            if match is None:
+                # An unrecognised name is left alone: this sweep owns exactly the
+                # record shape it can attribute to a pid, and a directory the
+                # operator or a later version put something else in is not its
+                # to empty.
+                continue
+            try:
+                # follow_symlinks=False on BOTH the stat and the unlink scope:
+                # the directory is agent-writable, so a planted link must not
+                # redirect either the age reading or the deletion.
+                if entry.is_symlink() or entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            try:
+                pid = int(match.group(1))
+            except ValueError:
+                continue
+            if platform_compat.pid_exists(pid):
+                continue
+            try:
+                os.unlink(entry.path)
+            except OSError:
+                continue
+            removed += 1
+    if removed:
+        logger.info(
+            "Pruned %d stale per-pid member-memory binding record(s) from %s",
+            removed,
+            root,
+        )
+    return removed
 
 
 def read_private_session_store(session_key: str) -> str | None:
@@ -34,7 +120,13 @@ def bind_private_session_store(session_key: str, memory_store: str) -> None:
         if current.store.store_id != memory_store or current.member_id is None:
             raise ValueError("The session already has another memory binding")
         return
-    bind_session_execution(session_key, execution_for_store(memory_store))
+    # Establishing, so it vouches. The store arrives as this function's ARGUMENT from
+    # trusted gateway code -- never read back from the session's own record -- and the
+    # early return above refuses to rebind a session that already has a record, so it
+    # cannot re-point an existing session at a peer's store. Without the
+    # vouch the session is published but unvouched, and its own-store dispatch is then
+    # refused with "cannot verify delegation within the caller's memory assignment".
+    bind_session_execution(session_key, execution_for_store(memory_store), vouch=True)
 
 
 def private_memory_store_for_session(session_key: str | None) -> str:

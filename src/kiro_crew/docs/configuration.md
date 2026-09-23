@@ -77,74 +77,41 @@ Set via `kirocrew config set agent.sandbox auto`.
 
 ## ACP Backend
 
-`agent.acp_backend` selects which ACP agent Kiro Crew drives. `agent.provider`
+`agent.acp_backend` selects the ACP harness Kiro Crew drives. `agent.provider`
 stays `acp` either way — the backend is a choice *within* ACP, not a different
 provider.
 
-| Value | Agent | Status |
-|-------|-------|--------|
-| `""` (default) | kiro-cli | full support |
-| `kas` | kiro-agent (KAS) | runs chat; some surfaces still missing |
+| Value | Harness | Notes |
+|-------|---------|-------|
+| `""` (default) | kiro-cli | The built-in default path. |
+| `kas` | Kiro Agent (KAS) | Served through kiro-cli's `acp --agent-engine v3` relay. |
+| `claude` | Claude Code | Uses the public `claude-agent-acp` adapter. |
+| `codex` | Codex | Uses the Codex ACP adapter. |
+| `opencode` | OpenCode | Uses OpenCode's native ACP server. |
+| `pi` | Pi | Uses `pi-acp` and its Pi gate extension. |
+| `goose` | goose | Uses goose's native ACP server. |
 
-**What works on `kas`:** normal chat — your configured agent, its prompt, its tool
-allowlist, and session resume. The context-usage percentage meter, compaction
-(summarization) status, and agent-switch echoes are wired: KAS reports these as
-`session/update` discriminants (`session_info_update` with a `context_usage` /
-`turn_completion` / `summarization_*` kind, and `current_mode_update`) rather than
-the separate `_kiro.dev/*` methods kiro-cli uses, and Kiro Crew maps them back to
-the same displays.
+The non-default harnesses are offered only when this build registers them. A
+host governance policy can narrow that list further, and the dashboard reports
+missing harness components with their install command. `kirocrew doctor` reports
+backend-specific setup failures. An unselectable or unrecognized value logs a
+warning and falls back to the default backend.
 
-**What does not, yet:**
+KAS is not a separate executable: Kiro Crew starts a sufficiently recent
+kiro-cli ACP relay. When Kiro Crew owns KAS authentication, the relay asks the
+gateway for access tokens and the encrypted refresh token stays in Kiro Crew;
+otherwise `--auth-method cli` uses kiro-cli's existing login. A sign-in or
+sign-out takes effect on the next KAS process.
 
-- Native subagent progress reporting (subagents run; their live progress does not
-  surface in the UI).
-- Slash commands: KAS advertises them (`available_commands_update`), but Kiro Crew
-  surfaces no available-commands UI for any backend (kiro-cli's
-  `_kiro.dev/commands/available` is likewise unconsumed), and slash-command
-  *execution* is not wired.
-- Auto-approve (`allowedTools`) is not carried over, so KAS applies its own
-  default approval policy.
-- `spawn_continue` works for runs started with an explicit keep, but not for
-  opportunistically-retained shared subagents.
-- Model selection is unverified: KAS advertises no model list on an
-  unauthenticated session, and Kiro Crew only sends a model the session
-  advertised, so a session may simply run KAS's own default model.
+Harness capabilities differ: agent-spec projection, MCP transport, model
+selection, permission routing, resume, compaction, and subagent continuation are
+not inferred from the harness name. See [Agent Spec Field
+Reference](agent-spec-fields.md) for the per-field behavior and the [agent host
+contract](../../../docs/system-specs/modules/agent-host-contract.md) for the
+per-harness capability matrix.
 
-KAS reports managed MCP startup through session-scoped `_kiro/mcp/status` and
-`_kiro/tools/didChange` notifications. Kiro Crew waits for the selected agent's
-required managed servers and tool exposure before its first prompt, including
-after resume. Tools intentionally excluded by the agent remain excluded; their
-absence does not block startup. Failure or missing readiness produces a startup
-error within the configured session-start timeout.
-
-**Signals with no KAS analog** (documented so they are not mistaken for gaps):
-KAS has no `clear/status` notification. A resumable-session existence probe would
-use KAS's `_kiro/session/list` (which returns the full `sessions[]` to search by
-id); that is deferred to the session-lifecycle work, not the display path.
-
-
-**KAS is served by kiro-cli's own ACP relay.** Kiro Crew spawns
-`kiro-cli acp --agent-engine v3` and speaks ordinary ACP to it; the relay
-forwards frames to KAS in both directions. Two consequences worth knowing:
-
-- **Credentials come from one of two places, chosen per spawn.** If you have
-  signed in through Kiro Crew's own login (the KAS login gate), Kiro Crew is the
-  engine's auth owner: the relay is started without `--auth-method`, the engine
-  asks Kiro Crew for an access token over its `_kiro/auth/getAccessToken`
-  callback, and Kiro Crew answers from its encrypted vault (the refresh token
-  never leaves Kiro Crew). Otherwise Kiro Crew adds `--auth-method cli` and the
-  relay resolves tokens from kiro-cli's own store — this works on any machine
-  where `kiro-cli login` has succeeded. A sign-in or sign-out takes effect on the
-  next KAS process, not on one already running.
-- **No KAS assets to locate.** Kiro Crew does not read kiro-cli's extracted KAS
-  bundle or its Node runtime, so there is nothing to point at and no override to
-  set. What it does need is a kiro-cli new enough to offer `--agent-engine v3`;
-  `kirocrew doctor` reports that when `agent.acp_backend` is `kas`.
-
-An unrecognized value logs a warning and falls back to the default backend, so a
-typo costs you a line in the log rather than a gateway that will not start.
-
-Set via `kirocrew config set agent.acp_backend kas`.
+Set a registered value with, for example,
+`kirocrew config set agent.acp_backend kas`.
 
 ## Key Settings
 
@@ -195,13 +162,16 @@ Set via `kirocrew config set agent.acp_backend kas`.
     "provider": "local",
     "streaming": true,
     "transcribe_region": "us-east-1",
-    "language_code": "en-US"
+    "language_code": "auto"
   },
   "memory": {
     "embedding_provider": "llama_cpp",
     "embedding_dim": 1024,
     "history_idle_hours": 3.0,
-    "history_max_days": 365
+    "history_max_days": 365,
+    "persistence_enabled": true,
+    "inject_memory": true,
+    "inject_lessons": true
   },
   "skills": {
     "max_triggered": 0
@@ -309,13 +279,14 @@ transcribed the same way.
 |-----|-------------|---------|
 | `stt.enabled` | Turn spoken input into text you can send | `true` |
 | `stt.provider` | `"local"` (this machine, no account), `"apple"` (the on-device recognizer built into macOS 26 and later), or `"transcribe"` (AWS Transcribe, which bills your AWS account) | `"local"` |
-| `stt.model` | Which speech model the local provider downloads and runs: `tiny`, `base`, `small`, or `large-v3-turbo`. Bigger is more accurate and a longer first-time download | `"base"` |
-| `stt.language_code` | Language for speech recognition, e.g. `en-US`, `fr-FR` | `"en-US"` |
+| `stt.model` | Which speech model the local provider downloads and runs: `tiny`, `base`, `small`, or `large-v3-turbo`. Bigger is more accurate and a longer first-time download — and on a CPU-only build the largest can recognise slower than you speak (an 11-second clip took 13.6 s on a 16-thread aarch64 CPU, 1.24x the audio), which Settings → Voice says beside the choice | `"base"` |
+| `stt.language_code` | Language for speech recognition, e.g. `en-US`, `fr-FR`. `"auto"` auto-detects on the local provider | `"auto"` |
 | `stt.streaming` | Show words in the message box while you are still speaking rather than only once you stop. Every provider supports it; turning it off spends less CPU on `local` and fewer API calls on `transcribe` | `true` |
-| `stt.silence_ms` | How long a pause must last before what you said is treated as a finished phrase. Raise it if you are being cut off mid-sentence, lower it if the text lags behind you. A value outside 200-5000 ms is clamped into that range, because a shorter pause than that falls between two ordinary words | `700` |
-| `stt.partial_interval_ms` | How often the live transcript is refreshed while you speak. Lower feels more immediate and costs a little more CPU per second of speech; higher is steadier to read. A value outside 100-5000 ms is clamped into that range | `400` |
+| `stt.silence_ms` | How long a pause must last before what you said is treated as a finished phrase. Raise it if you are being cut off mid-sentence, lower it if the text lags behind you. A value outside 200-5000 ms is clamped into that range. Set here only: Settings -> Voice offers no picker, because nobody can tell 700 ms from 750 ms by feel, and the setting most people actually want when dictation cuts them off is `stt.endpointing` | `700` |
+| `stt.partial_interval_ms` | How often the live transcript is refreshed while you speak. A value outside 100-5000 ms is clamped into that range. Set here only: Settings → Voice offers no picker for it, because a decode costs a large fixed amount plus a small amount per second of audio (about 0.78 s + 0.08 s per audio-second for `base` on a 32-core CPU build), so on any CPU build the recogniser, not this number, decides the real cadence | `400` |
 | `stt.idle_evict_secs` | How long the local model stays in memory after your last recording. It holds roughly 150 MB at the default model and reloads in a fraction of a second, so lower this on a machine short of memory. `0` releases it as soon as you stop speaking | `600` |
 | `stt.endpointing` | While dictating, judge each finished phrase with a fast background model and send the message once it reads as a complete request, without you pressing anything. Needs `streaming` | `false` |
+| `stt.polish` | After a dictation finishes, hand the TEXT (never the audio) to a fast model that fixes punctuation and spacing, and replace what is in the message box a moment later. Off by default because this is the one part of `local` recognition that sends anything off your machine. It never blocks you — the recogniser's own text is already there and already sendable — and never CHANGES a word: a reply that altered one is discarded, so the worst case is that nothing happens. It also never touches anything you typed after you stopped talking | `false` |
 | `stt.dictation_panel` | Show the animated dictation panel while recording instead of the thin status bar. Ignored when the browser lacks WebGL2 or the OS asks for reduced motion, both of which fall back to the bar | `true` |
 | `stt.timeout_secs` | Ceiling on transcribing one whole file: the audio decode, and each model load or recognition inside it | `300` |
 | `stt.transcribe_region` | AWS region for the Transcribe API (`transcribe` provider only) | `"us-east-1"` |
@@ -438,6 +409,9 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.history_max_days` | Days of history to retain before pruning | `365` |
 | `memory.backup_enabled` | Periodic rotating backups of every active memory store (the default store, named V1 stores and member V2 stores); retention does not delete active memories | `true` |
 | `memory.backup_keep` | Backup copies retained per store, with a minimum of one | `7` |
+| `memory.persistence_enabled` | Global switch for persistent memory. Off: no automatic memory writes anywhere — `learn_add` and `kirocrew learn add` refuse, history consolidation pauses entirely (no LLM turn spent), task-runner lesson extraction skips — and stored memory/lessons are not injected into new sessions. Within-conversation context is unaffected, and explicit dashboard edits/deletions (the right to forget) stay available. One documented exception: an installed app's own ingestion sweep (Ops Mission Control's ledger import) still writes app-scoped episodic rows, because it is reached only through that app's trigger | `true` |
+| `memory.inject_memory` | Inject the stored memory block (preferences, the memory activity index, recent-session snippets) into new-session context, including the re-injection after a compaction. On-demand `memory_recall` and writes are unaffected | `true` |
+| `memory.inject_lessons` | Inject the learned-corrections and user-profile blocks into new-session context. Writes are unaffected | `true` |
 
 Decay, episodic capacity eviction and history age pruning apply to V1 only.
 V2 keeps memory until explicit correction, replacement, forgetting or restoration.

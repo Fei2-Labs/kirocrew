@@ -28,11 +28,32 @@ from kiro_crew.decisions.points import skills_select as sel
 from kiro_crew.decisions.points import tool_risk as tr
 from kiro_crew.decisions.types import Answer
 
+#: The append ceiling these tests run under, in place of the production
+#: :data:`tr.LOG_BUDGET_SECS` (0.05 s). The tests here assert on the RECORD, and a
+#: record is refused whenever the off-loop append does not finish inside that
+#: budget -- so with the production value every one of them also asserts that a
+#: new-file ``CreateFile`` plus lock plus write beats 50 ms on the host. It does
+#: not on the Windows shard: the same tests came in ``None`` on 12 unrelated heads
+#: in two days (0.4 ms measured on a warm Linux host; reproduced here by pricing
+#: ``_log.append`` at 60 ms, which fails 8 of them every run). Raised, not removed:
+#: a writer that genuinely wedges still returns ``None`` and fails the assertion
+#: by name, 20 s in -- well under the suite's ``--timeout=120`` so it is a
+#: readable failure rather than a killed worker. The budget's OWN contract is
+#: pinned by ``TestRefusals.test_an_outcome_row_that_outlives_its_write_budget_...``
+#: with the budget set to 0, which reaches the branch with no clock at all.
+GENEROUS_LOG_BUDGET_SECS = 20.0
+
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """A private ``config_dir`` so the log writes under the test's own tree."""
+    """A private ``config_dir`` so the log writes under the test's own tree.
+
+    Also lifts the append budget to :data:`GENEROUS_LOG_BUDGET_SECS`: the row on
+    disk is what these tests read back, so the host's write latency must not be
+    able to decide the verdict.
+    """
     monkeypatch.setattr(_log, "log_dir", lambda: tmp_path / "decisions")
+    monkeypatch.setattr(tr, "LOG_BUDGET_SECS", GENEROUS_LOG_BUDGET_SECS)
     return tmp_path
 
 
@@ -346,6 +367,22 @@ class TestRefusals:
                 is None
             )
 
+    @pytest.mark.asyncio
+    async def test_an_outcome_row_that_outlives_its_write_budget_earns_no_badge(self, home):
+        """The badge must not outlive the row a verdict would be filed against.
+
+        The budget is set to ZERO, not to a small number: ``wait_for`` expires
+        before the append is even dispatched, so the branch is reached identically
+        on every host and the test carries no clock. A small positive value would
+        be a bet on the write losing a race it wins on a warm machine.
+        """
+        with _answering(tr.TIER_RISKY), patch.object(tr, "LOG_BUDGET_SECS", 0):
+            record = await tr.risk_record(
+                tool="bash", arguments="ls", policy="trust", session_key="chat-1"
+            )
+
+        assert record is None, "a row the caller stopped waiting for cannot back a badge"
+
     def test_read_answer_refuses_a_boolean_probability(self):
         """``True`` is not a probability, and ``isinstance(True, int)`` is True."""
         assert tr.read_answer({tr.QUESTION_ID: Answer(tr.QUESTION_ID, tr.TIER_RISKY, True)}) is None
@@ -457,6 +494,143 @@ class TestBudgets:
         assert tr.MAX_WAIT_SECS == sel.MAX_WAIT_SECS
 
 
+# ── the confidence a `risky` answer needs ─────────────────────────────────────
+
+
+class TestTheRiskyConfidenceThreshold:
+    """``risky`` is the alarming word, so it has to be believed before it is printed.
+
+    Two things these tests hold, and they pull in opposite directions. The badge
+    must not fire on a coin-flip ``risky`` -- that is what costs every other badge
+    its meaning. And the bar must not be so high that a force-push goes unbadged,
+    which is why the value is pinned inside the window it was measured in rather
+    than merely asserted to exist.
+    """
+
+    @pytest.mark.parametrize(
+        "tier, p, badged",
+        [
+            (tr.TIER_RISKY, 0.0, False),
+            (tr.TIER_RISKY, 0.42, False),
+            (tr.TIER_RISKY, 0.79, False),
+            # The bound is INCLUSIVE, the same direction ``memory_recall``'s is.
+            (tr.TIER_RISKY, tr.RISKY_CONFIDENCE_THRESHOLD, True),
+            (tr.TIER_RISKY, 0.98, True),
+            (tr.TIER_RISKY, 1.0, True),
+            # ``caution`` is the mild word and clears on its tier alone.
+            (tr.TIER_CAUTION, 0.0, True),
+            (tr.TIER_CAUTION, 0.34, True),
+            (tr.TIER_CAUTION, 1.0, True),
+            # ``safe`` is never a badge at any confidence at all.
+            (tr.TIER_SAFE, 0.0, False),
+            (tr.TIER_SAFE, 1.0, False),
+        ],
+    )
+    def test_which_answers_reach_the_card(self, tier, p, badged):
+        assert tr.earns_badge(tier, p) is badged
+
+    @pytest.mark.asyncio
+    async def test_a_low_confidence_risky_answer_draws_nothing(self, home):
+        """The ordinary refusal: no badge, and the reader is told nothing."""
+        with _answering(tr.TIER_RISKY, 0.57):
+            record = await tr.risk_record(
+                tool="bash", arguments="git push", policy="trust", session_key="chat-1"
+            )
+
+        assert record is None, "an unconvinced risky must leave the tool card alone"
+
+    @pytest.mark.asyncio
+    async def test_but_its_row_is_still_written_and_still_says_risky(self, home):
+        """The suppressed answers are the evidence a later bar is read from.
+
+        A refusal that dropped the row would make the bar unmeasurable from this
+        build's own logs, which is the one thing the value must not cost.
+        """
+        with _answering(tr.TIER_RISKY, 0.57):
+            await tr.risk_record(
+                tool="bash", arguments="git push", policy="trust", session_key="chat-1"
+            )
+
+        outcome = [r for r in _rows(home) if r.get("tier")]
+        assert len(outcome) == 1
+        assert outcome[0]["tier"] == tr.TIER_RISKY
+        assert outcome[0]["p"] == 0.57
+        # ``flagged`` is what the reader was SHOWN, so it follows the badge and not
+        # the tier -- otherwise the row and the card describe one call two ways.
+        assert outcome[0]["flagged"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_confident_risky_answer_is_badged_and_flagged(self, home):
+        with _answering(tr.TIER_RISKY, tr.RISKY_CONFIDENCE_THRESHOLD):
+            record = await tr.risk_record(
+                tool="bash", arguments="git push --force", policy="trust", session_key="chat-1"
+            )
+
+        assert record is not None
+        assert record["tier"] == tr.TIER_RISKY
+        assert record["flagged"] is True
+        assert [r for r in _rows(home) if r.get("tier")] == [record]
+
+    @pytest.mark.asyncio
+    async def test_a_caution_answer_at_the_same_confidence_is_still_badged(self, home):
+        """The asymmetry is DELIBERATE and is pinned so it is not quietly repaired.
+
+        A ``caution`` under the bar draws a badge while a ``risky`` under it draws
+        none. That is not an ordering slip: the two words name different claims,
+        and only ``risky``'s is expensive to be wrong about.
+        """
+        low = tr.RISKY_CONFIDENCE_THRESHOLD - 0.25
+        with _answering(tr.TIER_CAUTION, low):
+            caution = await tr.risk_record(
+                tool="fsWrite", arguments="{}", policy="trust", session_key="chat-1"
+            )
+        with _answering(tr.TIER_RISKY, low):
+            risky = await tr.risk_record(
+                tool="bash", arguments="git push", policy="trust", session_key="chat-2"
+            )
+
+        assert caution is not None
+        assert risky is None
+
+    @pytest.mark.asyncio
+    async def test_the_constant_is_what_decides(self, home, monkeypatch):
+        """Revert-verify: move the number and the SAME answer changes side.
+
+        Without this the two tests above would pass against a hard-coded literal,
+        or against a predicate that ignores the constant entirely.
+        """
+        monkeypatch.setattr(tr, "RISKY_CONFIDENCE_THRESHOLD", 0.50)
+        with _answering(tr.TIER_RISKY, 0.57):
+            now_badged = await tr.risk_record(
+                tool="bash", arguments="git push", policy="trust", session_key="chat-1"
+            )
+        assert now_badged is not None, "0.57 must badge once the bar is 0.50"
+
+        monkeypatch.setattr(tr, "RISKY_CONFIDENCE_THRESHOLD", 0.99)
+        with _answering(tr.TIER_RISKY, 0.98):
+            now_hidden = await tr.risk_record(
+                tool="bash", arguments="git push", policy="trust", session_key="chat-2"
+            )
+        assert now_hidden is None, "0.98 must be refused once the bar is 0.99"
+
+    def test_the_value_sits_inside_the_window_it_was_measured_in(self):
+        """A bound on both sides, because both failures are real.
+
+        Under roughly 0.75 the measured answers include a queued monitor edit and a
+        comment posted on a pull request -- calls that neither destroy data nor
+        leave the workspace, so a badge on them is the flag crying wolf. At 0.90 the
+        same reading drops eleven true ones, force-pushes and a credential fix among
+        them. A later reading may move the number inside this window on new
+        evidence; a value outside it contradicts the evidence there is.
+        """
+        assert 0.75 <= tr.RISKY_CONFIDENCE_THRESHOLD <= 0.85
+
+    def test_it_is_a_probability_and_not_a_percentage(self):
+        """``p`` is a 0..1 probability everywhere in this package, so the bar is too."""
+        assert isinstance(tr.RISKY_CONFIDENCE_THRESHOLD, float)
+        assert 0.0 < tr.RISKY_CONFIDENCE_THRESHOLD <= 1.0
+
+
 # ── the point's own identity ──────────────────────────────────────────────────
 
 
@@ -468,6 +642,15 @@ class TestThePointIsShipped:
         assert tr.TIER_SAFE not in tr.FLAGGED_TIERS
         assert set(tr.FLAGGED_TIERS) == {tr.TIER_CAUTION, tr.TIER_RISKY}
         assert tr.TIERS == (tr.TIER_SAFE, tr.TIER_CAUTION, tr.TIER_RISKY)
+
+    def test_membership_in_the_flagged_tiers_is_necessary_and_not_sufficient(self):
+        """One reader for the whole question, so a caller cannot ask half of it.
+
+        A surface that tested ``tier in FLAGGED_TIERS`` alone would print a badge
+        the point refused, which is the drift ``earns_badge`` exists to prevent.
+        """
+        assert tr.TIER_RISKY in tr.FLAGGED_TIERS
+        assert tr.earns_badge(tr.TIER_RISKY, 0.10) is False
 
     def test_the_module_imports_no_dashboard_or_permission_code(self):
         """A point may not reach the approval path, even to read it.

@@ -7,6 +7,7 @@ import functools
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -25,7 +26,7 @@ from aiohttp import web
 # binds via sys.modules and defers attribute access to call time, which also
 # keeps tests' monkeypatching of handlers.redact_* effective (late binding).
 import kiro_crew.dashboard.handlers as _h
-from kiro_crew import session_directive
+from kiro_crew import agent_discovery, session_directive
 from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.agent_discovery import (
@@ -33,7 +34,11 @@ from kiro_crew.agent_discovery import (
     read_agent_spec_strict,
     spec_by_declared_name,
 )
-from kiro_crew.agent_spec_format import agent_spec_candidates, iter_agent_spec_files
+from kiro_crew.agent_spec_format import (
+    agent_spec_candidates,
+    is_agent_spec_name,
+    iter_agent_spec_files,
+)
 
 # The migration module owns the pre-migration leftover-tab spelling.
 from kiro_crew.channel_transcript_migration import _orphan_target_stem
@@ -2586,12 +2591,22 @@ async def _remove_slot_for_history_key(
                 cancelled,
                 slot.key,
             )
-    if slot and slot.running and slot.task is not None:
-        slot.task.cancel()
-        try:
-            await asyncio.wait_for(slot.task, timeout=2.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
+    if slot:
+        teardown_tasks = {
+            task
+            for task in (slot.task, slot._stage_controller_task)
+            if task is not None and not task.done()
+        }
+        if teardown_tasks:
+            for task in teardown_tasks:
+                task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*teardown_tasks, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
 
     session_destroyed = False
     if slot and target_session_key is not None:
@@ -3537,7 +3552,149 @@ def _refuse_if_any_spec_is_unreadable(agents_dir: Path, agent_name: str) -> None
             ) from exc
 
 
+_SpecStatRevision = tuple[str, int, int, int, int, int, int]
+_AgentsDirRevision = tuple[int, tuple[_SpecStatRevision, ...], int]
+# Resolved policies keyed by agents directory, each entry pinned to the
+# stat-only revision of that directory it was read under. The read below
+# parses EVERY spec in the directory to find one declared name, and refuses
+# only after a second strict pass over all of them; a managed MCP server asks
+# for its policy on ordinary request traffic, so with a couple of thousand
+# installed specs each request costs the worker thread most of a second of
+# GIL-holding path validation and JSON parsing. An unchanged directory answers
+# from here for the price of one ``scandir``. Guarded by a lock: the reads run
+# on ``asyncio.to_thread`` workers.
+_TOOL_POLICY_CACHE_MAX_AGENTS = 256
+# Above this many spec entries the memo is not used, and the read costs what it costs on main.
+_TOOL_POLICY_REVISION_MAX_ENTRIES = 4096
+# ``st_ctime_ns`` is creation time on Windows, so entry metadata cannot prove
+# that an in-place rewrite did not happen; keep the memo disabled there.
+_TOOL_POLICY_MEMO_ENABLED = sys.platform != "win32"
+# Follow the racy-git precedent: metadata younger than this window is untrusted.
+_TOOL_POLICY_RACY_WINDOW_NS = 2_000_000_000
+_TOOL_POLICY_CACHE_LOCK = threading.Lock()
+_TOOL_POLICY_CACHE: dict[str, tuple[_AgentsDirRevision, dict[str, dict[str, Any] | None]]] = {}
+_TOOL_POLICY_REVISION_OVERFLOW_WARNED: set[str] = set()
+
+
+def _agents_dir_revision(agents_dir: Path) -> _AgentsDirRevision | None:
+    """Stat-only fingerprint of *agents_dir*; no spec is opened or parsed.
+
+    The directory's own mtime catches an entry added, removed, renamed or
+    re-linked; each spec entry's name, timestamps, size, identity and mode catch
+    ordinary in-place edits and metadata changes. In-process spec writers also
+    call :func:`~kiro_crew.agent_discovery.clear_list_agents_cache`, which
+    drops this cache too, closing the sub-tick window that made the sibling
+    catalog caches require explicit invalidation. An entry whose mtime or ctime
+    is within the last two seconds is not memoized, so a same-size rewrite that
+    lands in the same filesystem timestamp tick as the previous one cannot be
+    served stale (the racy-git rule).
+
+    A symlinked spec disables the memo because its entry metadata cannot see edits to its target.
+    On Windows the memo is disabled: ``st_ctime_ns`` is creation time there, so
+    entry metadata cannot prove an in-place rewrite did not happen.
+
+    Only entries with a recognised spec suffix (``is_agent_spec_name``) are
+    fingerprinted; that is a superset of what the spec scans parse (a Markdown
+    spec shadowed by its JSON twin is still fingerprinted), so the revision can
+    only be more sensitive than the scan, never less. Adding or removing a stray
+    file still invalidates through the directory mtime, but the stray file itself
+    is omitted from the entry tuples. A ``stat`` that fails records zeros: the
+    entry is still named, so its appearance and disappearance are revisions.
+    """
+    if not _TOOL_POLICY_MEMO_ENABLED:
+        return None
+    try:
+        dir_mtime = agents_dir.stat().st_mtime_ns
+    except OSError:
+        dir_mtime = 0
+    entries: list[_SpecStatRevision] = []
+    try:
+        with os.scandir(agents_dir) as it:
+            for entry in it:
+                if not is_agent_spec_name(entry.name):
+                    continue
+                if entry.is_symlink():
+                    return None
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    entries.append(
+                        (
+                            entry.name,
+                            st.st_mtime_ns,
+                            st.st_ctime_ns,
+                            st.st_size,
+                            st.st_ino,
+                            st.st_dev,
+                            st.st_mode,
+                        )
+                    )
+                except OSError:
+                    entries.append((entry.name, 0, 0, 0, 0, 0, 0))
+                if len(entries) > _TOOL_POLICY_REVISION_MAX_ENTRIES:
+                    key = str(agents_dir)
+                    with _TOOL_POLICY_CACHE_LOCK:
+                        should_warn = key not in _TOOL_POLICY_REVISION_OVERFLOW_WARNED
+                        _TOOL_POLICY_REVISION_OVERFLOW_WARNED.add(key)
+                    if should_warn:
+                        logger.warning(
+                            "tool-policy memo disabled for %s: %d spec entries exceed %d",
+                            agents_dir,
+                            len(entries),
+                            _TOOL_POLICY_REVISION_MAX_ENTRIES,
+                        )
+                    return None
+    except OSError:
+        pass
+    now = time.time_ns()
+    cutoff = now - _TOOL_POLICY_RACY_WINDOW_NS
+    if dir_mtime > cutoff or any(entry[1] > cutoff or entry[2] > cutoff for entry in entries):
+        return None
+    return dir_mtime, tuple(sorted(entries)), agent_discovery.spec_cache_generation()
+
+
 def _read_managed_tool_policy_sync(agents_dir: Path, agent_name: str) -> dict[str, Any] | None:
+    """:func:`_read_managed_tool_policy_uncached`, answered from the cache while
+    *agents_dir* is unchanged. Blocking; runs on a worker like the read it wraps.
+
+    Only a resolved answer -- a policy, or ``None`` for an agent that has none
+    -- is cached. A refusal (:class:`ManagedToolPolicyUnreadable`,
+    :class:`~kiro_crew.agent_discovery.AmbiguousAgentSpecError`) is re-derived
+    on every call: it names an operator error the caller audits per request,
+    and the state it reports is the one a fix to the directory clears.
+
+    The revision is taken before and after the read. An answer is stored only
+    when the directory revision is the same before and after the read, so a
+    write that lands during the read is never memoized under the revision that
+    preceded it. Two threads missing at once read redundantly and
+    last-write-wins, the same answer from the same revision. One entry per
+    directory: a new revision replaces the whole answer set, and the set is
+    capped so a churn of agent names cannot grow it without bound.
+    """
+    key = str(agents_dir)
+    revision = _agents_dir_revision(agents_dir)
+    if revision is None:
+        return _read_managed_tool_policy_uncached(agents_dir, agent_name)
+    with _TOOL_POLICY_CACHE_LOCK:
+        cached = _TOOL_POLICY_CACHE.get(key)
+        if cached is not None and cached[0] == revision and agent_name in cached[1]:
+            return cached[1][agent_name]
+    policy = _read_managed_tool_policy_uncached(agents_dir, agent_name)
+    revision_after = _agents_dir_revision(agents_dir)
+    if revision_after is None or revision_after != revision:
+        return policy
+    with _TOOL_POLICY_CACHE_LOCK:
+        cached = _TOOL_POLICY_CACHE.get(key)
+        if cached is None or cached[0] != revision:
+            cached = (revision, {})
+            _TOOL_POLICY_CACHE[key] = cached
+        answers = cached[1]
+        if len(answers) >= _TOOL_POLICY_CACHE_MAX_AGENTS:
+            answers.clear()
+        answers[agent_name] = policy
+    return policy
+
+
+def _read_managed_tool_policy_uncached(agents_dir: Path, agent_name: str) -> dict[str, Any] | None:
     """Read one agent's ``managedToolPolicy`` from disk. Blocking.
 
     Split out so the whole filesystem transaction -- the existence probe, the

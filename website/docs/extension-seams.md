@@ -69,7 +69,7 @@ the stock build's no-op property. Core registrations belong in the seed maps
 - the **edition's own** `$KIROCREW_EDITION_DIR/extensions.tsx` (or `.ts`) when that
   env var points at an edition repo, so the edition injects its `register*()`
   calls and component imports by build config, compiled through the same
-  vite/rollup pass, without shadowing or overlaying any core file. That
+  Vite/Rolldown pass, without shadowing or overlaying any core file. That
   copy-and-shadow erosion is what the seams exist to eliminate.
 
 Resolution is eager, so a misconfigured `KIROCREW_EDITION_DIR` (set but with no
@@ -89,8 +89,9 @@ one-way door. With the opt-in as the gate, every pipeline (release, publish, and
 the backend `setup.py` to `build-frontend.sh` path) is protected **by default**: a
 stray or inherited `KIROCREW_EDITION_DIR` fails the build instead of silently
 compiling edition sources into a public artifact. Only the edition's own build
-script sets the opt-in. Forgetting it fails safe (stock), and there is no guard
-variable a release job must remember to set. Never set
+script sets the opt-in. Forgetting it fails safe before any artifact is emitted;
+the build never falls back to stock. There is no guard variable a release job must
+remember to set. Never set
 `KIROCREW_ALLOW_EDITION=1` in a release or publish job.
 
 An edition-mode build also prints a loud self-identifying warning naming the
@@ -511,7 +512,7 @@ unoffered method draws nothing.
 
 **Remote-instance provisioner forms.**
 `registerRemoteProvisionerRenderer({ kind, component })` supplies the launch form
-that Settings → Remote Instances → "Set up a new one" draws for one provisioner
+that Settings → Remote Crew → "Set up a new one" draws for one provisioner
 the backend offers. It keys on `kind`, not `id`, for the same reason as the seam
 above: `id` is what `POST /api/cloud/launch` names in `provider_id` (an id the
 server does not offer is refused with `unknown_provisioner`), while `kind` exists

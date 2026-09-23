@@ -2161,29 +2161,37 @@ function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftCha
 
   const query = filter.trim().toLowerCase()
   const filtering = query.length > 0
+  // Rule ids are hyphen-joined slugs (`aws-destructive-ec2-run-instances`), but
+  // the same id is naturally read -- and typed -- as `<category>.<slug>`. Accept
+  // that dotted spelling too so a copied id always finds its rule.
+  const idQuery = query.replace(/\./g, '-')
 
   /** Categories reduced to their matching rules. A category whose NAME matches
    *  keeps all of its rules, so searching "credential" reads as a category jump
-   *  rather than a partial list. */
+   *  rather than a partial list. Matching is additive across the category key,
+   *  its display label, and each rule's id, description and pattern. */
   const visibleGroups = useMemo(() => {
     if (!query) return grouped
     const out: Record<string, DeniedCommandRule[]> = {}
     for (const [category, rules] of Object.entries(grouped)) {
-      const hits = categoryLabel(category).toLowerCase().includes(query)
+      const hits = category.toLowerCase().includes(idQuery) || categoryLabel(category).toLowerCase().includes(query)
         ? rules
         : rules.filter(r =>
-          r.description.toLowerCase().includes(query)
+          r.id.toLowerCase().includes(idQuery)
+          || r.description.toLowerCase().includes(query)
           || r.pattern.toLowerCase().includes(query))
       if (hits.length > 0) out[category] = hits
     }
     return out
-  }, [grouped, query])
+  }, [grouped, query, idQuery])
 
   const visibleUserRules = useMemo(() => {
     const rules = dc?.user_added ?? []
     if (!query) return rules
-    return rules.filter(r => r.pattern.toLowerCase().includes(query))
-  }, [dc, query])
+    return rules.filter(r =>
+      r.id.toLowerCase().includes(idQuery)
+      || r.pattern.toLowerCase().includes(query))
+  }, [dc, query, idQuery])
 
   const matchedRules = Object.values(visibleGroups).reduce((n, rules) => n + rules.length, 0)
   const nothingMatches = filtering && matchedRules === 0 && visibleUserRules.length === 0

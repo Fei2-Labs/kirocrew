@@ -130,22 +130,52 @@ _MCP_LOCK_PATH = _GLOBAL_MCP_JSON.with_suffix(".lock")
 
 
 class _McpFileLock:
-    """Async context manager wrapping a cross-platform file lock for mcp.json."""
+    """Async context manager wrapping a cross-platform file lock for mcp.json.
+
+    Both failure modes are REPORTED here before they propagate, mirroring
+    :func:`kiro_crew.agent.agents_spec_lock`, because several callers treat
+    this lock as best-effort work and swallow the refusal at a level no
+    operator reads. Without a report at WARNING a gateway that skipped its
+    mcp.json write reads in the log exactly like one that completed it. An
+    unwritable lock path (a read-only ``~/.kiro/settings`` mount, or a sidecar
+    whose own mode denies write) refuses BEFORE any lock is attempted;
+    ``platform_compat.acquire_lock`` bounds the acquire itself, so neither
+    failure mode can present as a hang. Both reports cover the setup and the
+    acquire alone -- the caller's body runs only after ``__aenter__`` returns,
+    so a caller-body error can never be mislabelled as a lock failure.
+    """
 
     async def __aenter__(self) -> None:
-        _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
-        _MCP_LOCK_PATH.touch(exist_ok=True)
-        # Open the lock fd WRITABLE and non-truncating. Windows msvcrt.locking()
-        # requires write access on the handle -- an "r" fd fails with EACCES and
-        # platform_compat.acquire_lock swallows that (best-effort semantics),
-        # silently degrading this to a no-op and letting concurrent
-        # /api/mcp/toggle requests race the atomic-rename write of mcp.json
-        # (one flip is lost). "r+" keeps the shared file present (no truncate);
-        # see platform_compat.open_lock_file for the full Windows rationale
-        # (GH-9248). Kept inline rather than routed through that helper: the fd
-        # is stored on self._fd and released in __aexit__, so it must OUTLIVE
-        # this method -- the with-scoped helper would close it at method return.
-        fd = open(_MCP_LOCK_PATH, "r+")
+        try:
+            _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
+            _MCP_LOCK_PATH.touch(exist_ok=True)
+            # Open the lock fd WRITABLE and non-truncating. Windows msvcrt.locking()
+            # requires write access on the handle -- an "r" fd fails with EACCES and
+            # platform_compat.acquire_lock swallows that (best-effort semantics),
+            # silently degrading this to a no-op and letting concurrent
+            # /api/mcp/toggle requests race the atomic-rename write of mcp.json
+            # (one flip is lost). "r+" keeps the shared file present (no truncate);
+            # see platform_compat.open_lock_file for the full Windows rationale
+            # (GH-9248). Kept inline rather than routed through that helper: the fd
+            # is stored on self._fd and released in __aexit__, so it must OUTLIVE
+            # this method -- the with-scoped helper would close it at method return.
+            fd = open(_MCP_LOCK_PATH, "r+")
+        except OSError as exc:
+            # Naming the path AND the errno is the point: "Read-only file
+            # system" on this specific path is what tells the operator what to
+            # change, and it is not something retrying can recover. No
+            # KIRO_HOME remedy: _GLOBAL_MCP_JSON resolves from a fixed
+            # Path.home() that ignores KIRO_HOME, so moving it cannot move
+            # this lock -- naming the config the lock guards is what stays
+            # true.
+            logger.warning(
+                "cannot open the mcp config lock %s (%s) -- writes to %s cannot be "
+                "serialized, so this update is being skipped",
+                _MCP_LOCK_PATH,
+                exc.strerror or exc,
+                _GLOBAL_MCP_JSON,
+            )
+            raise
         # Run blocking lock acquire in a thread to avoid blocking the event
         # loop. Bind self._fd ONLY AFTER a successful acquire — otherwise a
         # raise inside run_in_executor (executor shutdown RuntimeError,
@@ -157,8 +187,21 @@ class _McpFileLock:
                 None,
                 lambda: platform_compat.acquire_lock(fd.fileno(), exclusive=True),
             )
-        except BaseException:
+        except BaseException as exc:
             fd.close()
+            # Report the lock's OWN refusal only: acquire_lock fails closed
+            # with an OSError, at once for a real fd defect or past its
+            # bounded ceiling for a stuck holder. A CancelledError while
+            # pending or an executor-shutdown RuntimeError is this caller's
+            # lifecycle, not a lock failure, and reporting it would send an
+            # operator after a holder that does not exist. A stuck holder also
+            # calls for a DIFFERENT operator action (find the process still
+            # holding the lock) than an unwritable path, so this carries no
+            # remedy. No BlockingIOError case: this acquire is always a
+            # WAITING one, so a refusal here is never a caller's own "do not
+            # wait" choice.
+            if isinstance(exc, OSError):
+                logger.warning("mcp config lock %s: %s", _MCP_LOCK_PATH, exc)
             raise
         self._fd = fd
 
@@ -190,15 +233,32 @@ class _McpFileLockSync:
     """
 
     def __enter__(self) -> None:
-        _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
-        _MCP_LOCK_PATH.touch(exist_ok=True)
-        # Non-truncating "r+", kept inline for the same reason as
-        # :class:`_McpFileLock` above.
-        fd = open(_MCP_LOCK_PATH, "r+")
+        try:
+            _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
+            _MCP_LOCK_PATH.touch(exist_ok=True)
+            # Non-truncating "r+", kept inline for the same reason as
+            # :class:`_McpFileLock` above.
+            fd = open(_MCP_LOCK_PATH, "r+")
+        except OSError as exc:
+            # Same report, same rationale as :class:`_McpFileLock`: the sweep
+            # that takes this lock runs under a request's finally, so its
+            # refusal is otherwise swallowed with the rest of the cleanup.
+            logger.warning(
+                "cannot open the mcp config lock %s (%s) -- writes to %s cannot be "
+                "serialized, so this update is being skipped",
+                _MCP_LOCK_PATH,
+                exc.strerror or exc,
+                _GLOBAL_MCP_JSON,
+            )
+            raise
         try:
             platform_compat.acquire_lock(fd.fileno(), exclusive=True)
-        except BaseException:
+        except BaseException as exc:
             fd.close()
+            # OSError only, as in :class:`_McpFileLock`: the lock's own
+            # refusal, never this caller's lifecycle.
+            if isinstance(exc, OSError):
+                logger.warning("mcp config lock %s: %s", _MCP_LOCK_PATH, exc)
             raise
         self._fd = fd
 
@@ -902,6 +962,15 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
     Merges ``enabled`` and ``disabledTools`` from global mcp.json so
     probe results don't reset user's previous enable/disable choices.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_probe")
+    if denied is not None:
+        return denied
     global _mcp_probe_ts
     from kiro_crew.mcp_discovery import probe_all  # noqa: F811
 
@@ -1021,6 +1090,15 @@ async def api_mcp_measure_start(request: web.Request) -> web.Response:
     A second call while a pass is running is reported rather than queued, because
     both passes would select the same unmeasured set and simply double the spawns.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_measure")
+    if denied is not None:
+        return denied
     if _measure_progress["running"]:
         return web.json_response({"ok": False, "running": True, **_measure_progress})
     _measure_progress.update(running=True, done=0, measured=0, total=0, error="")
@@ -1079,6 +1157,15 @@ async def api_mcp_quarantine_clear(request: web.Request) -> web.Response:
     off by hand stays off. It does not mount or unmount anything either -- the
     server was never unmounted.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_quarantine_clear")
+    if denied is not None:
+        return denied
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
@@ -1134,6 +1221,15 @@ async def api_mcp_sync(request: web.Request) -> web.Response:
        ``sessions_reset: 0``. Otherwise every session and the warm pool are
        reset so the next message cold-starts on the new file.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_sync")
+    if denied is not None:
+        return denied
     from kiro_crew.mcp_discovery import (  # noqa: F811
         kirocrew_managed_names,
         sync_discovered_servers,
@@ -1348,6 +1444,15 @@ async def api_mcp_toggle(request: web.Request) -> web.Response:
     1. Sets ``disabled`` in ``~/.kiro/settings/mcp.json`` (ACP runtime).
     2. Syncs ``tools``/``allowedTools`` in ``kirocrew.json`` (non-ACP mode).
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_toggle")
+    if denied is not None:
+        return denied
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
@@ -1414,6 +1519,15 @@ async def api_mcp_toggle_tool(request: web.Request) -> web.Response:
 
     Updates ``disabledTools`` in ``~/.kiro/settings/mcp.json``.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_toggle_tool")
+    if denied is not None:
+        return denied
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
@@ -1479,6 +1593,15 @@ async def api_mcp_toggle_tool(request: web.Request) -> web.Response:
 
 async def api_mcp_toggle_all(request: web.Request) -> web.Response:
     """POST /api/mcp/toggle-all — enable or disable all MCP servers."""
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_toggle_all")
+    if denied is not None:
+        return denied
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
@@ -1526,6 +1649,15 @@ async def api_mcp_remove(request: web.Request) -> web.Response:
     on PATH it is also asked to uninstall (best-effort); on a vanilla
     machine ``aim`` is absent and that step is skipped gracefully.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_remove")
+    if denied is not None:
+        return denied
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
@@ -1591,7 +1723,34 @@ async def api_mcp_server_detail(request: web.Request) -> web.Response:
         { "command": "node", "args": ["server.js"], "env": {"KEY": "val"} }
 
     DELETE removes the server from the config.
+
+    Two caller classes, two authorizations. ``/api/mcp/servers`` is listed in
+    ``server._STRICT_INTERNAL_API_PATHS``, so its designed caller is an internal
+    loopback process presenting ``X-Internal-Secret`` -- the App Kit SDK's
+    ``register_mcp_server`` / ``remove_mcp_server``
+    (``packages/kirocrew-client-py``) is exactly that. ``token_auth`` grants such a
+    request and marks it ``internal_auth``, and it deliberately leaves
+    ``request["app"]`` ABSENT for the person-behind-the-secret case, which
+    ``is_owner_dashboard_request`` reads as not-the-owner. So the owner predicate
+    applies to the COOKIE caller only: a ``local_only=False`` deployment
+    reclassifies strict paths as mixed and a browser session can then arrive here,
+    and that session must be the owner, because a PUT writes a command later agent
+    sessions execute. Gating the internal caller too would answer 403 to the one
+    caller the route exists for.
     """
+    # Only authentication middleware publishes ``internal_auth``, and only on a
+    # constant-time ``X-Internal-Secret`` match -- a request header claiming to
+    # carry a secret is not evidence, so this cannot be spoofed by a browser.
+    if request.get("internal_auth") is not True:
+        # Body-scope import, like the sibling gates in this package
+        # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+        # reaches back into sibling handler modules, so importing the helper at
+        # module scope from here would close a cycle.
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        denied = await require_owner_dashboard_request(request, "mcp_server_detail")
+        if denied is not None:
+            return denied
     name = request.match_info["name"]
     if not name or not name.strip():
         return web.json_response({"error": "server name is required"}, status=400)
@@ -2282,6 +2441,15 @@ async def api_mcp_apply(request: web.Request) -> web.Response:
     closes that; the narrower file lock is retained inside ``_do_mcp_apply`` for
     cross-process coordination with bridges.py.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_apply")
+    if denied is not None:
+        return denied
     async with _get_apply_lock():
         return await _do_mcp_apply(request)
 
@@ -2855,6 +3023,15 @@ async def api_mcp_resolve_refresh(request: web.Request) -> web.Response:
     ``ready`` / ``unresolved`` / ``error``. A server that fails to resolve is not
     an error for the request: it simply keeps launching the way it does today.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_resolve_refresh")
+    if denied is not None:
+        return denied
     state: DashboardState = request.app["state"]
     refresh = getattr(state, "_mcp_resolve_refresh", None)
     if refresh is None:
@@ -2899,6 +3076,15 @@ async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
     so the dashboard session stays authenticated.  Returns the verified state
     ``{ok, enabled, running, ping_ok}``.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_gateway_enable")
+    if denied is not None:
+        return denied
     from kiro_crew.config.loader import config_path  # circular import
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # circular import
 
@@ -3428,6 +3614,15 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
     Returns ``{ok, name, stub, ...}`` for the single form and
     ``{ok, names, stub, ...}`` for the batch form.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_gateway_set_stub")
+    if denied is not None:
+        return denied
     from kiro_crew.config.loader import (  # noqa: F811
         ConfigReadError,
         config_path,

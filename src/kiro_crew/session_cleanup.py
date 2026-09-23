@@ -80,6 +80,8 @@ class CleanupOwner(Protocol):
 
     async def _reap_drained_bg_runtimes_locked(self) -> None: ...
 
+    async def _reap_idle_stale_bg_runtime(self) -> bool: ...
+
     def get_pid(self, key: str) -> int | None: ...
 
     async def reset(
@@ -163,6 +165,7 @@ class CleanupDeps:
     cleanup_orphaned_session_roots: Callable[[], int]
     cleanup_stale_sandbox_profiles: Callable[[], int]
     prune_session_pid_mappings: Callable[[], int]
+    prune_member_pid_bindings: Callable[[], int]
     prune_pycache: Callable[[], tuple[int, int]]
     collect_active_pids: ActivePidCollector
     periodic_pid_sweep: PeriodicPidSweep
@@ -334,16 +337,30 @@ class SessionCleanup:
             self._deps.logger.exception("Cleanup loop: _expire_idle crashed; continuing")
 
     async def _bg_drain_reap_hook(self) -> None:
-        # Avoid the runtime lock on the common empty-list path.  Parked runtimes
-        # otherwise remain PID-shielded forever on an idle gateway.
-        if not self._owner._draining_bg_runtimes:
-            return
+        # Two passes over the same lock, in this order: reap what already
+        # drained, then ask whether the LIVE shared runtime has itself gone idle
+        # and stale. The second is not optional housekeeping -- the staleness
+        # ceilings are otherwise only evaluated when the runtime is reused, and
+        # its pid is shielded from the orphan sweep, so a runtime nobody calls
+        # any more is never asked and never reaped (see
+        # ``BackgroundSessionRuntime.reap_idle_stale_bg_runtime``).
+        if self._owner._draining_bg_runtimes:
+            try:
+                async with self._owner._bg_runtime_lock:
+                    await self._owner._reap_drained_bg_runtimes_locked()
+            except Exception:
+                self._deps.logger.warning(
+                    "bg_drain_reap hook failed; will retry next tick",
+                    exc_info=True,
+                )
         try:
-            async with self._owner._bg_runtime_lock:
-                await self._owner._reap_drained_bg_runtimes_locked()
+            if await self._owner._reap_idle_stale_bg_runtime():
+                self._deps.logger.info(
+                    "Periodic sweep: retired the idle stale shared background runtime"
+                )
         except Exception:
             self._deps.logger.warning(
-                "bg_drain_reap hook failed; will retry next tick",
+                "idle-stale bg runtime sweep failed; will retry next tick",
                 exc_info=True,
             )
 
@@ -710,6 +727,7 @@ class SessionCleanup:
             await self._sweep_session_roots()
             await self._sweep_sandbox_artifacts()
             await self._sweep_session_pid_mappings()
+            await self._sweep_member_pid_bindings()
             await self._maybe_prune_pycache()
             await self._sweep_periodic_pids()
             await self._sweep_untracked_mcps()
@@ -791,6 +809,34 @@ class SessionCleanup:
         except Exception as exc:
             self._deps.logger.debug(
                 "session pid mapping sweep failed: %s",
+                type(exc).__name__,
+            )
+
+    async def _sweep_member_pid_bindings(self) -> None:
+        """Collect aged per-pid member-memory binding records.
+
+        A removed routing path wrote one record per agent process and deleted
+        none, and nothing else sweeps them, so they accumulate for the install's
+        life (165,975 files measured on an operator host). The pass itself is in
+        ``member_memory_auth.prune_legacy_member_pid_bindings``; it needs a caller
+        on a bounded cadence, which is what this one is. Blocking unlinks, so it
+        runs on the maintenance executor for the same reason the session-pid
+        mapping sweep does: the directory is same-uid agent-writable, and
+        filesystem work over such a path on the event loop parks the gateway.
+        """
+        try:
+            removed = await asyncio.get_running_loop().run_in_executor(
+                self._deps.get_maintenance_executor(),
+                self._deps.prune_member_pid_bindings,
+            )
+            if removed:
+                self._deps.logger.info(
+                    "Periodic sweep: pruned %d stale member-memory pid binding(s)",
+                    removed,
+                )
+        except Exception as exc:
+            self._deps.logger.debug(
+                "member-memory pid binding sweep failed: %s",
                 type(exc).__name__,
             )
 

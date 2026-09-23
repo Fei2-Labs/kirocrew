@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import agent_state
+from kiro_crew import agent_state, hooks
 from kiro_crew.agent_files import (
     AGENT_FILENAME,
     LITE_AGENT_FILENAME,
@@ -37,11 +37,72 @@ from kiro_crew.agent_spec_format import (
 )
 from kiro_crew.config.paths import kiro_agents_dir, project_agents_dir, project_kiro_dir
 from kiro_crew.executors import discovery_executor
-from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
-from kiro_crew.security import is_sensitive_path
+from kiro_crew.hooks import FileTooLargeError, is_unc_shape, unc_probe_allowed
+from kiro_crew.pinned_fs import open_fenced_for_read
+from kiro_crew.security import is_sensitive_canonical_path, is_sensitive_path
 from kiro_crew.sel import sel as _sel
 
 logger = logging.getLogger(__name__)
+
+
+_WINDOWS = os.name == "nt"
+
+
+def _fence_refuses(real: Path) -> bool:
+    """The sensitive-path verdict for the ``Path.resolve(strict=True)`` result.
+
+    Delegates to :func:`security.is_sensitive_canonical_path`, which picks the
+    gate by thread: the pre-resolved gate off the event loop (no ``mc-pathres``
+    submission, so a saturated pool cannot drop a healthy spec) and the bounded
+    gate on it. Dashboard handlers call the readers from coroutines; the native
+    skill projection reads every spec under ``asyncio.to_thread``.
+    """
+    return is_sensitive_canonical_path(str(real))
+
+
+def _unc_refused(spelling: str) -> bool:
+    """The Windows UNC trusted-root gate, as ``hooks.validate_file_path`` applies it.
+
+    A UNC path names a HOST: on Windows, resolving or opening one is an outbound
+    SMB connection, an NTLM credential probe the path's author controls. The
+    readers ask this BEFORE ``Path.resolve`` on the spelling they were handed
+    (so a UNC-shaped spec never reaches the probe) and again on the resolved
+    spelling (so a local link into a share is refused before the open). Only
+    the shares ``unc_probe_allowed`` names are admitted; every other platform
+    answers ``False`` here, exactly as the hooks gate does.
+    """
+    return _WINDOWS and is_unc_shape(spelling) and not unc_probe_allowed(spelling)
+
+
+class _SpecReadRefused(OSError):
+    """The pinned open refused the spec's inode (link, hardlink, non-regular, fence)."""
+
+
+def _read_spec_bytes(real: Path) -> bytes:
+    """Read a resolved, fence-judged spec path pinned to the descriptor it opens.
+
+    :func:`pinned_fs.open_fenced_for_read` refuses a link at the final
+    component, a non-regular or hardlinked inode, and an opened inode whose
+    kernel path :func:`_fence_refuses` rejects, raising :class:`_SpecReadRefused`;
+    a missing file raises ``FileNotFoundError``. The same ``hooks.MAX_FILE_BYTES``
+    cap as :func:`kiro_crew.hooks.safe_read_file_bytes` applies (read at call
+    time, so the two readers share one cap), raising :class:`FileTooLargeError`
+    past it, so a multi-gigabyte "agent config" is still refused at the cap
+    instead of being slurped into memory. Nothing here submits to the resolver
+    pool off the event loop.
+    """
+    fd = open_fenced_for_read(
+        real,
+        fence=lambda fd_real: _fence_refuses(Path(fd_real)),
+        refusal=_SpecReadRefused,
+    )
+    cap = hooks.MAX_FILE_BYTES
+    with os.fdopen(fd, "rb") as fh:
+        data = fh.read(cap + 1)
+    if len(data) > cap:
+        raise FileTooLargeError(f"File exceeds {cap // (1024 * 1024)} MB safety cap")
+    return data
+
 
 # Resolved per call, never captured at import: an import-time binding freezes
 # the data home and defeats pod isolation, the lazy legacy-home migration and
@@ -103,6 +164,12 @@ _PARSED_SPECS_REFRESHING: set[str] = set()  # Guarded by _PARSED_SPECS_LOCK.
 # read BEFORE the write that the clear announced, inside one mtime tick where
 # the signature cannot tell the difference.
 _PARSED_SPECS_GEN = 0
+
+
+def spec_cache_generation() -> int:
+    """Return the generation of in-process agent-spec content."""
+    with _PARSED_SPECS_LOCK:
+        return _PARSED_SPECS_GEN
 
 
 @dataclass
@@ -251,10 +318,13 @@ def _read_agent_spec(
     bytes, a document that is not an object, and oversized files are all
     rejected. A markdown file with no frontmatter fence is not a spec and is
     skipped like malformed JSON. The read itself goes through
-    :func:`kiro_crew.hooks.safe_read_file_bytes` — the hardened gate every other
-    dashboard file read uses — so a multi-gigabyte "agent config" is refused at
-    the size cap instead of being slurped into memory during a cache warm. The
-    agents directories are user-writable and shared with other tools, so none of
+    :func:`_read_spec_bytes`: a no-reparse open pinned to the descriptor it
+    reads, the same ``MAX_FILE_BYTES`` cap as every other dashboard file read,
+    and no resolver-pool submission off the event loop, so a multi-gigabyte
+    "agent config" is refused at the size cap instead of being slurped into
+    memory during a cache warm, and a saturated pool cannot drop a healthy spec.
+    The agents directories are user-writable and shared with other tools, so
+    none of
     these are hypothetical.
 
     *operation*/*source* label the SEL denial event emitted on a sensitive
@@ -273,6 +343,16 @@ def _read_agent_spec(
     """
     if path.name.startswith("._"):
         return None
+    if _unc_refused(str(path)):
+        # Refused BEFORE resolve: on Windows the resolve of a UNC spelling is
+        # itself the outbound SMB probe.
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(path),
+            error="untrusted UNC path rejected",
+        )
+        return None
     try:
         real = path.resolve(strict=True)
     except (OSError, RuntimeError):
@@ -282,8 +362,18 @@ def _read_agent_spec(
         # uncaught loop here crashes whichever surface asked — e.g. Slack's
         # `!agent` handler exits without replying.
         return None
-    if is_sensitive_path(str(real)):
-        logger.debug("Skipping sensitive agent config: %s", path)
+    if _unc_refused(str(real)):
+        # A local link into a share: the resolve has already probed, and the
+        # read must still not load the remote document.
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(real),
+            error="untrusted UNC path rejected",
+        )
+        return None
+    if _fence_refuses(real):
+        logger.debug("Skipping sensitive agent config: %r", path)
         _audit_denied(
             operation=operation,
             source=source,
@@ -292,26 +382,39 @@ def _read_agent_spec(
         )
         return None
     try:
-        raw = safe_read_file_bytes(str(real))
+        raw = _read_spec_bytes(real)
     except FileTooLargeError:
-        logger.debug("Skipping oversized agent config: %s", path)
+        logger.debug("Skipping oversized agent config: %r", path)
         return None
-    if raw is None:
-        logger.debug("Skipping unreadable agent config: %s", path)
+    except _SpecReadRefused as exc:
+        # A link or a hardlink planted at the spec's name, a non-regular inode,
+        # or an opened inode the fence rejects. The agents directories are
+        # shared with other tools (a hardlink-based dotfile layout produces the
+        # nlink refusal legitimately), so the reason and the path are logged
+        # where an operator sees them; a DEBUG line here is what turns a
+        # refused spec into an unexplained "no prepared skill discovery view".
+        # Both values come from an untrusted filename (the refusal message
+        # quotes the spelling), so they are rendered with ``%r``: a newline in
+        # the name is escaped instead of starting a forged log record.
+        logger.warning("Skipping agent config %r: %r", path, exc)
+        return None
+    except OSError:
+        # Absent or unreadable: "not a readable spec".
+        logger.debug("Skipping unreadable agent config: %r", path)
         return None
     try:
         data = parse_agent_spec_bytes(raw, path)
     except (UnicodeDecodeError, ValueError):
-        logger.debug("Skipping unreadable agent config: %s", path)
+        logger.debug("Skipping unreadable agent config: %r", path)
         return None
     if not isinstance(data, dict):
-        logger.debug("Skipping non-object agent config: %s", path)
+        logger.debug("Skipping non-object agent config: %r", path)
         return None
     return data
 
 
 class SensitiveAgentSpecPathError(ValueError):
-    """A spec path resolved to a target :func:`is_sensitive_path` refuses.
+    """A spec path resolved to a target the sensitive-path fence refuses.
 
     A ``ValueError`` like the other deterministic refusals, so a caller that
     only needs "not a spec" catches it with them; distinct so a caller that
@@ -333,29 +436,46 @@ def read_agent_spec_strict(path: Path, *, operation: str, source: str) -> Any:
     both did a bare ``Path.read_text``, so a symlink dropped into the
     user-writable agents directory was followed to wherever it pointed. The
     gates here are the listing reader's -- AppleDouble sidecars, the resolved
-    target checked against :func:`is_sensitive_path` (and the denial audited
-    under *operation*/*source*), the size-capped no-reparse open of
-    :func:`safe_read_file_bytes` -- but the outcome is raised, not swallowed:
+    target checked against the sensitive-path fence through :func:`_fence_refuses`
+    (and the denial audited under *operation*/*source*), the size-capped
+    descriptor-pinned open of :func:`_read_spec_bytes` -- but the outcome is
+    raised, not swallowed:
 
     * ``OSError`` -- the file could not be read: absent, unreadable, a broken
       or looping symlink (pathlib's ``RuntimeError`` is mapped to ``ELOOP``),
       or an open the hardened gate refused. Retrying may succeed.
     * ``ValueError`` -- the content is not a spec, and re-reading will not
-      change that: a sensitive resolved target (the
-      :class:`SensitiveAgentSpecPathError` subclass), a file over the size cap, bytes
-      that are not UTF-8 (``UnicodeDecodeError`` is a ``ValueError``), or a
-      document that does not parse.
+      change that: a sensitive resolved target or a UNC spelling outside the
+      trusted roots (both the :class:`SensitiveAgentSpecPathError` subclass), a
+      file over the size cap, bytes that are not UTF-8 (``UnicodeDecodeError``
+      is a ``ValueError``), or a document that does not parse.
 
     Returns the parsed document; a non-object is the caller's to reject, as
     the two forms' parsers leave it.
     """
     if path.name.startswith("._"):
         raise ValueError(f"{path} is an AppleDouble sidecar, not an agent spec")
+    if _unc_refused(str(path)):
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(path),
+            error="untrusted UNC path rejected",
+        )
+        raise SensitiveAgentSpecPathError(f"{path} names a share outside the trusted roots")
     try:
         real = path.resolve(strict=True)
     except RuntimeError as exc:
         raise OSError(errno.ELOOP, "symlink loop", str(path)) from exc
-    if is_sensitive_path(str(real)):
+    if _unc_refused(str(real)):
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(real),
+            error="untrusted UNC path rejected",
+        )
+        raise SensitiveAgentSpecPathError(f"{path} resolves to a share outside the trusted roots")
+    if _fence_refuses(real):
         _audit_denied(
             operation=operation,
             source=source,
@@ -364,11 +484,11 @@ def read_agent_spec_strict(path: Path, *, operation: str, source: str) -> Any:
         )
         raise SensitiveAgentSpecPathError(f"{path} resolves to a sensitive path")
     try:
-        raw = safe_read_file_bytes(str(real))
+        raw = _read_spec_bytes(real)
     except FileTooLargeError as exc:
         raise ValueError(f"{path}: {exc}") from exc
-    if raw is None:
-        raise OSError(errno.EACCES, "agent spec could not be read", str(path))
+    except _SpecReadRefused as exc:
+        raise OSError(errno.EACCES, "agent spec could not be read", str(path)) from exc
     return parse_agent_spec_bytes(raw, path)
 
 
@@ -907,12 +1027,17 @@ def expand_skill_uri(
     kiro-cli accepts ``skill://~/.kiro/skills/*/SKILL.md`` (global),
     ``skill:///abs/path/SKILL.md`` (absolute), and
     ``skill://.kiro/skills/*/SKILL.md`` (workspace-relative to the cwd at
-    session start). Workspace-relative URIs are resolved against the project
-    root inferred from *agent_path* — for the ``<project>/.kiro/agents/foo.json``
-    layout that is three levels up (``foo.json`` -> ``agents`` -> ``.kiro`` ->
-    ``<project>``), so appending the ``.kiro/``-prefixed glob yields
-    ``<project>/.kiro/...`` without doubling the ``.kiro`` segment. Best-effort:
-    the cwd kiro-cli actually uses may differ.
+    session start).
+
+    A workspace-relative URI resolves against *project_dir* when the caller
+    supplies one — every path that resolves skills for a prompt passes the
+    session's own project, which is the cwd kiro-cli is launched in. With no
+    project supplied it falls back to the project root inferred from
+    *agent_path*: for the ``<project>/.kiro/agents/foo.json`` layout that is three
+    levels up (``foo.json`` -> ``agents`` -> ``.kiro`` -> ``<project>``), so
+    appending the ``.kiro/``-prefixed glob yields ``<project>/.kiro/...`` without
+    doubling the ``.kiro`` segment. Both are best-effort: the cwd kiro-cli
+    actually uses may differ.
 
     Returns ``None`` for anything that is not a ``skill://`` URI.
     """
@@ -1240,6 +1365,8 @@ def clear_list_agents_cache() -> None:
     Invalidation is normally automatic via the directory signature; call this
     only to force an immediate refresh (e.g. right after writing an agent
     file).
+
+    The generation invalidates spec-derived caches in other modules.
     """
     _LIST_AGENTS_CACHE.clear()
     global _PARSED_SPECS_GEN

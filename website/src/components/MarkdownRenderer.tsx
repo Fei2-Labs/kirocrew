@@ -562,6 +562,11 @@ const LIST_STYLE_TYPE: Record<string, string> = {
 const MERMAID_ACTION_BTN_CLS =
   'p-1.5 rounded-md bg-bg-elevated/90 border border-border text-muted hover:text-text cursor-pointer'
 
+/** The longest a Mermaid draw waits on `document.fonts.ready` before it draws
+ *  in the fallback face anyway and leaves the loaded face to the one late
+ *  redraw. Why a cap, and why this number: see `whenFontsReady` in MermaidBlock. */
+export const MERMAID_FONTS_READY_CAP_MS = 2500
+
 const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ref = useRef<HTMLDivElement>(null)
@@ -723,9 +728,86 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
     // round again. Without ResizeObserver there is nothing to wait on, so the
     // result stands as it did before this change rather than rendering in a
     // loop.
+    //
+    // The box is one precondition of a trustworthy measurement; the FONTS are
+    // the other. The body face is swap-loaded (`display=swap` on the Google
+    // Fonts stylesheet in index.html), so text already painted -- the SVG's
+    // <foreignObject> labels included -- is repainted in the loaded face when it
+    // arrives, while the node and edge-label boxes keep the widths mermaid
+    // measured in the fallback face: every long label clipped at its right edge
+    // (#12480), deterministically for any diagram drawn while that load is in
+    // flight, which is every diagram in the transcript on a cold load. So the
+    // measurement also waits for `document.fonts.ready`, the same gate
+    // CliPanel and useFontOptions use before they measure text. `ready` settles
+    // when no load is PENDING, which leaves two ways for a face to land after
+    // the measurement, and the set is watched for both: a face whose
+    // unicode-range is first exercised by the diagram's own glyphs starts
+    // loading only once mermaid lays the label out, inside render(), so a
+    // `loadingdone` in flight or a load still pending at the end discards that
+    // SVG; and when the swap-loaded STYLESHEET is itself the late arrival (the
+    // dashboard is served from a local gateway, the font origin is the one slow
+    // resource), no face exists to be pending when `ready` is read, the diagram
+    // is drawn in the fallback face and the swap repaints it when the stylesheet
+    // lands -- so the watch outlives the draw, and the first `loadingdone` after
+    // it redraws the diagram. Either way ONE more attempt, which itself waits
+    // for the pending load, and the watch is spent. One, not a loop: a face
+    // that keeps loading, or a set that never settles, would otherwise redraw
+    // the diagram forever, and the second measurement already saw every glyph
+    // the first one exercised. Where `document.fonts` is absent (the test DOM,
+    // older engines) there is nothing to wait for and the gate is a no-op.
+    //
+    // The wait on `ready` is CAPPED at MERMAID_FONTS_READY_CAP_MS. `ready`
+    // settles only once no load is pending, and a font file whose packets are
+    // dropped -- not refused; a refusal fails fast and settles it -- keeps its
+    // FontFace pending for the browser's network timeout, tens of seconds or
+    // more. Uncapped, the gate would show NOTHING for every diagram on that cold
+    // load for the whole window, where drawing at once showed clipped but
+    // readable labels. Past the cap the diagram is drawn in the fallback face
+    // and the late-arrival path below takes over: the watch outlives the draw,
+    // so when the face does land its `loadingdone` redraws the diagram once in
+    // the loaded face -- the same final frame the stylesheet-late case reaches
+    // -- so the cap costs one fallback-face frame and no correctness. A load
+    // still pending when a CAPPED render ends is the very load the gate gave up
+    // on, so it does not count as a face that moved: one more attempt would
+    // only wait out the cap again and spend the single redraw that the late
+    // `loadingdone` needs. 2.5 s because in the harness's cold loads the face
+    // is requested at about +0.35 s and the transcript renders at about
+    // +1.3-1.6 s, so a face still pending when the gate is read is already a
+    // second into its fetch and 2.5 s more covers a live fetch several times
+    // over; it stays under the 3 s block period the CSS Fonts spec grants
+    // `font-display: block` before fallback text shows, and under the harness's
+    // 4 s hold, so its font-files pass exercises this path.
+    const fonts = document.fonts as FontFaceSet | undefined
+    let capTimer: ReturnType<typeof setTimeout> | undefined
+    /** Resolves when `ready` settles or the cap elapses, whichever is first;
+     *  `true` means the cap won and the draw to come measures in the fallback face. */
+    const whenFontsReady = (): Promise<boolean> => {
+      if (!fonts) return Promise.resolve(false)
+      return new Promise<boolean>(resolve => {
+        let done = false
+        const finish = (capped: boolean) => {
+          if (done) return
+          done = true
+          clearTimeout(capTimer)
+          capTimer = undefined
+          resolve(capped)
+        }
+        capTimer = setTimeout(() => finish(true), MERMAID_FONTS_READY_CAP_MS)
+        void fonts.ready.then(() => finish(false))
+      })
+    }
+    let fontsRetried = false
+    let rendering = false
+    let fontLanded = false
+    let onFontLoaded: (() => void) | undefined
+    const releaseFontWatch = () => {
+      if (onFontLoaded) fonts?.removeEventListener('loadingdone', onFontLoaded)
+      onFontLoaded = undefined
+    }
     const attempt = (mermaid: MermaidApi): Promise<{ svg: string } | null> =>
       whenBoxed()
-        .then(() => {
+        .then(whenFontsReady)
+        .then(capped => {
           if (!live) return null
           let lostBox = false
           if (typeof ResizeObserver === 'function') {
@@ -734,12 +816,15 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
             })
             watch.observe(host)
           }
+          fontLanded = false
+          rendering = true
           // Re-initialized per render so a theme switch between two diagrams is
           // picked up; initialize() is cheap and idempotent.
           initMermaid(mermaid)
           return mermaid.render(`mermaid-${id}`, code)
-            .then(result => ({ result, lostBox }))
+            .then(result => ({ result, lostBox, fontLanded, capped }))
             .finally(() => {
+              rendering = false
               watch?.disconnect()
               watch = undefined
             })
@@ -748,54 +833,80 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
           if (!step || !live) return null
           const boxless = step.lostBox || host.getClientRects().length === 0
           if (boxless && typeof ResizeObserver === 'function') return attempt(mermaid)
+          const fontMoved = step.fontLanded || (!step.capped && fonts?.status === 'loading')
+          if (fontMoved && !fontsRetried) {
+            fontsRetried = true
+            releaseFontWatch()
+            return attempt(mermaid)
+          }
           return step.result
         })
-    whenBoxed()
-      .then(loadMermaid)
-      .then(attempt)
-      .then(result => {
-        if (!result || !ref.current) return
-        settled = true
-        const range = document.createRange()
-        range.selectNodeContents(ref.current)
-        range.deleteContents()
-        ref.current.appendChild(range.createContextualFragment(result.svg))
-        setRendered({ svg: result.svg, code })
-      })
-      .catch(() => {
-        if (!live || !ref.current) return
-        settled = true
-        // The host is EMPTIED rather than filled with a hand-built <pre>. The
-        // source is rendered declaratively below for both states that show it
-        // (`failed || showSource`), so there is exactly one element -- and one set
-        // of styles -- meaning "this diagram's source as text". Building a second
-        // one here left two spellings of the same thing, kept in sync by hand,
-        // which diverges the first time either is retouched.
-        ref.current.textContent = ''
-        setRendered({ svg: '', code: '' })
-        setEnlarged(false)
-        // Reset so the failed state has ONE shape. Not to prevent stranding: the
-        // source below now lives OUTSIDE the hidden host, so neither value of
-        // `showSource` can strand the reader. It is that a later successful render
-        // should show the diagram it just produced rather than silently staying on
-        // text, and while no diagram exists neither does the toggle that would
-        // bring the reader back.
-        setShowSource(false)
-        setFailed(true)
-      })
+    const install = (result: { svg: string } | null) => {
+      if (!result || !live || !ref.current) return
+      settled = true
+      const range = document.createRange()
+      range.selectNodeContents(ref.current)
+      range.deleteContents()
+      ref.current.appendChild(range.createContextualFragment(result.svg))
+      setRendered({ svg: result.svg, code })
+    }
+    const fail = () => {
+      if (!live || !ref.current) return
+      settled = true
+      // The host is EMPTIED rather than filled with a hand-built <pre>. The
+      // source is rendered declaratively below for both states that show it
+      // (`failed || showSource`), so there is exactly one element -- and one set
+      // of styles -- meaning "this diagram's source as text". Building a second
+      // one here left two spellings of the same thing, kept in sync by hand,
+      // which diverges the first time either is retouched.
+      ref.current.textContent = ''
+      setRendered({ svg: '', code: '' })
+      setEnlarged(false)
+      // Reset so the failed state has ONE shape. Not to prevent stranding: the
+      // source below now lives OUTSIDE the hidden host, so neither value of
+      // `showSource` can strand the reader. It is that a later successful render
+      // should show the diagram it just produced rather than silently staying on
+      // text, and while no diagram exists neither does the toggle that would
+      // bring the reader back.
+      setShowSource(false)
+      setFailed(true)
+    }
+    const draw = () => whenBoxed().then(loadMermaid).then(attempt).then(install).catch(fail)
+    if (fonts) {
+      onFontLoaded = () => {
+        // Mid-render: read at the end of that render. After the draw: the late
+        // stylesheet case above, or a face the capped gate stopped waiting for
+        // -- redraw once, and the watch is spent. While still waiting for a box
+        // or for `ready`, the render to come measures in the landed face
+        // already, so there is nothing to do.
+        if (rendering) {
+          fontLanded = true
+          return
+        }
+        if (!settled || fontsRetried || !live) return
+        fontsRetried = true
+        releaseFontWatch()
+        void draw()
+      }
+      fonts.addEventListener('loadingdone', onFontLoaded)
+    }
+    void draw()
     return () => {
       // Torn down before anything was drawn: abandon this chain and forget the
       // code too, or the guard above would make the next run (a new code
       // string, or StrictMode's dev-only replay of this effect) skip a diagram
       // that never rendered. Once the SVG or the failure notice is on screen
-      // there is nothing to abandon, and the guard keeps doing its job.
-      if (settled) return
+      // there is nothing to abandon, and the guard keeps doing its job -- but
+      // the font watch, and a redraw it may have started, still end here.
       live = false
       observer?.disconnect()
       observer = undefined
       watch?.disconnect()
       watch = undefined
-      renderedRef.current = ''
+      clearTimeout(capTimer)
+      capTimer = undefined
+      releaseFontWatch()
+      if (!settled) renderedRef.current = ''
     }
   }, [code, id])
 
@@ -4307,7 +4418,7 @@ function extractPathHintFromText(text: string | undefined): string | undefined {
   return undefined
 }
 
-function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean }) {
+function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle, readOnlyCode }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean; readOnlyCode?: boolean }) {
   switch (block.type) {
     case 'diff': {
       const pathHint = prevBlock?.type === 'markdown'
@@ -4333,8 +4444,8 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slo
         ? `${slotKey}:${messageTs}:${block.startLine}`
         : undefined
       const node = collapseDiffs
-        ? <FoldableDiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} foldKey={foldKey} />
-        : <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} />
+        ? <FoldableDiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} foldKey={foldKey} />
+        : <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} />
       // Smooth mode: wrap so the block height eases as lines arrive. The wrapper
       // is mounted for the whole message lifecycle (smooth is constant) so the
       // child never remounts when streaming flips to complete.
@@ -4362,7 +4473,14 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slo
         const mdNode = <MarkdownContentCard content={block.content} lang={block.language} />
         return smooth ? <SmoothResize enabled={!block.complete}>{mdNode}</SmoothResize> : mdNode
       }
-      const node = <EditableCodeBlock code={block.content} lang={block.language} complete={block.complete} />
+      // `readOnlyCode`: the content is a record the reader must not be able to
+      // touch -- an approval's command awaiting authorization. EditableCodeBlock's
+      // Raw scratch editor edits a local copy that is never written back, so a
+      // pencil there lets someone edit the block and then Approve the ORIGINAL
+      // command while looking at their edit. Plain CodeBlock keeps copy only.
+      const node = readOnlyCode
+        ? <CodeBlock code={block.content} lang={block.language} complete={block.complete} />
+        : <EditableCodeBlock code={block.content} lang={block.language} complete={block.complete} />
       // Height-grow only — streaming code renders as one plain <pre> text node
       // so per-line content animation isn't applied here.
       return smooth ? <SmoothResize enabled={!block.complete}>{node}</SmoothResize> : node
@@ -4379,7 +4497,7 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slo
   }
 }
 
-export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean }) {
+export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false, readOnlyCode = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean; /** Render fenced code with the plain CodeBlock (copy only) instead of EditableCodeBlock. For content the reader must not be able to alter in place -- an approval's command beside its Approve control. */ readOnlyCode?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
   // One message = one config-rule scan pool. The blocks below each mount their
@@ -4548,6 +4666,7 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             softBreaks={softBreaks}
             collapseDiffs={collapseDiffs}
             mdCardToggle={mdCardToggle}
+            readOnlyCode={readOnlyCode}
           />
         ))}
       </ImageVersionCtx.Provider>

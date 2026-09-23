@@ -38,10 +38,11 @@ import sys
 import tempfile
 import threading
 import uuid
+from collections.abc import Collection
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, Iterator, Literal, MutableMapping, NamedTuple
+from typing import Any, Iterator, Literal, Mapping, MutableMapping, NamedTuple
 
 from kiro_crew import agent_state, platform_compat
 from kiro_crew.agent_discovery import (
@@ -952,7 +953,7 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     MCP server (``kirocrew-cron`` / ``kirocrew-core``).
 
     Prefers a standalone ``kirocrew`` binary when one resolves. Falls back
-    to ``<interpreter> [-s] -m kiro_crew <subcommand>`` when
+    to ``<interpreter> [-s] -P -m kiro_crew <subcommand>`` when
     :func:`_resolve_kirocrew_bin` cannot find a usable standalone binary --
     e.g. an install whose launcher is not on the service PATH (the gateway
     running as a systemd user service is the common case): there
@@ -961,12 +962,13 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     ``kirocrew.json`` on every config refresh.
 
     ``sys.executable`` is the absolute path of the running interpreter, so it
-    needs no PATH entry and ignores any broken launcher. ``python -m
-    kiro_crew`` dispatches the same CLI as the ``kirocrew`` console script.
+    needs no PATH entry and ignores any broken launcher. ``python -P -m
+    kiro_crew`` dispatches the same CLI as the ``kirocrew`` console script
+    while keeping the spawn CWD off ``sys.path``.
 
     A resolved ``bin\\kirocrew.cmd`` (the Windows bundle's relocatable shim,
     see :func:`_kirocrew_bin_subpath`) is unwrapped to the sibling
-    interpreter — ``<root>\\python.exe -P -s -m kiro_crew <sub>`` — instead of
+    interpreter — ``<root>\\python.exe -s -P -m kiro_crew <sub>`` — instead of
     being emitted verbatim. This mirrors ``website/electron/main.js``, which
     refuses to spawn the shim it resolved (Node's ``spawn()`` rejects
     ``.cmd``/``.bat`` without ``shell:true``, CVE-2024-27980 hardening) and
@@ -979,25 +981,21 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     """
     bin_path = _resolve_kirocrew_bin()
     if bin_path == "kirocrew":  # unresolved sentinel from _resolve_kirocrew_bin
-        argv = platform_compat.isolated_python_argv("-m", "kiro_crew", subcommand)
+        argv = platform_compat.isolated_python_argv("-P", "-m", "kiro_crew", subcommand)
         return argv[0], argv[1:]
     if bin_path.endswith(".cmd"):
         interpreter = Path(bin_path).parent.parent / "python.exe"
         if _interpreter_runnable(interpreter):
-            # ``-P`` (safe path, 3.11+) keeps the spawn CWD off ``sys.path``:
-            # kiro-cli spawns managed servers with the user's project as CWD,
-            # so with ``-m`` alone a cloned repo carrying a ``kiro_crew/``
-            # package would shadow the real one and run unconfined. Safe to
-            # pin here because this interpreter is always the bundle's own
-            # python-build-standalone 3.12 (packaging/build-desktop.sh); the
-            # generic ``sys.executable`` fallbacks below and above stay
-            # ``-P``-free because the project still supports Python 3.10,
-            # which lacks the flag.
+            # ``-P`` keeps the spawn CWD off ``sys.path`` on every supported
+            # interpreter, so a project package cannot shadow this install.
+            # The bundle also pins ``-s`` because its package never relies on
+            # per-user site-packages. Keep the shared ``-s -P -m`` order used
+            # whenever the helper adds user-site isolation to a fallback.
             argv = platform_compat.isolated_python_argv(
-                "-P", "-s", "-m", "kiro_crew", subcommand, executable=interpreter
+                "-s", "-P", "-m", "kiro_crew", subcommand, executable=interpreter
             )
             return argv[0], argv[1:]
-        argv = platform_compat.isolated_python_argv("-m", "kiro_crew", subcommand)
+        argv = platform_compat.isolated_python_argv("-P", "-m", "kiro_crew", subcommand)
         return argv[0], argv[1:]
     return bin_path, [subcommand]
 
@@ -1147,6 +1145,31 @@ def emission_eligible_mcp_servers() -> frozenset[str]:
     )
 
 
+def crew_owned_mcp_servers() -> frozenset[str]:
+    """Every MCP server name Crew owns, whether or not a rebuild would emit it.
+
+    Deliberately NOT :func:`emission_eligible_mcp_servers`. That set answers
+    "would a rebuild re-add this", so it drops every ``opt_in`` entry — and an
+    ``opt_in`` server the user DID grant is in their spec, serving tools, which is
+    exactly a server a caller asking this question needs named. Asking the
+    eligible set instead would silently omit the granted ones
+    (``kirocrew-dashboard``, ``kirocrew-work``, ``kirocrew-crew-log``).
+
+    The inverse error is harmless, which is why this errs wide: a consumer matches
+    these names against the servers a spec actually carries, so a name for a
+    server that is absent matches nothing. Naming one costs nothing; missing one
+    is the defect.
+
+    The edition seam's extras are included, and that is not an accident: they come
+    from ``_extra_mcp_servers()``, an edition ADAPTER, not from user config, so they
+    are host-owned in exactly the sense the managed map is. Whatever an edition
+    contributes there is Crew's own server and belongs in this set; a user's own
+    ``mcp.json`` entry can never reach it. The names are not constrained to a
+    ``kirocrew-`` prefix, so no caller may assume one.
+    """
+    return frozenset((*_MANAGED_MCP_SERVERS, *_extra_mcp_servers()))
+
+
 def _gated_off_servers() -> frozenset[str]:
     """Managed servers whose ``spec_gate`` is CLOSED right now.
 
@@ -1256,6 +1279,40 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
         "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-crew-log"),
         "opt_in": True,
     },
+    # Debug reads (five questions about a running gateway: which code it is, why a
+    # call was refused, the interpreter's threads, the process family, the recorded
+    # host series). ``opt_in`` for the same reason as the sets around it — a session
+    # that is not debugging a gateway should spend no context on these schemas.
+    #
+    # No ``autoApprove`` key, and the reason is sharper here than anywhere else on
+    # this list: these tools read HOST and CROSS-SESSION state, and an autoApproved
+    # MCP tool never reaches ``hooks.on_tool_call``. The wide views are additionally
+    # gated in the ROUTE to the owner's own dashboard tab, so the set is safe to
+    # grant broadly while remaining narrow in what it will actually answer.
+    "kirocrew-debug": {
+        "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-debug"),
+        "opt_in": True,
+    },
+    # Agent panels (an agent publishes DATA describing its own state; the
+    # dashboard renders it with a human-authored template in a sandboxed frame).
+    # ``opt_in`` for the same reason the dashboard set is: this is an assignable
+    # capability for long-running agents, and a default session must spend no
+    # context on a tool it will never call.
+    #
+    # Its own server rather than a tool added to ``kirocrew-dashboard``, because
+    # assignment is per server and that set is ratcheted to folder organization
+    # plus session control. Publishing a document is neither, and folding it in
+    # would widen a set the user granted for something else.
+    #
+    # No ``autoApprove`` key, for the reason the two sets above have none: an
+    # autoApproved MCP tool is approved inside kiro-cli and never reaches
+    # ``hooks.on_tool_call``, so the deny floor and governance ceiling would be
+    # bypassed -- and this tool's input is derived from text the agent read
+    # unattended.
+    "kirocrew-panel": {
+        "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-panel"),
+        "opt_in": True,
+    },
 }
 
 
@@ -1283,7 +1340,7 @@ def _extra_mcp_servers() -> dict[str, dict]:
     return dict(extra) if extra else {}
 
 
-def managed_mcp_spec_entry(name: str) -> dict[str, Any] | None:
+def managed_mcp_spec_entry(name: str, *, include_opt_in: bool = False) -> dict[str, Any] | None:
     """The kiro-spec ``mcpServers`` entry a fresh build would emit for *name*.
 
     One entry, resolved live (``invocation_fn`` + the pinned data home), for a
@@ -1292,6 +1349,14 @@ def managed_mcp_spec_entry(name: str) -> dict[str, Any] | None:
     assignable set is granted by a spec, never minted here) or when its
     ``spec_gate`` is closed — the same predicate the two spec writers use, so a
     caller cannot resurrect a server emission withholds.
+
+    ``include_opt_in`` resolves an ``opt_in`` entry's invocation anyway, and exists
+    for the ONE caller that is not asking the emission question:
+    ``mcp_gateway.gatewayd._spawns_own_control_plane``, which compares a spawn's
+    binary and argv against the invocation this name is DEFINED as. A closed
+    ``spec_gate`` still yields ``None`` under the flag; the branch below says why the
+    two disqualifiers part company there. It grants nothing on its own, because
+    neither spec writer passes it: an opt-in entry a writer omits is still omitted.
 
     ``autoApprove`` is deliberately NOT carried, unlike the emit loop in
     :func:`build_agent_config`. The flag is kiro-cli's local approval, and the
@@ -1306,7 +1371,18 @@ def managed_mcp_spec_entry(name: str) -> dict[str, Any] | None:
     spec = _MANAGED_MCP_SERVERS.get(name)
     if not isinstance(spec, dict):
         return None
-    if not _mcp_server_emission_eligible(name, spec):
+    if include_opt_in:
+        # The control-plane check asks what this name's INVOCATION is, not whether
+        # a rebuild would GRANT it, and ``_mcp_server_emission_eligible`` answers
+        # the second question. Its two disqualifiers part company here: ``opt_in``
+        # means "never auto-emitted, assigned per agent", so an opt-in server that
+        # IS running was legitimately granted and its invocation is still ours to
+        # compare against; a CLOSED ``spec_gate`` means the opposite -- the gate
+        # exists to keep that backend unspawned, so a spawn under its name is
+        # anomalous and must not be handed a token. Skip the first, keep the second.
+        if not _mcp_spec_gate_open(name, spec):
+            return None
+    elif not _mcp_server_emission_eligible(name, spec):
         return None
     try:
         if "invocation_fn" in spec:
@@ -3275,22 +3351,39 @@ def _is_alias_family(key: str, base: str) -> bool:
     ``mcp_server_alias`` is many-to-one, so :func:`_normalize_mcp_server_keys`
     gives the loser of a collision the lowest free ``base-<n>`` rather than
     dropping a distinct server. One base alias therefore stands for a FAMILY of
-    concrete keys, and anything reasoning about a server's identity from its base
-    alias has to include the suffixed siblings or it misses exactly the keys the
-    collision minted. Module level so the emitter and the ownership reconcile
-    cannot drift to two spellings of this rule.
+    concrete keys. The family rule serves KEY NORMALIZATION only
+    (converging equivalent duplicates onto one alias): the ref reconcile
+    deliberately consults no family, because which claimant a suffix came from
+    is not recoverable there -- its mount exemption is unconditional and its
+    grants require an exact claim.
     """
     return key == base or (key.startswith(f"{base}-") and key[len(base) + 1 :].isdigit())
 
 
-def _normalize_mcp_server_keys(config: dict) -> None:
+def _normalize_mcp_server_keys(
+    config: dict,
+    *,
+    reserved_keys: Collection[str] = (),
+    removed_grants: list[str] | None = None,
+) -> dict[str, str]:
     """Rewrite any slash-containing ``mcpServers`` key to its slash-free alias.
 
     Mutates ``config`` in place: moves each affected server spec under its
     alias key and rewrites (and de-duplicates) the matching ``@oldkey`` ->
-    ``@alias`` reference in ``tools``/``allowedTools``.  Migrates already-broken
-    existing configs.  Idempotent: slash-free keys are left untouched and a
-    re-merged duplicate collapses onto the canonical alias (no churn).
+    ``@alias`` reference in ``tools``/``allowedTools``. Returns each input key's
+    concrete mount alias so later ownership decisions survive collision suffixing.
+    Migrates already-broken existing configs. Idempotent: slash-free keys are left
+    untouched and a re-merged duplicate collapses onto the canonical alias (no churn).
+
+    ``reserved_keys`` names known-but-absent servers. Their refs are left
+    exactly as they are: no present key's per-tool prefix rewrite may capture
+    one, and nothing moves one onto an alias this function may hand to a live
+    server further down. An absent slashed server's refs therefore reach the
+    final dangling-ref reconcile unchanged and are dropped there -- it has no
+    ref-survival guarantee, and minting one is what lets an ``allowedTools``
+    grant move between servers. When provided, ``removed_grants`` receives only
+    grants this pass drops for a reserved-alias collision; rewrites and duplicate
+    collapse are not revocations.
 
     Dedup is by *normalized* spec (:func:`_norm_mcp_spec`), so a re-added key
     that differs only by an empty ``env``/``args`` reuses the existing alias
@@ -3306,20 +3399,86 @@ def _normalize_mcp_server_keys(config: dict) -> None:
     """
     servers = config.get("mcpServers")
     if not isinstance(servers, dict):
-        return
+        return {}
     managed = set(_MANAGED_MCP_SERVERS)
+    mounted_aliases = {key: key for key in servers}
 
     def _is_family(key: str, base: str) -> bool:
         """True if ``key`` is ``base`` or a ``base-<n>`` numeric-suffixed sibling."""
         return _is_alias_family(key, base)
 
-    def _rewrite_ref(old_ref: str, new_ref: str) -> None:
-        for key in ("tools", "allowedTools"):
-            lst = config.get(key)
-            if isinstance(lst, list):
-                config[key] = list(dict.fromkeys(new_ref if t == old_ref else t for t in lst))
+    def _rewrite_ref(ref: object, old_ref: str, new_ref: str) -> object:
+        # Both spellings kiro-cli resolves move together: the bare ``@server``
+        # and the per-tool ``@server/tool``. Leaving the per-tool spelling on
+        # the old key strands it on a name this pass removes, and the final
+        # reconcile then drops it from BOTH lists as dangling. The suffix is
+        # carried VERBATIM by slicing off the matched prefix -- never re-derived
+        # by splitting the ref, because the server key itself may contain a
+        # slash (``npm:@scope/pkg``), so a split takes the wrong component.
+        if isinstance(ref, str) and ref in _immovable:
+            return ref
+        if ref == old_ref:
+            return new_ref
+        if isinstance(ref, str) and ref.startswith(f"{old_ref}/"):
+            return new_ref + ref[len(old_ref) :]
+        return ref
 
-    for old_key in [k for k in servers if "/" in k and k not in managed]:
+    # A known-but-absent slashed server's refs are IMMOVABLE. They need
+    # protecting from exactly one thing -- a present ANCESTOR reading the absent
+    # descendant's bare ``@a/b/c`` as its own per-tool spelling -- and moving
+    # them to the absent server's own alias buys that protection at the price of
+    # MINTING a name this same function hands out further down (the canonical
+    # alias, or a ``base-<n>`` from the collision path below), so whatever lands
+    # there inherits an ``allowedTools`` grant belonging to the absent server,
+    # on the one list that never reaches the PreToolUse gate. No "is the alias
+    # free" test can close that: the name is allocated AFTER the test runs.
+    # Frozen instead, the refs address a name the final map does not hold and
+    # the reconcile drops them -- exactly as it did before this pass learned the
+    # per-tool spelling -- and no grant can travel.
+    #
+    # Ownership is resolved LONGEST-match across both sets, not "some reserved
+    # key claims this ref": with a reserved ancestor ``a/b`` and a PRESENT
+    # descendant ``a/b/c``, the bare ``@a/b/c`` belongs to the live key, and
+    # freezing it would strand that server with no ref instead.
+    #
+    # EVERY absent reserved key participates -- slash-free ones included. A
+    # slash-free unresolved key (``foo-bar``) is its own alias, so a present
+    # ``foo/bar`` normalizing onto that exact name is the same
+    # grant-inheritance hole as the slashed case: excluding it here kept its
+    # stale ``@foo-bar`` grant invisible to the collision filter below, and
+    # the grant auto-approved whatever live server landed on the name. The
+    # ``key not in servers`` guard still keeps every PRESENT key out, and
+    # longest-match ownership keeps a reserved name from claiming a live
+    # descendant's refs.
+    _reserved = {key for key in reserved_keys if isinstance(key, str) and key not in servers}
+    _claimable = _reserved | set(servers)
+
+    def _owner(ref: str) -> str:
+        """The longest key claiming ``ref``; an exact bare match always wins."""
+        return max(
+            (k for k in _claimable if ref == f"@{k}" or ref.startswith(f"@{k}/")),
+            key=len,
+            default="",
+        )
+
+    _immovable: set[str] = set()
+    for _key in ("tools", "allowedTools"):
+        _lst = config.get(_key)
+        if isinstance(_lst, list):
+            _immovable |= {
+                r
+                for r in _lst
+                if isinstance(r, str) and r.startswith("@") and _owner(r) in _reserved
+            }
+
+    # Phase A allocates every final mount key before any reference moves.
+    # Longest-first keeps an exact descendant ahead of its ancestor when their
+    # slash-containing names overlap; equal-length keys cannot prefix each
+    # other, so their order is immaterial.
+    renames: dict[str, str] = {}
+    for old_key in sorted(
+        [k for k in servers if "/" in k and k not in managed], key=len, reverse=True
+    ):
         spec = _norm_mcp_spec(servers.pop(old_key))
         base = mcp_server_alias(old_key)
 
@@ -3341,20 +3500,80 @@ def _normalize_mcp_server_keys(config: dict) -> None:
                     n += 1
                 alias = f"{alias}-{n}"
         servers[alias] = spec
-        _rewrite_ref(f"@{old_key}", f"@{alias}")
+        renames[old_key] = alias
+        mounted_aliases[old_key] = alias
 
-        # Converge any OTHER sibling that duplicates the spec we just placed
-        # (self-heals configs polluted by the pre-fix bug): drop it and redirect
-        # its @ref onto the surviving alias.
+        # Converge any OTHER sibling that duplicates the spec we just placed:
+        # drop it and redirect its @ref onto the surviving alias.
         for dup in [
             k
             for k in list(servers)
             if k != alias and _is_family(k, base) and _norm_mcp_spec(servers[k]) == spec
         ]:
             del servers[dup]
-            _rewrite_ref(f"@{dup}", f"@{alias}")
+            for source, target in renames.items():
+                if target == dup:
+                    renames[source] = alias
+            renames[dup] = alias
+            for source, target in mounted_aliases.items():
+                if target == dup:
+                    mounted_aliases[source] = alias
 
         logger.info("Normalized MCP server key %r -> %r (kiro-safe)", old_key, alias)
+
+    # Phase B resolves ownership from the untouched ref and maps that original
+    # prefix straight to its final alias. A moved ref is never matched again.
+    def _moved_once(ref: object, *, grant: bool = False) -> object:
+        if not isinstance(ref, str):
+            return ref
+        owner = _owner(ref)
+        alias = renames.get(owner)
+        if alias is None:
+            return ref
+        if grant and "/" in owner:
+            runtime_server = ref[1:].split("/", 1)[0]
+            # allowedTools follows the runtime's first-slash parsing. When both
+            # readings name claimable servers, preserving the runtime reading
+            # keeps a per-tool grant narrow instead of granting the renamed
+            # owner as a whole server.
+            if runtime_server != owner and runtime_server in _claimable:
+                return ref
+        return _rewrite_ref(ref, f"@{owner}", f"@{alias}")
+
+    for key in ("tools", "allowedTools"):
+        lst = config.get(key)
+        if isinstance(lst, list):
+            config[key] = list(
+                dict.fromkeys(_moved_once(ref, grant=key == "allowedTools") for ref in lst)
+            )
+
+    _reserved_aliases = {mcp_server_alias(key) for key in _reserved}
+
+    def _collides_with_reserved_alias(ref: object) -> bool:
+        """True when a live server occupies an absent server's alias family."""
+        if not isinstance(ref, str) or not ref.startswith("@"):
+            return False
+        alias = ref[1:].split("/", 1)[0]
+        return alias in servers and any(_is_alias_family(alias, base) for base in _reserved_aliases)
+
+    allowed = config.get("allowedTools")
+    if isinstance(allowed, list):
+        kept_allowed: list[object] = []
+        for ref in allowed:
+            dropped = (
+                isinstance(ref, str)
+                and ref in _immovable
+                and ref.startswith("@")
+                and ref[1:].split("/", 1)[0] in servers
+            ) or _collides_with_reserved_alias(ref)
+            if dropped:
+                if removed_grants is not None and isinstance(ref, str):
+                    removed_grants.append(ref)
+            else:
+                kept_allowed.append(ref)
+        config["allowedTools"] = kept_allowed
+
+    return mounted_aliases
 
 
 def migrate_agent_specs() -> int:
@@ -3849,13 +4068,107 @@ def _decline_shared_agent_home(*, audit: bool = True) -> Path | None:
     return kiro_agents_dir_path() / AGENT_FILENAME
 
 
+def _entry_is_the_declared_server(entry: object, spec: Mapping[str, Any]) -> bool:
+    """Whether ``entry`` is still the server whose spec declared its verbs.
+
+    A declaration names a server BY NAME, in a file the user owns and can repoint.
+    The verbs were declared for the transport the spec describes, so an entry
+    carrying another one is another server and inherits nothing.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if "invocation_fn" in spec:
+        try:
+            command, args = spec["invocation_fn"]()
+        except Exception:  # noqa: BLE001 — an unresolvable invocation declares nothing
+            return False
+    else:
+        command, args = spec.get("command"), spec.get("args")
+    if command and entry.get("command") != command:
+        return False
+    return args is None or list(entry.get("args") or []) == list(args)
+
+
+def declared_auto_approve(emitted: Mapping[str, object]) -> dict[str, tuple[str, ...]]:
+    """Per server, the ``autoApprove`` verbs its own spec DECLARES.
+
+    The governance floor drops a verb nothing declared. The managed registry and the
+    edition's contribution are the two sources that may declare one, and both live
+    here, so the lookup does too. ``emitted`` is the map about to be written and is
+    required: a name whose entry was repointed declares nothing.
+    """
+    declaring = (*_MANAGED_MCP_SERVERS.items(), *_extra_mcp_servers().items())
+    return {
+        n: tuple(s["autoApprove"])
+        for n, s in declaring
+        if isinstance(s, dict)
+        and isinstance(s.get("autoApprove"), list)
+        and s["autoApprove"]
+        and _entry_is_the_declared_server(emitted.get(n), s)
+    }
+
+
 def _strip_ungoverned_auto_approve(servers: dict[str, Any]) -> dict[str, Any]:
     """Local alias so tests can monkeypatch one name (see governance)."""
     return dict(strip_ungoverned_auto_approve(servers))
 
 
+def _write_derived_permissions(
+    config: dict[str, Any], allowed_tools: object, agent_filename: str
+) -> None:
+    """Derive ``config["permissions"]`` from *allowed_tools*, but only if kiro-cli accepts it.
+
+    The one version gate every generated spec writer shares. kiro-cli validates
+    specs with serde ``deny_unknown_fields`` and also serves the KAS backend, so
+    a release whose schema predates ``permissions`` refuses the WHOLE spec and
+    falls back to broader default grants -- and cannot be the KAS relay the field
+    exists for. An accepting version replaces any inherited value with the fresh
+    derivation. A refusing or unknown version removes any inherited value, where
+    keeping it costs the spec and withholding it costs nothing that release could
+    honour. The default-spec seed guards its existing block before calling here,
+    so hand-written seed input remains untouched.
+
+    Generated conductor and worker configs start from ``build_agent_config``,
+    which may carry a user override for this field; the version gate therefore
+    owns both replacement and removal rather than assuming a fresh config.
+
+    Function-local imports on a boot path, and routed through the agent-sdk
+    boundary: ``drivers.acp`` is the one layer permitted to import
+    ``kiro_crew.acp``.
+    """
+    from kiro_crew.kiro_cli import (  # noqa: PLC0415 - boot path
+        installed_kiro_cli_version,
+        spec_permissions_supported,
+    )
+
+    if not spec_permissions_supported(installed_kiro_cli_version()):
+        config.pop("permissions", None)
+        return
+
+    from kiro_crew.agent_sdk.drivers.acp import (  # noqa: PLC0415 - boot path
+        derived_agent_permissions,
+    )
+
+    config["permissions"] = derived_agent_permissions(allowed_tools, agent_filename)
+
+
 def _seed_kas_permissions(config: dict[str, Any]) -> None:
     """Give the spec a KAS ``permissions`` block if it has none. Never edit one.
+
+    **Only when the installed kiro-cli accepts the field.** kiro-cli validates
+    agent specs with serde ``deny_unknown_fields`` and serves the KAS backend as
+    well as its own, so one binary decides both questions: a release whose schema
+    predates ``permissions`` refuses the ENTIRE spec, drops the agent from its
+    table, and leaves every Kiro Crew MCP server absent from the session -- and
+    that same release cannot be the KAS relay the field exists for. Withholding
+    it there gives up nothing that release could have honoured, while writing it
+    gives up the whole spec. An UNKNOWN version (no pinned binary, a refused
+    spawn, unparseable output) withholds too: a wrong guess costs the whole spec.
+
+    A block already on disk is never removed here, whatever the version says --
+    the same seed-never-refresh rule below. A spec an older release already
+    refuses is repaired by ``kirocrew setup --agent-only --clean``, which
+    rebuilds from defaults and, through this gate, leaves the key out.
 
     Two things ride on this field, and the second is the surprising one:
 
@@ -3889,17 +4202,9 @@ def _seed_kas_permissions(config: dict[str, Any]) -> None:
     if config.get("permissions") is not None:
         return
 
-    # Routed through the agent-sdk boundary: ``drivers.acp`` is the one layer
-    # permitted to import ``kiro_crew.acp``, and agent.py's direct-import count
-    # is a shrink-only baseline that must not grow. Function-local for the same
-    # boot-path reason as every import here — this module has no business
-    # dragging the ACP stack onto the gateway boot path just to write one JSON
-    # field.
-    from kiro_crew.agent_sdk.drivers.acp import (  # noqa: PLC0415 - boot path
-        derived_agent_permissions,
-    )
-
-    config["permissions"] = derived_agent_permissions(config.get("allowedTools"), AGENT_FILENAME)
+    # The version gate and the derive live in the shared writer; the guard above
+    # is what is specific to seeding -- a hand-written block is never edited.
+    _write_derived_permissions(config, config.get("allowedTools"), AGENT_FILENAME)
 
 
 def _may_auto_approve(ref: str) -> bool:
@@ -4333,12 +4638,12 @@ def _app_owned_mcp_keys() -> _AppOwnership:
     config as ``playwright-mcp``. A raw composite key matches no candidate at all,
     so the owner of exactly the names that NEED aliasing would read as unowned.
 
-    Each key is a base alias standing for the whole :func:`_is_alias_family`, and
-    a colliding pair collapses to one entry whose value is the AND of their
-    enablements. The concrete ``base-<n>`` a collision mints is assigned against
-    the live server map, so it cannot be reproduced from manifests here; reading
-    the family with the conservative answer covers the sibling without guessing
-    which claimant it came from.
+    Each key is a base alias, and a colliding pair collapses to one entry whose
+    value is the AND of their enablements. The concrete ``base-<n>`` a collision
+    mints is assigned against the live server map, so it cannot be reproduced
+    from manifests here -- which is why the ref reconcile treats family
+    membership as a guess: a suffixed sibling inherits nobody's answer, its
+    grant goes unless a source vouches for it, and only its mount survives.
 
     Covers DISABLED apps deliberately: "an app owns this name and is switched off"
     is the case whose grant must not linger on the name, and a collection that
@@ -4428,6 +4733,40 @@ def _app_owned_mcp_keys() -> _AppOwnership:
             # the base is -- the direction that denies rather than grants.
             owned[_alias] = enabled and owned.get(_alias, True)
     return _AppOwnership(owned, fully_read)
+
+
+# Keys a scope global AUTHORS that are also TRANSPORT-INDEPENDENT, so one the
+# source has since DROPPED is dropped here too. Anything else on a merged entry is
+# the user's (``autoApprove``, ``disabledTools``, fields we do not model) and
+# survives by being ABSENT here, so one invented later defaults to surviving.
+# ``command``/``url`` are absent (a transport needs a scope that declares one;
+# ``test_mcp_rebuild_reconsumption`` owns that), so their dependants are too --
+# reconciling ``headers`` without its ``url`` would pair this source's credential
+# with the entry's old endpoint. mcp.md calls this adopting as a unit.
+_SOURCE_OWNED_MCP_KEYS = ("timeout", "disabled")
+
+
+def _merge_source_owned(mcps: dict, name: str, spec: dict, *, stale: set[str]) -> None:
+    """Reconcile a scope global's *spec* onto ``mcps[name]``.
+
+    ``setdefault`` was a no-op for a name the config already held, so a source the
+    user had CHANGED -- a bumped ``timeout`` -- never reached the generated spec
+    again. Only a name in *stale* is reconciled, and reconciling RETIRES it, so a
+    name claimed earlier in this pass by a higher-priority scope keeps winning and
+    the declared inter-scope precedence is left untouched.
+    """
+    existing = mcps.get(name)
+    if not isinstance(existing, dict):
+        mcps[name] = without_marker(spec)
+        return
+    if name not in stale:
+        return
+    stale.discard(name)
+    for key in _SOURCE_OWNED_MCP_KEYS:
+        if key in spec:
+            existing[key] = spec[key]
+        else:
+            existing.pop(key, None)
 
 
 def rebuild_agent_config(
@@ -4524,9 +4863,15 @@ def rebuild_agent_config(
     # had just stripped (the ceiling now governs that server) lost to the stale
     # grant, the tightening never reached an existing config, and those tools
     # kept skipping the PreToolUse gate.
+    # Names a PREVIOUS rebuild left behind -- the only stale projections a changed
+    # source reconciles. Seeded here so the app loop can retire what it claims.
+    _stale = set(config.get("mcpServers", {}))
     for _app_srv, _app_spec in _collect_app_mcp_servers().items():
         if _app_srv not in managed_names:
             config.setdefault("mcpServers", {})[_app_srv] = _app_spec
+            # The manifest just spoke, so a same-named shared-file leftover must
+            # not reconcile onto it -- this is how the app entry keeps outranking.
+            _stale.discard(_app_srv)
             # EXPOSE it: kiro-cli connects entries declared in `mcpServers`, but
             # an unreferenced server contributes no tools to the agent. `tools`
             # is the unconditional exposure list (the final
@@ -4546,11 +4891,12 @@ def rebuild_agent_config(
             # SHARED file and has no meaning in a spec we render ourselves, so
             # keeping it would put a key in front of the runtime that says nothing
             # to it.
-            config.setdefault("mcpServers", {}).setdefault(name, without_marker(spec))
+            _merge_source_owned(config.setdefault("mcpServers", {}), name, spec, stale=_stale)
 
     # Merge shared MCP servers from edition-contributed provider globals (CPP
-    # seam) — now LOWER priority than Kiro global; setdefault is a no-op when
-    # Kiro already populated the same key, so these only fill gaps. In OSS the
+    # seam) — now LOWER priority than Kiro global: an absent name is filled and a
+    # name claimed earlier in THIS pass was retired from ``_stale``, so these only
+    # fill gaps. In OSS the
     # seam is empty, so NO provider global (e.g. ~/.claude.json) is merged —
     # keeping rebuild symmetric with discovery + apply/uninstall so a server the
     # dashboard can't see is never re-merged into sessions. A companion
@@ -4568,7 +4914,7 @@ def rebuild_agent_config(
             if name not in managed_names:
                 # Copy (see note above) so the source dict stays pristine for
                 # the fallback-candidate lookup.
-                config.setdefault("mcpServers", {}).setdefault(name, without_marker(spec))
+                _merge_source_owned(config.setdefault("mcpServers", {}), name, spec, stale=_stale)
 
     # ~/.kiro/crew/mcp.json overrides kiro mcp.json for the kirocrew agent —
     # kirocrew-specific config wins in a tie.
@@ -4979,8 +5325,17 @@ def rebuild_agent_config(
 
     # Rewrite slash-containing server keys to kiro-safe aliases (also migrates
     # already-broken configs); runs after merges so global-only servers and
-    # their stale @refs are normalized too. See mcp_server_alias.
-    _normalize_mcp_server_keys(config)
+    # their stale @refs are normalized too. The normalizer reports only grants
+    # its terminal collision filter removes; rewrites and dedup stay non-revoking.
+    _alias_purge_removed_grants: list[str] = []
+    _mounted_alias_by_source = _normalize_mcp_server_keys(
+        config,
+        reserved_keys=_unresolved_this_pass,
+        removed_grants=_alias_purge_removed_grants,
+    )
+    _proxy_purge_grants_before = list(
+        dict.fromkeys(ref for ref in (config.get("allowedTools") or []) if isinstance(ref, str))
+    )
 
     # Drop any server whose argv invokes the deleted mcp-playwright-proxy
     # subcommand.  Runs on EVERY rebuild because the entry can be
@@ -4989,6 +5344,29 @@ def rebuild_agent_config(
     # GLOBAL ~/.kiro/settings/mcp.json, which is a different file and a
     # different ownership boundary; this covers the assembled agent config.
     purge_deleted_proxy_from_config(config)
+    _proxy_purge_grants_after = {
+        ref for ref in (config.get("allowedTools") or []) if isinstance(ref, str)
+    }
+    _alias_purge_revoked_by_purge = [
+        ref for ref in _proxy_purge_grants_before if ref not in _proxy_purge_grants_after
+    ]
+    _alias_purge_revoked = list(
+        dict.fromkeys((*_alias_purge_removed_grants, *_alias_purge_revoked_by_purge))
+    )
+    if _alias_purge_revoked:
+        try:
+            sel().log_api_access(
+                caller="system",
+                operation="mcp_auto_approve_revoked",
+                outcome="ok",
+                source="rebuild_agent_config",
+                resources=(
+                    f"{', '.join(_alias_purge_revoked)} auto-approval removed "
+                    "(reserved-alias collision or deleted-proxy purge)"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — auditing never fails the rebuild
+            logger.debug("SEL audit for revoked MCP auto-approvals failed", exc_info=True)
 
     # Sync shared (user-installed) servers to tools/allowedTools.
     # These are explicitly installed by the user via `aim mcp install` or
@@ -5014,24 +5392,49 @@ def rebuild_agent_config(
     # ``allowedTools`` is the one path that never reaches the PreToolUse gate, so
     # the operator's disable would be silently void for every tool on that server.
     #
-    # Both sides are keyed by the ALIAS, not the raw key, because that is the
-    # identity the emitted ref carries and the mapping is many-to-one: a slashed
-    # global key and a slash-free store key are different dict keys that mount the
-    # same ``@ref``. Comparing raw keys would let the alias-spelled entry look
-    # like a different server and re-add the ref the disable just removed.
-    #
-    # Unlike the OAuth-hint binding above, this match deliberately does NOT also
-    # demand transport identity. The two run in opposite directions: over-matching
-    # here only over-disables -- an availability cost, no privilege gained --
-    # while under-matching would let an operator's disable be missed on the one
-    # path (``allowedTools``) that never reaches the PreToolUse gate. Denying is
-    # allowed to be loose; granting is not.
-    _disabled_anywhere = {
-        mcp_server_alias(srv)
-        for scope in (extra_shared_mcp, shared_mcp, kirocrew_mcp)
-        for srv, srv_spec in scope.items()
+    # Mount stripping follows the concrete alias allocated above, so a distinct
+    # collision sibling remains mounted. Grant revocation is intentionally looser:
+    # every disabled source denies auto-approval to its canonical alias family,
+    # because ``allowedTools`` bypasses the PreToolUse gate.
+    _shared_source_entries = tuple(
+        itertools.chain(extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items())
+    )
+    _disabled_source_names = {
+        srv
+        for srv, srv_spec in _shared_source_entries
         if isinstance(srv_spec, dict) and srv_spec.get("disabled")
     }
+    _disabled_mounted_aliases = {
+        mounted
+        for srv, _srv_spec in _shared_source_entries
+        for mounted in (_mounted_alias_by_source.get(srv),)
+        if mounted is not None and srv in _disabled_source_names
+    }
+    _disabled_grant_families = {
+        mcp_server_alias(srv)
+        for srv, srv_spec in _shared_source_entries
+        if isinstance(srv_spec, dict) and srv_spec.get("disabled")
+    }
+
+    def _grant_ref_is_in_alias_family(ref: object, base: str) -> bool:
+        """True when an MCP grant targets ``base`` or a numeric-suffixed sibling."""
+        if not isinstance(ref, str) or not ref.startswith("@"):
+            return False
+        alias = ref[1:].partition("/")[0]
+        return _is_alias_family(alias, base)
+
+    for family in _disabled_grant_families:
+        family_ref = f"@{family}"
+        allowed = config.get("allowedTools")
+        if isinstance(allowed, list):
+            kept_allowed = [
+                tool for tool in allowed if not _grant_ref_is_in_alias_family(tool, family)
+            ]
+            if len(kept_allowed) != len(allowed):
+                allowed[:] = kept_allowed
+                if family_ref not in _shared_removed:
+                    _shared_removed.append(family_ref)
+
     # A server the probe has failed N consecutive times is COUNTED and surfaced,
     # but not unmounted here. The unmount has no safe lever in this file: the
     # generated agent config is simultaneously the mount decision and the only
@@ -5039,20 +5442,49 @@ def rebuild_agent_config(
     # lives only there and stamping ``disabled`` makes ``list_servers`` delete the
     # server's own row. See the follow-up issue linked from
     # docs/system-specs/modules/mcp-probe-quarantine.md.
-    for name, spec in itertools.chain(
-        extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items()
-    ):
+    for name, spec in _shared_source_entries:
         if not isinstance(spec, dict) or name in managed_names:
             continue
-        alias = mcp_server_alias(name)
+        alias = _mounted_alias_by_source.get(name)
+        if alias is None:
+            continue
         ref = f"@{alias}"
-        if spec.get("disabled") or alias in _disabled_anywhere:
+        # The bare spelling is rebuild-owned and is stripped from both lists.
+        # Per-tool spellings are stripped only from ``allowedTools``, where the
+        # disable defect lives because that list bypasses the PreToolUse gate. A
+        # per-tool ``tools`` ref mounts nothing while the map entry is disabled
+        # and resumes on re-enable; deleting it destroys a user's selective
+        # mount with no recovery lever. This is the same deny-may-be-loose,
+        # never-destroy-a-mount asymmetry used by the final reconcile. The ``/``
+        # boundary still protects a prefix-sharing server such as ``@aliasx``.
+        _owned = f"{ref}/"
+
+        def _strip_owned_refs(key: str, *, strip_per_tool: bool) -> bool:
+            """Drop the bare ref and, when requested, every owned per-tool ref.
+
+            Rebuilds the list in place rather than ``list.remove``, which drops
+            only the first occurrence and lets a duplicated ref survive.
+            """
+            lst = config.get(key)
+            if not isinstance(lst, list):
+                return False
+            kept = [
+                t
+                for t in lst
+                if t != ref and not (strip_per_tool and isinstance(t, str) and t.startswith(_owned))
+            ]
+            if len(kept) == len(lst):
+                return False
+            lst[:] = kept
+            return True
+
+        if spec.get("disabled") or alias in _disabled_mounted_aliases:
             for key in ("tools", "allowedTools"):
-                lst = config.get(key)
-                if lst is not None and ref in lst:
-                    lst.remove(ref)
-                    if ref not in _shared_removed:
-                        _shared_removed.append(ref)
+                if (
+                    _strip_owned_refs(key, strip_per_tool=key == "allowedTools")
+                    and ref not in _shared_removed
+                ):
+                    _shared_removed.append(ref)
         elif alias in valid_servers:
             valid_servers[alias].pop("disabled", None)
             # `tools` is what MOUNTS the server; `allowedTools` additionally
@@ -5064,17 +5496,19 @@ def rebuild_agent_config(
             # user-installed MCP server on the primary agent — the same bypass
             # that was closed for app agents, at the second of the two places
             # that write such a list. One predicate serves both.
-            keys = ("tools", "allowedTools") if _may_auto_approve(ref) else ("tools",)
+            may_auto_approve = _may_auto_approve(ref) and not any(
+                _grant_ref_is_in_alias_family(ref, base) for base in _disabled_grant_families
+            )
+            keys = ("tools", "allowedTools") if may_auto_approve else ("tools",)
             for key in keys:
                 if ref not in config.get(key, []):
                     config.setdefault(key, []).append(ref)
                     if ref not in _shared_added:
                         _shared_added.append(ref)
             if "allowedTools" not in keys:
-                lst = config.get("allowedTools")
-                if lst is not None and ref in lst:
-                    # A grant written before the ceiling arrived must not survive it.
-                    lst.remove(ref)
+                # A grant written before the ceiling arrived must not survive
+                # it -- in either spelling, and not as a duplicate either.
+                _strip_owned_refs("allowedTools", strip_per_tool=True)
                 if ref not in _shared_not_auto:
                     _shared_not_auto.append(ref)
     if _shared_added:
@@ -5341,110 +5775,68 @@ def rebuild_agent_config(
             for _n in scope
         }
         _vouched = _gated_aliases | _vouched_sources
-        # Matched by alias FAMILY, not equality. The ownership map is keyed by the
-        # base alias a manifest mints, while the config can hold the suffixed
-        # sibling, and an equality test reads that sibling as owned by nobody --
-        # leaving its auto-approval on the name once its app is switched off. Which
-        # claimant a suffix came from is not recoverable, so a candidate matching
-        # several claimed bases needs ALL of them switched on.
+        # Which claimant a collision suffix came from is not recoverable (it is
+        # assigned against the live server map, and the slashed key it came
+        # from is gone by the next rebuild), so family membership -- ``base-2``
+        # against a claimed ``base`` -- is a GUESS. The two lists price a guess
+        # differently, which is why this reconcile walks no family: the MOUNT
+        # survives every candidate here
+        # unconditionally (so the guess has nothing left to decide for it), and
+        # the GRANT requires positive evidence a guess can never supply (so
+        # attribution by family never lends one). What remains is exactness:
+        # a name an app claims EXACTLY answers to its own claimant.
 
         def _base_still_grants(_b: str) -> bool:
             """Whether a claimed base is POSITIVELY still owned and switched on."""
             return _app_owned_now.get(_b) is True
 
-        def _base_may_still_mount(_b: str) -> bool:
-            """Whether a claimed base might still be owned, counting an unread claim."""
-            if _b in _app_owned_now:
-                # The final read reached this app, so its answer is the answer.
-                return _app_owned_now[_b] is True
-            # Missing from the final read. That is positive REMOVAL only when the
-            # read saw every claim; otherwise the claim may merely have gone
-            # unread, which this module calls the ordinary shape of the failure.
-            # Dropping a MOUNT ref on that doubt can unmount a server for good, so
-            # the pre-rebuild answer stands here -- and only here. The grant side
-            # above requires the positive answer instead, because a grant kept on
-            # the same doubt is an auto-approval left on a name.
-            return not _ownership_full_now and _app_owned_at_start.get(_b) is True
-
-        # Built TWICE, because the two lists fail in opposite directions and one set
-        # cannot serve both. `_exempt_mounts` keeps a name whose ownership merely
-        # went unread, since dropping a mount ref can unmount a server for good.
-        # `_exempt_grants` requires a positive answer, since keeping a grant on the
-        # same doubt leaves an auto-approval on a name any later server inherits --
-        # and `allowedTools` is the path that never reaches the PreToolUse gate.
+        # Built TWICE, because the two lists fail in opposite directions and one
+        # set cannot serve both. `_exempt_mounts` keeps EVERY name this reconcile
+        # reached -- and it only ever reaches the unresolved and gated candidates;
+        # a server the locked app re-merge deleted is in neither set and loses
+        # both refs above. Dropping a `tools` ref can unmount a server for good
+        # -- an existing config never re-adds a template ref, and nothing
+        # re-adds a user's own suffixed sibling -- while keeping one costs at
+        # most a mount attempt against an empty name (an app-claimed UNRESOLVED
+        # name loses nothing either: re-enabling the app re-merges its entry and
+        # the kept ref resumes mounting it). `_exempt_grants` requires a
+        # positive answer, since keeping a grant on doubt leaves an
+        # auto-approval on a name any later server inherits -- and
+        # `allowedTools` is the path that never reaches the PreToolUse gate.
+        # The same mount-survives-doubt / grant-needs-evidence asymmetry the
+        # unresolved and gated handling in this reconcile already runs on.
         _exempt_mounts: set[str] = set()
         _exempt_grants: set[str] = set()
         for _n in _narrowed_away | _gated_aliases:
-            _bases = [_b for _b in _ever_app_owned if _is_alias_family(_n, _b)]
-            if _bases:
-                # A readable non-app SOURCE that declares this exact name outranks
-                # app attribution, because pruning its refs does not merely narrow
-                # them. The shared sync re-adds the BARE `@alias` to `allowedTools`
-                # once the command resolves again, so a user's per-tool grant comes
-                # back as a WHOLE-SERVER one -- widening the very grant this
-                # reconcile exists to keep from widening.
-                #
-                # The managed GATE does not vouch that way. `gated_off` says a
+            _exempt_mounts.add(_n)
+            if _n in _ever_app_owned:
+                # Exactly claimed: its own claimant decides the grant. A
+                # readable non-app SOURCE that still declares the name outranks
+                # a switched-off claim, because pruning its refs does not merely
+                # narrow them: the shared sync re-adds the BARE `@alias` to
+                # `allowedTools` once the command resolves again, so a user's
+                # per-tool grant comes back as a WHOLE-SERVER one -- widening
+                # the very grant this reconcile exists to keep from widening.
+                # The managed GATE does not vouch that way: `gated_off` says a
                 # shipped server is withheld right now, not that anything still
-                # declares the name, so an app whose alias lands exactly on a gated
-                # managed name must still lose its grant: otherwise reopening the
-                # gate hands the managed server an approval nobody granted for it.
-                #
-                # A SUFFIXED sibling stays ambiguous either way. The suffix is
-                # assigned against the live map and the slashed key it came from is
-                # gone by the next rebuild, so nothing here can tell a minted
-                # sibling from a name a source chose that way, and any vouching
-                # outranks the guess.
-                if _n in _vouched_sources or (_n not in _ever_app_owned and _n in _vouched):
-                    _exempt_mounts.add(_n)
+                # declares the name, so an app whose alias lands exactly on a
+                # gated managed name must still lose its grant -- otherwise
+                # reopening the gate hands the managed server an approval nobody
+                # granted for it.
+                if _n in _vouched_sources or _base_still_grants(_n):
                     _exempt_grants.add(_n)
-                    continue
-                # When the candidate is ITSELF a claimed alias, its own owner decides.
-                # Widening to the family lets a sibling's switched-off owner delete a
-                # name whose own app is switched on, and it does that to both lists
-                # because the AND below gates each of them. Family matching is for a
-                # name nothing claims exactly, where the suffix is the only evidence
-                # there is.
-                _deciding = [_n] if _n in _ever_app_owned else _bases
-                if all(_base_may_still_mount(_b) for _b in _deciding):
-                    _exempt_mounts.add(_n)
-                if _n in _ever_app_owned and all(_base_still_grants(_b) for _b in _deciding):
-                    # The GRANT needs the name to be a claimed base ITSELF, not
-                    # merely a family match. A suffix is minted against the live map
-                    # and the slashed key it came from is gone by the next rebuild,
-                    # so a `base-2` candidate cannot be told from a name a source
-                    # chose that way -- and attributing it to an ENABLED owner of
-                    # `base` would keep an auto-approval on a server that owner
-                    # never declared, for whatever binds to the name next. The mount
-                    # above stays on the family answer because that guess costs a
-                    # mount attempt against an empty name, while dropping it cannot
-                    # be undone. Exactness only ever narrows: a family sibling whose
-                    # base is switched off still loses its grant, which is the case
-                    # the family match was added for.
-                    _exempt_grants.add(_n)
-            else:
-                # No app claims this name or its family. The MOUNT is exempt
-                # unconditionally, matching the `if _bases:` branch above and this
-                # helper's own cost model: an unsure caller keeps the mount and
-                # drops only the grant. Gating it on the ownership read would let an
-                # unrelated app's unreadable manifest -- which that read calls an
-                # ordinary shape of failure -- permanently strip the `tools` refs of
-                # a server that merely has its binary off PATH this pass, and no
-                # later pass re-adds them.
-                _exempt_mounts.add(_n)
-                if _n in _vouched:
-                    # The GRANT is the side that needs a positive answer. An
-                    # unclaimed name whose command did not resolve has no source
-                    # declaring it, so keeping the auto-approval leaves it on the
-                    # NAME for whatever binds there next, and `allowedTools` never
-                    # reaches the PreToolUse gate. Dropping it costs one approval a
-                    # human can grant again, where the mount above cannot be undone.
-                    # The gate DOES vouch here, unlike in the app branch above:
-                    # there the grant belonged to a switched-off app, so reopening
-                    # the gate would hand the managed server an approval nobody
-                    # granted it, while here the grant is the withheld server's own
-                    # and revoking it strands a shipped default.
-                    _exempt_grants.add(_n)
+            elif _n in _vouched:
+                # Unclaimed -- including a `base-2` sibling nothing claims
+                # exactly, whose family guess never lends it an enabled owner's
+                # answer. The GRANT is the side that needs a positive answer,
+                # and here the vouching supplies it: a readable source still
+                # declares the name, or the grant is a gated-off shipped
+                # server's own, where revoking it would strand a shipped
+                # default. An unclaimed, unvouched name keeps nothing: the
+                # auto-approval would sit on the NAME for whatever binds there
+                # next, and `allowedTools` never reaches the PreToolUse gate,
+                # while dropping it costs one approval a human can grant again.
+                _exempt_grants.add(_n)
         # Snapshot the grant list, because only this side is a permission
         # decision: `tools` mounts, `allowedTools` auto-approves.
         _grants_before = [_r for _r in (config.get("allowedTools") or []) if isinstance(_r, str)]
@@ -6641,6 +7033,7 @@ _MEMBER_DASHBOARD_GRANTS: tuple[str, ...] = _CONDUCTOR_DASHBOARD_GRANTS + (
 _LEDGER_CONDUCTOR_WORK_GRANTS: tuple[str, ...] = (
     "@kirocrew-work/work_ledger_read",
     "@kirocrew-work/work_ledger_record",
+    "@kirocrew-work/work_ledger_rebuild",
     "@kirocrew-work/work_brief",
 )
 
@@ -7333,15 +7726,8 @@ def _conductor_spec(*, name: str, description: str, filename: str, source: str) 
     # as a literal: the rules come out byte-identical, a later edit to
     # ``allowedTools`` carries through, and a ceiling that strips a grant strips
     # its KAS rule with it (a hand-written ``kirocrew-core/*`` allow would have
-    # survived the filter on the KAS backend). Routed through the agent-sdk
-    # boundary like the pipeline conductor below: ``drivers.acp`` is the one
-    # layer permitted to import ``kiro_crew.acp``, and agent.py's direct-import
-    # count is a shrink-only baseline that must not grow.
-    from kiro_crew.agent_sdk.drivers.acp import (  # noqa: PLC0415 - boot path
-        derived_agent_permissions,
-    )
-
-    config["permissions"] = derived_agent_permissions(config["allowedTools"], filename)
+    # survived the filter on the KAS backend). The shared writer version-gates it.
+    _write_derived_permissions(config, config["allowedTools"], filename)
     return config
 
 
@@ -7832,16 +8218,8 @@ def _write_worker_spec(config: dict, path: Path, *, template_grants: list[str]) 
     # Derived from the FILTERED grant list rather than restated as a literal, so a
     # ceiling that strips a grant strips its KAS rule with it, and the cron
     # subtraction reaches the KAS backend rather than stopping at ``allowedTools``,
-    # which nothing reads there. Routed through the agent-sdk boundary like the
-    # conductors: ``drivers.acp`` is the one layer permitted to import
-    # ``kiro_crew.acp``.
-    from kiro_crew.agent_sdk.drivers.acp import (  # noqa: PLC0415 - boot path
-        derived_agent_permissions,
-    )
-
-    config["permissions"] = derived_agent_permissions(
-        config["allowedTools"], _WORKER_AGENT_FILENAME
-    )
+    # which nothing reads there. The shared writer version-gates it.
+    _write_derived_permissions(config, config["allowedTools"], _WORKER_AGENT_FILENAME)
 
     existing = _read_spec_capped(path)
     if isinstance(existing, dict) and "model" in existing and _worker_model_is_user_pinned():
@@ -8380,17 +8758,9 @@ def _install_pipeline_conductor_agent() -> None:
         source="_install_pipeline_conductor_agent",
     )
     config["mcpServers"] = _conductor_mcp_servers(config)
-    # Same derive-don't-restate rationale as the conductor above, but routed
-    # through the agent-sdk boundary: ``drivers.acp`` is the one layer permitted
-    # to import ``kiro_crew.acp``, and agent.py's direct-import count is a
-    # shrink-only baseline that must not grow.
-    from kiro_crew.agent_sdk.drivers.acp import (  # noqa: PLC0415 - boot path
-        derived_agent_permissions,
-    )
-
-    config["permissions"] = derived_agent_permissions(
-        config["allowedTools"], _PIPELINE_CONDUCTOR_AGENT_FILENAME
-    )
+    # Same derive-don't-restate rationale as the conductor above; the shared
+    # writer version-gates it.
+    _write_derived_permissions(config, config["allowedTools"], _PIPELINE_CONDUCTOR_AGENT_FILENAME)
     kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     path = kiro_agents_dir_path() / _PIPELINE_CONDUCTOR_AGENT_FILENAME
     _atomic_json_write(path, config)
@@ -8564,17 +8934,9 @@ def _install_security_conductor_agent() -> None:
     )
     config["mcpServers"] = _conductor_mcp_servers(config)
     # Derived from the FILTERED grant list rather than restated, so a ceiling
-    # that strips a grant strips its KAS rule with it. Routed through the
-    # agent-sdk boundary like both siblings: ``drivers.acp`` is the one layer
-    # permitted to import ``kiro_crew.acp``, and agent.py's direct-import count
-    # is a shrink-only baseline that must not grow.
-    from kiro_crew.agent_sdk.drivers.acp import (  # noqa: PLC0415 - boot path
-        derived_agent_permissions,
-    )
-
-    config["permissions"] = derived_agent_permissions(
-        config["allowedTools"], _SECURITY_CONDUCTOR_AGENT_FILENAME
-    )
+    # that strips a grant strips its KAS rule with it; the shared writer
+    # version-gates it.
+    _write_derived_permissions(config, config["allowedTools"], _SECURITY_CONDUCTOR_AGENT_FILENAME)
     kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     path = kiro_agents_dir_path() / _SECURITY_CONDUCTOR_AGENT_FILENAME
     _atomic_json_write(path, config)

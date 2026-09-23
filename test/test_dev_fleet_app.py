@@ -2089,6 +2089,58 @@ def test_build_env_excludes_credentials(monkeypatch):
     assert mod._build_env(with_credentials=True)["PATH"] == mod._TRUSTED_PATH
 
 
+def test_build_env_passes_npm_registry_but_drops_credential_shaped_keys(monkeypatch):
+    """NPM_CONFIG_REGISTRY is a registry URL, not a credential -- it must reach
+    every Dev Fleet npm step (preflight AND the real ``npm ci``/``npm run
+    build``) so both resolve against the same registry. A credential-shaped
+    variable next to it must still be dropped by the same allowlist.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setenv("NPM_CONFIG_REGISTRY", "https://registry.npmjs.org")
+    monkeypatch.setenv("NPM_CONFIG__AUTHTOKEN", "npm-secret-token")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-secret")
+
+    for env in (mod._build_env(), mod._build_env(with_credentials=True)):
+        assert env["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org"
+        assert "NPM_CONFIG__AUTHTOKEN" not in env
+        assert "SLACK_BOT_TOKEN" not in env
+
+
+def test_build_env_rejects_npm_registry_values_that_smuggle_credentials(monkeypatch):
+    """``NPM_CONFIG_REGISTRY`` is forwarded only when it is a bare
+    ``http``/``https`` registry URL with no userinfo, query, fragment, or
+    embedded whitespace -- URL syntax otherwise permits a credential-bearing
+    value (``https://user:token@host/``) or a smuggled second value to reach
+    a worktree-controlled build script through this allowlist entry. A value
+    that fails validation is dropped outright (fail closed), never rewritten,
+    and an unrelated credential-shaped variable next to it is still dropped
+    too.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    dropped = (
+        "https://u:tok@registry.example/",  # userinfo
+        "https://registry.example/?x=1",  # query
+        "https://registry.example/#f",  # fragment
+        "file:///etc/passwd",  # non-http(s) scheme
+        "",  # empty
+        "https://registry.npmjs.org ",  # embedded whitespace
+    )
+    for value in dropped:
+        monkeypatch.setenv("NPM_CONFIG_REGISTRY", value)
+        monkeypatch.setenv("NPM_CONFIG__AUTHTOKEN", "npm-secret-token")
+        monkeypatch.setenv("NPM_TOKEN", "npm-secret-token-2")
+        env = mod._build_env()
+        assert "NPM_CONFIG_REGISTRY" not in env, value
+        assert "NPM_CONFIG__AUTHTOKEN" not in env
+        assert "NPM_TOKEN" not in env
+
+    # A clean value right after a dropped one still passes through.
+    monkeypatch.setenv("NPM_CONFIG_REGISTRY", "https://registry.npmjs.org")
+    assert mod._build_env()["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org"
+
+
 def test_is_safe_env_key_matches_documented_spelling_on_windows():
     """A mixed-case allowlist entry must still match what ``os.environ`` yields.
 
@@ -3477,6 +3529,9 @@ def test_the_neutralizers_answer_from_the_real_object_graph(tmp_path, monkeypatc
     base_env["GIT_CONFIG_SYSTEM"] = os.devnull
 
     def run(*args, env=None):
+        # ``cwd=repo`` alongside ``-C repo``: the location is pinned twice on
+        # purpose. ``-C`` is what the module under test relies on; ``cwd`` keeps
+        # this fixture's real git from ever running in the worker's checkout.
         proc = subprocess.run(
             [git, "-C", str(repo), *args],
             capture_output=True,
@@ -3484,6 +3539,7 @@ def test_the_neutralizers_answer_from_the_real_object_graph(tmp_path, monkeypatc
             encoding="utf-8",
             timeout=60,
             env={**base_env, **(env or {})},
+            cwd=repo,
         )
         assert proc.returncode == 0, proc.stderr
         return proc.stdout.strip()
@@ -6968,7 +7024,9 @@ def test_kiro_crew_module_entry_actually_runs():
 @pytest.mark.asyncio
 async def test_pod_down_fails_closed_when_still_active():
     """A CLI exit 0 must NOT be reported as success if the unit is still up."""
-    with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
+    with patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/worktrees/kirocrew-wt-x"}, None)), \
+         patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
          patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")), \
          patch.object(runtime_mod, "_load_cfg", return_value=object()), \
          patch.object(runtime_mod, "_POD_AVAILABLE", True), \
@@ -6981,7 +7039,9 @@ async def test_pod_down_fails_closed_when_still_active():
 @pytest.mark.asyncio
 async def test_pod_down_ok_when_unit_gone():
     """rc 0 AND the unit not active -> genuine success."""
-    with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
+    with patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/worktrees/kirocrew-wt-x"}, None)), \
+         patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
          patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")), \
          patch.object(runtime_mod, "_load_cfg", return_value=object()), \
          patch.object(runtime_mod, "_POD_AVAILABLE", True), \
@@ -6994,7 +7054,9 @@ async def test_pod_down_ok_when_unit_gone():
 @pytest.mark.asyncio
 async def test_pod_down_fails_closed_when_verify_raises():
     """If the post-stop active-state check errors, fail closed (never claim ok)."""
-    with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
+    with patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/worktrees/kirocrew-wt-x"}, None)), \
+         patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
          patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")), \
          patch.object(runtime_mod, "_load_cfg", return_value=object()), \
          patch.object(runtime_mod, "_POD_AVAILABLE", True), \
@@ -7007,7 +7069,9 @@ async def test_pod_down_fails_closed_when_verify_raises():
 @pytest.mark.asyncio
 async def test_pod_down_nonzero_rc_is_failure():
     """A non-zero CLI exit is surfaced as failure verbatim."""
-    with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
+    with patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/worktrees/kirocrew-wt-x"}, None)), \
+         patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
          patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(1, "", "stop failed")):
         result = await mod._pod_down("kirocrew-wt-x")
     assert result["ok"] is False

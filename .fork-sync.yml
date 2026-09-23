@@ -360,6 +360,38 @@ conflict_policy:
       guards nothing.
 
 divergences:
+  - id: spec-adapter-agent-resources
+    what: |
+      `context._agent_spec_candidates`, `_load_agent_file_resources`, and the
+      spec-adapter context gate load a named agent's project-first `file://`
+      resources through the shared hardened spec reader. `_load_agent_prompt`
+      uses the same candidates so a project agent shadows its global namesake.
+    why: |
+      Public-spec adapters do not read Kiro agent specs. Losing this seam leaves
+      custom resources and project prompts silently absent while the Kiro path
+      still works, so ordinary context tests can pass unless the adapter path is
+      asserted directly. A project spec is user-owned input: the restoration must
+      retain `_read_agent_spec`'s size, symlink, encoding, and sensitive-path
+      guards rather than adding a direct JSON read.
+    pinned_by: "test/test_context.py::TestLoadAgentPrompt, test/test_context.py::TestLoadSteeringResources"
+    decided: 2026-09-23
+
+  - id: registry-adapter-effort-cold-start
+    what: |
+      `_create_adapter_provider_factory` keeps its registry-selected
+      `factory_backend` as the model/effort namespace and carries an advertised-
+      option effort level until `session/new` supplies that harness's vocabulary.
+    why: |
+      Sending an already validated Pi/goose/copilot factory through the direct
+      Kiro selector degrades it to Kiro by design. The resulting cold start judges
+      the adapter's model and effort with Kiro's registry, silently drops valid
+      levels such as Pi's `minimal`, and leaves the dashboard showing a value the
+      session never applied. Production reaches this through
+      `DefaultProviderRegistry`, so the pin must exercise that public seam rather
+      than call the low-level direct-Kiro factory.
+    pinned_by: "test/test_acp_pi_backend.py::TestAPersistedLevelSurvivesAColdStart"
+    decided: 2026-09-23
+
   - id: multi-repo-git-panel
     what: |
       Fork-only (5cb712fb5, on upstream's `feat/multi-repo-git-status` branch but
@@ -1149,9 +1181,8 @@ environmental_failures:
       docs-lint's citation check and reports dozens of "doc does not exist" and
       "line past end of file" findings against its bundled site-packages copy.
       Remove the build tree (or run docs-lint from a clean checkout) to see the
-      real signal underneath. One genuinely pre-existing finding under that
-      noise, predating this sync (already on fork `main`): "packaged docs with
-      an unrecorded consumer" for `src/kiro_crew/docs/experimental-acp-adapters.md`
-      (named in `website/src/pages/overview/AcpBackendCard.tsx` but never added
-      to `CODE_COUPLED_DOCS` in `scripts/docs_lint.py`) -- register the pairing
-      there in a follow-up, not part of this sync's scope.
+      real signal underneath. The 2026-09-23 sync also registered the formerly
+      missing `CODE_COUPLED_DOCS` pair for
+      `src/kiro_crew/docs/experimental-acp-adapters.md` and
+      `website/src/pages/overview/AcpBackendCard.tsx`, so a clean checkout now
+      passes this gate.

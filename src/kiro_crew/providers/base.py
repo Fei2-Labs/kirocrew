@@ -35,6 +35,8 @@ from kiro_crew.essential_delivery import EssentialDelivery
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Type-only: this module's runtime imports are deliberately just acp.types
     # and constants, and recovery.ladder pulls in mcp_gateway + metrics.
+    from pathlib import Path
+
     from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
     from kiro_crew.recovery.ladder import InfraError
 
@@ -165,6 +167,15 @@ class LLMProvider(ABC):
 
         The safe default is False: adapters added later publish their own session
         identity normally unless they explicitly adopt the deferred-SID contract.
+        """
+        return False
+
+    @property
+    def is_kiro_backend(self) -> bool:
+        """True only when the provider positively identifies as kiro-cli.
+
+        The safe default is False: adapters added later cannot accidentally earn
+        Kiro-only behavior merely by omitting this capability.
         """
         return False
 
@@ -463,6 +474,22 @@ class LLMProvider(ABC):
         return None
 
     @property
+    def work_scratch_dir(self) -> "Path | None":
+        """The ``$KIROCREW_SCRATCH`` directory the process serving this session
+        exposes, or ``None`` when it has none.
+
+        Read by whoever spawns a process on this session's behalf (a companion
+        runtime, a dedicated sub-agent process) so that process mounts the SAME
+        directory and the session tree keeps one work directory
+        (``agent_scratch``). Declared here with a safe default rather than probed
+        off the instance (harness-parity H14): a provider that never allocated
+        scratch answers ``None`` and the child starts its own directory, exactly
+        as before the capability existed. The ACP providers answer the directory
+        their live process was spawned with.
+        """
+        return None
+
+    @property
     def manual_compact_unsupported_backend(self) -> str | None:
         """Backend id when this provider cannot serve a manual ``/compact``,
         ``None`` when the command is fine to dispatch.
@@ -580,6 +607,12 @@ class LLMProvider(ABC):
         False when effort is unsupported. Default False."""
         return False
 
-    async def clear_effort(self) -> bool:
-        """Clear the slot's reasoning-effort override for the current model. Default False."""
+    async def clear_effort(self) -> bool | None:
+        """Clear the slot's reasoning-effort override for the current model.
+
+        True applied a default LIVE, False needs a session reset to reach it, and
+        None means NOTHING changed -- neither the workspace overlay nor the
+        provider's own map -- so the caller must commit no new slot value and
+        reset nothing. Default False.
+        """
         return False

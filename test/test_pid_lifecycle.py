@@ -325,7 +325,9 @@ class TestSignalOrphanedRuntimeGroup:
     def test_signals_each_vouched_member_by_identity(self, monkeypatch, seam) -> None:
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a", 102: "b"})
+        monkeypatch.setattr(
+            sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a", 102: "b"}
+        )
         self._identity(monkeypatch, {101: "a", 102: "b"})
         sent = self._delivery(monkeypatch, seam)
         killpg = MagicMock()
@@ -352,7 +354,7 @@ class TestSignalOrphanedRuntimeGroup:
 
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         self._identity(monkeypatch, {101: "a"})
 
         def _refuse(pid):
@@ -378,7 +380,7 @@ class TestSignalOrphanedRuntimeGroup:
 
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         self._identity(monkeypatch, {101: "a"})
 
         def _send(fd, sig):
@@ -403,7 +405,7 @@ class TestSignalOrphanedRuntimeGroup:
         """
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         self._identity(monkeypatch, {101: "a"})
 
         def _refuse(pid):
@@ -430,7 +432,7 @@ class TestSignalOrphanedRuntimeGroup:
         """
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         live = {101: "a"}
         monkeypatch.setattr(sp.platform_compat, "get_process_start_id", lambda pid: live.get(pid))
 
@@ -462,7 +464,9 @@ class TestSignalOrphanedRuntimeGroup:
         """
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a", 102: "b"})
+        monkeypatch.setattr(
+            sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a", 102: "b"}
+        )
         self._identity(monkeypatch, {101: "a", 102: "b2"})  # 102 changed hands
         sent = self._delivery(monkeypatch, seam)
 
@@ -475,7 +479,9 @@ class TestSignalOrphanedRuntimeGroup:
         the only target."""
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a", 103: "c"})
+        monkeypatch.setattr(
+            sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a", 103: "c"}
+        )
         self._identity(monkeypatch, {101: "a", 103: "c"})
         sent = self._delivery(monkeypatch, seam)
 
@@ -496,7 +502,9 @@ class TestSignalOrphanedRuntimeGroup:
         from kiro_crew import session_pid as sp
 
         # 101 is alive but under a NEW start id: the pid was reused.
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a2", 200: "z"})
+        monkeypatch.setattr(
+            sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a2", 200: "z"}
+        )
         kill = MagicMock()
         monkeypatch.setattr(sp.os, "kill", kill)
 
@@ -510,7 +518,7 @@ class TestSignalOrphanedRuntimeGroup:
     ) -> None:
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: None})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: None})
         kill = MagicMock()
         monkeypatch.setattr(sp.os, "kill", kill)
 
@@ -521,7 +529,7 @@ class TestSignalOrphanedRuntimeGroup:
         """Nothing to compare at the instant of the signal means no signal."""
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: None})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: None})
         kill = MagicMock()
         monkeypatch.setattr(sp.os, "kill", kill)
 
@@ -531,7 +539,7 @@ class TestSignalOrphanedRuntimeGroup:
     def test_no_vouching_member_sends_nothing(self, monkeypatch) -> None:
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {})
         kill = MagicMock()
         monkeypatch.setattr(sp.os, "kill", kill)
 
@@ -543,7 +551,7 @@ class TestSignalOrphanedRuntimeGroup:
         and PID pruning. The sweep retries a refused member on its own cadence."""
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         self._identity(monkeypatch, {101: "a"})
 
         def _refused(pid, sig):
@@ -555,7 +563,7 @@ class TestSignalOrphanedRuntimeGroup:
     def test_a_member_that_exited_under_us_counts_as_nothing(self, monkeypatch) -> None:
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         self._identity(monkeypatch, {101: "a"})
 
         def _gone(pid, sig):
@@ -597,7 +605,7 @@ class TestSignalOrphanedRuntimeGroup:
 
         kill = MagicMock()
         monkeypatch.setattr(sp.os, "kill", kill)
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
 
         assert sp._signal_orphaned_runtime_group(sp.os.getpgrp(), 15, "inst") == {}
         kill.assert_not_called()
@@ -676,6 +684,97 @@ class TestMarkedGroupMembers:
         assert sp._env_spawn_instance(101, root) == "abc123"
         assert sp._env_spawn_instance(202, root) is None  # marker but no instance
         assert sp._env_spawn_instance(303, root) is None  # unreadable
+
+    def test_a_caller_may_turn_off_the_runtime_identity_gate(self, tmp_path, monkeypatch) -> None:
+        """The argv gate is the ACP tree's shape, not every spawn's.
+
+        An app backend's members are whatever its manifest runs, so the default
+        gate rejects all of them and the reap would reach nothing. A caller that
+        turns the gate off keeps the group and instance checks unchanged.
+        """
+        from kiro_crew import session_pid as sp
+
+        monkeypatch.setattr(sp.sys, "platform", "linux")
+        root = self._fake_proc(tmp_path, {101: ("S", 100, "ours"), 104: ("S", 200, "ours")})
+        monkeypatch.setattr(sp, "Path", lambda p="/proc": root if p == "/proc" else Path(p))
+        real_reader = sp._env_spawn_instance
+        monkeypatch.setattr(sp, "_env_spawn_instance", lambda pid: real_reader(pid, root))
+        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid: True)
+        monkeypatch.setattr(sp, "_pid_start_token", lambda pid: f"s{pid}")
+        # The default gate is what an app backend's tree fails.
+        monkeypatch.setattr(sp, "_tracked_child_has_runtime_identity", lambda pid: False)
+
+        assert sp._marked_group_members(100, "ours") == {}
+        assert sp._marked_group_members(100, "ours", require_runtime_identity=False) == {
+            101: "s101"
+        }
+        # Turning the gate off relaxes ONLY that gate: a member of another group,
+        # or one carrying a different instance, is still refused.
+        assert sp._marked_group_members(200, "theirs", require_runtime_identity=False) == {}
+
+    def test_the_public_non_runtime_entry_point_turns_the_gate_off(self, monkeypatch) -> None:
+        """signal_orphaned_spawn_group differs from the ACP path in exactly one way."""
+        from kiro_crew import session_pid as sp
+
+        seen: dict[str, object] = {}
+
+        def _members(pgid, inst, **kwargs):
+            seen.update({"pgid": pgid, "inst": inst, **kwargs})
+            return {}
+
+        monkeypatch.setattr(sp, "_marked_group_members", _members)
+
+        assert sp.signal_orphaned_spawn_group(100, 15, "inst") == ({}, {})
+        assert seen["pgid"] == 100 and seen["inst"] == "inst"
+        assert seen["require_runtime_identity"] is False
+        # The ACP path keeps the gate ON, and says so rather than relying on a
+        # default the public entry point could change under it. It also keeps the
+        # single-map return: a refused signal changes nothing an ACP teardown does.
+        seen.clear()
+        assert sp._signal_orphaned_runtime_group(100, 15, "inst") == {}
+        assert seen["require_runtime_identity"] is True
+
+    def test_the_public_entry_point_reports_the_vouch_apart_from_the_signals(
+        self, monkeypatch
+    ) -> None:
+        """An empty signal set alone cannot say whether the group is GONE.
+
+        A caller keeping an orphan's only record has to tell "nothing is there" from
+        "everything there refused the signal" -- collapsing them is how a refusal
+        comes to read as a completed reap.
+        """
+        from kiro_crew import session_pid as sp
+
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
+        monkeypatch.setattr(sp, "_pid_start_token", lambda pid: "a")
+
+        # Every signal refused: the member is still vouched, and the census says so.
+        def _refuse(pid, sig, start):
+            raise OSError(1, "Operation not permitted")
+
+        monkeypatch.setattr(sp, "_signal_pid_by_identity", _refuse)
+        assert sp.signal_orphaned_spawn_group(100, 15, "inst") == ({101: "a"}, {})
+
+        # Nothing live in the group: both maps empty, which is the only shape that
+        # means "gone".
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {})
+        assert sp.signal_orphaned_spawn_group(100, 15, "inst") == ({}, {})
+
+    def test_the_public_entry_point_keeps_every_other_refusal(self, monkeypatch) -> None:
+        """A relaxed argv gate must not relax the group or instance guards."""
+        from kiro_crew import session_pid as sp
+
+        members = MagicMock(return_value={101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", members)
+        kill = MagicMock()
+        monkeypatch.setattr(sp.os, "kill", kill)
+
+        assert sp.signal_orphaned_spawn_group(0, 15, "inst") == ({}, {})
+        assert sp.signal_orphaned_spawn_group(1, 15, "inst") == ({}, {})
+        assert sp.signal_orphaned_spawn_group(100, 15, "") == ({}, {})
+        assert sp.signal_orphaned_spawn_group(os.getpgrp(), 15, "inst") == ({}, {})
+        members.assert_not_called()
+        kill.assert_not_called()
 
 
 class TestCleanupOrphanedMcpServers:
@@ -3656,13 +3755,24 @@ class TestMarkedMcpLauncherPredicates:
 
 
 class TestEnvHasKirocrewMarker:
-    """/proc/<pid>/environ positive-identity read."""
+    """Exec-time environ positive-identity read: ``/proc`` here, ``sysctl`` on macOS.
 
-    def test_non_linux_fails_closed(self) -> None:
+    Per-platform arms and the macOS record parse live in
+    ``test_darwin_spawn_marker.py``; this class keeps the ``/proc`` reader and
+    its real-child proof.
+    """
+
+    def test_platform_without_an_environ_oracle_fails_closed(self) -> None:
+        """Windows can read no same-uid environ, so the gate keeps refusing.
+
+        macOS is deliberately NOT this case any more: it reads the same
+        exec-time environment out of ``sysctl KERN_PROCARGS2``, which is what
+        makes the marked-launcher sweep reachable there at all.
+        """
         from kiro_crew.session_pid import _env_has_kirocrew_marker
 
         with patch("kiro_crew.session_pid.sys") as mock_sys:
-            mock_sys.platform = "darwin"
+            mock_sys.platform = "win32"
             assert _env_has_kirocrew_marker(os.getpid()) is False
 
     def test_read_failure_fails_closed(self) -> None:

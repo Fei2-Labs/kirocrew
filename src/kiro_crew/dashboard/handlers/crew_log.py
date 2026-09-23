@@ -113,6 +113,14 @@ def _bad_request(message: str, code: str) -> web.Response:
     return web.json_response({"error": message, "code": code}, status=400)
 
 
+def _owner_served_refusal(name: str) -> web.Response:
+    """The answer for a slot-keyed fold its owner serves: the same as an unregistered name."""
+    return _bad_request(
+        f"projection {name!r} is slot-keyed and is served by its owner, not by this route",
+        "unknown_projection",
+    )
+
+
 def _seq_param(request: web.Request, name: str) -> int | None:
     """A positive-int query parameter, ``None`` when absent, or raise ValueError."""
     raw = request.query.get(name)
@@ -189,9 +197,15 @@ def _unit_id(request: web.Request, given: str) -> tuple[str, bool]:
     state -- the exact reason ``crew_log/resolve.py`` documents for not touching it.
     And a retired unit belongs to a different session from the one this slot serves:
     presenting its totals here would imply a whole-life figure that needs the lineage
-    pointer (``session/opened.data.previous``) and a fold that follows it, and this
-    module has neither. So the honest move is to say what is addressable, not to
-    guess.
+    pointer (``session/opened.data.previous``) and a fold that follows it. Both now
+    exist -- the pointer on the entry, and ``session_tree.fold_slot_chain``, which
+    walks it newest unit first, bounded, cycle-guarded and held to one slot -- but
+    this function calls neither and deliberately answers the narrower question. A
+    caller that does join them owes the walk's ``ended`` reason as well as its ids:
+    only ``first`` reached the slot's first unit, so every other reason is a total
+    over PART of a life and presenting it as the whole would be the same false
+    implication in a new place. So the honest move here is still to say what is
+    addressable, not to guess.
     """
     if not given:
         return given, False
@@ -287,6 +301,12 @@ async def api_session_crew_log_projection(request: web.Request) -> web.Response:
         projections.require_name(name)
     except CrewLogError as exc:
         return _bad_request(exc.message, "unknown_projection")
+    if name == projections.OWNER_SERVED_SLOT_PROJECTION:
+        # A slot-keyed fold its OWNER serves: the owner orders the slot's units by
+        # what the crew recorded and pins the live unit last, which this route cannot
+        # do, and folding the one unit it addresses would serve a part of the record
+        # as the whole. Refused the way an unregistered name is.
+        return _owner_served_refusal(name)
     unit_id, _ = _unit_id(request, session_id)
     try:
         if name in projections.SLOT_PROJECTION_NAMES:
@@ -561,6 +581,14 @@ _OUT_OF_SCOPE_REFUSAL: Final[str] = (
     "dispatched, and this request does not fall inside that scope; the owner's own "
     "dashboard session reads any unit"
 )
+#: There is deliberately no second refusal for a lineage scan that came back short.
+#: The distinction is real and worth recording -- an edge the scan never read is not
+#: the same fact as a unit outside the caller's tree -- but a caller-visible one
+#: would be an existence oracle: this door passes the REQUESTED unit as the scan's
+#: ``preferred``, and a named unit's own read fault feeds the scan's flag, so a
+#: guessed id that exists and cannot be read would word the refusal differently from
+#: one that does not exist. The fact goes to the operator's log at the refusal site
+#: instead, which is the half that needed it.
 
 LIST_SCOPE_KEY: Final[str] = "crew_log_list_scope"
 
@@ -1121,6 +1149,33 @@ async def _read_scope_refusal(request: web.Request, session_key: str, unit: str)
     if class_refusal:
         return class_refusal
     if not view.dispatched_by(unit, slot):
+        # A false answer here has two causes and only one of them is about the
+        # request. The scan may have placed every unit it read and this one is simply
+        # not in the caller's tree; or the scan could not read part of the store, in
+        # which case the edge that would have placed it may never have been looked
+        # at. ``dispatched_by`` cannot tell them apart -- it answers False for a
+        # missing node either way -- and the view's ``incomplete`` flag now can.
+        #
+        # The CALLER is told neither: one refusal text for both, because this door
+        # hands its answer to an authenticated caller that may be guessing unit ids,
+        # and the flag is STEERABLE by that guess. The probe passes the requested
+        # unit as ``preferred`` (see ``_probe`` below), the scan admits a named unit
+        # first and folds its own read fault into the scan's bit
+        # (``session_tree._records_with_fault``), so a guessed id that exists AND
+        # cannot be read would flip the wording while an id that does not exist
+        # would not -- an existence oracle on exactly the boundary
+        # ``_OUT_OF_SCOPE_REFUSAL`` exists to keep closed. The incompleteness goes
+        # to the operator instead, where it answers "why can my conductor not read
+        # its own child" without answering "does this unit exist" for anyone else.
+        if view.incomplete:
+            logger.warning(
+                "crew log dispatch scope refused a read while the lineage scan was "
+                "INCOMPLETE: part of the store could not be read on this pass, so "
+                "this unit's place in the caller's tree is unknown rather than known "
+                "to be outside it. unit=%r caller slot=%r",
+                unit,
+                slot,
+            )
         return _OUT_OF_SCOPE_REFUSAL
     # The target test, and only once the unit is known to be in this caller's tree: a
     # caller outside the tree must not be able to tell a refused class from a refused
@@ -1607,6 +1662,18 @@ async def api_crew_log_unit_projection(request: web.Request) -> web.Response:
         projections.require_name(name)
     except CrewLogError as exc:
         return _bad_request(exc.message, "unknown_projection")
+    if name == projections.OWNER_SERVED_SLOT_PROJECTION:
+        # Same refusal as the per-session route: this fold is slot-keyed and served
+        # by its owner; a per-unit fold of it would be a part served as the whole.
+        return _owner_served_refusal(name)
+    if name in projections.SLOT_PROJECTION_NAMES:
+        # This route folds ONE unit. A slot-keyed fold joins every unit the slot ran
+        # under (and, for the work board, its bound workers' units), so one unit's
+        # answer would be a partial record that reads as whole. The session route
+        # resolves the slot from the unit's header and serves these names whole.
+        return _bad_request(
+            f"projection {name!r} is keyed by slot, not by session", "slot_projection"
+        )
     try:
         result = await asyncio.to_thread(projections.read_projection, unit, name)
     except CrewLogError as exc:

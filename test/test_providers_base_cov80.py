@@ -75,6 +75,7 @@ def test_rate_limit_defaults_to_no_quota(provider: _MinimalProvider) -> None:
 
 def test_identity_defaults_are_empty_not_wildcards(provider: _MinimalProvider) -> None:
     assert provider.defer_replay_sid_promotion is False
+    assert provider.is_kiro_backend is False
     assert provider.session_id == ""
     assert provider.cwd == ""
     assert provider.served_model == ""

@@ -82,7 +82,21 @@ export const CHUNK_BUDGETS = {
   // lazy import() boundary can move a catalog string out of `all`, which is why
   // shrinking is not an option here. Back to the 5% convention over the
   // measurement that includes this branch (11,930,130 B).
-  all: 12240 * KB, // measured 11650.5 KB on fix/gatewayd-overload-liveness 2026-09-16 (5.1% headroom)
+  // Re-measured 2026-09-21: the 5.1% headroom is spent and main's tip alone
+  // builds the chunk at 12,548,680 B (12254.6 KB) against the 12240 KB ceiling --
+  // 14.6 KB OVER, so the gate had begun failing on the merge ref of every open
+  // PR. Same recurrence as both notes above, and the third time it has landed
+  // this way. Attribution measured, not assumed: the branch that surfaced it
+  // (fix/fork-lane-claude-install-egress) changes six files under `.github/`,
+  // one under `docs/` and one under `test/` and NOTHING under `website/`, so the
+  // tree it built is main's tip verbatim; two unrelated fork PRs whose diffs are
+  // Python-only failed the same gate in the same window, and the measured size
+  // rose monotonically across those three runs (12,525.22 -> 12,541.08 ->
+  // 12,548.68 kB) while main merged, independent of any of their diffs. Still no
+  // module: the chunk holds the same 13 catalogs plus the entry, so shrinking
+  // remains unavailable for the reason stated above. Back to the 5% convention
+  // over that measurement.
+  all: 12870 * KB, // measured 12254.6 KB on main @ 34fe0de33e 2026-09-21 (5.0% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
@@ -139,7 +153,21 @@ export const CHUNK_BUDGETS = {
   // ceiling left at 0.04% headroom fails on the next feature's ordinary strings
   // rather than on the new library it exists to catch. Back to the 5% convention
   // over the measured size.
-  t: 905 * KB, // measured 862.2 KB on this branch rebased onto 1c7f963706 (~5% headroom)
+  // Re-measured on this branch: with the base catalogs restored and only this
+  // branch's other code present, the chunk builds at 926,128 B (904.4 KB), which
+  // is 592 B under the 905 KB ceiling -- 0.06% headroom. The judge row's nine
+  // keys across the twelve shipped catalogs, plus the generated `en-XA`
+  // pseudo-locale that roughly doubles each string's byte cost, add 1,456 B on
+  // top, so the build lands at 927,584 B (905.8 KB) -- 607 B over the old 905 KB
+  // ceiling. Attribution is measured, not assumed: reverting ONLY the files under
+  // `website/src/i18n/` to the base and rebuilding produces the 926,128 B above,
+  // and this branch adds no dependency to the chunk. No lazy `import()` boundary
+  // can move a catalog string out of it, same as the `all` entry's note. This is
+  // the drift the notes above already describe: a ceiling left under a tenth of a
+  // percent of headroom fails on the next feature's ordinary strings rather than
+  // on the new library it exists to catch. Back to the 5% convention over the
+  // measured size.
+  t: 951 * KB, // measured 905.8 KB on this branch (~5% headroom)
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor
@@ -175,7 +203,44 @@ export const CHUNK_BUDGETS = {
   // the merge result to 3,445,107 B (3364.4 KB). Preserve the documented margin
   // at that current measurement; a library-class regression still exceeds this
   // ceiling by hundreds of kilobytes.
-  App: 3533 * KB, // measured 3364.4 KB on managed-credentials PR (~5% headroom)
+  // Re-measured 2026-09-21 against main @ 20261b7633, whose tip alone -- no PR
+  // code in the tree -- builds this chunk at 3,619,504 B and so exceeds the
+  // 3533 KB (3,617,792 B) ceiling by 1,712 B on its own. The margin the lines
+  // above describe is therefore already spent: the gate fails on the merge ref
+  // of every open PR, which is exactly the recurrence the `all` and `t` entries
+  // document, and attribution here was measured rather than assumed (pristine
+  // main built in its own worktree, then this branch on top of it).
+  // The compaction shadow-scoring surface (the keep line, its record reader and
+  // one settings switch) adds 2,761 B of first-party code on top of that, for a
+  // merge result of 3,622,265 B. The ceiling moves to cover both parts --
+  // main's 1,712 B of drift and this surface's 2,761 B -- rounded up to this
+  // table's whole-KB unit: 3538 KB, which leaves 647 B of headroom. It is NOT
+  // restored to the ~5% margin the lines above prescribe, because that is a
+  // re-measure of main's growth rather than a cost this surface incurs; at 647 B
+  // the next app-core addition trips this entry again.
+  // Re-measured 2026-09-21 after rebasing onto main @ 17c96c7ab0, which had itself
+  // re-baselined this entry to 3538 KB for the compaction shadow-scoring surface
+  // (that measurement and its reasoning are the paragraph above; both notes are kept
+  // because the two surfaces are independent and the ceiling has to cover both).
+  // Attribution measured, not assumed: main's tip alone builds this chunk at
+  // 3,622,265 B per the note above, and this branch on top of it builds 3,624,314 B
+  // (3539.4 KB). So main's 3538 KB (3,622,912 B) is 1,402 B SHORT of the merge ref of
+  // this PR, which is why the entry moves again rather than being left alone.
+  // This branch's own cost is the difference, 2,049 B -- and that is the SAME 2,049 B
+  // measured against the previous base (main @ feed35446c at 3,616,146 B, this branch
+  // at 3,618,195 B), so the attribution is confirmed by two independent bases rather
+  // than by one build. It is not a library or a lazy-loadable surface: the member
+  // projection store, its hook and the roster/drawer wiring are first-party app-core
+  // code with no lazy boundary available, the same shape the notes above document.
+  // Back to the ~5% convention over the measurement that includes this branch,
+  // matching the `all` and `t` entries.
+  // The memory-recall strip, its own record reader and the card's second switch
+  // add a further 5,492 B on top of that. A tree carrying all three surfaces
+  // measures 3,641,334 B, which is what the ceiling below is set against. It
+  // covers every part -- main's drift and each surface's own cost -- with the ~5%
+  // margin the lines above prescribe, so ordinary first-party growth does not
+  // re-trip this entry within days.
+  App: 3714 * KB, // measured 3,641,334 B with all three surfaces (4.25% headroom)
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)
   // -- one deliberate `codeSplitting` group, see vite.config.ts.

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo, Fragment, type ReactNode } from 'react'
 import { useIsMobile } from '../../hooks/useIsMobile'
+import { useRailWidth } from '../../hooks/useRailWidth'
 import { useDevMode } from '../../hooks/useDevMode'
 import { usePointerDrag } from '../../hooks/usePointerDrag'
 import { useLongPressReorder } from '../../hooks/useLongPressReorder'
@@ -246,11 +247,12 @@ export type SidePanelWithholdable = ViewKind | 'terminal' | 'app'
 export interface SidePanelLeadingTab {
   /** Stable id — the value `usePanelTabs` stores as `activeId` while this tab is
    *  focused. Must not collide with a `TabKind` (`'summary'` is the chat's
-   *  session-summary view; the Members page uses `'crew-summary'`). */
+   *  session-summary view; the Crewmates page uses `'crew-notes'`,
+   *  `'crew-work-log'` and `'crew-dashboard'`). */
   id: string
   title: string
-  /** Strip glyph. A host may pass an identity (the member's avatar) rather than a
-   *  kind glyph — this is the one chip whose icon `KIND_ICON` does not own. */
+  /** Strip glyph. The host owns it — these are the chips whose icon `KIND_ICON`
+   *  does not own. */
   icon: ReactNode
   /** Body, rendered only while the tab is active (it is a query-driven view
    *  like the category tabs, not a mounted editor). */
@@ -306,16 +308,19 @@ interface SidePanelProps {
    *  Members page) omits it; a host whose panel the user opens and dismisses
    *  (ChatPage, and the same page's narrow-window overlay) passes it. */
   onClose?: () => void
-  /** A HOST-OWNED tab pinned AHEAD of the pinned views: non-closable, not
-   *  draggable, never in the + menu, and not stored in the tab bucket — the
-   *  host renders its body. The Crew Members page uses it for the member's
-   *  summary. Its `id` must also be handed to `usePanelTabs` as `leadingId` so
-   *  a fresh strip opens on it and focus can fall back to it. */
-  leadingTab?: SidePanelLeadingTab
+  /** HOST-OWNED tabs pinned AHEAD of the pinned views, in strip order:
+   *  non-closable, not draggable, never in the + menu, and not stored in the
+   *  tab bucket — the host renders each body. The Crewmates page uses three
+   *  (Notes / Work log / Dashboard). Their ids must not collide with a
+   *  `TabKind`, and the same ids must be handed to `usePanelTabs` as
+   *  `leadingIds` so a fresh strip opens on the first one and focus can fall
+   *  back to it. Always labelled: several icon-only chips would be unlabelled
+   *  navigation. */
+  leadingTabs?: readonly SidePanelLeadingTab[]
   /** Extra px the panel must keep clear to its left, on top of the shell's
-   *  own reserve (`measureSidePanelReservedW`, which budgets the nav rail and a
-   *  minimum chat pane). A host with more siblings in the row — the Members
-   *  page's roster column — passes their live width so a drag can never fold
+   *  own reserve (the live nav rail width plus `CHAT_PANE_MIN_W`). A host with
+   *  more siblings in the row -- the chat page's session sidebar, the Members
+   *  page's roster column -- passes their live width so a drag can never fold
    *  the pane beside the panel to nothing. */
   extraReserveW?: number
   /** Views this host WITHDRAWS from the strip: dropped from the pinned block
@@ -370,24 +375,19 @@ interface SidePanelProps {
 /** Panel minimum width (also the resize handle's lower clamp). */
 export const SIDE_PANEL_MIN_W = 320
 /**
- * Space reserved to the panel's left so the chat column never collapses:
- * the app nav rail (up to 220px expanded) plus a working minimum for the
- * chat column itself. The panel's effective width shrinks before eating
- * into this; when even SIDE_PANEL_MIN_W no longer fits beside it, ChatPage
- * auto-collapses the panel (and reopens it when space returns).
+ * Worst-case static budget for the space left of the panel: the nav rail at
+ * its EXPANDED width plus a working chat-pane minimum. Used only for the
+ * layout-mode gate on pages that decide beside-vs-overlay before the rail is
+ * known (MembersPage.panelSitsBeside). The panel's own width ceiling does NOT
+ * use it: that follows the live rail width (`useRailWidth`) plus
+ * `CHAT_PANE_MIN_W`, so a collapsed rail hands its space to the panel.
+ *
+ * Deliberately not a measurement of the top bar either: the header spans all
+ * three grid columns ('"topbar topbar topbar"'), so the panel sits UNDER it and
+ * cannot shorten it.
  */
 export const SIDE_PANEL_RESERVED_W = 560
 
-/**
- * Live minimum space the panel must leave to its left. The static reserve
- * only budgets the content row (nav rail + chat minimum) — but the actbar
- * grid column shortens the header row too, and the header's clusters
- * (branding + Request a Feature on the left; readout capsule + bell on the
- * right) can need more than 560px when the capsule is expanded. Without
- * accounting for that, the panel overlapped the bell/capsule before it
- * started shrinking. Returns the larger of the two constraints; falls back
- * to the static reserve when there's no header (embed/popout frames).
- */
 /** Usable minimum for the chat pane itself, beside the panel. */
 export const CHAT_PANE_MIN_W = 320
 
@@ -437,32 +437,6 @@ export function sidePanelEffectiveWidth(
   return Math.max(SIDE_PANEL_MIN_W, Math.min(width, maxW))
 }
 
-export function measureSidePanelReservedW(): number {
-  const header = document.querySelector('header.topbar-glass')
-  if (!header) return SIDE_PANEL_RESERVED_W
-  const clusters = Array.from(header.children).filter(
-    c => c.tagName !== 'A' && !c.hasAttribute('data-topbar-overlay'),
-  ) as HTMLElement[]
-  // Measure each cluster's CONTENT extent, not its box. The header is a grid
-  // whose side tracks are `minmax(0,1fr)` remainders and whose items stretch, so
-  // a cluster's own box tracks the TRACK width (about half the window) rather
-  // than what it holds — summing boxes inflated the reserve enough to halve a
-  // maximized panel. The extent spans first-child left to last-child right, so
-  // it includes the cluster's internal gaps but not the stretch slack.
-  const extent = (c: HTMLElement) => {
-    const kids = Array.from(c.children)
-      .map(k => k.getBoundingClientRect())
-      .filter(r => r.width > 0)
-    if (kids.length === 0) return 0
-    return Math.max(...kids.map(r => r.right)) - Math.min(...kids.map(r => r.left))
-  }
-  const content = clusters.reduce((sum, c) => sum + extent(c), 0)
-  const cs = getComputedStyle(header as HTMLElement)
-  const pad = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0)
-  // +24: minimum breathing gap between the two clusters.
-  return Math.max(SIDE_PANEL_RESERVED_W, Math.ceil(content + pad + 24))
-}
-
 export default function SidePanel({
   tabsCtl, slot, onFileOpen, onArtifactOpen, onAddToContext,
   projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource,
@@ -471,7 +445,7 @@ export default function SidePanel({
   pins, pinsLoading, onJumpToPin, onUnpin,
   slotTitle, chatMode,
   expanded, fillWidth, canDockBottom = true,
-  leadingTab, extraReserveW = 0, hiddenViews, onActiveTabChange,
+  leadingTabs, extraReserveW = 0, hiddenViews, onActiveTabChange,
 }: SidePanelProps) {
   const { tabs, activeId: storedActiveId, openView, openPanelTab, openTerminal, setActive, closeTab, patchTab, setOrder, syncPinned } = tabsCtl
   // A permanent panel has no close control and answers Escape with nothing —
@@ -557,14 +531,14 @@ export default function SidePanel({
   const visibleTabs = useMemo(() => (hiddenViews ? tabs.filter(t => !isWithheld(t.kind)) : tabs), [tabs, hiddenViews, isWithheld])
   const activeId = useMemo(() => {
     if (storedActiveId === null) return null
-    if (leadingTab && storedActiveId === leadingTab.id) return storedActiveId
+    if (leadingTabs?.some(t => t.id === storedActiveId)) return storedActiveId
     if (visibleTabs.some(t => t.id === storedActiveId)) return storedActiveId
-    return leadingTab?.id ?? visibleTabs[0]?.id ?? null
-  }, [storedActiveId, visibleTabs, leadingTab])
+    return leadingTabs?.[0]?.id ?? visibleTabs[0]?.id ?? null
+  }, [storedActiveId, visibleTabs, leadingTabs])
   // The fallback is REPORTED to the host, never written back into the store.
   // A host reads what the strip actually shows through `onActiveTabChange`
-  // (the Members page gates the Crew summary's data reads on it), so a stored
-  // focus on a withheld tab cannot leave the summary on its loading placeholders
+  // (the Crewmates page gates each leading tab's data reads on it), so a stored
+  // focus on a withheld tab cannot leave a tab body on its loading placeholders
   // — while the stored focus itself survives. Writing the fallback into the
   // bucket would wipe it: a withdrawal can be TEMPORARY (the Members page
   // withholds every slot view for the moment its thread POST is in flight), and
@@ -629,34 +603,33 @@ export default function SidePanel({
   // Responsive clamp: the user's chosen width is persisted untouched, but the
   // rendered width yields to the window so the chat keeps its reserved
   // minimum. On mobile the panel simply takes the full width. Re-measured on
-  // window resize AND when the header clusters change size (e.g. the readout
-  // capsule expanding), since the header's content need is part of the reserve.
+  // window resize.
   const isMobile = useIsMobile()
   // Bottom dock only applies on desktop; mobile always renders as the
   // full-width inline panel regardless of the stored preference.
   const isBottom = canDockBottom && dock === 'bottom' && !isMobile
-  const [maxW, setMaxW] = useState(() => window.innerWidth - measureSidePanelReservedW() - extraReserveW)
+  // The ceiling is what the ROW actually leaves for the panel: the live nav
+  // rail track (0 / 74 / 236 -- it collapses, so a static budget at its expanded
+  // width wasted up to 236px), the chat pane's minimum, and whatever sibling
+  // column the host adds via `extraReserveW`.
+  const railW = useRailWidth()
+  const reserveW = railW + CHAT_PANE_MIN_W + extraReserveW
+  const [maxW, setMaxW] = useState(() => window.innerWidth - reserveW)
   // Bottom-dock height cap: leave the topbar row + a usable chat minimum
   // visible above the panel. Re-measured on resize.
   const [maxH, setMaxH] = useState(() => Math.max(MIN_H, Math.round(window.innerHeight * 0.85)))
   useEffect(() => {
     const recalc = () => {
-      setMaxW(window.innerWidth - measureSidePanelReservedW() - extraReserveW)
+      setMaxW(window.innerWidth - reserveW)
       setMaxH(Math.max(MIN_H, Math.round(window.innerHeight * 0.85)))
     }
     recalc()
     window.addEventListener('resize', recalc)
-    // Observe the header's clusters (their intrinsic width is independent of
-    // the panel's own width, so this can't feed back into itself).
-    const header = document.querySelector('header.topbar-glass')
-    const ro = new ResizeObserver(recalc)
-    if (header) Array.from(header.children)
-      .filter(c => !c.hasAttribute('data-topbar-overlay'))
-      .forEach(c => ro.observe(c))
-    return () => { window.removeEventListener('resize', recalc); ro.disconnect() }
-    // `extraReserveW` is a sibling column's LIVE width (the Members roster is
-    // drag-resizable), so the clamp re-derives when it moves.
-  }, [extraReserveW])
+    return () => window.removeEventListener('resize', recalc)
+    // `reserveW` folds in LIVE widths (the rail collapses; the Members roster
+    // and the chat sidebar are drag-resizable), so the clamp re-derives when
+    // any of them moves.
+  }, [reserveW])
   const effectiveWidth = sidePanelEffectiveWidth({ fillWidth, isMobile, expanded, width, maxW })
   const effectiveHeight = Math.max(MIN_H, Math.min(height, maxH))
   // While the user drags the resize handle, every mousemove shifts the whole
@@ -672,7 +645,11 @@ export default function SidePanel({
     onStart: () => { startWRef.current = widthRef.current; setResizing(true) },
     onMove: ({ dx }) => {
       // Left-edge handle with the right edge pinned: dragging left (dx < 0) widens.
-      const max = Math.min(Math.round(window.innerWidth * 0.7), window.innerWidth - measureSidePanelReservedW() - extraReserveW)
+      // The ceiling is the SAME reserve-based clamp the render path and the
+      // preview-expand toggle use (the chat keeps its minimum) — not a viewport
+      // fraction on top of it. A 70% cap sat well under that reserve on wide
+      // windows and read as an arbitrary stop.
+      const max = window.innerWidth - reserveW
       setWidth(Math.max(MIN_W, Math.min(startWRef.current - dx, max)))
     },
     onEnd: () => { setResizing(false); safeSetItem(WIDTH_KEY, String(widthRef.current)) },
@@ -733,21 +710,29 @@ export default function SidePanel({
             matches the active chip's corner-piece width, so a piece lands in the
             gap instead of over a neighbour. */}
         <div className="flex items-end gap-2 shrink-0 -mb-px">
-          {/* The host's leading tab, ahead of the pinned views: same pinned
-              chip (icon-only when inactive, no close control), never a
-              Reorder item — it is the strip's identity, not a document. */}
-          {leadingTab && (
-            <TabChip
-              key={leadingTab.id}
-              tab={{ title: leadingTab.title }}
-              icon={leadingTab.icon}
-              active={leadingTab.id === activeId}
-              closable={false}
-              pinned
-              onSelect={() => setActive(leadingTab.id)}
-              onClose={() => {}}
-              testId="side-panel-leading-tab"
-            />
+          {/* The host's leading tabs, ahead of the pinned views: non-closable
+              chips, never Reorder items — they are the strip's identity, not
+              documents. ALWAYS labelled (`pinned={false}`): several icon-only
+              chips would be unlabelled navigation. No `role="tablist"` here —
+              the strip already carries one on the dynamic group, and the
+              pinned chips beside these have never had their own. */}
+          {!!leadingTabs?.length && (
+            <div className="flex items-end gap-2 shrink-0" data-testid="side-panel-leading-tabs">
+              {leadingTabs.map(lt => (
+                <TabChip
+                  key={lt.id}
+                  tab={{ title: lt.title }}
+                  icon={lt.icon}
+                  active={lt.id === activeId}
+                  closable={false}
+                  pinned={false}
+                  host
+                  onSelect={() => setActive(lt.id)}
+                  onClose={() => {}}
+                  testId={`side-panel-leading-tab-${lt.id}`}
+                />
+              ))}
+            </div>
           )}
           {pinnedTabs.map(t => (
             <TabChip key={t.id} tab={t} active={t.id === activeId} closable={false} pinned onSelect={() => setActive(t.id)} onClose={() => {}} />
@@ -903,16 +888,16 @@ export default function SidePanel({
       {/* Content area: left + top border (square corner) so the border wraps
           only the content, NOT the tab strip above (which stays borderless). */}
       <div className="flex-1 min-h-0 relative">
-        {/* The host's leading tab body. Mounted only while active, like the
-            category views: it is a query-driven summary, not an editor whose
+        {/* The ACTIVE leading tab's body. Only that one mounts, like the
+            category views: each is a query-driven view, not an editor whose
             buffer a switch would lose. Scrolls itself — the host renders plain
             content, and this keeps the strip pinned above a long body. */}
-        {leadingTab && activeId === leadingTab.id && (
-          <div key={leadingTab.id} className="absolute inset-0 overflow-y-auto" data-testid="side-panel-leading-body">
-            {leadingTab.render()}
+        {leadingTabs?.filter(lt => lt.id === activeId).map(lt => (
+          <div key={lt.id} className="absolute inset-0 overflow-y-auto" data-testid="side-panel-leading-body" data-leading-id={lt.id}>
+            {lt.render()}
           </div>
-        )}
-        {visibleTabs.length === 0 && !leadingTab && (
+        ))}
+        {visibleTabs.length === 0 && !leadingTabs?.length && (
           /* Empty state: launcher — the available views themselves, roomy and
              clickable, instead of a hint pointing at the + menu. */
           <div className="flex items-center justify-center h-full px-6">
@@ -1523,11 +1508,14 @@ function DraggableTabItem({ tab, active, separator, instantLayout, onSelect, onC
   )
 }
 
-function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = false, icon, testId }: {
+function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = false, host = false, icon, testId }: {
   /** A stored tab, or — for the host's leading tab — just a title: that chip has
    *  no `kind` (it is not a `PanelTab`) and brings its own `icon`. */
-  tab: Pick<PanelTab, 'title'> & Partial<Pick<PanelTab, 'kind' | 'sessionId'>>
+  tab: Pick<PanelTab, 'title'> & Partial<Pick<PanelTab, 'kind' | 'sessionId' | 'path'>>
   active: boolean; onSelect: () => void; onClose: () => void; closable?: boolean; pinned?: boolean
+  /** A host-owned leading chip: always labelled like a document tab, but named
+   *  (aria-label) like a pinned view, since it is the strip's own navigation. */
+  host?: boolean
   /** Overrides the kind-derived glyph. Required when `tab.kind` is absent. */
   icon?: ReactNode
   testId?: string
@@ -1554,11 +1542,16 @@ function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = fal
       // Icon-only pinned chips have no visible text, so give them an explicit
       // accessible name + hover tooltip. Harmless (and a nice tooltip) when the
       // label is also shown.
-      aria-label={pinned ? tab.title : undefined}
+      aria-label={pinned || host ? tab.title : undefined}
       // Labeled chips CSS-truncate at max-w-[240px], so the hover tooltip is
       // the only way to read a long title in full (e.g. an MCP app's
       // server/tool identity, #9868). Icon-only chips need it as their name.
-      title={tab.title}
+      // A file/diff/folder tab's label is only `basename(path)`, so a deep tree
+      // and two same-named files in different directories are indistinguishable
+      // from the label alone — prefer the full path whenever the tab carries
+      // one, and fall back to the title for the tabs that have none (terminal,
+      // app, pinned views).
+      title={tab.path ?? tab.title}
       data-testid={testId}
       // Browser-tab chip: 32px tall, top corners only (8px), bottom edge fused
       // into the panel body. Active = the body's own background (--bg) plus a

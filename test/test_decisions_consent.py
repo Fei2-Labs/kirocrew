@@ -36,6 +36,26 @@ from kiro_crew.decisions import consent
 CUSTOM = "https://proxy.example/v1/systemone"
 
 
+@pytest.fixture(autouse=True)
+def _judge_lane_unavailable(monkeypatch):
+    """Pin the judge's SECOND lane unavailable, because this file is about the keystone.
+
+    One point reads its own provider as well as the keystone: on the small-model lane
+    the judge is active with no consent at all, correctly, because that lane never
+    reaches the configured endpoint. Every expectation here is about what the KEYSTONE
+    decides, so the lane is held out of them and its own behaviour is pinned in
+    ``test_decisions_judge_llm.py``.
+
+    Autouse rather than per test because the alternative is worse than verbose: the
+    lane's availability is process-global (a ``DashboardState`` registers its runner),
+    so without this the answer would depend on whether some earlier test in the shard
+    happened to build one -- which is an order dependence, not a behaviour.
+    """
+    from kiro_crew.dashboard.handlers import decisions as mod
+
+    monkeypatch.setattr(mod, "_llm_lane_available", lambda: False)
+
+
 @pytest.fixture
 def keystone(tmp_path, monkeypatch):
     path = tmp_path / "decisions_consent.json"
@@ -236,6 +256,8 @@ class TestWrite:
             # Enabling alone consents to no tool arguments: the default is the
             # narrowest scope, so a caller that does not mention them grants none.
             "tool_args": False,
+            "compaction": False,
+            "memory_text": False,
         }
         assert consent.permits(CUSTOM) is True
         assert consent.permits(DEFAULT_ENDPOINT) is False
@@ -252,6 +274,8 @@ class TestWrite:
             # Cleared on the same terms as the endpoint and the ceiling, so a later
             # re-enable cannot inherit a tool-argument scope nobody re-reviewed.
             "tool_args": False,
+            "compaction": False,
+            "memory_text": False,
         }
         assert consent.permits(CUSTOM) is False
 
@@ -264,6 +288,8 @@ class TestWrite:
             "endpoint": DEFAULT_ENDPOINT,
             "history_budget_chars": 0,
             "tool_args": False,
+            "compaction": False,
+            "memory_text": False,
         }
 
     def test_records_the_history_ceiling_it_was_given(self, keystone):
@@ -439,6 +465,33 @@ def _request(*, app: str = "", user: str = "owner-1", owner: str = "owner-1", bo
     return req
 
 
+def _points_off():
+    """Every shipped point, all ``off`` -- what a keystone that consents to nothing reports.
+
+    Built from the same registry the handler projects from rather than a literal
+    list, so a build that ships another point does not have to be spelled twice.
+    :class:`TestPointProjection` is where the registry's own membership is pinned;
+    here the shape is all that matters.
+    """
+    from kiro_crew.decisions import gate
+
+    rows = []
+    for name in gate.DECISION_POINT_NAMES:
+        row = {
+            "id": name,
+            "needs_scope": gate.POINT_SCOPE_KEYS.get(name),
+            "status": "off",
+        }
+        # The judge carries the lane that would answer, on the one row that has two of
+        # them. With nothing consented its Jev side is not armed, so the gate resolves
+        # the default provider to the small model -- and this file pins that lane
+        # unavailable, which is why the row is ``off`` while still naming it.
+        if name == gate.JUDGE_POINT:
+            row["lane"] = gate.LANE_LLM
+        rows.append(row)
+    return rows
+
+
 @pytest.fixture
 def audit(monkeypatch):
     """Capture SEL rows the handler writes."""
@@ -469,6 +522,12 @@ class TestHandler:
             # Reported so the card draws the scope actually recorded rather than
             # inferring it from ``enabled``; absent on this keystone reads false.
             "tool_args": False,
+            "compaction": False,
+            "memory_text": False,
+            # One row per point this build ships, projected from the seam's own
+            # registry so the card lists what the gate will answer for. Nothing is
+            # sent on this keystone, so every status is the effective ``off``.
+            "points": _points_off(),
         }
         keystone.write_text(
             json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
@@ -577,10 +636,17 @@ class TestHandler:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "body",
-        [{"enabled": "true"}, {"enabled": 1}, {}, [], "yes", {"enabled": None}],
-        ids=["string", "int", "missing", "list", "scalar", "null"],
+        [{"enabled": "true"}, {"enabled": 1}, [], "yes", {"enabled": None}],
+        ids=["string", "int", "list", "scalar", "null"],
     )
     async def test_put_accepts_only_a_real_boolean(self, keystone, audit, configured, body):
+        """A PRESENT ``enabled`` must be a real boolean.
+
+        An ABSENT one is not in this list: it is the scope-only write
+        :class:`TestScopeOnlyWrite` pins, which is refused on its own terms rather
+        than as a malformed body. A non-object body still lands here, because there
+        is no field to omit in the first place.
+        """
         from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
 
         resp = await api_decisions_consent_put(_request(body=body))
@@ -691,13 +757,23 @@ class TestHandler:
         seen: list = []
         real = consent.save_enabled
 
-        def _spy(enabled, *, endpoint, history_budget_chars=0, tool_args=False):
+        def _spy(
+            enabled,
+            *,
+            endpoint,
+            history_budget_chars=0,
+            tool_args=False,
+            compaction=False,
+            memory_text=False,
+        ):
             seen.append(history_budget_chars)
             return real(
                 enabled,
                 endpoint=endpoint,
                 history_budget_chars=history_budget_chars,
                 tool_args=tool_args,
+                compaction=compaction,
+                memory_text=memory_text,
             )
 
         monkeypatch.setattr(consent, "save_enabled", _spy)
@@ -1021,6 +1097,102 @@ class TestCapabilityCeiling:
         assert consent.is_enabled() is False
 
     @pytest.mark.asyncio
+    async def test_raising_the_history_ceiling_is_refused_like_any_other_grant(
+        self, keystone, audit, configured, ceiling, governance_rows
+    ):
+        """A budget-only PUT carries no ``enabled`` and no scope, and still grants.
+
+        The number bounds how much prior conversation the seam may carry, so recording a
+        bigger one under the pin books an egress allowance for the moment the pin lifts
+        -- and the pin is exactly when it is cheapest to book, because nothing sends
+        while it holds. The write must be refused and the recorded ceiling untouched.
+
+        The scope rides along at its REVOKING value, because the route refuses a body
+        naming neither the switch nor a scope. So whatever this asserts can only have
+        come from the ceiling.
+        """
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        keystone.write_text(
+            json.dumps(
+                {"enabled": True, "endpoint": DEFAULT_ENDPOINT, "history_budget_chars": 100}
+            ),
+            encoding="utf-8",
+        )
+        ceiling(_PIN_DOC)
+        resp = await api_decisions_consent_put(
+            _request(body={"memory_text": False, "history_budget_chars": 50_000})
+        )
+        assert resp.status == 403
+        assert json.loads(resp.text)["code"] == "decisions_capability_denied"
+        assert consent.consented_history_budget() == 100, "the ceiling must not move"
+        assert audit[-1]["outcome"] == "denied" and audit[-1]["error"] == "capability_denied"
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_history_ceiling_stays_available_under_the_pin(
+        self, keystone, audit, configured, ceiling, governance_rows
+    ):
+        """``0`` takes prior turns back, so it is a revocation and must not be trapped."""
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        keystone.write_text(
+            json.dumps(
+                {"enabled": True, "endpoint": DEFAULT_ENDPOINT, "history_budget_chars": 5_000}
+            ),
+            encoding="utf-8",
+        )
+        ceiling(_PIN_DOC)
+        resp = await api_decisions_consent_put(
+            _request(body={"memory_text": False, "history_budget_chars": 0})
+        )
+        assert resp.status == 200
+        assert consent.consented_history_budget() == 0
+
+    @pytest.mark.asyncio
+    async def test_a_disabling_write_carrying_a_budget_is_not_trapped(
+        self, keystone, audit, configured, ceiling, governance_rows
+    ):
+        """Disabling forces the ceiling to 0, so the number in the body grants nothing."""
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        keystone.write_text(
+            json.dumps(
+                {"enabled": True, "endpoint": DEFAULT_ENDPOINT, "history_budget_chars": 5_000}
+            ),
+            encoding="utf-8",
+        )
+        ceiling(_PIN_DOC)
+        resp = await api_decisions_consent_put(
+            _request(body={"enabled": False, "history_budget_chars": 9_000})
+        )
+        assert resp.status == 200
+        assert consent.is_enabled() is False
+        assert consent.consented_history_budget() == 0
+
+    @pytest.mark.asyncio
+    async def test_the_recorded_endpoint_is_never_taken_from_the_body(
+        self, keystone, audit, configured, ceiling, governance_rows
+    ):
+        """The other half of the same question: a PUT cannot move the address either.
+
+        The endpoint written is always ``gate.configured_endpoint()``, and a write that
+        preserves consent preserves the RECORDED address from the writer's own read. The
+        body's ``endpoint`` is only ever the echo an enabling write is checked against,
+        and an enabling write is refused under the pin by the test above.
+        """
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
+        )
+        ceiling(_PIN_DOC)
+        resp = await api_decisions_consent_put(
+            _request(body={"endpoint": "https://attacker.example/v1", "memory_text": False})
+        )
+        assert resp.status == 200, "a revoking scope write stays available"
+        assert consent.consented_endpoint() == DEFAULT_ENDPOINT
+
+    @pytest.mark.asyncio
     async def test_the_get_reports_the_denial_and_stops_claiming_it_permits(
         self, keystone, audit, configured, ceiling, governance_rows
     ):
@@ -1094,3 +1266,419 @@ class TestCapabilityCeiling:
         put["app"] = ""
         resp = await api_dashboard_config(put)
         assert resp.status == 200, resp.text
+
+
+def _gate_module():
+    """The gate, imported late for the reason the handler imports it late."""
+    from kiro_crew.decisions import gate
+
+    return gate
+
+
+def _keystone_statuses(rows):
+    """The statuses of every point the KEYSTONE decides.
+
+    The judge is the one exclusion. Its row names the lane that would answer, and this
+    file pins that lane unavailable because the keystone does not govern it -- so a
+    build with no registered runner reports it ``off`` while consent is full. Folding
+    that into an assertion about consent would make the keystone's answer depend on
+    whether a model call is wired, which is a different question with a different test.
+    """
+    judge = _gate_module().JUDGE_POINT
+    return {r["status"] for r in rows if r["id"] != judge}
+
+
+class TestPointProjection:
+    """The card's overview list comes from the SEAM's registry, not from either side's array.
+
+    What is pinned is the projection, not the membership: a build that ships another
+    point must light up a row with no edit in the handler and none in the frontend,
+    which is only true while the rows are read from
+    ``gate.DECISION_POINT_NAMES``. The one membership fact asserted is that
+    ``tool.risk`` is the point carrying a scope, because its ``needs_scope`` is what
+    the card's per-point switch is drawn from.
+    """
+
+    @pytest.mark.asyncio
+    async def test_every_shipped_point_gets_a_row_in_the_registry_s_own_order(
+        self, keystone, audit, configured
+    ):
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_get
+        from kiro_crew.decisions import gate
+
+        rows = json.loads((await api_decisions_consent_get(_request())).text)["points"]
+        assert [r["id"] for r in rows] == list(gate.DECISION_POINT_NAMES)
+        # Against the gate's OWN scope map rather than one scope's set: a point that
+        # needs the transcript scope must report that scope, not the narrower one, and
+        # a third scope added to the gate has to appear here without editing this test.
+        assert {r["id"]: r["needs_scope"] for r in rows if r["needs_scope"]} == dict(
+            gate.POINT_SCOPE_KEYS
+        )
+        # Every scope named is a real keystone field, so the panel's switch writes a
+        # key the route accepts.
+        assert {r["needs_scope"] for r in rows if r["needs_scope"]} <= {
+            consent.STATE_KEY_TOOL_ARGS,
+            consent.STATE_KEY_COMPACTION,
+            consent.STATE_KEY_MEMORY_TEXT,
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_share_of_zero_reports_no_point_as_running(
+        self, keystone, audit, configured, monkeypatch
+    ):
+        """``decisions.bucket`` at 0 admits nobody, so nothing is running.
+
+        The status a reader cannot check for themselves is this one, and a row saying a
+        point is switched on while no session's key falls inside the sample is the card
+        telling them the seam works when no turn can reach it. ``off`` is already every
+        reason nothing is sent and a share of zero is one of them.
+        """
+        from kiro_crew.dashboard.handlers import decisions as mod
+
+        # Every scope the GATE knows about, read from its own map rather than listed
+        # here: a scope this test does not grant leaves its point reporting
+        # ``needs_scope``, which would answer the share question with a scope answer.
+        keystone.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "endpoint": DEFAULT_ENDPOINT,
+                    **{key: True for key in set(_gate_module().POINT_SCOPE_KEYS.values())},
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Consent stands for every scope, so only the share decides.
+        monkeypatch.setattr(mod, "_sampling_admits_anybody", lambda: True)
+        rows = json.loads((await mod.api_decisions_consent_get(_request())).text)["points"]
+        assert _keystone_statuses(rows) == {"active"}
+
+        monkeypatch.setattr(mod, "_sampling_admits_anybody", lambda: False)
+        rows = json.loads((await mod.api_decisions_consent_get(_request())).text)["points"]
+        assert {r["status"] for r in rows} == {"off"}
+        # The keystone is untouched by the report: the share is a config value, and a
+        # reader who raises it must not have to re-consent.
+        assert consent.is_enabled() is True
+        assert consent.consented_tool_args() is True
+
+    @pytest.mark.asyncio
+    async def test_the_share_is_read_off_the_event_loop(
+        self, keystone, audit, configured, monkeypatch
+    ):
+        """The config read behind the share must not run on the loop thread.
+
+        Reading ``decisions.bucket`` is a stat and a parse of ``config.json``, and the
+        projection happens on every open of the card. On slow storage a direct call
+        holds the loop for that long and every other request plus the heartbeat waits
+        behind it. Fails if ``_payload`` is called directly from either coroutine.
+        """
+        import asyncio as _asyncio
+        import threading
+
+        from kiro_crew.dashboard.handlers import decisions as mod
+
+        loop_thread = threading.current_thread()
+        seen: list[threading.Thread] = []
+
+        def _sampled() -> bool:
+            seen.append(threading.current_thread())
+            return True
+
+        monkeypatch.setattr(mod, "_sampling_admits_anybody", _sampled)
+        await mod.api_decisions_consent_get(_request())
+        assert seen, "the projection never resolved the share"
+        assert _asyncio.get_running_loop() is not None
+        assert all(
+            t is not loop_thread for t in seen
+        ), "the share was read on the event loop thread"
+
+    def test_an_unreadable_share_reports_no_point_as_running(self, monkeypatch):
+        """Fail-closed, the same direction the gate's own bucket parse takes."""
+        from kiro_crew.dashboard.handlers import decisions as mod
+
+        class Boom:
+            @staticmethod
+            def load():
+                raise RuntimeError("config unreadable")
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "kiro_crew.config.loader",
+            type("M", (), {"KiroCrewConfig": Boom}),
+        )
+        assert mod._sampling_admits_anybody() is False
+
+    @pytest.mark.asyncio
+    async def test_a_point_added_to_the_registry_appears_with_no_handler_edit(
+        self, keystone, audit, configured, monkeypatch
+    ):
+        """The property the projection exists for, driven by widening the registry."""
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_get
+        from kiro_crew.decisions import gate
+
+        monkeypatch.setattr(
+            gate, "DECISION_POINT_NAMES", (*gate.DECISION_POINT_NAMES, "invented.point")
+        )
+        rows = json.loads((await api_decisions_consent_get(_request())).text)["points"]
+        assert rows[-1] == {
+            "id": "invented.point",
+            "needs_scope": None,
+            "status": "off",
+        }
+
+    @pytest.mark.asyncio
+    async def test_status_is_the_effective_answer_and_a_missing_scope_says_so(
+        self, keystone, audit, configured
+    ):
+        """Three statuses, and the middle one is the reason it is not a boolean.
+
+        A point needing a scope the owner never granted is neither running nor
+        switched off: the fix is its own panel's switch, so it must not report the
+        word that sends a reader back to the main switch they already turned on.
+        """
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_get
+
+        async def _get():
+            return await api_decisions_consent_get(_request())
+
+        # Consent given, no scope: every SCOPED point is held back and no other is.
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
+        )
+        rows = json.loads((await _get()).text)["points"]
+        got = {r["id"]: r["status"] for r in rows}
+        assert {i for i, s in got.items() if s == "needs_scope"} == set(
+            _gate_module().POINT_SCOPE_KEYS
+        )
+        assert got["skills.select"] == "active" and got["model.route"] == "active"
+
+        # EVERY scope granted: every point is active. Written from the gate's own map
+        # so a build that adds a scope grants it here too, rather than leaving one
+        # point stuck on ``needs_scope`` and this assertion quietly weakened.
+        granted = {"enabled": True, "endpoint": DEFAULT_ENDPOINT}
+        for key in set(_gate_module().POINT_SCOPE_KEYS.values()):
+            granted[key] = True
+        keystone.write_text(json.dumps(granted), encoding="utf-8")
+        rows = json.loads((await _get()).text)["points"]
+        assert _keystone_statuses(rows) == {"active"}
+
+        # The endpoint moved: nothing is sent, so every row is off -- including the
+        # one whose scope is still recorded. ``status`` is the EFFECTIVE answer.
+        configured(CUSTOM)
+        rows = json.loads((await _get()).text)["points"]
+        assert {r["status"] for r in rows} == {"off"}
+
+    @pytest.mark.asyncio
+    async def test_a_governance_pin_makes_every_row_off_even_with_consent_recorded(
+        self, keystone, audit, configured, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers import decisions as mod
+
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT, "tool_args": True}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "kiro_crew.decisions.capability.is_decisions_denied", lambda profile=None: True
+        )
+        rows = json.loads((await mod.api_decisions_consent_get(_request())).text)["points"]
+        assert {r["status"] for r in rows} == {"off"}
+
+
+class TestScopeOnlyWrite:
+    """Omitting ``enabled`` moves a SCOPE without restating consent.
+
+    The card's per-point panels need it: a switch granting one egress category must
+    not have to echo an endpoint, because echoing an endpoint is a review of an
+    address and a scope switch is not one. What makes that safe is that the write is
+    refused unless consent is ALREADY in force for the address config names -- the
+    same ``permits`` predicate the GET reports and the gate enforces.
+    """
+
+    @pytest.mark.asyncio
+    async def test_it_moves_the_scope_and_leaves_the_switch_and_address_alone(
+        self, keystone, audit, configured
+    ):
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
+        )
+        resp = await api_decisions_consent_put(_request(body={"tool_args": True}))
+        assert resp.status == 200
+        body = json.loads(resp.text)
+        assert body["enabled"] is True and body["tool_args"] is True
+        assert body["endpoint"] == DEFAULT_ENDPOINT
+        assert consent.consented_tool_args() is True
+        # The verb names the widest thing the write did, and granting an egress
+        # CATEGORY is a widening even though the switch beside it never moved. The
+        # revoking direction is what must not read as a grant, and it does not.
+        assert audit[-1]["outcome"] == "granted"
+        # And back off again, still without restating consent.
+        resp = await api_decisions_consent_put(_request(body={"tool_args": False}))
+        assert resp.status == 200
+        assert json.loads(resp.text)["enabled"] is True
+        assert consent.consented_tool_args() is False
+
+    @pytest.mark.asyncio
+    async def test_the_history_ceiling_may_travel_on_its_own(self, keystone, audit, configured):
+        """The card's ceiling box sends this body and nothing else.
+
+        The ceiling is not a scope, but it moves on the same terms: a number on the
+        keystone the card offers by itself, where raising it is not a review of an
+        address. A predicate that named only the two scopes refused every ceiling save
+        with a 400 -- the control dead on the one path an owner has for it.
+        """
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
+        )
+        resp = await api_decisions_consent_put(_request(body={"history_budget_chars": 4000}))
+        assert resp.status == 200, resp.text
+        body = json.loads(resp.text)
+        assert body["history_budget_chars"] == 4000
+        # The switch and the address are untouched, and the row still names the widest
+        # thing the write did: a bigger ceiling carries more conversation off the
+        # machine, so raising it from 0 is a grant. Clearing it back to 0 is the
+        # revocation, and that is the direction the verb must not call a grant.
+        assert body["enabled"] is True
+        assert body["endpoint"] == DEFAULT_ENDPOINT
+        assert consent.consented_history_budget() == 4000
+        assert audit[-1]["outcome"] == "granted"
+
+    @pytest.mark.asyncio
+    async def test_a_body_naming_nothing_at_all_is_still_refused(self, keystone, audit, configured):
+        """The property the predicate exists for, which widening it must not lose."""
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
+        )
+        for body in ({}, {"nonsense": True}, {"history_budget": 10}):
+            resp = await api_decisions_consent_put(_request(body=body))
+            assert resp.status == 400, f"{body!r} -> {resp.status}"
+            assert json.loads(resp.text)["code"] == "decisions_consent_invalid_body"
+
+    @pytest.mark.asyncio
+    async def test_it_buys_nothing_when_no_consent_is_recorded(self, keystone, audit, configured):
+        """The property that keeps an omitted field from buying anything.
+
+        Not a refusal: the writer resolves the switch from the keystone under its own
+        lock, so the record stays off and the scope is stored as ``False``. The reply
+        says so, which is what the card re-reads -- and it is the same answer a
+        concurrent revoke landing first would produce.
+        """
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        resp = await api_decisions_consent_put(_request(body={"tool_args": True}))
+        assert resp.status == 200
+        body = json.loads(resp.text)
+        assert body["enabled"] is False
+        assert body["tool_args"] is False, "a scope cannot be recorded against an off switch"
+        assert consent.consented_tool_args() is False
+
+    @pytest.mark.asyncio
+    async def test_it_is_refused_when_the_endpoint_moved_under_the_consent(
+        self, keystone, audit, configured
+    ):
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
+        )
+        configured(CUSTOM)
+        resp = await api_decisions_consent_put(_request(body={"tool_args": True}))
+        assert resp.status == 409
+        payload = json.loads(resp.text)
+        assert payload["configured_endpoint"] == CUSTOM
+        assert consent.consented_tool_args() is False, "nothing was recorded"
+
+    @pytest.mark.asyncio
+    async def test_a_governance_pin_refuses_it_like_an_enabling_write(
+        self, keystone, audit, configured, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "kiro_crew.decisions.capability.is_decisions_denied", lambda profile=None: True
+        )
+        resp = await api_decisions_consent_put(_request(body={"tool_args": True}))
+        assert resp.status == 403
+        assert json.loads(resp.text)["code"] == "decisions_capability_denied"
+        assert consent.consented_tool_args() is False
+
+    def test_the_writer_resolves_the_kept_switch_from_its_own_read(self, keystone, configured):
+        """A revoke that lands first WINS, and the scope write lands fail-closed.
+
+        Driven at the writer, because this is the ordering the sentinel exists for:
+        the handler checked ``permits`` before the write, so a revoke in between
+        would otherwise be undone by a stale ``True``.
+        """
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
+        )
+        # The revoke lands first.
+        consent.save_enabled(False, endpoint=DEFAULT_ENDPOINT)
+        # The scope write then rides KEEP_ENABLED and must not restore the switch.
+        state = consent.save_enabled(
+            consent.KEEP_ENABLED, endpoint=DEFAULT_ENDPOINT, tool_args=True
+        )
+        assert state["enabled"] is False
+        assert state["tool_args"] is False, "a scope cannot be recorded against an off switch"
+        assert state["endpoint"] == ""
+
+    def test_the_writer_never_re_binds_the_address_from_its_argument(self, keystone, configured):
+        """A scope write is not a review, so it cannot move where consent points."""
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
+        )
+        state = consent.save_enabled(
+            consent.KEEP_ENABLED, endpoint=DEFAULT_ENDPOINT, tool_args=True
+        )
+        assert state["endpoint"] == DEFAULT_ENDPOINT
+        assert state["tool_args"] is True
+        assert consent.permits(DEFAULT_ENDPOINT) is True
+        assert consent.permits(CUSTOM) is False
+
+    def test_a_scope_write_is_refused_when_the_recorded_address_is_not_the_one_in_force(
+        self, keystone, configured
+    ):
+        """The address moving mid-write refuses the scope instead of carrying it over.
+
+        The handler tests ``permits`` for the configured endpoint before calling, and
+        that check is outside the writer's lock. A re-bind landing in the window would
+        otherwise put the new egress scope on whatever the keystone records by then --
+        an address the owner never reviewed. Driven at the writer, because the window
+        it closes only exists below the handler's check.
+        """
+        keystone.write_text(
+            json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
+        )
+        before = keystone.read_text(encoding="utf-8")
+        with pytest.raises(consent.ConsentEndpointMovedError) as caught:
+            consent.save_enabled(consent.KEEP_ENABLED, endpoint=CUSTOM, tool_args=True)
+        # The RECORDED address travels on the error: it is the one a caller has to
+        # show before asking again.
+        assert caught.value.recorded == DEFAULT_ENDPOINT
+        assert keystone.read_text(encoding="utf-8") == before, "nothing may be written"
+        assert consent.consented_tool_args() is False
+
+    def test_a_recorded_off_switch_refuses_no_scope_write_on_the_address(
+        self, keystone, configured
+    ):
+        """An off keystone has no address, so the comparison must not fire on it.
+
+        A revoked consent records ``endpoint: ""``. The scope write still has nothing
+        to grant -- the clearing branch writes the fail-closed values -- and it has to
+        reach that branch rather than raising about an address that was cleared on
+        purpose.
+        """
+        keystone.write_text(json.dumps({"enabled": False, "endpoint": ""}), encoding="utf-8")
+        state = consent.save_enabled(consent.KEEP_ENABLED, endpoint=CUSTOM, tool_args=True)
+        assert state["enabled"] is False
+        assert state["tool_args"] is False
+        assert state["endpoint"] == ""

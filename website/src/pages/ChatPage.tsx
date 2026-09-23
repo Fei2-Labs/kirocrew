@@ -81,6 +81,7 @@ import CollapsibleToolGroup from './chat/CollapsibleToolGroup'
 import { isSystemNoticeRow } from './chat/CompactionCard'
 import { decisionStripFieldOf } from './chat/decisionRecord'
 import { RowDisclosureProvider } from './chat/rowDisclosure'
+import { useJevAutoSend } from './chat/useJevAutoSend'
 import type { DisplayItem, TurnItem } from './chat/types'
 import { MeasureFarm } from '../hooks/virtualizer/MeasureFarm'
 import { useScrollManager } from './chat/useScrollManager'
@@ -254,6 +255,7 @@ import { openPanelView, claimAppAutoOpen } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAgents } from '../hooks/useAgents'
 import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
@@ -942,15 +944,43 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const hiddenModelIds = hiddenModelsQ.data
   const modelPickerConfigured = useModelPickerConfigured()
   const availableModels = effectiveModels
+  // Whether the picker may offer `Auto (Jev)` (see `lib/jevRoute.ts`): the fleet's
+  // answer AND the owner's keystone consent, both required. Two reads the page
+  // already makes for other reasons, so the row costs no new request.
+  const jevDashCfgQ = useQuery<{ decisions_enabled?: boolean }>({
+    queryKey: ['dashboardConfig'],
+    queryFn: () => api.dashboardConfig(),
+    staleTime: 30_000,
+  })
+  const jevConsentQ = useQuery({
+    queryKey: ['decisionsConsent'],
+    queryFn: () => api.getDecisionsConsent(),
+    // A 404 is "this gateway predates the keystone", not a transient failure: the
+    // row is simply not offered.
+    retry: false,
+  })
+  // NOT offered for a remote-bound session. Its turns run on the peer through
+  // `relay_remote_turn`, which never reaches the routing hook, and the slot-model
+  // route forwards the resolved `auto` to the peer without the flag — so the entry
+  // would be a control that silently does nothing.
+  // The slot answer is the third gate: without one the entry has nowhere to land.
+  // It returns as soon as a slot exists.
+  const jevRouteOn =
+    jevRouteOffered(jevDashCfgQ.data, jevConsentQ.data, !!activeSlot) && !remoteCrew.isRemote
+  const jevRouteLabel = i18nT('pages.chatPage.model_auto_jev_description')
   const modelPickerModels = useMemo(
     () => {
       const pickerSlot = slots.find(slot => slot.key === activeSlot)
-      return filterInteractiveModels(effectiveModels, hiddenModelIds, [
-        pickerSlot?.model || '',
-        pickerSlot?.served_model || '',
-      ])
+      return withJevRoute(
+        filterInteractiveModels(effectiveModels, hiddenModelIds, [
+          pickerSlot?.model || '',
+          pickerSlot?.served_model || '',
+        ]),
+        jevRouteOn,
+        jevRouteLabel,
+      )
     },
-    [effectiveModels, hiddenModelIds, slots, activeSlot],
+    [effectiveModels, hiddenModelIds, slots, activeSlot, jevRouteOn, jevRouteLabel],
   )
   const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(modelPickerModels)
   // Whether the composer held focus when the picker was opened from its chip
@@ -1046,8 +1076,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // same transport -- `sendTurn` never rejects, so the outcome is read from the
   // receipt, not from an error callback.
   const steerMutation = useMutation({
-    mutationFn: ({ text, sendId, slot }: { text: string; sendId?: string; slot: string }) =>
-      sendTurn({ message: text, slot, steer: true, ...(sendId ? { meta: { sendId } } : {}) }),
+    // `auto` sends the same POST with `steer: 'auto'`: the gateway then chooses
+    // between injecting into the running turn and queueing for the next one
+    // (`decisions/points/message_steer.py`). The receipt policy below is unchanged,
+    // because the answer arrives as the `dispatched` of a steer or the `queued` of
+    // a queue -- both rulings `applySteerReceipt` already owns.
+    mutationFn: ({ text, sendId, slot, auto }: { text: string; sendId?: string; slot: string; auto?: boolean }) =>
+      sendTurn({ message: text, slot, steer: auto ? 'auto' : true, ...(sendId ? { meta: { sendId } } : {}) }),
     onSuccess: (receipt, { text, sendId, slot }) => {
       // Receipt policy for a steer, owned once in chat-core (issue #9457):
       // applySteerReceipt decides WHICH ruling applies; the adapter below is
@@ -2125,6 +2160,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     pinExpanded,
     setPinExpanded,
     onPinCollapsedHeight,
+    scrollTranscriptBy,
     updatePinnedPrompt,
     onScrollPin,
     scrollToPinnedPrompt,
@@ -2272,6 +2308,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // entry stays hidden until it says true — the endpoint is the authority, the
   // frontend never guesses (same posture as the mobile-connect rail row).
   const socialShareOn = dashCfg?.social_share_enabled === true
+  // Whether the split send button may offer `Auto (Jev)`: the fleet ceiling and
+  // the owner's consent, both the gateway's answers (see useJevAutoSend).
+  const jevAutoConsented = useJevAutoSend()
   // Connections cards own consent for the providers they render, so chat drops
   // the duplicate OAuth banner — but only while that gallery is reachable.
   const connectionsUiOn = useConnectionsUiEnabled()
@@ -3016,7 +3055,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // pick snap straight back to e.g. claude-opus-5 — Auto was unselectable.
     // kiro-cli advertises `auto` as a real model id (and its default_model), and
     // the ChatPane + Alt+Shift model-cycle paths already send it verbatim.
-    if (!activeSlot) { setPendingModel(modelName); return }
+    // `pendingModel` is forwarded into slot creation verbatim, and the sentinel is
+    // not a model any provider serves. So it is held as NOTHING: creation omits the
+    // model and the backend resolves the agent's own chain, which is what a held
+    // `auto` would have resolved to anyway. Routing is armed by a pick made once the
+    // slot exists, where the flag is set with it.
+    if (!activeSlot) {
+      if (modelName === JEV_ROUTE_MODEL) { setPendingModel(''); return }
+      setPendingModel(modelName)
+      return
+    }
     try {
       // performSlotSwitch owns the whole protocol: per-slot+field serialized
       // dispatch, latest-request-wins adjudication, hung-request timeout, and
@@ -3030,7 +3078,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           const r = await api.chatSlotModel(activeSlot, modelName)
           return r?.model ?? modelName
         },
-        (value) => dispatch(updateSlot({ key: activeSlot, model: value })))
+          // The routing flag is written from the REQUEST, not from the response's
+          // `model`: the gateway resolves the sentinel to `auto`, so the stored
+          // model cannot tell a routed pick from a plain Auto one. Written on
+          // every pick, because picking a concrete model is what clears it.
+        (value) => dispatch(updateSlot({
+          key: activeSlot,
+          model: value,
+          jev_route: modelName === JEV_ROUTE_MODEL,
+        })))
     } catch (e) {
       // Same failure surface as the agent switch beside this: the shared
       // notice toast, preferring the server's own message. The chip keeps
@@ -5052,7 +5108,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // the text inline via the 'steer_push' WS event. Composer, pending files,
   // paste blocks, and the per-slot drafts are all cleared HERE (not in
   // ChatInput) so text and attachments clear atomically.
-  const steer = useCallback(() => {
+  const steer = useCallback((opts?: { auto?: boolean }) => {
     if (!activeSlot) return
     // Nothing to inject into: the composer is busy purely because background
     // sub-agents are still running for this slot (spawn_run is fire-and-forget,
@@ -5152,7 +5208,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // and post-steer chunks would append to it (see lib/pendingChunkDrain.ts).
     drainPendingChunks()
     dispatch(appendMessage({ role: 'user', content: llmTxt, cls: 'msg msg-u', ts: new Date().toISOString(), meta: { steer: true, optimistic: true, sendId: steerSendId } }))
-    steerMutation.mutate({ text: llmTxt, sendId: steerSendId, slot: activeSlot })
+    // The optimistic bubble above stays a STEER bubble for an `auto` send: steer
+    // is the answer every refusal keeps, so it is the honest guess while the POST
+    // is in flight, and a queue answer replaces this row through the same
+    // `queue_push` reconcile a manual queue uses.
+    steerMutation.mutate({ text: llmTxt, sendId: steerSendId, slot: activeSlot, auto: opts?.auto === true })
     // Staged session references are deliberately NOT part of steering: neither
     // carried into the payload nor cleared. Only the TEXT has a restore path
     // (steerMutation hands it back on a refused, failed or unconfirmed steer);
@@ -5206,8 +5266,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     [renderedDisplayItems],
   )
 
-  const navigateToTurn = useCallback((displayIndex: number) => {
-    navToDisplayIndex(displayIndex, { behavior: 'smooth', align: 'start', offset: -24 })
+  const navigateToTurn = useCallback((displayIndex: number, opts?: { instant?: boolean }) => {
+    // instant: used by the minimap's drag-scrub — a smooth glide would lag the
+    // pointer and queue easings on every marker crossing.
+    navToDisplayIndex(displayIndex, { behavior: opts?.instant ? 'auto' : 'smooth', align: 'start', offset: -24 })
   }, [navToDisplayIndex])
 
   // The transcript renders the deferred `renderedTranscript` snapshot; while a
@@ -5658,7 +5720,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock className="lucide-inline" /> {cronLabel}</span>}
                 {/* Same session wiring as the assistant branch. Without it `resolveSessionChip`
                     refuses at its first guard and a `/chat?sid=` link gains `target="_blank"`. */}
-                <div className="msg-content px-4 py-3 text-sm leading-6 rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} messageTs={m.ts} softBreaks /></MessageErrorBoundary></div>
+                <div className="mc-message-font-scope msg-content px-4 py-3 leading-relaxed rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} messageTs={m.ts} softBreaks /></MessageErrorBoundary></div>
                 {/* No `font-mono`: a formatted date is prose, and Tailwind's
                     `font-mono` pins `var(--mono)` — a token the Font Family
                     setting never writes, so it overrode the user's choice and
@@ -6670,7 +6732,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
 
       {/* Chat pane */}
       {embedMode !== 'sessions' && (
-      <div ref={setChatPaneEl} className={`relative flex flex-col bg-bg min-w-0 min-h-0 h-full overflow-hidden ${(activityOpen && !activitySlot) || search.isOpen ? 'flex-[1_1_60%]' : 'flex-1'}`} style={{ transition: 'flex 0.2s', ...(!sidebarOpen && !isMobile ? { marginLeft: '-0.5rem' } : {}), '--mc-content-width': CONTENT_WIDTH[chatConfig.contentWidth].messages, '--mc-input-width': CONTENT_WIDTH[chatConfig.contentWidth].input } as React.CSSProperties}>
+      <div ref={setChatPaneEl} className={`relative flex flex-col bg-bg min-w-0 min-h-0 h-full overflow-hidden ${(activityOpen && !activitySlot) || search.isOpen ? 'flex-[1_1_60%]' : 'flex-1'}`} style={{ transition: 'flex 0.2s', ...(!sidebarOpen && !isMobile ? { marginLeft: '-0.5rem' } : {}), '--mc-content-width': CONTENT_WIDTH[chatConfig.contentWidth].messages, '--mc-input-width': CONTENT_WIDTH[chatConfig.contentWidth].input, '--mc-message-font-size': `${chatConfig.messageFontSize}px` } as React.CSSProperties}>
         {snipFrame && (
           <SnipOverlay
             frame={snipFrame}
@@ -7028,12 +7090,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   images={pinned.images}
                   bodyBeyondPreview={pinned.bodyBeyondPreview}
                   pushUp={pinned.push}
+                  liveH={pinned.liveH}
                   bannerH={pinned.bannerH}
                   expanded={pinExpanded}
                   onToggleExpanded={() => setPinExpanded(p => !p)}
                   onJump={() => scrollToPinnedPrompt(pinned.idx)}
                   cardRef={pinCardRef}
                   onCollapsedHeight={onPinCollapsedHeight}
+                  scrollTranscriptBy={scrollTranscriptBy}
                 />
               )}
             </div>
@@ -7083,10 +7147,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               scrollerRef={scrollerRef}
               onNavigate={navigateToTurn}
               // The rail maps loaded turns only; while the server holds older
-              // rows it wears an end-cap that says so and loads them (#8221).
-              earlier={slotHasMore && cursorIsForActiveSlot
-                ? { loading: loadingOlder, onLoad: handleLoadEarlier }
-                : undefined}
+              // rows its labels say "of N loaded" (#8221's disclosure).
+              windowed={slotHasMore && cursorIsForActiveSlot}
+              side={chatConfig.minimapSide}
             />
             <TranscriptScrollShell
               scrollerRef={scrollerRef}
@@ -7580,6 +7643,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onSend={() => send()}
               canSteer={composerBusy}
               onSteer={steer}
+              // AND a turn actually running. `composerBusy` is also true when only
+              // background sub-agents are working, and there is no turn to decide
+              // ABOUT in that state: the send starts a fresh turn and the point
+              // never runs, so offering the mode there would promise a decision
+              // nothing makes.
+              jevAutoAvailable={jevAutoConsented && !!slotRunning}
               onFollowUpSend={(text?: string, sourceKeyAtClick?: string | null) => {
                 // Double-click and Send-now share dispatchPlanFollowUp with
                 // single-click (#6240). First-click row identity refuses a
@@ -7674,6 +7743,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               // The served default is shown exactly when the pin alone would
               // have read `auto`; that is the inherited case the marker names.
               modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
+              // The turn's model is Jev's to pick exactly when the routing gate
+              // says so: the slot names no model, and the preview is on. Reads the
+              // slot's RAW model, not `shownModel` -- that one substitutes the
+              // served id for an inheriting slot, so it is almost never `auto` and
+              // would hide every routed turn. Same `jevRouteOn` the picker's row is
+              // drawn from, so chip, menu and gate cannot disagree.
+              modelIsJevRouted={jevRouteOn && isUnpinnedModel(currentSlot?.model)}
               onAgentClick={provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); setAgentDropdown(!agentDropdown) } : undefined}
               onModelClick={(rect, trigger, composerHadFocus) => {
                 modelPickerReturnsFocusRef.current = !!composerHadFocus
@@ -7860,7 +7936,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 inputRef={modelInputRef}
                 onListKeyDown={onModelListKeyDown}
                 models={filteredModels}
-                activeModel={shownModel}
+                activeModel={jevRouteShownModel(shownModel, currentSlot)}
                 onSelectModel={pickModel}
                 modelsLoading={remoteCrew.modelsPending}
                 modelsFailed={remoteCrew.failed}
@@ -8045,6 +8121,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               slotTitle={activeSlotTitle} chatMode={mode}
               expanded={panelMaximized}
               fillWidth={panelFillWidth}
+              extraReserveW={!isMobile && sidebarOpen ? effectiveSidebarWidth : 0}
               canDockBottom={false}
             />
           </motion.div>
@@ -8085,6 +8162,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 slotTitle={activeSlotTitle} chatMode={mode}
                 expanded={panelMaximized}
                 fillWidth={panelFillWidth}
+                extraReserveW={!isMobile && sidebarOpen ? effectiveSidebarWidth : 0}
               />
             </motion.div>
           )}

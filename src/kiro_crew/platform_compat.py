@@ -112,6 +112,130 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     os.execv(resolved, argv)
 
 
+def execv_target_available(path: str) -> bool:
+    """Whether ``execv`` has a file here it may attempt. Two metadata syscalls.
+
+    Distinct from ``is_executable_file`` further down, which answers a different
+    question: that one decides whether to treat a file as a runnable HOOK, and on
+    Windows it accepts a regular file by extension because there is no execute bit
+    to read. A restart target is not a hook -- the process image itself depends on
+    the answer, and an extension decides nothing -- so this asks only the two things
+    the kernel will also ask, and reports on Windows whatever ``os.access`` does
+    there.
+
+    Kept beside the exec family because callers on the event loop must hand BOTH
+    syscalls to a worker thread in ONE hop: a pathname on a stalled network mount
+    blocks each of them, so offloading one and leaving the other inline still
+    freezes the loop.
+    """
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+#: Exit status for a process replacement that failed after the final drain. The
+#: generic failure code, matching the gateway's other unrecoverable exits; the
+#: distinguishing signal is the CRITICAL log line, not a private number a
+#: supervisor would have to be taught.
+_POST_DRAIN_EXEC_FAILURE_EXIT = 1
+
+# Ceiling on the event log's exit flush, covering the wait for a worker as well as the
+# work. ``eventlog_hooks.drain_for_shutdown`` bounds the work itself at
+# SHUTDOWN_DRAIN_SECONDS (5.0s); what no inner ceiling can bound is the queue wait for
+# a thread to run on. Derived as that inner bound plus one second, the same rule
+# ``cli.drain_log_queue_before_hard_exit`` applies to its own flush, so the two exit
+# drains do not drift apart on a number nobody chose.
+_EXIT_FLUSH_DEADLINE_SECS = 6.0
+
+
+async def exit_after_failed_restart_exec(target: str | None) -> None:
+    """Exit this process after a restart exec failed past the point of no return.
+
+    Lives beside the two ``reexec_*`` functions because it is their partner: it
+    answers the one outcome neither of them can, and a future reader editing
+    either exec sees it here.
+
+    Both update-restart paths reach their exec only after ``close_all()``, which
+    makes the exec the last reversible instruction they have. Every session is
+    already torn down, the final history save already ran, and the tree on disk
+    is already the NEW version while this process image is still the old one.
+
+    Callers validate the target BEFORE the drain, and that is what keeps the
+    ordinary failures out of here -- but validating cannot make an exec
+    infallible. The target can be replaced between the check and the call, and a
+    file that is present and carries the exec bit can still be the wrong
+    architecture, a truncated image, or a script whose interpreter is missing.
+    The kernel is the authority on every one of those and reports them as
+    ``OSError`` from ``execv`` itself, so the exec site is the only place they
+    can be answered -- and answering them by returning is what left a gateway
+    alive with nothing to serve.
+
+    Answer by exiting. A surviving process here serves nothing it can serve
+    honestly: its sessions are gone, and its code and the install on disk are
+    different versions.
+    It also holds the port, so the operator's own relaunch would fail to bind on
+    top of it. Exiting makes the failure visible to whatever started this
+    gateway, frees the port for that relaunch, and cannot serve the version skew.
+    Reopening admission instead would not substitute: the sessions closed by
+    ``close_all()`` do not come back, and the skew would then be served.
+
+    Exits through ``os._exit``, which runs no ``atexit`` handler -- so the two
+    bounded flushes the force-exit signal handler performs are repeated here for
+    the same reason: the CRITICAL line is the whole diagnosis, and it is queued,
+    not yet on disk. Both are best-effort; a wedged disk must delay this exit,
+    never hold it. Unlike that signal handler, which cannot await, both run on a
+    worker thread: waiting for a wedged log write on the event loop would hold every
+    remaining task -- and the port this exit exists to release -- for the length of
+    their own timeouts.
+
+    Off-loop alone does not make the wait bounded, so the event log's flush also
+    carries a deadline and runs on the dedicated subprocess pool rather than the
+    default executor. ``asyncio.to_thread`` queues against a pool every other
+    ``to_thread`` in the process shares: saturated, the await never resumes and the
+    exit this function exists to perform simply never happens -- the loop is free,
+    which is what the inner ceiling guarantees, but the process still serves nothing
+    on a port it never releases. A deadline around the flush, plus a pool kept
+    separate for calls that can block on a wedged kernel resource, is what makes "a
+    wedged disk must delay this exit, never hold it" true of the wait and not only of
+    the work.
+
+    The ``gateway.log`` tail is not spelled out again here.
+    :func:`kiro_crew.cli.drain_log_queue_before_hard_exit` is the shared async
+    hard-exit drain for that queue -- same pool, its own outer deadline, and it never
+    raises -- so every hard-exit path keeps one spelling and one ceiling for it.
+    """
+    logger.critical(
+        "Gateway restart could not replace this process (target %r); exiting instead of "
+        "serving with every session closed and an install this image does not match. "
+        "Repair the install and start the gateway again.",
+        target or sys.executable,
+        exc_info=True,
+    )
+    from kiro_crew.cli import drain_log_queue_before_hard_exit
+
+    try:
+        await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), _drain_event_log_for_exit
+            ),
+            timeout=_EXIT_FLUSH_DEADLINE_SECS,
+        )
+    except Exception:
+        # Also the deadline: TimeoutError is an Exception, and a fatal exit must never
+        # be blocked by bookkeeping or logging.
+        pass
+    # The gateway.log tail has its own async hard-exit drain, which already offloads to
+    # this pool under its own deadline and already never raises. Calling it keeps one
+    # spelling and one ceiling for that queue across every hard-exit path.
+    await drain_log_queue_before_hard_exit()
+    os._exit(_POST_DRAIN_EXEC_FAILURE_EXIT)
+
+
+def _drain_event_log_for_exit() -> None:
+    """Flush the member event log's queue. Off-loop; bounded inside the module."""
+    from kiro_crew import eventlog_hooks
+
+    eventlog_hooks.drain_for_shutdown()
+
+
 # Python's os.rename() replaces an existing empty directory on POSIX. Directory
 # publication sometimes needs the stronger create-if-absent contract, which the
 # kernel exposes but the stdlib does not: renameat2(RENAME_NOREPLACE) on Linux
@@ -1463,6 +1587,15 @@ _DARWIN_CTL_KERN = 1
 _DARWIN_KERN_PROCARGS2 = 49
 _DARWIN_PROCARGS_BUFSIZE = 64 * 1024
 
+# The environment sits AFTER argv in that same record, so the environ probe
+# cannot share the argv probe's bound: the kernel truncates silently, and a
+# process with a long argv -- a recursively self-appending launcher is exactly
+# that shape -- would have its environment cut off and read as "no marker",
+# failing closed on the very process an identity gate most needs to place. Sized
+# at the kernel's own ``ARG_MAX`` ceiling on argv plus environment instead, so
+# truncation is impossible rather than merely unlikely.
+_DARWIN_PROCARGS_ENV_BUFSIZE = 1024 * 1024
+
 # ``sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)`` answers for a ZOMBIE where
 # ``proc_pidinfo`` refuses: the kernel walks its zombie list for this query as
 # well as the live one, and a zombie's ``proc`` still carries its start instant.
@@ -1669,6 +1802,52 @@ def darwin_process_argv(pid: int) -> list[str] | None:
         parts = rest.split(b"\0")[:argc]
         argv = [p.decode("utf-8", errors="replace") for p in parts if p]
         return argv or None
+    except Exception:
+        return None
+
+
+def darwin_process_environ(pid: int) -> list[bytes] | None:
+    """Exec-time environment of *pid* via ``sysctl KERN_PROCARGS2``, or None.
+
+    Returns the raw ``KEY=VALUE`` entries. ``None`` means the record could not
+    be read or parsed -- never an empty list for an unreadable process, so a
+    caller can tell "no such variable" apart from "could not look".
+
+    Same-uid processes only, and no entitlement or elevated privilege for our
+    own: the same kernel record and the same permission contract
+    :func:`darwin_process_argv` already reads. The environment here is the
+    kernel's copy fixed at exec, which is why it is ownership evidence a
+    process cannot forge for another, unlike anything on disk.
+
+    The ``argc`` argv entries are skipped BY COUNT, empty strings included, so
+    an *argument* that merely looks like an environment entry can never be read
+    as one -- the point of the read is that a user's own shell can reproduce any
+    argv.
+    """
+    libc = _darwin_sysctl_handle()
+    if libc is None:
+        return None
+    try:
+        mib = (ctypes.c_int * 3)(_DARWIN_CTL_KERN, _DARWIN_KERN_PROCARGS2, pid)
+        buf = ctypes.create_string_buffer(_DARWIN_PROCARGS_ENV_BUFSIZE)
+        size = ctypes.c_size_t(_DARWIN_PROCARGS_ENV_BUFSIZE)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        raw = buf.raw[: size.value]
+        if len(raw) < 4:
+            return None
+        argc = struct.unpack_from("<i", raw, 0)[0]
+        if argc <= 0:
+            return None
+        rest = raw[4:]
+        exe_end = rest.find(b"\0")
+        if exe_end < 0:
+            return None
+        rest = rest[exe_end:].lstrip(b"\0")
+        entries = [token for token in rest.split(b"\0")[argc:] if token]
+        # No entries past argv is a record whose environment is missing, not a
+        # process running with an empty one: every exec'd process has some.
+        return entries or None
     except Exception:
         return None
 
@@ -2764,7 +2943,7 @@ def _root_owned_entry(path: str) -> bool:
     Not to be confused with :func:`path_writable_by_current_user`, which answers
     the opposite question ("could this account write it") over two LEXICAL chains
     and rounds unknown to writable. That shape cannot see a mid-chain symlink hop,
-    which is why :func:`_is_root_owned_path` resolves component by component and
+    which is why :func:`_is_root_owned_path` walks :func:`traversed_components` and
     calls this per entry instead of delegating wholesale.
 
     ``os.stat`` rather than ``os.lstat`` on purpose: every caller has already
@@ -2786,48 +2965,57 @@ def _root_owned_entry(path: str) -> bool:
     return True
 
 
-def _is_root_owned_path(path: str) -> bool:
-    """True when nothing on the way to *path*'s target is another uid's to change.
+def traversed_components(path: str | os.PathLike[str]) -> list[Path] | None:
+    """Every directory a component-by-component walk to *path* passes through, then the target.
 
-    Resolves *path* one COMPONENT at a time and validates every directory the walk
-    actually passes through, expanding each symlink it meets — a component's as
-    much as the final name's — and then validating the directories on the target's
-    side too.
+    Resolves *path* one COMPONENT at a time, expanding each symlink it meets — a
+    directory component's as much as the final name's — and records every
+    directory the walk actually reads, on the original side and on each expanded
+    target's side alike, followed by the final resolved target. Visit order, each
+    entry once. No ownership or permission question is asked here: this is the
+    ENUMERATION that any executable-trust predicate must ask its question over,
+    kept separate so that callers with different questions ("root's alone to
+    change", "not another uid's", "not writable by this process") share the walk
+    rather than each spelling a weaker one.
 
-    Two weaker shapes were tried here first and both were bypassable, which is why
-    it is written this way rather than more briefly:
+    Two shorter shapes were tried for this enumeration and both were bypassable,
+    which is why every caller must use this one rather than either:
 
     * ``realpath`` and then walk the result collapses the chain, so
-      ``/usr/local/bin/aws -> /tmp/link -> /usr/bin/aws`` is accepted with ``/tmp``
-      — the one directory where the retarget happens — never looked at;
-    * walking ``os.path.dirname`` lexically misses a symlinked COMPONENT, because
-      ``os.stat`` follows symlinks while ``dirname`` does not: for
-      ``/usr/local/bin -> /opt/x/bin`` the target's own parent ``/opt/x``, which
-      can replace it wholesale, is never visited.
+      ``/usr/local/bin/aws -> /tmp/link -> /usr/bin/aws`` yields ``/usr/bin`` and
+      its ancestors with ``/tmp`` — the one directory where the retarget
+      happens — never named;
+    * walking ``os.path.dirname`` / ``Path.parents`` lexically misses a symlinked
+      COMPONENT, because ``os.stat`` follows symlinks while ``dirname`` does not:
+      for ``/usr/local/bin -> /opt/x/bin`` the target's own parent ``/opt/x``,
+      which can replace it wholesale, is never visited.
 
-    A directory has to be root-owned with no group or world write bit, because
-    replacing an entry needs write on its DIRECTORY rather than on the entry, and a
-    group-writable directory is writable by more than root whoever owns it. The
-    final target has to satisfy the same rule as a file, since a writable regular
-    file can be edited in place without touching any directory. Symlinks met on the
-    way are deliberately not checked themselves: their mode is meaningless (0777 on
+    Every lexical ancestor of the fully resolved target is in the result (the
+    walk builds the target's path one directory at a time, and each directory is
+    recorded before a name is joined onto it), so a question asked over this list
+    is asked over a superset of ``resolved.parents`` plus the target. Symlinks
+    met on the way are deliberately absent: their mode is meaningless (0777 on
     Linux) and they cannot be edited in place, only replaced, which the directory
-    holding them already governs.
+    holding them — present in the result — already governs.
 
-    POSIX semantics. Windows callers do not reach it (:func:`trusted_aws_bin`
-    answers ``None`` there before the gate).
+    POSIX path semantics (``os.sep``-rooted); Windows callers keep their own
+    ACL-driven chains and must not route through here.
 
-    Any ``OSError``, and any path needing more than :data:`_MAX_SYMLINK_HOPS`
-    expansions, answers ``False``. The fail direction is "decline", never "assume".
+    ``None`` on any ``OSError`` and on any path needing more than
+    :data:`_MAX_SYMLINK_HOPS` expansions. The fail direction is "could not
+    enumerate", never a shorter list: a caller that treats ``None`` as anything
+    but a refusal is answering a question it did not ask.
     """
-    if not os.path.isabs(path):
-        path = os.path.abspath(path)
+    text = os.fspath(path)
+    if not os.path.isabs(text):
+        text = os.path.abspath(text)
     # Reversed, so `pop()` yields the next component and a symlink's own components
     # can be pushed on to be consumed before the rest of the original path.
-    pending = path.split(os.sep)
+    pending = text.split(os.sep)
     pending.reverse()
     resolved = os.sep
     hops = 0
+    visited: dict[str, None] = {}
     while pending:
         name = pending.pop()
         if name in ("", os.curdir):
@@ -2835,30 +3023,53 @@ def _is_root_owned_path(path: str) -> bool:
         if name == os.pardir:
             resolved = os.path.dirname(resolved)
             continue
-        # About to read `resolved` as a directory, so it must be one nobody but
-        # root can change. Checked here rather than after descending, so the
-        # target side of an expanded symlink is covered by the same line.
-        if not _root_owned_entry(resolved):
-            return False
+        # About to read `resolved` as a directory, so it is one the walk depends
+        # on. Recorded here rather than after descending, so the target side of
+        # an expanded symlink is covered by the same line.
+        visited[resolved] = None
         candidate = os.path.join(resolved, name)
         try:
             is_link = os.path.islink(candidate)
         except OSError:
-            return False
+            return None
         if not is_link:
             resolved = candidate
             continue
         hops += 1
         if hops > _MAX_SYMLINK_HOPS:
-            return False
+            return None
         try:
             target = os.readlink(candidate)
         except OSError:
-            return False
+            return None
         if os.path.isabs(target):
             resolved = os.sep
         pending.extend(reversed(target.split(os.sep)))
-    return _root_owned_entry(resolved)
+    visited[resolved] = None
+    return [Path(component) for component in visited]
+
+
+def _is_root_owned_path(path: str) -> bool:
+    """True when nothing on the way to *path*'s target is another uid's to change.
+
+    :func:`_root_owned_entry` asked over :func:`traversed_components` — every
+    directory the walk reads and the final target. A directory has to be
+    root-owned with no group or world write bit, because replacing an entry needs
+    write on its DIRECTORY rather than on the entry, and a group-writable
+    directory is writable by more than root whoever owns it. The final target has
+    to satisfy the same rule as a file, since a writable regular file can be
+    edited in place without touching any directory.
+
+    POSIX semantics. Windows callers do not reach it (:func:`trusted_aws_bin`
+    answers ``None`` there before the gate).
+
+    A walk that cannot be enumerated (``None``) answers ``False``. The fail
+    direction is "decline", never "assume".
+    """
+    components = traversed_components(path)
+    if components is None:
+        return False
+    return all(_root_owned_entry(str(component)) for component in components)
 
 
 def _local_aws_bin_candidate() -> str | None:

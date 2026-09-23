@@ -258,6 +258,7 @@ from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
 # ── Crew Members (handlers/members.py) ──
 from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
     api_member_activity,
+    api_member_briefing,
     api_member_rules_get,
     api_member_rules_put,
     api_member_thread,
@@ -974,6 +975,7 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     api_shutdown,
     api_stt_config,
     api_stt_ffmpeg_download,
+    api_stt_polish,
     api_stt_prepare,
     api_stt_prewarm,
     api_stt_status,

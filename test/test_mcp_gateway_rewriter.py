@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew.mcp_cleanup import mcp_entry_is_muted, mcp_entry_is_registry_governed
 from kiro_crew.mcp_gateway import rewriter
 from kiro_crew.mcp_gateway.hashing import expand_stub_flags, is_secret_env_key
 from kiro_crew.mcp_gateway.manager import is_credential_env_key
@@ -76,6 +77,28 @@ class TestSettingsInjection:
         out = _injectable_settings_servers(spec, frozenset([alias]))
         # Keyed by the RAW name, because the caller filters raw-keyed src_servers.
         assert set(out) == {"npm:@playwright/mcp"}
+
+    @pytest.mark.parametrize("value", [True, "true", 1, {}], ids=repr)
+    def test_a_muted_settings_server_is_never_injected(self, value: object) -> None:
+        """Same class as the per-agent wrap guard, same fail-closed reading.
+
+        A settings server injected as a stub is a LIVE server in every agent's
+        overlay, so reading only a literal ``True`` here re-enabled a globally
+        muted server for every agent at once — the wider blast radius of the two.
+        """
+        spec = {"mcpServers": {"muted-mcp": {"command": sys.executable, "disabled": value}}}
+        assert _injectable_settings_servers(spec, frozenset(["muted-mcp"])) == {}
+
+    def test_a_registry_governed_settings_server_is_never_injected(self) -> None:
+        """Wider blast radius than the per-agent case: a settings server enters
+        EVERY agent's overlay, so one injected stub would un-govern it
+        everywhere."""
+        spec = {"mcpServers": {"governed-mcp": {"command": sys.executable, "type": "registry"}}}
+        assert _injectable_settings_servers(spec, frozenset(["governed-mcp"])) == {}
+
+    def test_an_unmuted_settings_server_is_still_injected(self) -> None:
+        spec = {"mcpServers": {"live-mcp": {"command": sys.executable, "disabled": False}}}
+        assert set(_injectable_settings_servers(spec, frozenset(["live-mcp"]))) == {"live-mcp"}
 
     def test_http_server_is_never_injected_even_when_listed(self) -> None:
         """HTTP/SSE needs no stub and merges globally; injecting it would gain
@@ -164,6 +187,115 @@ def test_disabled_poolable_server_is_not_wrapped(tmp_path: Path) -> None:
     assert _WRAPPER_MARKER not in entry  # never wrapped into a live stub
     assert "poolable" not in entry  # internal hint stripped
     assert entry.get("command") == "some-mcp"  # original launch left intact
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, {}, [], None], ids=repr)
+def test_a_non_boolean_mute_is_not_wrapped_either(tmp_path: Path, value: object) -> None:
+    """The mute is read fail-closed, through the shared launch-decision predicate.
+
+    Reading only a literal ``True`` here was not a cosmetic difference: a wrapped
+    entry carries the wrapper marker, ``session_servers.injection_server_names``
+    collects exactly those names, and the session projections subtract a stubbed
+    name BEFORE their own mute check -- so an entry the spec silenced with a
+    non-boolean value was injected at session level as a live server. The value is
+    also unforwardable on its own terms, since both spec schemas type it boolean.
+    """
+    spec = {
+        "name": "agent-a",
+        "mcpServers": {"muted": {"command": sys.executable, "disabled": value}},
+    }
+    new_spec, wrapped = _rewrite(spec, tmp_path, stub_servers=frozenset({"muted"}))
+    entry = new_spec["mcpServers"]["muted"]
+
+    assert wrapped == 0
+    assert _WRAPPER_MARKER not in entry
+    assert entry.get("disabled") == value
+
+
+def test_a_registry_governed_server_is_not_wrapped(tmp_path: Path) -> None:
+    """A catalog-governed entry has nothing here to pool.
+
+    In registry access mode the client resolves it by map key and supplies the
+    catalog's own command, so a stub is overridden; outside that mode the marked
+    entry is the one the client drops. Wrapping it only made the name a "stubbed
+    name" the session projections subtract, which is how the entry reached a
+    session as a live local process with the marker governing nothing.
+    """
+    spec = {
+        "name": "agent-a",
+        "mcpServers": {"governed": {"command": sys.executable, "type": "registry"}},
+    }
+    new_spec, wrapped = _rewrite(spec, tmp_path, stub_servers=frozenset({"governed"}))
+    entry = new_spec["mcpServers"]["governed"]
+
+    assert wrapped == 0
+    assert _WRAPPER_MARKER not in entry
+    assert entry.get("type") == "registry", "the marker must survive for the client's filter"
+    assert entry.get("command") == sys.executable
+
+
+def test_a_plain_type_does_not_block_pooling(tmp_path: Path) -> None:
+    """Guard against over-correction: ``type: stdio`` is not a registry marker."""
+    spec = {
+        "name": "agent-a",
+        "mcpServers": {"live": {"command": sys.executable, "type": "stdio"}},
+    }
+    _, wrapped = _rewrite(spec, tmp_path, stub_servers=frozenset({"live"}))
+    assert wrapped == 1
+
+
+def test_an_explicit_false_is_not_a_mute(tmp_path: Path) -> None:
+    """Fail-closed must not swallow the spelling that means "enabled"."""
+    spec = {
+        "name": "agent-a",
+        "mcpServers": {"live": {"command": sys.executable, "disabled": False}},
+    }
+    new_spec, wrapped = _rewrite(spec, tmp_path, stub_servers=frozenset({"live"}))
+
+    assert wrapped == 1
+    assert new_spec["mcpServers"]["live"].get(_WRAPPER_MARKER) is True
+
+
+class TestTheRegistryPredicate:
+    """One reading of the marker for every site that decides a launch."""
+
+    def test_the_marker_is_recognized(self) -> None:
+        assert mcp_entry_is_registry_governed({"command": "x", "type": "registry"}) is True
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"command": "x"},
+            {"command": "x", "type": "stdio"},
+            {"command": "x", "type": "Registry"},
+            {"command": "x", "type": True},
+            "",
+            None,
+        ],
+        ids=repr,
+    )
+    def test_anything_else_is_not(self, entry: object) -> None:
+        """Exact match, not a case-insensitive or truthy one: the value is the
+        client's own discriminator and only ``"registry"`` means anything to it."""
+        assert mcp_entry_is_registry_governed(entry) is False
+
+
+class TestTheMutePredicate:
+    """One reading of ``disabled`` for every site that decides a launch."""
+
+    @pytest.mark.parametrize("value", [True, "true", "false", 1, 0, {}, [], None], ids=repr)
+    def test_anything_but_a_literal_false_is_a_mute(self, value: object) -> None:
+        assert mcp_entry_is_muted({"command": "x", "disabled": value}) is True
+
+    @pytest.mark.parametrize("entry", [{"command": "x"}, {"command": "x", "disabled": False}])
+    def test_absent_or_false_is_not(self, entry: dict) -> None:
+        assert mcp_entry_is_muted(entry) is False
+
+    @pytest.mark.parametrize("entry", ["", None, [], 0])
+    def test_a_non_entry_is_not_a_mute(self, entry: object) -> None:
+        """A malformed entry is handled by the caller that skips it, not read as a
+        restriction it never expressed."""
+        assert mcp_entry_is_muted(entry) is False
 
 
 def test_enabled_listed_server_is_still_wrapped(tmp_path: Path) -> None:
@@ -567,7 +699,7 @@ def test_rewriter_calls_restrict_to_owner_on_windows(tmp_path: Path, monkeypatch
     # API; this test is about the lockdown of what gets WRITTEN, so read the
     # fixture plainly at both seams.
     monkeypatch.setattr(
-        "kiro_crew.agent_discovery.safe_read_file_bytes", lambda raw: Path(raw).read_bytes()
+        "kiro_crew.agent_discovery._read_spec_bytes", lambda real: Path(real).read_bytes()
     )
     monkeypatch.setattr("kiro_crew.hooks.safe_read_file_bytes", lambda raw: Path(raw).read_bytes())
     # Forwarding ON or the env-declaring fixture is declassified and no sidecar
@@ -823,7 +955,7 @@ def test_failed_sidecar_protection_leaves_no_readable_credentials(
     # Same as the lockdown test above: keep the hardened spec read and source
     # fingerprint off the real Win32 open the simulated flag would select.
     monkeypatch.setattr(
-        "kiro_crew.agent_discovery.safe_read_file_bytes", lambda raw: Path(raw).read_bytes()
+        "kiro_crew.agent_discovery._read_spec_bytes", lambda real: Path(real).read_bytes()
     )
     monkeypatch.setattr("kiro_crew.hooks.safe_read_file_bytes", lambda raw: Path(raw).read_bytes())
     with (
@@ -1259,3 +1391,184 @@ def test_cmd_safe_command_contract_on_real_windows(tmp_path: Path) -> None:
     if got != str(target):
         assert os.path.exists(got)
         assert not rewriter._CMD_UNSAFE.intersection(got)
+
+
+def _unencoded_json_reads(source: str) -> list[int]:
+    """Line numbers of ``json.loads(<path>.read_text(...))`` with no encoding."""
+    import ast
+
+    found: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        if ast.unparse(node.func) not in ("json.loads", "json.load"):
+            continue
+        if not node.args:
+            continue
+        inner = node.args[0]
+        if not isinstance(inner, ast.Call):
+            continue
+        if not ast.unparse(inner.func).endswith(".read_text"):
+            continue
+        if not any(k.arg == "encoding" for k in inner.keywords):
+            found.append(inner.lineno)
+    return found
+
+
+class TestRewriterDecodesJsonAsUtf8:
+    """Agent specs and the global settings file are UTF-8 JSON written by
+    somebody else -- a user, an editor, the Kiro IDE -- so the rewriter decodes
+    them as UTF-8 rather than as the host's text code page.
+
+    Two harms follow from a code-page decode. Where the bytes are undecodable
+    the read raises ``UnicodeDecodeError``, which is a ``ValueError`` and so
+    matches neither the ``OSError`` arm (transient: keep the previous overlay)
+    nor the ``json.JSONDecodeError`` arm (deterministic: skip this agent) --
+    it leaves ``rewrite_agents`` entirely and takes the whole pass down, not
+    just the one offending agent. Where the bytes are decodable under the code
+    page but mean something else, nothing raises and the mojibake is written
+    into the overlay that spawns the backend.
+    """
+
+    @staticmethod
+    def _unrepresentable_char() -> str:
+        """A character the host's text code page cannot encode, or ``""``.
+
+        Picked against the live code page rather than hardcoded: which
+        characters survive depends on the host (cp1252 cannot take the CJK
+        one, cp950 cannot take the accented one), and a UTF-8 host encodes
+        every candidate -- the case with no divergence to show.
+        """
+        import locale
+
+        code_page = locale.getpreferredencoding(False)
+        for candidate in ("張", "é", "Ж", "क"):
+            try:
+                candidate.encode(code_page)
+            except UnicodeEncodeError:
+                return candidate
+        return ""
+
+    def test_agent_spec_round_trips_a_character_outside_the_code_page(self, tmp_path: Path) -> None:
+        import locale
+
+        from kiro_crew.mcp_gateway.rewriter import rewrite_agents
+
+        needle = self._unrepresentable_char()
+        if not needle:
+            pytest.skip("this host's code page encodes every probe character")
+        # Guard the guard: a representable needle passes against a code-page
+        # decode too, which would make this test prove nothing.
+        with pytest.raises(UnicodeEncodeError):
+            needle.encode(locale.getpreferredencoding(False))
+
+        source_dir = tmp_path / "agents"
+        source_dir.mkdir()
+        spec = {
+            "name": f"agent-{needle}",
+            "mcpServers": {
+                "myserver": {
+                    "command": sys.executable,
+                    "args": [f"kirocrew-{needle}-arg"],
+                    "poolable": True,
+                }
+            },
+        }
+        # Written the way an editor or the Kiro IDE writes it: UTF-8 bytes,
+        # non-ASCII literal rather than escaped.
+        (source_dir / "agent.json").write_text(
+            json.dumps(spec, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        overlay_dir = tmp_path / "overlay"
+        rewrite_agents(
+            source_dir=source_dir,
+            overlay_dir=overlay_dir,
+            socket_path=tmp_path / "gw.sock",
+            work_dir=tmp_path / "wd",
+            sandbox_mode="auto",
+            approval_mode="interactive",
+            stub_servers=frozenset(["myserver"]),
+        )
+
+        overlay = overlay_dir / "agent.json"
+        assert overlay.is_file(), "the agent produced no overlay at all"
+        # Compare decoded VALUES, not raw bytes: the overlay writer escapes
+        # non-ASCII, so the literal character is absent from the file text
+        # whether or not the source decoded correctly.
+        written = json.dumps(json.loads(overlay.read_text(encoding="utf-8")), ensure_ascii=False)
+        assert needle in written, (
+            "the overlay lost a character the source spec carried, so the "
+            "source was decoded as the host code page instead of UTF-8"
+        )
+
+    def test_undecodable_agent_spec_skips_only_that_agent(self, tmp_path: Path) -> None:
+        """Bytes that are not valid UTF-8 degrade to the documented skip.
+
+        Pinning the read to UTF-8 removes the common trigger but not this one:
+        a genuinely corrupt file still raises ``UnicodeDecodeError``, and that
+        is a ``ValueError``, so it matches neither the ``OSError`` arm nor a
+        bare ``json.JSONDecodeError`` arm. Unhandled, it leaves
+        ``rewrite_agents`` and abandons every OTHER agent in the same pass --
+        the blast radius this asserts against. Runs on every platform, because
+        the bytes are invalid under UTF-8 rather than under a code page.
+        """
+        from kiro_crew.mcp_gateway.rewriter import rewrite_agents
+
+        source_dir = tmp_path / "agents"
+        source_dir.mkdir()
+        good = {
+            "name": "healthy",
+            "mcpServers": {"myserver": {"command": sys.executable, "poolable": True}},
+        }
+        (source_dir / "healthy.json").write_text(json.dumps(good), encoding="utf-8")
+        # 0x81 is a continuation byte with no lead byte: invalid UTF-8 anywhere.
+        (source_dir / "corrupt.json").write_bytes(b'{"name": "\x81\x81", "mcpServers": {}}')
+
+        overlay_dir = tmp_path / "overlay"
+        rewrite_agents(
+            source_dir=source_dir,
+            overlay_dir=overlay_dir,
+            socket_path=tmp_path / "gw.sock",
+            work_dir=tmp_path / "wd",
+            sandbox_mode="auto",
+            approval_mode="interactive",
+            stub_servers=frozenset(["myserver"]),
+        )
+
+        assert (overlay_dir / "healthy.json").is_file(), (
+            "one undecodable spec took down the whole rewrite pass; the healthy "
+            "agent beside it got no overlay"
+        )
+
+    def test_every_json_read_pins_utf8(self) -> None:
+        """A ratchet, because the defect is one omitted keyword and reads clean.
+
+        The behavioural test above only diverges on a host whose code page is
+        not UTF-8, so on a UTF-8 runner it passes either way. This one fails
+        everywhere, which is what stops a re-added bare ``read_text()``
+        reaching a release through a green Linux shard. It also covers the
+        settings-file read, which has no cheap behavioural harness.
+        """
+        from kiro_crew.mcp_gateway import rewriter as rw
+
+        source = Path(rw.__file__).read_text(encoding="utf-8")
+        offenders = _unencoded_json_reads(source)
+        assert offenders == [], (
+            "rewriter.py decodes JSON with the host code page at line(s) "
+            f"{offenders}; pass encoding='utf-8' -- these files are UTF-8 "
+            "JSON written by an editor, the Kiro IDE, or this module itself"
+        )
+
+    def test_the_ratchet_can_actually_fail(self) -> None:
+        """A scan that matches nothing passes for the wrong reason."""
+        assert _unencoded_json_reads(
+            "import json\nfrom pathlib import Path\nx = json.loads(Path('a').read_text())\n"
+        ) == [3]
+        assert (
+            _unencoded_json_reads(
+                "import json\nfrom pathlib import Path\n"
+                "x = json.loads(Path('a').read_text(encoding='utf-8'))\n"
+            )
+            == []
+        )

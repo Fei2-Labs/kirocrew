@@ -491,9 +491,56 @@ accessible outline suppressor, `backdrop-blur-xs` is the 4px blur, and the
 
 Colors come from CSS custom properties defined in `src/index.css`, including the
 semantic roles `--aim`, `--clarify`, and the `--diff-*` family. Never a hardcoded
-`#hex` / `rgb()` / `rgba()` literal; see
+`#hex` / `rgb()` / `rgba()` literal, and never a raw palette class
+(`text-green-500`, `bg-amber-400`): state colors are `text-ok` / `text-warn` /
+`text-danger` / `text-info`, and a running state is `text-accent`. See
 [theming-contract](theming-contract.md) for the variable set, the stable class
-hooks, and the checker.
+hooks, and the checkers.
+
+Three of those rules are enforced by `@shadcn/lint` inside the blocking
+`eslint src/ --max-warnings 0` gate (configured in `eslint.config.js`, the
+`shadcn` block):
+
+- `shadcn/no-raw-colors` — a palette class or a literal SVG `fill`/`stroke`
+  where a token belongs. Use the token; a logo whose colors are the artwork's
+  own gets a file-level override (see `KiroGhost.tsx`).
+- `shadcn/no-unknown-classes` — a class Tailwind emits no CSS for. Usually a
+  typo, a v3 spelling (`outline-none`, `resize-vertical`), or a class whose
+  stylesheet was deleted. A class that IS real but lives outside the theme's
+  import graph — an app stylesheet authored as a TS template string, a
+  selector hook a Playwright spec locates by — is listed in the rule's `allow`
+  with the file that owns it; the entry allows a name, it generates no CSS.
+- `shadcn/require-static-classes` — a `className` on a `ui/` primitive built
+  from a value the linter cannot read (an imported constant, a function call,
+  an array `join`). Keep the class strings in the file that applies them: a
+  shared class string becomes a small wrapper component (`FilterMenuLabel`),
+  a helper call gets a `cn(...)`.
+
+`shadcn/no-restyle` — a `className` that changes what a `ui/` primitive owns
+(its color, spacing, shape, typography) — is off in that gate: a few hundred
+call sites restyle primitives today and the gate is a hard zero, so turning it
+on is a design decision (fix the sites or write per-component contracts), not a
+lint toggle. What IS enforced is that the backlog cannot grow.
+`scripts/check-restyle-ratchet.mjs` (`npm run lint:restyle-ratchet`, run by
+CI beside the phantom-classes gate) lints with the rule through its own config
+(`allow: ['layout']`, so margins and widths pass) and holds every file at the
+count recorded in `scripts/restyle-baseline.json`: a file whose count rises, or
+a file with findings and no entry, fails the build; a file whose count fell
+fails too, until you record the drop with
+`npm run lint:restyle-ratchet -- --update-baseline`, which only ever lowers a
+number or prunes an entry that reached 0 — so progress is locked in, not left
+to a log line. Lowering a count is the only edit the script makes; the one hand
+edit is moving an entry to a file's new path when the file moves (the count may
+not grow). It is a separate script rather than ESLint's bulk suppressions
+because editors lint through the Node API, which ignores the suppressions
+file, and the CLI loads that file for every config, which would fail the i18n
+eslint run on "unused" entries. Adding a restyle to a file at its
+ceiling means using the primitive's own variant or size prop, keeping layout
+classes at the call site, or wrapping the primitive in a small named component
+that carries the class in the component file — not raising the number.
+`no-inline-styles` and `no-arbitrary-values` stay off by design — inline
+`style={}` is the mandated method for apps, and translucent theme surfaces are
+`bg-[color-mix(…)]` because the color tokens carry no alpha channel.
 
 Built-in themes are picked in Settings, Display tab, and the choice syncs across
 instances. Each theme has a dark and a light block, and the default theme's

@@ -140,16 +140,17 @@ seconds.
 
 - **Admission is by whole block, never by slicing the joined prompt.** Protected
   blocks (rules, preferences, identity, steering, pinned skill bodies) go first and
-  are never truncated; the rest spend what is left, and an omitted block is named
-  in a `[Context budget: omitted …]` line.
+  are never truncated below the model-safe ceiling; the rest spend what is left, and
+  an omitted block is named in a `[Context budget: omitted …]` line.
 - **Thread history has its own window-scaled allowance**, and keeps its framing
   plus the newest tail rather than vanishing.
 - **The model-safe ceiling** on protected content is
   `max(3 × the base, window_tokens × 4.0 × 0.125)` (`_PROTECTED_CONTEXT_FLOOR` is
   the base tripled; `_PROTECTED_CONTEXT_CHARS_PER_TOKEN` and
   `_PROTECTED_CONTEXT_WINDOW_FRACTION` are the two factors). Over it, lessons
-  re-render smaller first; preferences are kept from their head with an in-prompt
-  notice naming the file.
+  fall back to the ordinary lessons budget (`caps.lessons`, still bounded by the
+  ceiling) and re-render smaller, highest-ranked complete entries first;
+  preferences are kept from their head with an in-prompt notice naming the file.
 - **A bigger model window does not buy more background.** `_resolve_caps` scales
   only thread/replay limits; an unknown or `auto` window resolves to the 1M
   reference (`_effective_window`).
@@ -297,29 +298,37 @@ per-run model or effort override, or a member launch force the dedicated path.
 | Process | the parent's kiro-cli | its own kiro-cli |
 | Start cost | ~200ms | ~3–5s |
 | Context assembly | identical `build_message` call | identical |
-| `$KIROCREW_SCRATCH` | **the parent's** | **its own** |
+| `$KIROCREW_SCRATCH` | **the parent's** | **the parent's** (mounted as a second window) |
 
 `agent_scratch.py` → `allocate_scratch` gives each spawned agent **process**
 `<data home>/scratch/<label>-<token8>/`, and `scratch_env` points
-`TMPDIR`/`TMP`/`TEMP`/`KIROCREW_SCRATCH` at it — per process, not per session
+`TMPDIR`/`TMP`/`TEMP` at it — per process, not per session
 (`acp/client.py` for a dedicated client, `acp/runtime.py` for a runtime). It also
 pins kiro-cli's chat log there, but only where `cap_kiro_cli_logs` can bound it
 (`_CAN_CAP_LOGS`); on Windows the key is omitted and kiro-cli keeps its default
 location, since a pinned log nothing rotates is worse than the CLI's own unlink.
 
-So a **shared-session** child sees the parent's scratch dir while a
-**dedicated-process** child gets an empty one: a brief staged under
-`$KIROCREW_SCRATCH` is unreadable to a dedicated child. Reclamation is keyed on
+`$KIROCREW_SCRATCH` itself follows the **session tree**, not the process. A
+shared-session child runs in the parent's process and sees the parent's directory
+for free; a dedicated-process child and a companion runtime are spawned with the
+parent's `work_scratch_dir` as `shared_scratch`, which the spawner mounts as a
+second private window into the masked scratch root and names as the child's
+`KIROCREW_SCRATCH` (`scratch_env(own, shared=…)`). So a brief staged under
+`$KIROCREW_SCRATCH` is readable by every child, however it was placed, and a
+`_bg` runtime recycled for age or RSS hands the sessions it takes over the same
+directory (its replacement inherits and adopts it). Reclamation is keyed on
 process liveness rather than on file age — a directory is removed only once its
 recorded owner's process GROUP is dead **and** the whole tree has been idle past a
-grace window, and an ownerless directory is never deleted.
+grace window, and an ownerless directory is never deleted. The seams and the
+ownership rule: [subagent](../system-specs/modules/subagent.md#one-kirocrew_scratch-per-session-tree).
 
 ## 4. Default agent vs other agents
 
 One function decides, for both session start and post-compaction re-injection:
-`context.py` → `_skills_injection_plan(agent, is_cc)`. It returns
-`(inject?, globs)` from two facts — whether the agent's JSON maps skills, and
-whether the agent is the built-in `kirocrew`.
+`context.py` → `_skills_injection_plan`. It returns `(inject?, globs)` from two
+facts — whether the agent's JSON maps skills, and whether the agent is the
+built-in `kirocrew`. The backend is not one of them: it accepts `is_cc` and ignores
+it (steering, below, is the one block the backend does gate).
 
 | Agent | `skill://` mapping | Skills it sees | Why |
 |---|---|---|---|
@@ -332,9 +341,10 @@ The mapping is read by `agent_discovery.py` → `agent_skill_globs`, which pulls
 `skill://` entries out of the spec's `resources` (`skill_resource_uris`) and
 expands each into an fnmatch glob over real paths (`expand_skill_uri`:
 `skill://~/…` against the home dir, `skill:///abs/…` verbatim, a relative URI
-against the project root inferred from the spec's location). `file://` steering
-entries are deliberately excluded, and an `only=` list matching nothing yields
-**no** skills rather than the full catalog.
+against the `project_dir` the caller supplies — the session's project on this path
+— falling back to the project root inferred from the spec's location only when no
+project is supplied). `file://` steering entries are deliberately excluded, and an
+`only=` list matching nothing yields **no** skills rather than the full catalog.
 
 A mapping defines availability on both backends. Crew supplies a bounded directory
 and an agent-scoped `skill_search` pointer; ordinary bodies load only when selected.
@@ -478,7 +488,7 @@ until it does.
 | Per-member working memory (briefing) | **Implemented** | `members.py` → `member_briefing_path`, `read_member_briefing`, `member_briefing_supported`; injected as layer 4 by `context.py` → `_build_member_section`. Agent-writable by design, with no dashboard endpoint — the member edits it with its own file tools. Capped at `MEMBER_BRIEFING_MAX_CHARS` on read. |
 | Per-member permanent rules | **Implemented** | `members.py` → `member_rules_path`, `read_member_rules`, `write_member_rules`; stored under `trust/member-rules/` so the member's file tools cannot rewrite its own boundary. `MEMBER_RULES_MAX_CHARS` cap enforced on write (a human dashboard action), never truncated on read. |
 | Private per-member memory | **Implemented for explicitly created members** | Memory V2: one SQLite database per immutable `member_id`, resolved by `config/loader.py` → `resolve_agent_bindings` and `execution_context.py` → `member_config_for_id`; bounded essentials from `member_essential_context.py`, recall through `memory_recall`. **Gap:** legacy and auto-discovered members remain on Global V1 and are not migrated, and a member cannot choose or rebind a shared store. |
-| Per-member activity log | **Implemented** | `members.py` → `record_activity`, `read_activity`; append-only `activity.jsonl`, rotated at `_ACTIVITY_LOG_MAX_BYTES` keeping one generation, with a per-record cap that aborts the read rather than skipping an over-cap line. |
+| Per-member activity log | **Implemented** | `members.py` → `record_activity`, `read_activity`, now backed by the per-member event log rather than `activity.jsonl`; each record is one `activity/record` event under the caps `eventlog/log.py` applies per append. There is NO rotation: rotation renamed the file out from under readers and dropped its oldest rows, which a sequence-ordered reader cannot survive, so the log is bounded per row and per value and accumulates over a member's lifetime. The legacy file is folded in once and then retired to `activity.jsonl.migrated`. |
 | Per-member permission control | **Partial** | Real and enforced, but keyed on the **template**, not the member: `agent_capabilities.py` resolves owner-reviewed intent over `agent_state.CAPABILITY_SECTIONS` (`mcpServers`, `tools`, `allowedTools`, `autoApprove`, `skills`, `prompt`, `model`, `resources`). A member gets its own permissions only through a **private copy** of its template (`private_to` lineage; `dashboard/handlers/agents.py` → `_foreign_private_copy_owner`, `_prune_private_copy_of_deleted_crew`), which is refused to a second crew. **Gaps:** two members sharing one template share its permissions; `[PERMANENT RULES]` is prompt-level guidance, not an enforced gate; and `agent.member_dispatch` is one global ceiling rather than a per-member one. |
 | Per-member DM binding | **Implemented** | `members.py` → `dm_binding_path`, `read_dm_binding`, `write_dm_binding`; under `trust/member-bindings/`, because the binding is the thread's identity authority. |
 

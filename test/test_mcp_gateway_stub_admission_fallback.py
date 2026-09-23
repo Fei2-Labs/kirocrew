@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -171,21 +172,31 @@ async def _open(sock: Path) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]
 
 
 def _scripted_daemon(script: Any) -> Any:
-    """Accept one connection, read the ``ensure_backend`` frame, run ``script``."""
+    """Accept one connection, read the ``ensure_backend`` frame, run ``script``.
+
+    The handler tasks are retained on ``spawn.tasks`` so a test can cancel one
+    whose ``script`` never returns; its ``finally`` then closes the server-side
+    writer, which is what ``server.wait_closed()`` waits for on POSIX.
+    """
     seen: list[dict[str, Any]] = []
+    tasks: list[asyncio.Task[None]] = []
 
     async def on_connect(reader: Any, writer: Any) -> None:
-        line = await reader.readline()
-        seen.append(json.loads(line))
+        # The ``finally`` covers the readline too: a handler cancelled while it is
+        # still waiting for the ``ensure_backend`` frame must also release the
+        # server-side transport, or ``server.wait_closed()`` waits on it forever.
         try:
+            line = await reader.readline()
+            seen.append(json.loads(line))
             await script(writer)
         finally:
             writer.close()
 
     def spawn(reader: Any, writer: Any) -> None:
-        asyncio.get_running_loop().create_task(on_connect(reader, writer))
+        tasks.append(asyncio.get_running_loop().create_task(on_connect(reader, writer)))
 
     spawn.seen = seen  # type: ignore[attr-defined]
+    spawn.tasks = tasks  # type: ignore[attr-defined]
     return spawn
 
 
@@ -195,32 +206,89 @@ async def _send(writer: Any, frame: dict[str, Any]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_queued_frames_extend_a_queue_aware_wait(short_sock_dir) -> None:
-    """Six keepalives at 0.05 s under a 0.12 s silence window: a fixed deadline of
-    0.12 s would have given up long before the ``ready`` at 0.3 s."""
+async def test_queued_frames_extend_a_queue_aware_wait(short_sock_dir, monkeypatch) -> None:
+    """Six keepalives, each 0.1 s apart on the loop's clock, under a 0.12 s silence
+    window: a fixed deadline of 0.12 s would have given up long before the ``ready``
+    read at 0.7 s. Every frame arrives inside the window it renews, so the wait extends.
+
+    The clock is the LOOP's, and the test moves it. ``asyncio.wait_for`` schedules
+    its silence timer with ``loop.time()``, so on a real clock this test was a race
+    between the daemon's 0.05 s keepalive cadence and the 0.12 s window -- one 150 ms
+    stall of the loop thread between two frames (a loaded Windows worker) read as
+    silence and returned ``timeout``, on four unrelated heads. Here each frame read
+    costs exactly 0.1 s of loop time and nothing else moves the clock, so the ratio
+    is the test's, not the scheduler's.
+
+    A frozen loop clock also freezes the test's own ``wait_for(..., timeout=10)``
+    net, so a read that never resolved would hang the worker instead of failing.
+    The watchdog below runs on the REAL clock: after ten seconds it jumps the loop
+    clock past every armed deadline and wakes the loop, so every frozen timer fires
+    at once and the test ends red, by name, the way the net was meant to end it.
+    """
+    loop = asyncio.get_running_loop()
+    clock = [loop.time()]
+    monkeypatch.setattr(loop, "time", lambda: clock[0])
+
+    def expire_every_frozen_timer() -> None:
+        clock[0] += 1_000_000.0
+
+    watchdog = threading.Timer(
+        10.0, lambda: loop.call_soon_threadsafe(expire_every_frozen_timer)
+    )
+    watchdog.daemon = True
+    watchdog.start()
+
+    real_read_frame = stub._read_frame
+
+    async def a_frame_every_tenth(reader: Any) -> Any:
+        # The daemon has been quiet for 0.1 s of loop time when this frame lands:
+        # inside the 0.12 s window, so the wait must renew, never give up.
+        clock[0] += 0.1
+        return await real_read_frame(reader)
+
+    monkeypatch.setattr(stub, "_read_frame", a_frame_every_tenth)
 
     async def script(writer: Any) -> None:
         for _ in range(6):
-            await asyncio.sleep(0.05)
             await _send(writer, {"type": "queued", "position": 1, "capacity": 4})
         await _send(writer, {"type": "ready"})
-        await asyncio.sleep(0.05)
 
     handler = _scripted_daemon(script)
-    server, sock = await _serve(handler, short_sock_dir)
+    server = writer = None
     try:
+        server, sock = await _serve(handler, short_sock_dir)
         reader, writer = await _open(sock)
+        started = clock[0]
         outcome, frame = await asyncio.wait_for(
             stub._ensure_backend_admitted(
-                reader, writer, queue_aware=True, total_budget_secs=10.0, silence_secs=0.12
+                reader,
+                writer,
+                queue_aware=True,
+                total_budget_secs=10.0,
+                silence_secs=0.12,
+                now=lambda: clock[0],
             ),
             timeout=10,
         )
-        writer.close()
     finally:
-        server.close()
-        await server.wait_closed()
+        # Unconditional, and in this order, so a RED run still ends: our end
+        # closes; the daemon handler is cancelled and awaited, so its ``finally``
+        # closes the server-side writer (a ``script`` that never returned would
+        # otherwise hold the connection ``wait_closed`` waits for on POSIX); then
+        # the server drains. The watchdog stays armed through all of it.
+        if writer is not None:
+            writer.close()
+        for task in handler.tasks:
+            task.cancel()
+        await asyncio.gather(*handler.tasks, return_exceptions=True)
+        if server is not None:
+            server.close()
+            await server.wait_closed()
+        watchdog.cancel()
     assert (outcome, frame) == (stub._ADMIT_READY, {"type": "ready"})
+    # The wait outlived any fixed 0.12 s deadline by a wide margin: that is the
+    # renewal, and it is measured on the same clock the timer runs on.
+    assert clock[0] - started == pytest.approx(0.7)
     assert handler.seen[0]["wait_budget_secs"] == 10.0, "a queue-aware stub declares its budget"
 
 

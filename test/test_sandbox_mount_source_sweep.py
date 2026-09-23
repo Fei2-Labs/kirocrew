@@ -1100,6 +1100,62 @@ class TestMountPinnedSourceNames:
         assert _cleanup_stale_sandbox_mount_sources(roots=[str(tmp_path)]) == 0
         assert held.exists()
 
+    def test_identical_mount_tables_are_parsed_once_per_scan(self, tmp_path: Path):
+        """Every thread of a group reports its leader's mount table verbatim,
+        so a scan over a many-threaded host is thousands of reads of a few
+        dozen distinct tables; each distinct table is split and matched once,
+        and the repeats cost the read alone. ``matcher`` sees every line of a
+        parsed table, so its call count is the number of lines parsed."""
+        proc = tmp_path / "proc"
+        self._proc_task(proc, 1, mountinfo="")
+        table = (
+            "100 99 0:40 /kirocrew_sb_777_home /root/home rw - tmpfs tmpfs rw\n"
+            "101 99 0:40 /kirocrew_sb_777_ssh /root/.ssh rw - tmpfs tmpfs rw\n"
+        )
+        self._proc_task(proc, 500, mountinfo=table, threads={tid: table for tid in range(501, 521)})
+        self._proc_task(proc, 600, mountinfo=table)
+        matched: list[str] = []
+
+        def _matcher(name: str) -> bool:
+            matched.append(name)
+            return name.startswith("kirocrew_sb_")
+
+        coverage = _PinScanCoverage()
+        pinned, complete = _mount_pinned_source_names(
+            proc_root=str(proc), matcher=_matcher, coverage=coverage
+        )
+
+        assert pinned == {"kirocrew_sb_777_home", "kirocrew_sb_777_ssh"}
+        assert complete is True and coverage.covered is True
+        assert matched == ["kirocrew_sb_777_home", "kirocrew_sb_777_ssh"]
+
+    @pytest.mark.parametrize(
+        "cache_limit",
+        ["_MOUNT_TABLE_CACHE_MAX_ENTRIES", "_MOUNT_TABLE_CACHE_MAX_BYTES"],
+    )
+    def test_tables_past_cache_limit_remain_parsed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cache_limit: str
+    ):
+        """A zero cache bound drops deduplication, not mount-source discovery."""
+        monkeypatch.setattr(f"kiro_crew.sandbox.{cache_limit}", 0)
+        proc = tmp_path / "proc"
+        first = "100 99 0:40 /kirocrew_sb_1_first /root/a rw - tmpfs tmpfs rw\n"
+        uncached = "101 99 0:40 /kirocrew_sb_2_later /root/b rw - tmpfs tmpfs rw\n"
+        self._proc_task(proc, 1, mountinfo=first)
+        self._proc_task(proc, 500, mountinfo=uncached, threads={501: uncached})
+        matched: list[str] = []
+
+        def _matcher(name: str) -> bool:
+            matched.append(name)
+            return name.startswith("kirocrew_sb_")
+
+        pinned, complete = _mount_pinned_source_names(proc_root=str(proc), matcher=_matcher)
+
+        assert pinned == {"kirocrew_sb_1_first", "kirocrew_sb_2_later"}
+        assert complete is True
+        assert set(matched) == {"kirocrew_sb_1_first", "kirocrew_sb_2_later"}
+        assert len(matched) == 3
+
     @pytest.mark.skipif(
         not os.path.isdir("/proc/1"),
         reason="needs an unfiltered procfs exposing pid 1 (Linux, no hidepid)",

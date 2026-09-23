@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Check, ChevronDown, ChevronUp, FolderInput } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
+import { motion, useReducedMotion } from 'framer-motion'
 import {
   api,
   ApiError,
@@ -69,19 +70,43 @@ export function ChannelFolderBackfill(props: {
   const { namespace, folderName, disabled, testId } = props
   const qc = useQueryClient()
   const [pending, setPending] = useState(false)
-  const [report, setReport] = useState<BackfillReport | null>(null)
+  // Every receipt carries an id minted when it arrived, so the SAME node keeps
+  // rendering it when it moves from "current run" to "stranded": one keyed list
+  // below reconciles both roles, and a receipt that changes role keeps its key,
+  // its DOM node and its expanded state. A reader who watched a list arrive
+  // sees that same list slide down under the next run, not vanish and reappear.
+  const nextId = useRef(0)
+  const [report, setReport] = useState<Receipt | null>(null)
+  // Receipts whose content cannot be recovered by clicking again. Only one shape
+  // qualifies: a `folder_gone` report that MOVED something. Those sessions were
+  // stamped with the deleted folder's id, so a later pass refuses to offer them
+  // (`needs_backfill_filing` treats either stamp as filed) and recreating the
+  // folder mints a fresh id that does not reattach them. The named list is the
+  // only thing that says WHICH sessions to move back by hand, so it stays on the
+  // panel, beneath later runs, until the panel closes.
+  //
+  // Every other receipt is re-derivable by one more click: "nothing to move",
+  // "save the folder name first", "no folder exists yet", a `folder_gone` that
+  // filed nothing, an all-failed count (failed writes are never stamped, so the
+  // next pass retries them), and a store failure. None of those is kept.
+  const [stranded, setStranded] = useState<Receipt[]>([])
   const [error, setError] = useState('')
+  const reduceMotion = useReducedMotion()
 
   const run = () => {
     setPending(true)
     setError('')
+    if (report && report.report.reason === 'folder_gone' && report.report.moved.length > 0) {
+      setStranded(prev => [...prev, report])
+    }
     // The previous report is dropped BEFORE the request, not after it returns: a
     // stale "moved 3" sitting under a spinner reads as the current run's result.
     setReport(null)
     void api
       .backfillChannelFolder(namespace)
       .then(answer => {
-        setReport(answer)
+        nextId.current += 1
+        setReport({ id: nextId.current, report: answer })
         // The gateway pushes a slots update for every OPEN tab it re-placed, so
         // the live sidebar moves on its own. These two cover what that push does
         // not: a conversation with no open tab (it only exists in History), and a
@@ -112,7 +137,27 @@ export function ChannelFolderBackfill(props: {
           ? i18nT('pages.settings.botChannelPanel.backfill_running')
           : i18nT('pages.settings.botChannelPanel.backfill_existing')}
       </Btn>
-      {report && <BackfillOutcome report={report} folderName={folderName} />}
+      {/* ONE list for the current run and the kept receipts, because React only
+          preserves a node whose key stays put in the same parent. Two sibling
+          slots -- `{report && ...}` then `{stranded.map(...)}` -- unmount the
+          receipt from one and remount it in the other on the very click that
+          makes it stranded, which is the hard swap the continuity rule forbids. */}
+      {(report || stranded.length > 0) && (
+        <div data-testid="backfill-receipts">
+          {[
+            ...(report ? [{ ...report, stranded: false }] : []),
+            ...stranded.map(r => ({ ...r, stranded: true })),
+          ].map(r => (
+            <BackfillOutcome
+              key={r.id}
+              report={r.report}
+              folderName={folderName}
+              stranded={r.stranded}
+              animate={!reduceMotion}
+            />
+          ))}
+        </div>
+      )}
       {/* No hand-off: the failure is a refused bulk move, and the panel around
           this button holds the user's unsaved settings draft (the folder name
           they may be mid-edit, and on the token panels a pasted credential).
@@ -137,13 +182,31 @@ export function ChannelFolderBackfill(props: {
   )
 }
 
+/** A report plus the identity it keeps for as long as the panel shows it. */
+type Receipt = { id: number; report: BackfillReport }
+
 /** What one completed run says. Split out so each outcome is one branch rather
  *  than a chain of ternaries inside the button's JSX. */
-function BackfillOutcome(props: { report: BackfillReport; folderName: string }) {
-  const { report, folderName } = props
+function BackfillOutcome(props: {
+  report: BackfillReport
+  folderName: string
+  /** A kept `folder_gone` receipt from an EARLIER run. Its green "Moved N"
+   *  headline gives way to an instruction to move those N back by hand -- the
+   *  note above it says they fell out of the folder, so asserting the move would
+   *  contradict it -- and it renders no failed or remaining counts: those
+   *  describe sessions the next click retries, so repeating them under a later
+   *  run's own counts would put two answers to "can clicking again help" on one
+   *  card. */
+  stranded?: boolean
+  /** Animate the slide when a later run is inserted above this receipt. Off
+   *  under `prefers-reduced-motion`, where the move is instant. */
+  animate?: boolean
+}) {
+  const { report, folderName, stranded = false, animate = false } = props
   // Collapsed for each new report rather than remembered: the button drops the
   // previous report before it requests, so this component unmounts between runs
-  // and a later run's list cannot inherit an earlier one's expanded state.
+  // and a later run's list cannot inherit an earlier one's expanded state. A
+  // stranded receipt is its own mounted instance and keeps its own toggle.
   const [expanded, setExpanded] = useState(false)
   // The folder the SERVER acted on wins over the panel's copy of the name: on a
   // `folder_missing` answer they are the same, but after a rename that has not
@@ -230,7 +293,7 @@ function BackfillOutcome(props: { report: BackfillReport; folderName: string }) 
   // dropped the count in exactly those cases -- the count that tells the user
   // whether clicking again can help.
   const failureNotice =
-    report.failed > 0 ? (
+    !stranded && report.failed > 0 ? (
       <ErrorNotice
         variant="inline"
         className="mt-2 text-[11.5px]"
@@ -267,6 +330,19 @@ function BackfillOutcome(props: { report: BackfillReport; folderName: string }) 
   }
 
   const named = expanded ? report.moved : report.moved.slice(0, NAMED_LIMIT)
+  // A `folder_gone` receipt with names is an instruction from the moment it
+  // arrives, not only once it is kept: the note above it says those sessions
+  // fell back out of the folder, so a green "Moved N into the folder" under it
+  // would assert the state the note denies -- on the current run exactly as on
+  // a kept one. The two instruction sentences differ only in naming the run:
+  // the kept one says "from an earlier run", because under a later run's output
+  // "while this ran" in the note no longer points at anything.
+  const instruction = report.reason === 'folder_gone' && report.moved.length > 0
+  const headline = stranded
+    ? i18nT('pages.settings.botChannelPanel.backfill_stranded', { count: report.moved.length })
+    : instruction
+      ? i18nT('pages.settings.botChannelPanel.backfill_move_back', { count: report.moved.length })
+      : i18nT('pages.settings.botChannelPanel.backfill_moved', { count: report.moved.length, folder })
   return (
     // No `role` on this wrapper. It holds the receipt AND, when a write failed,
     // an `ErrorNotice` carrying `role="alert"`; an assertive alert nested inside a
@@ -274,19 +350,34 @@ function BackfillOutcome(props: { report: BackfillReport; folderName: string }) 
     // interrupting, which is the failure the `errors-use-error-notice` rule
     // exists to prevent. Status semantics belong on the non-error output only:
     // the receipt sentence below, and `BackfillNote`, which carries its own.
-    <div className="mt-2" data-testid="backfill-result">
+    // `layout` animates this node's slide when a later run is inserted above it,
+    // so the receipt the reader just saw is visibly the one now sitting lower.
+    <motion.div
+      layout={animate}
+      className="mt-2"
+      data-testid={stranded ? 'backfill-stranded-result' : 'backfill-result'}
+    >
       {reasonNote}
+      {/* Same node in both roles: the class swap is a colour transition rather
+          than a remount, so the line the reader watched turns from a receipt into
+          an instruction in place. No glyph on an instruction: the check mark is
+          the success claim, and any arrow-shaped icon beside "move back by hand"
+          read to a blind reader as a control that would do the moving. */}
       <p
-        className="inline-flex items-center gap-1.5 text-[12px] text-ok mt-0 mb-1"
+        className={`inline-flex items-center gap-1.5 text-[12px] mt-0 mb-1 transition-colors duration-300 ${
+          instruction ? 'text-muted' : 'text-ok'
+        }`}
         role="status"
       >
-        <Check size={13} />
-        {i18nT('pages.settings.botChannelPanel.backfill_moved', {
-          count: report.moved.length,
-          folder,
-        })}
+        {!instruction && <Check size={13} />}
+        {headline}
       </p>
-      <ul className="list-none pl-0 m-0 text-[11.5px] text-muted">
+      {/* Bulleted and indented under the headline: a bare name on its own line
+          between two status sentences read to a blind reader as an unrelated
+          settings heading, not as the session the sentence above it counts.
+          `list-inside` because each item truncates with `overflow: hidden`, and
+          an outside marker sits in the part of the box that clips. */}
+      <ul className="list-disc list-inside pl-3 m-0 text-[11.5px] text-muted">
         {named.map(m => (
           <li key={m.key} className="truncate">
             {m.title || i18nT('pages.settings.botChannelPanel.backfill_untitled', { channel: m.label })}
@@ -311,7 +402,7 @@ function BackfillOutcome(props: { report: BackfillReport; folderName: string }) 
       )}
       {/* A capped run failed at nothing, so it stays a plain note: it is
           guidance that another click continues, not a failure report. */}
-      {report.remaining > 0 && report.failed === 0 && (
+      {!stranded && report.remaining > 0 && report.failed === 0 && (
         <BackfillNote
           text={i18nT('pages.settings.botChannelPanel.backfill_remaining', {
             count: report.remaining,
@@ -333,7 +424,7 @@ function BackfillOutcome(props: { report: BackfillReport; folderName: string }) 
           and discards it. The remedy never needs the agent either -- the writes
           failed, and the button is still there to click again. */}
       {failureNotice}
-    </div>
+    </motion.div>
   )
 }
 

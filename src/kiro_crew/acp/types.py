@@ -29,6 +29,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_CLIENT_META_SETTINGS,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
+    ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
@@ -58,6 +59,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
     ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY,
     effort_config_option_id,
+    effort_config_option_value,
     model_registry_namespace,
     overlay_project_scope,
     selectable_backends,
@@ -1042,6 +1044,10 @@ class AcpEvent:
     #: classification (cache hit), not the miss-default False.
     raw_params_trusted: bool = False
     shell_classified: bool = False
+    #: tool_identity_trusted: tool_name below came from a provenance-verified
+    #: adapter-authored identity channel, never a title or inline fallback.
+    #: Security gates must require this flag in addition to a recognized name.
+    tool_identity_trusted: bool = False
     #: mcp_identity_trusted: mcp_server_name/tool_name below were populated
     #: from a provenance-verified source — the origin-scoped tool_call caches
     #: (permission path) or ``_meta.kiro`` on the tool_call frame itself —
@@ -1051,14 +1057,15 @@ class AcpEvent:
     #: fails CLOSED (identity not counted as verified) instead of silently
     #: passing on non-emptiness alone.
     mcp_identity_trusted: bool = False
-    # Canonical, NON-model-authored tool identity from ``_meta.kiro`` (see
-    # ``_dispatch._kiro_tool_name``). ``title`` is LLM-authored prose — for shell
-    # tools ``select_tool_title`` even prefers the model's ``description`` — so a
-    # security gate MUST key on these, never on ``title``. ``mcp_server_name`` is
-    # populated ONLY for MCP-served tools (empty for built-ins/shell), so a
-    # non-empty value is the trusted signal "a real MCP tool call" rather than a
-    # forged shell result. Empty when the backend does not emit ``_meta.kiro``
-    # (fail-closed: callers that gate on these get no match).
+    # Canonical, NON-model-authored tool identity from adapter-authored
+    # ``_meta.kiro`` or ``_meta.goose`` (see ``_dispatch._kiro_tool_name``).
+    # ``title`` is LLM-authored prose — for shell tools ``select_tool_title``
+    # even prefers the model's ``description`` — so a security gate MUST key on
+    # these, never on ``title``. ``mcp_server_name`` is populated ONLY for
+    # MCP-served tools (empty for built-ins/shell), so a non-empty value is the
+    # trusted signal "a real MCP tool call" rather than a forged shell result.
+    # Empty when the backend emits neither trusted harness channel (fail-closed:
+    # callers that gate on these get no match).
     tool_name: str = ""
     mcp_server_name: str = ""
     #: True when a spec-adapter MCP title matched more than one server in the

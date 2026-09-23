@@ -550,9 +550,10 @@ class TestUnchangedBaseline:
         # installs by design, so a co-writer can overwrite a recorded key -- and an
         # overwrite that happens to match the recorded byte length would pass a
         # length-only check. The skip would then hold, uploads would stop while the tree
-        # was unchanged, and `restore_download` (which names no version id) would fetch
-        # the foreign current version and refuse it as unverified, with no automated
-        # path back to our bytes. Same length, different version, must upload.
+        # was unchanged, and a restore would fetch the foreign current version, fail the
+        # fingerprint, and be left depending on `_recover_recorded_version` finding our
+        # noncurrent bytes still on the drive -- a narrower guarantee than simply having
+        # uploaded. Same length, different version, must upload.
         self._seed(size=10)
         with mock.patch.object(
             backup.storage,
@@ -649,6 +650,15 @@ class TestUnchangedBaseline:
         assert self.authz.call_count == 1
         assert self.authz.call_args.kwargs["operation"] == backup.SEL_OP_BASELINE_PROBE
         assert self.authz.call_args.kwargs["caller"] == backup.CALLER_SCHEDULED
+        # The probe carries no kind's payload -- it is a HEAD of an archive already in
+        # the bucket, and writes nothing -- so no per-kind grant governs it. Naming a
+        # kind here would subject a read to that kind's grant and turn a withdrawn
+        # snapshot consent into a refused PROBE, which this module answers by
+        # uploading: the nightly would re-upload an unchanged tree every night, the
+        # exact cost this baseline exists to avoid. `None` is the real answer the
+        # parameter documents, not an opt-out, and the parameter has no default
+        # precisely so this site must state it.
+        assert self.authz.call_args.kwargs["payload_kind"] is None
 
     def test_a_refused_probe_uploads_rather_than_skipping(self):
         # Consent withdrawn during the build: the gate raises and the run uploads. It

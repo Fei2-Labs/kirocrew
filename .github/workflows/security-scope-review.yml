@@ -1683,7 +1683,25 @@ jobs:
             # the RAW header here; whether it is attributable to THIS head is the
             # marker's job, decided in the shared table rather than folded into the
             # header, so a present-but-unmarked header is not silently honoured.
-            model="$(printf '%s\n' "$summary" | grep -iE '^[[:space:]]*Scope-Verdict:' | head -n1 | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr '[:lower:]' '[:upper:]')"
+            # ONE awk over a here-string, not a pipeline. A `grep` that matches
+            # nothing exits 1, and a `head -n1` closes the pipe on a long summary
+            # so its producer dies of SIGPIPE with 141 -- and under this step's
+            # `pipefail` plus the runner's own `-e` either status aborts the step
+            # HERE, one line above the fallback written for an absent header.
+            # Suppressing the statuses would be worse than the abort: 141 arrives
+            # with a header already in hand, so silencing it hands this lane a
+            # verdict read out of a document the step never finished reading.
+            # Hence BOTH halves of the shape below. No pipeline, so there is no
+            # status to suppress and awk exits 0 whether or not a header is there.
+            # And no `exit` on the first match: the whole summary is read, the
+            # FIRST header is what survives, and it is printed from `END`, so a
+            # verdict is never taken from a partial read. Same tool and the same
+            # here-string as the five sibling review lanes' own header capture.
+            # The class spells out the five characters `[[:space:]]` matches
+            # inside a record -- an awk record holds no newline -- because the
+            # runners' awk is mawk and nothing here should depend on its POSIX
+            # class support; the indentation the contract displays still matches.
+            model="$(awk '!found && tolower($0) ~ /^[ \t\v\f\r]*scope-verdict:/ { sub(/^[^:]*:[ \t\v\f\r]*/, ""); gsub(/\r/, ""); value = toupper($0); found = 1 } END { if (found) print value }' <<< "$summary")"
             [ -z "$model" ] && model="UNKNOWN"
             # The marker is the ONLY proof the review ran for THIS revision. A
             # here-string, not `printf | grep`, so a long summary cannot

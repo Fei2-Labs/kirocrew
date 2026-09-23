@@ -400,8 +400,11 @@ class TestSessionOpenedRecordsTheAllocationsSelection:
     ):
         """The regression: a claim of a pre-warmed session must not re-resolve.
 
-        An eager allocation arms a ``resumed=True`` observation for the real turn,
-        so this is the shape a prewarmed first turn sees. The config default has
+        An eager allocation that RESUMED arms a ``resumed=True`` observation for the
+        real turn, so this is the shape a resuming prewarmed first turn sees. (A
+        prewarm that started fresh arms ``FRESH`` instead and arrives as
+        ``is_new=True, resumed=False``; that shape is covered by
+        ``TestSessionOpenedCoversTheTierBelowTheCaller``.) The config default has
         moved since that allocation; the entry must still name what was allocated.
         """
         _runner_config(_config(tmp_path))
@@ -420,10 +423,10 @@ class TestSessionOpenedRecordsTheAllocationsSelection:
     async def test_a_fresh_allocation_replaces_a_dead_sessions_selection(
         self, tmp_path, _runner_config
     ):
-        """``is_new`` means THIS call allocated, so its own selection is the truth.
+        """A value left by a session that died without teardown must not outlive it.
 
-        A value left by a session that died without a teardown must not outlive it
-        and be reported as this session's provenance.
+        The live session stamped nothing, so the record falls back to this turn's own
+        selection rather than reporting the dead session's provenance.
         """
         _runner_config(_config(tmp_path))
         state, _client = _turn_state(tmp_path)
@@ -450,3 +453,109 @@ class TestSessionOpenedRecordsTheAllocationsSelection:
 
         assert slot._session_requested_model is None
         assert opened.call_args.kwargs["model_requested"] == ""
+
+
+class TestSessionOpenedCoversTheTierBelowTheCaller:
+    """A model resolved INSIDE ``get_or_create`` reaches ``model_requested``.
+
+    The turn selects through the slot pin, the crew pin and the resolved default.
+    When all three defer it asks for nothing, and the session manager resolves an
+    id from its own config; that call reports the provider, ``is_new`` and
+    ``resumed``, so the turn has no selection of its own to record. These turns
+    pin the stamp the allocation leaves as the fourth tier, and pin that a session
+    with no selection anywhere still writes no field.
+    """
+
+    @staticmethod
+    def _capture():
+        return unittest.mock.patch.object(
+            chat_runner.crew_log_emit, "on_session_opened", unittest.mock.MagicMock()
+        )
+
+    @staticmethod
+    def _all_tiers_defer(tmp_path: Path) -> KiroCrewConfig:
+        """A config whose global pin is empty, so the turn resolves ``""``."""
+        return _load_config(
+            tmp_path,
+            {
+                "agent": {"model": "", "provider": "acp"},
+                "agents": {"default": {"kiro_agent": "kirocrew", "memory_store": "default"}},
+                "default_agent": "default",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_allocations_own_resolution_is_recorded(self, tmp_path, _runner_config):
+        """The regression: the turn asks for nothing, the allocation resolves one."""
+        _runner_config(self._all_tiers_defer(tmp_path))
+        state, _client = _turn_state(tmp_path)
+        state.sessions.allocation_requested_model = unittest.mock.MagicMock(
+            return_value=GLOBAL_DEFAULT
+        )
+        slot = _slot()
+
+        with self._capture() as opened:
+            await _drive(state, slot)
+
+        assert _session_model(state) is None
+        assert slot._session_requested_model == GLOBAL_DEFAULT
+        assert opened.call_args.kwargs["model_requested"] == GLOBAL_DEFAULT
+
+    @pytest.mark.asyncio
+    async def test_no_tier_anywhere_still_records_nothing(self, tmp_path, _runner_config):
+        """An allocation that resolved nothing writes no field, not an empty one."""
+        _runner_config(self._all_tiers_defer(tmp_path))
+        state, _client = _turn_state(tmp_path)
+        slot = _slot()
+
+        with self._capture() as opened:
+            await _drive(state, slot)
+
+        assert slot._session_requested_model == ""
+        assert opened.call_args.kwargs["model_requested"] == ""
+
+    @pytest.mark.asyncio
+    async def test_the_allocations_stamp_beats_a_fresh_re_resolution(
+        self, tmp_path, _runner_config
+    ):
+        """The stamp wins, because the branch cannot tell prewarmed from cold.
+
+        A prewarmed session arms ``FirstTurnState.FRESH``, whose ``is_new`` is True
+        and ``resumed`` is False, so a claim of one arrives here exactly as a cold
+        start does. Reading this turn's own resolution first would write a model the
+        session never ran on whenever config moved between the allocation and the
+        first turn -- into an entry nothing rewrites.
+        """
+        _runner_config(_config(tmp_path))
+        state, _client = _turn_state(tmp_path)
+        state.sessions.allocation_requested_model = unittest.mock.MagicMock(
+            return_value="model-the-allocation-chose"
+        )
+        slot = _slot()
+
+        with self._capture() as opened:
+            await _drive(state, slot)
+
+        assert _session_model(state) == GLOBAL_DEFAULT
+        assert slot._session_requested_model == "model-the-allocation-chose"
+        assert opened.call_args.kwargs["model_requested"] == "model-the-allocation-chose"
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_stamped_nothing_falls_back_to_this_turn(
+        self, tmp_path, _runner_config
+    ):
+        """A registration site that resolves no model stamps ``""``.
+
+        The fallback is what keeps the top three tiers recorded for such a session
+        rather than regressing them to absent.
+        """
+        _runner_config(_config(tmp_path))
+        state, _client = _turn_state(tmp_path)
+        slot = _slot()
+
+        with self._capture() as opened:
+            await _drive(state, slot)
+
+        assert state.sessions.allocation_requested_model.return_value == ""
+        assert slot._session_requested_model == GLOBAL_DEFAULT
+        assert opened.call_args.kwargs["model_requested"] == GLOBAL_DEFAULT

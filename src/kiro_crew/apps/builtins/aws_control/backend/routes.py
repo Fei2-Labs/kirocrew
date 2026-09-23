@@ -38,6 +38,7 @@ MUTATIONS (also restricted-session refused + SEL-audited)
 ``POST /backup/{account}/nightly``             toggle the nightly snapshot
 ``POST /backup/{account}/retention``           set or clear the retention count
 ``POST /backup/{account}/nightly-sessions``    toggle the nightly sessions archive
+``POST /backup/{account}/layer-b``             permit unredacted context in the sessions archive
 ``POST /backup/{account}/restore``             download an archive to the staging dir
 ``POST /install/label``                        rename THIS install (display only, local)
 
@@ -2324,6 +2325,26 @@ async def _handle_backup_status(request: web.Request) -> web.Response:
             backup_mod.scheduled_sessions_blocked_code,
             scheduled_account=account == await accounts_mod.default_account_id(),
         ),
+        # Per kind, the last sweep's count of archives this install wrote that no sweep
+        # can ever retire, and their bytes. The count above says what retention WILL
+        # collect; this says what it never will, which is why a bill can fail to fall
+        # after an operator enables it. Empty until a sweep has measured one, and
+        # stamped rather than live -- refreshing it would need the bucket listing this
+        # payload deliberately keeps opt-in.
+        "retentionUnclaimed": await asyncio.to_thread(backup_mod.retention_unclaimed, account),
+        # Beside it, never instead of it: one is a floor on the archives this install
+        # remembers, the other counts what the listing held that it has no record of,
+        # and the first deliberately reads 0 for the second's keys. Neither asserts
+        # anything is reclaimable. See `backup.retention_unrecorded`.
+        "retentionUnrecorded": await asyncio.to_thread(backup_mod.retention_unrecorded, account),
+        # Per kind, the consecutive-failure record for UNATTENDED attempts, and absent
+        # for a kind whose last attempt completed. `runs` below says when the nightly
+        # last SUCCEEDED, which cannot distinguish a schedule that has never run from
+        # one that has been failing since a particular day -- and the operator is the
+        # one who has to act on that difference. Local and free, like `install`: it is
+        # a read of the same state document this payload already loads, so it rides on
+        # the unpolled half rather than waiting for the opt-in remote one.
+        "nightlyFailures": await asyncio.to_thread(backup_mod.nightly_failures, account),
         "runs": await asyncio.to_thread(backup_mod.last_runs, account),
         "jobs": await asyncio.to_thread(_account_jobs, account),
         # This install's own identity, so every row can be told from every other
@@ -2554,6 +2575,47 @@ async def _handle_backup_retention(request: web.Request) -> web.Response:
     return web.json_response({"retentionKeep": raw})
 
 
+async def _handle_backup_layer_b(request: web.Request) -> web.Response:
+    """The ONLY writer of the sessions archive's Layer B permission.
+
+    Owner-gated by ``_guarded`` like every route here, and it reaches the state
+    file directly rather than through the agent file gate -- which is the whole
+    point of keeping this permission out of ``config.json``. See
+    ``backup.sessions_layer_b_enabled`` for why an agent-writable home would
+    let a prompt-injected shell consent to an irreversible upload of unredacted
+    model context on the operator's behalf.
+    """
+    target = await _account_target(request)
+    if isinstance(target, web.Response):
+        return target
+    body = await _body(request)
+    # Validated, never coerced, for the same reason the nightly toggle above is:
+    # `bool("false")` is True, so a stringly-typed caller asking for OFF would
+    # switch unredacted context ON. Here the wrong direction is unrecallable
+    # rather than merely billable, so the posture is not optional.
+    raw = body.get("enabled")
+    if not isinstance(raw, bool):
+        return _bad_request("enabled must be a boolean", "invalid_enabled")
+    enabled = raw
+    account, _profile, _region = target
+    try:
+        await asyncio.to_thread(backup_mod.set_sessions_layer_b, account, enabled)
+    except OSError:
+        # Same contract as the nightly toggle: the write can genuinely fail, and
+        # a permission the console renders as stored while the next read denies it
+        # is worse than an error. Fixed message, structured code, path only in
+        # the log.
+        logger.exception("aws-control: the Layer B permission could not be persisted")
+        return web.json_response(
+            {
+                "error": "the Layer B setting could not be saved",
+                "code": "state_persist_failed",
+            },
+            status=500,
+        )
+    return web.json_response({"sessionsIncludeLayerB": enabled})
+
+
 async def _handle_backup_restore(request: web.Request) -> web.Response:
     """Download an archive to the staging dir — never a live hot-swap."""
     ctx = await _require_drive(request)
@@ -2734,6 +2796,10 @@ def register_routes(app: web.Application) -> None:
     r.add_post(
         f"{_BASE}/backup/{{account}}/nightly-sessions",
         _guarded(_mutating("backup_nightly_sessions")(_handle_backup_nightly_sessions)),
+    )
+    r.add_post(
+        f"{_BASE}/backup/{{account}}/layer-b",
+        _guarded(_mutating("backup_layer_b")(_handle_backup_layer_b)),
     )
     r.add_post(
         f"{_BASE}/backup/{{account}}/restore",

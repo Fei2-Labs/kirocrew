@@ -1508,11 +1508,15 @@ def _ssh_effective_config(tmp_path, config_text: str, ssh_args: list[str], host:
     """
     cfg = tmp_path / "ssh_config"
     cfg.write_text(config_text.format(host=host, sock=str(tmp_path / "cm-%r@%h:%p")), "utf-8")
+    # ``cwd=tmp_path``: the real binary is the point of this probe (only ssh can
+    # answer its own precedence rules), so it stays real -- but it runs pinned to
+    # the test's own directory rather than inheriting the worker's checkout cwd.
     out = subprocess.run(
         ["ssh", "-G", "-F", str(cfg), *ssh_args, host],
         capture_output=True,
         text=True,
         timeout=_SSH_CONFIG_PROBE_TIMEOUT_SECS,
+        cwd=tmp_path,
     )
     assert out.returncode == 0, f"ssh -G failed: {out.stderr}"
     # Repeated keys are accumulated, not overwritten: ssh prints one
@@ -1618,6 +1622,7 @@ Host {host}
             capture_output=True,
             text=True,
             timeout=_SSH_CONFIG_PROBE_TIMEOUT_SECS,
+            cwd=tmp_path,
         )
         assert out.returncode == 0, f"production argv broke a working config: {out.stderr}"
         assert "bad configuration option" not in out.stderr.lower()
@@ -2001,17 +2006,39 @@ class TestSshTunnelManager:
 
 
 class _FakeReq:
-    def __init__(self, state, *, headers=None, match=None, body=None, query=None, user="owner"):
+    def __init__(
+        self,
+        state,
+        *,
+        headers=None,
+        match=None,
+        body=None,
+        query=None,
+        user="owner",
+        app_token="",
+    ):
         self.app = {"state": state}
         self.headers = headers or {}
         self.match_info = match or {}
         self.query = query or {}
         self._body = body
-        # Mirrors aiohttp Request mapping: require_auth sets request["user"].
-        self._attrs = {"user": user} if user is not None else {}
+        # Mirrors the aiohttp Request MAPPING, all three reads the owner predicate
+        # in ``_guard`` performs: ``.get("user")`` for the subject, ``"app" in``
+        # then ``["app"]`` for the app-token claim. A double that serves only
+        # ``.get`` raises on the ``in`` test. ``app_token`` stays "" for a browser
+        # session; a test wanting an app token passes it.
+        self._attrs = {"app": app_token}
+        if user is not None:
+            self._attrs["user"] = user
 
     def get(self, key, default=None):
         return self._attrs.get(key, default)
+
+    def __contains__(self, key):
+        return key in self._attrs
+
+    def __getitem__(self, key):
+        return self._attrs[key]
 
     async def json(self):
         if self._body is None:
@@ -2037,6 +2064,17 @@ def _fake_reconfigure(mgr, keep_intent=True):
 
 
 class _State:
+    """Dashboard-state stand-in for the instances handlers.
+
+    ``owner_id`` matches ``_FakeReq``'s default caller, because ``_guard`` demands
+    the positively-identified owner: the whole control plane mints peer dashboard
+    credentials with the owner's manager-held credential, so an authenticated
+    non-owner must not reach it. A test wanting that caller passes a different
+    ``user=``.
+    """
+
+    owner_id = "owner"
+
     def __init__(self, registry, manager=None):
         self.instances_registry = registry
         self.instances_manager = manager
@@ -6004,12 +6042,12 @@ class TestSsmTargetShapeHasOneDefinition:
             with pytest.raises(SsmValidationError):
                 validate_ssm_target(value)
 
-    def test_registry_accepts_an_ecs_target_for_an_ssm_record(self, tmp_path):
+    def test_registry_accepts_an_ecs_target_for_a_fargate_record(self, tmp_path):
         """End of the seam: a record carrying an ECS target must persist."""
         from kiro_crew.instances.registry import InstancesRegistry
 
         reg = InstancesRegistry(path=tmp_path / "instances.json")
-        inst = reg.add(name="Fargate crew", connection_method="ssm", ssm_target=_ECS_OK)
+        inst = reg.add(name="Fargate crew", connection_method="fargate", ssm_target=_ECS_OK)
         assert inst.ssm_target == _ECS_OK
         # Round-trips through disk rather than only passing the in-memory check.
         reloaded = InstancesRegistry(path=tmp_path / "instances.json").get(inst.id)
@@ -6268,6 +6306,12 @@ class TestSsmTunnelArgv:
             return FakeProc()
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        # stop() on the SSM transport reaps the child's whole process group by
+        # pid. FakeProc.pid is a made-up number, so the real signal would land
+        # on whatever unrelated process holds that pid on the host (on CI, an
+        # xdist worker). Keep the signal out of the OS; the fake's terminate()
+        # is the fallback path and settles returncode.
+        monkeypatch.setattr(stm._SshTunnel, "_signal_group", staticmethod(lambda pid, sig: False))
 
         async def main():
             t = _SshTunnel(

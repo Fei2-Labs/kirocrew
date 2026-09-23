@@ -30,6 +30,8 @@ from kiro_crew.acp.client import (
     AcpProcessDied,
     advertised_model_ids,
     model_is_unusable,
+    registration_rate_limited_error,
+    registration_throttle_line,
 )
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead, AcpRuntimeError, AcpSessionHandle
@@ -230,6 +232,11 @@ class AcpSessionProvider(LLMProvider):
             logger.debug("set_keep_transcript: handle rejected attribute", exc_info=True)
 
     @property
+    def work_scratch_dir(self) -> Path | None:
+        """The session tree's ``$KIROCREW_SCRATCH`` directory (see ``AcpRuntime.work_scratch_dir``)."""
+        return self._runtime.work_scratch_dir
+
+    @property
     def child_fidelity_aware(self) -> bool:
         """See AcpSessionHandle.child_fidelity_aware."""
         return getattr(self._handle, "child_fidelity_aware", False)
@@ -376,21 +383,11 @@ class AcpSessionProvider(LLMProvider):
                     yield event
         except AcpRuntimeDead as exc:
             # Translate the shared-runtime death into the exception types
-            # chat_runner handles (parity with AcpClient): auth-expiry ->
-            # AcpAuthRequired (non-retryable login prompt); otherwise
-            # AcpProcessDied. Without this, AcpRuntimeDead (an AcpRuntimeError,
-            # NOT an AcpError) escapes both the AcpProcessDied and AcpError
-            # handlers and surfaces as an unhandled crash.
-            if self._runtime.saw_not_logged_in():
-                # The runtime is the only object here that still knows which
-                # harness died, and each one signs in differently — read the
-                # remedy off its declaration rather than naming one harness's CLI
-                # to an operator running another.
-                raise AcpAuthRequired(
-                    host_auth.signed_out_message(self._runtime.acp_backend),
-                    backend=self._runtime.acp_backend,
-                ) from exc
-            raise AcpProcessDied(str(exc)) from exc
+            # chat_runner handles (parity with AcpClient) — see _translate_dead.
+            # Without this, AcpRuntimeDead (an AcpRuntimeError, NOT an AcpError)
+            # escapes both the AcpProcessDied and AcpError handlers and surfaces
+            # as an unhandled crash.
+            raise self._translate_dead(exc) from exc
         except AcpRuntimeError as exc:
             # Base AcpRuntimeError (e.g. prompt()'s "turn already active"
             # concurrent-prompt guard) is also OUTSIDE the AcpError hierarchy;
@@ -444,11 +441,22 @@ class AcpSessionProvider(LLMProvider):
     def _translate_dead(self, exc: AcpRuntimeDead) -> AcpProcessDied | AcpAuthRequired:
         """Map a shared-runtime death (AcpRuntimeDead — an AcpRuntimeError OUTSIDE
         the AcpError hierarchy) to the AcpError-hierarchy exception every caller
-        expects: AcpAuthRequired on auth-expiry, else AcpProcessDied. Keeps the
-        ENTIRE AcpSessionProvider surface within AcpError (+ asyncio.TimeoutError)
+        expects: AcpAuthRequired on auth-expiry, the typed transient
+        AcpRegistrationRateLimited when the retained stderr shows a throttled
+        dynamic registration, else AcpProcessDied. Keeps the ENTIRE
+        AcpSessionProvider surface within AcpError (+ asyncio.TimeoutError)
         so a runtime.send_* failure never escapes to a caller that only catches
         AcpError (e.g. chat_runner) and lands on its generic `except Exception`
-        (raw error card, no retry/reset). Mirrors stream()'s translation."""
+        (raw error card, no retry/reset). Mirrors stream()'s translation.
+
+        Auth is asked FIRST: a rejected credential is terminal and actionable,
+        so it must never be downgraded to a retryable throttle by a stray
+        throttle line in the same tail. The throttle branch is additionally
+        gated on the handle's ``prompt_or_tool_seen`` latch — a session that
+        already produced output or ran a tool must fail generically, because
+        the transient verdict would license a replay that can repeat side
+        effects. ``getattr`` fails CLOSED (seen=True) so a handle double
+        without the latch never widens the retry surface."""
         if self._runtime.saw_not_logged_in():
             # Same per-harness remedy as stream(): this translation is shared by
             # every runtime-touching call, so a literal here would misinform an
@@ -457,6 +465,11 @@ class AcpSessionProvider(LLMProvider):
                 host_auth.signed_out_message(self._runtime.acp_backend),
                 backend=self._runtime.acp_backend,
             )
+        if not getattr(getattr(self, "_handle", None), "prompt_or_tool_seen", True):
+            tail = getattr(self._runtime, "redacted_stderr_tail", lambda: "")()
+            cause = registration_throttle_line(tail) if tail else None
+            if cause is not None:
+                return registration_rate_limited_error(str(exc), cause)
         return AcpProcessDied(str(exc))
 
     async def _guarded(self, awaitable: Any) -> Any:

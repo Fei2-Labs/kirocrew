@@ -91,6 +91,9 @@ and any path segment starting with a dot.
 
 Path form depends on distribution: a registry app uses a repo-relative path
 (rewritten to a blob-proxy URL), while a built-in uses an absolute served URL.
+Write every path relative to the directory `app.json` lives in — for a registry
+entry with a `subdirectory`, the store joins that prefix before it builds the
+blob URL, so `ui/icons/app.png` is fetched as `apps/<name>/ui/icons/app.png`.
 
 | Field | Rendered where | Aspect |
 |-------|----------------|--------|
@@ -147,7 +150,9 @@ Execution model:
 - Every script is wrapped as `/bin/bash -c "set -euo pipefail\n<script>"`, so an
   unset variable or any failing command in a pipeline aborts the script. Write
   scripts assuming bash, and prefer `bash script.sh` over `source script.sh` so
-  the intent is explicit.
+  the intent is explicit. Native Windows hosts without `/bin/bash` report the
+  lifecycle hook as failed; avoid these hooks or document that prerequisite for
+  an app that claims Windows support.
 - Scripts run sandboxed with a minimal environment (no gateway secrets) plus
   `NONINTERACTIVE=1`, with `cwd` set to the app directory, under a cgroup
   ceiling, in their own process group so a timeout kills the whole tree. They
@@ -260,12 +265,12 @@ unreachable on exactly the hosts that need it to explain how to get the desktop 
 # Build the UI bundle if the app has one
 cd my-app/ui && npm install && npm run build && cd ..
 
-curl -X POST http://localhost:5476/api/apps/install \
-  -H 'Content-Type: application/json' \
-  -d '{"source": "./my-app"}'
-
-curl -X POST http://localhost:5476/api/apps/my-app/enable
+kirocrew app install /absolute/path/to/my-app
+kirocrew app enable my-app
 ```
+
+The REST routes require dashboard or app authentication; a bare `curl` request
+is not an equivalent local-install command.
 
 The dashboard's Sources menu on the Apps page can install from a local path too.
 
@@ -277,22 +282,12 @@ Verify:
 4. If it ships agents, ask one to do something from chat.
 5. If it ships crons, confirm they appear on the Schedule page.
 
-Debug:
+Debug the installed record with `kirocrew app info my-app`; the install command
+reports manifest validation errors directly and names the offending field.
 
-```bash
-curl http://localhost:5476/api/apps | python3 -m json.tool
-curl http://localhost:5476/api/apps/my-app/manifest | python3 -m json.tool
-```
-
-Manifest validation errors are returned by the install call itself, so a
-rejected install names the offending field.
-
-Iterate:
-
-```bash
-cd ui && npm run build && cd ..
-curl -X POST http://localhost:5476/api/apps/my-app/update
-```
+To iterate, rebuild the UI and use the installed app's **Update** action in the
+authenticated App Store UI. The update REST route is available to authenticated
+clients, but not to a bare `curl` request.
 
 For a tighter loop, turn on dev mode (`kirocrew app dev my-app`, or `POST
 /api/apps/my-app/dev`): UI files are then served with `Cache-Control: no-store`
@@ -412,7 +407,7 @@ The seed (and any federated registry index) uses this row shape:
 | `gitUrl` | yes | Any git-cloneable URL (`https://github.com/...`, `git@host:...`). The legacy `repo` field is still read and used as the clone target when no `gitUrl` is present. |
 | `repo` | | Repo identifier the blob proxy uses to serve committed images. |
 | `branch` | | Branch to read and clone. Defaults to `main`. For an entry cloning the registry repo itself (the monorepo layout), the registry's **configured** branch overrides this declaration — the index was read from that branch, so a divergent declaration names a state that does not exist there; the divergence is warning-logged. Entries cloning a different repository keep their declared branch. |
-| `subdirectory` | | Path within the repo holding `app.json`, for a monorepo layout. Treated as untrusted: it is joined with symlink-resolving containment and rejected if it escapes the clone root. |
+| `subdirectory` | | Path within the repo holding `app.json`, for a monorepo layout. Treated as untrusted: it is joined with symlink-resolving containment and rejected if it escapes the clone root. The store also joins it into every art path the manifest declares (`iconPath`, `heroImage*`, `screenshots*`) when it builds blob-proxy URLs, so those paths stay relative to the app directory. |
 | `resources` | | `"gateway"` (default) or `"app"`: who registers agents, skills, MCP servers, and crons. |
 | `lifecycle` | | `"gateway"` (default), `"app"`, or `"locked"`: who owns updates and uninstall. |
 | `detectInstalled` | | Shell command that exits 0 when the app is already present on the machine (for self-managed apps). It runs sandboxed with a 5s timeout. |
@@ -572,7 +567,7 @@ installed one.
 - [ ] No `..` or absolute paths in `agents`, `skills`, `sops`, `ui.entry`,
       `ui.pages[].entryPoint`, `backend.entryPoint`
 - [ ] `permissions` are minimal, and each one is actually used
-- [ ] Icon committed, square, 256x256 or larger
+- [ ] Icon committed, square, opaque, and 512x512
 - [ ] At least one screenshot and one hero image committed
 - [ ] `description` is plain text and reads well truncated to two lines
 - [ ] `tags` are lowercase and land the app in the right category

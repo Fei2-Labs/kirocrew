@@ -197,7 +197,7 @@ export interface StatusData {
    * AMBIGUOUS by construction: it is what an unconfigured channel and a
    * configured one that never started both look like. Nothing in this payload
    * separates them — each channel's own config endpoint reports `configured`,
-   * which is what Settings > Channels reads.
+   * which is what Settings > Messaging Channels reads.
    */
   channels?: Record<string, { connected: boolean; error: string }>
   /** Governance enforcement health. */
@@ -1072,6 +1072,15 @@ export interface ChatSlot {
    *  the absence of an answer, never a denial. DISPLAY only — the pin is
    *  deliberately kept when withheld, so this must not drive a write. */
   model_withheld?: boolean | null
+  /** Whether this session's turns ask Jev which model tier to run on -- the chat
+   *  picker's `Auto (Jev)` entry (`lib/jevRoute.ts`, `decisions/points/model_route.py`).
+   *
+   *  Shipped on every slot, so "the owner picked a model by hand" is a positive
+   *  value rather than an absent key. Unlike `model_withheld` and `served_model`
+   *  this IS the owner's own choice, so it drives the picker's highlight: a routed
+   *  slot stores `model: 'auto'`, and highlighting the Auto row would name a
+   *  behaviour the session does not have. */
+  jev_route?: boolean
   /** The model id the live session actually resolved to; `''`/absent when not
    *  known. A slot with no pin — or one whose pin was withheld — runs on the
    *  backend's own choice, which the pin cannot name, so this is what lets a
@@ -1430,12 +1439,25 @@ export interface SubagentActivity {
   result?: string
 }
 
+/** Where `clampToolOutput` (store/chatSlice.ts) removed the middle of a tool
+ *  payload: the stored string is `head + '\n' + tail`, `at` is the offset of
+ *  the tail (right after that newline) and `count` is how many characters were
+ *  dropped between the two. Renderers put the localized marker there at view
+ *  time, so the store never holds a rendered string and the marker follows a
+ *  later language switch. */
+export interface ToolPayloadCut {
+  at: number
+  count: number
+}
+
 export interface ToolActivity {
   type: string
   text: string          // tool name (or approval / activity label)
   purpose?: string      // tool purpose
   input?: string        // tool input (commands, file content, etc.)
   output?: string       // tool output (stdout, results, etc.)
+  input_cut?: ToolPayloadCut   // set only when `input` was clamped
+  output_cut?: ToolPayloadCut  // set only when `output` was clamped
   ts: number
   execution_started_at?: number // when execution began (after approval); survives remount
   auto?: boolean        // auto-approved tool call

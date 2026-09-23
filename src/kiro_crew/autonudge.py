@@ -215,6 +215,27 @@ AUTONUDGE_STOP_REASON = "autonudge_stop"
 # authorization the loop cannot grant itself.
 APPROVAL_STALL_REASON = "approval_stalled"
 
+# Persisted reason for a loop that stood down because its cycles kept failing to
+# get a model session at all. A delivered cycle whose turn dies on
+# ``session/new timed out`` costs a full turn's dispatch and produces nothing, so
+# re-arming on the plain interval buys another identical failure: observed on an
+# operator host as 15 consecutive auto-nudge cycles all ending in
+# ``session/new timed out after 90s (0/10 MCP server(s) reported)``, stopped only
+# by ``max_cycles`` running out. System-imposed like the other bounds -- the
+# remedy (host pressure easing, a gate unstarving) is not something the loop can
+# arrange -- so it is re-armable.
+SESSION_START_FAILURE_REASON = "session_start_failures"
+
+# Consecutive start failures before a wake is DEFERRED instead of fired, and
+# before the loop stands down for good. Two separate numbers because they answer
+# two different questions: the first assumes the host is briefly busy and slows
+# the poll (the failures are themselves evidence of contention, so retrying at
+# full rate adds to it), the second concludes that whatever is wrong is not
+# clearing and stops spending turns on it. A single landed turn on the slot
+# clears the streak, so a loop that recovers is never held back.
+_START_FAILURE_BACKOFF_AFTER = 3
+_START_FAILURE_STANDDOWN_AFTER = 5
+
 # Persisted reason for a loop stopped because its LAST delivered cycle ended on
 # a STRUCTURAL terminal error -- the backend rejected the prompt's shape as
 # malformed, deterministically, so re-firing the identical context every
@@ -260,7 +281,13 @@ class NudgeAdmissionRefused(RuntimeError):
 # ``_REPLACEABLE_LOOP_STOP_REASONS`` below). ``structural_terminal`` needs both,
 # for the same reason ``cycle_cap``/``runtime_budget`` do.
 _TERMINAL_BOUND_REASONS = frozenset(
-    {"cycle_cap", "runtime_budget", APPROVAL_STALL_REASON, STRUCTURAL_TERMINAL_REASON}
+    {
+        "cycle_cap",
+        "runtime_budget",
+        APPROVAL_STALL_REASON,
+        STRUCTURAL_TERMINAL_REASON,
+        SESSION_START_FAILURE_REASON,
+    }
 )
 
 # Persisted reason for a loop ``_load`` deactivated because its kill-switch path
@@ -715,6 +742,16 @@ class NudgeLoop:
     # outlives a restart; cleared on every revival so a re-granted loop is not
     # stopped by stale evidence.
     approval_stalled: bool = False
+    # How many of this loop's cycles in a row ended without ever getting a model
+    # session (``session/new`` timed out or otherwise failed). Raised by
+    # ``notify_cycle_start_failed`` and zeroed by ``notify_cycle_landed``, both
+    # driven by evidence from the slot's own turns rather than by a prediction.
+    # Consumed by ``_timer``: past ``_START_FAILURE_BACKOFF_AFTER`` the wake is
+    # deferred, past ``_START_FAILURE_STANDDOWN_AFTER`` the loop stops with
+    # ``SESSION_START_FAILURE_REASON``. Persisted, because the host condition
+    # that produces it routinely outlives a restart, and cleared on every revival
+    # so a recovered loop is not stood down by stale evidence.
+    consecutive_start_failures: int = 0
     # Absolute wall-clock deadline for the next fire (0 = unset: the next arm
     # starts a fresh full countdown). This is what makes the countdown
     # deadline-preserving — user turns cancel the pending timer TASK but never
@@ -1028,6 +1065,13 @@ class AutoNudgeService:
         # backoff + once-per-streak failure logging). Not persisted; resets on
         # a delivered fire, on removal, and on restart.
         self._rearm_fail_count: dict[str, int] = {}
+        # Which start-failure streak value each loop has already paid a deferral
+        # for, so one wake per failure is deferred and the next one fires. Without
+        # it the streak -- which only grows on a DELIVERED cycle -- freezes below
+        # the stand-down threshold and the loop polls at the backoff interval for
+        # good. Not persisted: a restart re-arms on a fresh full interval anyway,
+        # so the worst a lost entry costs is one extra deferral.
+        self._start_failure_deferred: dict[str, int] = {}
         # Strong refs to in-flight shielded add() tasks: keeps a detached
         # mutation supervised (no GC, failures logged) even when every awaiting
         # caller was cancelled. Discarded on completion.
@@ -1409,6 +1453,20 @@ class AutoNudgeService:
                     fallback=float(_MIN_IDLE_SECS),
                 )
                 loop.idle_secs = int(idle_num)
+                # ``consecutive_start_failures`` is compared with ``>=`` on every
+                # wake, and this store is agent-writable, so a persisted string or
+                # ``null`` would raise ``TypeError`` inside ``_timer`` and the
+                # active automation would silently never fire again -- and the
+                # malformed value survives every reload. Normalised at the
+                # boundary for the same reason ``gate``, ``self_armed`` and
+                # ``config_generation`` are, rather than by hardening the one
+                # comparison.
+                streak_num, streak_repaired = _repair_number(
+                    loop.consecutive_start_failures, lo=0.0, fallback=0.0
+                )
+                loop.consecutive_start_failures = int(streak_num)
+                if streak_repaired:
+                    self._store_dirty = True
                 if (
                     loop.monitor is not None
                     and loop.monitor.version == MONITOR_STATE_VERSION
@@ -2825,6 +2883,9 @@ class AutoNudgeService:
                         # silence this stop exists to end.
                         if not was_active:
                             loop.approval_stalled = False
+                            # Same rule, same reason: the streak is evidence
+                            # about a PAST run, and a revival starts a fresh one.
+                            loop.consecutive_start_failures = 0
                     else:
                         loop.stopped_reason = stopped_reason or MANUAL_STOP_REASON
             revived = loop.active and not was_active
@@ -2923,6 +2984,7 @@ class AutoNudgeService:
             return None
         self._cancel_timer(loop_id)
         self._rearm_fail_count.pop(loop_id, None)
+        self._start_failure_deferred.pop(loop_id, None)
         self._rearm_pending.discard(loop_id)
         self._accepted_monitor_turns.pop(loop_id, None)
         if persist:
@@ -4430,6 +4492,51 @@ class AutoNudgeService:
         )
         self._persist_soon()
 
+    def notify_cycle_start_failed(self, slot_key: str) -> None:
+        """Record that a turn in *slot_key* never obtained a model session.
+
+        Called from the chat runner's terminal-error path when the failure is
+        tagged ``session_start_failed`` and the turn was this loop's own cycle.
+        Evidence, not inference: the turn was dispatched, spent its budget and
+        produced nothing, which is the one thing that distinguishes a starved
+        cycle from a quiet one.
+
+        Records and returns. Like ``notify_approval_stalled``, the decision is
+        left to ``_timer``, which owns every terminal and scheduling decision and
+        evaluates them serialized before a fire -- deciding here would mean
+        touching a timer that may be mid-fire.
+        """
+        loop = self._find_by_slot(slot_key)
+        if not loop or not loop.active:
+            return
+        loop.consecutive_start_failures += 1
+        logger.warning(
+            "AutoNudge: loop %s's cycle never got a model session "
+            "(%d consecutive); it will back off at %d and stand down at %d",
+            loop.id,
+            loop.consecutive_start_failures,
+            _START_FAILURE_BACKOFF_AFTER,
+            _START_FAILURE_STANDDOWN_AFTER,
+        )
+        self._persist_soon()
+
+    def notify_cycle_landed(self, slot_key: str) -> None:
+        """Clear *slot_key*'s start-failure streak: a turn on it completed.
+
+        Any landed turn counts, a human's as much as a cycle's -- the streak is a
+        reading of whether this session can start at all, and a turn that reached
+        completion proves it can. That is the conservative direction: it can only
+        let a loop keep running, never stop one.
+        """
+        loop = self._find_by_slot(slot_key)
+        if not loop or not loop.consecutive_start_failures:
+            return
+        loop.consecutive_start_failures = 0
+        # Drop the paid-deferral marker with the streak it belonged to: a streak
+        # that climbs back to the same value must pay its own deferral again.
+        self._start_failure_deferred.pop(loop.id, None)
+        self._persist_soon()
+
     def notify_turn_complete(self, slot_key: str) -> None:
         """Called by gateway after HOOK_EVENT_STOP — resume the countdown for this slot.
 
@@ -5373,6 +5480,65 @@ class AutoNudgeService:
             await self.update(loop.id, active=False, stopped_reason=APPROVAL_STALL_REASON)
             self._emit("expired", loop)
             return
+        # Cycles that never reach a model session. A delivered cycle whose turn
+        # dies on ``session/new`` produced nothing, and firing the next one on the
+        # plain interval reproduces it -- 15 times in a row on the host this came
+        # from, until ``max_cycles`` happened to run out. Checked here, with the
+        # other terminal bounds, on recorded evidence only
+        # (``notify_cycle_start_failed``); a single landed turn on the slot clears
+        # the streak, so a loop that recovers is never held back.
+        #
+        # Stand-down is terminal in the same shape as the other bounds
+        # (deactivate, ``expired`` so the notifier tells the user rather than
+        # letting it go silent, re-armable once the host recovers). Below that,
+        # the wake is DEFERRED rather than spent: the delay escalates per failure
+        # past the threshold and is capped by the loop's own interval, so a loop
+        # under a briefly-loaded host slows to a poll instead of adding its own
+        # retries to the contention.
+        if loop.consecutive_start_failures >= _START_FAILURE_STANDDOWN_AFTER:
+            logger.warning(
+                "AutoNudge: loop %s stood down — %d consecutive cycles never got "
+                "a model session, so cycle %d would spend a turn to fail the same "
+                "way; it stays inspectable and can be resumed once the host "
+                "recovers",
+                loop.id,
+                loop.consecutive_start_failures,
+                loop.cycle_count + 1,
+            )
+            self._start_failure_deferred.pop(loop.id, None)
+            await self.update(loop.id, active=False, stopped_reason=SESSION_START_FAILURE_REASON)
+            self._emit("expired", loop)
+            return
+        if loop.consecutive_start_failures >= _START_FAILURE_BACKOFF_AFTER:
+            # ONE deferral per streak value, then fire again. The streak only
+            # grows on a DELIVERED cycle that fails, so deferring every wake at
+            # the same value would freeze it below the stand-down threshold and
+            # poll at the backoff interval forever -- a slower version of the
+            # very loop this exists to end. Paying the delay once per failure
+            # lets the next cycle either recover (a landed turn clears the
+            # streak) or advance it toward the stand-down.
+            already = self._start_failure_deferred.get(loop.id)
+            if already != loop.consecutive_start_failures:
+                self._start_failure_deferred[loop.id] = loop.consecutive_start_failures
+                shift = min(
+                    loop.consecutive_start_failures - _START_FAILURE_BACKOFF_AFTER,
+                    _REARM_BACKOFF_MAX_SHIFT,
+                )
+                backoff = min(
+                    _REARM_BACKOFF_SECS * (2**shift),
+                    _REARM_MAX_BACKOFF_SECS,
+                    loop.idle_secs,
+                )
+                logger.info(
+                    "AutoNudge: loop %s deferring cycle %d by %gs — %d consecutive "
+                    "cycles never got a model session",
+                    loop.id,
+                    loop.cycle_count + 1,
+                    backoff,
+                    loop.consecutive_start_failures,
+                )
+                self._arm_timer(loop, delay=backoff)
+                return
         # Fire. Update state only if the callback reports actual delivery —
         # otherwise skipped nudges (e.g. slot mid-turn) inflate cycle_count and
         # prematurely trip max_cycles. Missing callback → nothing to deliver.

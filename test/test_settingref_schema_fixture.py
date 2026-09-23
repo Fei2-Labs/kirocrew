@@ -27,6 +27,10 @@ DECISIONS_READER_PATH = ROOT / "website" / "src" / "pages" / "settings" / "decis
 FEATURE_PREVIEWS_PATH = (
     ROOT / "website" / "src" / "pages" / "settings" / "FeaturePreviewsSection.tsx"
 )
+# The Decisions (Jev) card itself. `FeaturePreviewsSection` mounts it and owns the
+# four per-device preview flags; every control that writes the keystone or a
+# `decisions.*` path lives here, so this is the file the cross-layer checks read.
+DECISIONS_CARD_PATH = ROOT / "website" / "src" / "pages" / "settings" / "DecisionsCard.tsx"
 TS_CONST_RE = r"export const {name} = '([^']+)'"
 
 
@@ -129,11 +133,55 @@ class TestDecisionsSettingCrossLayer:
         )
 
     def test_the_toggle_writes_the_consent_route_and_carries_no_config_key(self):
-        card = FEATURE_PREVIEWS_PATH.read_text(encoding="utf-8")
+        card = DECISIONS_CARD_PATH.read_text(encoding="utf-8")
         assert "api.saveDecisionsConsent(" in card
         assert (
             'configKey="decisions.enabled"' not in card
         ), "a configKey naming decisions.enabled would name a path nothing reads"
+        # The section that MOUNTS the card must not grow a second consent writer: two
+        # callers of the same keystone route are two places for an endpoint echo to
+        # drift from the address the reader was shown.
+        section = FEATURE_PREVIEWS_PATH.read_text(encoding="utf-8")
+        assert (
+            "api.saveDecisionsConsent(" not in section
+        ), "the mounting section writes consent too; the card is the one writer"
+
+    def test_the_card_offers_no_control_for_a_path_the_config_route_refuses(self):
+        """A field whose every save is refused is worse than a pointer line.
+
+        ``PATCH /api/config/kirocrew`` matches its allowlist exactly, and
+        ``decisions.provider.*`` is deliberately absent: the endpoint would let a
+        dashboard caller choose where the state a decision point collects is sent, and
+        ``api_key`` is schema-sensitive so the masked GET hands back a sentinel. The
+        card therefore SHOWS the address and names the path. Read as source text
+        because the defect is a call site, not a rendered string.
+        """
+        from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+        card = DECISIONS_CARD_PATH.read_text(encoding="utf-8")
+        reader = DECISIONS_READER_PATH.read_text(encoding="utf-8")
+        endpoint_path = _ts_const(reader, "DECISIONS_ENDPOINT_PATH")
+        budget_path = _ts_const(reader, "DECISIONS_HISTORY_BUDGET_PATH")
+        assert endpoint_path not in _EDITABLE_CONFIG
+        assert budget_path not in _EDITABLE_CONFIG
+        for const in ("DECISIONS_ENDPOINT_PATH", "DECISIONS_HISTORY_BUDGET_PATH"):
+            assert (
+                f"path: {const}" not in card
+            ), f"the card PATCHes {const}, which the config route refuses"
+        # The ceiling has a writer, and it is the owner-only consent route.
+        assert "api.saveDecisionsHistoryBudget(" in card
+
+    def test_every_tier_the_card_offers_is_editable_on_the_backend(self):
+        """The three pickers write real paths, or they are three dead controls."""
+        from kiro_crew.config.sections import DECISION_MODEL_ROUTE_TIERS
+        from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+        reader = DECISIONS_READER_PATH.read_text(encoding="utf-8")
+        prefix = _ts_const(reader, "DECISIONS_MODEL_ROUTE_PATH")
+        for tier in DECISION_MODEL_ROUTE_TIERS:
+            assert (
+                f"{prefix}.{tier}" in _EDITABLE_CONFIG
+            ), f"the card offers a picker for {tier}, which the config route refuses"
 
     def test_the_consent_routes_are_registered(self):
         from kiro_crew.dashboard import handlers
@@ -141,30 +189,54 @@ class TestDecisionsSettingCrossLayer:
         assert callable(handlers.api_decisions_consent_get)
         assert callable(handlers.api_decisions_consent_put)
 
-    def test_the_frontend_live_point_is_a_point_the_backend_ships(self):
-        """The WHOLE registry, spelled out, and which of its points the card names.
+    def test_the_frontend_and_backend_name_the_same_points(self):
+        """Both directions, because each one breaks a different surface.
 
-        Exact equality rather than membership, and that is the point of the test
-        rather than a detail of it: this is the list that decides what may send
-        conversation text off the machine, so a third point has to be a deliberate
-        edit HERE as well as in the gate. Membership would let the registry grow
-        with nobody asked, which is the ratchet this assertion is.
+        A point the FRONTEND names but the backend does not ship is a reader
+        waiting for a record nothing writes. A point the BACKEND ships but the
+        frontend cannot name draws nothing at all -- ``decisionRecord.ts``
+        dispatches on the record's own ``point`` and returns null for one it does
+        not know, so that direction fails silently and looks exactly like a healthy
+        release stamping no record.
 
-        The ORDER is the claim on top of the count. The card names the point whose
-        answer is CONSUMED -- its copy is about the switch changing which skill a
-        message loads -- while the annotating point only describes a tool call the
-        permission policy has already answered. A card naming that one would
-        promise the switch changes a decision it does not touch.
+        The frontend side is DISCOVERED, not listed: every ``DECISIONS_*_POINT``
+        constant the reader exports. So shipping a third point is one constant in
+        ``decisionsPreview.ts`` and no edit here -- which also keeps two branches
+        each adding a point from colliding on this file.
+
+        The ANNOTATING point is the one name held here rather than discovered: it
+        draws a badge on the tool card instead of a line in the strip, so the
+        reader exports no constant for it. The backend-minus-frontend difference
+        therefore has to come out as exactly that one name, never as a point whose
+        record no surface draws.
+
+        Discovery is asserted non-empty and anchored on the skills point, because a
+        scan that silently matched nothing would pass while measuring nothing.
         """
         from kiro_crew.decisions.gate import DECISION_POINT_NAMES
         from kiro_crew.decisions.points.tool_risk import POINT as ANNOTATION_POINT
 
-        point = _ts_const(DECISIONS_READER_PATH.read_text(encoding="utf-8"), "DECISIONS_LIVE_POINT")
-        assert DECISION_POINT_NAMES == (point, ANNOTATION_POINT), (
-            f"the card's point {point!r} plus the annotating point {ANNOTATION_POINT!r} "
-            f"no longer spell the backend registry {DECISION_POINT_NAMES}: a point was "
-            "added, removed or reordered, and a point is an egress path -- say here "
-            "which one the card is about"
+        source = DECISIONS_READER_PATH.read_text(encoding="utf-8")
+        names = re.findall(r"export const (DECISIONS_\w+_POINT)\b", source)
+        assert names, (
+            "no DECISIONS_*_POINT constant found in decisionsPreview.ts -- the "
+            "discovery pattern no longer matches how the reader spells a point, so "
+            "this assertion would compare nothing"
+        )
+        frontend = {_ts_const(source, name) for name in names}
+        assert (
+            "skills.select" in frontend
+        ), f"the reader stopped naming the skills point (found {sorted(frontend)})"
+        backend = set(DECISION_POINT_NAMES)
+        assert frontend <= backend, (
+            f"the reader names {sorted(frontend - backend)} which the backend does "
+            "not ship: a strip line waiting for a record nothing writes"
+        )
+        assert backend - frontend == {ANNOTATION_POINT}, (
+            f"the backend ships {sorted(backend - frontend - {ANNOTATION_POINT})} with "
+            f"no reader constant; only the annotating point {ANNOTATION_POINT!r} draws "
+            "outside the strip, and a point is an egress path -- name it in "
+            "decisionsPreview.ts so some surface shows what was sent"
         )
 
 

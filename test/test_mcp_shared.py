@@ -1184,15 +1184,15 @@ class TestStdioLoopCallerIdentity:
         finally:
             harness.close()
 
-    def test_no_usable_answer_does_not_refuse_the_call(self, monkeypatch):
-        """``resolution_failed`` stays permissive, against the security argument.
+    def test_no_usable_answer_refuses_the_call(self, monkeypatch):
+        """``resolution_failed`` refuses, because the exclusion set is unknown.
 
-        On the argument it should refuse: an exclusion may exist and the process
-        holding it cannot answer. That was implemented and measured, and the
-        repository's real-MCP end-to-end lane will not run a legitimate first tool
-        call under it. In this deployment an ordinary call reaches this arm, so
-        refusing costs every caller their tools rather than costing an attacker
-        one. Kept permissive and audited until the gateway can say why.
+        Nothing came back, or a ``5xx`` said the gateway is broken, or the resolve
+        raised. Every ``4xx`` returns before that arm, so this reason means the
+        policy could not be READ -- an operator exclusion may exist while the
+        process holding it cannot answer for it. Serving the empty set as a
+        permission is what would let an excluded tool run, so the call is refused
+        and the refusal names the same condition the audit trail does.
         """
         ran = []
         harness = _LoopHarness(monkeypatch, lambda n, a: ran.append(n) or "ok")
@@ -1204,12 +1204,69 @@ class TestStdioLoopCallerIdentity:
         try:
             harness.send(_tools_call_with_caller(53, "echo", "dashboard:chat-13"))
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
-            assert ran == ["echo"]
+            assert ran == []
+            _body = json.dumps(harness.responses[0][1])
+            assert "is unavailable" in _body
+            assert "resolution_failed" in _body
             ops = [
                 c.kwargs.get("operation")
                 for c in harness.sel_mock.log_api_access.call_args_list
             ]
-            assert "tool_policy.unenforced_call" in ops
+            assert "tool_policy.unenforced_call" not in ops
+        finally:
+            harness.close()
+
+    def test_the_unreachable_gateway_refusal_names_a_retry_not_a_spec_edit(
+        self, monkeypatch
+    ):
+        """The refusal has to diagnose the condition it actually hit.
+
+        ``policy_unreadable`` means the gateway read a spec and could not use it,
+        so its text sends the caller to the agents directory. ``resolution_failed``
+        means the gateway was never reached: no spec is implicated, and that same
+        text would have the caller edit healthy files to fix an outage, leaving the
+        edit as the real defect. The condition clears on its own, so the remedy is
+        a retry.
+        """
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "resolution_failed"),
+        )
+        try:
+            harness.send(_tools_call_with_caller(56, "echo", "dashboard:chat-16"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "could not reach the gateway" in body
+            assert "retry" in body
+            assert "agents directory" not in body
+            assert "could not parse" not in body
+        finally:
+            harness.close()
+
+    def test_an_excluded_tool_stays_excluded_when_the_gateway_cannot_answer(
+        self, monkeypatch
+    ):
+        """The defect this guards: a real exclusion going unenforced.
+
+        The named tool is genuinely excluded for this session, and the resolver
+        cannot reach the gateway to say so. The exclusion set therefore arrives
+        empty with ``resolution_failed``, which is indistinguishable by value
+        alone from an operator who excluded nothing. The reason is what keeps them
+        apart, so the excluded tool must not execute.
+        """
+        ran = []
+        harness = _LoopHarness(monkeypatch, lambda n, a: ran.append(n) or "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "resolution_failed"),
+        )
+        try:
+            harness.send(_tools_call_with_caller(55, "blocked", "dashboard:chat-15"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            assert ran == []
         finally:
             harness.close()
 

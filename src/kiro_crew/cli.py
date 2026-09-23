@@ -1603,7 +1603,7 @@ Examples:
         help="Run a script cron locally with real MCP tools; notifications are captured and printed instead of delivered",
     )
     cron_preview.add_argument(
-        "script", help="Script path in module:function format (e.g. ~/.kiro/crew/crons/my.py:run)"
+        "script", help="Script file in file.py:function format (e.g. ~/.kiro/crew/crons/my.py:run)"
     )
     cron_preview.add_argument("--message", "-m", default="", help="ctx.message value")
     cron_preview.add_argument(
@@ -2522,6 +2522,13 @@ Examples:
     # the two above: the crew log is an optional subsystem behind a flag, so a
     # session that never verifies or audits it spends nothing on the set.
     sub.add_parser("mcp-crew-log")
+    # mcp-debug (MCP server — the five read-only debug tools). Opt-in for the same
+    # reason: debugging a gateway is something a person asks for on purpose, so a
+    # session that never does it should not carry the schemas.
+    sub.add_parser("mcp-debug")
+    # mcp-panel (MCP server -- an agent publishes its own dashboard panel).
+    # Mounted only for an agent whose spec grants the opt-in set.
+    sub.add_parser("mcp-panel")
 
     # Builtin app MCP servers (spawned by the agent backend, not user-facing).
     # Only builtins that actually ship an ``mcp_server`` module get a verb —
@@ -3276,6 +3283,16 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # the module reads is itself flag-gated: `kirocrew gateway` boots through
         # this module and must not import the crew log to start.
         importlib.import_module("kiro_crew.mcp_crew_log").run_mcp_server()
+    elif args.command == "mcp-debug":
+        # Same importlib form and the same reason again. It matters more here than
+        # anywhere else on this list: this module's routes import kiro_crew.diag
+        # lazily and that package may not exist in the build at all, so importing
+        # this server eagerly would make a diagnostics gap break `kirocrew gateway`.
+        importlib.import_module("kiro_crew.mcp_debug").run_mcp_server()
+    elif args.command == "mcp-panel":
+        # Lazily imported like mcp-dashboard above: a default-off optional
+        # subsystem must not be imported just to start the gateway.
+        importlib.import_module("kiro_crew.mcp_panel").run_mcp_server()
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
         # Registration gates this verb on _builtin_mcp_server_available, and
         # _run_app_mcp_server is the ONE dispatch-time spelling of "import the

@@ -569,7 +569,7 @@ class TestGovernanceWithdrawsTheSeam:
 
 
 class TestPointName:
-    def test_the_shipped_vocabulary_is_the_two_points(self):
+    def test_the_shipped_vocabulary_is_the_shipped_points(self):
         """The whole allowlist, spelled out: a name reaches the provider or it does not.
 
         Held as an exact tuple rather than a membership check, so adding a point is
@@ -577,7 +577,15 @@ class TestPointName:
         decides what may send conversation text off the machine, and a test that
         only asked "is my name in it" would let one arrive unnoticed.
         """
-        assert DECISION_POINT_NAMES == ("skills.select", "tool.risk")
+        assert DECISION_POINT_NAMES == (
+            "skills.select",
+            "tool.risk",
+            "message.steer",
+            "model.route",
+            "compaction.keep",
+            "memory.recall",
+            "nudge.wake",
+        )
 
     @pytest.mark.parametrize("unknown", ["skills.dedupe", "cron.novelty", "", "skills.Select"])
     def test_an_unknown_point_is_refused_even_when_enabled(
@@ -595,13 +603,20 @@ class TestPointName:
     def test_every_shipped_name_is_admitted(self, install_impl, monkeypatch):
         """Each shipped point, given the egress scope its own request needs.
 
-        ``tool.risk`` carries tool-call arguments, so consent alone does not admit
-        it -- the keystone's ``tool_args`` scope does, and this test grants it rather
-        than dropping the point from the loop, because "every shipped name" is the
-        claim and a loop that skipped one would stop making it.
+        Three points carry a category the main switch never described, so consent
+        alone does not admit any of them -- ``tool.risk`` needs the keystone's
+        ``tool_args`` scope, ``compaction.keep`` its ``compaction`` one and
+        ``memory.recall`` its ``memory_text`` one. All are granted here rather than
+        dropping those points from the loop, because "every shipped name" is the claim
+        and a loop that skipped one would stop making it.
+
+        Granted through the gate's own table rather than by naming the readers: a point
+        added with a fourth scope is then admitted by this loop automatically, so the
+        test keeps asserting what it says instead of silently narrowing to three.
         """
         install_impl(_RecordingOracle())
-        monkeypatch.setattr(consent_mod, "consented_tool_args", lambda *_a, **_kw: True)
+        for reader_name, _category in gate_mod._POINT_SCOPES.values():
+            monkeypatch.setattr(consent_mod, reader_name, lambda *_a, **_kw: True)
         for name in DECISION_POINT_NAMES:
             assert is_enabled(name, config=_config()) is True
 
@@ -615,6 +630,44 @@ class TestPointName:
         install_impl(_RecordingOracle())
         assert is_enabled("skills.select", config=_config()) is True
         assert is_enabled("tool.risk", config=_config()) is False
+
+    def test_the_compaction_point_is_refused_without_its_own_scope(self, install_impl, monkeypatch):
+        """And the tool-argument scope does not grant the wider one.
+
+        ``tool_args`` was reviewed as the arguments of the one call about to run;
+        ``compaction.keep`` sends the conversation and every tool input the session
+        has accumulated. An install that granted the narrower yes must be inert here.
+        """
+        install_impl(_RecordingOracle())
+        monkeypatch.setattr(consent_mod, "consented_tool_args", lambda *_a, **_kw: True)
+        assert is_enabled("tool.risk", config=_config()) is True
+        assert is_enabled("compaction.keep", config=_config()) is False
+
+    def test_the_memory_point_is_refused_without_its_own_scope(self, install_impl, monkeypatch):
+        """And neither scope beside it grants it.
+
+        A recalled memory is text the agent wrote down turns or days ago, which is not
+        what either other scope was reviewed as, so an install that granted both must
+        still be inert for ``memory.recall``.
+        """
+        install_impl(_RecordingOracle())
+        monkeypatch.setattr(consent_mod, "consented_tool_args", lambda *_a, **_kw: True)
+        monkeypatch.setattr(consent_mod, "consented_compaction", lambda *_a, **_kw: True)
+        assert is_enabled("tool.risk", config=_config()) is True
+        assert is_enabled("compaction.keep", config=_config()) is True
+        assert is_enabled("memory.recall", config=_config()) is False
+
+    def test_every_scoped_point_is_inert_on_a_keystone_recording_no_scope(self, install_impl):
+        """The state every install consented before the scopes existed is in.
+
+        Driven off the gate's own table so a point added with a new scope is covered
+        without this test being touched.
+        """
+        install_impl(_RecordingOracle())
+        assert is_enabled("skills.select", config=_config()) is True
+        assert is_enabled("message.steer", config=_config()) is True
+        for name in gate_mod._POINT_SCOPES:
+            assert is_enabled(name, config=_config()) is False, name
 
 
 # ---------------------------------------------------------------------------

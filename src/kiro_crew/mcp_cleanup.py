@@ -17,9 +17,69 @@ import logging
 import re
 from collections.abc import Collection
 from pathlib import Path
+from typing import Any
 
 from kiro_crew.agent_sdk.mcp_refs import RESERVED_TOOL_NAMESPACES
 from kiro_crew.config.paths import kiro_home
+
+#: kiro-cli's enterprise-governance discriminator. The spec WRITER owns the
+#: literal (``agent._MCP_REGISTRY_TYPE``); this is the copy the readers share, and
+#: a ratchet test pins them equal.
+MCP_REGISTRY_TYPE = "registry"
+
+
+def mcp_entry_is_registry_governed(entry: Any) -> bool:
+    """Whether one ``mcpServers`` entry defers its launch to an admin's catalog.
+
+    A ``"type": "registry"`` entry names a catalog record rather than describing a
+    local process: in registry access mode the client resolves it by map key and
+    applies the catalog's own command, and OUTSIDE that mode the client drops it.
+    Neither outcome is a server this side may launch, which is why the answer does
+    not depend on whether registry mode is declared locally -- the marker alone
+    settles it.
+
+    Here beside :func:`mcp_entry_is_muted` because every site that decides whether
+    a server LAUNCHES has to give the same answer, and the gateway is one of them:
+    a marked entry it wraps into a broker stub carries a local command the client
+    never asked for, and the wrapped name is what the session projections subtract
+    as a "stubbed name" -- so the entry arrives as a live local process and the
+    marker governs nothing. The gateway reads this predicate for that reason, not
+    only the projections.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("type") == MCP_REGISTRY_TYPE
+
+
+def mcp_entry_is_muted(entry: Any) -> bool:
+    """Whether one ``mcpServers`` entry asks not to be launched.
+
+    Anything but an absent ``disabled`` or a literal ``False`` is a mute. That is
+    FAIL-CLOSED on purpose, and the direction matters because the two mistakes are
+    not symmetric: reading an odd value as "enabled" launches a server the user
+    tried to silence, while reading it as "muted" withholds one they can un-mute
+    by fixing the value. An ill-typed ``disabled`` is also not forwardable -- both
+    kiro-cli's spec schema and KAS's wire schema type the field as a boolean and
+    reject the document over it -- so there is no reading under which the odd value
+    yields a working server.
+
+    Lives here, in the module that already pins the shared managed-server set, so
+    the sites that decide whether a server LAUNCHES share one answer instead of
+    spelling it each. They did not: ``is True`` in the gateway rewriter against
+    ``is not False`` in the session projections meant a server muted with a
+    non-boolean was passed over by the rewriter's guard, wrapped into a live
+    pooling stub, and so subtracted from the projection as a "stubbed name" before
+    any mute check could see it -- muted in the spec, running in the session.
+
+    Not every reader of ``disabled`` belongs here. A roster row or a capability
+    listing answers "does the user consider this on", where ordinary truthiness is
+    right and a wrong answer costs a chip, not a process. This predicate is for
+    the launch decision.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("disabled", False) is not False
+
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +115,13 @@ ALWAYS_ON_BIN_MCP_SERVERS = (
     "kirocrew-core",
     "kirocrew-computer",
 )
-OPT_IN_BIN_MCP_SERVERS = ("kirocrew-dashboard", "kirocrew-work", "kirocrew-crew-log")
+OPT_IN_BIN_MCP_SERVERS = (
+    "kirocrew-dashboard",
+    "kirocrew-work",
+    "kirocrew-crew-log",
+    "kirocrew-debug",
+    "kirocrew-panel",
+)
 
 # Every managed-binary server name, regardless of how it reaches a spec. This is
 # the cleanup view: Kiro Crew never legitimately writes any of them into the
@@ -344,22 +410,29 @@ def purge_deleted_proxy_from_config(config: dict) -> list[str]:
     servers = config.get("mcpServers")
     if not isinstance(servers, dict):
         return []
-    to_remove = [
-        name for name, spec in servers.items()
-        if _invokes_deleted_playwright_proxy(spec)
-    ]
+    to_remove = [name for name, spec in servers.items() if _invokes_deleted_playwright_proxy(spec)]
     for name in to_remove:
         del servers[name]
     if to_remove:
         # Also strip @refs from tools/allowedTools so kiro-cli does not try
-        # to mount a server that no longer exists in the map.
+        # to mount a server absent from the map. Both spellings
+        # the server owns go: the bare ``@name`` and the per-tool
+        # ``@name/tool`` -- a per-tool grant left in ``allowedTools`` is an
+        # auto-approval on the deleted proxy's name, and that list never
+        # reaches the PreToolUse gate. Bounded by the ``/`` so a
+        # prefix-sharing name (``@namex``) is untouched. Rebuilt in place
+        # rather than ``list.remove`` so a duplicated ref cannot survive.
         for key in ("tools", "allowedTools"):
             lst = config.get(key)
             if isinstance(lst, list):
                 for name in to_remove:
                     ref = f"@{name}"
-                    while ref in lst:
-                        lst.remove(ref)
+                    owned = f"{ref}/"
+                    lst[:] = [
+                        t
+                        for t in lst
+                        if t != ref and not (isinstance(t, str) and t.startswith(owned))
+                    ]
         logger.info(
             "Purged deleted-proxy MCP entries from agent config: %s",
             to_remove,

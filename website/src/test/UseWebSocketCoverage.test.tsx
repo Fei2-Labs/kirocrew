@@ -371,7 +371,27 @@ describe('useWebSocket frame router', () => {
     }
   })
 
-  it('raises a desktop notification for an approval while the tab is hidden', () => {
+  it.each(['live', 'reconciled'])('fences %s approval commands while preserving its purpose policy', async delivery => {
+    const approval = {
+      id: 'ap-literal', source: 'cron', tool: 'execute_bash',
+      tool_input: 'echo ```; rm -rf *cache*', tool_purpose: '**Reason:** cleanup', ts: 5,
+    }
+    if (delivery === 'reconciled') vi.mocked(api.approvals).mockResolvedValueOnce([approval])
+    const { ws } = mount()
+    // Boot notification fetch and the pending-approval snapshot must settle first.
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    if (delivery === 'live') {
+      act(() => { ws.simulateMessage({ type: 'approval', data: approval }) })
+    }
+    const note = testStore.getState().notifications.items.find(n => n.approval_id === approval.id)
+    const body = '**Source:** cron\n\n````approval-command\necho ```; rm -rf *cache*\n````'
+    expect(note?.body).toBe(delivery === 'live' ? `${body}\n\n**Reason:** cleanup` : body)
+  })
+
+  it('hands an approval to the feed and raises no desktop notification of its own', () => {
+    // The feed entry is what reaches the OS (useNativeNotification constructs
+    // the toast, tagged with the approval id); a constructor here would be a
+    // second banner for the same approval.
     class MockNotification {
       static permission = 'granted'
       static instances: { title: string }[] = []
@@ -387,7 +407,10 @@ describe('useWebSocket frame router', () => {
           data: { id: 'ap-1', slot: ACTIVE, source: 'agent', tool: 'execute_bash', tool_input: '{}', ts: 5 },
         })
       })
-      expect(MockNotification.instances).toHaveLength(1)
+      expect(MockNotification.instances).toHaveLength(0)
+      const feedNote = testStore.getState().notifications.items.find(n => n.approval_id === 'ap-1')
+      expect(feedNote?.kind).toBe('approval')
+      expect(feedNote?.title).toContain('execute_bash')
       const card = chat().messages.find(m => m.role === 'permission')
       expect(card?.meta?.approval_id).toBe('ap-1')
       expect(chat().toolLog.some(e => e.approval_id === 'ap-1')).toBe(true)
@@ -1600,11 +1623,11 @@ describe('useWebSocket frame router', () => {
       ws.simulateMessage({ type: 'chat_status', data: { slot: ACTIVE, status: 'Compacting…' } })
     })
     expect(chat().slotContextPct[ACTIVE]).toBe(42)
-    expect(chat().slotStatusDetail[ACTIVE]?.text).toBe('Compacting…')
+    expect(chat().slotStatusDetail[ACTIVE]).toMatchObject({ kind: 'thinking', label: 'Compacting…' })
 
     // A status frame with no text is ignored rather than clearing the detail.
     act(() => { ws.simulateMessage({ type: 'chat_status', data: { slot: ACTIVE } }) })
-    expect(chat().slotStatusDetail[ACTIVE]?.text).toBe('Compacting…')
+    expect(chat().slotStatusDetail[ACTIVE]).toMatchObject({ kind: 'thinking', label: 'Compacting…' })
   })
 
   it('forwards the plan rate limit riding the context-usage frame', () => {

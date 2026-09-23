@@ -2101,8 +2101,14 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
                       ellipsis would re-collide the very labels the 64-char budget
                       distinguishes. minWidth:0 lets the flex item shrink;
                       overflowWrap:'anywhere' lets an unbreakable run (a sha, a
-                      base64 arg) wrap instead of clipping past the panel edge. */}
-                  <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+                      base64 arg) wrap instead of clipping past the panel edge.
+                      whiteSpace:'pre-wrap' because the default COLLAPSES runs of
+                      whitespace, which for an exact-string grant is an elision
+                      one character wide: `grep "a  b" f` would render as
+                      `grep "a b" f` while granting the two-space string. The
+                      budget clamp above is a layout decision for this narrow
+                      column; collapsing whitespace earns nothing anywhere. */}
+                  <span style={{ minWidth: 0, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
                     {i18nT('apps.mochi.approval.trust_this_command', { cmd: truncateCommandLabel(req.fullCommand) })}
                   </span></button>
               )}

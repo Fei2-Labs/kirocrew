@@ -330,6 +330,13 @@ export interface CommentsSidebarProps {
   onRefresh: () => void
   /** Optional "ask agent to address comments" — secondary, opens a chat. */
   onAskAgent?: () => void
+  /** Optional batch-submit bar for the footer, so a host with a chat to send to
+   *  can offer "send every pending comment as one message" from the sidebar
+   *  itself. Rendered as handed over: the bar is `ArtifactPanel`'s `SubmitBar`,
+   *  and the HOST renders it because this sidebar is one of that panel's own
+   *  children — importing it here would close an import cycle. Hosts without a
+   *  send path omit it and the footer is unchanged. */
+  submitBar?: React.ReactNode
   onClose: () => void
   /** Hide Resolve/Review/Delete (e.g. a fully read-only view). */
   restrictActions?: boolean
@@ -381,7 +388,7 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
   const isMobile = useIsMobile()
   const {
     comments, loading, remoteSyncError, loadError, mutationError, onDismissMutationError, onAdd, onReply, onResolve,
-    onMarkReview, onDelete, onRefresh, onAskAgent, onClose, restrictActions, hideResolve, hideDelete,
+    onMarkReview, onDelete, onRefresh, onAskAgent, submitBar, onClose, restrictActions, hideResolve, hideDelete,
     onCommentClick, onReopen, activeCommentId, flashCommentId,
     containerClassName, containerStyle, onEditComment,
   } = props
@@ -591,8 +598,9 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
         )}
       </div>
 
-      {/* footer: doc-level add + optional ask-agent */}
+      {/* footer: optional batch submit + doc-level add + optional ask-agent */}
       <div className="border-t border-border p-2 shrink-0 space-y-2">
+        {submitBar}
         {adding ? (
           <div>
             <textarea

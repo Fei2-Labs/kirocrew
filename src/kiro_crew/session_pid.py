@@ -1522,7 +1522,12 @@ def group_vouching_available() -> bool:
     return sys.platform == "linux"
 
 
-def _marked_group_members(pgid: int, instance: str) -> dict[int, str | None]:
+def _marked_group_members(
+    pgid: int,
+    instance: str,
+    *,
+    require_runtime_identity: bool = True,
+) -> dict[int, str | None]:
     """Live members of process group *pgid* spawned as incarnation *instance*.
 
     Returned as ``pid -> start id`` so a caller that signals the group twice can
@@ -1551,6 +1556,20 @@ def _marked_group_members(pgid: int, instance: str) -> dict[int, str | None]:
     so the answer is ``{}`` on macOS and Windows and the caller signals nothing
     -- a missed reap there, never a wrong kill. Zombies are skipped: they hold
     no memory and cannot be signalled into exiting.
+
+    *require_runtime_identity* is the ARGV gate
+    (:func:`_tracked_child_has_runtime_identity`), on by default because it is the
+    shape the ACP runtime's own group has. A caller whose tree is not an agent
+    runtime turns it OFF -- an app backend's members are whatever its manifest runs
+    (a uvicorn worker, a build subprocess), so requiring the runtime shape excludes
+    every one of them and the reap reaches nothing. Turning it off is not "no
+    identity": the group and instance checks above still apply and are already
+    conclusive, because the instance is a fresh value per spawn and cannot be
+    inherited from an earlier or later incarnation of the same group number. The
+    ACP path's reason for the extra gate -- an intentional survivor that merely
+    inherited the TREE-WIDE ``KIROCREW_SPAWNED`` marker -- does not reach a member
+    of THIS group: a process that deliberately detaches calls ``setsid`` and
+    thereby leaves the group. See :func:`signal_orphaned_spawn_group`.
     """
     if not group_vouching_available() or pgid <= 1 or not instance:
         return {}
@@ -1580,7 +1599,7 @@ def _marked_group_members(pgid: int, instance: str) -> dict[int, str | None]:
         if (
             _env_spawn_instance(member) == instance
             and _env_has_kirocrew_marker(member)
-            and _tracked_child_has_runtime_identity(member)
+            and (not require_runtime_identity or _tracked_child_has_runtime_identity(member))
         ):
             members[member] = _pid_start_token(member)
     return members
@@ -1665,13 +1684,14 @@ def _signal_pid_by_identity(pid: int, sig: int, start: str) -> bool:
         os.close(fd)
 
 
-def _signal_orphaned_runtime_group(
+def _vouch_and_signal_orphaned_group(
     pgid: int,
     sig: int,
     instance: str,
     *,
     expected: Mapping[int, str | None] | None = None,
-) -> dict[int, str | None]:
+    require_runtime_identity: bool = True,
+) -> tuple[dict[int, str | None], dict[int, str | None]]:
     """Signal a runtime's group members after its leader has been reaped, if ours.
 
     The kill path that signals a live tree is ``killpg(getpgid(root))``, and it
@@ -1707,19 +1727,28 @@ def _signal_orphaned_runtime_group(
     incarnation, the start id proves the pass is looking at the same processes,
     and a process that was not signalled on the first pass owes no escalation.
 
-    Returns the members actually signalled, ``pid -> start id`` -- the value a
-    caller hands back as *expected* -- or an empty map when nothing was. A
-    member that exited between the vouch and the signal, or whose identity no
-    longer reads as vouched, is skipped. A refused signal is logged and skipped:
-    a teardown must finish clearing its own state and pruning its PID entries
-    whatever the kernel answered, and a signal this process was refused is one
-    the periodic sweep retries on its own cadence.
+    Returns ``(vouched, signalled)``: the live members the vouch FOUND, and the
+    subset a signal was actually delivered to -- the latter being the value a
+    caller hands back as *expected*. A member that exited between the vouch and the
+    signal, or whose identity stops reading as vouched, is skipped; so is one
+    whose signal the kernel REFUSED, which is why the two maps are reported
+    separately. A teardown that only has to clear its own state can ignore the
+    census (see :func:`_signal_orphaned_runtime_group`); a caller deciding whether
+    to keep an orphan's only record cannot, because an empty ``signalled`` alone
+    cannot say whether the group is gone or merely unreachable right now.
+
+    *require_runtime_identity* is passed through to :func:`_marked_group_members`;
+    a caller whose tree is not an agent runtime turns it off. See
+    :func:`signal_orphaned_spawn_group`, the public entry point for those.
     """
     if platform_compat.IS_WINDOWS or pgid <= 1 or pgid == os.getpgrp() or not instance:
-        return {}
-    members = _marked_group_members(pgid, instance)
-    if not members:
-        return {}
+        return {}, {}
+    vouched = _marked_group_members(
+        pgid, instance, require_runtime_identity=require_runtime_identity
+    )
+    if not vouched:
+        return {}, {}
+    members = vouched
     if expected is not None:
         still_ours: dict[int, str | None] = {
             p: start
@@ -1728,13 +1757,13 @@ def _signal_orphaned_runtime_group(
         }
         if not still_ours:
             logger.info(
-                "_signal_orphaned_runtime_group: none of the %d member(s) vouched for "
+                "_vouch_and_signal_orphaned_group: none of the %d member(s) vouched for "
                 "group %d are still alive; not re-signalling a group that may be a "
                 "newer runtime's",
                 len(expected),
                 pgid,
             )
-            return {}
+            return vouched, {}
         # The escalation's target set is the FIRST pass's, not a fresh census: a
         # member found only now was not signalled then, owes no grace, and is
         # exactly what a newer incarnation of the number would look like.
@@ -1759,8 +1788,8 @@ def _signal_orphaned_runtime_group(
             continue
         except OSError:
             logger.warning(
-                "_signal_orphaned_runtime_group: signal %d to pid %d (group %d) refused; "
-                "leaving it to the orphan sweep",
+                "_vouch_and_signal_orphaned_group: signal %d to pid %d (group %d) refused; "
+                "leaving the member alive; the caller decides what a refusal means",
                 sig,
                 member,
                 pgid,
@@ -1768,7 +1797,76 @@ def _signal_orphaned_runtime_group(
             )
             continue
         signalled[member] = start
-    return signalled
+    return vouched, signalled
+
+
+def _signal_orphaned_runtime_group(
+    pgid: int,
+    sig: int,
+    instance: str,
+    *,
+    expected: Mapping[int, str | None] | None = None,
+) -> dict[int, str | None]:
+    """The ACP teardown's view of :func:`_vouch_and_signal_orphaned_group`.
+
+    Returns only what was SIGNALLED, which is all this caller acts on: an ACP
+    teardown clears its own state and prunes its PID entries whatever the kernel
+    answered, so a refused signal changes nothing it does next. A caller that must
+    tell "the group is empty" apart from "every signal was refused" -- because it
+    is deciding whether to keep a record that is an orphan's only handle -- needs
+    the vouched census too and calls the implementation through
+    :func:`signal_orphaned_spawn_group`.
+    """
+    return _vouch_and_signal_orphaned_group(pgid, sig, instance, expected=expected)[1]
+
+
+def signal_orphaned_spawn_group(
+    pgid: int,
+    sig: int,
+    instance: str,
+    *,
+    expected: Mapping[int, str | None] | None = None,
+) -> tuple[dict[int, str | None], dict[int, str | None]]:
+    """Signal a NON-agent-runtime spawn's group members after its leader is gone.
+
+    Public entry point onto :func:`_vouch_and_signal_orphaned_group` for a tree
+    that Kiro Crew spawned as its own session leader but which is not an ACP
+    runtime -- today an app backend (``kiro_crew.apps.backend``), whose members are
+    whatever the app's manifest runs. Read that function's docstring for the
+    reasoning; the single difference in the signalling is that the per-member ARGV
+    gate is off, because an app backend's tree never has the runtime shape and
+    would otherwise vouch for nothing.
+
+    Every other guarantee is the one the ACP path makes and is deliberately not
+    re-implemented here: the group is resolved from the session-leader contract
+    rather than from the dead pid, each member is vouched by the caller's exact
+    per-spawn instance token, each signal is pinned to a pid plus its start
+    instant (never aimed at the group NUMBER, which the kernel may have reissued),
+    an escalation signals only members the first pass vouched, and a host that
+    cannot read the vouch signals nothing at all.
+
+    Returns ``(vouched, signalled)``: the live members the vouch FOUND, and the
+    subset a signal was actually delivered to. The ACP path discards the census
+    because a refused signal changes nothing it does next, but this caller is
+    deciding whether to keep a record that is an orphan's only handle, and for that
+    the two must be told apart: an empty ``signalled`` with a non-empty ``vouched``
+    means the members are alive and the kernel refused (a later attempt can
+    succeed), while both empty means the group is genuinely gone. Collapsing them
+    into one count is how a refusal comes to look like a completed reap.
+
+    Callers must stamp a fresh ``KIROCREW_SPAWN_INSTANCE`` on the tree's root at
+    spawn time and persist it with the pid they will later reap by; without the
+    token there is no identity to vouch with and both maps come back empty. Check
+    :func:`group_vouching_available` to report a host where the vouch cannot be
+    read as the leak it is, rather than as a completed reap.
+    """
+    return _vouch_and_signal_orphaned_group(
+        pgid,
+        sig,
+        instance,
+        expected=expected,
+        require_runtime_identity=False,
+    )
 
 
 def _provider_tree_gone(
@@ -3392,12 +3490,32 @@ def _read_env_has_kirocrew_marker(pid: int, proc_root: Path | None = None) -> bo
 
     ``None`` distinguishes an unreadable environment from a readable one that
     lacks the marker. An explicit *proc_root* permits fixture-owned process
-    tables on every host; production reads remain Linux-only.
+    tables on every host and always takes the ``/proc`` path, so a fixture's
+    verdict never depends on the host it runs on.
+
+    Two production arms, one per platform that HAS a same-uid environ oracle:
+
+    * Linux reads ``/proc/<pid>/environ``.
+    * macOS reads the same exec-time environment out of ``sysctl
+      KERN_PROCARGS2`` (:func:`platform_compat.darwin_process_environ`) -- the
+      kernel record ``ps -E`` reads, answered for a same-uid process with no
+      entitlement and no elevated privilege, and already relied on in this
+      codebase for argv.
+
+    Both are in-process kernel reads of a copy fixed at exec, which is what
+    makes the marker ownership evidence rather than a claim: a same-uid process
+    can write any file and set any argv, but it cannot alter another process's
+    exec-time environment. Every other platform has no such oracle and stays
+    ``None``, which the boolean wrapper turns into a refusal.
     """
-    if sys.platform != "linux" and proc_root is None:
-        return None
-    root = proc_root if proc_root is not None else Path("/proc")
     needle = f"{KIROCREW_SPAWNED_ENV}={KIROCREW_SPAWNED_VALUE}".encode()
+    if proc_root is None:
+        if sys.platform == "darwin":
+            entries = platform_compat.darwin_process_environ(pid)
+            return None if entries is None else needle in entries
+        if sys.platform != "linux":
+            return None
+    root = proc_root if proc_root is not None else Path("/proc")
     try:
         environ = (root / str(pid) / "environ").read_bytes()
     except OSError:
@@ -3431,11 +3549,11 @@ def _env_spawn_instance(pid: int, proc_root: Path | None = None) -> str | None:
 def _env_has_kirocrew_marker(pid: int, proc_root: Path | None = None) -> bool:
     """True if *pid*'s environment carries the ``KIROCREW_SPAWNED`` marker.
 
-    Reads ``/proc/<pid>/environ`` (exec-time environment, same-UID readable).
-    Linux-only and FAIL-CLOSED: any read failure — and every non-Linux
-    platform, where there is no reliable same-UID environ read — returns
-    ``False`` so the marked-launcher sweep path never kills without positive
-    identity. macOS/Windows keep the pre-existing cmdline-marker-only behavior.
+    Reads the exec-time environment through :func:`_read_env_has_kirocrew_marker`
+    (``/proc`` on Linux, ``sysctl KERN_PROCARGS2`` on macOS) and collapses its
+    tri-state answer to a verdict. FAIL-CLOSED: any read failure, and every
+    platform with no same-UID environ oracle — Windows — returns ``False``, so a
+    sweep path that needs this marker never kills without positive identity.
     *proc_root* is a test seam for fixture-owned process tables.
     """
     return _read_env_has_kirocrew_marker(pid, proc_root) is True
@@ -3449,7 +3567,9 @@ def _is_sweepable_orphan_mcp(pid: int, cmdline: bytes) -> bool:
        the pre-existing behavior, works on Linux and macOS.
     2. cmdline is a fingerprint-less MCP launcher shape AND the process
        environ carries the ``KIROCREW_SPAWNED`` marker (catches escaped
-       ``npx @playwright/mcp`` trees; Linux-only, fail-closed elsewhere).
+       ``npx @playwright/mcp`` and ``<launcher> mcp start-server`` trees).
+       Needs a same-uid environ oracle, which Linux and macOS have and Windows
+       does not, so this arm is fail-closed there.
     """
     if _is_orphan_mcp(cmdline):
         return True
@@ -3807,6 +3927,50 @@ def _tracked_agent_pids() -> set[int]:
     """
     tracked, _complete = _read_tracked_agent_pids()
     return tracked
+
+
+def tracked_agent_pid_owners() -> dict[int, int]:
+    """``{tracked pid: the pid that owns its registry entry}`` -- READ ONLY.
+
+    A diagnostic accessor, added for :mod:`kiro_crew.diag.procs` so a process
+    view does not have to re-spell this file format. It grants nothing and
+    authorizes nothing: it neither writes, locks, signals, nor reports
+    completeness, and no reaper consults it.
+
+    The two files record opposite field orders (:data:`_REAPABLE_PID_FIELD`),
+    and the owner is the field the reapers deliberately ignore: in
+    ``kiro_session_pids.txt`` it is the GATEWAY that spawned the runtime, and in
+    ``kiro_pids.txt`` it is the tracked PARENT the descendant hangs off. Both
+    answer "who does this process belong to" for an operator reading a tree,
+    which is why they are surfaced together here and nowhere else.
+
+    Session entries win a collision: the two files share one number space, and
+    the session entry is the one that names a gateway. A legacy single-field
+    line records no owner at all and is skipped rather than given a fabricated
+    one. This is a SUBTRACTIVE read in the same sense as
+    :func:`_pid_start_token` -- a pid absent from the result means "no recorded
+    owner", never "not ours".
+    """
+    owners: dict[int, int] = {}
+    paths = (_session_pid_file_path(), _pid_file_path())
+    for path, (_label, reapable_index) in zip(paths, _REAPABLE_PID_FIELD):
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        owner_index = 1 - reapable_index
+        for line in raw.split():
+            fields = line.split(":")
+            if len(fields) < 2:
+                continue  # legacy bare-PID line: no owner recorded
+            try:
+                pid = int(fields[reapable_index])
+                owner = int(fields[owner_index])
+            except ValueError:
+                continue
+            if pid > 0 and owner > 0:
+                owners.setdefault(pid, owner)
+    return owners
 
 
 def _is_untracked_managed_agent_orphan(pid: int, cmdline: bytes, tracked_pids: set[int]) -> bool:

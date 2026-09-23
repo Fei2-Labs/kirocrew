@@ -46,6 +46,7 @@ from kiro_crew.constants import (
 # the role pin / provider default"). Import-safe: ``effort`` pulls in only
 # ``model_registry`` (stdlib-only), so no cycle back into validation.
 from kiro_crew.effort import EFFORT_VALUES
+from kiro_crew.lesson_validation import LESSON_APPLIES_VALUES
 from kiro_crew.monitoring.models import (
     MAX_MONITOR_AGENT_TURNS,
     MAX_MONITOR_CADENCE_SECS,
@@ -62,6 +63,7 @@ from kiro_crew.monitoring.registry import (
 )
 from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
 from kiro_crew.solo_spawn import SOLO_SPAWN_REASONS
+from kiro_crew.work_vocab import WORK_ITEM_STATES, WORK_VERDICTS, WORK_WORKER_STATUSES
 
 # ── Constants ──
 
@@ -95,6 +97,29 @@ MAX_RESPONSE_LEN = 100_000  # truncate tool responses
 ALLOWED_LESSON_CATEGORIES = frozenset({"tool", "preference", "knowledge"})
 
 
+def bounded_session_id(value: object) -> "str | None":
+    """*value* when it is a non-empty ACP session id within
+    :data:`MAX_ACP_SESSION_ID_LEN`, else ``None``.
+
+    The one spelling of the bound, here because more than one store retains these
+    ids and a bound applied twice is a bound that can diverge -- two same-named
+    private copies had already split on their sentinel before this became shared.
+
+    The id comes from the backend, or is read back from a file an agent can write,
+    so it is input rather than a fact at every retention point. An over-long or
+    non-string value answers "no id" rather than a truncated one, which would name
+    a different unit; and a caller that retains an unbounded string can push a
+    whole record past its own maximum size, where the record is dropped rather
+    than truncated, so one bad value costs a record that had nothing to do with it.
+
+    Callers wanting an empty string rather than ``None`` spell it ``or ""`` at the
+    call site, so the sentinel is the caller's choice and not a second definition.
+    """
+    if not isinstance(value, str) or not value or len(value) > MAX_ACP_SESSION_ID_LEN:
+        return None
+    return value
+
+
 def normalize_lesson_category(value: object, *, strict: bool) -> str:
     """Normalize a lesson category to a usable string label.
 
@@ -119,6 +144,9 @@ def normalize_lesson_category(value: object, *, strict: bool) -> str:
 
 # Allowed scopes for lessons (mirrors the learn_add MCP inputSchema enum).
 ALLOWED_LESSON_SCOPES = frozenset({"global", "workspace"})
+# Derived from the vocabulary module rather than restated, so a new tier cannot be
+# accepted by one surface and refused by the other.
+ALLOWED_LESSON_APPLIES = frozenset(LESSON_APPLIES_VALUES)
 
 # The ``GET /api/lessons`` window: how many lessons one call returns when the
 # caller names no ``limit``, and the most it may ask for. Both the route and the
@@ -1168,6 +1196,11 @@ LEARN_ADD_SCHEMA = ToolSchema(
         # rather than stored as a lesson that reports success and applies nowhere.
         # Whether the named path exists is still the gate's business, at injection.
         FieldSpec("repo_scope", str, max_len=MAX_SHORT_STRING, pattern=SCOPE_FRAGMENT_RE),
+        # Which startup tier the correction belongs to, as STATED by the caller.
+        # Nothing infers it from category, source or wording, because none of
+        # those separates a standing rule from a past finding. Absent leaves the
+        # row unstated, which is served as a standing rule.
+        FieldSpec("applies", str, allowed=ALLOWED_LESSON_APPLIES),
         # scope/workspace: the /api/lessons handler stores and lists
         # workspace-scoped lessons, but that tier does NOT reach a prompt -- the
         # context builder gates injected lessons on repo_scope instead. The
@@ -1751,7 +1784,7 @@ WORKFLOW_RERUN_SCHEMA = ToolSchema(
 
 # Artifact tools — slug pattern matches kiro_crew.artifacts._SLUG_RE.
 _ARTIFACT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$")
-_ARTIFACT_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}$")
+_ARTIFACT_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}\Z")
 _ARTIFACT_KIND_RE = re.compile(r"^(widget|html|markdown|svg|json|text|image|webapp)$")
 
 # Model identifiers passed to kiro-cli ``--model`` (AcpRuntime). First char
@@ -2479,6 +2512,25 @@ _ISSUE_RADAR_CREW_SKIP_SCOPES = frozenset(
     }
 )
 
+#: Work-item fields the record tool may EMPTY through its ``clear`` list. Spelled
+#: out so the tool schema advertises them as an enum; pinned against the entry
+#: type's ``RADAR_CLEARABLE_FIELDS`` by test, so the two cannot drift.
+_ISSUE_RADAR_CREW_CLEARABLE_FIELDS = frozenset(
+    {
+        "decision",
+        "why",
+        "next",
+        "worktree",
+        "branch",
+        "base_sha",
+        "pr_number",
+        "claim_comment_id",
+        "ci_state",
+        "labels_applied",
+        "outcome",
+    }
+)
+
 # Abbreviated-or-full git object name. Bounds ``base_sha`` to something that can
 # actually be handed to git on a resume; a resumed turn checks out from this
 # value, so an arbitrary 5k string here is a resume that fails much later.
@@ -2520,9 +2572,11 @@ ISSUE_RADAR_CREW_READ_SCHEMA = ToolSchema(
 ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
     tool_name="issue_radar_crew_record",
     fields=[
-        # Bounds the number that becomes the work item's FILENAME
-        # (``crews/<crew_id>/<n>.json``) — same ENAMETOOLONG rationale as the
-        # investigation record, hence the same constant.
+        # Bounds the number the work item is KEYED by: a JSON int on one
+        # ``radar/recorded`` crew log entry and the string key the fold files the
+        # item under. The bound guards a key rather than a path, and keeps the
+        # same constant as the investigation record so a number a crew records is
+        # one every other Issue Radar surface can also hold.
         #
         # NOT required. A crew that swept its queue and took nothing has no issue
         # to name, and requiring one here left it recording the cycle against an
@@ -2531,7 +2585,7 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
         # ``sweep`` is valid ONLY without one — is enforced on the write route and
         # in the store, because it is a relation between two fields and this
         # schema validates them one at a time. Keeping the bound here still
-        # matters: when a number IS sent it is the filename.
+        # matters: when a number IS sent it is the item's key.
         FieldSpec("number", int, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER),
         FieldSpec("phase", str, max_len=32, allowed=_ISSUE_RADAR_CREW_PHASES),
         # Bounded but deliberately NOT ``allowed=``, unlike ``phase`` beside it.
@@ -2545,7 +2599,7 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
         # an enum in the tool schema, so the model is told what to pick.
         FieldSpec("skip_scope", str, max_len=32),
         # ``outcome`` is a bounded free string, NOT an enum: the store keeps it
-        # as free text (``crew_store.upsert_work_item``) and no vocabulary is
+        # as free text (``crew_store.commit_work_progress``) and no vocabulary is
         # defined anywhere in the app, so an allowlist invented here would
         # reject a legitimate terminal outcome and lose it.
         FieldSpec("outcome", str, max_len=MAX_SHORT_STRING),
@@ -2583,6 +2637,10 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
             item_max_len=MAX_SHORT_STRING,
             max_items=20,
         ),
+        # Names of work-item fields this update empties. The route checks each name
+        # against the store's clearable list and refuses an unknown one; this bound
+        # only keeps the list from being a payload.
+        FieldSpec("clear", list, item_type=str, item_max_len=32, max_items=16),
         # One public progress line. Short by design: it is rendered as a list
         # item inside the claim comment's <details> block, not as a report.
         FieldSpec("event", str, max_len=MAX_SHORT_STRING),
@@ -3493,6 +3551,106 @@ MCP_CREW_LOG_SCHEMAS: dict[str, ToolSchema] = {
 }
 
 
+# ── Tool Schemas (MCP Debug — server ``kirocrew-debug``) ──
+#
+# Its own registry for the same reason the crew-log one is separate: the five
+# debug tools ship on an opt-in server, and a session that is not debugging a
+# gateway must not pay for their schemas.
+#
+# What is NOT here is the load-bearing part. No schema carries a path, a pid to
+# signal, a file to write, or a flag to set: every field is a QUESTION narrowing
+# (a window, a filter, a format) so the surface cannot express an action. That is
+# a stronger guarantee than an allowlist someone has to keep correct as fields
+# are added. ``session`` is the one field naming another party, and it is a scope
+# REQUEST that the route re-decides on the caller's own forwarded identity — a
+# caller naming a session it may not read is refused there, not trusted here.
+#
+# The caps restate the server's own (``mcp_debug.MAX_SAMPLE_SECONDS``) rather than
+# importing them, because ``validation`` is imported by the gateway on every
+# request path and an MCP stdio server module is not; ``test_mcp_debug.py`` pins
+# the two together so they cannot drift.
+_DEBUG_THREAD_MODES = frozenset({"now", "sample", "dumps"})
+_DEBUG_PROCESS_FORMATS = frozenset({"tree", "flat"})
+
+#: Seconds of on-demand sampling one call may ask for. Mirrors
+#: ``mcp_debug.MAX_SAMPLE_SECONDS``; the route clamps independently.
+_DEBUG_MAX_SAMPLE_SECONDS = 60
+
+#: Characters of a free-text window or filter argument. Generous for an ISO
+#: timestamp or a '30m' window and far short of anything that could carry a
+#: payload into a route's query string.
+_DEBUG_MAX_ARG_CHARS = 128
+
+DEBUG_GATEWAY_SCHEMA = ToolSchema(tool_name="debug_gateway")
+
+DEBUG_REFUSALS_SCHEMA = ToolSchema(
+    tool_name="debug_refusals",
+    fields=[
+        FieldSpec("session", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("since", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("last", int, min_val=1, max_val=1000),
+    ],
+)
+
+DEBUG_THREADS_SCHEMA = ToolSchema(
+    tool_name="debug_threads",
+    fields=[
+        FieldSpec("mode", str, allowed=_DEBUG_THREAD_MODES),
+        FieldSpec("seconds", (int, float), min_val=0, max_val=_DEBUG_MAX_SAMPLE_SECONDS),
+        FieldSpec("hz", int, min_val=1, max_val=1000),
+        FieldSpec("deep", bool),
+        # A dump NAME, never a path: the route resolves it inside the crash-dump
+        # store's own directory, so a separator or a parent reference here cannot
+        # address a file outside it. Bounded and pattern-checked so a traversal
+        # attempt is refused at the schema rather than relied upon to fail later.
+        FieldSpec(
+            "read",
+            str,
+            max_len=_DEBUG_MAX_ARG_CHARS,
+            pattern=re.compile(r"^[A-Za-z0-9._-]+$"),
+        ),
+    ],
+)
+
+DEBUG_PROCESSES_SCHEMA = ToolSchema(
+    tool_name="debug_processes",
+    fields=[
+        FieldSpec("format", str, allowed=_DEBUG_PROCESS_FORMATS),
+        FieldSpec("kind", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("owner", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("orphan_only", bool),
+        FieldSpec("include_env", bool),
+    ],
+)
+
+DEBUG_SNAPSHOTS_SCHEMA = ToolSchema(
+    tool_name="debug_snapshots",
+    fields=[
+        FieldSpec("around", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("radius", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("since", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("until", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec(
+            "fields",
+            list,
+            item_type=str,
+            item_max_len=64,
+            max_items=64,
+        ),
+        FieldSpec("events_only", bool),
+        FieldSpec("cursor", str, max_len=_DEBUG_MAX_ARG_CHARS),
+    ],
+)
+
+MCP_DEBUG_SCHEMAS: dict[str, ToolSchema] = {
+    "debug_gateway": DEBUG_GATEWAY_SCHEMA,
+    "debug_refusals": DEBUG_REFUSALS_SCHEMA,
+    "debug_threads": DEBUG_THREADS_SCHEMA,
+    "debug_processes": DEBUG_PROCESSES_SCHEMA,
+    "debug_snapshots": DEBUG_SNAPSHOTS_SCHEMA,
+}
+
+
 # ── Tool Schemas (MCP Work ledger — server ``kirocrew-work``) ──
 #
 # Its own registry for the same reason the dashboard one is separate: the four
@@ -3507,9 +3665,9 @@ MCP_CREW_LOG_SCHEMAS: dict[str, ToolSchema] = {
 # a worker cannot write a conductor-owned field because no parameter carries one,
 # which is a stronger guarantee than an allowlist that must be kept correct as
 # fields are added.
-_WORK_STATUSES = frozenset({"progress", "done", "blocked", "question"})
-_WORK_VERDICTS = frozenset({"pass", "fail", "pending", "refused", "error"})
-_WORK_ITEM_STATES = frozenset({"open", "accepted", "rejected", "abandoned"})
+_WORK_STATUSES = frozenset(WORK_WORKER_STATUSES)
+_WORK_VERDICTS = frozenset(WORK_VERDICTS)
+_WORK_ITEM_STATES = frozenset(WORK_ITEM_STATES)
 #: A superset of the store's six conductor actions: ``accept`` promotes a worker's
 #: claimed ``pr`` into ``acceptance`` and is served by its own store function.
 _WORK_RECORD_ACTIONS = frozenset({"create", "bind", "decide", "verdict", "close", "goal", "accept"})
@@ -3532,6 +3690,7 @@ WORK_REPORT_SCHEMA = ToolSchema(
 )
 
 WORK_LEDGER_READ_SCHEMA = ToolSchema(tool_name="work_ledger_read")
+WORK_LEDGER_REBUILD_SCHEMA = ToolSchema(tool_name="work_ledger_rebuild")
 
 WORK_LEDGER_RECORD_SCHEMA = ToolSchema(
     tool_name="work_ledger_record",
@@ -3583,8 +3742,35 @@ MCP_WORK_SCHEMAS: dict[str, ToolSchema] = {
     "work_report": WORK_REPORT_SCHEMA,
     "work_ledger_read": WORK_LEDGER_READ_SCHEMA,
     "work_ledger_record": WORK_LEDGER_RECORD_SCHEMA,
+    "work_ledger_rebuild": WORK_LEDGER_REBUILD_SCHEMA,
 }
 
+
+# ── Tool Schemas (MCP Panel — server ``kirocrew-panel``) ──
+#
+# Its own registry for the same reason the dashboard one is separate: the panel
+# tools ship in an opt-in server, and a tool absent from its server's registry
+# has its args passed through raw.
+PANEL_PUBLISH_SCHEMA = ToolSchema(
+    tool_name="panel_publish",
+    fields=[
+        # No max_len on the object itself — the store enforces the byte and
+        # depth ceilings, because a character count over a nested structure is
+        # not the bound that matters and would pass a deeply nested payload.
+        FieldSpec("data", dict, required=True),
+        FieldSpec("template", str, max_len=64),
+        FieldSpec("title", str, max_len=200),
+    ],
+)
+# Empty on purpose and registered on purpose: the tool takes no arguments, and
+# an empty registered schema REJECTS an unexpected one, where no schema at all
+# would pass it through unvalidated.
+PANEL_TEMPLATES_SCHEMA = ToolSchema(tool_name="panel_templates")
+
+MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
+    "panel_publish": PANEL_PUBLISH_SCHEMA,
+    "panel_templates": PANEL_TEMPLATES_SCHEMA,
+}
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
     _cu_types.TOOL_LIST_APPS: ToolSchema(tool_name=_cu_types.TOOL_LIST_APPS, fields=[]),
@@ -3751,7 +3937,9 @@ class McpTextContent:
         return {"type": self.type, "text": self.text}
 
 
-def build_tool_response(text: str, max_len: int = MAX_RESPONSE_LEN) -> dict[str, Any]:
+def build_tool_response(
+    text: str, max_len: int = MAX_RESPONSE_LEN, *, is_error: bool = False
+) -> dict[str, Any]:
     """Build a validated, sanitized MCP tools/call response.
 
     Returns the ``result`` payload for a JSON-RPC response:
@@ -3759,10 +3947,15 @@ def build_tool_response(text: str, max_len: int = MAX_RESPONSE_LEN) -> dict[str,
 
     This is the single exit point for all tool responses — ensures every
     response conforms to the MCP TextContent schema and is sanitized.
+    ``is_error`` adds the MCP ``isError`` flag so a client can tell a refusal
+    from an answer without pattern-matching the prose.
     """
     text = sanitize_response(text, max_len)
     content = McpTextContent(type="text", text=text)
-    return {"content": [content.to_dict()]}
+    frame: dict[str, Any] = {"content": [content.to_dict()]}
+    if is_error:
+        frame["isError"] = True
+    return frame
 
 
 def validate_jsonrpc_response(resp: dict[str, Any]) -> dict[str, Any]:

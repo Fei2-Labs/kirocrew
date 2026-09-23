@@ -26,7 +26,7 @@ from kiro_crew.metrics.sessions import (
     record_session_ended,
     record_session_started,
 )
-from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN
+from kiro_crew.validation import bounded_session_id
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
@@ -37,19 +37,6 @@ else:
 
 
 ProviderFactory = Callable[..., LLMProvider]
-
-
-def _bounded_session_id(value: object) -> "str | None":
-    """*value* when it is a non-empty ACP session id within
-    ``MAX_ACP_SESSION_ID_LEN``, else ``None``.
-
-    The id comes from the backend, so it is bounded at the point of retention
-    rather than trusted: a runtime that hands back an oversize string gets no
-    id on the row, never a truncated one that would name a different unit.
-    """
-    if not isinstance(value, str) or not value or len(value) > MAX_ACP_SESSION_ID_LEN:
-        return None
-    return value
 
 
 class SessionClosingError(RuntimeError):
@@ -197,6 +184,12 @@ class _AllocationOwner(Protocol):
 
     def _fold_key(self, key: str) -> str: ...
 
+    async def await_replay_gap(self, key: str) -> None: ...
+
+    def absorb_orphaned_release(self, key: str) -> bool: ...
+
+    def adopt_turn(self, key: str) -> None: ...
+
     def get_provider(self, key: str) -> LLMProvider | None: ...
 
     async def get_subagent_runtime(
@@ -283,7 +276,34 @@ def _collect_parent_runtime_kwargs(
     tool_search = provider.tool_search_settings
     if tool_search is not None:
         kwargs["tool_search"] = tool_search
+    # The parent's session tree keeps ONE work directory across every process
+    # it spans: a companion runtime is handed the parent's ``$KIROCREW_SCRATCH``
+    # as a second private window into the masked scratch root, so a brief the
+    # parent staged there is readable by the subagents the runtime hosts (see
+    # ``agent_scratch``); at spawn it joins the tree's owner marker beside the parent.
+    shared_scratch = parent_work_scratch_dir(owner, parent_session_key)
+    if shared_scratch is not None:
+        kwargs["shared_scratch"] = shared_scratch
     return kwargs
+
+
+def parent_work_scratch_dir(owner: _AllocationOwner, parent_session_key: str) -> Path | None:
+    """The work directory of *parent_session_key*'s session tree, or None.
+
+    Read off the parent's live provider through the ``LLMProvider``
+    capability (``work_scratch_dir``, harness-parity H14 -- declared on the
+    ABC with a ``None`` default, never probed for a private name); None when
+    the parent has no live provider or its process carries no scratch. The
+    caller passes it as ``shared_scratch`` to the spawn it makes on the
+    parent's behalf -- a companion runtime here, a dedicated subagent process
+    in ``subagent_manager/run.py`` -- and the spawn re-validates it at mount
+    time (``agent_scratch.shared_scratch_window``).
+    """
+    provider = owner.get_provider(parent_session_key)
+    if provider is None:
+        return None
+    path = provider.work_scratch_dir
+    return path if isinstance(path, Path) else None
 
 
 class SessionAllocationService:
@@ -455,6 +475,7 @@ class SessionAllocationService:
         # Idle Semaphore(1).acquire completes without suspending, keeping the
         # locked check and decrement atomic on the event loop.
         await session.semaphore.acquire()
+        session.turn_owner = asyncio.current_task()
         return True
 
     def capability_runtime_view(self, member: str, saved_revision: str) -> dict[str, Any]:
@@ -631,6 +652,8 @@ class SessionAllocationService:
             raise
         if not still_valid:
             session.semaphore.release()
+        else:
+            session.turn_owner = asyncio.current_task()
         return still_valid
 
     async def _evict_stale_session(self, key: str, session: Any) -> None:
@@ -790,6 +813,7 @@ class SessionAllocationService:
             )
         assert won_race_session is session
         await session.semaphore.acquire()
+        session.turn_owner = asyncio.current_task()
         return session.provider, True, False
 
     def _get_session_agent(self, session_key: str) -> str:
@@ -832,7 +856,7 @@ class SessionAllocationService:
                     # it. Backend-authored, so bounded here where it is retained
                     # (the bound every other store of this id applies); an
                     # oversize or empty value is carried as None, not truncated.
-                    "sid": _bounded_session_id(getattr(session.provider, "session_id", None)),
+                    "sid": bounded_session_id(getattr(session.provider, "session_id", None)),
                     "pid": self._runtime_pid(runtime),
                     "owns_runtime": bool(getattr(client, "_owns_runtime", True)),
                     "created_at": session.created_at,
@@ -955,6 +979,9 @@ class SessionAllocationService:
     def resumable_hint(self, key: str) -> bool:
         return self._owner._session_map.has_hint(self._owner._fold_key(key))
 
+    def mapped_sid(self, key: str) -> str:
+        return self._owner._session_map.mapped_sid(self._owner._fold_key(key))
+
     def seed_conversation(
         self,
         key: str,
@@ -989,6 +1016,15 @@ class SessionAllocationService:
         occupies the same key.
         """
         key = self._owner._fold_key(key)
+        if self._owner.absorb_orphaned_release(key):
+            # The permit this task held died with a session ``reset`` popped;
+            # the occupant under the key now (if any) is a successor whose
+            # permit belongs to someone else.
+            self._deps.logger.debug(
+                "release(%s): permit already died with a reset session; not unlocking the successor",
+                key,
+            )
+            return
         session = self._sessions.get(key)
         if session:
             if (
@@ -1276,6 +1312,11 @@ class SessionAllocationService:
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
         """Reserve logical ownership for the complete claim/allocation call."""
+        # An older message between its reset and its replay holds the key: a
+        # claim made now would run -- and persist -- ahead of it. Waited out
+        # BEFORE the reservation so the ownership generation does not move for a
+        # claimant that has not been admitted yet; the replay's own task passes.
+        await self._owner.await_replay_gap(key)
         token = object()
         async with self._lock:
             if self._closing:
@@ -1305,6 +1346,10 @@ class SessionAllocationService:
             await self._remove_reservation_cancellation_drained(reserved_key, token)
             raise
         self._remove_reservation_now(reserved_key, token)
+        # This task now holds the key's live permit. If it reset its previous
+        # session on this key (a replay), the release it will make is for THIS
+        # permit and must not be swallowed as the old one's.
+        self._owner.adopt_turn(reserved_key)
         return result
 
     def _remember_capability_failure(self, key: str, preparation: Any) -> None:
@@ -1441,9 +1486,33 @@ class SessionAllocationService:
                     session.first_turn = self._deps.first_turn_nothing_armed
                 return session.provider, first_turn.is_new, first_turn.resumed
             await owner._evict_stale_session(key, session)
-            if not owner._provider_factory:
-                raise RuntimeError("No provider factory configured")
-            factory = owner._provider_factory
+            # Re-enter the claim rather than cold-start in place. The session
+            # this claimant waited on was replaced or retired under it -- a reset
+            # wakes its waiters exactly so they get here -- and the key may now
+            # hold a successor, or sit inside a replay gap that must be waited
+            # out; only the front door sees either. Bounded like the won-race
+            # retry it mirrors. A key that simply has no session any more takes
+            # the same cold start it would have taken here, one hop later.
+            maximum = constants.won_race_max_retries
+            if _won_race_retries >= maximum:
+                raise RuntimeError(
+                    f"get_or_create({key!r}) exceeded {maximum} won-race retries — "
+                    "session kept going stale between acquire and re-validate"
+                )
+            return await owner.get_or_create(
+                key,
+                agent=agent,
+                channel_id=channel_id,
+                approval_policy=approval_policy,
+                model=model,
+                cwd=cwd,
+                extra_env=extra_env,
+                speculative=speculative,
+                speculative_resume=speculative_resume,
+                wait_if_busy=wait_if_busy,
+                _won_race_retries=_won_race_retries + 1,
+                **extra_factory_kwargs,
+            )
 
         # FORK CROSSOVER (restored at the 2026-09-21 sync; upstream has no
         # equivalent). A caller may name a backend that is NOT the configured one
@@ -1563,6 +1632,12 @@ class SessionAllocationService:
             # belong to the pool's backend, not the one asked for. Cold-starting
             # through the factory is what makes the pin real.
             pool_decision = "bypass_backend"
+        elif extra_factory_kwargs.get("shared_scratch") is not None:
+            # A dedicated subagent joining its parent's session tree needs the
+            # parent's work directory MOUNTED, and a pooled child's mounts were
+            # fixed when it was pre-spawned with no parent. Cold-starting is what
+            # makes ``$KIROCREW_SCRATCH`` name the same place as the parent's.
+            pool_decision = "bypass_shared_scratch"
         elif await self._crew_pins_effort(agent, extra_factory_kwargs.get("crew_agent")):
             # A CREW's pinned effort is fixed at spawn time and the warm-pool
             # claim path never re-pushes it, so a warm hit would silently run
@@ -1847,6 +1922,14 @@ class SessionAllocationService:
                         agent=session_agent or "",
                     )
                     session.capability_member = preparation.member
+                    # The id the provider above was constructed with, kept
+                    # readable for the allocation's caller. ``model`` is resolved
+                    # from config when the caller passed none, and that resolution
+                    # is invisible in this call's return value, so a caller
+                    # recording the session's selection has no other source for it.
+                    # Stamped from the same local rather than re-resolved, which is
+                    # what keeps the id sent and the id read identical.
+                    session.requested_model = model or ""
                     session.loaded_capabilities = stamp
                     self.state.capability_failures.pop(key, None)
                     replay_needed = getattr(provider, "_history_replay_needed", False) is True
@@ -1914,6 +1997,7 @@ class SessionAllocationService:
                     # Fresh semaphore acquisition is synchronous and cannot
                     # wait, so doing it under _lock does not invert lock order.
                     await session.semaphore.acquire()
+                    session.turn_owner = asyncio.current_task()
                     self._deps.inc_session_created()
                     result = (provider, True, resumed)
         except BaseException:

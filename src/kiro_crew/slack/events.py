@@ -54,6 +54,7 @@ from kiro_crew.executors import subprocess_executor
 from kiro_crew.fork_version import full_version
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.mcp_discovery import list_servers
+from kiro_crew.messaging.commands import note_user_stop
 from kiro_crew.messaging.dispatch import admit_inbound_callback
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.platform import current_context, safe_context_call
@@ -77,7 +78,9 @@ from kiro_crew.slack.blocks import (
 )
 from kiro_crew.slack.enterprise import trusted_bot_admission
 from kiro_crew.slack.files import (
+    VOICE_MEMO_DURATION_UNVERIFIED,
     VOICE_MEMO_FAILED,
+    VOICE_MEMO_TOO_LONG,
     VOICE_MEMO_UNAVAILABLE,
     is_voice_memo,
     process_slack_files,
@@ -112,8 +115,9 @@ from kiro_crew.slack.sessions_view import (
 )
 from kiro_crew.slack.transport_dispatch import handle_message_transport
 from kiro_crew.stats import Stats
+from kiro_crew.transcribe import audio_exceeds_secs, batch_duration_cap_secs
 from kiro_crew.transcribe import is_available as stt_available
-from kiro_crew.transcribe import transcribe_audio
+from kiro_crew.transcribe import load_stt_config, transcribe_audio
 
 if TYPE_CHECKING:
     from kiro_crew.slack.client import SlackClientOps
@@ -1651,7 +1655,9 @@ async def _transcribe_with_reaction(
 async def _transcribe_files(orch: "GatewayOrchestrator", files: list[dict]) -> list[str]:
     """Download and transcribe audio files, return list of transcription strings.
 
-    Only what speech-to-text could hear. A memo that produced nothing is reported
+    What speech-to-text could hear, plus one pinned refusal note
+    (:data:`VOICE_MEMO_TOO_LONG` / :data:`VOICE_MEMO_DURATION_UNVERIFIED`) per
+    memo refused before transcription. A memo that produced nothing is reported
     by the caller, which knows how many arrived: see :func:`_voice_memo_context`.
     """
     results: list[str] = []
@@ -1677,7 +1683,29 @@ async def _transcribe_files(orch: "GatewayOrchestrator", files: list[dict]) -> l
                 source="transcribe",
                 resources=f.get("name", "?"),
             )
-            transcript = await transcribe_audio(dest)
+            stt_config = await asyncio.to_thread(load_stt_config)
+            duration_cap = batch_duration_cap_secs(stt_config)
+            if duration_cap is not None:
+                exceeds = await audio_exceeds_secs(
+                    dest, duration_cap, timeout_secs=stt_config.timeout_secs
+                )
+                if exceeds is not False:
+                    note = VOICE_MEMO_DURATION_UNVERIFIED
+                    error = "audio_duration_unverified"
+                    if exceeds:
+                        note = VOICE_MEMO_TOO_LONG.format(minutes=duration_cap // 60)
+                        error = "audio_too_long"
+                    results.append(note)
+                    sel().log_api_access(
+                        caller="stt",
+                        operation="stt.transcribe",
+                        outcome="denied",
+                        source="transcribe",
+                        resources=f.get("name", "?"),
+                        error=error,
+                    )
+                    continue
+            transcript = await transcribe_audio(dest, stt_config)
             sel().log_api_access(
                 caller="stt",
                 operation="stt.transcribe",
@@ -2557,6 +2585,14 @@ async def _route_message(
                 await orch.slack.post_message(channel, "Nothing running.", thread_ts or msg_ts)
             return
         session_key = thread_ts or msg_ts
+        # Recorded BEFORE the liveness checks: a turn between its abandoned
+        # attempt and its compaction replay has no session at this moment, and
+        # an interaction-originated turn has no registered task either; the
+        # replay reads this record to stay dropped (``note_user_stop``).
+        # Against the thread's OWNING session, not the bare thread key: a
+        # linked thread's turns -- and their replay -- run under the dashboard
+        # session that owns it, and that is the key the replay reads.
+        note_user_stop(orch.sessions, orch.sessions.get_session_for_thread(session_key) or session_key)
         has_session = orch.sessions.has_session(session_key)
         active_task = orch._session_tasks.pop(session_key, None)
         if has_session or active_task:

@@ -118,34 +118,46 @@ class TestTheReadIsBoundedBeforeItAllocates:
         Asserting only that an oversized file reads as unset passes for an implementation that
         reads the whole thing and then discards it -- the exact shape being fixed. So this
         records what the reader asked the file for.
+
+        Instrumented on ``os.read`` rather than on a file object's ``read``. The record is now
+        opened with ``os.open`` so the alias check can ``fstat`` the descriptor the bytes came
+        from, and a watcher on ``builtins.open`` sees nothing there and would pass vacuously.
+        The emptiness assertion is what makes that kind of drift loud instead of silent, and it
+        is why it stays.
         """
+        import os as _os
+
         from kiro_crew.cloud.launch_state import _MAX_FILE_BYTES
 
         p = tmp_path / "cloud_launch_state.json"
         with open(p, "wb") as fh:
             fh.truncate(_MAX_FILE_BYTES * 64)
         asked: list = []
+        watched: set = set()
 
-        real_open = open
+        real_os_open, real_os_read = _os.open, _os.read
 
         def _watching_open(path, *a, **k):
-            fh = real_open(path, *a, **k)
+            fd = real_os_open(path, *a, **k)
             if str(path) == str(p):
-                real_read = fh.read
+                watched.add(fd)
+            return fd
 
-                def _read(size=-1):
-                    asked.append(size)
-                    return real_read(size)
+        def _watching_read(fd, size, *a, **k):
+            if fd in watched:
+                asked.append(size)
+            return real_os_read(fd, size, *a, **k)
 
-                fh.read = _read  # type: ignore[method-assign]
-            return fh
-
-        monkeypatch.setattr("builtins.open", _watching_open)
+        monkeypatch.setattr(_os, "open", _watching_open)
+        monkeypatch.setattr(_os, "read", _watching_read)
         LaunchState.load(p)
 
         assert asked, "the reader never read the file, so this measures nothing"
-        # -1, or any size past the ceiling, means the whole file was requested.
+        # Any single request past the ceiling means more than the bound was asked for.
         assert all(0 < n <= _MAX_FILE_BYTES + 1 for n in asked), asked
+        # And the loop must stop at the budget rather than draining the rest of the file:
+        # a short-read loop with no budget would keep asking until EOF.
+        assert sum(asked) <= _MAX_FILE_BYTES + 1, asked
 
     def test_a_record_at_exactly_the_ceiling_still_reads(self, tmp_path):
         """The allowed size is allowed: a document exactly at the limit is not refused."""
@@ -471,8 +483,8 @@ class TestTheTwoProductWritersAreSerialised:
         real_read = ls._read_document
         fired = {"n": 0}
 
-        def _racing_read(q):
-            out = real_read(q)
+        def _racing_read(q, **kw):
+            out = real_read(q, **kw)
             # Exactly once, and only for clear_tag's own read: a launch commits here.
             if fired["n"] == 0 and str(q) == str(p):
                 fired["n"] = 1
@@ -678,6 +690,254 @@ class TestAnAliasedRecordIsRefusedWhereItsTagIsConsumed:
         LaunchState.record(profile="p", region="us-east-1", last_tag="kc-mine")
 
         assert LaunchState.load().last_tag == "kc-mine"
+
+    def test_an_alias_planted_after_the_by_name_check_is_still_refused(self, tmp_path, monkeypatch):
+        """The window itself, forced: the check must answer about the inode that was READ.
+
+        A by-name ``lstat`` followed by a separate ``open`` of the same name is a
+        check-then-use: the judged inode and the consumed inode are two resolutions, so an
+        alias appearing in between is judged by nobody and the record is adopted anyway.
+
+        The fault is injected at the real seam and keyed on the BY-NAME call (``fd is None``),
+        which is precisely the gap between the check and the read -- not on a call ordinal,
+        which the fix itself changes. With the read pinned to one descriptor and re-checked on
+        it, the second call sees the alias and refuses.
+        """
+        import os
+
+        import kiro_crew.cloud.launch_state as ls
+        from kiro_crew.sandbox import SandboxCeilingUnsealable
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        LaunchState.record(profile="p", region="us-east-1", last_tag="kc-mine")
+        p = ls.state_path()
+        alias = tmp_path / "planted-in-the-window.json"
+        real_check = ls.require_unaliased_launch_state
+        planted = {"n": 0}
+
+        def _plant_in_the_window(path, *, fd=None):
+            real_check(path, fd=fd)
+            if fd is None and planted["n"] == 0:
+                planted["n"] = 1
+                os.link(p, alias)
+
+        monkeypatch.setattr(ls, "require_unaliased_launch_state", _plant_in_the_window)
+
+        with pytest.raises(SandboxCeilingUnsealable):
+            LaunchState.load()
+
+        assert planted["n"] == 1, "the window was never forced, so this measures nothing"
+        assert p.stat().st_nlink > 1, "the fixture did not produce a second link"
+
+    def test_a_symlink_planted_in_the_window_refuses_instead_of_reading_as_absent(
+        self, tmp_path, monkeypatch
+    ):
+        """The OTHER alias shape in the same window, which must not degrade to "no record".
+
+        ``O_NOFOLLOW`` reports a symlinked leaf as ``ELOOP``, so a blanket
+        ``except OSError: return None`` would turn the kernel's own alias refusal into the
+        absent answer. Absent is not neutral on this path: it is what makes a pre-provision
+        clear read as "nothing saved", which is the forged-empty result that lets the wizard
+        provision where it was supposed to abort.
+
+        Same window as the hardlink case and keyed the same way, on the BY-NAME call, because
+        a symlink already present is refused by that call before the open is ever reached.
+
+        Gated on the CAPABILITY, not on a platform name, because the capability is the whole
+        mechanism: Windows defines no ``O_NOFOLLOW``, so the pinned open follows a link there
+        and this shape is not refused at the open. That boundary is declared on
+        ``_O_NOFOLLOW`` and in the PR body rather than left implicit, and what Windows retains
+        is the by-name refusal for a link that is already present --
+        ``test_the_read_that_every_verb_goes_through_refuses[symlink]``, which runs everywhere.
+        """
+        import os
+
+        import kiro_crew.cloud.launch_state as ls
+        from kiro_crew.sandbox import SandboxCeilingUnsealable
+
+        if not getattr(os, "O_NOFOLLOW", 0):
+            pytest.skip(
+                "the in-window symlink refusal IS O_NOFOLLOW; this platform has no such flag, "
+                "and the pre-existing-symlink refusal is covered by "
+                "test_the_read_that_every_verb_goes_through_refuses[symlink]"
+            )
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        LaunchState.record(profile="p", region="us-east-1", last_tag="kc-mine")
+        p = ls.state_path()
+        elsewhere = tmp_path / "theirs.json"
+        elsewhere.write_text(
+            json.dumps({"profile": "p", "region": "us-east-1", "last_tag": "kc-theirs"}),
+            encoding="utf-8",
+        )
+        real_check = ls.require_unaliased_launch_state
+        planted = {"n": 0}
+
+        def _plant_in_the_window(path, *, fd=None):
+            real_check(path, fd=fd)
+            if fd is None and planted["n"] == 0:
+                planted["n"] = 1
+                p.unlink()
+                p.symlink_to(elsewhere)
+
+        monkeypatch.setattr(ls, "require_unaliased_launch_state", _plant_in_the_window)
+
+        with pytest.raises(SandboxCeilingUnsealable):
+            LaunchState.load()
+
+        assert planted["n"] == 1, "the window was never forced, so this measures nothing"
+        assert p.is_symlink(), "the fixture did not leave a symlink at the record's name"
+
+    def test_a_pinned_read_that_fails_after_the_open_refuses_too(self, tmp_path, monkeypatch):
+        """The READ side of the same rule, which a first version of this fix left fail-open.
+
+        The open and the read were separate handlers and only the open had the rule, so an
+        ``os.read`` failure still answered "no record" on the pinned path. It is reachable
+        rather than theoretical: a directory swapped in at the name OPENS fine under
+        ``O_RDONLY``, and the read then fails with ``EISDIR`` -- and a swap at that name is the
+        aliasing race this function exists to defend. Both handlers now go through
+        ``_refuse_or_absent``, so there is one rule and no second copy to forget.
+        """
+        import errno as _errno
+        import os as _os
+
+        import kiro_crew.cloud.launch_state as ls
+        from kiro_crew.sandbox import SandboxCeilingUnsealable
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        LaunchState.record(profile="p", region="us-east-1", last_tag="kc-mine")
+        p = ls.state_path()
+        real_os_read = _os.read
+        watched: set = set()
+        real_os_open = _os.open
+        fired = {"n": 0}
+
+        def _watching_open(path, *a, **k):
+            fd = real_os_open(path, *a, **k)
+            if str(path) == str(p):
+                watched.add(fd)
+            return fd
+
+        def _failing_read(fd, size, *a, **k):
+            if fd in watched:
+                fired["n"] += 1
+                raise OSError(_errno.EISDIR, "simulated directory swapped in at the name")
+            return real_os_read(fd, size, *a, **k)
+
+        monkeypatch.setattr(_os, "open", _watching_open)
+        monkeypatch.setattr(_os, "read", _failing_read)
+
+        with pytest.raises(SandboxCeilingUnsealable):
+            LaunchState.load()
+
+        assert fired["n"] >= 1, "the read never failed, so this measures nothing"
+
+    def test_the_post_destroy_clear_still_degrades_quietly_on_an_unreadable_record(
+        self, tmp_path, monkeypatch
+    ):
+        """The exempt caller keeps its no-raise contract, so the refusal is scoped not blanket.
+
+        Without this, making every non-ENOENT open failure refuse would also make the clear that
+        runs AFTER a stack is deleted raise, which is the failure shape this module exists to
+        have removed: the irreversible work is done and there is nothing left to protect.
+
+        The fault is ``ELOOP``, injected at the record's own ``os.open``. A real symlink LOOP
+        produces exactly that errno on POSIX with or without ``O_NOFOLLOW`` (measured), and it
+        is not ``ENOENT``, so it is the shape that reaches the branch under test. Injected
+        rather than built on disk so the branch is measured on Windows too, where a loop is not
+        the same fixture -- a platform skip here would score as a pass on a platform where the
+        property was never checked.
+
+        A plain symlinked record would NOT do: the unpinned open carries no ``O_NOFOLLOW``, so
+        it follows the link and succeeds, the error branch never runs, and the test passes for a
+        reason that has nothing to do with the guard. That is what an earlier version of this
+        test did, and a mutation making the refusal blanket survived it.
+        """
+        import errno as _errno
+        import os as _os
+
+        import kiro_crew.cloud.launch_state as ls
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        LaunchState.record(profile="p", region="us-east-1", last_tag="kc-gone")
+        p = ls.state_path()
+        real_os_open = _os.open
+        fired = {"n": 0}
+
+        def _looping_open(path, *a, **k):
+            if str(path) == str(p):
+                fired["n"] += 1
+                raise OSError(_errno.ELOOP, "simulated symlink loop")
+            return real_os_open(path, *a, **k)
+
+        monkeypatch.setattr(_os, "open", _looping_open)
+
+        # Declines by RETURNING rather than raising, which is the property under test.
+        assert LaunchState.clear_tag("kc-gone", p) is False
+        assert (
+            fired["n"] >= 1
+        ), "the fault never reached the record's open, so this measures nothing"
+
+    def test_both_the_name_and_the_descriptor_are_checked(self, tmp_path, monkeypatch):
+        """The allow direction, and proof the descriptor check is actually wired.
+
+        Two assertions rather than one, because they fail for different reasons. The record
+        still loading is what makes the pin a CONDITIONAL refusal instead of a blanket break.
+        Seeing both a ``fd is None`` call and a ``fd is not None`` call is what stops this
+        passing against an implementation that kept only the by-name check -- which is the
+        state being fixed, and which reads as green on every other test in this class.
+        """
+        import kiro_crew.cloud.launch_state as ls
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        LaunchState.record(profile="p", region="us-east-1", last_tag="kc-ok")
+        real_check = ls.require_unaliased_launch_state
+        by_descriptor: list = []
+
+        def _watch(path, *, fd=None):
+            by_descriptor.append(fd is not None)
+            return real_check(path, fd=fd)
+
+        monkeypatch.setattr(ls, "require_unaliased_launch_state", _watch)
+
+        assert LaunchState.load().last_tag == "kc-ok"
+        assert True in by_descriptor, "the descriptor check never ran, so the read is unpinned"
+        assert False in by_descriptor, "the by-name check never ran, so the symlink shape is open"
+
+    @pytest.mark.parametrize("shape", ("symlink", "hardlink"))
+    def test_the_pre_provision_clear_refuses_an_aliased_record(self, tmp_path, monkeypatch, shape):
+        """The second consume point, which read the tag with no alias check at all.
+
+        ``try_clear_tag`` reads the record and ``wizard._clear_prior_pointer`` provisions or
+        aborts on what it reports, so the tag is an input to a security decision here exactly
+        as it is in ``load``. The refusal is affordable because nothing has been provisioned
+        and nothing is billing -- the same reason that caller's own abort is affordable.
+        """
+        from kiro_crew.sandbox import SandboxCeilingUnsealable
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        p = self._aliased_record(tmp_path, shape)
+
+        with pytest.raises(SandboxCeilingUnsealable):
+            LaunchState.try_clear_tag("kc-theirs", path=p)
+
+    @pytest.mark.parametrize("shape", ("symlink", "hardlink"))
+    def test_the_wizard_does_not_provision_on_an_aliased_record(self, tmp_path, monkeypatch, shape):
+        """What the refusal buys, at the caller whose answer decides the irreversible step.
+
+        The hazard is not the raise, it is a forged pointer reading as "nothing saved": that
+        turns a deliberate abort into a launch which leaves a live stack named by a pointer the
+        operator never wrote, and a later ``destroy`` with no ``--tag`` resolves it. So the
+        property pinned is that this caller does not answer True.
+        """
+        from kiro_crew.cloud import wizard
+        from kiro_crew.sandbox import SandboxCeilingUnsealable
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        self._aliased_record(tmp_path, shape)
+
+        with pytest.raises(SandboxCeilingUnsealable):
+            wizard._clear_prior_pointer("kc-theirs")
 
     @pytest.mark.parametrize(("shape", "word"), (("symlink", "SYMLINK"), ("hardlink", "hardlink")))
     def test_the_refusal_names_the_file_the_shape_and_one_command(

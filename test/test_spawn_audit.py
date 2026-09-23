@@ -317,6 +317,29 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # directories. Called from a worker thread, never the event loop --
         # ``test/test_acp_pi_backend.py`` pins that.
         "acp/client.py::_verify_pi_gate",
+        # The subprocess-pool child interpreter: ONE fixed argv, ``sys.executable -S <leaf
+        # script>``, where the script is a module-relative constant (tests pass their
+        # own stub). No agent value reaches the command, the args or the cwd -- the
+        # path to resolve travels over stdin as a length-prefixed frame, never as an
+        # argument, and no shell is involved. It is listed rather than routed because
+        # this child exists to ``lstat``/``readlink`` the very paths the
+        # sensitive-path gate is checking, sensitive ones included: under the agent
+        # sandbox it would be denied exactly those reads, and a resolver answering
+        # "cannot resolve" where the true answer is a credential symlink's target
+        # would weaken the gate rather than harden it. The env is inherited
+        # deliberately, so a path resolves in the child to what it resolves to in
+        # the parent.
+        "subprocess_pool/executor.py::_spawn",
+        # The PDF extractor child: ONE fixed argv, ``sys.executable -P -m
+        # kiro_crew.pdf_extract_child --max-chars=N --max-pages=M`` with both
+        # numbers module constants of the two callers (file-grep, knowledge
+        # ingest). The untrusted input -- the document -- travels on stdin, never
+        # on argv, cwd or env, and the env is ``scrub_env()``. It is spawned
+        # through ``popen_limited`` under ``RLIMIT_PROFILE_EXTRACTOR``, whose
+        # fixed ``RLIMIT_AS`` is the containment this spawn exists to add:
+        # ``pdfplumber`` commits a page's whole character list before any caller
+        # can measure it, so the memory bound has to sit one process down.
+        "pdf_extract.py::extract_pdf_segments",
         # The shadow-venv update engine's four spawns. None is agent-influenced
         # and none can route through sandboxed_spawn_argv, because the engine's
         # whole job is to build the NEXT gateway install outside the agent
@@ -378,6 +401,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # agent can write to names the executable; a resource ceiling / sandbox
         # adds nothing to a `--version` call.
         "diagnostics.py::_kiro_cli_version",
+        # The spec-permissions version gate: the same fixed argv
+        # ``[<kiro-cli>, "--version"]`` as the diagnostics probe above, 5s timeout,
+        # no shell, no cwd, pinned through ``pin_kiro_cli`` (no pin, no spawn), and
+        # cached per binary identity so it runs once per install rather than once
+        # per spec rebuild. Its answer decides whether ``agent.py`` writes the KAS
+        # ``permissions`` block a pre-2.23 kiro-cli refuses; nothing an agent says
+        # in a turn reaches the argv, and a sandbox adds nothing to ``--version``.
+        "kiro_cli.py::installed_kiro_cli_version",
         # Tailnet origin derivation + forwarded-peer whois (RFC:
         # rfc-tailnet-dashboard-access): one fixed argv — ``["<tailscale>",
         # "status", "--json"]`` or ``["<tailscale>", "whois", "--json",
@@ -511,6 +542,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # it, and it runs once per process (lru_cache) to name the code revision the
         # MCP gateway daemon and its owner compare.
         "code_fingerprint.py::_git_fingerprint",
+        # Fixed `git log -1 --format=%ct` argv (shell=False), run against the same
+        # `code_fingerprint._PACKAGE_ROOT` the entry above uses, and derived from
+        # `__file__` rather than from any request. No agent-influenced input reaches
+        # the command, the args or the cwd: `debug_gateway` takes no parameters at
+        # all. It answers HEAD's commit time so the route can say whether the running
+        # gateway predates the caller's fix, and it is bounded by a 5s timeout with
+        # every failure answering None.
+        "dashboard/handlers/debug.py::_head_commit_time",
         # Fixed `git rev-parse --verify` argv (shell=False) against the OPERATOR-chosen
         # clone, asking whether the operator's `scopeDiffBase` resolves. The ref comes from
         # config (`_CONFIG_WRITABLE`), not from the agent, and it is passed as one argv
@@ -1227,6 +1266,17 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cloud/source.py::_git_tracked_files",
         "cloud/source.py::_tracked_tree_is_dirty",
         "cloud/source.py::_use_git_archive",
+        # Release-tag probe before a packaged install's cloud launch: `<trusted
+        # git> ls-remote --exit-code --tags -- <repo> refs/tags/<ref>`, a fixed
+        # argv with no shell. The binary comes from
+        # `platform_compat.trusted_git_bin` (never PATH); `ref` is built by
+        # `release_channel.release_refs` from this build's own `__version__`
+        # through a `\d+\.\d+\.\d+` regex, and `repo` is the template's public
+        # URL or a caller argument `ec2.deploy` charset-validates -- neither is
+        # agent-reachable. Env drops every inherited `GIT_*` and pins global /
+        # system config off; stdin is DEVNULL; the exit code is the only thing
+        # read. Same classification as the `cloud/source.py` git probes above.
+        "cloud/ec2.py::release_tag_exists",
         # Windows tunnel teardown: `taskkill /T /F /PID <pid>`, a fixed argv whose
         # only variable is the pid of a child THIS process created (the Popen handed
         # to kill_port_forward) -- never agent-supplied, no shell, no PATH shim

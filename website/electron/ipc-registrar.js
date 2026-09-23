@@ -72,8 +72,12 @@ function createIpcRegistrar({
         : (windows.focusedDashboardWindow() || windows.getMainWindow() || null)
     ),
     createWindow: () => windows.createMainWindow(),
-    // A global shortcut fires while another app is frontmost. On macOS the
-    // window rises without keyboard focus unless the app steals activation.
+    // A global shortcut fires while another app is frontmost. A fullscreen
+    // tray-close hides the whole application, so unhide it before win.show();
+    // then steal activation after the window has been surfaced.
+    showApp: () => {
+      if (process.platform === "darwin" && typeof app.show === "function") app.show();
+    },
     focusApp: () => {
       if (process.platform === "darwin") app.focus({ steal: true });
     },

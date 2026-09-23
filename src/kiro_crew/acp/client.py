@@ -47,6 +47,7 @@ from typing import (
 )
 
 from kiro_crew import (
+    __version__,
     acp_tool_gate,
     agent_scratch,
     agent_sdk,
@@ -188,6 +189,7 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     JsonRpcRequest,
     effort_config_option_id,
+    effort_config_option_value,
     model_registry_namespace,
     overlay_project_scope,
 )
@@ -281,7 +283,17 @@ from kiro_crew.skill_usage import get_global_skill_read_observer
 logger = logging.getLogger(__name__)
 
 CLIENT_NAME = "kirocrew"
-CLIENT_VERSION = "0.1.2"
+#: The version reported to the agent host in ``initialize``'s ``clientInfo``, and
+#: from there into the host's own telemetry (``acp_client_version``). It is the
+#: PACKAGE version, never a literal of its own: a hand-maintained literal is a
+#: second version number nobody bumps, and this one was not -- it sat at
+#: ``"0.1.2"`` from the first commit that named it while the product shipped
+#: 0.2.0 through 0.8.0, so every Crew-driven session of every release reported
+#: one indistinguishable version and no version split of Crew traffic was
+#: possible. Reading ``__version__`` also inherits what that attribute already
+#: resolves at import: a release lane's rewritten literal AND a repackager's
+#: ``BUILD_VERSION`` stamp.
+CLIENT_VERSION = __version__
 _T = TypeVar("_T")
 # kiro-cli uses a date-stamped protocol; every spec-dialect adapter follows the
 # upstream ACP spec, whose protocolVersion is an integer MAJOR version (currently
@@ -488,7 +500,37 @@ _GOOSE_BUILTIN_DEVELOPER = "developer"
 _ADAPTER_INTERPRETERS = frozenset({"node", "node.exe"})
 
 
-def _adapter_spawn_label(argv: Sequence[str], seam: str) -> str:
+def _is_adapter_package_entry(program: str, pkg_entry: Path) -> bool:
+    """Whether *program* is *pkg_entry* sitting under some node_modules root."""
+    parts = Path(program).parts
+    wanted = pkg_entry.parts
+    if len(parts) < len(wanted):
+        return False
+    return [p.casefold() for p in parts[-len(wanted) :]] == [p.casefold() for p in wanted]
+
+
+def _named_by_override(program: str, override_env: str | None) -> bool:
+    """Whether the operator's override is what supplied *program*.
+
+    The resolution ladder takes the override as its first candidate verbatim, so
+    an equality test against the resolved program is what separates a deliberate
+    override from the adapter's own installed entry.
+    """
+    if not override_env:
+        return False
+    override = os.environ.get(override_env, "").strip()
+    if not override:
+        return False
+    return os.path.normpath(os.path.expanduser(override)) == os.path.normpath(program)
+
+
+def _adapter_spawn_label(
+    argv: Sequence[str],
+    seam: str,
+    *,
+    pkg_entry: Path | None = None,
+    override_env: str | None = None,
+) -> str:
     """Keep a stable seam label while identifying the resolved program.
 
     Both ACP seams resolve their binary through a documented environment
@@ -500,8 +542,23 @@ def _adapter_spawn_label(argv: Sequence[str], seam: str) -> str:
     if not argv:
         return seam
     program = argv[0]
-    if Path(program).name.casefold() in _ADAPTER_INTERPRETERS and len(argv) > 1:
+    if Path(program).name.casefold() in _ADAPTER_INTERPRETERS:
+        # A bare interpreter identifies no adapter at all.
+        if len(argv) <= 1:
+            return seam
         program = argv[1]
+        # An adapter installed as a Node package resolves to its own
+        # `dist/index.js`, whose basename names the packaging rather than the
+        # adapter, so the seam alone is the useful identity there. That shortcut
+        # is only honest for the package's OWN entry under its own scope: a
+        # script the operator's override supplied, or any other `index.js`, is
+        # the one record of which build actually launched, so its path stays.
+        if (
+            pkg_entry is not None
+            and not _named_by_override(program, override_env)
+            and _is_adapter_package_entry(program, pkg_entry)
+        ):
+            return seam
     return f"{seam} via {program}" if program else seam
 
 
@@ -2970,6 +3027,13 @@ class AcpError(Exception):
         # it — a spent usage limit or an unentitled model are also terminal but
         # a NEW context can succeed, so they are not this fact.
         self.structural_terminal: bool = False
+        # Whether this error happened while STARTING a session rather than on a
+        # prompt or another request. The twin of
+        # ``AcpRequestTimeout.session_start_failed`` on the runtime path: the two
+        # exception families share no base, so a self-driving caller reads the
+        # fact with ``getattr`` and both halves must spell it the same way. Only
+        # the raise sites that know the method set it True.
+        self.session_start_failed: bool = False
 
 
 def _wire_contract_for_backend(backend: str) -> tuple[int | str, dict[str, Any]]:
@@ -3086,6 +3150,30 @@ class AcpSandboxInitFailed(AcpError):  # noqa: N818
             f"not start{said}. Retrying cannot fix this: {remediation}",
             transient=False,
         )
+
+
+class AcpRegistrationRateLimited(AcpProcessDied):  # noqa: N818
+    """The runtime died after its dynamic registration was throttled (HTTP 429).
+
+    A SUBCLASS of :class:`AcpProcessDied`, because the process IS gone and every
+    existing death handler must keep treating it as a death; the narrower fact is
+    WHY: the child's registration calls were rate-limited by the endpoint, which
+    is a transient property of the endpoint's capacity, not of this host or this
+    request. ``transient`` is fixed True so the retry ladders that read the
+    verdict off the exception (``llm_helpers.acp_error_is_transient``, and
+    through it the sub-agent run loop and ``stream_and_collect``) retry with
+    their existing bounded backoff instead of surfacing a terminal generic
+    death. Replay SAFETY stays where it already lives: every consumer's
+    zero-activity gate decides between a verbatim replay and a continue, so this
+    classification never widens what a retry may re-run.
+
+    The message carries ONE retained cause rather than the full stderr tail: the
+    throttle prints the identical line on every attempt, and five copies of it
+    behind a death summary is the repetitive wall this type exists to replace.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, transient=True)
 
 
 class AcpToolGateUnroutable(AcpError):  # noqa: N818
@@ -3523,6 +3611,73 @@ async def sandbox_init_failure_for_runtime(runtime: Any) -> "AcpSandboxInitFaile
     )
 
 
+# A dynamic-registration call the endpoint throttled, read off the dead child's
+# stderr. Deliberately CONJUNCTIVE per line: a line must carry both the
+# registration context and an unambiguous too-many-requests marker before it
+# classifies, so neither a model-turn throttle (429 with no registration
+# context, which the provider-error path already classifies from its structured
+# frame) nor an unrelated registration failure (auth rejection, malformed
+# response — both terminal) can fire this. A bare ``429`` is deliberately NOT a
+# marker: a digit that lands in an exit code or a byte count must not upgrade a
+# crash to a throttle.
+#
+# Free-text stderr is an accepted evidence source here for the same reason it
+# is for :func:`is_auth_failure_output` and the sandbox latch: the child's
+# stderr is subprocess diagnostic output, not the structured frame the
+# compaction classifier insists on — but it is also the ONLY surface this
+# failure reaches, because the child dies before any frame can carry it. The
+# consequence of a false positive is bounded (a budgeted retry of a turn whose
+# replay safety is gated on observed activity by every consumer), which is why
+# the conjunctive signature above is the whole defence this needs.
+_RE_REGISTRATION_FAILED = re.compile(r"\bregistration failed\b", re.IGNORECASE)
+_RE_REGISTRATION_THROTTLE_MARK = re.compile(
+    r"\bHTTP 429\b|\btoo many requests\b|\brequested too many times\b", re.IGNORECASE
+)
+
+
+def registration_throttle_line(haystack: str) -> str | None:
+    """The first line of *haystack* showing a throttled registration, or ``None``.
+
+    *haystack* is a child's retained stderr (newline-joined lines). Matched per
+    LINE so the two tokens must describe the same event: a registration failure
+    early in the tail plus an unrelated throttle mention later must not combine
+    into a verdict neither line supports. Returns the line itself so the caller
+    can retain ONE sanitized cause instead of the tail's repeated copies.
+    """
+    for line in haystack.splitlines():
+        if _RE_REGISTRATION_FAILED.search(line) and _RE_REGISTRATION_THROTTLE_MARK.search(line):
+            return line.strip()
+    return None
+
+
+def is_registration_throttle_output(haystack: str) -> bool:
+    """True when *haystack* (a child's stderr) shows a throttled registration.
+
+    Shared by both ACP transports — ``AcpClient`` reads its own stderr ring
+    buffer, the shared-runtime death translations read
+    ``AcpRuntime.redacted_stderr_tail()`` — so the two cannot come to disagree
+    about what the signature IS, the same anti-drift reason
+    :func:`is_auth_failure_output` is one function.
+    """
+    return registration_throttle_line(haystack) is not None
+
+
+def registration_rate_limited_error(base: str, cause: str) -> "AcpRegistrationRateLimited":
+    """Build the typed error for a death whose evidence shows a registration throttle.
+
+    ONE composer for every translation site (the shared-runtime ``_died``, the
+    provider's ``_translate_dead``, the direct client's own death paths), so the
+    guidance and the one-retained-cause shape cannot drift apart. *base* is the
+    site's own death context; *cause* is the single matched stderr line, already
+    redacted by whichever reader captured it.
+    """
+    return AcpRegistrationRateLimited(
+        f"{base} — dynamic registration was rate-limited by the endpoint "
+        f"(HTTP 429); this is endpoint throttling, not a crash — retry later. "
+        f"Cause: {cause}"
+    )
+
+
 # Account/plan capacity is EXHAUSTED — terminal. Distinct from a throttle: a
 # throttle clears in seconds and a retry is the right move, whereas a spent
 # monthly allowance does not come back until it resets, so retrying only adds
@@ -3730,16 +3885,6 @@ PROVIDER_ERROR_CONNECTION = "connection"
 PROVIDER_ERROR_HTTP_5XX = "http_5xx"
 PROVIDER_ERROR_UNKNOWN = "unknown"
 
-_PROVIDER_ERROR_RETRYABLE: frozenset[str] = frozenset(
-    {
-        PROVIDER_ERROR_MODEL_UNAVAILABLE,
-        PROVIDER_ERROR_THROTTLE,
-        PROVIDER_ERROR_CREDENTIAL_PROPAGATION,
-        PROVIDER_ERROR_CONNECTION,
-        PROVIDER_ERROR_HTTP_5XX,
-    }
-)
-
 
 @dataclass(frozen=True)
 class ProviderErrorClass:
@@ -3886,6 +4031,27 @@ def resolve_pin_spelling(model_id: str, advertised: Sequence[str] | None) -> str
     either spelling, and an id advertised verbatim (qualifier and all) never
     gets peeled at all.
 
+    When the peel misses too, both sides are folded with
+    :func:`model_registry.catalog_key` — the same fold
+    :func:`model_registry.namespace_vocabulary` judges nativeness with. That
+    fold strips an inference-profile prefix, the ``[1m]`` window marker and an
+    effort suffix, so a pin spelled in another namespace's provider-id form
+    (``global.anthropic.claude-opus-4-8[1m]``) meets the bare id this harness
+    advertises for the same model (``claude-opus-4.8``). Without it the two
+    sides fold with different functions: the vocabulary side calls the pin
+    native, this side finds no spelling, and the cold start reports an
+    entitlement problem for what is a spelling one. The fold is a SPELLING fold,
+    not a model fold: a candidate the static registry places as a DIFFERENT
+    canonical model from the pin (``claude-opus-4-8`` at 200K against a pin
+    naming the 1M ``claude-opus-4.8``) is rejected even though ``catalog_key``
+    folds the window marker away -- see
+    :func:`model_registry.same_registered_model` -- so a pin never resolves to
+    its neighbour with another context window. Several advertised spellings of
+    the SAME model can remain (a base and a 1M variant the registry lists as one
+    model); the winner is :func:`model_registry.preferred_advertised_spelling`,
+    the tie-break :func:`model_registry.resolve_wire_model_id` applies, so the
+    two folds cannot prefer different spellings.
+
     Returns the ADVERTISED spelling of the match, not the caller's: the result
     is meant to be sent on the wire (``session/set_model`` accepts advertised
     ids), and it keeps the display verdict and the wire withhold answering from
@@ -3909,7 +4075,16 @@ def resolve_pin_spelling(model_id: str, advertised: Sequence[str] | None) -> str
     namespace, sep, bare = wanted.partition("::")
     if sep and namespace and bare in by_key:
         return by_key[bare]
-    return ""
+    wanted_key = model_registry.catalog_key(wanted)
+    if not wanted_key:
+        return ""
+    folded = [
+        m
+        for m in ids
+        if model_registry.catalog_key(m) == wanted_key
+        and model_registry.same_registered_model(model_id, m)
+    ]
+    return model_registry.preferred_advertised_spelling(folded)
 
 
 def resolve_usable_model(preferred: str, advertised: Sequence[str] | None) -> str:
@@ -4124,6 +4299,9 @@ async def _push_model_via_effort_split(driver: Any, backend: str, model_id: str)
     # selector" and skips -- the session then runs the suffix's effort while the
     # UI reports the slot's.
     effort_option = effort_config_option_id(backend)
+    # ...and the same resolver for the VALUE, so the split writes the level in the
+    # harness's own vocabulary rather than the suffix's verbatim.
+    effort = effort_config_option_value(backend, effort)
     if not driver.supports_config_option(effort_option):
         logger.warning(
             "ACP model %s applied as %s; adapter exposes no %r option, effort %s not applied",
@@ -5138,6 +5316,7 @@ class AcpClient:
         permission_mode: str | None = None,
         allow_ungated_tools: bool = False,
         private_memory: bool = False,
+        shared_scratch: Path | None = None,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -5165,6 +5344,16 @@ class AcpClient:
         # Default False = fail closed. Every AcpClient construction site that does
         # not thread this (tests, pools) therefore gets the enforced behaviour.
         self._allow_ungated_tools = allow_ungated_tools
+        # The session tree's work directory when this client is a DEDICATED
+        # subagent process spawned on a parent's behalf: re-validated at spawn
+        # (``agent_scratch.shared_scratch_window``) and mounted as a second
+        # private window beside this process's own scratch, which keeps the
+        # temp triple and the kiro-cli log. ``None`` for a session that starts
+        # its own tree. Once live, the client joins the tree's owner marker
+        # beside its parent (``agent_scratch.adopt_owner``), so a parent that
+        # dies first leaves no dead-owner marker over its running children.
+        self._shared_scratch: Path | None = Path(shared_scratch) if shared_scratch else None
+        self._scratch_dir: Path | None = None
         # True once this session has CREATED <work_dir>/.claude/settings.local.json
         # itself. Only then does reset remove it, and only then does a re-seed
         # overwrite it. The writer refuses a path that already holds a file it did
@@ -5423,6 +5612,14 @@ class AcpClient:
         # claude-agent-acp to reject the response.
         self._permission_options: dict[str | int, dict[str, str]] = {}
         self._stderr_lines: deque[str] = deque(maxlen=20)
+        # Latched on this process's FIRST non-thinking text chunk, tool call or
+        # tool result, cleared with the rest of the process state on respawn:
+        # the registration-throttle death classification is refused once work
+        # has been observed, so the transient verdict it hands the retry
+        # ladders can only ever license replaying a turn that provably did
+        # nothing. Per PROCESS (this client owns exactly one), matching the
+        # ring the evidence is read from.
+        self._prompt_or_tool_seen = False
         # Set by ``_spawn`` from the wrapped argv; only meaningful once a child
         # has been spawned. False before that, which is also the safe default for
         # the classifier: a spawn that never reached the wrap cannot have been
@@ -5838,7 +6035,12 @@ class AcpClient:
         self._session_mcp_snapshot = projection.derived_spec_snapshot
         servers = projection.params.get("mcpServers") or []
         out = list(servers) if isinstance(servers, list) else []
-        return self._append_member_dispatch_server(out)
+        # The restriction half of the projection's withhold set, from the SAME parse the
+        # array came out of: the member append must not re-add a name this projection
+        # refused on a transport where the withhold is the whole of the enforcement.
+        return self._append_member_dispatch_server(
+            out, projection.restricted_servers, projection.disabled_servers
+        )
 
     def _pooled_broker_stubs(self) -> list[dict[str, Any]]:
         """The raw broker stubs for this session, with no per-backend narrowing.
@@ -5872,7 +6074,12 @@ class AcpClient:
             self._stub_session_token,
         )
 
-    def _append_member_dispatch_server(self, servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _append_member_dispatch_server(
+        self,
+        servers: list[dict[str, Any]],
+        restricted: Collection[str] = (),
+        disabled: Collection[str] = (),
+    ) -> list[dict[str, Any]]:
         """Mount the dashboard session-control server into a member DM session.
 
         Session-level and additive: the on-disk agent spec is untouched, so every
@@ -5880,21 +6087,92 @@ class AcpClient:
         carries ``KIROCREW_SESSION_KEY`` for strict identity — the same value this
         client already exports to the child process env.
 
-        Honors the same permission-surface precondition the mirror translation
-        just applied: when Crew does not own the session's native permission
-        file, the whole array was withheld, and quietly appending a
-        session-control server there would hand a pre-approvable surface exactly
-        the tools the withhold exists to keep off it.
+        The permission-surface precondition is asked of the BACKEND's ROUTING --
+        ``acp_tool_gate.is_enforced`` -- rather than read off
+        ``_claude_settings_authored`` alone. That flag answers one harness's question:
+        claude declares a routing this core does not enforce, so owning
+        ``settings.local.json`` is what stands in for the read-back it lacks, and
+        appending session control onto a surface Crew does not own would hand a
+        pre-approvable file exactly the tools the mirror's withhold keeps off it. A
+        harness whose routing IS enforced cannot satisfy that flag and does not need
+        to -- its session is refused before its first prompt unless the gate arms --
+        and its mirror documents the flag as accepted-and-ignored (see
+        ``providers/mirrors/opencode.py``), so reading the flag there would withhold
+        every member's tools on the strength of a condition that cannot describe the
+        backend.
+
+        A whole-server ``disabled`` on the dashboard server stops the mount outright,
+        for every backend and with no second channel to weigh: ``disabled`` has no
+        per-tool or per-call form, so a harness handed the server cannot refuse a call
+        to it, and the ``tools`` allowlist that keeps it out of the spec-described half
+        of the array does not reach an element this method appends itself. Mounting it
+        anyway would make the operator's switch-off of session control a no-op for the
+        one session type that holds the strongest tools Crew hands out.
+
+        The other composer answers alike: ``AcpRuntime`` asks
+        ``session_mcp.session_mcp_server_is_disabled`` on its create and resume paths,
+        so a member session on an ``ACP_BACKENDS_ACP_RUNTIME`` host (codex, KAS) gets
+        the same answer this method gives. It asks through that reader rather than
+        through a field on the projection because half of those hosts have no mirror to
+        carry one -- KAS projects through ``acp.kas_agents``, not an array.
+
+        A per-tool restriction on the dashboard server is the second precondition,
+        and it is the one this method can UNDO rather than merely fail: the projection
+        withholds a narrowed server (*restricted*), and on a backend whose
+        ``registry.PerToolDeny`` is ``WHOLE_SERVER`` that withhold is the ONLY
+        enforcement there is -- no rule in a file the harness reads, and no per-call
+        identity Crew can refuse by. Appending the entry back would make a tool the
+        operator switched off callable again. So the mount is withheld instead and the
+        thread runs as plain chat. A backend with a second channel keeps its mount:
+        codex refuses the call at permission time from ``denied_tools``, and claude's
+        deny rules refuse it inside the adapter.
+
+        Both halves of a session's array must agree about this. ``AcpRuntime`` mounts
+        the same entry on the resume and create paths, and :meth:`_foreign_mcp_identity`
+        judges a trusted tool identity against the array THIS method returns -- scoped to
+        ``ACP_BACKENDS_SESSION_MCP_ARRAY``, and reached only from
+        :meth:`_refuse_identity_drift`, whose own gate is ``ACP_BACKENDS_META_IDENTITY``
+        (goose alone today, so no backend mounted here runs it yet). A backend that later
+        joins that set and mounts the server on one path while this one withholds it would
+        refuse every dispatch call as a drifted server rather than run a plain chat.
         """
         if self.backend not in ACP_BACKENDS_MEMBER_DISPATCH:
             return servers
         # circular import: members' module graph is heavy; resolved at call time.
-        from kiro_crew.members import is_member_session_key, member_dispatch_session_server
+        from kiro_crew.members import (
+            MEMBER_DISPATCH_SERVER,
+            is_member_session_key,
+            member_dispatch_session_server,
+        )
 
         if not is_member_session_key(self._session_key):
             return servers
         session_key = self._session_key or ""
-        if not getattr(self, "_claude_settings_authored", False):
+        if MEMBER_DISPATCH_SERVER in disabled:
+            logger.warning(
+                "member session %s: %s is switched off for this session (disabled), so "
+                "session control is not mounted -- no backend can refuse a call to a "
+                "server it was handed, and mounting it would undo that switch. The DM "
+                "thread runs as plain chat; re-enable that server to restore it",
+                self._session_key,
+                MEMBER_DISPATCH_SERVER,
+            )
+            return servers
+        if MEMBER_DISPATCH_SERVER in restricted and self._withhold_is_the_only_deny_channel():
+            logger.warning(
+                "member session %s: one of %s's tools is switched off and this backend has "
+                "no channel to refuse a call to it, so the projection withheld the server "
+                "and mounting it here would make that tool reachable again. The DM thread "
+                "runs as plain chat; stop narrowing that server to restore session control",
+                self._session_key,
+                MEMBER_DISPATCH_SERVER,
+            )
+            return servers
+        # An unenforced routing is the ONLY case the owned-file fallback answers for;
+        # see the precondition paragraph above for why an enforced one must not read it.
+        if not acp_tool_gate.is_enforced(self.backend) and not getattr(
+            self, "_claude_settings_authored", False
+        ):
             logger.warning(
                 "member session %s: permission surface not Crew-owned — session "
                 "control is not mounted; the DM thread runs as plain chat",
@@ -5910,6 +6188,33 @@ class AcpClient:
             )
             return servers
         return [e for e in servers if e.get("name") != entry["name"]] + [entry]
+
+    def _withhold_is_the_only_deny_channel(self) -> bool:
+        """Whether withholding a server is this backend's ONLY per-tool deny channel.
+
+        Read from the declaration each mirror already publishes
+        (``registry.PerToolDeny``) rather than from a second membership set, so a
+        backend cannot answer one way here and another way in the projection that
+        performs the withhold.
+
+        Fail-CLOSED on a backend with no declaration at all: ``projection_for`` raises
+        for one, and "no declared deny channel" is exactly the case where re-adding a
+        withheld server cannot be shown to be safe. The cost of being wrong in this
+        direction is a member thread that runs as plain chat.
+        """
+        from kiro_crew.providers.mirrors import PerToolDeny, projection_for
+
+        try:
+            return projection_for(self.backend).per_tool_deny is PerToolDeny.WHOLE_SERVER
+        except Exception:
+            logger.warning(
+                "member session %s: backend %r declares no MCP projection, so its per-tool "
+                "deny channel is unknown; treating a withheld server as un-re-addable",
+                self._session_key,
+                self.backend,
+                exc_info=True,
+            )
+            return True
 
     def _prepare_spawn_workspace(self) -> None:
         """Create the session's work dir, then snapshot its spec for the detector.
@@ -7037,6 +7342,17 @@ class AcpClient:
 
     def _is_process_alive(self) -> bool:
         return self._process is not None and self._process.returncode is None
+
+    @property
+    def work_scratch_dir(self) -> Path | None:
+        """The session tree's work directory this process exposes as ``$KIROCREW_SCRATCH``.
+
+        The inherited directory when this client was spawned into an existing
+        tree, else its own allocation; ``None`` before spawn or when allocation
+        failed. Handed as ``shared_scratch`` to every spawn made on behalf of
+        this session (see ``session_allocation._collect_parent_runtime_kwargs``).
+        """
+        return self._shared_scratch or self._scratch_dir
 
     def is_process_alive(self) -> bool:
         """True if the underlying process exists and has not exited."""
@@ -8168,8 +8484,18 @@ class AcpClient:
                     f"dependency), or set CLAUDE_AGENT_ACP_BIN to its entry script."
                 )
             argv: list[str] = claude_argv
-            spawn_label = _adapter_spawn_label(argv, CLAUDE_ACP_BIN)
-            stderr_label = _adapter_spawn_label(argv, "claude-acp")
+            spawn_label = _adapter_spawn_label(
+                argv,
+                CLAUDE_ACP_BIN,
+                pkg_entry=_CLAUDE_ACP_PKG_ENTRY,
+                override_env="CLAUDE_AGENT_ACP_BIN",
+            )
+            stderr_label = _adapter_spawn_label(
+                argv,
+                "claude-acp",
+                pkg_entry=_CLAUDE_ACP_PKG_ENTRY,
+                override_env="CLAUDE_AGENT_ACP_BIN",
+            )
         elif self._is_opencode:
             # This harness serves ACP from its own binary, so the argv is that binary
             # plus its ``acp`` subcommand: no adapter entry script, no node, and no
@@ -8349,7 +8675,9 @@ class AcpClient:
                     f"{_ENV_PI_ACP_PI_COMMAND} to the executable."
                 )
             argv = pi_acp_argv
-            spawn_label = _adapter_spawn_label(argv, PI_ACP_BIN)
+            spawn_label = _adapter_spawn_label(
+                argv, PI_ACP_BIN, pkg_entry=_PI_ACP_PKG_ENTRY, override_env=_ENV_PI_ACP_BIN
+            )
             stderr_label = spawn_label
             # Same refuse-then-mask preflight as the two enforced arms above, keyed
             # on the routing rather than on this harness's identity, and FIRST for
@@ -8597,6 +8925,15 @@ class AcpClient:
         # child's own directory is re-exposed as a PRIVATE window (siblings stay hidden).
         # Fail-open; owner recorded after spawn; reclamation is
         # liveness-keyed, never age-keyed.
+        if self._shared_scratch is None and self._scratch_dir is not None:
+            # A respawn of this client (``ensure_ready`` after the process
+            # exited): the directory the previous process exposed IS this
+            # session's tree -- the children it spawned mounted it, and the
+            # work it staged is there -- so the new process joins it instead
+            # of starting an empty one that hides that work until the old
+            # directory is reclaimed. Validated and adopted below like any
+            # inherited tree; dropped if it was swept meanwhile.
+            self._shared_scratch = self._scratch_dir
         self._scratch_dir = None
         try:
             self._scratch_dir = await asyncio.to_thread(
@@ -8611,6 +8948,15 @@ class AcpClient:
                 exc_info=True,
             )
         scratch_window = (str(self._scratch_dir),) if self._scratch_dir is not None else ()
+        # The tree's work directory as a second window into the masked root
+        # (twin of acp/runtime.py): re-validated now, since the allocation it
+        # names may have been swept, and dropped -- not re-created -- if so.
+        if self._shared_scratch is not None:
+            self._shared_scratch = await asyncio.to_thread(
+                agent_scratch.shared_scratch_window, self._shared_scratch
+            )
+        if self._shared_scratch is not None:
+            scratch_window = (*scratch_window, str(self._shared_scratch))
         # Resolve the SSH_AUTH_SOCK forward opt-in OFF the event
         # loop (KiroCrewConfig.load() may stat/read config) ONCE, then pass the
         # resolved boolean into both the sandbox wrap below and the parent-side
@@ -8772,7 +9118,11 @@ class AcpClient:
         # The scratch dir was allocated before the sandbox wrap (carved out of
         # the masked root there); hand it to the child as its temp.
         if self._scratch_dir is not None:
-            env.update(agent_scratch.scratch_env(self._scratch_dir))
+            env.update(agent_scratch.scratch_env(self._scratch_dir, shared=self._shared_scratch))
+        elif self._shared_scratch is not None:
+            # Own allocation failed (inherited temp) but the tree's work
+            # directory is mounted: the prompt-visible name still points there.
+            env["KIROCREW_SCRATCH"] = str(self._shared_scratch)
         # Memory-aware cap for pytest-xdist's ``-n auto``: xdist sizes auto to
         # the CPU count, ignoring memory, so a full-suite run in an agent turn
         # can spawn cpu_count workers x ~1 GB each and exhaust the host. xdist
@@ -8899,6 +9249,26 @@ class AcpClient:
                     # recoverable; that deletion is not.
                     raise agent_scratch.ScratchBoundaryError(
                         "the scratch owner marker still names the gateway after a failed update"
+                    )
+            if self._shared_scratch is not None:
+                # Twin of acp/runtime.py: join the tree's owner marker beside
+                # the parent, so the sweep keeps the tree while either lives.
+                adopt_outcome = await asyncio.get_running_loop().run_in_executor(
+                    subprocess_executor(),
+                    functools.partial(agent_scratch.adopt_owner, self._shared_scratch, self._pid),
+                )
+                if adopt_outcome in ("refused", "stale"):
+                    raise agent_scratch.SharedScratchJoinError(
+                        "the inherited scratch owner marker could not be joined"
+                        if adopt_outcome == "stale"
+                        else "the inherited scratch owner marker was replaced with a link"
+                    )
+                if adopt_outcome != "recorded":
+                    logger.warning(
+                        "agent-scratch: could not join the owner marker of %r (%s); the tree's "
+                        "work directory is left unowned and will not be swept",
+                        self._shared_scratch.name,
+                        adopt_outcome,
                     )
             logger.info("Spawned %s (PID %d)", _spawn_label, self._pid)
             # Track root PID and do an early descendant scan.  kiro-cli forks
@@ -9357,6 +9727,10 @@ class AcpClient:
         self.last_prompt_stats.cost_session_usd = 0.0
         self._buffer.clear()
         self._stderr_lines.clear()
+        # A fresh process opens a fresh registration window: cleared WITH the
+        # ring, so the latch and the evidence it gates always describe the same
+        # child.
+        self._prompt_or_tool_seen = False
         if self._stderr_task and not self._stderr_task.done():
             self._stderr_task.cancel()
         self._stderr_task = None
@@ -10138,15 +10512,27 @@ class AcpClient:
                         if isinstance(exc, OSError):
                             await asyncio.sleep(_ACP_RESPAWN_BACKOFF_S)
                     else:
+                        # Read the ring BEFORE the cleanup below clears it: a
+                        # startup that died with a throttled registration on its
+                        # stderr is pre-prompt by construction, so the typed
+                        # transient subclass is the accurate verdict here too.
+                        _throttled = await self._registration_throttle_line()
                         # AcpAuthRequired subclasses AcpError; label it distinctly
                         # so a not-logged-in exit is never counted as a generic
                         # startup error. (The fork has no separate auth fail-fast
                         # branch — retry semantics stay unchanged.)
-                        _startup_outcome = (
-                            "auth_required" if isinstance(exc, AcpAuthRequired) else "error"
-                        )
+                        if isinstance(exc, AcpAuthRequired):
+                            _startup_outcome = "auth_required"
+                        elif _throttled is not None:
+                            _startup_outcome = "registration_rate_limited"
+                        else:
+                            _startup_outcome = "error"
                         await self._cleanup_failed_live_spawn()
                         self._reset_state()
+                        if _throttled is not None and not isinstance(exc, AcpAuthRequired):
+                            raise registration_rate_limited_error(
+                                "ACP session startup failed", _throttled
+                            ) from exc
                         raise
         finally:
             try:
@@ -10217,6 +10603,41 @@ class AcpClient:
             mode=self._sandbox_mode,
             extra_hidden_dirs=self._sandbox_hidden_dirs,
         )
+
+    async def _registration_throttle_line(self) -> str | None:
+        """One redacted stderr line showing a throttled registration, or ``None``.
+
+        Refuses to classify once this process has produced a non-thinking text
+        chunk or dispatched a tool (``_prompt_or_tool_seen``): the transient
+        verdict this evidence buys licenses the retry ladders to act, and a
+        stale throttle line surviving in the ring past real work must never
+        hand that verdict to a death whose replay could repeat side effects.
+        The latch clears with the ring on respawn, so a recovered throttle
+        followed by a fresh child opens a fresh window.
+
+        Returns ``None`` when nothing was retained, which is the case for a
+        restricted-memory session: stderr is not kept there by design, so this
+        cannot classify and must not guess. Those sessions keep the generic
+        death surface rather than getting a made-up verdict.
+
+        Settles the drain first, for the reason :meth:`_sandbox_init_failure`
+        does: the ring is filled by the drain task while the death that brings
+        us here is discovered on the stdout side, so a straight read can miss a
+        line already in the pipe. Redacted before it leaves: the line rides an
+        exception message that reaches session cards and persisted errors, and
+        child stderr is untrusted subprocess output that can echo a credential.
+        """
+        if getattr(self, "_prompt_or_tool_seen", True):
+            return None
+        await self._settle_stderr()
+        if not self._stderr_lines:
+            return None
+        line = registration_throttle_line("\n".join(self._stderr_lines))
+        if line is None:
+            return None
+        line, _ = redact_exfiltration_urls(line)
+        line, _ = redact_credentials(line)
+        return line
 
     async def shutdown(self) -> None:
         """Gracefully stop the ACP process."""
@@ -10539,6 +10960,13 @@ class AcpClient:
             progress = self._mcp_timeout_progress(expected_mcp)
             if progress:
                 message += f" ({progress})"
+            err = AcpTimeoutError(message=message)
+            # A start that never answered, tagged for the self-driving callers
+            # that count consecutive start failures (see
+            # ``AcpError.session_start_failed``). Set only in this branch: the
+            # other awaited requests are not session starts.
+            err.session_start_failed = True
+            raise err
         raise AcpTimeoutError(message=message)
 
     def _mcp_timeout_progress(self, expected: object) -> str:
@@ -10917,6 +11345,16 @@ class AcpClient:
                     consecutive_empty += 1
                     if consecutive_empty >= _MAX_CONSECUTIVE_EMPTY and not self._is_process_alive():
                         rc = self._process.returncode if self._process else "?"
+                        # A death whose retained stderr shows a throttled
+                        # registration is endpoint throttling, not a crash:
+                        # raise the typed transient subclass so the retry
+                        # ladders recover it (a respawn through ensure_ready
+                        # genuinely retries registration on this transport).
+                        _throttled = await self._registration_throttle_line()
+                        if _throttled is not None:
+                            raise registration_rate_limited_error(
+                                f"Process exited during prompt (exit code {rc})", _throttled
+                            )
                         raise AcpProcessDied(f"Process exited during prompt (exit code {rc})")
                     # Staleness check: if caller set _stale_eligible (text was
                     # streamed) and kiro-cli has gone silent, exit early.
@@ -11466,6 +11904,7 @@ class AcpClient:
                     if not is_thinking:
                         self.last_prompt_stats.text_chunks += 1
                         self._stale_eligible = True
+                        self._prompt_or_tool_seen = True
                     yield AcpEvent(kind=kind, text=chunk, control_notice=_notice_chunk)
                     if not is_thinking and _is_tool_interrupted_marker(chunk):
                         # kiro-cli's built-in security filter cancelled the turn's tools.
@@ -11484,6 +11923,7 @@ class AcpClient:
                 tool_event = self._extract_tool_event(msg)
                 if tool_event:
                     self._stale_eligible = False
+                    self._prompt_or_tool_seen = True
                     # Arm the tool-stall watchdog: if no further data arrives
                     # within _TOOL_STALL_TIMEOUT, _prompt_loop treats the turn
                     # as dead instead of hanging to the full prompt timeout.
@@ -11576,6 +12016,11 @@ class AcpClient:
                     len(_subs) if isinstance(_subs, list) else "n/a",
                 )
                 if isinstance(_subs, list):
+                    # A roster means children exist: a spawned child can mutate
+                    # state before its first activity frame is observed, so the
+                    # roster itself closes the registration-throttle window.
+                    if _subs:
+                        self._prompt_or_tool_seen = True
                     # No runtime_global marking here: AcpClient owns a dedicated
                     # process with a single session, so an ownerless frame from
                     # it is this session's own roster, never a co-tenant's.
@@ -11607,6 +12052,12 @@ class AcpClient:
                 if _ssid and _ssid == (self._session_id or ""):
                     continue
                 if _ssid and _tcid:
+                    # A child's tool call is this process's side effect for
+                    # replay purposes — the parent prompt spawned it, so a
+                    # replay would re-run it. Close the registration-throttle
+                    # window, exactly as the shared-runtime handle does for its
+                    # fanned-out child tool calls.
+                    self._prompt_or_tool_seen = True
                     # Sub-agent output is LLM-influenced — redact the title before
                     # it reaches the dashboard/persisted message.
                     _su_title, _ = redact_exfiltration_urls(str(_upd.get("title") or ""))
@@ -11623,6 +12074,10 @@ class AcpClient:
                     # Skip reasoning/thinking blocks (is_thinking) — those are the
                     # sub-agent's internal reasoning, not user-visible output, and
                     # the flat pre-port read never surfaced them.
+                    # Observed child output also closes the registration-throttle
+                    # window: a child whose tool frame was lost or differently
+                    # spelled must not read as "did nothing".
+                    self._prompt_or_tool_seen = True
                     _su_text, _ = redact_exfiltration_urls(_su_text)
                     _su_text, _ = redact_credentials(_su_text)
                     yield AcpEvent(
@@ -13238,8 +13693,9 @@ class AcpClient:
                 kind, _ = redact_exfiltration_urls(kind)
                 kind, _ = redact_credentials(kind)
             self.last_prompt_stats.tool_calls.append((kind, title))
-            # Trusted identity from _meta.kiro (NOT the LLM-authored title) —
-            # shared with the _dispatch builder so both event paths carry it.
+            # Trusted identity from adapter-authored markers (NOT the
+            # LLM-authored title), shared with the dispatch builder so both
+            # event paths carry the same classifier verdict.
             return AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 title=title,
@@ -13263,6 +13719,13 @@ class AcpClient:
                     update,
                     allow_spec_title_identity=self._is_spec_adapter,
                     spec_mcp_server_names=getattr(self, "_spec_mcp_server_names", ()),
+                ),
+                tool_identity_trusted=bool(
+                    _kiro_tool_name_ext(
+                        update,
+                        allow_spec_title_identity=self._is_spec_adapter,
+                        spec_mcp_server_names=getattr(self, "_spec_mcp_server_names", ()),
+                    )
                 ),
                 mcp_identity_trusted=bool(
                     _kiro_mcp_server_name_ext(

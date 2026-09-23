@@ -107,6 +107,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 if TYPE_CHECKING:
@@ -146,6 +147,7 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.mcp_gateway.abort import schedule_abort
+from kiro_crew.member_memory_auth import prune_legacy_member_pid_bindings
 from kiro_crew.messaging.link import (
     UNBIND_REASON_SESSION_DESTROYED,
     UNBIND_REASON_UNSPECIFIED,
@@ -177,6 +179,7 @@ from kiro_crew.session_allocation import (  # noqa: F401
 from kiro_crew.session_allocation import (
     _collect_parent_runtime_kwargs,
 )
+from kiro_crew.session_allocation import parent_work_scratch_dir as _parent_work_scratch_dir
 from kiro_crew.session_background import (
     BackgroundRuntimeDeps,
     BackgroundSessionRuntime,
@@ -985,6 +988,12 @@ class _Session:
     # the caller's existing stale-provider path evicts it and cold starts. Default
     # False so every existing construction site is unaffected.
     retire_on_identity_change: bool = False
+    # True while the lease is held for a LIFETIME rather than a turn -- see
+    # ``session_lifecycle._turn_in_flight``, which is what asks.
+    lifecycle_lease: bool = False
+    # Set by a lifecycle holder for the whole of its turn, INCLUDING the setup before the
+    # provider registers one. ``has_active_turn`` cannot see that window.
+    lifecycle_turn_active: bool = False
     prompt_count: int = 0
     consecutive_failures: int = 0
     # Bounded rather than plain: a release() call that lands on this object
@@ -993,9 +1002,29 @@ class _Session:
     # counter above 1, which would let a second turn acquire concurrently
     # with one still in flight.
     semaphore: asyncio.BoundedSemaphore = field(default_factory=lambda: asyncio.BoundedSemaphore(1))
+    # The task that acquired the turn permit above, recorded at every acquire
+    # site and read by ``reset``: a session popped while its permit is held
+    # remembers WHO held it, so that task's later key-only ``release`` is
+    # absorbed instead of unlocking whatever successor now occupies the key.
+    turn_owner: Any = None
     approval_policy: str = ""  # "" (interactive) | "auto" (auto-approve all tools)
     agent: str = ""  # kiro agent name used for this session
     capability_member: str = ""
+    # The model this session's allocation SELECTED, as handed to the provider.
+    # Stamped at registration from the same local the factory receives, so the id
+    # sent and the id readable here are one value and cannot diverge.
+    #
+    # It exists because a caller that pins nothing at any of its own tiers passes
+    # ``model=None`` and the allocation resolves one itself, inside a call whose
+    # return says only which provider, whether it is new, and whether it resumed.
+    # A caller recording what it asked for therefore has nothing to record for that
+    # allocation, while the session runs on a concrete id. Read through
+    # ``SessionManager.allocation_requested_model``.
+    #
+    # ``""`` means this allocation resolved nothing, or a registration site that
+    # does not resolve models made the session. Both are "no selection to report",
+    # which is what a consumer of the empty value states.
+    requested_model: str = ""
     loaded_capabilities: LoadedCapabilities | None = None
     # Slack message queue: FIFO of (msg_ts, text, kwargs) waiting for the semaphore
     queue: deque[tuple[str, str, dict]] = field(default_factory=deque)
@@ -1279,6 +1308,7 @@ class SessionManager:
                 data_home=data_home
             ),
             prune_session_pid_mappings=lambda: _prune_stale_session_pid_files(),
+            prune_member_pid_bindings=lambda: prune_legacy_member_pid_bindings(),
             prune_pycache=lambda: prune_pycache(),
             collect_active_pids=lambda sessions: _collect_active_pids(
                 cast(dict[Any, Any], sessions)
@@ -1693,6 +1723,33 @@ class SessionManager:
         """Resolve exact, canonical, then legacy aliases onto a live key."""
         return self._allocation_boundary()._fold_key(key)
 
+    def set_lifecycle_turn_active(self, key: str, active: bool) -> bool:
+        """Record whether a lifecycle holder is taking a turn.
+
+        A holder that keeps its lease across an idle life has to say when it is WORKING,
+        because the pre-stream setup runs before the provider registers a turn and a probe
+        reading the provider alone would tear the session down mid-setup. Returns whether a
+        registered session was updated.
+        """
+        session = self._allocation_boundary()._sessions.get(self._fold_key(key))
+        if session is None:
+            return False
+        session.lifecycle_turn_active = active
+        return True
+
+    def mark_lifecycle_lease(self, key: str) -> bool:
+        """Declare that this key's lease is held for a LIFETIME, not for one turn.
+
+        A holder that keeps the lease across an idle listening life must say so, because a
+        busy probe reading the lease alone would otherwise refuse every teardown on the key
+        for as long as the holder exists. Returns whether a registered session was marked.
+        """
+        session = self._allocation_boundary()._sessions.get(self._fold_key(key))
+        if session is None:
+            return False
+        session.lifecycle_lease = True
+        return True
+
     def has_session(self, key: str) -> bool:
         """Return whether a live session exists for the folded key."""
         return self._allocation_boundary().has_session(key)
@@ -2072,6 +2129,10 @@ class SessionManager:
         """Delegate stale-backend runtime retirement."""
         await self._background_runtime._retire_stale_backend_bg_runtime()
 
+    async def _reap_idle_stale_bg_runtime(self) -> bool:
+        """Delegate the periodic idle-and-stale retirement of the shared runtime."""
+        return await self._background_runtime.reap_idle_stale_bg_runtime()
+
     async def _provider_backed_bg_session(self) -> "_ProviderBgSession":
         """Return the serialized provider-backed background adapter."""
         return cast(
@@ -2151,6 +2212,10 @@ class SessionManager:
     def _parent_runtime_kwargs(self, parent_session_key: str) -> dict:
         """Return the parent runtime security and backend posture."""
         return _collect_parent_runtime_kwargs(cast(Any, self), parent_session_key)
+
+    def parent_work_scratch_dir(self, parent_session_key: str) -> Path | None:
+        """The ``$KIROCREW_SCRATCH`` directory of the exact parent's session tree, or None."""
+        return _parent_work_scratch_dir(cast(Any, self), parent_session_key)
 
     def is_session_sharing_eligible(self, parent_session_key: str) -> bool:
         """Return whether the exact parent can share a runtime."""
@@ -2376,6 +2441,7 @@ class SessionManager:
         expect_session: _Session | None = None,
         skip_if_busy: bool = False,
         skip_if_injecting: bool = False,
+        refuse_only_on_active_turn: bool = False,
         clear_conversation: bool = False,
         ends_conversation: bool = False,
     ) -> bool:
@@ -2385,6 +2451,7 @@ class SessionManager:
             expect_session=cast(Any, expect_session),
             skip_if_busy=skip_if_busy,
             skip_if_injecting=skip_if_injecting,
+            refuse_only_on_active_turn=refuse_only_on_active_turn,
             clear_conversation=clear_conversation,
             ends_conversation=ends_conversation,
         )
@@ -2429,6 +2496,34 @@ class SessionManager:
     def consume_needs_reinjection(self, key: str) -> bool:
         """Consume a live session's reinjection marker."""
         return self._compaction.consume_needs_reinjection(key)
+
+    def allocation_requested_model(self, key: str) -> str:
+        """Return the model *key*'s live allocation selected, or ``""``.
+
+        The selection a caller makes is the caller's to record. This answers the
+        tier BELOW every caller: an allocation handed ``model=None`` resolves an
+        id from config itself, hands it to the provider, and reports only the
+        provider, ``is_new`` and ``resumed`` — so the caller's own record of what
+        was asked for is blank while the session runs on a concrete model. Reading
+        the stamp the allocation left is what closes that, and it is the SAME
+        value the provider received, not a second resolution.
+
+        A caller composes this OVER its own selection (``this or own``) rather
+        than under it. ``is_new`` with ``resumed`` false says the caller consumed a
+        fresh first-turn observation, NOT that the caller allocated the session: a
+        prewarmed session that started fresh arms exactly that observation, so a
+        claim of one is indistinguishable from a cold start in the return value.
+        This stamp is the allocation's own selection by construction and is right
+        for both cases; the caller's own resolution is right only for the cold
+        start, since on a prewarmed claim it re-resolves a config that may have
+        moved since the session was allocated.
+
+        ``""`` for an unknown key, a session with no selection, and a session made
+        by a registration site that resolves no models. All three are "nothing to
+        report", which is what an empty value says.
+        """
+        session = self._sessions.get(self._fold_key(key))
+        return session.requested_model if session is not None else ""
 
     def provider_switch_replay_pending(self, key: str) -> bool:
         """Return whether a live session still owes conversation replay.
@@ -2699,7 +2794,12 @@ class SessionManager:
         )
 
     async def discard_conversation(
-        self, key: str, *, replay: bool = True, skip_if_busy: bool = False
+        self,
+        key: str,
+        *,
+        replay: bool = True,
+        skip_if_busy: bool = False,
+        refuse_only_on_active_turn: bool = False,
     ) -> bool:
         """Drop native conversation state while retaining channel linkage.
 
@@ -2709,7 +2809,10 @@ class SessionManager:
         atomicity contract.
         """
         return await self._lifecycle_boundary().discard_conversation(
-            key, replay=replay, skip_if_busy=skip_if_busy
+            key,
+            replay=replay,
+            skip_if_busy=skip_if_busy,
+            refuse_only_on_active_turn=refuse_only_on_active_turn,
         )
 
     async def drain_active_turns(self, timeout: float | None = None) -> int:
@@ -2799,6 +2902,15 @@ class SessionManager:
         """Return whether a folded key has resumable state."""
         return self._allocation_boundary().resumable_hint(key)
 
+    def mapped_sid(self, key: str) -> str:
+        """The session ID a folded key maps to, in memory, without pruning.
+
+        For a caller recording HISTORY rather than deciding a resume. Use
+        :meth:`resumable_sid` for the latter: its file check is what makes the
+        answer a resumable session, and this one deliberately omits it.
+        """
+        return self._allocation_boundary().mapped_sid(key)
+
     def seed_conversation(self, key: str, sid: str, *, provider: str = "", cwd: str = "") -> None:
         """Seed a persisted conversation mapping."""
         self._allocation_boundary().seed_conversation(key, sid, provider=provider, cwd=cwd)
@@ -2814,6 +2926,14 @@ class SessionManager:
     def release(self, key: str, *, cleanup: bool = False) -> None:
         """Release the key-based session lease."""
         self._allocation_boundary().release(key, cleanup=cleanup)
+
+    def absorb_orphaned_release(self, key: str) -> bool:
+        """Whether the calling task's release belongs to a session already reset."""
+        return self._lifecycle_boundary().absorb_orphaned_release(key)
+
+    def adopt_turn(self, key: str) -> None:
+        """The calling task now holds *key*'s live permit; forget any orphan record."""
+        self._lifecycle_boundary().adopt_turn(key)
 
     async def _safe_cleanup(self, provider: LLMProvider, session_id: str) -> None:
         """Best-effort cleanup of provider session files."""
@@ -3163,8 +3283,24 @@ class SessionManager:
         )
 
     def stop_generation(self, key: str) -> int:
-        """Monotonic count of :meth:`stop_turn` requests recorded for *key*."""
+        """Monotonic count of user Stop requests recorded for *key*."""
         return self._lifecycle_boundary().stop_generation(key)
+
+    def note_stop(self, key: str) -> bool:
+        """Record a user Stop for *key* without cancelling anything."""
+        return self._lifecycle_boundary().note_stop(key)
+
+    def open_replay_gap(self, key: str) -> None:
+        """Keep Stops recordable for *key* across a reset-then-replay window."""
+        self._lifecycle_boundary().open_replay_gap(key)
+
+    def close_replay_gap(self, key: str) -> None:
+        """End the window :meth:`open_replay_gap` opened."""
+        self._lifecycle_boundary().close_replay_gap(key)
+
+    async def await_replay_gap(self, key: str) -> None:
+        """Wait out another task's open replay gap on *key* before claiming."""
+        await self._lifecycle_boundary().await_replay_gap(key)
 
     async def _send_abort_for_session(self, key: str, session: Any) -> None:
         """Best-effort abort gateway work before hard session teardown."""

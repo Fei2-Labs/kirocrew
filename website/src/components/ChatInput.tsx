@@ -42,7 +42,7 @@ import { Badge, Btn, Slider } from './ui'
 import ErrorNotice from './ErrorNotice'
 import { useTouchPushToTalk } from '../hooks/useTouchPushToTalk'
 import { consumeComposerRelease, COMPOSER_EXPAND_EVENT } from '../pages/chat/composerFocus'
-import BusySendButton, { useBusySendMode } from './BusySendButton'
+import BusySendButton, { useBusySendMode, type BusySendMode } from './BusySendButton'
 import { isScreenSnipSupported } from '../hooks/useScreenSnip'
 import { useImeGuard } from '../hooks/useImeGuard'
 import ContextBar, { contextTip, contextColor, composeContextReadout, contextPctClamped, fmtTokens } from './ContextBar'
@@ -468,8 +468,19 @@ interface ChatInputProps {
   /** Act on the composer NOW rather than queueing: a mid-turn steer into the
    * running turn, or a fresh turn when only sub-agents are running. Reads the
    * composer text and pending files itself (ChatPage) and clears them
-   * atomically — ChatInput must NOT clear the value around this call. */
-  onSteer?: () => void
+   * atomically — ChatInput must NOT clear the value around this call.
+   *
+   * `auto` asks the GATEWAY to choose between steering and queueing for this one
+   * message (`steer: "auto"`, `decisions/points/message_steer.py`). It rides this
+   * callback rather than a second one because it is the same send down the same
+   * route: only the flag differs, and a host that ignores the argument keeps
+   * today's behaviour, which is the steer this callback has always meant. */
+  onSteer?: (opts?: { auto?: boolean }) => void
+  /** Whether the host may offer `Auto (Jev)` in the split button's mode picker:
+   * the gateway reports the Decisions seam as permitted by governance AND
+   * consented to. Defaults to false, so a surface that never asks cannot offer a
+   * mode the gateway would refuse to act on. */
+  jevAutoAvailable?: boolean
   /** How the BUSY composer offers its send. `'split'` (default): the
    * Steer/Queue split button with its per-slot mode picker — the main chat
    * and split-view panes. `'steer-only'`: the surface has no queue concept —
@@ -547,8 +558,33 @@ interface ChatInputProps {
    * backend's served default), not a pin. The chip then carries the same
    * ` · default` marker and explanatory tooltip the agent chip uses for its
    * inherited case, so a served model does not read as something the user
-   * chose. A pinned chip has nothing to explain. */
+   * chose. A pinned chip has nothing to explain. Yields to
+   * `modelIsJevRouted` below, which describes the same unpinned slot more
+   * specifically. */
   modelIsInheritedDefault?: boolean
+  /**
+   * True when THIS turn's model is Jev's to pick: the slot names no model
+   * (`auto`, or the empty string a freshly dispatched slot carries) and the Jev
+   * preview is on, so `model.route` puts the turn in a tier and runs it on that
+   * tier's model.
+   *
+   * The chip then names the POLICY (`Auto (Jev)`) in place of `modelName`, rather
+   * than an id with a marker beside it. A routed session's model changes from turn
+   * to turn, so naming one makes a chip that reads like a pin and is stale by the
+   * next reply; the model a given turn actually ran on is on that turn's routing
+   * receipt, which is per-turn and cannot go stale. It is also the exact label the
+   * picker highlights for this slot (`jevRouteShownModel`), so the chip and the
+   * open menu say the same word for the same choice.
+   *
+   * Hosts compute it from the SAME `jevRouteOffered()` the picker's row is drawn
+   * from (`lib/jevRoute.ts`) against the slot's raw `model`, which is what the
+   * routing gate reads. One condition, so the chip cannot say Auto for a turn that
+   * routed, nor Auto (Jev) for one that did not.
+   *
+   * Wins over `modelIsInheritedDefault`: both describe a slot that pinned nothing,
+   * and this one names WHO picks instead, which is the more specific fact and the
+   * one that costs money. */
+  modelIsJevRouted?: boolean
   /**
    * Picker openers (agent, model, project, and `onSessionControlClick` below).
    * Each hands the host the chip's click-time rect AND the chip element itself:
@@ -919,6 +955,7 @@ function ChatInput({
   providerLabel,
   rateLimit,
   onSteer,
+  jevAutoAvailable = false,
   busyMode = 'split',
   disabled: disabledProp = false,
   placeholder = '',
@@ -941,6 +978,7 @@ function ChatInput({
   agentLabel,
   agentIsInheritedDefault,
   modelIsInheritedDefault,
+  modelIsJevRouted,
   agentSource,
   modelName,
   onAgentClick,
@@ -1586,7 +1624,18 @@ function ChatInput({
   // silently queue from a surface that never shows that choice.
   const steerOnly = busyMode === 'steer-only'
   const busyChoiceAvailable = isRunning && (!stopState || stopState === 'idle') && !!canSteer && !!onSteer
-  const steerActive = busyChoiceAvailable && (steerOnly || busySendMode === 'steer')
+  // A stored `auto` from a session where the seam WAS available resolves back to
+  // the shipped default while it is not: consent can be withdrawn and a fleet can
+  // pin the seam off, and a mode kept on screen after that would send a flag the
+  // gateway refuses to act on — which is a steer either way, but one the sender
+  // was told was a decision.
+  const effectiveBusyMode: BusySendMode =
+    busySendMode === 'auto' && !jevAutoAvailable ? 'steer' : busySendMode
+  // `auto` is an ACTIVE steer: the send goes down the steer route carrying the
+  // flag, and the gateway decides there. Its fallback on every refusal is that
+  // same steer, so the composer's own reading of "acting now" is unchanged.
+  const steerActive = busyChoiceAvailable && (steerOnly || effectiveBusyMode !== 'queue')
+  const steerAuto = busyChoiceAvailable && !steerOnly && effectiveBusyMode === 'auto'
   /**
    * Fire the composer. `alternate === true` performs the OTHER busy action for
    * this one send — queue when the split button says steer, steer when it says
@@ -1609,9 +1658,12 @@ function ChatInput({
     if (voiceTranscribing) return
     const flip = alternate === true && busyChoiceAvailable && !steerOnly
     const steerNow = flip ? !steerActive : steerActive
-    if (steerNow && onSteer) onSteer()
+    // A flipped send never asks: the chord is the sender answering the question
+    // themselves for this one message, so handing it to the oracle anyway would
+    // ignore the only explicit instruction on the send.
+    if (steerNow && onSteer) onSteer(steerAuto && !flip ? { auto: true } : undefined)
     else onSend()
-  }, [disabled, voiceTranscribing, busyChoiceAvailable, steerOnly, steerActive, onSteer, onSend])
+  }, [disabled, voiceTranscribing, busyChoiceAvailable, steerOnly, steerActive, steerAuto, onSteer, onSend])
   const sendFollowUp = useCallback((text?: string, sourceKeyAtClick?: string | null) => {
     if (!disabled) onFollowUpSend?.(text, sourceKeyAtClick)
   }, [disabled, onFollowUpSend])
@@ -4007,6 +4059,18 @@ function ChatInput({
         animate={{ opacity: 1, height: 'auto' }}
         exit={{ opacity: 0, height: 0 }}
         transition={{ type: 'spring', damping: 26, stiffness: 280, mass: 0.7 }}
+        // The halo lives on THIS element, not on the bordered wrapper inside it:
+        // this element clips its content for the height:0 exit, and a child's
+        // box-shadow is content, so a halo drawn one level down is cut at the
+        // edge. An element's own shadow is outside its overflow clip. Radius
+        // mirrors the wrapper's so the halo hugs the same corners. With an
+        // approval box attached above, the wrapper has no top radius and the
+        // approval glow already lights the pair, so the halo stands down.
+        // Incognito and temporary modes paint the wrapper's border warn / aim
+        // at all times; the focus halo takes the same color there so the one
+        // control lights up in one color instead of an accent ring around a
+        // warn or aim edge.
+        className={hasApproval ? undefined : `composer-halo rounded-2xl${memoryMode === 'temporary' ? ' composer-halo-aim' : memoryMode === 'incognito' ? ' composer-halo-warn' : ''}`}
         style={{ overflow: 'hidden' }}
       >{/* File drag-and-drop target. Drag-drop is inherently pointer-only; the
            keyboard-accessible path is the "Attach files" button that opens the
@@ -4072,7 +4136,7 @@ function ChatInput({
           />
         )}
 
-        {optimizing && <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl"><Sparkles size={14} className="inline mr-1 text-yellow-400" /> {i18nT('components.chatInput.optimizing_prompt')}</span>}
+        {optimizing && <span className="optimize-overlay absolute inset-0 flex items-center justify-center backdrop-blur-md pointer-events-none z-10 rounded-2xl"><span className="optimize-overlay-pill inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium text-text"><Sparkles size={15} className="text-accent animate-pulse shrink-0" /> {i18nT('components.chatInput.optimizing_prompt')}</span></span>}
         {/* The textarea fallback is seamless for typing (draft intact), but the
             failure itself must be user-visible, not only a console line: the
             person who opted into the editor should know they are no longer in
@@ -4640,11 +4704,12 @@ function ChatInput({
                     </button>
                   ) : (
                   <BusySendButton
-                    mode={busySendMode}
+                    mode={effectiveBusyMode}
                     onModeChange={setBusySendMode}
                     onFire={fireComposer}
                     disabled={disabled}
                     altChordAvailable={sendOnEnter === 'enter'}
+                    autoAvailable={jevAutoAvailable}
                   />
                   )
                 ) : (
@@ -4672,11 +4737,12 @@ function ChatInput({
                 // in place (disabled) so the composer's shape does not jump
                 // when the first character lands.
                 <BusySendButton
-                  mode={busySendMode}
+                  mode={effectiveBusyMode}
                   onModeChange={setBusySendMode}
                   onFire={fireComposer}
                   disabled
                   altChordAvailable={sendOnEnter === 'enter'}
+                  autoAvailable={jevAutoAvailable}
                 />
               )
             ) : (<>
@@ -5123,22 +5189,29 @@ function ChatInput({
               // reads exactly like a pin. A pinned chip keeps the plain hint.
               title={isRunning
                 ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                : modelIsInheritedDefault
-                  ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                  : i18nT('components.chatInput.model_2', { name: modelName })}
+                : modelIsJevRouted
+                  ? i18nT('pages.chatPage.model_auto_jev_description')
+                  : modelIsInheritedDefault
+                    ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+                    : i18nT('components.chatInput.model_2', { name: modelName })}
               aria-label={isRunning
                 ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                : modelIsInheritedDefault
-                  ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                  : i18nT('components.chatInput.model_2', { name: modelName })}
+                : modelIsJevRouted
+                  ? i18nT('pages.chatPage.model_auto_jev_description')
+                  : modelIsInheritedDefault
+                    ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+                    : i18nT('components.chatInput.model_2', { name: modelName })}
             >
               <span className="truncate max-w-[180px]">
-                {modelName}
+                {modelIsJevRouted ? i18nT('components.modelDropdownList.auto_jev') : modelName}
               </span>
-              {modelIsInheritedDefault && (
-                // Outside the truncating span: a long provider-prefixed id must
-                // ellipsize its own tail, never the marker that tells a served
-                // default apart from a pin.
+              {/* Outside the truncating span: a long provider-prefixed id must
+                  ellipsize its own tail, never the marker beside it. A routed chip
+                  takes NO marker -- its label is already the policy, and a second
+                  word next to it would be a marker on a name that is not a model.
+                  So the two unpinned states differ by KIND (a policy vs an id with
+                  a marker), not by two adjectives a reader has to tell apart. */}
+              {!modelIsJevRouted && modelIsInheritedDefault && (
                 <>
                   <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>
                   <span className="opacity-60 shrink-0">{i18nT('components.agentSelector.default')}</span>

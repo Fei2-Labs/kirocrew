@@ -2023,7 +2023,7 @@ def caller_names_a_missing_slot(slots: object, session_key: str) -> bool:
 #: widen — the point of the header is that a NEW internal caller surfaces as
 #: ``unknown-internal`` in the audit until someone decides what to call it,
 #: instead of silently inheriting another component's label.
-KNOWN_INTERNAL_CALLERS = frozenset({"kirocrew-dashboard", "kirocrew-crew-log"})
+KNOWN_INTERNAL_CALLERS = frozenset({"kirocrew-dashboard", "kirocrew-crew-log", "kirocrew-debug"})
 
 
 def request_origin(
@@ -2176,6 +2176,44 @@ def effective_request_app(state: object, request: web.Request) -> str:
         getattr(state, "_slots", None),
         request.headers.get("X-Session-Key", ""),
     )
+
+
+#: Request key under which the chat folder/tag gate
+#: (``handlers/_shared.py``'s ``private_chat_route_refusal``) stamps the VERIFIED
+#: member principal (``member:<store>``) when it admits a member caller. The
+#: constant lives HERE, the lowest layer, so the gate that writes it and
+#: :func:`folder_principal` that reads it share one key and cannot drift.
+MEMBER_CHAT_PRINCIPAL_KEY = "member_chat_principal"
+
+
+def folder_principal(state: object, request: web.Request) -> str:
+    """The principal that owns a folder written by *request*, or ``""``.
+
+    The generalisation of :func:`effective_request_app` from "which app" to
+    "which non-person principal", so the chat-folder tree fence
+    (``chat_folders``' ``owner_app`` comparisons) can be one uniform check
+    across app AND crew-member callers instead of two:
+
+    * an APP caller -> its bare app name, EXACTLY what
+      :func:`effective_request_app` returns and what ``owner_app`` has always
+      stored, so every folder written before members existed keeps its meaning
+      and no migration is needed;
+    * an admitted crew MEMBER caller -> ``"member:<store>"``, read from the
+      principal the gate already stamped on the VERIFIED scope (never a second
+      config read on the event loop, never a body value). App names are
+      validated identifiers that never begin ``member:``, so the two principal
+      spaces cannot collide;
+    * the person -> ``""`` (absent/empty ``owner_app``), unchanged.
+
+    Ordering matters: the app claim is checked FIRST. A member never carries an
+    app claim (``request["app"]`` is set only for a resolved app), so the two
+    arms are mutually exclusive, but checking the app first keeps an app's
+    principal byte-identical to what it was.
+    """
+    app = effective_request_app(state, request)
+    if app:
+        return app
+    return str(request.get(MEMBER_CHAT_PRINCIPAL_KEY) or "")
 
 
 def _cron_job_owner(jobs: object, job_id: str) -> str:
@@ -3101,6 +3139,19 @@ def token_auth_middleware(
         request["auth_token"] = session_token
         # POSITIVE dashboard-user signal for the WS scope gate (see above).
         request["is_dashboard_user"] = not app_name
+        # WHICH credential authenticated: the ``?token=`` the caller presented,
+        # or the session cookie the fallback above adopted after that query
+        # token proved invalid. One bit, derived from the same ``from_cookie``
+        # the cookie-set branch below already keys on -- a fresh cookie is set
+        # only on a query-token exchange, so this is that decision named.
+        #
+        # A status code cannot carry it. ``/api/auth/me`` is not owner-gated, so
+        # a session that is authenticated but owner-denied answers 200 there on
+        # its cookie alone; a caller reading only the status would take that for
+        # "the token I sent was accepted". ``api_auth_me`` returns this so the
+        # in-banner re-auth exchange can tell the two apart, which it cannot do
+        # from Set-Cookie: that header is unreadable from a browser.
+        request["auth_from_query_token"] = not from_cookie
 
         # App-token least-privilege gate (CWE-269): an app token is confined to
         # its own namespace + its manifest ``permissions.api`` allowlist. This

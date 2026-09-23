@@ -1119,6 +1119,73 @@ class TestCancelRaceCondition:
         await mgr.close_all()
 
 
+class TestAllocationRequestedModel:
+    """The model an allocation selects is readable by its caller.
+
+    A caller that pins nothing passes ``model=None``, and the allocation resolves
+    an id from config itself. ``get_or_create`` reports the provider, ``is_new``
+    and ``resumed``, so that id is otherwise invisible to the caller recording what
+    the session was asked to run.
+    """
+
+    @staticmethod
+    def _capturing_factory(captured: dict):
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            captured.update(kwargs)
+            m = AsyncMock()
+            m.start = AsyncMock()
+            m.context_usage_pct = lambda: 0.0
+            m.is_process_alive = lambda: True
+            m.is_alive.return_value = True
+            return m
+
+        return factory
+
+    @pytest.mark.asyncio
+    async def test_the_internally_resolved_id_is_the_id_the_provider_got(self, cfg):
+        """One value: the stamp is the same string the factory received."""
+        cfg.agent.model = "claude-sonnet-5"
+        captured: dict = {}
+        mgr = SessionManager(cfg, provider_factory=self._capturing_factory(captured))
+
+        await mgr.get_or_create("alloc-resolved")
+
+        assert captured["model_override"] == "claude-sonnet-5"
+        assert mgr.allocation_requested_model("alloc-resolved") == "claude-sonnet-5"
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_callers_explicit_model_is_reported_unchanged(self, cfg):
+        """An explicit model is stamped too, so one read serves both cases."""
+        captured: dict = {}
+        mgr = SessionManager(cfg, provider_factory=self._capturing_factory(captured))
+
+        await mgr.get_or_create("alloc-explicit", model="claude-haiku-5")
+
+        assert mgr.allocation_requested_model("alloc-explicit") == "claude-haiku-5"
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_an_allocation_that_resolves_nothing_reports_nothing(self, cfg):
+        """No tier resolved an id, so there is no selection to report."""
+        cfg.agent.model = ""
+        captured: dict = {}
+        mgr = SessionManager(cfg, provider_factory=self._capturing_factory(captured))
+
+        await mgr.get_or_create("alloc-blank")
+
+        assert captured["model_override"] is None
+        assert mgr.allocation_requested_model("alloc-blank") == ""
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_key_reports_nothing(self, cfg):
+        """No session, so nothing to report — never an error."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        assert mgr.allocation_requested_model("never-allocated") == ""
+        await mgr.close_all()
+
+
 class TestDeadProviderCleanup:
     """Tests for orphaned child process cleanup when a dead provider is detected."""
 
@@ -3118,7 +3185,9 @@ class TestResolveAgentModelResolution:
         agents = tmp_path / "agents"
         agents.mkdir()
         (agents / "linked.json").symlink_to(target)
-        monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+        monkeypatch.setattr(
+            agent_discovery, "is_sensitive_canonical_path", lambda p: str(target) in str(p)
+        )
 
         with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents):
             assert SessionManager._resolve_agent_model("linked") == "auto"
@@ -6229,6 +6298,100 @@ class TestParentEndCancelsItsChildren:
         await mgr.close_all()
 
     @pytest.mark.asyncio
+    async def test_parent_end_cancels_owned_followup_without_recreating_session(self, cfg):
+        """A queued continuation cannot outlive the parent that accepted it."""
+        from kiro_crew.subagent import SubagentInfo
+        from kiro_crew.subagent_manager.cancellation import CancellationCoordinator
+
+        parent = "dashboard:chat-9"
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create(parent)
+
+        watcher_started = asyncio.Event()
+        release_watcher = asyncio.Event()
+        dispatch = AsyncMock()
+
+        async def _dispatch_followup():
+            watcher_started.set()
+            await release_watcher.wait()
+            await dispatch()
+            await mgr.get_or_create(parent)
+
+        info = SubagentInfo(
+            id="child-with-followup",
+            task="original task",
+            agent="default",
+            parent_session_key=parent,
+        )
+        info.done = True
+        info._reported_to_parent = True
+        info.pending_followups = ["continue after the parent ends"]
+        info._followup_watcher = True
+        watcher = asyncio.create_task(_dispatch_followup())
+        cancel_reasons: list[str] = []
+        audited: list[tuple[str, str]] = []
+
+        class _Children:
+            def __init__(self):
+                self._agents = {info.id: info}
+                self._queue = []
+                self._teardown_cancelled_ids = set()
+                self._followup_watchers = {info.id: watcher}
+                self._followup_watcher_parents = {info.id: parent}
+                self._followup_watcher_infos = {info.id: info}
+
+            def _audit_followup(self, owned, outcome):
+                audited.append((owned.id, outcome))
+
+            def _cancel_task_intentionally(self, task, owned=None, *, reason):
+                cancel_reasons.append(reason)
+                task.cancel()
+
+        children = _Children()
+        coordinator = CancellationCoordinator(children)  # type: ignore[arg-type]
+
+        class _Handler:
+            def snapshot_teardown_children(self, parent_session_key):
+                return coordinator.snapshot_teardown_children_impl(parent_session_key)
+
+            async def cancel_for_teardown(
+                self,
+                agent_ids,
+                *,
+                parent_session_key="",
+                verb="",
+            ):
+                return await coordinator.cancel_for_teardown_impl(
+                    agent_ids,
+                    parent_session_key=parent_session_key,
+                    verb=verb,
+                )
+
+        mgr.set_child_teardown_handler(_Handler())
+        await watcher_started.wait()
+        try:
+            await mgr.remove(parent)
+            release_watcher.set()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+            assert cancel_reasons == ["parent teardown cancelled owned follow-up"]
+            assert info.pending_followups == []
+            assert audited == [(info.id, "followup_suppressed")]
+            assert children._followup_watchers == {}
+            assert children._followup_watcher_parents == {}
+            assert children._followup_watcher_infos == {}
+            dispatch.assert_not_awaited()
+            assert not mgr.has_session(
+                parent
+            ), "the queued follow-up rebuilt the conversation after parent teardown"
+        finally:
+            release_watcher.set()
+            if not watcher.done():
+                watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            await mgr.close_all()
+
+    @pytest.mark.asyncio
     async def test_remove_cancels_children(self, cfg):
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         _snapshotted, seen, cb = self._recorder()
@@ -7281,6 +7444,9 @@ class TestParentEndCancelsItsChildren:
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers = {"run-delivered": watcher}
 
+            def _cancel_task_intentionally(self, task, info=None, *, reason):
+                task.cancel()
+
         manager = _Manager()
         coordinator = CancellationCoordinator(manager)  # type: ignore[arg-type]
 
@@ -7340,6 +7506,9 @@ class TestParentEndCancelsItsChildren:
                 self._queue = []
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers = {"run-1": watcher}
+
+            def _cancel_task_intentionally(self, task, info=None, *, reason):
+                task.cancel()
 
         manager = _Manager()
         coordinator = CancellationCoordinator(manager)  # type: ignore[arg-type]

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The ACP layer spans **five** modules: the legacy per-session client (`acp/client.py`, one subprocess per session), the multiplexed runtime (`acp/runtime.py`, one subprocess fanned out to N sessions), the per-session handle (`acp/session_handle.py`, one `sessionId` + queue + prompt/approve/reject loop), a shared dispatch parser (`acp/_dispatch.py`, pure frame-shaping/redaction helpers all paths route through), and the session provider (`acp/session_provider.py`, `AcpSessionProvider` adapting an `AcpSessionHandle` to the `LLMProvider` ABC so runtime-backed sessions are interchangeable with `AcpClient`). All are JSON-RPC 2.0 over stdio for `kiro-cli acp` or `claude-agent-acp`, managing subprocess lifecycle, session initialization, prompt streaming, and tool permissions. All protocol constants in `acp/types.py`.
+The primary ACP session transport path spans **five** modules: the legacy per-session client (`acp/client.py`, one subprocess per session), the multiplexed runtime (`acp/runtime.py`, one subprocess fanned out to N sessions), the per-session handle (`acp/session_handle.py`, one `sessionId` + queue + prompt/approve/reject loop), a shared dispatch parser (`acp/_dispatch.py`, pure frame-shaping/redaction helpers all paths route through), and the session provider (`acp/session_provider.py`, `AcpSessionProvider` adapting an `AcpSessionHandle` to the `LLMProvider` ABC so runtime-backed sessions are interchangeable with `AcpClient`). All are JSON-RPC 2.0 over stdio for a registry-selected ACP harness, managing subprocess lifecycle, session initialization, prompt streaming, and tool permissions. Protocol constants live in `acp/types.py`; the complete backend and host-capability matrix is in [agent-host-contract.md](agent-host-contract.md#column-meaning).
 
 ## Native skill startup views
 
@@ -54,7 +54,13 @@ This overlay also affects standalone native custom agents in that workspace.
 The [Kiro CLI 2.10 release notes](https://kiro.dev/changelog/cli/2-10/)
 document this setting and agent-config hot reload. No documented per-invocation
 settings channel was found; changing `KIRO_HOME` would also relocate native
-identity and session state, so it is not used for this overlay.
+identity and session state, so it is not used for this overlay. Every in-product
+workspace `cli.json` writer—projection, effort, Tool Search, and the built-in
+review pool—takes the same verified `.kirocrew-cli-settings.lock` sidecar and
+reads the file only after acquiring it. Projection holds that lock from the
+fresh read through alias publication and settings commit, so a concurrent writer
+cannot be replaced by a stale pre-enumeration snapshot. Lock identity changes or
+a two-second acquisition timeout fail closed without writing the settings file.
 Crew records the original local inheritance key's presence and value in
 `kirocrew.skillDiscovery.previousInheritance`. Rollback restores that snapshot
 only while the native key still equals Crew's asserted `true`, removes Crew's
@@ -62,8 +68,87 @@ overlay markers and preserves unrelated settings and a native key that the
 operator changed or removed. Older overlays use their recorded local/global
 source and boolean preference for restoration. Stop projected sessions before
 rollback so another active Crew process cannot reassert the shared overlay.
-Aliases remain on disk: automatic pruning cannot safely identify obsolete views
-owned by other workspaces or still used by active native processes.
+Inactive aliases owned by the same Crew data home are pruned only when the
+recorded work directory or authored source proves that the pair cannot be
+regenerated. Aliases published by builds that predate this lifecycle carry NO
+record of either kind, so an ownership-keyed reclaim alone would leave the entire
+accumulated backlog on disk and bound only post-upgrade growth -- which is the
+per-turn tool-spec cost this exists to remove. Those are reclaimed on a separate
+path that does not read a record: the name must match Crew's own prefix plus the
+24-hex digest the projection derives, the file must be a projected view (it
+renames itself to that alias and carries no `skill://` resource), AND it must
+carry one positive mark the projection itself writes -- Crew's managed
+`kirocrew-core` server entry, or the absolute steering resource pointing at this
+host's kiro home. A matching NAME alone never authorizes removal, and neither
+does shape: an unlink is not undoable and an operator's own agent could in
+principle carry that name, so an unrecorded view Crew cannot positively claim is
+left alone. That is a smaller reclaim than the name shape would allow and the
+right side to err on. That path cannot prove the pair unregenerable, so
+its safety rests on the consumer contract instead -- the spawn argv and
+`session/set_mode` both re-prepare before they use an alias, and `/agent` is
+refused rather than translated -- which makes a removal a cache eviction for a
+live pre-upgrade session (its next preparation republishes the same name WITH a
+record) and a reclaim for every dead work directory. That contract has exactly
+one hole, at the upgrade boundary: a publisher from a build predating the lease
+holds no lease, and between its write and kiro-cli reading `--agent` its alias is
+indistinguishable from backlog -- and it will NOT re-prepare, having already done
+so, making a deletion a failed spawn rather than an eviction. An unrecorded alias
+is therefore spared until it is older than a minimum age. That age is NOT a
+liveness proxy -- the reason an age cut-off is rejected for the recorded path --
+it only has to exceed publish-to-spawn, which is milliseconds, while the backlog
+it reclaims is hours to days old; a clock that moved backwards lands on the
+sparing side. Because no record exists, a
+legacy alias also carries no data-home attribution, so a second Crew home sharing
+this agents directory sees the same eviction-then-republish rather than the
+home-scoped skip a recorded alias gets. Every other gate still applies to it:
+this run's own set, live in-process projections and held leases are all checked
+first, and removal is identity-checked against the bytes and inode just read.
+Reclaims are capped PER RUN rather than per candidate examined: the first prune
+after an upgrade faces the whole accumulated backlog, and it runs while the
+publication lock is held, whose own acquisition ceiling is 2s — draining
+thousands of files in one sweep would make a concurrent spawn fail to acquire and
+fall back to authored agents. The backlog is bounded and shrinking, so spreading
+it over successive spawns reclaims it just as completely. Projected agent JSON contains only fields accepted by Kiro's strict
+schema; lifecycle ownership lives in the non-spec
+`.kirocrew-skill-projection-metadata` directory. Each sidecar records the alias's
+exact byte digest, so a stale or replaced sidecar cannot authorize deletion of a
+different spec. No released build ever wrote lifecycle fields INTO a spec --
+kiro-cli denies unknown fields, so the projection never could -- and an alias
+without a sidecar is judged by the unrecorded path above instead. On Windows, untrusted metadata paths must resolve to a classified
+local volume with no linked ancestor or linked leaf before any existence probe;
+remote, unclassifiable, or linked paths retain the alias without triggering a
+network lookup. Each live projection publishes one bounded lease in the non-spec
+`.kirocrew-skill-projection-leases` directory as TWO files: a `.json` record
+naming its aliases, which is never locked, and a `.hold` sidecar that carries the
+lock for the projection object's lifetime and is never read. The split is
+required, not stylistic: Windows file locks are MANDATORY, so a lock on byte 0 of
+the record makes a reader's parse fail with a lock violation from any other
+handle, including one in the same process. Pruning always runs while the current
+projection holds its own lease, so a single-file lease turned every liveness
+probe into the uncertainty answer and reclaimed nothing on Windows while passing
+on POSIX, where locks are advisory. Finalization releases the lock and removes
+both identity-verified sidecars. Pruning reads each record without any lock and
+tests its `.hold` with a non-blocking exclusive acquisition: a held lease keeps
+every alias it names, while an unlocked one is crash/finalizer residue and both
+files are identity-checked and reclaimed. An unreadable, malformed, linked,
+replaced, or otherwise uncertain lease keeps the alias. OS lock release makes a
+crashed process's lease stale without trusting a PID.
+
+Alias publication and pruning share one cross-process lock sidecar in the native
+agents directory, with a two-second acquisition ceiling instead of the platform
+lock's general five-minute ceiling. A sidecar that is a symlink or junction,
+changes identity while opened or acquired, or is otherwise unverifiable is
+treated as lock failure. Removal revalidates the candidate's identity, bytes,
+digest-bound ownership sidecar, and source staleness under that lock immediately before
+unlinking it. POSIX uses descriptor-relative identity-checked deletion; Windows
+uses the same global publisher lock plus a final no-link identity check before
+its by-name unlink. An unknown platform without either contract retains the
+stale alias. A changed, unreadable, oversized, or otherwise uncertain candidate
+remains on disk. If the lock cannot be opened or acquired, preparation retains
+every alias and the current settings file byte-for-byte, then falls back to the
+authored native agent rather than risking a stale-snapshot overwrite or blocking
+startup. Active, foreign-home, unmarked, malformed, unreadable, oversized or
+otherwise uncertain alias files remain on disk.
 
 Windows runtime teardown records the reaped return code after the owned-handle
 drain, before dropping the process reference, just as POSIX teardown does. The
@@ -206,7 +291,13 @@ late starts clean the native transcript files supported by the provider. This
 does not add a sandbox or promise control over every external provider's own
 on-disk session format or crash recovery.
 
-`AcpClient(acp_backend=...)` selects which subprocess to launch:
+`AcpClient(acp_backend=...)` validates the id against `ACP_BACKENDS_KNOWN` and
+selects its launch record from `agent_sdk/backends.py`. Current ids are `""`
+(kiro-cli), `"kas"`, `"claude"`, `"codex"`, `"opencode"`, `"pi"`, `"goose"`,
+and `"deepseek"`; public-build selectability is a separate registry. The complete
+launch and host-capability table is in
+[agent-host-contract.md](agent-host-contract.md#column-meaning). Two launch paths
+need additional detail here:
 
 - `""` (default): `kiro-cli acp --agent <name>` (resolved by `_resolve_kiro_bin`). Per-session kiro settings are layered in via the workspace overlay `<work_dir>/.kiro/settings/cli.json` (written by `AcpProvider`, not the client): reasoning **effort** (`chat.modelDefaults`) and **MCP Tool Search** (`toolSearch.enabled` + activation thresholds from `agent.tool_search_min_pct` / `tool_search_min_tokens`, gated by `agent.tool_search`, default on) — see providers.md.
 - `"claude"` (`ACP_BACKEND_CLAUDE`): `claude-agent-acp` (resolved by `_resolve_claude_acp_bin` → `(list[str] | None, str)` — argv plus the augmented PATH actually searched). Resolution order: `CLAUDE_AGENT_ACP_BIN` env var, then the **vendored copy** (`_resolve_vendored_claude_acp` — `<node_modules>/@agentclientprotocol/claude-agent-acp/dist/index.js` found under the package's `_vendor/node_modules` from the distribution bundle, the sibling `KiroCrewWebsite/node_modules` in a source checkout, or `KIROCREW_PROJECT_DIR`; needs no global npm install or network — matters on hosts that have no package-registry token at gateway runtime), then `mise which claude-agent-acp` (respects MISE_DATA_DIR and all mise config), then a direct glob under mise's Node installs dir (`_mise_node_installs_dir` — `<mise-data>/installs/node`, root from `env.mise_data_dir` so MISE_DATA_DIR / XDG_DATA_HOME are honoured), then augmented PATH (`env.augmented_path` — mise shims, `~/.npm-packages/bin`, `~/.volta/bin`, `/opt/homebrew/bin`, plus EVERY per-version manager bin dir via `env.node_all_bin_dirs` (mise/asdf/nvm/fnm, all installed versions — a global npm binary can live under any of them), so a non-login launchd/systemd gateway also finds globally-installed binaries). Adapters are operator-installed, never bundled. A vendored copy is used when present (companion edition or a source checkout that already has `node_modules`); otherwise the operator installs `@agentclientprotocol/claude-agent-acp`. `_resolve_vendored_claude_acp` accepts a root only when the hoisted dependency marker `@agentclientprotocol/sdk` is present alongside the entry, so an incomplete vendored copy is skipped in favour of a complete one instead of being spawned and crashed. For scripts under mise installs, returns `[node_binary, script_path]` to bypass `#!/usr/bin/env node` shebang resolution which fails in non-interactive daemon contexts. For standalone binaries, returns `[binary_path]`. `AcpProvider` uses the adapter-only `SpecAdapterAcpClient`, whose pre-spawn `tool_gate.enforce` calls `claude.ensure_routed_settings`; the base Kiro `AcpClient` does not run this adapter admission step (H13). The seed writes `<work_dir>/.claude/settings.local.json` with `defaultMode: default` when no mode is configured (it never overwrites an explicit bypass). That seed is what makes Claude ROUTED; the adapter then participates in the same approve / trust_reads / trust / yolo protocol as kiro-cli. Public spawn does **not** set `CLAUDE_CONFIG_DIR` — the permission seed is project-local and typically wins over `~/.claude` because cwd is `work_dir`, but the operator's global Claude MCP/plugins are not isolated on this path. The vendor-owned `.credentials.json` remains behind Kiro Crew's sensitive-path floor at the default `~/.claude` root and any root selected by `CLAUDE_CONFIG_DIR` or `CLAUDE_HOME`; neighbouring settings files remain readable. The env carries `CLAUDE_CODE_EXECUTABLE` (claude backend only, set in `_spawn` when unset): the adapter delegates the model turn to `@anthropic-ai/claude-agent-sdk`, which needs a per-platform native Claude binary (~250 MB each) shipped as npm `optionalDependencies` that the website install omits — so the vendored closure does **not** include it and the SDK fails `session/new` with `Claude native binary not found for <platform>`. The SDK does **not** search PATH for `claude` itself (so the host merely having the external agent CLI installed is not enough), and bundling a quarter-GB binary per platform is not viable; instead `_resolve_claude_code_executable` finds an existing `claude` (`CLAUDE_CODE_EXECUTABLE` override → `mise which claude` → augmented PATH incl. `~/.toolbox/bin`, where a managed distribution may ship the external agent CLI) and the adapter forwards it to the SDK as `pathToClaudeCodeExecutable` (no version check). If none is found the var is left unset (with a warning) so the adapter's native-binary error surfaces rather than a guessed bad path; an explicit operator-set value always wins. The lookup runs off the event loop in the same `to_thread` hop as `_resolve_claude_acp_bin` (`_resolve_claude_spawn_bins`); success is memoised and a miss is retried. The kiro spawn arm never calls it — `_mise_which` is a `subprocess.run(..., timeout=5)`, and a hung `mise` on the loop would stall chat, Slack, cron, and the heartbeat. Kiro Crew still enforces per-tool security via `HooksConfig.auto_deny_tools`, evaluated in `HookManager.on_tool_call` (`hooks.py`) on every `session/request_permission` event. Because `CLAUDE_CONFIG_DIR` is unset on the public spawn path, the adapter also reads the user's global `~/.claude` settings — a live gate-bypass hazard for inherited `permissions.allow` entries, recorded as a known gap in claude-code-provider.md.
@@ -264,7 +355,7 @@ searched elsewhere; an install therefore takes effect once that cache is reset
 
 **Kiro executable resolution at spawn.** Trust is "the CLI runs": any resolvable
 executable Kiro CLI launches for ACP, regardless of install source, owner, or
-fixed path — KiroCrew is not the authority on where Kiro CLI is installed, and
+fixed path — Kiro Crew is not the authority on where Kiro CLI is installed, and
 Kiro CLI's own self-updater legitimately rewrites its bytes as the user, so an
 install-source/owner/path/codesign gate would strand real installs (toolbox,
 Homebrew, winget, a self-updated `/Applications` bundle) with no recovery path.
@@ -281,7 +372,7 @@ searched.
 returns the resolved path; `TrustedAcpExecutableSnapshot` now carries just
 `launch_path`.
 
-**The CLI is always launched IN PLACE — never from a copy.** KiroCrew execs the
+**The CLI is always launched IN PLACE — never from a copy.** Kiro Crew execs the
 binary at the path it resolved, on every platform. This is a hard requirement,
 not a preference:
 
@@ -448,6 +539,7 @@ entry in `_permission_options` at the next turn's start and on cancel.
 **Permission frames are bound to one handle.** A `session/request_permission` with a missing `sessionId` is answered once at connection level (`-32601`) and is never approved from a session handle. A frame whose `sessionId` belongs to a different registered handle is rejected on this one. A foreign id that is not another registered session is a routed backend-internal child and may be answered on the owner handle. Unknown `optionId` values fail closed (cancel / reject), never invent an answer.
 
 The host always sends one-shot approvals (`always=False`, the default). Kiro Crew — not the agent — owns the trust scope (`slot._trust`, `slot._trust_reads`, `slot._trusted_patterns`, `safety_override`, `channel.trusted`, parent session `approval_policy`). Per-call `session/request_permission` is required so Kiro Crew's PreToolUse hooks (`auto_deny_tools`, sensitive-path checks, credential redaction) fire on every tool invocation. The `always=True` argument is accepted for call-site compatibility and is treated as `allow_once`; it does not persist an adapter grant.
+The host always sends one-shot approvals (`always=False`, the default). Kiro Crew — not the agent — owns the trust scope (`slot._trust`, `slot._trust_reads`, `slot._trusted_patterns`, `safety_override`, `channel.trusted`, parent session `approval_policy`). Per-call `session/request_permission` is required so Kiro Crew's PreToolUse hooks (`auto_deny_tools`, sensitive-path checks, credential redaction) fire on every tool invocation. The `always=True` path is reserved for a future "skip Kiro Crew hooks for this exact tool" feature; no caller passes it today.
 
 The rendered tool-input cache is consumed by the first permission event, but
 structured raw params remain keyed by `toolCallId` for the whole turn. A repeated
@@ -528,7 +620,7 @@ authoritative. The normal prompt's browser instructions keep approval groups,
 borrowed-browser ownership and subagent session isolation inline rather than
 relying on a skill pointer for those controls.
 
-Default model: `claude-opus-4.8`. Default tools: `execute_bash`, `fs_read`, `fs_write`, `code`, `grep`, `glob`, `use_aws`, `web_fetch`, `web_search`, `introspect`, `session`, `report`, `@kirocrew-cron`, `@kirocrew-core`.
+Default model: `auto`. Default tools: `execute_bash`, `fs_read`, `fs_write`, `code`, `grep`, `glob`, `web_fetch`, `web_search`, `introspect`, `session`, `report`, `tool_search`, `@kirocrew-cron`, `@kirocrew-core`, `@kirocrew-computer`.
 
 **Agent compatibility repair** (`agent.py`): `repair_agent_configs()` is the single
 entry point (called at install, gateway startup, and periodically ~60s). Its
@@ -548,11 +640,14 @@ output schema.
 
 ## Custom Agent Support
 
-Custom agents (AIM-installed or user-created) are fully supported. The `--agent`
-flag passed to `kiro-cli acp` at spawn time drives all configuration:
+Custom-agent support is backend-specific. Kiro CLI consumes the selected agent
+through `--agent`; KAS projects it on the wire; foreign hosts translate, withhold,
+or decline fields through their provider-mirror contracts. The authoritative
+per-backend matrix is [agent-host-contract.md](agent-host-contract.md#1-agent-definition-and-layout).
+The details below describe the Kiro and Claude paths implemented directly here:
 
-- **Model**: `set_model` is skipped for custom agents — kiro-cli uses the
-  agent's own `model` field. Only the default kirocrew agent gets KiroCrew's
+- **Model (kiro-cli)**: `set_model` is skipped for custom agents — kiro-cli uses the
+  agent's own `model` field. Only the default kirocrew agent gets Kiro Crew's
   configured model override.
 - **MCP servers**: backend-dependent.
   - **kiro-cli**: servers arrive through the `--agent` spec. This seam returns
@@ -575,7 +670,7 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
     servers from the agent config (respects `mcpServers` in the agent's config
     file). Non-kirocrew agents (e.g. AIM-installed) load only their own
     `mcpServers`. The kirocrew agent loads from global `~/.kiro/settings/mcp.json`
-    where `disabled` and `disabledTools` flags are respected. KiroCrew's dashboard
+    where `disabled` and `disabledTools` flags are respected. Kiro Crew's dashboard
     MCP tab writes directly to the global config. Loading is not one-shot:
     kiro-cli 2.10.0+ watches the agent file and reconciles a RUNNING session
     against an edit (only the changed servers restart, conversation kept, applied
@@ -657,7 +752,9 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
 - **Denied commands**: Enforced at Kiro Crew's `hooks.py` PreToolUse gate;
   see [security](security.md).
 
-Custom agents use cold start with `--agent <name>` flag at spawn time.
+Kiro CLI custom agents use a cold start with `--agent <name>` at spawn time.
+Other backends follow the selection and projection contracts in
+[agent-host-contract.md](agent-host-contract.md#1-agent-definition-and-layout).
 
 ## Protocol Flow
 
@@ -1007,7 +1104,7 @@ the model quotes the text in prose) and complete the turn immediately — `_disp
 also synthesizes a final `EVENT_COMPLETE` so dashboard and CLI callers using
 `stream_events` exit cleanly.  The text itself is still yielded so the user sees what
 happened, and a `tool_interrupted`-tagged SEL audit event is written for the security
-log since kiro-cli's cancellation is a permission decision outside KiroCrew's control.
+log since kiro-cli's cancellation is a permission decision outside Kiro Crew's control.
 
 ### Stale-turn gate (`AcpClient`)
 
@@ -1365,7 +1462,7 @@ not expose a rate-limit payload until a sharing backend requires it.
 
 ## Exceptions
 
-`AcpError` (base), `AcpTimeoutError` (has `partial_output`), `AcpPermissionNeeded`, `AcpProcessDied`, `AcpAuthRequired`, `AcpPromptBusy`.
+`AcpError` (base), `AcpTimeoutError` (has `partial_output`), `AcpPermissionNeeded`, `AcpProcessDied` (and its transient subclass `AcpRegistrationRateLimited`, raised when the death's retained stderr shows a throttled dynamic registration), `AcpAuthRequired`, `AcpPromptBusy`.
 
 - `AcpAuthRequired` — the runtime path (kiro/KAS) detected a signed-out CLI on stderr (`kiro-cli login` needed). Non-retryable: `ensure_ready()` skips the retry ladder and re-raises so callers surface the actionable message rather than reset-and-requeue. JSON-RPC session-expired / not-authenticated errors on either path stay `AcpError` (raising `AcpAuthRequired` there would latch the kiro signed-out service from a Codex/Claude failure) and quote the backend's own `signin_command` — a Codex host is told `codex login`, not `kiro-cli login`.
 - `AcpPromptBusy` — a prompt is already in progress on the session, classified from kiro-cli's "already in progress" text via `_PROMPT_BUSY_RE` and raised at prompt-dispatch sites. `slack/handler.py` catches it and auto-resets the wedged session (`sessions.reset`) before recording the failure, so the next message cold-starts cleanly.
@@ -1443,7 +1540,7 @@ Subprocess lifecycle:
 - **The readiness `whoami` runs against the real home, like an ACP session.**
   `kiro_prerequisite._run_auth_command(..., isolate_home=False)` runs the
   resolved CLI against the real environment/home under the standard OS sandbox
-  with only the KiroCrew data home hidden, and executes a sandbox-visible
+  with only the Kiro Crew data home hidden, and executes a sandbox-visible
   private snapshot of the resolved bytes (keeping the resolved basename so a
   multiplexer still dispatches). A rewritten `HOME` breaks any CLI whose session
   or tool registry lives in the real home — a toolbox multiplexer cannot even
@@ -1451,13 +1548,13 @@ Subprocess lifecycle:
   though a real session authenticates fine.
 - **Sign-in is fully delegated to `kiro-cli`.** `kiro-cli login
   --use-device-flow` runs against the user's REAL home and writes its own
-  credential store, exactly as it does from a terminal. KiroCrew stages no
+  credential store, exactly as it does from a terminal. Kiro Crew stages no
   credentials and copies none back — the staged-home publish path (and the
   "Kiro identity changed during sign-in" conflict two racing gateways could
   hit) is gone. The isolated credential-minimal home remains available for
   callers that opt into it, so a probe can never read the real `~/.aws` /
   `~/.ssh`; the operator-initiated login runs in the real home inside the same
-  OS sandbox posture ACP already uses, with the KiroCrew data home hidden.
+  OS sandbox posture ACP already uses, with the Kiro Crew data home hidden.
 - 10MB stdout buffer for large JSON-RPC lines
 - stderr drained in background (`_drain_stderr`) to prevent pipe deadlock. Each line bumps `_last_activity` (liveness for `is_responsive`), is appended to the bounded 20-entry `_stderr_lines` diagnostic ring buffer, and is forwarded as a redacted `WARNING`. **Exception — suppression filter:** lines matching a marker in the module-level `_SUPPRESSED_STDERR_MARKERS` tuple (currently `thinking_tokens`) are dropped — no `WARNING`, not appended to the ring buffer — but **still** bump `_last_activity`. This handles the claude-agent-acp "Unexpected case: {...thinking_tokens...}" stderr noise. **Mechanism** (confirmed by reading the vendored adapter's `dist/acp-agent.js`): claude-code emits a `system` message with subtype `thinking_tokens`, but the adapter's `switch (message.subtype)` enumerates only ~18 known subtypes (`init`, `status`, `compact_boundary`, `memory_recall`, `api_retry`, …) and routes anything else to `default: unreachable(message)`, which writes `logger.error("Unexpected case: " + JSON.stringify(message))` to stderr — one line per token delta, measured at ~10 lines/sec during active thinking (one per 2–4 thinking tokens). The payload is only `estimated_tokens`/`_delta`/`uuid`/`session_id`, so dropping it loses no response content. This is a forward-compat gap in the vendored adapter, **not** new behavior in a specific claude-code build — the `thinking_tokens` event is present in both `2.1.165.357` and `2.1.168.358` (verified by string-matching both bundled `claude` binaries), so it predates the `.168` update that drew attention to it. The cleaner long-term fix is upstream (add a `thinking_tokens` case to the adapter or bump the vendored version); this filter is the version-agnostic stopgap that also absorbs the next unenumerated subtype's flood. (Note `thinking_tokens` is by far the dominant subtype hitting `unreachable` — ~14k occurrences vs. a handful of rare `permission_denied` across retained logs — which is why the marker tuple stays narrow rather than suppressing all "Unexpected case" lines.) Two concrete reasons to drop rather than downgrade the level: (1) **log hygiene** — `gateway.log` uses `RotatingFileHandler(maxBytes=2MB, backupCount=3)` (`cli.py`), so a sustained burst rolls genuine diagnostics out of the retained 8MB window; (2) **event-loop load** — the file handler is a plain *synchronous* handler and `_drain_stderr` runs on the gateway event loop, so each forwarded line costs a synchronous file write + two regex redaction passes on the same loop that streams responses (small per session, compounding across concurrent thinking sessions). Keeping liveness prevents the idle watchdog from killing an actively-thinking turn; skipping the ring buffer stops a burst from evicting the last real errors. A throttled `DEBUG` summary (≥ `_SUPPRESSED_STDERR_SUMMARY_INTERVAL_SECS` apart, plus a flush at EOF) keeps the suppression observable. Match substrings are kept narrow so a genuine error is never silently swallowed. This is a log-volume / event-loop-load reduction — **not** a fix for any turn-stall or "agent not responding" symptom (no such causal link was established).
 
@@ -1571,8 +1668,29 @@ session-start timeout's progress and hide the servers that never reported for it
 Both holders are bounded (`_INIT_NOTIFICATION_BUFFER_LIMIT`) and claim by the
 session id inside the frame, so no frame can reach two sessions.
 
+**One permit is reserved for a start that has not gone out.** A collector holding
+its permit is the intended back-pressure — the backend really is still working on
+that request — but at `session_start_concurrency = 2` two collectors hold the
+WHOLE gate for up to 300 s, and every `session/new` gateway-wide then queues
+behind requests whose callers already gave up. The failures those queued starts
+produce time out too and create more collectors, so the gate self-locks.
+Measured on an operator host: one member slot spent 15 consecutive auto-nudge
+cycles on `session/new timed out after 90s (0/10 MCP server(s) reported)` while
+no new agent process was ever spawned — every attempt was in this queue.
+
+So the hand-off is now conditional. `StartPermit.hold_for_collector()` claims one
+of at most `limit - _COLLECTOR_PERMIT_HEADROOM` (1) collector holds
+(`SessionStartGate.collector_holds`, ceiling `collector_hold_ceiling`); denied,
+`_collect_late_start` releases the permit itself, logs
+`outcome=gate_permit_returned` with the counts, and gives the collector `None`.
+A collector without a permit is unchanged in every other respect: it still owns
+the request id and still adopts or tears down the late session. At `limit == 1`
+the ceiling is 0, which is the only reading of "always keep one free" a
+single-permit gate admits. A refusal is logged with both counts rather than tallied: the log line is what an operator reads when a start queues, and a counter no runtime reader consults is dead weight.
+
 Every path releases the permit exactly once (`StartPermit.release()` is
-idempotent; `SessionStartGate.releases` counts real releases) and unregisters
+idempotent; `SessionStartGate.releases` counts real releases, and a release
+returns the collector hold so the ceiling recovers) and unregisters
 the collector (`AcpRuntime.start_collectors()` lists live ones). A caller
 never re-issues `session/new` for the same attempt while a collector owns it,
 and never starts a dedicated process in its place: congestion is answered by

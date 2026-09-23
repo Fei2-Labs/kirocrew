@@ -9,6 +9,7 @@ the one the operator configured.
 from __future__ import annotations
 
 import json
+import sys
 import types
 from pathlib import Path
 
@@ -687,6 +688,433 @@ class TestMcpServersProjection:
         assert kas_agents.MANAGED_MCP_SERVER_NAMES == frozenset(KIROCREW_BIN_MCP_SERVERS)
 
 
+def _kas_wire_maps(entry: dict) -> dict:
+    """What KAS's own mapper makes of one projected entry.
+
+    Transcribed from ``mapClientMcpServers`` (``resolve-client-agents.ts``): a
+    stdio entry is rebuilt from ``command``/``args``/``env``/``timeout``, a remote
+    one from ``url``/``headers``/``env``/``timeout``, and an entry with neither is
+    dropped. Everything else the wire schema accepted is thrown away here.
+
+    PROVENANCE, because everything the projection withholds rests on it:
+    transcribed from ``packages/kiro-agent/src/services/custom-agents/
+    resolve-client-agents.ts`` on ``kiro-team/kiro-agent``'s ``main``. It is a
+    reading of source, NOT a live measurement -- no KAS process is startable from
+    this repo's test environment -- so an upstream change makes this fixture wrong
+    before it makes the projection wrong, which is why it is pinned here rather
+    than left implicit. The host-contract row records the same, with the date.
+
+    When kiro-agent starts copying these fields through, THIS fixture is what goes
+    red. Two Crew-side behaviours become removable at that point, not one: the mute
+    handled by omission (``TestMutedServersAreNotDeclared``) AND the withhold of a
+    third-party registry entry under registry mode
+    (``TestRegistryGovernedEntries``), which exists only because the marker cannot
+    reach the host's own filter. The ``TODO(kiro-agent)`` beside
+    ``_KAS_DISCARDED_ENTRY_KEYS`` names the upstream change.
+    """
+    if entry.get("command"):
+        keys = ("command", "args", "env", "timeout")
+    elif entry.get("url"):
+        keys = ("url", "headers", "env", "timeout")
+    else:
+        return {}
+    return {k: entry[k] for k in keys if k in entry}
+
+
+#: Keys ``ClientAgentMcpServerSchema`` declares. A key outside this set is
+#: stripped by the zod object before the mapper above ever runs -- which is
+#: ``type``'s fate, and a different mechanism from being accepted then discarded.
+_KAS_WIRE_SCHEMA_KEYS = frozenset(
+    {
+        "command",
+        "args",
+        "env",
+        "cwd",
+        "url",
+        "headers",
+        "disabled",
+        "autoApprove",
+        "disabledTools",
+        "timeout",
+    }
+)
+
+
+class TestTheBackendLosesBothFields:
+    """Why the projection withholds instead of just forwarding the fields.
+
+    Pins the upstream shape the two behaviours below are a response to, so a
+    reader does not have to take the workaround on faith -- and so the day
+    kiro-agent fixes its mapper, these are the assertions that fail and say which
+    Crew-side handling is now redundant.
+    """
+
+    def test_the_registry_marker_has_no_slot_at_all(self):
+        assert "type" not in _KAS_WIRE_SCHEMA_KEYS
+
+    def test_the_mute_is_accepted_and_then_discarded(self):
+        assert "disabled" in _KAS_WIRE_SCHEMA_KEYS
+        assert _kas_wire_maps({"command": "x", "disabled": True}) == {"command": "x"}
+
+    def test_a_marked_entry_arrives_indistinguishable_from_an_unmarked_one(self):
+        assert _kas_wire_maps({"command": "x", "type": "registry"}) == {"command": "x"}
+
+    def test_the_named_discards_are_the_ones_the_mapper_drops(self):
+        entry = {k: "v" for k in _KAS_WIRE_SCHEMA_KEYS}
+        entry["command"] = "x"
+        survived = set(_kas_wire_maps(entry))
+        for key in kas_agents._KAS_DISCARDED_ENTRY_KEYS:
+            assert key not in survived, f"{key} is not discarded after all"
+
+
+class TestMutedServersAreNotDeclared:
+    """``disabled: true`` is the user's own decision and the backend discards it.
+
+    Omitting the declaration is the only way to express "do not launch this" that
+    survives the wire, and it is faithful rather than lossy: a server the backend
+    was never told about does not run, which is exactly what the flag asks for.
+    """
+
+    def test_a_muted_server_is_withheld(self):
+        out = to_client_custom_agent(
+            "a",
+            _spec(
+                mcpServers={"muted": {"command": "x", "disabled": True}, "live": {"command": "y"}}
+            ),
+            "p",
+        )
+        assert out["mcpServers"] == {"live": {"command": "y"}}
+
+    def test_forwarding_it_would_have_launched_the_server(self):
+        """The round trip, stated as one assertion: declared means launched."""
+        entry = {"command": "x", "disabled": True}
+        assert _kas_wire_maps(entry) == {"command": "x"}, "the mute does not survive"
+        out = to_client_custom_agent("a", _spec(mcpServers={"muted": entry}), "p")
+        assert "mcpServers" not in out, "so the entry must not be declared"
+
+    def test_crews_own_managed_server_is_not_exempt(self):
+        """The mute is about a server the user can un-mute, so it costs nothing to
+        honour -- and honouring it for third parties only would mean a user who
+        silenced ``kirocrew-work`` still got it."""
+        out = to_client_custom_agent(
+            "a", _spec(mcpServers={"kirocrew-core": {"command": "x", "disabled": True}}), "p"
+        )
+        assert "mcpServers" not in out
+
+    @pytest.mark.parametrize("value", ["true", "false", 1, 0, {}, [], None], ids=repr)
+    def test_a_non_boolean_value_is_read_as_a_mute_not_coerced(self, value):
+        """Fail closed, for two reasons at once. ``disabled: z.boolean()`` rejects
+        a non-boolean, and a client agent that fails the schema is dropped WHOLE
+        -- Crew injects exactly one agent, so forwarding this costs the session
+        its entire configuration, not one server."""
+        out = to_client_custom_agent(
+            "a", _spec(mcpServers={"odd": {"command": "x", "disabled": value}}), "p"
+        )
+        assert "mcpServers" not in out
+
+    def test_an_explicit_false_still_declares_the_server(self):
+        out = to_client_custom_agent(
+            "a", _spec(mcpServers={"live": {"command": "x", "disabled": False}}), "p"
+        )
+        assert out["mcpServers"]["live"]["command"] == "x"
+
+    def test_the_withhold_is_explained(self, caplog):
+        with caplog.at_level("INFO", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent(
+                "kirocrew", _spec(mcpServers={"muted": {"command": "x", "disabled": True}}), "p"
+            )
+        assert "muted" in caplog.text
+        assert "would launch the server anyway" in caplog.text
+
+    def test_a_bad_type_is_explained_as_a_bad_type(self, caplog):
+        with caplog.at_level("INFO", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent(
+                "kirocrew", _spec(mcpServers={"odd": {"command": "x", "disabled": "yes"}}), "p"
+            )
+        assert "is not a boolean" in caplog.text
+
+    def test_the_spec_is_not_mutated(self):
+        spec = _spec(mcpServers={"muted": {"command": "x", "disabled": True}})
+        to_client_custom_agent("a", spec, "p")
+        assert spec["mcpServers"]["muted"] == {"command": "x", "disabled": True}
+
+
+class TestAMutedServerCannotArriveThroughThePoolingStub:
+    """The mute has to hold on the path that does NOT go through this block.
+
+    A stubbed name is subtracted from the projection before any check here, so the
+    projection alone cannot honour a mute on a pooled server -- the decision has to
+    be the same one the gateway rewriter makes when it chooses to wrap. Both now
+    read ``mcp_entry_is_muted``, and this drives the real chain rather than
+    asserting the predicate twice.
+    """
+
+    @staticmethod
+    def _stub_names(spec: dict, tmp_path: Path) -> frozenset[str]:
+        """The names the gateway would inject at session level for *spec*.
+
+        Derived the way ``session_servers.injection_server_names`` derives them --
+        from the wrapper marker the rewriter leaves -- so a change in what the
+        rewriter wraps changes this answer.
+        """
+        from kiro_crew.mcp_gateway import rewriter
+
+        rewritten, _ = rewriter._rewrite_single_spec(
+            dict(spec),
+            stubs_dir=tmp_path / "stubs",
+            socket_path=tmp_path / "gw.sock",
+            work_dir=tmp_path,
+            sandbox_mode="off",
+            approval_mode="",
+            stub_servers=frozenset(spec.get("mcpServers", {})),
+        )
+        return frozenset(
+            name
+            for name, entry in rewritten["mcpServers"].items()
+            if entry.get(rewriter._WRAPPER_MARKER) or entry.get(rewriter._WRAPPER_MARKER_LEGACY)
+        )
+
+    @pytest.mark.parametrize("value", [True, "true", 1], ids=repr)
+    def test_a_muted_poolable_server_is_never_stubbed_and_so_is_withheld(
+        self, value: object, tmp_path: Path
+    ):
+        spec = _spec(mcpServers={"muted": {"command": sys.executable, "disabled": value}})
+        stubbed = self._stub_names(spec, tmp_path)
+
+        assert stubbed == frozenset(), "a muted server must not become a live stub"
+        out = to_client_custom_agent("kirocrew", spec, "p", stub_server_names=stubbed)
+        assert "mcpServers" not in out
+
+    def test_a_registry_governed_poolable_server_is_never_stubbed_either(self, tmp_path: Path):
+        """The peer of the mute case, and the same escape.
+
+        A catalog-governed entry an operator lists for pooling was wrapped by the
+        rewriter (which had no reading of the marker at all), became a stubbed
+        name, and was subtracted here before the marker guard -- so it reached the
+        session as a live local process that kiro-cli would have refused.
+        """
+        spec = _spec(
+            mcpServers={"governed": {"command": sys.executable, "type": "registry"}},
+            tools=["@governed"],
+        )
+        stubbed = self._stub_names(spec, tmp_path)
+
+        assert stubbed == frozenset(), "a catalog-governed server must not become a stub"
+        out = to_client_custom_agent("kirocrew", spec, "p", stub_server_names=stubbed)
+        assert "mcpServers" not in out
+
+    def test_a_withhold_outranks_the_stub_subtraction(self, caplog):
+        """Ordering, pinned on the one thing the two orders differ on: the REASON.
+
+        Both orders leave the block empty for a stubbed name, so an
+        absent-``mcpServers`` assertion passes either way and pins nothing. What
+        subtract-first loses is the refusal itself: the name is handed to the
+        injection silently, and nothing records that this entry was muted or
+        catalog-governed. Withhold-first says so, which is what makes a server
+        that does not appear in the session explicable.
+        """
+        spec = _spec(
+            mcpServers={
+                "muted": {"command": "x", "disabled": True},
+                "governed": {"command": "y", "type": "registry"},
+            }
+        )
+        with caplog.at_level("INFO", logger="kiro_crew.acp.kas_agents"):
+            out = to_client_custom_agent(
+                "kirocrew", spec, "p", stub_server_names=frozenset({"muted", "governed"})
+            )
+
+        assert "mcpServers" not in out
+        assert "not declaring MCP server 'muted'" in caplog.text
+        assert "withholding MCP server 'governed'" in caplog.text
+
+    def test_an_unmuted_poolable_server_still_takes_its_stub(self, tmp_path: Path):
+        """The other direction, so the guard cannot pass by stubbing nothing."""
+        spec = _spec(mcpServers={"live": {"command": sys.executable}})
+        stubbed = self._stub_names(spec, tmp_path)
+
+        assert stubbed == frozenset({"live"})
+        out = to_client_custom_agent("kirocrew", spec, "p", stub_server_names=stubbed)
+        assert "mcpServers" not in out, "a stubbed name is declared by the injection, not here"
+
+
+class TestRegistryGovernedEntries:
+    """The filter mirrors kiro-cli's, which is SYMMETRIC.
+
+    In registry mode an entry survives only by resolving its marker against the
+    administrator's catalog; outside registry mode the MARKED entry is the one
+    dropped. Nothing on this side can resolve a catalog -- and the backend cannot
+    even see the marker -- so a non-managed entry is withheld in both directions
+    and the reason is logged either way.
+    """
+
+    @staticmethod
+    def _governed(monkeypatch, on: bool = True) -> None:
+        """Patch the SHARED reading, not a local copy of it.
+
+        Patching ``session_mcp._registry_mode`` is what proves the projection asks
+        that module rather than reading the config a second time: a second reading
+        could answer differently, and a ceiling that disagrees with itself is not
+        a ceiling.
+        """
+        from kiro_crew.acp import session_mcp
+
+        monkeypatch.setattr(session_mcp, "_registry_mode", lambda: on)
+
+    def test_a_marked_third_party_entry_is_withheld_outside_registry_mode(self):
+        """kiro-cli drops it too: outside registry mode the marker is the
+        disqualifier. The backend would strip the marker and mount it."""
+        out = to_client_custom_agent(
+            "a",
+            _spec(
+                mcpServers={
+                    "governed": {"command": "x", "type": "registry"},
+                    "plain": {"command": "y"},
+                }
+            ),
+            "p",
+        )
+        assert out["mcpServers"] == {"plain": {"command": "y"}}
+
+    def test_registry_mode_withholds_every_third_party_server(self, monkeypatch):
+        self._governed(monkeypatch)
+        out = to_client_custom_agent(
+            "a",
+            _spec(
+                mcpServers={
+                    "marked": {"command": "x", "type": "registry"},
+                    "unmarked": {"command": "y"},
+                }
+            ),
+            "p",
+        )
+        assert "mcpServers" not in out
+
+    def test_registry_mode_keeps_crews_own_control_plane(self, monkeypatch):
+        """The same exemption ``session_mcp`` makes, for the same reason: these are
+        the host's own processes, and a session without them cannot report back to
+        its channel at all. It is also what makes the eventual upstream fix a
+        no-op here -- a governed session keeps them the day ``type`` is carried."""
+        self._governed(monkeypatch)
+        out = to_client_custom_agent(
+            "a",
+            _spec(
+                mcpServers={
+                    "kirocrew-core": {"command": "x", "type": "registry"},
+                    "third-party": {"command": "y", "type": "registry"},
+                }
+            ),
+            "p",
+        )
+        assert set(out["mcpServers"]) == {"kirocrew-core"}
+        assert out["mcpServers"]["kirocrew-core"]["type"] == "registry"
+
+    def test_the_withhold_names_the_direction_it_fired_in(self, monkeypatch, caplog):
+        with caplog.at_level("INFO", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent(
+                "kirocrew", _spec(mcpServers={"g": {"command": "x", "type": "registry"}}), "p"
+            )
+        assert "registry mode is off" in caplog.text
+        caplog.clear()
+        self._governed(monkeypatch)
+        with caplog.at_level("INFO", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent("kirocrew", _spec(mcpServers={"g": {"command": "x"}}), "p")
+        assert "registry mode is on" in caplog.text
+
+    def test_the_marker_gap_is_warned_about_not_left_silent(self, monkeypatch, caplog):
+        """The symptom is a session that starts fine with no Crew tools and no
+        error from the host, which is why this one is a WARNING: it is the only
+        local signal that the control plane was dropped."""
+        self._governed(monkeypatch)
+        with caplog.at_level("WARNING", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent(
+                "kirocrew", _spec(mcpServers={"kirocrew-core": {"command": "x"}}), "p"
+            )
+        assert "no slot for" in caplog.text
+        assert "spawn_run" in caplog.text
+        assert "mcp_registry_mode false" in caplog.text
+
+    def test_the_warning_does_not_need_the_stamp_to_be_present(self, monkeypatch, caplog):
+        """A spec materialized while the mode was off carries unmarked managed
+        entries, and that install loses its control plane identically. Requiring
+        the stamp would silence the one case that cannot self-diagnose."""
+        self._governed(monkeypatch)
+        with caplog.at_level("WARNING", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent(
+                "kirocrew", _spec(mcpServers={"kirocrew-cron": {"command": "x"}}), "p"
+            )
+        assert "no slot for" in caplog.text
+
+    def test_it_warns_once_per_projection_not_once_per_server(self, monkeypatch, caplog):
+        self._governed(monkeypatch)
+        with caplog.at_level("WARNING", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent(
+                "kirocrew",
+                _spec(
+                    mcpServers={
+                        "kirocrew-core": {"command": "x"},
+                        "kirocrew-cron": {"command": "y"},
+                        "kirocrew-work": {"command": "z"},
+                    }
+                ),
+                "p",
+            )
+        assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+
+    def test_an_ungoverned_install_is_silent(self, caplog):
+        with caplog.at_level("WARNING", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent("kirocrew", _spec(), "p")
+        assert caplog.text.strip() == ""
+
+    def test_the_registry_type_matches_the_spec_writer(self):
+        """A rename in ``agent.py`` must not silently stop the readers matching.
+
+        The WRITER owns the literal; every reader shares one copy of it in
+        ``mcp_cleanup``, and ``session_mcp`` keeps its own mirror with its own
+        filter. All three have to agree or a governed entry stops being
+        recognized as one.
+        """
+        from kiro_crew import agent as agent_mod
+        from kiro_crew.acp import session_mcp
+        from kiro_crew.mcp_cleanup import MCP_REGISTRY_TYPE
+
+        assert MCP_REGISTRY_TYPE == agent_mod._MCP_REGISTRY_TYPE
+        assert MCP_REGISTRY_TYPE == session_mcp._KIRO_REGISTRY_TYPE
+
+
+class TestDiscardedRestrictionsAreReported:
+    """A restriction the backend throws away is reported, not silently honoured.
+
+    Debug rather than warning: the server is still declared and still runs, so
+    this explains a setting that had no effect -- it is not a lost capability.
+    """
+
+    def test_a_discarded_restriction_is_named(self, caplog):
+        with caplog.at_level("DEBUG", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent(
+                "kirocrew",
+                _spec(mcpServers={"srv": {"command": "x", "disabledTools": ["learn_add"]}}),
+                "p",
+            )
+        assert "disabledTools" in caplog.text
+
+    def test_a_key_crew_itself_removed_is_not_blamed_on_the_backend(self, caplog):
+        """``autoApprove`` never reaches the wire, so naming it here would report
+        Crew's own subtraction as the backend's discard."""
+        with caplog.at_level("DEBUG", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent(
+                "kirocrew",
+                _spec(mcpServers={"srv": {"command": "x", "autoApprove": ["t"]}}),
+                "p",
+            )
+        assert "autoApprove" not in caplog.text
+
+    def test_an_entry_with_no_restrictions_says_nothing(self, caplog):
+        with caplog.at_level("DEBUG", logger="kiro_crew.acp.kas_agents"):
+            to_client_custom_agent("kirocrew", _spec(), "p")
+        assert "discards" not in caplog.text
+
+
 class TestRuntimeSuppliesTheStubbedSet:
     """The seam between the overlay and the projection.
 
@@ -1264,16 +1692,18 @@ class TestHoistManagedServers:
     @pytest.mark.parametrize(
         "entry",
         [
-            {"command": "kc", "disabled": True},
             {"command": "kc", "disabledTools": ["learn_add"]},
             {"command": "kc", "timeout": 5},
             {"command": "kc", "type": "registry"},
             {"url": "https://example.invalid/mcp"},
             {"args": ["mcp"]},
         ],
-        ids=["disabled", "disabledTools", "timeout", "registry", "remote", "no-command"],
+        ids=["disabledTools", "timeout", "registry", "remote", "no-command"],
     )
     def test_a_restricted_or_unrepresentable_entry_keeps_the_block_path(self, entry):
+        # No ``disabled: true`` case: such an entry is never declared in the first
+        # place (see ``TestMutedServersAreNotDeclared``), so it cannot reach here
+        # to be hoisted or kept.
         projected = to_client_custom_agent(
             "kirocrew", _spec(mcpServers={"kirocrew-core": entry}), "p"
         )

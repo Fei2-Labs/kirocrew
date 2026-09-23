@@ -181,6 +181,10 @@ class CronStoreUnreadable(ValueError):
     write that never happened. Background writers (the reaper merge, the job
     result merge, the deferred-removal drain) catch it and degrade: a corrupt
     store must not take down the scheduler loop.
+
+    Also raised by :func:`dispatched_agents_from_disk` when the store is PRESENT
+    but nothing loads from it, so a reader that must fail CLOSED (the template
+    delete guard) does not mistake an unreadable store for an empty one.
     """
 
 
@@ -332,44 +336,101 @@ def agent_sequence_dispatches(seq: list[str]) -> bool:
     return len(seq) > 1
 
 
-def job_agent_names_from_disk() -> list[tuple[str, str]]:
-    """``(job name, agent name)`` for every agent a stored cron job dispatches.
+def dispatched_agents_from_disk(*, loadable_only: bool) -> list[tuple[str, str, str]]:
+    """``(job id, holder label, agent name)`` for every agent a stored job DISPATCHES.
 
-    Read-only + best-effort like :func:`referenced_skill_names`: reads
-    ``crons.json`` directly (so it needs no running scheduler) and returns an
-    empty list on any error. ``kirocrew doctor`` uses this to warn when a job
-    still names a deprecated agent spec.
+    The ONE walk that encodes the dispatch-mirroring rule, so the two readers
+    that need it -- ``kirocrew doctor`` through :func:`job_agent_names_from_disk`
+    and the Agent templates delete guard -- cannot drift when a job kind is
+    added. Reads ``crons.json`` directly (no running scheduler) and lets any
+    read or parse error propagate; the doctor wrapper is the one that swallows.
 
     Mirrors dispatch, not storage: a ``script`` or ``command`` job bypasses
     agent dispatch entirely, so its agent fields are dormant and the record is
     skipped whole; otherwise, when :func:`agent_sequence_dispatches` the
-    sequence entries are reported and ``agent_id`` is dormant, else
-    ``agent_id`` is reported and the sequence (if any) is dormant. A record
-    whose fields the scheduler's own loader rejects (a non-list sequence, a
-    non-string entry or ``agent_id``) dispatches nothing, so it contributes
-    nothing here rather than failing doctor over a job that never runs.
+    sequence entries are reported and ``agent_id`` is dormant, else the
+    template the job actually runs is reported and the sequence (if any) is
+    dormant. That template is the captured ``execution_context.template_id``
+    when the record carries one (:func:`resolve_cron_memory` and the gateway
+    dispatch both read it there -- a schedule created from a template chat
+    with no ``agent`` argument names its template ONLY there, ``agent_id``
+    staying empty), else ``agent_id`` for a legacy record. A record whose
+    AGENT fields the scheduler's loader rejects (a non-list sequence, a
+    non-string entry or ``agent_id``) dispatches nothing and contributes nothing.
+
+    *loadable_only* is where the two readers legitimately differ. The delete
+    guard passes ``True``: it counts only records the scheduler could build
+    (:func:`_is_loadable_record`), because a record with no ``schedule`` never
+    fires and must not pin a template forever. Doctor passes ``False``: it
+    warns about every deprecated name written on disk, including a partial or
+    legacy record the operator can still see and repoint.
     """
-    out: list[tuple[str, str]] = []
+    store = config_dir() / _CRONS_FILE
+    records, loadable = _read_job_records(store)
+    if not records and not loadable:
+        # Present but unreadable (permissions, bytes, JSON, shape): the
+        # scheduler loads nothing from it NOW, but a repaired store brings its
+        # jobs back with the agents they name -- so this is not "no
+        # references", it is "the references cannot be read", and the caller
+        # decides how loud to be. A store whose records parsed but none of
+        # which the scheduler can build is NOT this case: those records are
+        # returned and each reader applies its own loadability rule below.
+        raise CronStoreUnreadable(str(store))
+    out: list[tuple[str, str, str]] = []
+    for j in records:
+        if loadable_only and not _is_loadable_record(j):
+            continue
+        if j.get("script") or j.get("command"):
+            continue  # runs with no LLM; agent fields are dormant
+        seq = j.get("agent_sequence", [])
+        if not isinstance(seq, list) or any(not isinstance(s, str) for s in seq):
+            continue  # the scheduler's loader rejects this record whole
+        agent_id = j.get("agent_id", "")
+        if agent_id is not None and not isinstance(agent_id, str):
+            continue  # same rejection class
+        job_id = j.get("id")
+        job_id = job_id if isinstance(job_id, str) else ""
+        name = j.get("name")
+        label = name if isinstance(name, str) and name else (job_id or "<unnamed job>")
+        if agent_sequence_dispatches(seq):
+            names = [s for s in seq if s]
+        else:
+            runs = _captured_template_id(j.get("execution_context")) or agent_id
+            names = [runs] if runs else []
+        out.extend((job_id, label, agent) for agent in dict.fromkeys(names))
+    return out
+
+
+def _captured_template_id(execution_context: Any) -> str:
+    """The template a stored job's captured execution names, or ``""``.
+
+    Read leniently on purpose: this is a reference scan over records on disk,
+    not the loader, so a record whose context is missing or malformed simply
+    contributes no captured name and falls back to ``agent_id`` -- the same
+    order the dispatcher applies when it has no usable context.
+    """
+    if not isinstance(execution_context, dict):
+        return ""
+    template_id = execution_context.get("template_id")
+    return template_id if isinstance(template_id, str) else ""
+
+
+def job_agent_names_from_disk() -> list[tuple[str, str]]:
+    """``(job name, agent name)`` for every agent a stored cron job dispatches.
+
+    Read-only + best-effort like :func:`referenced_skill_names`: the doctor
+    wrapper over :func:`dispatched_agents_from_disk` that returns an empty list
+    on any error (an unreadable store included -- doctor reports that fault
+    through its own check), so ``kirocrew doctor`` can warn about a job that
+    still names a deprecated agent spec without failing over the store.
+    """
     try:
-        for j in _read_job_records(config_dir() / _CRONS_FILE)[0]:
-            if j.get("script") or j.get("command"):
-                continue  # runs with no LLM; agent fields are dormant
-            label = j.get("name") or j.get("id")
-            holder = label if isinstance(label, str) and label else "<unnamed job>"
-            seq = j.get("agent_sequence", [])
-            if not isinstance(seq, list) or any(not isinstance(s, str) for s in seq):
-                continue  # the scheduler's loader rejects this record whole
-            agent_id = j.get("agent_id", "")
-            if agent_id is not None and not isinstance(agent_id, str):
-                continue  # same rejection class
-            if agent_sequence_dispatches(seq):
-                names = [s for s in seq if s]
-            else:
-                names = [agent_id] if agent_id else []
-            out.extend((holder, name) for name in names)
+        return [
+            (label, agent)
+            for _job_id, label, agent in dispatched_agents_from_disk(loadable_only=False)
+        ]
     except Exception:
         return []
-    return out
 
 
 _STORE_VERSION = 2
@@ -578,6 +639,41 @@ class CronStoreBusy(TimeoutError):
     CLI process, or the off-loop batch-remove worker holding the lock), so the
     correct caller response is to retry, not to fail permanently.
     """
+
+
+@contextmanager
+def cron_store_lock(
+    store_dir: Path, *, timeout: float = _FILE_LOCK_TIMEOUT_SECS, poll: float = _FILE_LOCK_POLL_SECS
+) -> Iterator[None]:
+    """The cron store's cross-process advisory lock, for a caller with no service.
+
+    ONE implementation of the store lock: :meth:`CronService._file_lock` (every
+    store mutator, loop-safety guard included) delegates here, and the Agent
+    templates delete guard takes it directly around its reference check and the
+    file rename, so a schedule cannot be written between "nothing dispatches this
+    template" and the template going -- the two writers exclude each other on
+    the same ``.crons.lock`` file the mutators use. The reader side mirrors
+    :func:`dispatched_agents_from_disk`: a walk over the store file, so holding
+    the store lock across walk + rename is exactly what makes the pair atomic.
+
+    Off the event loop ONLY (the guard runs on a worker thread; the mutators go
+    through their ``*_async`` variants): the spin sleeps. Bounded -- raises
+    :class:`CronStoreBusy` after *timeout* rather than parking the caller on a
+    slow holder. Non-truncating create-or-open (GH-9248): a contending opener on
+    Windows must not crash at open() before the spin starts.
+    """
+    store_dir.mkdir(parents=True, exist_ok=True)
+    lock = store_dir / ".crons.lock"
+    deadline = time.monotonic() + timeout
+    with platform_compat.open_lock_file(lock) as lock_fd:
+        while not platform_compat.try_acquire_lock(lock_fd, exclusive=True):
+            if time.monotonic() >= deadline:
+                raise CronStoreBusy(f"Could not acquire cron store lock within {timeout:g}s")
+            time.sleep(poll)
+        try:
+            yield
+        finally:
+            platform_compat.release_lock(lock_fd)
 
 
 # ── Loop-safety guard ───────────────────────────────────────────────────────
@@ -826,7 +922,7 @@ class CronJob:
     env: dict[str, str] = field(default_factory=dict)  # per-job environment variables
     timeout_secs: int = _JOB_TIMEOUT_SECS
     strict_schedule: bool = False  # when True, skip jitter and fire exactly on schedule
-    script: str = ""  # Python callable path (module:func or file.py:func); bypasses LLM dispatch
+    script: str = ""  # Script file "<config_dir>/crons/x.py:func"; bypasses LLM dispatch
     command: str = ""  # Shell command for direct execution; bypasses LLM dispatch
     timeout: int = (
         0  # script/command timeout in seconds (0 = use default: 30s script, 300s command)
@@ -2248,6 +2344,18 @@ class CronService:
             # irrelevant to force-killing a locally-running task.
             jobs_by_id = {j.id: j for j in self._jobs}
             for job_id, started in list(self._job_start_times.items()):
+                # A task that is done() while its start stamp is still here
+                # never reached _run_job_isolated's finally (a run that ends
+                # normally pops the stamp there, before its task finishes), so
+                # every marker it claimed is still standing -- _executing above
+                # all, which the due-scan, _next_wake_secs and run_job read as
+                # "still running". Release it on THIS sweep, not once the run's
+                # deadline passes: that is at least _JOB_TIMEOUT_SECS and up to
+                # a day away, and every scheduled fire until then is skipped.
+                # A live task or no tracked task falls through to the timeout
+                # backstop below unchanged.
+                if self.discard_finished_run(job_id):
+                    continue
                 elapsed = now - started
                 # DECIDE and REPORT on the monotonic clock. An entry with no
                 # monotonic stamp (a run already in flight across an upgrade, or
@@ -2269,12 +2377,6 @@ class CronService:
                 ) + (_pool_queue_allowance(job) + _gate_budget_allowance(job) + _vet_allowance(job))
                 jitter_allowance = self._job_jitter.get(job_id, 0.0)
                 if elapsed_mono <= deadline + jitter_allowance:
-                    continue
-                task = self._running_tasks.get(job_id)
-                if task and task.done():
-                    # Normal timeout path already completed; just clean up tracking.
-                    self._job_start_times.pop(job_id, None)
-                    self._job_start_monotonic.pop(job_id, None)
                     continue
                 logger.warning(
                     "Reaper: cron job %s exceeded %ds (ran %.0fs), force-killing",
@@ -2489,6 +2591,14 @@ class CronService:
         ``cancelled`` history entry, and leaves ``consecutive_failures``
         untouched. Returns True when a running execution was found.
         """
+        # A finished task is not a running execution, whatever _executing says.
+        # Trusting the marker here would kill nothing, answer True, record a
+        # "Cancelled by user after Ns" row for a run that ended long ago, and
+        # add the job to _cancelled_jobs for a finally that never runs (the
+        # task is done) -- so the job's NEXT real run would be treated as
+        # cancelled and drop its result. Release the leftovers and answer
+        # "not running" instead; a live task is untouched and cancels below.
+        self.discard_finished_run(job_id)
         if job_id not in self._executing:
             return False
         logger.info("Cancel: user-initiated cancellation of cron job %s", job_id)
@@ -4433,6 +4543,36 @@ class CronService:
         """Return whether a job is currently executing."""
         return job_id in self._executing
 
+    def discard_finished_run(self, job_id: str) -> bool:
+        """Drop the in-memory markers of a run whose task has already finished.
+
+        ``_executing`` and ``_running_tasks`` are released by
+        ``_run_job_isolated``'s ``finally``. A task that ends without reaching
+        it leaves both populated with nothing left to clear them, so the job
+        reads as running for the life of the gateway: every manual run of it is
+        refused, and the due-scan, ``_next_wake_secs`` and ``run_job`` -- which
+        all skip a job in ``_executing`` -- pass over every scheduled fire. The
+        three consumers that gate on "is a run in flight?" ask here first: the
+        manual-run route before its 409, the reaper sweep before its deadline
+        math, and ``cancel()`` before its guard, so a finished task is never
+        mistaken for a live one. A task still running, or no tracked task at
+        all, is left untouched. Returns True when stale markers were dropped.
+        """
+        task = self._running_tasks.get(job_id)
+        if task is None or not task.done():
+            return False
+        self._running_tasks.pop(job_id, None)
+        self._executing.discard(job_id)
+        self._job_start_times.pop(job_id, None)
+        self._job_start_monotonic.pop(job_id, None)
+        self._job_jitter.pop(job_id, None)
+        self._job_run_meta.pop(job_id, None)
+        logger.warning(
+            "Cron: dropped stale running markers for job %s -- its task had already finished",
+            job_id,
+        )
+        return True
+
     def running_since(self, job_id: str) -> float | None:
         """Return the epoch start time of a running job, or None."""
         return self._job_start_times.get(job_id)
@@ -4893,44 +5033,57 @@ class CronService:
         meta = self._job_run_meta.get(job.id)
         started_at = meta[0] if meta else time.time()
         trigger = meta[1] if meta else "scheduled"
-        self._job_start_times[job.id] = started_at
-        # Stamped here rather than derived from started_at: the two clocks share
-        # no epoch, so the reaper's deadline is only meaningful against a stamp
-        # taken on its own clock.
-        self._job_start_monotonic[job.id] = time.monotonic()
-        # One increment per execution, before the jitter sleep so a run cancelled
-        # during jitter still counts as fired. ``kind`` is the dispatch shape --
-        # ``script`` and ``command`` bypass the model entirely, so this is the
-        # split between jobs that cost tokens and jobs that cost none.
-        if job.script:
-            kind = "script"
-        elif job.command:
-            kind = "command"
-        else:
-            kind = "agent"
-        emit_counter(CRON_FIRES, {"kind": kind, "trigger": trigger})
-        # Apply jitter to spread execution unless strict_schedule is set or manual
-        jitter = self._compute_jitter(job) if trigger != "manual" else 0
-        self._job_jitter[job.id] = jitter
         # Provisional; refined once the jitter sleep completes. Only read on
         # the history path, which a cancelled-during-jitter run never reaches.
         exec_started_at = started_at
-        # ``last_result`` is a cross-run context-carry field for AGENT jobs
-        # (see build_cron_session_context): result-less runs leave the
-        # previous value in place so the next run's prompt keeps its dedup
-        # context. Command and script jobs have theirs cleared once in the
-        # finally below, because the prompt built for them is never dispatched.
-        # The history recorder in the finally block must NOT attribute that
-        # carried-over value to THIS run, so clear the freshness marker here;
-        # executor callbacks set it via CronJob.set_run_result() when the run
-        # actually produces a result. (String identity/equality can't stand in
-        # for the marker: CPython interns equal literals and caches single-char
-        # strings, so a run re-producing the previous text looks identical to
-        # one that produced nothing.)
-        job.result_produced = False
         being_cancelled = False
         marker_write: "asyncio.Future[None] | None" = None
+        # Everything the finally below releases is claimed INSIDE the try. The
+        # caller (_on_timer, run_job) has already added the job to _executing
+        # and stored this task in _running_tasks, and the timer path never
+        # awaits the task, so that finally is the only cleanup those two
+        # markers ever get. Bookkeeping claimed ahead of the try -- the start
+        # stamps, the fire counter, the jitter -- is outside that protection:
+        # an exception there ends the task with both markers still set and
+        # nothing on this path left to clear them; the job then reads as
+        # running until the reaper sweep, the manual-run route or cancel()
+        # meets the finished task (discard_finished_run), and every scheduled
+        # fire and every manual run in between is skipped or refused with 409.
         try:
+            self._job_start_times[job.id] = started_at
+            # Stamped here rather than derived from started_at: the two clocks
+            # share no epoch, so the reaper's deadline is only meaningful
+            # against a stamp taken on its own clock.
+            self._job_start_monotonic[job.id] = time.monotonic()
+            # One increment per execution, before the jitter sleep so a run
+            # cancelled during jitter still counts as fired. ``kind`` is the
+            # dispatch shape -- ``script`` and ``command`` bypass the model
+            # entirely, so this is the split between jobs that cost tokens and
+            # jobs that cost none.
+            if job.script:
+                kind = "script"
+            elif job.command:
+                kind = "command"
+            else:
+                kind = "agent"
+            emit_counter(CRON_FIRES, {"kind": kind, "trigger": trigger})
+            # Apply jitter to spread execution unless strict_schedule is set or manual
+            jitter = self._compute_jitter(job) if trigger != "manual" else 0
+            self._job_jitter[job.id] = jitter
+            # ``last_result`` is a cross-run context-carry field for AGENT jobs
+            # (see build_cron_session_context): result-less runs leave the
+            # previous value in place so the next run's prompt keeps its dedup
+            # context. Command and script jobs have theirs cleared once in the
+            # finally below, because the prompt built for them is never
+            # dispatched. The history recorder in the finally block must NOT
+            # attribute that carried-over value to THIS run, so clear the
+            # freshness marker here; executor callbacks set it via
+            # CronJob.set_run_result() when the run actually produces a result.
+            # (String identity/equality can't stand in for the marker: CPython
+            # interns equal literals and caches single-char strings, so a run
+            # re-producing the previous text looks identical to one that
+            # produced nothing.)
+            job.result_produced = False
             # The jitter sleep MUST live inside this try: hourly/daily jobs
             # sleep up to 59 min here, and a user cancel() during that window
             # raises CancelledError at the sleep — if that happened BEFORE the
@@ -5745,22 +5898,8 @@ class CronService:
         is caught rather than silently re-freezing it.
         """
         self._guard_off_event_loop()
-        self._dir.mkdir(parents=True, exist_ok=True)
-        lock = self._dir / ".crons.lock"
-        deadline = time.monotonic() + timeout
-        # Non-truncating create-or-open (GH-9248): the old ``lock.open("w")``
-        # truncated before the acquire attempt, so on Windows a contending
-        # opener crashed with PermissionError at open() -- before the spin ever
-        # started. See platform_compat.open_lock_file / work_ledger._open_lock.
-        with platform_compat.open_lock_file(lock) as lock_fd:
-            while not platform_compat.try_acquire_lock(lock_fd, exclusive=True):
-                if time.monotonic() >= deadline:
-                    raise CronStoreBusy(f"Could not acquire cron store lock within {timeout:g}s")
-                time.sleep(poll)
-            try:
-                yield
-            finally:
-                platform_compat.release_lock(lock_fd)
+        with cron_store_lock(self._dir, timeout=timeout, poll=poll):
+            yield
 
     def _record_fingerprint(self) -> None:
         """Snapshot the store file's fingerprint as the last-loaded state.

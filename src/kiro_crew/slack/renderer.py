@@ -51,7 +51,12 @@ from kiro_crew.messaging.outbound_files import (
     hide_local_refs,
     protected_ref_spans,
 )
-from kiro_crew.messaging.renderer import Renderer, chunk_text
+from kiro_crew.messaging.renderer import (
+    Renderer,
+    chunk_text,
+    count_redaction_tags,
+    redaction_notice,
+)
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -121,6 +126,40 @@ PARTIAL_TURN_MARKER = (
     "Everything above was already established — continue from this point instead of "
     "starting the request over.]_"
 )
+
+
+#: Longest trailing run ``_split_trailing_word`` will hold back. Whitespace is
+#: the only word boundary available here, so the bound is what keeps the rule
+#: honest for scripts that never supply one -- see that function.
+_WORD_HOLD_MAX = 32
+
+
+def _split_trailing_word(text: str) -> tuple[str, str]:
+    """Split off a trailing run of non-whitespace so a caller can hold it back.
+
+    Returns ``(ready, held)``: ``ready`` ends on whitespace (or is empty),
+    ``held`` is the trailing word-in-progress to prepend to the next chunk.
+
+    The holdback is BOUNDED, and both bounds exist for the same reason: a
+    "word" here is only "text since the last whitespace", which is not a word
+    at all in a script written without spaces. Chinese, Japanese and Thai
+    supply no boundary for whole paragraphs, so holding until one arrives would
+    re-hold the entire buffer on every tick and degrade those replies to
+    newline-granularity lumps -- losing exactly the throttled cadence the
+    stream path exists to provide. So a run with no whitespace before it, or
+    one longer than ``_WORD_HOLD_MAX``, is sent as written. A space-delimited
+    script is served by the split-at-last-whitespace path alone; the bound
+    caps the cost of this guard at one short word for everyone else.
+    """
+    if not text or text[-1].isspace():
+        return text, ""
+    for i in range(len(text) - 1, -1, -1):
+        if text[i].isspace():
+            held = text[i + 1 :]
+            # An over-long run is not a word mid-flight; it is a script this
+            # rule cannot read. Tearing it is the lesser harm against stalling.
+            return (text, "") if len(held) > _WORD_HOLD_MAX else (text[: i + 1], held)
+    return text, ""
 
 
 def _redact_all(text: str) -> str:
@@ -370,6 +409,12 @@ class SlackRenderer(Renderer):
         # (see ``_filter_options_brackets`` / ``_resolve_comment_hold``).
         self._bracket_hold = ""
         self._stream_buffer = ""  # unsent text buffered between throttled flushes
+        # Trailing run of non-whitespace held back by a non-final flush so a
+        # throttled cut never lands mid-word (see ``_flush_stream_buffer``).
+        # Slack's stream append is final -- there is no un-appending a torn
+        # word half -- so the tail is kept here and re-prepended on the next
+        # flush instead of being sent early.
+        self._word_hold = ""
         self._last_edit = 0.0  # monotonic ts of the last stream edit (throttle)
         self._task_counter = 0
         self._active_task_id = ""
@@ -379,6 +424,11 @@ class SlackRenderer(Renderer):
         self._controller: Any = None
         self._tool_to_phase: Any = None
         self._finalized = False  # guards close() from double-finalizing
+        # Redaction placeholders in text this turn shipped: the final answer
+        # body counted once at on_done, plus the posted 💭 reasoning. Feeds the
+        # post-answer notice, mirroring the native handler's per-turn tally.
+        self._redacted_creds = 0
+        self._redacted_urls = 0
         self._t0 = 0.0
         self._started = False  # guards on_turn_start against double-fire
         # Outbound-upload gates. The root is the provider's resolved cwd, so it
@@ -535,12 +585,30 @@ class SlackRenderer(Renderer):
             self._delivered += text
         return ok
 
-    async def _flush_stream_buffer(self) -> None:
-        """Strip thinking tags and flush the buffered stream text (if any)."""
-        if not self._stream_buffer:
+    async def _flush_stream_buffer(self, *, final: bool = False) -> None:
+        """Strip thinking tags and flush the buffered stream text (if any).
+
+        A non-final flush (the throttled ``on_text_chunk``/``on_tool_call``
+        paths) holds back a trailing run of non-whitespace: the timer that
+        drives this method fires on a wall-clock interval with no regard for
+        where the model happened to cut its last fragment, so without a
+        holdback a word (or, for multibyte scripts, a character split across
+        two model fragments) can be torn in half across two Slack appends --
+        appends are final on Slack's side, so a torn half can never be
+        stitched back together after the fact. ``final=True`` (``on_done``)
+        always flushes everything: the turn is ending and nothing later will
+        pick up a held tail.
+        """
+        if not self._stream_buffer and not (final and self._word_hold):
             return
         flush, _ = strip_thinking_tags(self._stream_buffer, strip_whitespace=False)
         self._stream_buffer = ""
+        flush = self._word_hold + flush
+        self._word_hold = ""
+        if not final:
+            flush, self._word_hold = _split_trailing_word(flush)
+            if not flush:
+                return
         if self._uploads_enabled():
             flush = await self._withhold_refs(flush)
             if not flush:
@@ -859,6 +927,48 @@ class SlackRenderer(Renderer):
                 pass  # non-critical teardown; never raise from close()
         self._finalized = True
 
+    async def release_held_word(self) -> None:
+        """Send a word held back by a throttled flush when no flush will follow.
+
+        A held tail has exactly three exits, and the third is this one.
+        ``on_done`` releases it itself (``final=True``), and the ``wait``
+        boundary releases it before abandoning its stream -- but a turn that
+        DIES mid-stream reaches neither, and the tail would simply be dropped.
+        That loss is not confined to the screen: the dispatcher's
+        partial-progress rescue persists ``delivered_text``, so a dropped tail
+        is missing from the durable transcript the retry resumes from, which is
+        the opposite of what that rescue exists to do. Call this BEFORE reading
+        that ledger.
+
+        The hold goes out WITH whatever ``_stream_buffer`` has accumulated
+        behind it, for the same reason the hold exists at all. The two are one
+        word cut in two: the hold is the front of it and the buffer opens with
+        the rest, so sending the hold alone would append a half-word as the
+        last thing the transcript establishes -- reintroducing, on the failure
+        path, exactly the tear the throttled holdback prevents everywhere else.
+        Together they end where the model's own text ends. This is a final
+        release, so it mirrors ``_flush_stream_buffer(final=True)``: thinking
+        tags are stripped from the buffer, and nothing is held back.
+
+        Best-effort and idempotent, like ``close()``: it runs on an exception
+        path, so it must not replace the real error with a bookkeeping one. With
+        no live stream to append to there is nothing that could show the tail,
+        and the ledger is right to stay silent about it.
+        """
+        held, self._word_hold = self._word_hold, ""
+        if not (self._use_slack_stream and self._stream_ts):
+            return
+        buffered, self._stream_buffer = self._stream_buffer, ""
+        if buffered:
+            buffered, _ = strip_thinking_tags(buffered, strip_whitespace=False)
+        tail = held + buffered
+        if not tail:
+            return
+        try:
+            await self._append_stream(tail)
+        except Exception:
+            logger.warning("Slack: releasing a held word failed", exc_info=True)
+
     @property
     def delivered_text(self) -> str:
         """Assistant text Slack has actually SHOWN for this turn.
@@ -992,13 +1102,22 @@ class SlackRenderer(Renderer):
         # Reasoning is unbounded, and Slack rejects an over-limit message outright
         # the whole 💭 reply, not its tail. Split it fence-safely so a long
         # chain of thought arrives as ordered replies instead of vanishing.
+        posted_any = False
         for chunk in await self._split_for_slack(f"💭 {reasoning}"):
             # Best-effort: MUST NOT raise. Reasoning is a
             # decorative side channel — the answer is delivered separately.
             try:
                 await self.slack.post_message(self.channel, chunk, self.thread_ts)
+                posted_any = True
             except Exception:
                 logger.warning("Failed to post thinking chunk", exc_info=True)
+        if posted_any:
+            # The reasoning reached the reader, so its placeholders count toward
+            # this turn's redaction notice (the native handler tallies its
+            # thinking text the same way).
+            cred_count, url_count = count_redaction_tags(reasoning)
+            self._redacted_creds += cred_count
+            self._redacted_urls += url_count
 
     async def on_tool_call(
         self, tool_call_id: str, title: str, tool_kind: str = "", tool_purpose: str = ""
@@ -1022,8 +1141,15 @@ class SlackRenderer(Renderer):
         except Exception:
             logger.warning("Slack set_thread_status failed — skipping tool status", exc_info=True)
         # Flush any buffered streamed text before the tool status, like native.
+        # FINAL, deliberately: the tool card is appended immediately below, so
+        # whatever is held here can only be released on the far side of it --
+        # "I will check" would send "I will ", card, then "check" joined to the
+        # post-tool prose. The hold exists to let a torn word be stitched by the
+        # NEXT flush, and at a tool boundary there is no such flush: the card
+        # already separates the two appends, so holding cannot stitch anything
+        # and only reorders. Release it on the near side instead.
         if self._use_slack_stream:
-            await self._flush_stream_buffer()
+            await self._flush_stream_buffer(final=True)
         if self._active_task_id:
             elapsed = self._tool_elapsed_str()
             self._cancel_tool_timer()
@@ -1061,6 +1187,14 @@ class SlackRenderer(Renderer):
             if self._ref_hold:
                 await self._append_stream(self._ref_hold)
                 self._ref_hold = ""
+            if self._word_hold:
+                # The tool-boundary flush above is final, so the hold is
+                # normally already empty here; the 30s elapsed timer can put
+                # one back with a throttled flush of its own, and this stream
+                # is being abandoned rather than continued, so there is no
+                # later flush to release it -- send it now or lose it.
+                await self._append_stream(self._word_hold)
+                self._word_hold = ""
             # A held comment is this message's tail: settle it against the
             # source before that is discarded, and append it when it is content.
             self._bracket_hold, released = _resolve_comment_hold(
@@ -1147,8 +1281,11 @@ class SlackRenderer(Renderer):
         self._bracket_hold, released = _resolve_comment_hold(self._bracket_hold, self._accumulated)
         self._stream_buffer += released
         # Flush any buffered (throttled) stream text before finalizing.
+        # final=True: this is the end of the turn, so any word held back by an
+        # earlier throttled flush must go out now rather than wait for a flush
+        # that will never come.
         if self._use_slack_stream:
-            await self._flush_stream_buffer()
+            await self._flush_stream_buffer(final=True)
         clean_text, options = extract_options(self._accumulated)
         # Trailing control-tag lines (``<!-- keep-visible -->`` and siblings)
         # are protocol: the stream's comment hold kept them off the appended
@@ -1272,6 +1409,15 @@ class SlackRenderer(Renderer):
             # After the text, so the answer reads first and each picture lands
             # under the sentence that introduced it.
             await self._upload_files(files)
+        # The answer is out in one of the delivery forms above (stream finalize,
+        # placeholder update, or direct post — the direct post raises on
+        # failure, skipping this). Count its placeholders once, over the final
+        # display-safe body: the per-append stream scans run the same idempotent
+        # redactors, so this is the form the reader is left with.
+        if clean_text:
+            cred_count, url_count = count_redaction_tags(clean_text)
+            self._redacted_creds += cred_count
+            self._redacted_urls += url_count
         # Clear thread status now that the turn is complete. Best-effort, and
         # MUST NOT raise: the answer is already delivered above — a
         # raising status clear must not convert a delivered turn into a
@@ -1365,3 +1511,20 @@ class SlackRenderer(Renderer):
         # this un-set so the dispatcher books a failure), so finalize here. On a
         # non-OPTIONS turn this is already True from above, so this is a no-op.
         self._finalized = True
+        if self._redacted_creds or self._redacted_urls:
+            # One notice for the whole turn, threaded under the answer it
+            # describes. Best-effort by the shared contract: the answer is
+            # already delivered, so a failed notice send is logged, never
+            # raised.
+            try:
+                await self.slack.post_message(
+                    self.channel,
+                    redaction_notice(self._redacted_creds, self._redacted_urls),
+                    self.thread_ts,
+                )
+            except Exception:
+                logger.warning(
+                    "Slack transport: could not deliver the redaction notice "
+                    "(answer already sent)",
+                    exc_info=True,
+                )

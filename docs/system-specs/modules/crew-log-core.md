@@ -1,10 +1,10 @@
 # Crew log Core
 
-Owners: `kiro_crew.crew_log` (`schema.py`, `store.py`, `errors.py`)
+Owners: `kiro_crew.crew_log` (`schema.py`, `store.py`, `errors.py`, `lease.py`, `entry_types.py`)
 
 ## 1. Purpose
 
-`kiro_crew.crew_log` gives a crew or a session one durable, ordered, citable record of what happened. It is the storage layer only: it defines a file format, enforces who may write what into it, and reads it back. It carries no routes, no MCP tools, no dashboard surface and no migration.
+`kiro_crew.crew_log` gives a crew, a session, or a member one durable, ordered, citable record of what happened. It is the storage layer only: it defines a file format, enforces who may write what into it, and reads it back. It carries no routes, no MCP tools, no dashboard surface and no migration.
 
 The problem it answers is that long-horizon work keeps its state in a context window, which harness-owned compaction summarizes lossily. Transcripts are not a substitute: rotation, compaction and consolidation rewrite the whole file, the grain is a message rather than an operation, and no field defines an order a consumer can fold on. An append-only file with a writer-assigned sequence inverts that -- the record is the authority, the context is a cache -- and lets one unit cite a segment of another's history instead of copying it.
 
@@ -21,6 +21,7 @@ A fact with no unit to belong to still has a home: a script cron, or gateway lif
 ```
 <data home>/crew-log/crews/<store name>/log.jsonl
 <data home>/crew-log/sessions/<store name>/log.jsonl
+<data home>/crew-log/members/<store name>/log.jsonl
 .lock                                                # sibling, per crew log
 .lease                                               # sibling, per crew log
 ```
@@ -37,7 +38,7 @@ The `crew-log` root is established EAGERLY, and that is what makes the mask non-
 
 ## 4. Envelope
 
-Line 1 is the header; every later line is an entry. This section is the part that is the same for both kinds -- the fields, the bounds, and what `ref` and `thread` mean. What belongs to one kind alone is in 4a and 4b.
+Line 1 is the header; every later line is an entry. This section is the part that is the same for all three kinds -- the fields, the bounds, and what `ref` and `thread` mean. What belongs to one kind alone is in 4a through 4c.
 
 ```json
 {"type":"crew","version":1,"id":"qa","createdAt":1789000000000}
@@ -50,7 +51,7 @@ Line 1 is the header; every later line is an entry. This section is the part tha
 | `type` | `domain/action`, or the one guest form `app:<name>/<action>`. A type carries the FACT; who wrote it is `src`. |
 | `seq` | Contiguous from 1 after the header. Writer-assigned. |
 | `time` | Epoch milliseconds. Writer-assigned. |
-| `src` | The emitter. Which names a kind accepts is per kind: 4a and 4b. |
+| `src` | The emitter. Which names a kind accepts is per kind: 4a through 4c. |
 | `thread` | Optional. The seq of an earlier entry in this same file -- a grouping key, like a chat thread id. |
 | `ref` | Optional. `{unit, id, from, to?}`, a pointer to a segment of another (or the same) crew log. `to` absent means one line. |
 | `ignorable` | Optional, `true` only. The writer's promise that a reader which does not know this `type` may skip the line. Absent on every entry that does not set it. |
@@ -62,7 +63,7 @@ A serialized entry is capped at `MAX_ENTRY_BYTES` (64 KiB) and a `ref` at `MAX_R
 
 `ref` is deliberately kind-independent: it is the envelope's, so a crew's log may cite a session's segment and a session's log may cite a crew's. Section 4b names the one bridge a writer takes today.
 
-Two overlaps between the kinds are intentional and are not collisions. The `message` domain exists in BOTH kinds with different `data` -- a crew forwards messages, a session records its own bodies -- because ownership answers "does this kind have such events", and both do. And `ref` crossing kinds is the mechanism the two records are joined by, rather than one kind copying the other's bytes.
+Two overlaps between the crew and session kinds are intentional and are not collisions. The `message` domain exists in both with different `data` -- a crew forwards messages, a session records its own bodies -- because ownership answers "does this kind have such events", and both do. And `ref` crossing kinds is the mechanism the records are joined by, rather than one kind copying another's bytes.
 
 ### 4a. The session's log
 
@@ -97,7 +98,7 @@ The families, from the RFC:
 | knowledge | `crew/finding`, `crew/summary`, `crew/note-*`, `crew/link` | the segment covered |
 | memory | `memory/bound\|copied\|forgotten\|restored` | -- |
 
-Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. Until that module exists these two contracts are held by review against this section. TODO: declare them in the crew log type registry module, `kiro_crew.crew_log.types`, when it lands.
+Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. `kiro_crew.crew_log.entry_types` now declares and enforces the session kind only; these two crew-kind contracts remain held by review against this section until that module's `ENTRY_TYPES` registry gains crew declarations.
 
 **`crew/dispatch`** -- a parent asking for an item to be worked.
 
@@ -139,11 +140,22 @@ Both of these are one type each, not one per writer. The child's identity is `sr
 
 `ref` on a report is **the one cross-kind bridge a writer takes**: from a crew's log into a session's segment, one level down, in the direction a conductor reads. The pair is symmetric with `subagent/spawned` (section 5): the child's header `thread` points up at the entry that caused it, and that entry's `ref` points down into the child's record.
 
+### 4c. The member's log
+
+A member log is the third crew-log kind. Its header carries the member slug and an
+optional display name; `src` is `gateway`, `dashboard`, `patrol`, or an
+`app:<name>` guest confined to its own type namespace. The event vocabulary,
+writers, projections, migration, and transport are owned by
+[member-event-log.md](member-event-log.md); this core owns only the shared
+envelope, storage, lease, and damage rules it uses.
+
 ## 5. The session-log format, pre-release
 
 **The shapes below are PRE-RELEASE and may change.** `KIROCREW_CREW_LOG` defaults off, so
-no crew log directory is created on a stock install and there is no user data on disk for a shape
-change to break. While that holds, a type may be added, removed or reshaped in one commit.
+the session emitter creates no session-kind unit on a stock install. The shared `crew-log`
+root is still pre-created as a security boundary, and independent member-kind logs may exist;
+neither freezes the default-off session entry shapes. While that holds, a session type may be
+added, removed or reshaped in one commit.
 
 **The freeze point is the release that turns the flag on by default.** From then on there are
 files a reader may hold, so the compatibility strategy has to be decided rather than assumed: a
@@ -163,7 +175,7 @@ source were removed (see the emitter spec's "Removed types").
 ### Session, turn
 | Type | `data` | Emitter |
 |---|---|---|
-| `session/opened` | header echo + `resumed`; `model_requested` when a tier resolved one; `parent {slot, sid?}` on a session another session made through `session_create` | yes |
+| `session/opened` | header echo + `resumed`; `model_requested` when a tier resolved one; `previous {sid}` on a crew log created while its slot already had one; `parent {slot, sid?}` on a session another session made through `session_create` | yes |
 | `session/closed` | `{reason}` | yes |
 | `turn/started` | `{turn, actor, depth, message_seq?, attempt?}` | yes |
 | `turn/refused` | `{turn, actor, reason, depth}` | yes |
@@ -251,6 +263,25 @@ same entry, so no reader can observe a phase that moved without its reason. No
 happened to be inside, and the record is folded across every session unit of the
 slot (`session-work-ledger.md`).
 
+### Observed objects
+
+| Type | `data` | Emitter |
+|---|---|---|
+| `object/observed` | `{producer: probe, kind, target, fingerprint, facts, facts_omitted?, observed_at}` — the state of an object outside the session, as one named producer observed it | yes |
+
+One entry per CHANGE of the producer's fingerprint for one subject, never one per
+poll, appended into the log of the session the producer works for. `producer` is a
+CLOSED vocabulary (`probe`, the structured monitor's provider probe) and the emitter
+refuses a value outside it rather than coercing it: the value is what lets a reader
+tell a measured record from a sentence an agent typed, and a coerced producer would
+attribute the record to a mechanism that did not make it. `facts` is the probe's
+canonical snapshot verbatim, so its members are the monitored kind's own vocabulary
+and a fact the probe could not establish stays absent; a snapshot too large for one
+line is recorded short by a NAMED member in `facts_omitted` rather than dropped or
+trimmed silently. No `turn`: a probe runs without a model turn, so the observation
+belongs to no turn. The monitor's state document still holds no history of the
+subject -- this entry is that history (`monitor-architecture.md`).
+
 ### Background and children
 
 | Type | `data` | Emitter |
@@ -297,15 +328,51 @@ session, so the fold that builds the session tree (`crew_log/session_tree.py`, `
 keys it by `slot`, reads the first `session/opened` of each crew log, takes the parent from any log of
 the slot that carries one, and never lets a log without one retract it.
 
+**The other edge is the SLOT's own succession.** A slot outliving its ACP session is not an edge case
+but the steady state: a restart whose `session/load` does not re-attach, a reset, an agent/model/effort
+switch, a compaction that recycles the session and a provider swap each tear the ACP session down, and
+the successor cold-starts under a new id. `CrewLog.exists` is false for that id, so the slot gains a
+SECOND crew log, and `resumed` is false there because nothing re-attached. That is correct and is also
+all `resumed` can say, so the successor's `session/opened` carries `previous {sid}`: the crew log the
+same slot was writing before. Same citation shape as `parent`, written once at creation and never
+rewritten, absent rather than empty when there is nothing to name -- the slot's first crew log, a
+predecessor the gateway could not name, and one whose own header does not name this slot are all
+"nothing to follow". No `slot` is repeated inside it,
+because it is the slot in `data.slot`. The id comes from the persisted slot-to-session mapping, read
+without pruning before allocation publishes the successor over it. One limit is recorded rather than
+handled: an allocation whose replay is still pending does not publish its fresh id over the mapping,
+so for that window a mapping read can
+name the crew log BEFORE the newest one -- two successive crew logs then cite one predecessor
+and the crew log between them is cited by nobody, which is a chain gap tracked with the rest of the
+supersede work in #12148. A successful resume answers the same id and the emitter writes no edge,
+since a crew log cannot be its own predecessor.
+
+The edge is a citation and nothing else. Recording it opens no store for writing but this session's
+own, and no writer here appends to the crew log it names. It does READ that crew log's header, because
+`previous` means the same slot and the source it comes from can name a crew log the slot never
+wrote -- a mapping entry can be stale or recycled: the
+edge is recorded only when the named crew log's own header names this slot, and a candidate whose
+header cannot be read is not named at all. Closing that crew log's own dangling turn and tool calls
+is a separate change: a repair that must wait on the predecessor's outstanding writes has to be
+resumable rather than decided once, which a citation neither needs nor has. Tracked as #12148. Until
+then a superseded crew log keeps an open `turn/started`, which is the state every reader of this log
+already tolerates.
+
+The read side is `session/opened.data.previous` itself, folded into the `status` projection and served
+by the existing projection route. A reader that wants the SLOT rather than the session folds the newest
+crew log, follows `previous` to the one before it, and repeats. There is deliberately no chain-walking
+helper in the store: the walk is one field read per fold, and a bounded, cycle-guarded walker belongs
+with the first fold that actually performs it rather than shipped ahead of any caller.
+
 ## 6. Rules
 
 Every refusal is a `CrewLogError` carrying a stable `code`; the codes are API surface and are additive-only.
 
-**Ownership** answers whether a kind of unit has such events at all. `schema.TYPE_OWNERSHIP` maps kind to owned `type` domains -- crew: `member` `activity` `slot` `patrol` `message` `crew` `item` `memory`; session: `session` `turn` `step` `tool` `approval` `model` `compaction` `plan` `ledger` `message` `request` `context` `background` `subagent` `write` -- and anything else is `event_type_not_owned`. It is prefix-based, so a new action under an owned domain needs no change: `crew/dispatch` and `crew/report` are owned by the `crew` domain the registry already lists. `message` appears in both registries, which is what ownership means: a crew forwards messages and a session records its own bodies, so both kinds have such events and neither name is a collision.
+**Ownership** answers whether a kind of unit has such events at all. `schema.TYPE_OWNERSHIP` maps kind to owned `type` domains -- crew: `member` `activity` `slot` `patrol` `message` `crew` `item` `memory`; member: `member` `activity` `slot` `patrol`; session: `session` `turn` `step` `tool` `approval` `model` `compaction` `plan` `ledger` `object` `message` `request` `context` `background` `subagent` `write` -- and anything else is `event_type_not_owned`. It is prefix-based, so a new action under an owned domain needs no change: `crew/dispatch` and `crew/report` are owned by the `crew` domain the registry already lists. `message` appears in the crew and session registries, which is what ownership means: a crew forwards messages and a session records its own bodies, so both kinds have such events and neither name is a collision.
 
 **Namespacing** answers whether an emitter may write it, and it is a rule about `src`. Two halves:
 
-- **Which emitters a kind takes at all.** `schema.KIND_FIXED_SOURCES` and `schema.KIND_SOURCE_PREFIXES` are the lists, spelled out in 4a and 4b; anything else is `bad_src`. The lists are per kind rather than shared because the writers are: a shared list accepts `patrol` inside one session's own turn history, and `src` is what a reader attributes an entry to, so that is an authorization hole rather than a convenience. `require_src` therefore takes `kind` as a required keyword argument -- it selects the rule, so a caller that omits it fails loudly instead of having its `src` measured against some default kind's list.
+- **Which emitters a kind takes at all.** `schema.KIND_FIXED_SOURCES` and `schema.KIND_SOURCE_PREFIXES` are the lists, spelled out in 4a through 4c; anything else is `bad_src`. The lists are per kind rather than shared because the writers are: a shared list accepts `patrol` inside one session's own turn history, and `src` is what a reader attributes an entry to, so that is an authorization hole rather than a convenience. `require_src` therefore takes `kind` as a required keyword argument -- it selects the rule, so a caller that omits it fails loudly instead of having its `src` measured against some default kind's list.
 - **What a guest may write.** A `crew:<name>` emitter writes the crew kind's own built-in domains: its name in `src` is the signature, so `crew/report` is one type every child writes and the entries are told apart by who signed them. An `app:<name>` emitter writes only under its own `app:<name>/` type prefix, else `namespace_violation`. That prefix is the ONE guest type namespace, kept for a fact no built-in domain covers, and it is judged by this rule *instead of* ownership -- which is why the registry needs no app entries.
 
 A type never carries the writer's identity. `crew:<name>/<action>` is not a type at all but a malformed one (`bad_type`): identity belongs in `src`, where authorization reads it, and a type that repeats it would make the same fact a different type per writer -- so a fold would need to parse the type to group two children's reports on one item, and the registry would grow an entry per crew.
@@ -599,6 +666,6 @@ here and the other is not.
 
 ## 9. Scope
 
-The first consumer is the session-log emitter (`docs/system-specs/modules/crew-log-emitter.md`), which writes the ACP turn lifecycle behind the `KIROCREW_CREW_LOG` flag. No crew writer exists yet, so the crew half of the ownership registry has no emitter. That is safe to leave open because the crew half is a registry of the kind's own domains rather than a list of writers: a guest crew writes those domains under its own `src`, and an app needs no entry at all, since its `app:<name>/` prefix is its permission.
+The session-log emitter ([crew-log-emitter.md](crew-log-emitter.md)) writes the ACP turn lifecycle behind the `KIROCREW_CREW_LOG` flag. The member event log ([member-event-log.md](member-event-log.md)) independently writes the member kind through `kiro_crew.eventlog`. No crew-kind writer exists yet, so that ownership registry still describes the domains a future crew emitter may write rather than events produced today; a guest app needs no registry entry because its `app:<name>/` prefix is its permission.
 
 Read and write paths ship together deliberately: the guarantees this format makes -- contiguous seq under a lock, torn-tail repair, refusal before any byte is written -- are each a claim about what a reader sees after a writer acted, so neither half demonstrates them alone. `test/test_crew_log_core.py` exercises them against real files rather than against a mock.

@@ -1110,6 +1110,21 @@ class AgentConfig:
             "re-consent before code execution.",
         ),
     )
+    apps_ui_stream_timeout_secs: int = field(
+        default=30,
+        metadata=_meta(
+            "App UI Stream Timeout",
+            "Total transfer deadline, in seconds, for ONE response body on the "
+            "unauthenticated /apps/{name}/ui/ route. Clamped to 5..600; a value "
+            "that is not a whole number loads as 30. Read per request, so an "
+            "edit applies without a restart. There is no off switch: the route "
+            "holds eight descriptor permits, and this deadline is what stops a "
+            "client that quits draining its socket from holding one for as long "
+            "as it stays connected — eight such clients would otherwise stop "
+            "every app UI on the host. Raise it only when a real transfer on "
+            "this host needs longer than the default allows.",
+        ),
+    )
     jail: str = field(
         default=JAIL_MODE_AUTO,
         metadata=_meta(
@@ -1172,7 +1187,11 @@ class AgentConfig:
             "when many MCP servers are configured. kiro-cli backend only. "
             "Deferral only starts once the specs cross tool_search_min_pct or "
             "tool_search_min_tokens; disabling reverts to sending full tool "
-            "specs. No effect on an alternate ACP backend.",
+            "specs. Kiro Crew's OWN servers are exempt and always send full "
+            "specs, whatever this is set to: loading one mid-turn would change "
+            "the tools list a thinking block's signature is bound to and the "
+            "provider would reject the conversation. No effect on an alternate "
+            "ACP backend.",
         ),
     )
     tool_search_min_pct: int = field(
@@ -1615,8 +1634,12 @@ class AgentConfig:
         default=1.0,
         metadata=_meta(
             "SubAgent CPU Cost (cores)",
-            "First-boot per-agent CPU-cost fallback (cores) used to auto-size the "
-            "cap until a learned value accumulates.",
+            "Deprecated and inert: the subagent cap is sized from host memory "
+            "only, because over-committing memory is an unrecoverable OOM while "
+            "over-committing CPU only slows work the adaptive controller already "
+            "backs off from. Preserved on load and save so an existing config is "
+            "not rewritten out from under the operator.",
+            deprecated=True,
         ),
     )
     subagent_auto_max: int = field(
@@ -1851,7 +1874,10 @@ class SessionConfig:
         metadata=_meta(
             "Archive Retention (days)",
             "Days to keep compacted/rotated session archives before auto-cleanup. "
-            "-1 disables cleanup (manage deletion manually).",
+            "-1 disables cleanup (manage deletion manually). The same window collects "
+            "a closed session's crew log, and with the crew log on that is where "
+            "Issue Radar keeps each repository's shared skip memory and its crews' "
+            "open work items.",
             nullable=True,
         ),
     )
@@ -2019,8 +2045,12 @@ class MemoryConfig:
         metadata=_meta(
             "Embedding Threads",
             "CPU threads for an explicit memory query or user-started re-embedding. "
-            "Defaults to 4; explicit settings are honoured up to the machine's "
-            "core count. All memory stores share one model and inference worker. "
+            "Defaults to 4, capped one core below the machine's core count -- never "
+            "below one thread, so a single-core host still embeds -- to leave the "
+            "event loop a core wherever there is one to spare; 4 means that default, "
+            "so pinning threads on a 4-core host takes another number. Any other "
+            "setting is honoured up to the core count. All memory stores share one "
+            "model and inference worker. "
             "V2 message context does not run an embedding search; V1 retains "
             "its session-start retrieval.",
         ),
@@ -2185,6 +2215,34 @@ class MemoryConfig:
             "Memory Backups Kept",
             "How many backups to keep per store after an automatic or requested backup. "
             "Values below 1 are treated as 1 so retention cannot empty the directory.",
+        ),
+    )
+    persistence_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Persistence Enabled",
+            "Global switch for persistent memory. Off: no automatic memory "
+            "writes (lessons, consolidation extraction, task-runner lessons) "
+            "and no stored memory/lessons injected into new sessions; "
+            "within-conversation context is unaffected. Explicit dashboard "
+            "edits and deletions stay available. An installed app's own "
+            "ingestion sweep is out of scope and still writes app-scoped rows.",
+        ),
+    )
+    inject_memory: bool = field(
+        default=True,
+        metadata=_meta(
+            "Inject Memory Context",
+            "Inject the stored memory block (preferences, the memory activity "
+            "index and recent-session snippets) into new-session context. "
+            "On-demand memory_recall is unaffected.",
+        ),
+    )
+    inject_lessons: bool = field(
+        default=True,
+        metadata=_meta(
+            "Inject Lessons Context",
+            "Inject the learned-corrections and user-profile blocks into " "new-session context.",
         ),
     )
     migrated: bool = field(
@@ -4950,7 +5008,11 @@ class SttConfig:
             "Which speech model the local provider downloads and runs. Bigger is "
             "more accurate and a longer first-time download: `tiny` on a machine "
             "short of memory, `base` for everyone, `small` when accents or jargon "
-            "are being misheard, `large-v3-turbo` for the best accuracy available.",
+            "are being misheard, `large-v3-turbo` for the best accuracy available "
+            "-- though on a CPU-only build it can recognise slower than you speak: "
+            "an 11-second clip took 13.6 s on a 16-thread aarch64 CPU, 1.24x the "
+            "audio. The Voice panel says so beside the choice when the build it "
+            "measured has no acceleration.",
             enum=list(_VALID_STT_MODELS),
         ),
     )
@@ -4960,6 +5022,18 @@ class SttConfig:
             "Language Code",
             "Language for speech recognition (e.g. zh-CN, en-US). The local provider "
             "defaults to auto-detect; choosing a language can improve short dictation.",
+        ),
+    )
+    polish: bool = field(
+        default=False,
+        metadata=_meta(
+            "AI Cleanup",
+            "After dictation finishes, have your configured model fix punctuation "
+            "and capitalisation. Your WORDS are never changed: a "
+            "reply that altered one is discarded, so the worst case is that nothing "
+            "happens. Off by default because it sends the TRANSCRIPT (never the "
+            "audio) to that model, so a local-only setup stays local-only until you "
+            "turn this on.",
         ),
     )
     streaming: bool = field(
@@ -5489,8 +5563,27 @@ class McpConfig:
             "with a warning. These directories are prepended to the search path "
             "used by the MCP probe, the agent-config command resolver, and the "
             "broker's rewriter alike, so a binary found here is found "
-            "everywhere. They do NOT join the search for the agent runtime "
-            "itself, which must not be shadowable by a configured directory.",
+            "everywhere. They also join the PATH of the broker daemon and every "
+            "pooled MCP backend it spawns, so a wrapper script found here can "
+            "exec a bare tool name; the daemon reads this when it starts, so a "
+            "change reaches it only once it is replaced. They do NOT join the "
+            "search for the agent runtime itself, which must not be shadowable "
+            "by a configured directory.",
+            restart=True,
+        ),
+    )
+    honour_auto_approve: bool = field(
+        default=False,
+        metadata=_meta(
+            "Honour MCP autoApprove",
+            "Keep an ``autoApprove`` list no server spec declares -- one hand-added "
+            "to ``mcp.json`` -- in the agent config Kiro Crew writes. Off by default, "
+            "and off DROPS those verbs: such a tool is approved locally with no "
+            "permission request, so no approval card is ever shown for it. A ceiling "
+            "strips the key whatever this says; a verb a spec declares is kept either "
+            "way. Applies at restart, when the spec is rebuilt, so turning it off "
+            "does not retract a grant already in the file.",
+            restart=True,
         ),
     )
 
@@ -5722,6 +5815,129 @@ DECISION_PROVIDER_MODEL_DEFAULT = "jev-latest"
 # conversation sent raises this themselves.
 DECISION_HISTORY_BUDGET_DEFAULT = 0
 
+# The tiers ``model.route`` may answer with, and the model each maps to by default.
+# The keys are the point's CLOSED answer domain
+# (``decisions.points.model_route.TIERS``): a key outside it is dropped, because a
+# tier the question never offers can never be answered and a map that accepted one
+# would read as configured while routing nothing.
+#
+# The values are ordinary model ids and grant nothing on their own -- the point
+# validates each against what the provider advertises to this account and keeps the
+# session's current model when an id is not there -- so this stays a config value
+# rather than a keystone one.
+DECISION_MODEL_ROUTE_TIERS: tuple[str, ...] = ("simple", "medium", "complex")
+
+# Every tier defaults to ``""`` -- INHERIT, i.e. the turn keeps the model its
+# session is already on. No concrete model id is named here, and none may be: a
+# hardcoded id fails at runtime -- silently, until the first prompt -- for every
+# account not entitled to it, so
+# ``docs/system-specs/common/model-selection.md`` allows ids to be pinned only in
+# an operator-written map and keeps code defaults at ``""`` / ``"auto"``.
+# ``code-review.yml`` gates on it.
+#
+# The three keys are PRESENT and empty rather than absent, which is the same
+# shape ``agent.role_models``'s roles take: "this tier exists and is unpinned" is
+# a state the log and the strip report ("complex -> (unpinned)"), so it needs a
+# spelling of its own rather than being inferred from a missing key.
+DECISION_MODEL_ROUTE_DEFAULT: dict[str, str] = {tier: "" for tier in DECISION_MODEL_ROUTE_TIERS}
+
+
+def coerce_model_route(raw: object) -> dict[str, str]:
+    """Normalize ``decisions.model_route`` from a hand-edited config.
+
+    Always returns all three tiers. Each value goes through
+    :func:`normalize_agent_model`, exactly as :func:`coerce_role_models` does, so
+    ``"auto"`` and a non-string both collapse to ``""`` -- "inherit" has ONE
+    spelling, and a tier set to ``"auto"`` keeps inheriting instead of hard-pinning
+    the backend's own default.
+
+    A tier outside the three is dropped: the question never offers it, so it could
+    never be answered, and a map that accepted one would read as configured while
+    routing nothing.
+    """
+    section = raw if isinstance(raw, dict) else {}
+    return {tier: normalize_agent_model(section.get(tier)) for tier in DECISION_MODEL_ROUTE_TIERS}
+
+
+# The providers ``decisions.nudge_wake.provider`` may name. ``auto`` resolves at
+# decision time -- Jev when the keystone consents to it, the LLM lane otherwise --
+# so a machine that later gains or loses a Jev key needs no config edit.
+JUDGE_PROVIDER_AUTO = "auto"
+JUDGE_PROVIDER_JEV = "jev"
+JUDGE_PROVIDER_LLM = "llm"
+JUDGE_PROVIDERS = (JUDGE_PROVIDER_AUTO, JUDGE_PROVIDER_JEV, JUDGE_PROVIDER_LLM)
+
+
+@dataclass
+class NudgeWakeConfig:
+    """Per-point settings for the wake judge (``decisions`` point ``nudge.wake``).
+
+    Deliberately carries NO ``enabled``. There is no feature toggle, because the two
+    lanes are authorized by different things and neither of them is a toggle:
+
+    * The Jev lane needs the Decisions keystone in full -- the main switch AND this
+      point's own ``nudge_evidence`` scope, because that scope names a category of
+      egress to the Jev endpoint. Config cannot grant it and this section cannot
+      widen it.
+    * The ``llm`` lane needs no consent row, so ``provider = llm`` plus a ``judge``
+      spec on the loop is what runs it. What makes that safe is not that config is
+      trusted: the lane adds no destination and no data class. It sends to the model
+      provider the owner's sessions already send to every turn, carrying a scrubbed,
+      bounded subset of the owner's own children's transcripts, which that provider
+      already received when those sessions ran. The judge only chooses QUIET against
+      firing and is fail-open, so the worst case is one delayed wake, bounded by the
+      quiet-streak floor.
+
+    Hot-applied: the gate reads the live snapshot per call.
+    """
+
+    provider: str = field(
+        default=JUDGE_PROVIDER_AUTO,
+        metadata=_meta(
+            "Judge provider",
+            "Which judge answers at nudge.wake: 'jev' (the System One model this "
+            "card's consent switch covers), 'llm' (a small text-only model on the "
+            "provider this machine already uses, no extra key needed), or 'auto' "
+            "-- Jev when consent stands for it, otherwise the small model. "
+            "Anything else reads as 'auto'. Choosing 'jev' without that consent "
+            "sends nothing and every tick fires as it does today.",
+        ),
+    )
+    llm_model: str = field(
+        default="",
+        metadata=_meta(
+            "Judge model (LLM lane)",
+            "The model id the 'llm' lane runs on, spelled as your provider "
+            "advertises it. EMPTY INHERITS: the judge keeps the model its "
+            "background agent already resolves, which is the default. A value that "
+            "is not a short model id is ignored rather than sent.",
+        ),
+    )
+
+    @classmethod
+    def from_raw(cls, section: object) -> "NudgeWakeConfig":
+        """Normalize rather than reject, the posture the whole section takes.
+
+        Every unreadable value resolves to the shipped default. Neither key can reach
+        a destination the session does not already send to, so a hand-edit that fails
+        to parse costs a preference, not a permission.
+        """
+        if not isinstance(section, dict):
+            return cls()
+        raw_provider = section.get("provider")
+        provider = raw_provider.strip().lower() if isinstance(raw_provider, str) else ""
+        raw_model = section.get("llm_model")
+        return cls(
+            # An unknown name reads as ``auto`` rather than as an error: a typo must
+            # not become a third lane and must not stop the gateway booting.
+            provider=provider if provider in JUDGE_PROVIDERS else JUDGE_PROVIDER_AUTO,
+            # Kept verbatim (stripped) and validated where it is USED, against
+            # ``decisions.types.MODEL_ID_RE``: storing "" for an id this build
+            # cannot use would make the saved config disagree with what the operator
+            # wrote, and the bound that matters is at the call that names a model.
+            llm_model=raw_model.strip() if isinstance(raw_model, str) else "",
+        )
+
 
 @dataclass
 class DecisionProviderConfig:
@@ -5783,8 +5999,10 @@ class DecisionsConfig:
     same placement as ``computer_use.json`` and ``aws_service_consent.json``. This
     section carries only the knobs that grant nothing on their own: the sampling
     share, the prior-conversation budget (0 by default, so raising it is a choice),
-    and the provider. There is no per-point arm and no shadow mode: one point ships
-    (``skills.select``).
+    the tier-to-model map ``model.route`` reads, and the provider. There is no
+    per-point arm and no shadow mode: two points ship (``skills.select``,
+    ``model.route``), each reached only through its own owner-made choice --
+    a non-zero ``skills.max_triggered`` and the picker's ``Auto (Jev)`` entry.
 
     Every field is hot-applied (no ``restart=True`` anywhere): the gate reads the
     live snapshot per call, so a bucket change takes effect on the next decision
@@ -5817,9 +6035,40 @@ class DecisionsConfig:
             "choice rather than an upgrade. A negative value reads as 0.",
         ),
     )
+    model_route: dict[str, str] = field(
+        default_factory=lambda: dict(DECISION_MODEL_ROUTE_DEFAULT),
+        metadata=_meta(
+            "Model per difficulty tier",
+            "Which model answers a chat turn Jev put in each difficulty tier, for "
+            "a session whose model is set to 'Auto (Jev)' in the chat model "
+            "picker. Keys are the three tiers the question offers -- 'simple', "
+            "'medium', 'complex' -- and each value is a model id the provider "
+            "advertises to your account, exactly as the chat model picker spells "
+            "it. Every tier is EMPTY by default, which means inherit: the turn "
+            "keeps the model its session is already on, and the decision is still "
+            "recorded so you can see which tier Jev chose before you pin anything. "
+            "No model id is named for you, because an id your account is not "
+            "offered would fail on the first prompt. 'auto' means the same as empty. "
+            "An id your account cannot run keeps the session's model too and "
+            "records why in the decision log. Routing a turn to a dearer model "
+            "costs more, which is why it happens only for a session whose owner "
+            "picked 'Auto (Jev)' -- a manual model choice is never overridden.",
+        ),
+    )
     provider: DecisionProviderConfig = field(
         default_factory=DecisionProviderConfig,
         metadata=_meta("Provider", "Where decisions are sent and what they may cost."),
+    )
+    nudge_wake: NudgeWakeConfig = field(
+        default_factory=NudgeWakeConfig,
+        metadata=_meta(
+            "Wake judge",
+            "Per-point settings for nudge.wake: which judge answers, and the model "
+            "id for the small-model lane. The Jev lane still needs this point's "
+            "consent scope on the Decisions card; the small-model lane needs no "
+            "consent row, because it sends to the model provider your sessions "
+            "already use, so picking it here is what runs it.",
+        ),
     )
 
     @classmethod
@@ -5896,7 +6145,13 @@ class DecisionsConfig:
                 DECISION_HISTORY_BUDGET_DEFAULT,
                 0,
             ),
+            # Per-TIER fallback rather than per-map: see `coerce_model_route`. An
+            # absent section and one naming no known tier both read as the shipped
+            # map, since this key cannot widen anything -- every id is still held
+            # against the provider's advertised list at routing time.
+            model_route=coerce_model_route(section.get("model_route")),
             provider=provider,
+            nudge_wake=NudgeWakeConfig.from_raw(section.get("nudge_wake")),
         )
 
 
@@ -7028,7 +7283,7 @@ class WeixinConfig:
     """Weixin (personal WeChat) channel via Tencent's iLink Bot API.
 
     Distinct from :class:`WeComConfig` (enterprise WeCom over WebSocket). The
-    bot ``token`` + ``account_id`` are obtained through the Settings > Channels
+    bot ``token`` + ``account_id`` are obtained through the Settings > Messaging Channels
     QR-login flow; prefer the WEIXIN_TOKEN credential over storing the token
     here.
     """
@@ -7131,7 +7386,7 @@ class WhatsAppConfig:
 
     Pairs as a linked device on the operator's own WhatsApp account — there is
     no bot token. Pairing state lives in a local session database under the
-    data home (``whatsapp/session.db``), created by the Settings > Channels QR
+    data home (``whatsapp/session.db``), created by the Settings > Messaging Channels QR
     flow. Requires the optional ``whatsapp`` dependency
     (``pip install 'neonize==0.4.3.post0'``; see :mod:`kiro_crew.extras`).
 
@@ -7145,7 +7400,7 @@ class WhatsAppConfig:
         metadata=_meta(
             "Enabled",
             "Enable the WhatsApp channel (QR-linked personal account over the "
-            "WhatsApp Web protocol). Pair a device from Settings > Channels; "
+            "WhatsApp Web protocol). Pair a device from Settings > Messaging Channels; "
             "needs the 'whatsapp' dependency extra installed.",
             tags=["whatsapp"],
         ),

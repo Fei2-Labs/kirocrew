@@ -273,7 +273,10 @@ ROWS_ONLY_OWNED_META_KEYS: frozenset[str] = frozenset({"_type", "created_at", "l
 # and its background-refresh budget: read back beside another slot's title they
 # either unlock the refresh on a name a user typed by hand or lock a generated name
 # out of refresh permanently. They travel WITH the title, so they are deferred with
-# it.
+# it. ``title_low_signal`` is the same shape — the early-refresh eligibility of
+# THIS slot's title — so a popped slot's stale flag carried over a live
+# replacement's would wrongly suppress or re-arm the replacement's turn-one
+# refresh after restart. It defers with the title too.
 #
 # ``created_by`` and ``origin`` are the same shape and the highest-consequence
 # instance of it, because what they describe is AUTHORIZATION rather than
@@ -296,7 +299,7 @@ ROWS_ONLY_OWNED_META_KEYS: frozenset[str] = frozenset({"_type", "created_at", "l
 # disagree about them in a way that outlives the pair.
 ROWS_ONLY_DEFERRED_META_KEYS: frozenset[str] = (
     SLOT_OWNED_META_KEYS - ROWS_ONLY_OWNED_META_KEYS
-) | frozenset({"title_origin", "title_refresh_mark", "created_by", "origin"})
+) | frozenset({"title_origin", "title_refresh_mark", "title_low_signal", "created_by", "origin"})
 
 
 def carry_unowned_metadata(
@@ -2945,8 +2948,12 @@ class ConversationLog:
         key: str,
         fields: dict,
         guard: Callable[[dict], bool],
+        *,
+        require_existing: bool = False,
     ) -> bool:
-        return self._metadata_projection.update_metadata_if(key, fields, guard)
+        return self._metadata_projection.update_metadata_if(
+            key, fields, guard, require_existing=require_existing
+        )
 
     def _update_metadata_locked(self, key: str, fields: dict) -> None:
         self._metadata_projection._update_metadata_locked(key, fields)

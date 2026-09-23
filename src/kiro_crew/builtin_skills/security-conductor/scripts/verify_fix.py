@@ -126,19 +126,19 @@ here, and it is what decides how each kind is treated:
     Classified by the tool gate's deny composite, never run. The claim a shell row
     makes is "the gate must not refuse this", so classification answers it exactly
     and running the command would answer a different question. "Refused" means
-    refused by ANY of the four checks ``hooks.on_tool_call`` applies to a shell
-    command, in its order -- the path fence, the sensitive-command tier, the
+    refused by ANY of the three checks ``hooks.on_tool_call`` applies to a shell
+    command, in its order -- the sensitive-command tier, the
     exfiltration auditor, and the deny-rule catalog (:data:`TIERS`, the same table
     ``scripts/deny_diff.py`` declares). Measuring the catalog alone would go green
-    on a fix that tightened any of the other three, which is the specific way this
+    on a fix that tightened either of the other two, which is the specific way this
     gate could ship a meaningless pass. The verdict names the tier that refused,
-    because "the path fence refused it" and "a catalog rule matched it" need
+    because "the sensitive-command tier refused it" and "a catalog rule matched it" need
     different fixes. The composite is called in a CHILD process with the worktree's own ``src`` ahead of
     everything on ``PYTHONPATH``, because the point is to classify against the
     FIXED code: importing it in this process would bind whatever copy of the
     package the interpreter already loaded, which for a test runner inside the
     repository is the unfixed one. When the import fails, or the tree lacks one of
-    the four checks, every shell row is ``unverifiable`` and the verdict is 20 -- a
+    the three checks, every shell row is ``unverifiable`` and the verdict is 20 -- a
     fence that cannot be read is not a fence that agreed, and a tier that is missing
     is coverage silently lost, not a tier that permitted. The probe's argv is FIXED -- this script re-entered with
     ``--classify-stdin`` -- and there is deliberately no flag to substitute another
@@ -271,6 +271,16 @@ CONTRACT_UNREADABLE = 20
 #: diff empty and every scope check trivially honoured. The caller naming the base is
 #: the more specific statement, and here the caller is this gate.
 CONTRACT_BASE = "origin/main"
+
+#: Why a ``test`` row was not run. Running one executes code out of the fixed
+#: worktree, which this gate does while a conductor-declared blast radius covers
+#: every changed path in it. A contract that is violated or unreadable leaves that
+#: uncovered, so the row is reported rather than run.
+CONTRACT_SKIPPED_TEST_ROW = (
+    "not run: the declared fix contract did not settle as honoured, so running a test"
+    " row would execute code from a worktree whose changed paths are not known to sit"
+    " inside the declared blast radius"
+)
 
 #: The pytest argv every ``test`` row runs under, before its selector. ``-n 0``
 #: keeps xdist from forking workers for one node, ``-o addopts=`` drops the
@@ -816,16 +826,13 @@ def run_verifier(
 #: composite. A check the tree does not carry is coverage lost, and the probe
 #: reports it as unavailable rather than skipping it.
 TIERS: tuple[tuple[str, str], ...] = (
-    ("sensitive-path", "sensitive_path_refusal"),
+    # No path tier: a shell command is command text, which the gate deliberately does
+    # not match paths in; see the matching note on ``deny_diff._TIERS``.
     ("sensitive-bash", "is_sensitive_bash_command"),
     ("exfil", "audit_bash_exfiltration"),
     ("deny-rules", "is_denied"),
 )
 
-#: Reason reported for a tier whose check answers True/False rather than a string.
-#: The path fence is the one such check, and a bare ``True`` would otherwise render
-#: as an empty refusal.
-BOOL_TIER_REASON = "Blocked: access to sensitive path"
 
 #: This script re-entered in probe mode. The probe imports the product's fence, so
 #: it is spelled as a re-entry rather than as an inline ``-c`` program: the same
@@ -1007,7 +1014,7 @@ def classify_stdin(stream: Any, out: Any) -> int:
         if check is None:
             # A missing tier is coverage lost, not a tier that permitted. Reporting
             # the composite as unavailable keeps the shell rows out of the passing
-            # set instead of certifying them against three checks out of four.
+            # set instead of certifying them against two checks out of three.
             json.dump({"available": False, "error": f"kiro_crew.security has no {attribute}"}, out)
             out.write("\n")
             return 0
@@ -1024,10 +1031,8 @@ def classify_stdin(stream: Any, out: Any) -> int:
                 return 0
             if not outcome:
                 continue
-            # The path fence answers True/False; the others answer a reason or None.
-            # Both mean refused, and the tier is named so the reviewer knows which
-            # fix to reach for.
-            text = BOOL_TIER_REASON if outcome is True else str(outcome)
+            # The tier is named so the reviewer knows which fix to reach for.
+            text = str(outcome)
             reason = f"[{name}] {text}"
             break
         results.append({"command": command, "reason": reason})
@@ -1149,7 +1154,10 @@ def run_test_row(
 
 
 def check_test_rows(
-    rows: list[dict[str, Any]], worktree: Path, timeout: int
+    rows: list[dict[str, Any]],
+    worktree: Path,
+    timeout: int,
+    contract_verdict: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
     """Run the behaviour corpus. ``(broken, unverifiable, checked)``.
 
@@ -1157,10 +1165,25 @@ def check_test_rows(
     a corpus the caller gets to shrink: the fixer running the gate would choose which
     half of it applies. A row that cannot be run is reported ``unverifiable`` by the
     paths below, which is a verdict rather than a choice.
+
+    ``contract_verdict`` is the one thing that stops a row from being run, and it is
+    not such a choice: it is this script's own verdict from
+    :func:`run_contract_check`, which the subject of the check cannot set. Running a
+    row means executing code out of the fixed worktree -- pytest imports the named
+    module and the ``conftest.py`` above it. That is sound while the contract holds,
+    because then every changed path is inside a blast radius a conductor declared
+    outside the worktree. A violated or unreadable contract withdraws exactly that
+    assurance, so the rows are reported ``unverifiable`` and pytest is never invoked.
+    The verdict does not move: ``broken`` and ``unverifiable`` both outrank the
+    ``unverifiable`` these rows contribute.
     """
     broken: list[dict[str, Any]] = []
     unsettled: list[dict[str, Any]] = []
     if not rows:
+        return broken, unsettled, 0
+    if contract_verdict is not None:
+        for row in rows:
+            unsettled.append(describe_row(row, CONTRACT_SKIPPED_TEST_ROW))
         return broken, unsettled, 0
     python = classifier_python(worktree)
     available, note = pytest_available(python, worktree, timeout)
@@ -1209,9 +1232,16 @@ def describe_row(row: dict[str, Any], why: str) -> dict[str, Any]:
 
 
 def check_golden_paths(
-    rows: list[dict[str, Any]], worktree: Path, timeout: int
+    rows: list[dict[str, Any]],
+    worktree: Path,
+    timeout: int,
+    contract_verdict: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], int]:
     """Classify the shell corpus, run the test corpus, hand every other kind to a human.
+
+    ``contract_verdict`` reaches :func:`check_test_rows`, which stops running rows
+    when it is set. Shell rows are still classified either way: classification reads
+    the worktree's fence rather than running a corpus row through it.
 
     Returns ``(broken, unverifiable, needs_human, checked)``. The split is the
     design: the first two are verdicts about checks this script makes, and the third
@@ -1240,7 +1270,10 @@ def check_golden_paths(
             broken.append(describe_row(row, f"the deny fence refuses it: {refusal}"))
 
     test_broken, test_unsettled, test_checked = check_test_rows(
-        [row for row in rows if str(row["kind"]) == TEST_KIND], worktree, timeout
+        [row for row in rows if str(row["kind"]) == TEST_KIND],
+        worktree,
+        timeout,
+        contract_verdict,
     )
     broken.extend(test_broken)
     unsettled.extend(test_unsettled)
@@ -1401,7 +1434,12 @@ def main(argv: list[str] | None = None) -> int:
     # does not change -- ``reproduces`` outranks everything -- but a fix that failed
     # AND broke three legitimate operations is one round of feedback instead of two,
     # and the second round would only be reached after the first was fixed.
-    broken, unsettled, needs_human, checked = check_golden_paths(rows, worktree, args.timeout)
+    # The contract verdict travels with the corpus check: a worktree whose changed
+    # paths are not known to sit inside the declared blast radius is one this gate
+    # reads but does not run. See :func:`check_test_rows`.
+    broken, unsettled, needs_human, checked = check_golden_paths(
+        rows, worktree, args.timeout, contract_verdict
+    )
 
     # A corpus that could not be read is not a corpus that passed. Zero rows checked
     # would fold to ``holds`` by construction, which is exactly the vacuous green a

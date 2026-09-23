@@ -2425,6 +2425,27 @@ jobs:
           npm run lint:phantom-classes -- --test
           npm run lint:phantom-classes
 
+      - name: Check no file restyles more ui/ primitives than the baseline allows
+        # `shadcn/no-restyle` stays off in eslint.config.js: the tree carries a
+        # few hundred call sites that restyle ui/ primitives and the eslint gate
+        # is a hard zero. Off means the backlog can grow silently, so this step
+        # runs the rule through its own config and holds each file at the count
+        # recorded in website/scripts/restyle-baseline.json — a rise or a new
+        # file fails; a fall fails too until `--update-baseline` records it, so
+        # progress is locked in rather than left to a log line. That flag never
+        # raises a number. Whole-tree, no base ref: the baseline is committed,
+        # so the gate is complete for regression without a diff. Not eslint's
+        # own bulk suppressions: the Node API editors use ignores that file, and
+        # the CLI loads it for every config, so the i18n eslint run would fail
+        # on "unused" entries (both measured; see the script header).
+        working-directory: website
+        run: |
+          # Self-test first: it plants one restyled primitive and asserts the
+          # rule fires under this config, so a plugin or parser change that
+          # silences the rule fails here instead of passing every count as 0.
+          npm run lint:restyle-ratchet -- --test
+          npm run lint:restyle-ratchet
+
   # Prove `npm ci` still works on the OLDEST Node the frontend claims to support.
   # Every other job here runs the .nvmrc toolchain (Node 24 / npm 11), and npm 11
   # and npm 10 (Node 22) build different ideal trees for an OPTIONAL PEER
@@ -3160,6 +3181,16 @@ jobs:
   # (`unshare --mount --map-root-user`); the CodeBuild container answers EPERM.
   # Keeping it separate limits hosted runner use to its ~3.5-minute run. No SPA,
   # no Node, no browser: the test drives the gateway over HTTP, like the boot matrix.
+  #
+  # `--timeout=600` is a BACKSTOP, not the test's budget. The module caps all of a
+  # test's waiting at `_TEST_BUDGET_SECONDS` (570) anchored at test start, so a
+  # stalled workflow fails inside `_finished` -- which names the run and its
+  # progress -- while this cap only catches a hang outside those waits. Two
+  # gateway boots and nine workflow waits need more room than the ~3.5-minute
+  # typical run, and a cap at that scale fires on runner slowness while saying
+  # nothing about which workflow hung. Keep this above
+  # `_TEST_BUDGET_SECONDS` and below `timeout-minutes`;
+  # `test_e2e_private_namespace_budget.py` enforces both.
   e2e-private-namespace:
     name: E2E (private member namespace, hosted)
     needs: [await-fast-gate]
@@ -3191,7 +3222,7 @@ jobs:
           KIROCREW_STRICT_ON_LOOP_PERSIST: "1"
         run: |
           echo "::remove-matcher owner=python::"
-          python -m pytest -q -n0 --no-cov --timeout=300 test/e2e/test_private_workflow_memory.py
+          python -m pytest -q -n0 --no-cov --timeout=600 test/e2e/test_private_workflow_memory.py
 
   # The only job that BOOTS A GATEWAY on macOS and Windows.
   #

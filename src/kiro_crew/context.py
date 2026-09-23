@@ -22,9 +22,9 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew import model_registry, resource_status
 from kiro_crew._sqlite_compat import sqlite3
+from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE, is_spec_adapter_provider_label
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
-from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE, is_spec_adapter_provider_label
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
 from kiro_crew.board_tag_grammar import is_grantable_tag_id
 from kiro_crew.config import live
@@ -1021,6 +1021,18 @@ _MEMORY_PREFS_CAP = _budget(0.026)  # user preferences                     = 2.6
 _MEMORY_PROJECTS_CAP = _budget(0.039)  # active projects                      = 3.9%
 _MEMORY_HISTORY_CAP = _budget(0.16)  # daily history (multi-tier decay)     = 16%
 _LESSONS_CAP = _budget(0.226)  # learned corrections (high priority)  = 22.6%
+# Startup rule allowance for the authored directive tier. Window-INDEPENDENT
+# and deliberately NOT a share of ``_CONTEXT_BUDGET_BASE``: that base is the
+# ordinary discretionary pool, and standing rules are not discretionary. The
+# value restores the allowance a 1M-window session had before the base was
+# pinned to its smallest-window value (165_000 * 0.226 = 37_290).
+_LESSONS_STARTUP_CAP = 37_000
+# Past findings the author marked as experience rather than as standing rules.
+# A SEPARATE, deliberately smaller allowance instead of a share of
+# ``_LESSONS_CAP``: the two tiers answer different questions, so a user with many
+# findings must not be able to crowd out their own standing rules, and a user with
+# many rules must not lose the findings budget. Both are window-independent.
+_LESSON_EXPERIENCE_CAP = _budget(0.05)  # learned experience (on-demand tier)  = 5%
 _SEMANTIC_MEMORY_CAP = _budget(0.077)  # semantic memory (vector)             = 7.7%
 _EPISODIC_MEMORY_CAP = _budget(0.077)  # episodic memory (vector)             = 7.7%
 _SKILLS_CAP = _budget(0.15)  # skills top-K block (lazy-loaded)     = 15%
@@ -1100,6 +1112,8 @@ class _ResolvedCaps:
     projects: int
     memory_history: int
     lessons: int
+    lessons_startup: int
+    lesson_experience: int
     semantic: int
     episodic: int
     skills: int
@@ -1156,6 +1170,8 @@ def _resolve_caps_cached(window: int) -> _ResolvedCaps:
         projects=_scaled(_MEMORY_PROJECTS_CAP),
         memory_history=_scaled(_MEMORY_HISTORY_CAP),
         lessons=_scaled(_LESSONS_CAP),
+        lessons_startup=_scaled(_LESSONS_STARTUP_CAP),
+        lesson_experience=_scaled(_LESSON_EXPERIENCE_CAP),
         semantic=_scaled(_SEMANTIC_MEMORY_CAP),
         episodic=_scaled(_EPISODIC_MEMORY_CAP),
         skills=_scaled(_SKILLS_CAP),
@@ -1432,6 +1448,37 @@ _GROUP_DESCRIPTIONS = {
 def _group_included(groups: frozenset[str] | None, group: str) -> bool:
     """True when *group* is in scope; ``None`` ⇒ every group."""
     return groups is None or group in groups
+
+
+def _config_scoped_groups(
+    context_groups: frozenset[str] | None, cfg: "KiroCrewConfig | None" = None
+) -> frozenset[str] | None:
+    """The caller-passed scope intersected with the operator's config toggles.
+
+    ``memory.inject_memory`` / ``memory.inject_lessons`` (with
+    ``memory.persistence_enabled`` as the global switch) withhold a group on
+    EVERY surface. Intersecting here — instead of at each call site — keeps a
+    new context entry point from silently escaping the config;
+    ``build_session_context``, the v2 essentials builder and the
+    post-compaction re-injection all route through this.
+    Subagent narrowing is preserved: config can only remove groups from the
+    caller-passed scope, never add one back. Only the memory and lessons groups
+    are ever subtracted, so a project-group gate reads the caller scope
+    directly. The ``[CONTEXT SCOPE]`` block
+    stays keyed to the caller-passed value, because "your parent withheld"
+    describes per-spawn narrowing, not the operator's standing choice.
+    """
+    if cfg is None:
+        cfg = KiroCrewConfig.load()
+    withheld: set[str] = set()
+    if not (cfg.memory.persistence_enabled and cfg.memory.inject_memory):
+        withheld.add(CONTEXT_GROUP_MEMORY)
+    if not (cfg.memory.persistence_enabled and cfg.memory.inject_lessons):
+        withheld.add(CONTEXT_GROUP_LESSONS)
+    if not withheld:
+        return context_groups
+    base = SWITCHABLE_CONTEXT_GROUPS if context_groups is None else context_groups
+    return frozenset(base) - withheld
 
 
 def _build_context_scope_section(groups: frozenset[str] | None) -> str:
@@ -1968,57 +2015,74 @@ def steering_target_admissible(resolved: Path, base: Path | None = None) -> bool
     )
 
 
-def _load_steering_resources() -> str:
-    """Load steering files from the agent config's resources array.
+def _agent_spec_candidates(agent: str, project: str | None = None) -> list[Path]:
+    """Return project-first specs, matching backend agent resolution order."""
+    candidates: list[Path] = []
+    if project:
+        try:
+            from kiro_crew.agent_discovery import project_agent_files
 
-    kiro-cli injects these automatically for its sessions; the dashboard
-    must do it explicitly so that dashboard chat sessions also benefit
-    from project-specific steering conventions.
-    Only loads ``file://`` resources matching ``*.md``.
+            candidates.extend(project_agent_files(project))
+        except Exception:
+            logger.debug("Project agent scan failed for %r", agent, exc_info=True)
+    candidates.extend(iter_agent_spec_files(kiro_agents_dir(), ordered=False))
+    return candidates
+
+
+def _load_agent_file_resources(agent: str, project: str | None = None) -> str:
+    """Load markdown ``file://`` resources for a spec-adapter session.
+
+    Kiro injects these natively. Public-spec adapters do not read Kiro agent
+    specs, so Crew resolves the same project-first spec and injects its files.
+    The shared hardened reader applies size, symlink, encoding and sensitive-path
+    guards before any user-owned spec is parsed.
     """
     try:
-        cfg_path = kiro_agents_dir() / "kirocrew.json"
-        if not cfg_path.exists():
-            return ""
-        # The agents dir is user-writable and shared with other tools, so the
-        # spec goes through the hardened agent-spec reader. ``safe_read_file``
-        # screens the resolved target but reads it with an unbounded
-        # ``fh.read()`` -- the size cap guards ``safe_read_file_bytes``, the
-        # other helper -- and emits no SEL event, so it would read an oversized
-        # spec whole here and audit no refusal. Every outcome the blanket
-        # ``except`` below would absorb (PermissionError on a sensitive target,
-        # AttributeError on non-object JSON) arrives as ``None`` and returns
-        # the same empty string, without the read.
         from kiro_crew.agent_discovery import _read_agent_spec
 
-        cfg = _read_agent_spec(
-            cfg_path,
-            operation="steering_resources",
-            source="unknown",
-        )
+        cfg: dict[str, Any] | None = None
+        for candidate in _agent_spec_candidates(agent, project):
+            candidate_data = _read_agent_spec(
+                candidate,
+                operation="steering_resources",
+                source="context",
+            )
+            if candidate_data is None:
+                continue
+            if candidate_data.get("name") == agent or candidate.stem == agent:
+                cfg = candidate_data
+                break
         if cfg is None:
             return ""
-        resources = cfg.get("resources", [])
+
         parts: list[str] = []
-        for res in resources:
-            if not isinstance(res, str) or not res.startswith("file://"):
+        for resource in cfg.get("resources", []):
+            if not isinstance(resource, str) or not resource.startswith("file://"):
                 continue
-            raw_pattern = res.removeprefix("file://")
-            base = Path.home()
-            for p in sorted(base.glob(raw_pattern)):
-                if p.suffix == ".md" and steering_target_admissible(p.resolve()):
-                    try:
-                        parts.append(safe_read_file(str(p)))
-                    except PermissionError:
-                        pass
+            raw_pattern = resource.removeprefix("file://")
+            for path in sorted(Path.home().glob(raw_pattern)):
+                resolved = path.resolve()
+                if path.suffix != ".md" or not steering_target_admissible(resolved):
+                    continue
+                try:
+                    parts.append(safe_read_file(str(path)))
+                except PermissionError:
+                    pass
         if parts:
             logger.debug(
-                "loaded %d steering bytes from %d files", sum(len(p) for p in parts), len(parts)
+                "loaded %d steering bytes from %d files",
+                sum(len(part) for part in parts),
+                len(parts),
             )
-        return "\n".join(parts) if parts else ""
+        return "\n".join(parts)
     except Exception as exc:
         logger.debug("steering load failed: %s", type(exc).__name__)
         return ""
+
+
+def _load_steering_resources() -> str:
+    """Compatibility wrapper for the default agent's resources."""
+    return _load_agent_file_resources("kirocrew")
 
 
 # Critical rules reinforced every session (supplements the system prompt).
@@ -3131,10 +3195,32 @@ class ContextBuilder:
         )
 
         try:
-            path = resolve_template_path(agent, project)
+            # Keep the shared candidate seam used by adapter resources: tests and
+            # callers can pin one hardened spec source, and project scope shadows
+            # the global template exactly as backend discovery does.
+            path: Path | None = None
+            data: dict[str, Any] | None = None
+            for candidate in _agent_spec_candidates(agent, project):
+                candidate_data = _read_agent_spec(
+                    candidate,
+                    operation="agent_prompt",
+                    source="context",
+                )
+                if candidate_data is None:
+                    continue
+                if candidate_data.get("name") == agent or candidate.stem == agent:
+                    path = candidate
+                    data = candidate_data
+                    break
             if path is None:
-                return ""
-            data = _read_agent_spec(path, operation="agent_prompt", source="context")
+                # Retain the canonical resolver for member/template aliases that
+                # are not represented by a directly named candidate.
+                path = resolve_template_path(agent, project)
+                if path is None:
+                    return ""
+                data = _read_agent_spec(path, operation="agent_prompt", source="context")
+                if data is None:
+                    return ""
             if data is None:
                 return ""
             prompt = data.get("prompt") or ""
@@ -3347,6 +3433,21 @@ class ContextBuilder:
         template = member_template or template
         if not owner:
             return ""
+        # Same config intersection as build_session_context: this builder is a
+        # second context entry point, so a group the operator disabled must be
+        # withheld here too rather than only on the main path.
+        #
+        # EXCEPT when profile_overrides is supplied. That argument makes this a
+        # VALIDATOR (_validate_private_profile_update), not a context build: the
+        # candidate profile is appended only under the memory-group gate below,
+        # and render_essentials' combined-budget refusal is what rejects a
+        # profile that fits per-file but overflows the combined cap. Scoping the
+        # groups here would drop that gate whenever injection is disabled, so an
+        # oversized profile would save and then break every later member build.
+        # A validation pass must see the complete candidate set regardless of
+        # what the operator currently injects.
+        if profile_overrides is None:
+            context_groups = _config_scoped_groups(context_groups)
         reads = not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY)
         identity = self._build_member_section(owner, strict=True, include_briefing=reads)
         documents = documents_for_member(
@@ -3512,13 +3613,8 @@ class ContextBuilder:
             memory_store = execution_context.store.legacy_name
             blocks_reads = blocks_reads or execution_context.memory_mode == "temporary"
         is_custom = agent and agent != "kirocrew"
-        # The EXACT label, not ``is_claude_code`` (restored 2026-09-21).
-        # ``provider_type`` here is a provider LABEL off the session map;
-        # ``is_claude_code`` answers about the ``agent.provider`` axis, which is
-        # enum=["acp"], so it can only ever return False on this value.
-        is_cc = provider_type == PROVIDER_LABEL_CLAUDE
-        # Skills widen to every spec DIALECT while branding stays claude-only --
-        # see the pair in build_message for why these cannot be one flag.
+        # Resource injection widens to every spec dialect; none reads Kiro agent
+        # resource globs itself. Branding remains Claude-only in ``build_message``.
         is_spec_adapter = is_spec_adapter_provider_label(provider_type or "")
         caps = _resolve_caps(model_window)
         parts: list[str] = []
@@ -3658,6 +3754,19 @@ class ContextBuilder:
         # member capability gate below — one read per context build.
         _cfg = KiroCrewConfig.load()
 
+        # Config-driven injection toggles (memory.inject_memory /
+        # memory.inject_lessons, with memory.persistence_enabled as the global
+        # switch): a group the operator disabled is withheld on EVERY surface —
+        # dashboard, channels, cron, heartbeat, task runner, eval, subagents —
+        # by intersecting here, the one method all context builds pass through,
+        # rather than at the eleven call sites that would each have to remember
+        # to pass ``context_groups``. The caller-passed ``context_groups`` keeps
+        # driving the [CONTEXT SCOPE] block below: its "Your parent withheld"
+        # prose describes subagent narrowing, and a config withholding is the
+        # operator's standing choice, not the parent's per-spawn one, so it is
+        # deliberately silent there.
+        effective_groups = _config_scoped_groups(context_groups, _cfg)
+
         if mode == _member_mode and _member_backend_can_dispatch(_cfg):
             append_required(
                 f"[CREW MEMBER OPERATING MODE]\n"
@@ -3723,7 +3832,7 @@ class ContextBuilder:
         # the sub-agent reads the scope as framing rather than discovering a gap.
         append_required(_build_context_scope_section(context_groups))
 
-        if _group_included(context_groups, CONTEXT_GROUP_LESSONS):
+        if _group_included(effective_groups, CONTEXT_GROUP_LESSONS):
             profile_ctx = _build_user_profile_section(_cfg)
             if profile_ctx:
                 parts.append(profile_ctx)
@@ -3771,11 +3880,10 @@ class ContextBuilder:
         # what kiro-cli already loaded.
         if (
             not essentials
-            and not is_custom
-            and is_cc
+            and is_spec_adapter
             and _group_included(context_groups, CONTEXT_GROUP_PROJECT)
         ):
-            steering_ctx = _load_steering_resources()
+            steering_ctx = _load_agent_file_resources(agent or "kirocrew", project)
             if steering_ctx:
                 append_required(
                     "[Steering resources]\n" + steering_ctx + "\n[End of steering resources]\n\n"
@@ -3903,7 +4011,7 @@ class ContextBuilder:
         memory = None
         member_vectors = None
         if not blocks_reads and any(
-            _group_included(context_groups, group)
+            _group_included(effective_groups, group)
             for group in (CONTEXT_GROUP_MEMORY, CONTEXT_GROUP_LESSONS)
         ):
             if private:
@@ -3920,7 +4028,7 @@ class ContextBuilder:
                     )
             else:
                 memory = self.get_memory_for(workspace, memory_store)
-        if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY):
+        if not blocks_reads and _group_included(effective_groups, CONTEXT_GROUP_MEMORY):
             if private:
                 append_required(
                     "[Memory tools]\n"
@@ -4036,7 +4144,7 @@ class ContextBuilder:
         lessons_renderer: Callable[[int], str] | None = None
         lessons_part_index: int | None = None
         if (memory is not None or member_vectors is not None) and _group_included(
-            context_groups, CONTEXT_GROUP_LESSONS
+            effective_groups, CONTEXT_GROUP_LESSONS
         ):
             # V1 only: the JSONL store answers when the vector store is absent OR not yet
             # populated, and stays silent once it holds lessons.
@@ -4055,11 +4163,13 @@ class ContextBuilder:
 
                 def _render_member_lessons(hard_cap: int) -> str:
                     return member_store.get_lessons_context(
-                        query_text="",
+                        query_text=query_text,
                         cap=caps.lessons,
                         project_dir=project,
                         background=True,
                         hard_cap=hard_cap,
+                        directive_budget=caps.lessons_startup,
+                        experience_budget=caps.lesson_experience,
                     )
 
                 lessons_renderer = _render_member_lessons
@@ -4075,6 +4185,8 @@ class ContextBuilder:
                         project_dir=project,
                         background=True,
                         hard_cap=hard_cap,
+                        directive_budget=caps.lessons_startup,
+                        experience_budget=caps.lesson_experience,
                     )
 
                 lessons_renderer = _render_vector_lessons
@@ -4082,13 +4194,25 @@ class ContextBuilder:
                 lesson_store = self.get_lessons_for(workspace, memory_store)
 
                 def _render_named_jsonl_lessons(hard_cap: int) -> str:
-                    return lesson_store.get_context(project_dir=project, cap=hard_cap)
+                    return lesson_store.get_context(
+                        project_dir=project,
+                        cap=hard_cap,
+                        directive_budget=caps.lessons_startup,
+                        experience_budget=caps.lesson_experience,
+                        query_text=query_text,
+                    )
 
                 lessons_renderer = _render_named_jsonl_lessons
             else:
 
                 def _render_default_jsonl_lessons(hard_cap: int) -> str:
-                    return self.lessons.get_context(project_dir=project, cap=hard_cap)
+                    return self.lessons.get_context(
+                        project_dir=project,
+                        cap=hard_cap,
+                        directive_budget=caps.lessons_startup,
+                        experience_budget=caps.lesson_experience,
+                        query_text=query_text,
+                    )
 
                 lessons_renderer = _render_default_jsonl_lessons
 
@@ -4122,7 +4246,7 @@ class ContextBuilder:
             session_key
             and self.conversation_log
             and not blocks_reads
-            and _group_included(context_groups, CONTEXT_GROUP_MEMORY)
+            and _group_included(effective_groups, CONTEXT_GROUP_MEMORY)
         ):
             provenance = self.conversation_log.recent_with_provenance(
                 session_key, exclude_last_n=exclude_last_n
@@ -4448,7 +4572,14 @@ class ContextBuilder:
             # so the LLM treats it as its identity, not background info.
             if slim_resume:
                 agent_prompt = ""
-            elif is_cc and (not is_custom or not _private_owner):
+            elif is_custom:
+                # A named template owns its prompt on every backend. Checking the
+                # Claude label first silently replaced project/custom prompts with
+                # the product persona on that adapter.
+                agent_prompt = self._load_agent_prompt(
+                    agent or "", project, owner_template=(agent or "") if _private_owner else ""
+                )
+            elif is_cc:
                 # CC gets the SAME KiroCrew persona prompt as kiro — including
                 # the Output Format rules (diff blocks, image embeds, OPTIONS)
                 # which are dashboard UI contracts, not kiro-specific. Only the
@@ -4463,10 +4594,6 @@ class ContextBuilder:
                     agent_prompt = agent_prompt.strip()
                 except Exception:
                     agent_prompt = ""
-            elif is_custom:
-                agent_prompt = self._load_agent_prompt(
-                    agent or "", project, owner_template=(agent or "") if _private_owner else ""
-                )
             else:
 
                 try:
@@ -4636,7 +4763,13 @@ class ContextBuilder:
         # mapping excludes and an unmapped custom agent cannot receive a block
         # its session-start context never contained.
         if not is_new_session and needs_reinjection:
-            if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY):
+            # The stored-memory half routes through the same config intersection
+            # as the session-start build: this path restores a block that build
+            # withheld, so reading the caller scope alone would hand back the
+            # activity index the operator's inject_memory setting excluded.
+            if not blocks_reads and _group_included(
+                _config_scoped_groups(context_groups), CONTEXT_GROUP_MEMORY
+            ):
                 memory = self.get_memory_for(workspace, memory_store)
                 parts.append(_neutralize_structural_markers(memory.activity_index()))
                 parts.append(
@@ -4956,11 +5089,11 @@ class ContextBuilder:
             # reaches `build_message` only through `run_in_embed_pool`, so the
             # loop captured at construction runs only the `decide` await.
             def select() -> list[str] | None:
-                from kiro_crew.decisions.points.skills_select import (
+                from kiro_crew.decisions.points import (
                     HISTORY_ROLES,
                     MAX_HISTORY_MESSAGES,
-                    selected_skills,
                 )
+                from kiro_crew.decisions.points.skills_select import selected_skills
 
                 def prior_turns() -> list[dict]:
                     # The cheapest prior-turn source this method can reach: a

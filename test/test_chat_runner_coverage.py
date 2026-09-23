@@ -58,9 +58,10 @@ from kiro_crew.trust_patterns import canonical_non_shell_trust_key, exact_trust_
 
 def _slot(key: str = "chat-cov-1") -> _ChatSlot:
     slot = _ChatSlot(key)
-    # Titled on purpose: an untitled slot makes the end-of-turn cycle spawn
-    # _maybe_auto_title, which is a real LLM path. maybe_refresh_title (the
-    # titled branch) self-guards and returns without a call.
+    # Titled on purpose: the end-of-turn cycle routes titling through
+    # title_then_refresh, and a titled slot makes both halves self-guard
+    # (_maybe_auto_title no-ops, maybe_refresh_title returns not-due) without
+    # a real LLM call.
     slot._titled = True
     return slot
 
@@ -79,6 +80,10 @@ def _state(tmp_path, **kwargs) -> DashboardState:
     # truthy, so every busy-probe would read "turn in flight" on an idle state.
     sessions.get_provider = MagicMock(return_value=None)
     sessions.resumable_sid = MagicMock(return_value=None)
+    # Production answers a plain string, "" when the allocation selected nothing.
+    # Left as a bare MagicMock it would answer a truthy object, which the runner
+    # would store as the slot's requested model and hand to the crew-log emitter.
+    sessions.allocation_requested_model = MagicMock(return_value="")
     sessions.remove = AsyncMock()
     sessions.record_failure = AsyncMock()
     sessions.remove_if_unclaimed = AsyncMock(return_value=False)
@@ -1139,13 +1144,13 @@ class TestMarkKiroSignedOut:
         chat_runner._mark_kiro_signed_out(state)
 
 
-class TestDeliverAuthErrorToSlack:
+class TestDeliverLinkedSlackMessage:
     @pytest.mark.asyncio
     async def test_no_slack_client_is_a_noop(self, tmp_path):
         state = _state(tmp_path)
         state.slack_client = None
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, _slot(), state.sessions, "dashboard:x", "signed out"
         )
 
@@ -1154,7 +1159,7 @@ class TestDeliverAuthErrorToSlack:
         state = _state(tmp_path)
         state.slack_client = AsyncMock()
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, _slot(), state.sessions, "dashboard:x", "signed out"
         )
 
@@ -1166,7 +1171,7 @@ class TestDeliverAuthErrorToSlack:
         state.slack_client = AsyncMock()
         state.sessions.get_slack_link = MagicMock(return_value=("111.222", "C123"))
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, _slot(), state.sessions, "dashboard:x", "signed out"
         )
 
@@ -1181,7 +1186,7 @@ class TestDeliverAuthErrorToSlack:
         slot._slack_thread_ts = "1.2"
         slot._slack_channel = "C1"
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, slot, state.sessions, "dashboard:x", "signed out"
         )
 
@@ -2584,6 +2589,99 @@ class TestStartNextQueuedTurn:
         assert len(slot._queue) == 1
 
     @pytest.mark.asyncio
+    async def test_run_now_bypasses_the_child_hold_for_the_selected_message(self, tmp_path):
+        """The explicit card action runs one selected user message beside child work."""
+        state, slot = _state(tmp_path), _slot()
+        q1 = slot.queue_append("first")
+        q2 = slot.queue_append("second")
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load") as load,
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(
+                chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())
+            ) as run_chat,
+        ):
+            load.return_value.dashboard.merge_queued_messages = False
+            started = await chat_runner._start_next_queued_turn(
+                state,
+                slot,
+                allow_user_during_subagents=True,
+                required_queue_id=q2,
+            )
+
+        assert started is True
+        assert spawn.call_count == 1
+        assert run_chat.call_args.args[2] == "second"
+        assert [item["id"] for item in slot._queue] == [q1]
+
+    @pytest.mark.asyncio
+    async def test_run_now_never_merges_unselected_cards(self, tmp_path):
+        """The selected card runs alone even when ordinary queue merging is on."""
+        state, slot = _state(tmp_path), _slot()
+        q1 = slot.queue_append("first")
+        q2 = slot.queue_append("selected")
+        q3 = slot.queue_append("third")
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load") as load,
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(
+                chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())
+            ) as run_chat,
+        ):
+            load.return_value.dashboard.merge_queued_messages = True
+            started = await chat_runner._start_next_queued_turn(
+                state,
+                slot,
+                allow_user_during_subagents=True,
+                required_queue_id=q2,
+            )
+
+        assert started is True
+        assert spawn.call_count == 1
+        assert run_chat.call_args.args[2] == "selected"
+        assert [item["id"] for item in slot._queue] == [q1, q3]
+
+    @pytest.mark.asyncio
+    async def test_run_now_starts_nothing_when_the_selected_card_is_gone(self, tmp_path):
+        """Selection identity prevents a stale click from starting another card."""
+        state, slot = _state(tmp_path), _slot()
+        qid = slot.queue_append("another card")
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        started = await chat_runner._start_next_queued_turn(
+            state,
+            slot,
+            allow_user_during_subagents=True,
+            required_queue_id="missing",
+        )
+
+        assert started is False
+        assert [item["id"] for item in slot._queue] == [qid]
+
+    @pytest.mark.asyncio
+    async def test_run_now_does_not_bypass_an_active_stage(self, tmp_path):
+        """The override is narrow: an orchestrator stage still owns dispatch."""
+        state, slot = _state(tmp_path), _slot()
+        q1 = slot.queue_append("stage-owned first")
+        q2 = slot.queue_append("wait for the stage")
+        slot._in_stage_execution = True
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        started = await chat_runner._start_next_queued_turn(
+            state,
+            slot,
+            allow_user_during_subagents=True,
+            required_queue_id=q2,
+        )
+
+        assert started is False
+        assert [item["id"] for item in slot._queue] == [q1, q2]
+
+    @pytest.mark.asyncio
     async def test_reset_notice_is_emitted_for_a_stopping_slot(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
         slot.queue_append("next please")
@@ -2921,7 +3019,7 @@ class TestFinishQueueCycle:
 
         with (
             patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush,
-            patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()),
+            patch.object(chat_runner, "title_then_refresh", new=AsyncMock()),
         ):
             await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
@@ -2932,7 +3030,7 @@ class TestFinishQueueCycle:
     async def test_idle_cycle_emits_done_and_refreshes_the_sidebar(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
-        with patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()):
+        with patch.object(chat_runner, "title_then_refresh", new=AsyncMock()):
             await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
