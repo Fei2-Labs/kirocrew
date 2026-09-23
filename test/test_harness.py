@@ -41,6 +41,7 @@ from kiro_crew.testing.harness import (
     _resolve_workspace_src,
     _terminate_process_group,
     _wait_for_ready_line,
+    harness_environment,
     parse_ready_line,
     spawn_feature_gateway,
     terminate_pgid,
@@ -55,6 +56,24 @@ _POSIX_ONLY = pytest.mark.skipif(
     platform_compat.IS_WINDOWS,
     reason="POSIX process-group semantics (setsid/killpg, -SIGKILL return codes)",
 )
+
+
+def _end_descendant_pinned(pid: int, token: str) -> None:
+    """Teardown for a raw descendant pid: SIGKILL it only while it is still ours.
+
+    The tests below publish a grandchild's pid through a pipe and hold nothing
+    else on it -- no ``Popen``, so nothing keeps the number as a zombie once it
+    exits. After the body has proven that pid dead the kernel is free to hand the
+    number to any other process, so a bare ``os.kill(pid, SIGKILL)`` in a
+    ``finally`` would go out on every PASSING run at whatever now holds it. The
+    start-time token captured at spawn is the identity: it reads ``None`` once the
+    process is gone and never matches a different process, so a mismatch means
+    there is nothing of ours left to signal.
+    """
+    if platform_compat.process_start_time(pid) != token:
+        return
+    with contextlib.suppress(OSError):
+        platform_compat.kill_pid_pinned(pid, token, platform_compat.SIGKILL)
 
 
 class FakePopen:
@@ -315,14 +334,15 @@ def test_terminate_ends_a_descendant_that_left_the_process_group() -> None:
     )
     assert proc.stdout is not None
     escaped_pid = int(proc.stdout.readline().strip())
+    escaped_token = platform_compat.process_start_time(escaped_pid)
+    assert escaped_token is not None
     assert os.getpgid(escaped_pid) != proc.pid, "the child must be outside the group"
     try:
         assert _terminate_process_group(proc) is True
         assert proc.poll() is not None
         assert not platform_compat.pid_exists(escaped_pid), "the escaped child outlived teardown"
     finally:
-        with contextlib.suppress(OSError):
-            os.kill(escaped_pid, signal.SIGKILL)
+        _end_descendant_pinned(escaped_pid, escaped_token)
         with contextlib.suppress(OSError):
             proc.kill()
         proc.wait(timeout=10)
@@ -950,10 +970,12 @@ def test_spawn_feature_gateway_explicit_host_inputs_are_child_scoped(
     assert env["KIROCREW_KIRO_BIN"] == str(binary)
     assert env["KIROCREW_HOME"] == str(data_home)
     assert env["KIRO_HOME"] == str(data_home / "kiro")
-    assert captured["cwd"] == str(_resolve_workspace_src().parent)
+    assert Path(captured["cwd"]) == data_home.parent
     assert preflight["env"]["KIRO_HOME"] == str(data_home / "kiro")
     assert preflight["env"]["KIROCREW_KIRO_BIN"] == str(binary)
-    assert preflight["cwd"] == _resolve_workspace_src().parent
+    assert preflight["cwd"] == data_home.parent
+    assert Path(captured["cwd"]) == preflight["cwd"]
+    assert Path(captured["cwd"]) != _resolve_workspace_src().parent
     assert env["PATH"] == preflight["env"]["PATH"]
     assert os.environ["PATH"] == parent_path
 
@@ -1335,8 +1357,7 @@ def test_dead_root_ends_saved_in_group_child() -> None:
         assert _terminate_process_group(proc, {child_pid: token}) is False
         assert not platform_compat.pid_exists(child_pid), "the saved child outlived teardown"
     finally:
-        with contextlib.suppress(OSError):
-            os.kill(child_pid, signal.SIGKILL)
+        _end_descendant_pinned(child_pid, token)
         with contextlib.suppress(OSError):
             proc.kill()
         proc.wait(timeout=10)
@@ -1380,14 +1401,15 @@ def test_terminate_preserves_home_after_root_exits() -> None:
         assert _terminate_process_group(proc, {escaped_pid: token}) is False
         assert not platform_compat.pid_exists(escaped_pid), "the saved child outlived teardown"
     finally:
-        with contextlib.suppress(OSError):
-            os.kill(escaped_pid, signal.SIGKILL)
+        _end_descendant_pinned(escaped_pid, token)
         with contextlib.suppress(OSError):
             proc.kill()
         proc.wait(timeout=10)
 
 
-def test_preflight_runs_after_seed_and_preserves_its_files(tmp_path, monkeypatch):
+def test_preflight_runs_after_seed_and_preserves_its_files(
+    tmp_path, monkeypatch, nonbundled_python_with_user_site
+):
     """A native whoami/config preflight may legitimately populate private state."""
     from kiro_crew.seed import seed
 
@@ -1395,8 +1417,10 @@ def test_preflight_runs_after_seed_and_preserves_its_files(tmp_path, monkeypatch
     proc = _make_fake_proc_with_ready('{"port": 51234, "token": "synthetic"}')
 
     def seed_child(argv, **kwargs):
+        assert argv[1:3] == ["-s", "-c"]
         assert argv[-1] == "minimal"
-        assert "replace" not in argv[2]
+        seed_source = argv[argv.index("-c") + 1]
+        assert "replace" not in seed_source
         home = Path(kwargs["env"]["KIROCREW_HOME"])
         assert not any(home.iterdir())
         with monkeypatch.context() as child:
@@ -1445,3 +1469,146 @@ def test_failed_preflight_seed_never_calls_preflight_or_gateway():
             pytest.fail("failed seed reached gateway")
     assert called == []
     popen.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["command", "argv", "args", "executable"])
+def test_gateway_launcher_rejects_command_input(tmp_path, monkeypatch, field):
+    from kiro_crew.testing import harness
+
+    with patch.object(harness.subprocess, "Popen") as spawn:
+        with pytest.raises(TypeError, match="unexpected keyword"):
+            harness._launch_gateway(
+                tmp_path,
+                {},
+                fixture=None,
+                approval="reads",
+                crons=False,
+                **{field: "request-supplied-command"},
+            )
+        spawn.assert_not_called()
+
+
+def test_gateway_launcher_fixed_command_and_restart_seed(
+    tmp_path, nonbundled_python_with_user_site
+):
+    from kiro_crew.testing import harness
+
+    env = {"KIROCREW_HOME": str(tmp_path)}
+    with patch.object(harness.subprocess, "Popen") as spawn:
+        for fixture in ("minimal", None):
+            harness._launch_gateway(tmp_path, env, fixture=fixture, approval="reads", crons=False)
+            cmd = spawn.call_args.args[0]
+            expected = [
+                sys.executable,
+                "-s",
+                "-m",
+                "kiro_crew",
+                "gateway",
+                "--test-mode",
+            ]
+            if fixture is not None:
+                expected += ["--seed", fixture]
+            assert cmd == expected + ["--approval", "reads", "--no-crons"]
+            assert spawn.call_args.kwargs["cwd"] == tmp_path.parent
+            assert spawn.call_args.kwargs["env"] is env
+            assert spawn.call_args.kwargs["start_new_session"] == platform_compat.IS_POSIX
+            assert (
+                spawn.call_args.kwargs["creationflags"] == platform_compat.CREATE_NEW_PROCESS_GROUP
+            )
+
+
+# --------------------------------------------------------------------------- #
+# harness_environment: the one download switch, and the pins that never move.
+# --------------------------------------------------------------------------- #
+
+
+def test_harness_environment_skips_the_model_download_by_default(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("KIROCREW_SKIP_MODEL_DOWNLOAD", raising=False)
+    env = harness_environment(tmp_path, tmp_path / "src")
+    assert env["KIROCREW_SKIP_MODEL_DOWNLOAD"] == "1"
+    assert env["KIROCREW_HOME"] == str(tmp_path)
+    assert env["KIRO_HOME"] == str(tmp_path / "kiro")
+    assert env["PYTHONUNBUFFERED"] == "1"
+
+
+def test_harness_environment_can_arm_the_download_path_for_one_gateway(
+    tmp_path, monkeypatch
+) -> None:
+    # An inherited skip must not quietly re-arm itself: the evidence driver that
+    # asks for the production download path is the only caller of False.
+    monkeypatch.setenv("KIROCREW_SKIP_MODEL_DOWNLOAD", "1")
+    monkeypatch.setenv("KIROCREW_EMBED_MODEL_URL", "https://127.0.0.1:9/never-served.gguf")
+    env = harness_environment(tmp_path, tmp_path / "src", skip_model_download=False)
+    assert "KIROCREW_SKIP_MODEL_DOWNLOAD" not in env
+    # Supported production knobs exported by the test process reach the gateway.
+    assert env["KIROCREW_EMBED_MODEL_URL"] == "https://127.0.0.1:9/never-served.gguf"
+    # The isolation the harness exists for is not negotiable through the switch.
+    assert env["KIROCREW_HOME"] == str(tmp_path)
+    assert env["KIRO_HOME"] == str(tmp_path / "kiro")
+
+
+def test_harness_environment_pins_home_over_an_inherited_one(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("KIROCREW_HOME", "/operator/real/home")
+    monkeypatch.setenv("KIRO_HOME", "/operator/real/kiro")
+    for skip in (True, False):
+        env = harness_environment(tmp_path, tmp_path / "src", skip_model_download=skip)
+        assert env["KIROCREW_HOME"] == str(tmp_path)
+        assert env["KIRO_HOME"] == str(tmp_path / "kiro")
+
+
+def test_restart_without_a_supervisor_is_refused_with_the_download_switch() -> None:
+    handle = GatewayHandle(url="http://localhost:1/?token=t", port=1, token="t", home=Path("."), proc=FakePopen([]))  # type: ignore[arg-type]
+    with pytest.raises(GatewaySpawnError):
+        handle.restart(skip_model_download=False)
+
+
+def test_restart_changes_only_download_switch_and_keeps_environment(monkeypatch):
+    monkeypatch.setenv("KIROCREW_EMBED_MODEL_URL", "https://127.0.0.1:9/original.gguf")
+    launches = []
+
+    def fake_launch(_home, env, **_kwargs):
+        launches.append(dict(env))
+        return _make_fake_proc_with_ready(
+            '{"port": 51234, "token": "fixture-token", "pid": 9876, "home": "/fixture"}'
+        )
+
+    with (
+        patch("kiro_crew.testing.harness._launch_gateway", side_effect=fake_launch),
+        patch("kiro_crew.testing.harness._terminate_process_group", return_value=True),
+        patch("kiro_crew.testing.harness.platform_compat.process_descendants", return_value=[]),
+    ):
+        with spawn_feature_gateway(fixture="empty") as handle:
+            monkeypatch.setenv("KIROCREW_EMBED_MODEL_URL", "https://127.0.0.1:9/changed.gguf")
+            handle = handle.restart(skip_model_download=False)
+            handle = handle.restart()
+            handle.restart(skip_model_download=True)
+    assert [env.get("KIROCREW_SKIP_MODEL_DOWNLOAD") for env in launches] == ["1", None, None, "1"]
+    snapshots = [
+        {k: v for k, v in env.items() if k != "KIROCREW_SKIP_MODEL_DOWNLOAD"} for env in launches
+    ]
+    assert all(env == snapshots[0] for env in snapshots)
+
+
+def test_restart_tracks_each_tree_teardown_and_keeps_scratch_cwd():
+    from kiro_crew.testing import harness
+
+    launches = []
+
+    def fake_popen(cmd, **kwargs):
+        launches.append(kwargs)
+        return _make_fake_proc_with_ready('{"port": 51234, "token": "fixture-token"}')
+
+    with (
+        patch.object(harness.subprocess, "Popen", side_effect=fake_popen),
+        patch.object(harness, "_terminate_process_group", return_value=True),
+        patch.object(harness.platform_compat, "process_descendants", return_value=[]),
+    ):
+        with spawn_feature_gateway(fixture="empty") as first:
+            second = first.restart()
+            assert first.teardown_confirmed
+            assert not second.teardown_confirmed
+            assert first.home == second.home
+            assert all(Path(call["cwd"]) == first.home.parent for call in launches)
+            assert all(Path(call["cwd"]) != _resolve_workspace_src().parent for call in launches)
+        assert second.teardown_confirmed
+    assert not first.home.exists()

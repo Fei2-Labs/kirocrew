@@ -185,6 +185,10 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         # rebind would be un-erasable and the session would keep consolidating
         # into the silo it left.
         "memory_store",
+        # The namespace the agent was picked in. Slot-owned for the same reason
+        # as memory_store: a name-only pick after a template pick writes no key,
+        # and an unowned key would carry the stale "template" forward forever.
+        "agent_kind",
         "project",
         # Remote-execution binding: owned by the slot, so clearing it in memory
         # clears it on disk. Left unowned, a rebind or an unbind would be undone
@@ -206,6 +210,11 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         # CLEARED by absence once the flush delivers them — carried forward
         # instead, a restart would re-deliver a note the user already saw.
         "deferred_notes",
+        # Durable copy of the queued user prompts. Owned, not monotonic: the
+        # value is written while prompts wait and must be CLEARED by absence
+        # once the drain consumes them — carried forward instead, a restart
+        # would hand back a prompt whose turn already ran.
+        "queued_prompts",
         "pinned",
         "color_index",
         "color_hex",
@@ -264,7 +273,10 @@ ROWS_ONLY_OWNED_META_KEYS: frozenset[str] = frozenset({"_type", "created_at", "l
 # and its background-refresh budget: read back beside another slot's title they
 # either unlock the refresh on a name a user typed by hand or lock a generated name
 # out of refresh permanently. They travel WITH the title, so they are deferred with
-# it.
+# it. ``title_low_signal`` is the same shape — the early-refresh eligibility of
+# THIS slot's title — so a popped slot's stale flag carried over a live
+# replacement's would wrongly suppress or re-arm the replacement's turn-one
+# refresh after restart. It defers with the title too.
 #
 # ``created_by`` and ``origin`` are the same shape and the highest-consequence
 # instance of it, because what they describe is AUTHORIZATION rather than
@@ -287,7 +299,7 @@ ROWS_ONLY_OWNED_META_KEYS: frozenset[str] = frozenset({"_type", "created_at", "l
 # disagree about them in a way that outlives the pair.
 ROWS_ONLY_DEFERRED_META_KEYS: frozenset[str] = (
     SLOT_OWNED_META_KEYS - ROWS_ONLY_OWNED_META_KEYS
-) | frozenset({"title_origin", "title_refresh_mark", "created_by", "origin"})
+) | frozenset({"title_origin", "title_refresh_mark", "title_low_signal", "created_by", "origin"})
 
 
 def carry_unowned_metadata(
@@ -929,6 +941,13 @@ def _cleanup_old_archives(retention_days: int | None = None, base: Path | None =
     When *retention_days* is None, the value is resolved from config
     (``session.archive_retention_days``).  A negative value disables cleanup
     entirely — the user manages archive deletion manually.
+
+    The same pass expires closed SESSION CREW LOGS, on the same setting and inside
+    the same throttle (:func:`kiro_crew.crew_log.store.sweep_expired`). One switch
+    governs both because a session's message bodies live in its crew log now: a
+    build that expired the transcript archive while the crew log it points into grew
+    forever would keep the larger half of the same history indefinitely, and a
+    second setting for it would be a second thing to find and turn off.
     """
     global _last_cleanup
 
@@ -953,20 +972,53 @@ def _cleanup_old_archives(retention_days: int | None = None, base: Path | None =
     if retention_days < 0:
         return 0  # cleanup disabled
     adir = _archive_dir(base)
-    if not adir.exists():
-        return 0
     cutoff = now - retention_days * 86400
     removed = 0
-    for p in adir.glob("*.jsonl"):
-        try:
-            if p.stat().st_mtime < cutoff:
-                p.unlink()
-                removed += 1
-        except OSError:
-            pass
+    # An absent archive directory is not a reason to skip the crew log half: a
+    # session can hold a crew log long before anything of its transcript is
+    # archived, so returning here would leave that half uncollected until the
+    # first archive ever written.
+    if adir.exists():
+        for p in adir.glob("*.jsonl"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
     if removed:
         logger.info("Cleaned %d expired archive files (>%dd)", removed, retention_days)
+    _cleanup_expired_crew_logs(retention_days, now)
     return removed
+
+
+def _cleanup_expired_crew_logs(retention_days: int, now: float) -> None:
+    """Expire closed the sessions' logs, best-effort, never at the transcript's cost.
+
+    Off the event loop, which is what makes the added filesystem work safe rather
+    than merely cheap: the only caller is ``_cleanup_old_archives``, reached from
+    ``_archive_lines`` on the rotation path, and that path runs in the dashboard's
+    flush executor thread (see ``chat_persistence``, which documents
+    ``_save_slot_to_history`` running there) or on the shutdown save. The sweep
+    reads a header and a bounded tail per closed unit, inside the hourly throttle
+    the archive cleanup already has, so the cost is once an hour in a worker rather
+    than per delete on the loop.
+
+    Imported lazily and swallowed on failure for one reason each. Lazily because
+    this module is imported on every startup while the crew log store is only
+    reachable behind ``KIROCREW_CREW_LOG``, and a launch without the flag
+    should not pay for the import. Swallowed because the caller is on the
+    transcript ARCHIVE path: a crew log tree that cannot be swept is a disk-space
+    problem, and letting it raise here would turn that into a failure to archive
+    the transcript, which loses history rather than retaining too much of it. The
+    sweep logs its own counts.
+    """
+    try:
+        from kiro_crew.crew_log.store import sweep_expired
+
+        sweep_expired(retention_days, now=now)
+    except Exception:
+        logger.debug("The session's log retention sweep failed", exc_info=True)
 
 
 def transcript_sort_key(ts: str) -> tuple[int, float]:
@@ -1776,6 +1828,47 @@ class ConversationLog:
     def has_log(self, key: str) -> bool:
         """Return True if a conversation log file exists for *key*."""
         return self._path(key).exists()
+
+    def has_messages(self, key: str) -> bool:
+        """Return True if *key*'s transcript holds at least one message row.
+
+        A transcript file is created by the first METADATA write -- a title,
+        an agent pick, a model pick -- long before any message is exchanged,
+        so :meth:`has_log` answers "does a file exist", not "was anything
+        said". Callers deciding whether a conversation already carries
+        context before selecting a member need the second question:
+        a metadata-only file is an empty conversation.
+
+        An absent file is empty, but a file that exists and cannot be
+        read raises ``OSError`` rather than reading as empty, and a record that
+        cannot be delivered intact or is not valid JSON counts as content --
+        unverifiable history is still history. The forgiving tail readers are
+        not used here for that reason.
+        """
+        from kiro_crew.jsonl_util import UnreadableRecord, strict_records
+
+        path = self._path(key)
+        with self._locked(key):
+            try:
+                handle = open(path, "rb")
+            except FileNotFoundError:
+                return False
+            with handle:
+                try:
+                    for record in strict_records(handle, path):
+                        line = record.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except ValueError:
+                            return True
+                        if isinstance(data, dict) and data.get("_type") == "metadata":
+                            continue
+                        return True
+                except UnreadableRecord:
+                    return True
+        return False
 
     def session_mtime(self, key: str) -> float | None:
         """Return the session file's mtime, or None if it can't be stat'd.
@@ -2824,7 +2917,7 @@ class ConversationLog:
         require_memory_consolidation_session_key(key, expected_store)
         binding = read_private_session_store(key)
         if binding is not None and binding != expected_store:
-            raise ValueError("The transient session belongs to another private store")
+            raise ValueError("The transient session belongs to another memory store")
         path = self._path(key)
         existed = path.exists()
         deleted = self.delete_session(key)
@@ -2855,8 +2948,12 @@ class ConversationLog:
         key: str,
         fields: dict,
         guard: Callable[[dict], bool],
+        *,
+        require_existing: bool = False,
     ) -> bool:
-        return self._metadata_projection.update_metadata_if(key, fields, guard)
+        return self._metadata_projection.update_metadata_if(
+            key, fields, guard, require_existing=require_existing
+        )
 
     def _update_metadata_locked(self, key: str, fields: dict) -> None:
         self._metadata_projection._update_metadata_locked(key, fields)
@@ -2987,7 +3084,7 @@ class ConversationLog:
     def last_message_preview(self, key: str, sanitize=None) -> str:
         return self._read_projection.last_message_preview(key, sanitize=sanitize)
 
-    def last_message_info(self, key: str, sanitize=None) -> tuple[str, float]:
+    def last_message_info(self, key: str, sanitize=None) -> tuple[str, float, bool]:
         return self._read_projection.last_message_info(key, sanitize=sanitize)
 
     @staticmethod

@@ -19,6 +19,7 @@ from kiro_crew.artifacts import (
     ArtifactStore,
     ArtifactValidationError,
     _infer_kind,
+    _validate_slug,
     detect_editor_kind,
     has_unthemed_hardcoded_colors,
     slugify,
@@ -96,10 +97,21 @@ class TestSlugify:
     def test_collapses_punctuation(self) -> None:
         assert slugify("hello! world?? foo!! bar") == "hello-world-foo-bar"
 
-    def test_empty_falls_back(self) -> None:
-        assert slugify("") == "artifact"
-        assert slugify("!!!") == "artifact"
-        assert slugify("---") == "artifact"
+    def test_empty_falls_back_to_distinct_hash_slugs(self) -> None:
+        # No surviving slug-safe characters: fall back to artifact-<hash> so
+        # distinct inputs derive distinct slugs.
+        for name in ("", "!!!", "---"):
+            out = slugify(name)
+            assert out.startswith("artifact-")
+            assert _validate_slug(out) == out
+        assert slugify("!!!") != slugify("---")
+
+    def test_non_ascii_names_derive_distinct_stable_slugs(self) -> None:
+        chinese = slugify("\u4f1a\u8bae\u7eaa\u8981")
+        japanese = slugify("\u8cb7\u3044\u7269\u30ea\u30b9\u30c8")
+        assert chinese != japanese
+        assert chinese == slugify("\u4f1a\u8bae\u7eaa\u8981")
+        assert _validate_slug(chinese) == chinese
 
     def test_truncates_long_input(self) -> None:
         long = "a" * 300
@@ -196,6 +208,12 @@ class TestCreateValidation:
     def test_invalid_tag_format(self, store: ArtifactStore) -> None:
         with pytest.raises(ArtifactValidationError):
             store.create(name="x", content="a", tags=["bad tag with spaces"])
+
+    @pytest.mark.parametrize("tag", ["cr\n", "a" * 64 + "\n"])
+    def test_trailing_newline_tag_is_rejected(self, store: ArtifactStore, tag: str) -> None:
+        """A raw HTTP/store tag cannot use ``$``'s before-newline match."""
+        with pytest.raises(ArtifactValidationError):
+            store.create(name="x", content="a", tags=[tag])
 
     def test_dedupes_tags(self, store: ArtifactStore) -> None:
         art = store.create(name="x", content="a", tags=["a", "b", "a"])
@@ -298,12 +316,46 @@ class TestList:
     def test_empty(self, store: ArtifactStore) -> None:
         assert store.list() == []
 
-    def test_returns_newest_first(self, store: ArtifactStore) -> None:
+    def test_returns_newest_first(self, store: ArtifactStore, monkeypatch) -> None:
+        from kiro_crew import artifacts
+
+        # All timestamp reads within a write share its explicit instant.
+        now = "2026-01-01T00:00:00.000001+00:00"
+        monkeypatch.setattr(artifacts, "_now_iso", lambda: now)
         store.create(name="alpha", content="a")
+        now = "2026-01-01T00:00:00.000002+00:00"
         store.create(name="bravo", content="b")
+        now = "2026-01-01T00:00:00.000003+00:00"
         store.create(name="charlie", content="c")
         items = store.list()
         assert [a.slug for a in items] == ["charlie", "bravo", "alpha"]
+
+        now = "2026-01-01T00:00:00.000004+00:00"
+        store.update("alpha", content="updated oldest artifact")
+        assert [a.slug for a in store.list()] == ["alpha", "charlie", "bravo"]
+
+    def test_a_timestamp_tie_still_has_one_defined_order(
+        self, store: ArtifactStore, monkeypatch
+    ) -> None:
+        """Equal ``updated_at`` must not leave the order to the filesystem.
+
+        ``_now_iso`` is microsecond ISO, so two artifacts written inside one
+        microsecond carry the identical stamp. Sorting on ``updated_at`` alone is a
+        stable sort over equal keys, which preserves directory scan order and makes
+        "newest first" answer differently per platform and per filesystem -- Windows
+        CI failed ``test_artifacts_handlers.TestList.test_returns_items`` on exactly
+        that. The ``slug`` tie-break is what makes the answer total.
+        """
+        from kiro_crew import artifacts
+
+        monkeypatch.setattr(
+            artifacts, "_now_iso", lambda: "2026-01-01T00:00:00.000001+00:00"
+        )
+        # Created out of slug order, so passing cannot be an accident of insertion.
+        for name in ("bravo", "alpha", "charlie"):
+            store.create(name=name, content=name)
+
+        assert [a.slug for a in store.list()] == ["charlie", "bravo", "alpha"]
 
     def test_filter_by_tag(self, store: ArtifactStore) -> None:
         store.create(name="a", content="a", tags=["x"])
@@ -538,7 +590,10 @@ class TestSecurity:
         self, store: ArtifactStore, monkeypatch
     ) -> None:
         # _snapshot_version() reads through self._read_text(), not src.read_text()
-        # directly, so the is_sensitive_path() gate always applies.
+        # directly, so the sensitive-path gate always applies. The helper hands
+        # the gate the realpath it already computed through
+        # is_sensitive_canonical_path; that is the name to patch, since the
+        # bounded is_sensitive_path is not on this read path.
         # If the gate ever started flagging artifact-internal paths (e.g. a
         # symlink expansion landing on a sensitive path), the snapshot read
         # must refuse rather than silently leak. Verify the gated helper is
@@ -546,20 +601,20 @@ class TestSecurity:
         from kiro_crew import artifacts as art_mod
 
         store.create(name="x", content="v1")
-        # First update succeeds — is_sensitive_path() returns False normally.
+        # First update succeeds: the gate returns False normally.
         store.update("x", content="v2", snapshot=True)
 
-        # Now make is_sensitive_path() return True for current.html only.
+        # Now make the gate return True for current.html only.
         # _snapshot_version reads from current.html via self._read_text() now;
         # that read must surface ArtifactError.
-        original = art_mod.is_sensitive_path
+        original = art_mod.is_sensitive_canonical_path
 
         def _selective(p: str) -> bool:
             if "current.html" in p:
                 return True
             return original(p)
 
-        monkeypatch.setattr(art_mod, "is_sensitive_path", _selective)
+        monkeypatch.setattr(art_mod, "is_sensitive_canonical_path", _selective)
         with pytest.raises(ArtifactError):
             store.update("x", content="v3", snapshot=True)
 
@@ -1941,6 +1996,10 @@ class TestSourceRootBarrier:
         monkeypatch.undo()
         assert src.read_text(encoding="utf-8") == "ORIGINAL"
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="os.link needs elevated privileges on Windows to make the second name",
+    )
     def test_rejected_writes_do_not_leak_descriptors(
         self, home_store, project_file
     ) -> None:
@@ -1950,27 +2009,56 @@ class TestSourceRootBarrier:
         through it), so it cannot be closed in a blanket ``finally``. That made
         each rejected update leak one descriptor, which would eventually exhaust
         the gateway's limit.
+
+        The subject therefore has to be a path the write gate refuses AFTER that
+        open: a second hardlink on the file, which ``_pinned_replace``'s
+        ``fstat`` check rejects (``st_nlink > 1``). A path OUTSIDE the approved
+        root -- what this test drove before -- never gets that far:
+        ``allowed_source_roots`` refuses it in ``_try_write_source_path`` itself,
+        so no descriptor is opened and the leak this test names could not have
+        been observed either way.
+
+        Pairing is read off the descriptors the writer itself opened and closed,
+        never a ``/proc/<pid>/fd`` census: this worker's other threads (executor
+        pools, the SEL writer) open and close descriptors of their own, so a
+        census moves for reasons that have nothing to do with this write.
         """
         import os as _os
 
         proj, src = project_file
-        # A path outside the approved root is rejected during validation.
-        outside = proj.parent / "outside.md"
-        outside.write_text("x", encoding="utf-8")
+        target = str(src.resolve())
+        # A second name on the same inode makes st_nlink == 2, which the pinned
+        # writer refuses -- but only once it already holds the descriptor.
+        _os.link(target, str(src.with_name("second-name.md")))
 
-        def open_fds() -> int:
-            try:
-                return len(_os.listdir(f"/proc/{_os.getpid()}/fd"))
-            except OSError:  # pragma: no cover -- non-Linux
-                pytest.skip("no /proc to count descriptors")
+        opened: list[int] = []
+        closed: list[int] = []
+        real_open, real_close = _os.open, _os.close
 
-        before = open_fds()
-        for _ in range(40):
-            assert (
-                home_store._try_write_source_path(str(outside), "nope", str(proj)) is False
-            )
-        # A leak would add ~40 descriptors; allow a little slack for unrelated I/O.
-        assert open_fds() - before < 10
+        def tracking_open(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
+            if str(path) == target:
+                opened.append(fd)
+            return fd
+
+        def tracking_close(fd: int, /) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        # Wrapped, never stubbed -- the real syscalls still run, so what the
+        # assertions below see is the writer's own cleanup. Scoped to a context
+        # rather than the shared ``monkeypatch``, whose ``undo()`` would also
+        # unpin the fake ``Path.home`` the ``home_store`` fixture installed.
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(_os, "open", tracking_open)
+            patched.setattr(_os, "close", tracking_close)
+            for _ in range(5):
+                assert home_store._try_write_source_path(target, "nope", str(proj)) is False
+
+        assert len(opened) == 5, "the refusal never reached the descriptor-pinned open"
+        leaked = [fd for fd in opened if fd not in closed]
+        assert leaked == [], f"a rejected update leaked its descriptor: {leaked}"
+        assert src.read_text(encoding="utf-8") == "# live from the project"
 
     def test_write_refuses_when_an_acl_attribute_cannot_be_carried(
         self, home_store, project_file, monkeypatch

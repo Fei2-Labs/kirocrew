@@ -33,8 +33,6 @@ from kiro_crew.dashboard.handlers.kas_login import (
     api_kas_login_status,
 )
 
-pytestmark = pytest.mark.asyncio
-
 
 class _FakeState:
     owner_id = ""
@@ -142,6 +140,7 @@ def _body(resp) -> dict:
     return json.loads(resp.text)
 
 
+@pytest.mark.asyncio
 async def test_all_handlers_503_with_code_when_service_unavailable(monkeypatch):
     # The service is built lazily on first request; if construction fails, the
     # handlers surface a coded 503 rather than crashing.
@@ -162,6 +161,7 @@ async def test_all_handlers_503_with_code_when_service_unavailable(monkeypatch):
         assert _body(resp)["code"] == "kas_login_unavailable"
 
 
+@pytest.mark.asyncio
 async def test_status_ok():
     resp = await api_kas_login_status(_FakeRequest(_StubService()))
     assert resp.status == 200
@@ -173,12 +173,14 @@ async def test_status_ok():
         assert key in body
 
 
+@pytest.mark.asyncio
 async def test_begin_device_ok():
     resp = await api_kas_login_begin_device(_FakeRequest(_StubService(), {"provider": "google"}))
     assert resp.status == 200
     assert _body(resp)["login_id"] == "lid-1"
 
 
+@pytest.mark.asyncio
 async def test_begin_passes_replaces_through_and_rejects_an_unknown_slot():
     """An account switch names the slot it replaces; the handler forwards it as-is
     on both transports and answers a coded 400 (not `invalid_provider`) when the
@@ -201,6 +203,7 @@ async def test_begin_passes_replaces_through_and_rejects_an_unknown_slot():
     assert _body(resp)["code"] == "invalid_identity"
 
 
+@pytest.mark.asyncio
 async def test_begin_device_missing_and_unknown_provider():
     resp = await api_kas_login_begin_device(_FakeRequest(_StubService(), {}))
     assert resp.status == 400
@@ -211,12 +214,14 @@ async def test_begin_device_missing_and_unknown_provider():
     assert _body(resp)["code"] == "invalid_provider"
 
 
+@pytest.mark.asyncio
 async def test_begin_device_malformed_json_is_400():
     resp = await api_kas_login_begin_device(_FakeRequest(_StubService(), None))
     assert resp.status == 400
     assert _body(resp)["code"] == "invalid_provider"
 
 
+@pytest.mark.asyncio
 async def test_poll_ok_and_missing_and_unknown():
     resp = await api_kas_login_poll(_FakeRequest(_StubService(), {"login_id": "lid-1"}))
     assert resp.status == 200
@@ -231,6 +236,7 @@ async def test_poll_ok_and_missing_and_unknown():
     assert _body(resp)["code"] == "unknown_login_id"
 
 
+@pytest.mark.asyncio
 async def test_logout_ok_and_invalid_identity():
     resp = await api_kas_login_logout(_FakeRequest(_StubService(), {"identity": "social"}))
     assert resp.status == 200
@@ -241,6 +247,7 @@ async def test_logout_ok_and_invalid_identity():
     assert _body(resp)["code"] == "invalid_identity"
 
 
+@pytest.mark.asyncio
 async def test_logout_retires_running_identity_store_runtimes():
     """A sign-out sweeps running KAS processes that were spawned on the vault's
     identity (same remedy as an external kiro-cli logout); a sweep failure is
@@ -283,6 +290,7 @@ async def test_logout_retires_running_identity_store_runtimes():
     assert req.app["state"].sessions.calls == 0
 
 
+@pytest.mark.asyncio
 async def test_credential_mutations_reject_non_owner():
     # begin/poll/logout mutate the machine-global Kiro credential, so a non-owner
     # dashboard caller must get an audited 403 and never reach the service.
@@ -300,6 +308,7 @@ async def test_credential_mutations_reject_non_owner():
         assert svc.calls == []  # short-circuited before the service
 
 
+@pytest.mark.asyncio
 async def test_logout_store_failure_returns_coded_500():
     from kiro_crew.auth.store import TokenStoreError
 
@@ -312,6 +321,7 @@ async def test_logout_store_failure_returns_coded_500():
     assert _body(resp)["code"] == "logout_failed"
 
 
+@pytest.mark.asyncio
 async def test_status_open_to_non_owner():
     # status is a read (no credential mutation), so it stays available to any
     # allowed dashboard user.
@@ -319,6 +329,7 @@ async def test_status_open_to_non_owner():
     assert resp.status == 200
 
 
+@pytest.mark.asyncio
 async def test_begin_and_poll_return_502_on_transport_error():
     import aiohttp
 
@@ -338,6 +349,7 @@ async def test_begin_and_poll_return_502_on_transport_error():
     assert _body(resp)["code"] == "auth_service_unreachable"
 
 
+@pytest.mark.asyncio
 async def test_begin_answers_409_when_a_sign_out_landed_mid_begin():
     from kiro_crew.auth.service import SignedOutDuringLoginError
 
@@ -354,6 +366,7 @@ async def test_begin_answers_409_when_a_sign_out_landed_mid_begin():
         assert _body(resp)["code"] == "signed_out_during_login"
 
 
+@pytest.mark.asyncio
 async def test_status_store_failure_returns_coded_500():
     from kiro_crew.auth.store import TokenStoreError
 
@@ -369,6 +382,7 @@ async def test_status_store_failure_returns_coded_500():
 # ── loopback begin / cancel handlers ────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_begin_loopback_ok_returns_portal_url_and_port():
     svc = _StubService()
     resp = await api_kas_login_begin_loopback(_FakeRequest(svc, {"provider": "google"}))
@@ -380,6 +394,7 @@ async def test_begin_loopback_ok_returns_portal_url_and_port():
     assert svc.calls == [("loopback", "google", "")]
 
 
+@pytest.mark.asyncio
 async def test_begin_loopback_missing_unknown_and_malformed_provider_are_400():
     resp = await api_kas_login_begin_loopback(_FakeRequest(_StubService(), {}))
     assert resp.status == 400
@@ -396,6 +411,7 @@ async def test_begin_loopback_missing_unknown_and_malformed_provider_are_400():
     assert _body(resp)["code"] == "invalid_provider"
 
 
+@pytest.mark.asyncio
 async def test_begin_loopback_unavailable_is_coded_409():
     # The dashboard keys its device-code fallback off this exact status + code,
     # so the shape is a contract, not a courtesy.
@@ -404,6 +420,7 @@ async def test_begin_loopback_unavailable_is_coded_409():
     assert _body(resp)["code"] == "loopback_unavailable"
 
 
+@pytest.mark.asyncio
 async def test_cancel_ok_and_missing_login_id():
     svc = _StubService()
     resp = await api_kas_login_cancel(_FakeRequest(svc, {"login_id": "lid-lb"}))
@@ -418,6 +435,7 @@ async def test_cancel_ok_and_missing_login_id():
     assert svc.calls == []  # nothing to cancel, service untouched
 
 
+@pytest.mark.asyncio
 async def test_cancel_is_idempotent_for_unknown_login_id():
     # Cancel is called on every start-over path in the dashboard, including after
     # the login already finished or expired, so an unknown id is a no-op 200.
@@ -443,6 +461,7 @@ async def _hit(port: int, path: str, params: dict) -> None:
             assert resp.status == 200
 
 
+@pytest.mark.asyncio
 async def test_wait_for_callback_returns_query_fields():
     sock, port = _bound_loopback()
     task = asyncio.create_task(wait_for_callback(sock, port, "st-1", timeout_secs=10))
@@ -455,6 +474,7 @@ async def test_wait_for_callback_returns_query_fields():
     assert result["path"] == "/oauth/callback"
 
 
+@pytest.mark.asyncio
 async def test_wait_for_callback_accepts_signin_path():
     sock, port = _bound_loopback()
     task = asyncio.create_task(wait_for_callback(sock, port, "st-2", timeout_secs=10))
@@ -464,6 +484,7 @@ async def test_wait_for_callback_accepts_signin_path():
     assert result["path"] == "/signin/callback"
 
 
+@pytest.mark.asyncio
 async def test_wait_for_callback_state_mismatch_raises():
     sock, port = _bound_loopback()
     task = asyncio.create_task(wait_for_callback(sock, port, "expected", timeout_secs=10))
@@ -473,6 +494,7 @@ async def test_wait_for_callback_state_mismatch_raises():
         await asyncio.wait_for(task, timeout=5)
 
 
+@pytest.mark.asyncio
 async def test_wait_for_callback_portal_error_raises():
     sock, port = _bound_loopback()
     task = asyncio.create_task(wait_for_callback(sock, port, "st", timeout_secs=10))
@@ -482,6 +504,7 @@ async def test_wait_for_callback_portal_error_raises():
         await asyncio.wait_for(task, timeout=5)
 
 
+@pytest.mark.asyncio
 async def test_wait_for_callback_times_out():
     sock, port = _bound_loopback()
     with pytest.raises(PortalAuthError, match="timed out"):

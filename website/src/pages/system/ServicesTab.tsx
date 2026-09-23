@@ -21,6 +21,7 @@ import InfoTip from '../../components/InfoTip'
 import McpGatewayCard from '../McpGatewayCard'
 import type { AcpBackendsPayload } from '../overview/AcpBackendCard'
 import HostRuntimeCard from './HostRuntimeCard'
+import TasksCapacityCard from './TasksCapacityCard'
 import { fmtNumber, fmtPercent, fmtUnit } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import type { SystemData } from '../../types'
@@ -177,7 +178,7 @@ export default function ServicesTab() {
   const acpBackendsPreview = usePreviewFlag(PREVIEW_ACP_BACKENDS)
   const { data: acpBackends } = useQuery<AcpBackendsPayload>({
     queryKey: ['acp-backends', { probe: true }],
-    queryFn: () => api.acpBackends({ probe: true }) as Promise<AcpBackendsPayload>,
+    queryFn: () => api.acpBackends({ probe: true }) as unknown as Promise<AcpBackendsPayload>,
     // No fetch when the row is hidden: the endpoint is owner-only, and an
     // unrendered request would add cost or log a refusal for no visible control.
     enabled: acpBackendsPreview,
@@ -248,7 +249,7 @@ export default function ServicesTab() {
   // WHICH channels appear: only those with something to report — connected, or
   // carrying a connect error. `{ connected: false, error: '' }` is exactly what an
   // UNCONFIGURED channel looks like, so rendering every key would put seven
-  // meaningless "Not connected" rows on a Slack-only install. Settings > Channels
+  // meaningless "Not connected" rows on a Slack-only install. Settings > Messaging Channels
   // is the surface that knows `configured` (it asks each channel's own config
   // endpoint) and is where "did I set this up?" belongs; this page answers "is
   // what I set up running, and if not, why not?".
@@ -334,6 +335,10 @@ export default function ServicesTab() {
 
       {/* Host runtime — self-hides outside the Windows desktop shell */}
       <HostRuntimeCard />
+
+      {/* Durable task queue + effective concurrency — the capacity the
+          services above are serving right now */}
+      <TasksCapacityCard />
     </>
   )
 }

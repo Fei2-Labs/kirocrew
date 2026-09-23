@@ -29,6 +29,7 @@ import pytest
 from aiohttp import web
 
 import kiro_crew.dashboard.handlers.memory as mem_mod
+from kiro_crew.embeddings import CustomModelSpec
 
 _MOD = "kiro_crew.dashboard.handlers.memory"
 
@@ -1565,6 +1566,123 @@ class TestMemoryMutationSessionGate:
         assert _body(resp) == {"content": "", "content_redacted": False}
 
 
+@pytest.mark.asyncio
+class TestSubagentMemorySessionRecognition:
+    @pytest.mark.parametrize(
+        "run_id", ["", "../worker", r"..\worker", ".worker", "C:worker", "worker:stream", "a\x00b"]
+    )
+    async def test_invalid_subagent_ids_cannot_reach_the_filesystem(self, monkeypatch, run_id):
+        from kiro_crew.dashboard.handlers.cron import _recognize_session
+        from kiro_crew.history import is_incognito_transcript
+
+        # Model an existing target at every spelling: rejection must come from
+        # key validation, not from an absent file (including Windows ADS paths).
+        exists = MagicMock(return_value=True)
+        with monkeypatch.context() as patched:
+            patched.setattr(Path, "exists", exists)
+            refusal = await _recognize_session(
+                _make_state(),
+                f"subagent:{run_id}",
+                "test.memory",
+                blocks_persisted_mode=is_incognito_transcript,
+            )
+
+        assert refusal is not None
+        assert refusal.status == 400
+        assert _body(refusal)["code"] == "unknown_session"
+        exists.assert_not_called()
+
+    async def test_subagent_history_cannot_replace_a_live_allocation(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard.handlers.cron import _recognize_session
+        from kiro_crew.history import ConversationLog, is_incognito_transcript
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        await asyncio.to_thread(
+            log.update_metadata, "subagent:worker-a", {"memory_store": "default"}
+        )
+
+        refusal = await _recognize_session(
+            _make_state(),
+            "subagent:worker-a",
+            "test.memory",
+            blocks_persisted_mode=is_incognito_transcript,
+        )
+
+        assert refusal is not None
+        assert refusal.status == 400
+        assert _body(refusal)["code"] == "unknown_session"
+
+    @pytest.mark.parametrize(
+        "collision", ["live-slot", "restricted-key", "bare", "dashboard", "cron"]
+    )
+    async def test_a_subagent_cannot_borrow_another_sessions_identity(
+        self, tmp_path, monkeypatch, collision
+    ):
+        from kiro_crew.dashboard.handlers.cron import _recognize_session
+        from kiro_crew.history import ConversationLog, is_incognito_transcript
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        state = _make_state()
+        if collision == "live-slot":
+            state._slots["worker-a"] = SimpleNamespace(memory_mode="persistent")
+        elif collision == "restricted-key":
+            state._restricted_keys.add("subagent:worker-a")
+        else:
+            key = "worker-a" if collision == "bare" else f"{collision}:worker-a"
+            log = ConversationLog(base_dir=tmp_path / "sessions")
+            await asyncio.to_thread(log.update_metadata, key, {"memory_mode": "persistent"})
+
+        refusal = await _recognize_session(
+            state,
+            "subagent:worker-a",
+            "test.memory",
+            blocks_persisted_mode=is_incognito_transcript,
+        )
+
+        assert refusal is not None
+        assert refusal.status == 400
+        assert _body(refusal)["code"] == "unknown_session"
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"_type": "metadata", "memory_mode": "persistent"},
+            {"_type": "metadata", "memory_mode": "incognito"},
+            {"_type": "metadata", "memory_mode": "temporary"},
+            {"_type": "metadata", "memory_mode": "unknown"},
+            {"_type": "metadata", "memory_mode": []},
+            {"role": "user", "content": "not metadata"},
+        ],
+    )
+    async def test_subagent_history_mode_cannot_replace_a_live_allocation(
+        self, tmp_path, monkeypatch, metadata
+    ):
+        from kiro_crew.dashboard.handlers.cron import _recognize_session
+        from kiro_crew.history import is_incognito_transcript
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "subagent_worker-a.jsonl").write_text(
+            json.dumps(metadata) + "\n", encoding="utf-8"
+        )
+        # Neither a saved mode nor a colliding slot can make this child live.
+        state = _make_state()
+        state._slots["worker-a"] = SimpleNamespace(memory_mode="persistent")
+
+        refusal = await _recognize_session(
+            state,
+            "subagent:worker-a",
+            "test.memory",
+            blocks_persisted_mode=is_incognito_transcript,
+        )
+
+        assert refusal is not None
+        assert refusal.status == 400
+        assert _body(refusal)["code"] == "unknown_session"
+
+
 # ---------------------------------------------------------------------------
 # consolidate
 # ---------------------------------------------------------------------------
@@ -1866,7 +1984,7 @@ class TestEmbeddingStatusCustomModel:
     @pytest.mark.asyncio
     async def test_healthy_custom_model_reports_done_and_no_retry(self) -> None:
         model_path = Path("/models/custom.gguf")
-        custom = SimpleNamespace(error="", path=model_path)
+        custom = CustomModelSpec(model_path, "custom.gguf", 768, "")
         a, b, c, d = self._patches(custom, model_present=True)
         with a, b, c, d:
             body = _body(await mem_mod.api_memory_embedding_status(_make_request(_make_state())))
@@ -1882,7 +2000,7 @@ class TestEmbeddingStatusCustomModel:
 
     @pytest.mark.asyncio
     async def test_broken_custom_model_reports_error_without_retry(self) -> None:
-        custom = SimpleNamespace(error="unreadable", path=Path("/models/custom.gguf"))
+        custom = CustomModelSpec(Path("/models/custom.gguf"), "custom.gguf", 768, "unreadable")
         a, b, c, d = self._patches(custom, model_present=False)
         with a, b, c, d:
             body = _body(await mem_mod.api_memory_embedding_status(_make_request(_make_state())))
@@ -1893,7 +2011,7 @@ class TestEmbeddingStatusCustomModel:
     @pytest.mark.asyncio
     async def test_missing_custom_file_reports_error_naming_the_path(self) -> None:
         model_path = Path("/models/custom.gguf")
-        custom = SimpleNamespace(error="", path=model_path)
+        custom = CustomModelSpec(model_path, "custom.gguf", 768, "")
         a, b, c, d = self._patches(custom, model_present=False)
         with a, b, c, d:
             body = _body(await mem_mod.api_memory_embedding_status(_make_request(_make_state())))
@@ -2178,7 +2296,14 @@ def _apply_store(previous_dim: int = 512, retargeted: bool = True) -> Any:
     store._embedding_dim = previous_dim
     store.set_embedding_dim.return_value = retargeted
     store.recorded_embedding_space.return_value = "sig"
-    store.backfill_missing_embeddings.return_value = 7
+    store.recorded_rebuild_generation.return_value = "test-request"
+    store.embedding_repair_state.return_value = (False, 7)
+
+    def backfill(**kwargs: Any) -> int:
+        store.embedding_repair_state.return_value = (False, 0)
+        return 7
+
+    store.backfill_missing_embeddings.side_effect = backfill
     return store
 
 
@@ -2237,6 +2362,8 @@ class _ApplyHarness:
             )
         )
         enter(patch(f"{_MOD}.active_embedding_space_signature", return_value="sig"))
+        enter(patch(f"{_MOD}.embedding_rebuild_generation", return_value="test-request"))
+        enter(patch(f"{_MOD}.validated_cached_vector_stores", return_value=()))
         enter(patch(f"{_MOD}.embedding_backend_serving", return_value=self._serving))
         enter(patch(f"{_MOD}._write_embed_model_config", self.write))
         enter(patch(f"{_MOD}._read_memory_config", return_value={"embed_model_id": "m"}))
@@ -2278,6 +2405,20 @@ class TestApplyEmbeddingModelWorker:
         h.activate.assert_called_once()
         h.prog.finish.assert_called_once_with(7)
         store.backfill_missing_embeddings.assert_called_once()
+        h.prog.begin_run.assert_called_once_with(7)
+        h.prog.advance.assert_called_once_with(7, 7)
+
+    @pytest.mark.asyncio
+    async def test_unhandled_rebuild_request_refuses_activation(self) -> None:
+        store = _apply_store()
+        store.recorded_rebuild_generation.return_value = "previous-request"
+        with _ApplyHarness() as h:
+            await _run_apply(store, "")
+        h.activate.assert_not_called()
+        store.backfill_missing_embeddings.assert_not_called()
+        h.rollback.assert_awaited_once()
+        h.reset.assert_called_once()
+        assert "could not be removed" in h.prog.fail.call_args[0][0]
 
     @pytest.mark.asyncio
     async def test_load_failure_drops_the_candidate_and_fails(self) -> None:

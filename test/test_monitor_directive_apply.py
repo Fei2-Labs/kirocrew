@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.autonudge import AutoNudgeService
+from kiro_crew.autonudge import APPROVAL_STALL_REASON, AutoNudgeService
 from kiro_crew.autonudge_authz import authorize_and_update_monitor
+from kiro_crew.dashboard import session_directive_apply as sda
 from kiro_crew.dashboard.session_directive_apply import apply_session_directive
 from kiro_crew.monitoring.models import (
     MonitorBudgets,
@@ -175,25 +176,116 @@ async def test_webex_structured_watch_is_refused_by_authoritative_consumer(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_webex_structured_stop_is_refused_by_authoritative_consumer(tmp_path):
+async def test_webex_legacy_loop_is_stopped_by_monitor_stop(tmp_path):
+    """monitor_stop binds the general key, so a Webex legacy loop stops here.
+
+    Webex hosts a legacy timer loop but no structured monitor. Before the stop
+    resolved the general binding, this call was refused as an unsupported
+    session type; now it stops the loop the session was allowed to arm.
+    """
     service = AutoNudgeService(base_dir=tmp_path)
     audit = MagicMock()
     session_key = "webex:kirocrew:direct:operator@example.com"
-    with (
-        patch("kiro_crew.autonudge.get_instance", return_value=service),
-        patch("kiro_crew.dashboard.session_directive_apply._audit", audit),
-    ):
-        result = await apply_session_directive(
-            SimpleNamespace(),
-            None,
-            session_key,
-            "monitor_stop",
-            {},
-        )
+    loop = await service.add(
+        slot_key=session_key,
+        message="Watch the pull request.",
+        idle_secs=300,
+    )
+    try:
+        with (
+            patch("kiro_crew.autonudge.get_instance", return_value=service),
+            patch("kiro_crew.dashboard.session_directive_apply._audit", audit),
+        ):
+            result = await apply_session_directive(
+                SimpleNamespace(),
+                None,
+                session_key,
+                "monitor_stop",
+                {"reason": "done"},
+            )
 
-    assert "not supported" in result
-    audit.assert_called_once_with(session_key, "monitor_stop", "denied")
-    service.stop()
+        assert not result.startswith("Error:")
+        assert "stopped" in result
+        # A legacy loop is REMOVED, not retained: nothing is left to inspect.
+        assert service.get_by_slot(session_key) is None
+        audit.assert_called_once_with(session_key, "monitor_stop", "success")
+    finally:
+        service.stop()
+    # Referenced so a future reader sees the armed loop id is not asserted on.
+    assert loop is not None
+
+
+@pytest.mark.asyncio
+async def test_monitor_stop_removes_a_dashboard_legacy_loop(tmp_path):
+    """The defect this fix targets: monitor_stop on a legacy timer loop.
+
+    monitor_stop resolved only a structured monitor, so a session that armed a
+    timer loop and called monitor_stop got a silent no-op while the loop kept
+    firing. Binding the general key makes it stop the legacy loop.
+    """
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = await service.add(slot_key="chat-1", message="Watch it.", idle_secs=300)
+    try:
+        with (
+            patch("kiro_crew.autonudge.get_instance", return_value=service),
+            patch("kiro_crew.dashboard.session_directive_apply._audit", MagicMock()),
+        ):
+            result = await apply_session_directive(
+                SimpleNamespace(),
+                SimpleNamespace(key="chat-1", _app=""),
+                "dashboard:chat-1",
+                "monitor_stop",
+                {"reason": "done"},
+            )
+
+        assert not result.startswith("Error:")
+        assert "stopped" in result
+        assert service.get_by_slot("chat-1") is None
+    finally:
+        service.stop()
+    assert loop is not None
+
+
+@pytest.mark.asyncio
+async def test_monitor_stop_and_autonudge_stop_route_a_structured_loop_identically(tmp_path):
+    """One implementation, two entry points: both retain the structured record.
+
+    A structured monitor stopped through either tool is retained for inspection
+    rather than removed, because both delegate to the same resolve-and-route
+    path.
+    """
+    for kind in ("monitor_stop", "autonudge_stop"):
+        service = AutoNudgeService(base_dir=tmp_path / kind)
+        loop = await service.add_monitor(
+            slot_key="chat-1",
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            cadence_secs=300,
+            budgets=MonitorBudgets(),
+        )
+        try:
+            with (
+                patch("kiro_crew.autonudge.get_instance", return_value=service),
+                patch("kiro_crew.autonudge_authz.sel", return_value=MagicMock()),
+                patch("kiro_crew.dashboard.session_directive_apply._audit", MagicMock()),
+            ):
+                result = await apply_session_directive(
+                    SimpleNamespace(),
+                    SimpleNamespace(key="chat-1", _app=""),
+                    "dashboard:chat-1",
+                    kind,
+                    {"reason": "done"},
+                )
+
+            assert "retained for inspection" in result, kind
+            # Retained, not removed: the record survives for monitor_inspect.
+            retained = service.get_by_slot("chat-1")
+            assert retained is not None, kind
+            assert not retained.active, kind
+        finally:
+            service.stop()
+        assert loop is not None
 
 
 @pytest.mark.asyncio
@@ -632,4 +724,54 @@ async def test_banner_cannot_silently_patch_a_structured_monitor(tmp_path):
 
     assert result.startswith("monitor_update cannot apply")
     assert "banner" in result
+    service.stop()
+
+
+@pytest.mark.asyncio
+async def test_denied_monitor_update_is_surfaced_into_the_session(tmp_path):
+    # A denied REVISION is as unobservable as a denied arm: the MCP tool has
+    # already answered "update requested" over its own pipe, so a denial that
+    # stays in the gateway log leaves the agent reporting a revision that never
+    # landed. The consumer must put a row where the
+    # session's reader can see it, worded for a revision -- the loop kept its
+    # PREVIOUS instruction, which is not the same fact as "nothing is running".
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = await service.add("chat-1", "watch the build", idle_secs=60)
+    # Pause it the way an unanswered approval does, so monitor_update's
+    # paused-loop protection denies the patch at apply time.
+    await service.update(loop.id, active=False, stopped_reason=APPROVAL_STALL_REASON)
+    surfaced = MagicMock()
+    state = SimpleNamespace(
+        _slots={
+            "chat-1": SimpleNamespace(
+                workspace="default", mode="", memory_mode="persistent", is_closing=False
+            )
+        },
+        sessions=None,
+        channel_transports={},
+    )
+    slot = SimpleNamespace(key="chat-1", _app="", messages=[])
+    with (
+        patch("kiro_crew.autonudge.get_instance", return_value=service),
+        patch("kiro_crew.dashboard.state.append_and_surface", surfaced),
+    ):
+        result = await apply_session_directive(
+            state,
+            slot,
+            "dashboard:chat-1",
+            "monitor_update",
+            {"patch": {"message": "revised instruction"}},
+        )
+
+    assert "is PAUSED" in result
+    surfaced.assert_called_once()
+    called_state, called_slot, role, text, cls = surfaced.call_args.args
+    assert called_state is state and called_slot is slot
+    assert role == "notice" and cls == "msg msg-info"
+    assert text.startswith(sda.REVISION_REFUSAL_NOTICE_PREFIX)
+    # The revision wording, not the arming wording: a paused loop that kept its
+    # old instruction is not a session with no automation at all.
+    assert not text.startswith(sda.ARM_REFUSAL_NOTICE_PREFIX)
+    assert "kept its previous instruction" in text
+    assert "approval prompt" in text
     service.stop()

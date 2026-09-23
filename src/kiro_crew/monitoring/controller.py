@@ -22,6 +22,7 @@ from kiro_crew.monitoring.models import (
     MonitorDecision,
     MonitorDispatchResult,
     MonitorObservation,
+    MonitorObservationStatus,
     MonitorProbeResult,
     MonitorState,
     MonitorVerdict,
@@ -30,6 +31,7 @@ from kiro_crew.monitoring.models import (
     transient_probe_failure,
 )
 from kiro_crew.monitoring.pull_request import provider_error_result
+from kiro_crew.monitoring.registry import monitor_kind
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 MONITOR_WAKE_MAX_CHARS = 4096
@@ -116,6 +118,12 @@ class _Provider(Protocol):
 
 MonitorDispatcher = Callable[[Any, str], Awaitable[MonitorDispatchResult]]
 OwnerCredentialsAuthorizer = Callable[[_Loop, MonitorState], bool]
+#: Names the crew log unit a loop's OWNER session is writing -- its live ACP session
+#: id -- or ``""`` when the slot has no live session. Injected by the host, which is
+#: the one party that holds the session registry; the controller never opens a
+#: session or a file to find out. Typed on ``Any`` for the loop, as the dispatcher
+#: is, so a host callback annotated with its own loop type satisfies it.
+OwnerSessionResolver = Callable[[Any], str]
 
 
 class MonitorController:
@@ -129,6 +137,7 @@ class MonitorController:
         providers: Mapping[str, _Provider] | None = None,
         clock: Callable[[], float] = time.time,
         owner_credentials_authorized: OwnerCredentialsAuthorizer | None = None,
+        owner_session_id: OwnerSessionResolver | None = None,
     ) -> None:
         self._service = service
         self._dispatch = dispatch
@@ -137,6 +146,7 @@ class MonitorController:
         self._owner_credentials_authorized = (
             owner_credentials_authorized or self._protected_owner_credentials_authorized
         )
+        self._owner_session_id = owner_session_id
         self._providers = dict(providers or {})
         if not self._providers:
             self._providers = {
@@ -205,6 +215,12 @@ class MonitorController:
             return MonitorVerdict(decision=MonitorDecision.STOP_BUDGET)
         config_generation = state.config_generation
         target = state.target
+        kind = state.kind
+        # Read BEFORE the probe. The service publishes an accepted observation into
+        # this same state object, so after apply_monitor_probe returns this field
+        # already names the new fingerprint, and the comparison the record depends
+        # on would compare a value with itself.
+        previous_fingerprint = state.last_fingerprint
         previous_observation = deepcopy(state.last_observation)
         provider = self._providers.get(state.kind)
         result: MonitorProbeResult
@@ -248,9 +264,84 @@ class MonitorController:
             now=now,
             config_generation=config_generation,
         )
+        self._record_observation(
+            loop,
+            state,
+            result,
+            kind=kind,
+            target=target,
+            previous_fingerprint=previous_fingerprint,
+            now=now,
+        )
         if verdict.decision is not MonitorDecision.WAKE_ACTIONABLE:
             return verdict
         return await self._dispatch_claimed(loop, state, now=now, entries=verdict.entries)
+
+    def _record_observation(
+        self,
+        loop: _Loop,
+        state: MonitorState,
+        result: MonitorProbeResult,
+        *,
+        kind: str,
+        target: str,
+        previous_fingerprint: str,
+        now: float,
+    ) -> None:
+        """Append the probe's canonical snapshot to the owner session's crew log.
+
+        Once per CHANGE, never per poll, and independent of the wake decision: a
+        subject that moved from one pending state to another is recorded even
+        though nobody is woken for it, because the record is about the subject,
+        not about what the engine chose to do.
+
+        "Changed" is judged against the state the service PUBLISHED, not against
+        the raw observation. ``apply_monitor_probe`` copies an accepted observation
+        into this live state object before it returns, and declines one taken
+        under a superseded configuration generation without touching it. Reading
+        the published fingerprint back is what keeps the record honest in both
+        directions: a declined observation writes nothing (the next tick will
+        observe the subject again and record it then, once), and a baseline reset
+        that raced this probe cannot be mistaken for a change, because the state
+        then names neither the previous fingerprint nor this one.
+
+        The provider-error result is excluded before any of that: a failed read is
+        no evidence about the subject, carries no fingerprint, and is never
+        published as one.
+
+        The owner session is named by the host's resolver. A slot with no live
+        session -- cold after a restart, or torn down -- records nothing rather
+        than opening one: a probe runs without a model turn and must stay that
+        cheap. Nothing here is allowed to reach the tick: a record that could not
+        be made is logged, and the wake this tick may owe is delivered regardless.
+        """
+        if self._owner_session_id is None:
+            return
+        observation = result.observation
+        if observation.status is MonitorObservationStatus.PROVIDER_ERROR:
+            return
+        if not observation.fingerprint or observation.fingerprint == previous_fingerprint:
+            return
+        if state.last_fingerprint != observation.fingerprint:
+            return
+        try:
+            session_id = self._owner_session_id(loop)
+            if not session_id:
+                return
+            from kiro_crew.crew_log import emit as crew_log_emit
+            from kiro_crew.crew_log.entry_types import OBJECT_PRODUCER_PROBE
+
+            crew_log_emit.on_object_observed(
+                session_id,
+                producer=OBJECT_PRODUCER_PROBE,
+                kind=kind,
+                target=target,
+                fingerprint=observation.fingerprint,
+                facts=result.canonical,
+                observed_at=now,
+            )
+        except Exception:
+            logger.exception("structured monitor could not record its observation")
 
     async def _dispatch_claimed(
         self,
@@ -268,6 +359,7 @@ class MonitorController:
         """
         envelope = format_monitor_wake(
             monitor_id=loop.id,
+            kind=state.kind,
             target=state.target,
             objective=state.objective,
             fingerprint=state.last_wake_fingerprint,
@@ -319,6 +411,7 @@ class MonitorController:
 def format_monitor_wake(
     *,
     monitor_id: str,
+    kind: str,
     target: str,
     objective: str,
     fingerprint: str,
@@ -326,26 +419,51 @@ def format_monitor_wake(
     canonical: Mapping[str, object],
     wake_instructions: str = "",
 ) -> str:
-    """Render only allowlisted canonical facts, redacted before the hard cap."""
-    checks = canonical.get("checks")
+    """Render only allowlisted canonical facts, redacted before the hard cap.
+
+    The subject noun and the fields to render come from the registry entry for
+    *kind*, so each subject describes itself to the agent it wakes. *kind* is the
+    monitor's armed kind (``MonitorState.kind``), the authoritative record of what
+    is being watched -- not a value read out of the provider-supplied canonical,
+    which is versioned and may be thin.
+
+    Two absences read differently. A kind the registry has no entry for is an
+    unidentifiable subject: it yields a neutral envelope that names the kind and
+    says its fields are undeclared, never one subject's shape stamped over
+    another's facts. A registered kind whose canonical is thin -- an empty or older
+    ``last_observation`` -- still knows its noun and field list from the entry, and
+    simply reports its state changed. Everything rendered here passes through the
+    redaction and the hard cap below, so a canonical field a provider fills reaches
+    the woken agent scrubbed, not raw.
+    """
+    entry = monitor_kind(kind)
     changed: list[str] = []
-    if isinstance(checks, Mapping):
-        for state in ("failed", "pending", "unknown"):
-            values = checks.get(state)
-            if isinstance(values, list) and values:
-                changed.append(f"{state} checks: {len(values)}")
-    for name in ("blocking_review", "mergeability", "review_decision", "state"):
-        value = canonical.get(name)
-        if isinstance(value, (str, int, bool)):
-            changed.append(f"{name}={value}")
+    if entry is None:
+        subject_noun = f"{kind} subject" if kind else "monitored subject"
+        changed_line = "canonical fields undeclared for this kind"
+    else:
+        subject_noun = entry.subject_noun
+        for name in entry.wake_fields:
+            if name == "checks":
+                checks = canonical.get("checks")
+                if isinstance(checks, Mapping):
+                    for check_state in ("failed", "pending", "unknown"):
+                        values = checks.get(check_state)
+                        if isinstance(values, list) and values:
+                            changed.append(f"{check_state} checks: {len(values)}")
+                continue
+            value = canonical.get(name)
+            if isinstance(value, (str, int, bool)):
+                changed.append(f"{name}={value}")
+        changed_line = "; ".join(changed) or "canonical state changed"
     head = canonical.get("head_revision")
     action = wake_instructions.strip() or "Inspect the changed facts and take the next safe action."
     envelope = (
         f"{MONITOR_WAKE_PREFIX}\n"
-        f"Monitor {monitor_id}: pull request {target}; objective: {objective}.\n"
+        f"Monitor {monitor_id}: {subject_noun} {target}; objective: {objective}.\n"
         f"Fingerprint: {fingerprint}. Classification: {reason_code or 'actionable'}.\n"
         f"Head: {head if isinstance(head, str) else 'unknown'}. "
-        f"Changed: {'; '.join(changed) or 'canonical state changed'}.\n"
+        f"Changed: {changed_line}.\n"
         f"Next action: {action}"
     )
     envelope, _ = redact_exfiltration_urls(envelope)

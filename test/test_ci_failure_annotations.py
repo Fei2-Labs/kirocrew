@@ -314,7 +314,25 @@ class TestTheMatcherThatLiedIsOffWhereverPytestRuns:
 
     @staticmethod
     def _runs_pytest(step: dict) -> bool:
-        return re.search(r"(?m)^\s*pytest\s", str(step.get("run", ""))) is not None
+        return (
+            re.search(r"(?m)^\s*(?:python(?:3)?\s+-m\s+)?pytest(?:\s|$)", str(step.get("run", "")))
+            is not None
+        )
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("pytest -q", True),
+            ("pytest", True),
+            ("python -m pytest -q", True),
+            ("  python3 -m pytest --collect-only", True),
+            ("echo pytest", False),
+            ("# python -m pytest -q", False),
+            ("python -m pytest_helper", False),
+        ],
+    )
+    def test_recognizes_direct_and_module_invocations(self, command, expected) -> None:
+        assert self._runs_pytest({"run": command}) is expected
 
     @classmethod
     def _pytest_jobs(cls) -> dict[str, list[dict]]:
@@ -334,8 +352,11 @@ class TestTheMatcherThatLiedIsOffWhereverPytestRuns:
             "ci.yml:backend-test",
             "ci.yml:backend-test-windows",
             "ci.yml:backend-test-windows-fail-closed",
-            "ci.yml:backend-test-macos",
             "ci.yml:backend-test-sandbox",
+            # The macOS suite moved out of ci.yml (the runner queue sat on the
+            # required check); macos-on-demand.yml calls this same job on the PR
+            # path, so the one entry covers both.
+            "platform-tests.yml:backend-test-macos",
             "release.yml:release-candidate-tests",
             "test-durations.yml:refresh",
         }, set(self._pytest_jobs())

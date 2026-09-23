@@ -17,6 +17,7 @@ from kiro_crew.messaging.session_resume import (
     SessionChoice,
     SessionResumeController,
     same_bucket_origin_keys,
+    session_title_of,
 )
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -305,16 +306,7 @@ class DiscordSessionResume:
 
     async def _title_of(self, session_key: str) -> str:
         """The stored title for *session_key*, read off-loop, with a stable fallback."""
-        title = ""
-        if self.conv_log is not None:
-            try:
-                meta = await asyncio.to_thread(self.conv_log.get_metadata, session_key)
-                title = str((meta or {}).get("title") or "")
-            except Exception:
-                logger.debug("discord resume: title lookup failed", exc_info=True)
-        # The picker's fallback for an untitled session, so a bootstrapped record
-        # names the conversation the way the user saw it listed.
-        return title or session_key.removeprefix("dashboard:")
+        return await asyncio.to_thread(session_title_of, self.conv_log, session_key, "discord")
 
     async def show_picker(
         self,

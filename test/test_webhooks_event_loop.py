@@ -67,9 +67,27 @@ def store_dir(tmp_path, monkeypatch):
     # into another module's tests.
     webhooks._reset_signature_replay()
     webhooks._reset_auth_throttle()
+    # The hook CAPACITY globals are the same shape and were not floored here.
+    # `api_hooks_agent` acquires `_hook_semaphore` and claims the session key in
+    # `_hook_inflight_sessions`, and BOTH are given back only by
+    # `_run_hook_agent`'s finally -- which the green-path tests below patch away
+    # with a no-op runner. Without the restore below, every run of this file
+    # drops the worker's permits 6 -> 5 for good and strands `hook:x`, and the
+    # victim is whatever later test on that worker asserts on capacity: a 429
+    # `capacity_reached` test passes for the wrong reason, and
+    # `test_webhooks_api.py`'s gather-all-permits test HANGS to the 120s timeout,
+    # which takes the xdist worker with it.
+    #
+    # Restored to what this test INHERITED rather than to a pristine 6, so a leak
+    # from an earlier test is not re-reported against every test after it.
+    inherited_permits = hooks_handlers._hook_semaphore._value
+    hooks_handlers._reset_hook_inflight()
     yield tmp_path
     webhooks._reset_signature_replay()
     webhooks._reset_auth_throttle()
+    hooks_handlers._reset_hook_inflight()
+    while hooks_handlers._hook_semaphore._value < inherited_permits:
+        hooks_handlers._hook_semaphore.release()
 
 
 def _request(headers=None, body=b"{}", remote="10.1.2.3"):
@@ -165,6 +183,17 @@ class TestManagementRoutesOffloadStoreIo:
         req.json = _json
         req.get = lambda *a, **k: "dashboard"
         req.match_info = {}
+        # The mint route is owner-gated (``require_owner_dashboard_request``), and
+        # the predicate reads ``state.owner_id`` plus the claims the token-auth
+        # middleware publishes. A bare MagicMock answers every lookup with another
+        # MagicMock, which reads as a NON-owner and returns 403 before the store
+        # call this test is measuring. Present the owner the same way the caller
+        # already spells itself, ``dashboard``, so the offload assertion stays on
+        # its own subject. The gate's denial behaviour is covered in
+        # ``test_webhooks_api.TestTokenMintIsOwnerOnly``.
+        req.app = {"state": MagicMock(owner_id="dashboard")}
+        req.__contains__ = lambda _self, key: key in {"user", "app"}
+        req.__getitem__ = lambda _self, key: {"user": "dashboard", "app": ""}[key]
 
         with patch.object(webhooks.WebhookTokenStore, "create", create), \
                 patch.object(hooks_handlers, "_installed_agent_names", lambda: {"kirocrew"}), \
@@ -198,6 +227,15 @@ class TestManagementRoutesOffloadStoreIo:
 
         req.json = _json
         req.get = lambda *a, **k: "dashboard"
+        # The switch route is owner-gated, same as the mint route above, and the
+        # predicate reads ``state.owner_id`` plus the claims the token-auth
+        # middleware publishes. Present the owner the way this caller already
+        # spells itself, ``dashboard``, so the offload assertion stays on its own
+        # subject rather than landing on the gate. The gate's denial behaviour is
+        # covered in ``test_webhooks_api.TestTokenMintIsOwnerOnly``.
+        req.app = {"state": MagicMock(owner_id="dashboard")}
+        req.__contains__ = lambda _self, key: key in {"user", "app"}
+        req.__getitem__ = lambda _self, key: {"user": "dashboard", "app": ""}[key]
 
         with patch.object(webhooks.WebhookTokenStore, "set_switch", switch), \
                 patch.object(hooks_handlers, "_sel", MagicMock()):

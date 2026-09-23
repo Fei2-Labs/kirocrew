@@ -85,7 +85,7 @@ jobs:
     # the guard is on every step, so a step added later cannot quietly run
     # against fork content.
     name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'UX Review' || 'UX Review (same-repo lane, not applicable to forks)' }}"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # Agentic reviewer reading untrusted PR diff content -- never gets fleet credentials, same isolation as claude-review.yml/codex-review.yml.
     # Model-call latency has a fat tail: ~18 min observed max, and a killed
     # review surfaces as a RED required check, so keep generous headroom.
     timeout-minutes: 60
@@ -326,7 +326,7 @@ jobs:
       # One assume per model call (pass 1 here, pass 2 below): a session lasts
       # an hour, and a call that inherits a spent session dies on an expired
       # token with no verdict.
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
           && (
@@ -367,7 +367,7 @@ jobs:
           github.actor != 'dependabot[bot]' && steps.scope.outputs.ui == 'true' && steps.human_override.outputs.active != 'true'
           && steps.evidence.outputs.screens == 'true'
           )
-        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
+        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -486,7 +486,7 @@ jobs:
           fi
 
       # Fresh Bedrock session for pass 2 (see the note on the first assume).
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
           && (
@@ -510,7 +510,7 @@ jobs:
           && (
           github.actor != 'dependabot[bot]' && steps.scope.outputs.ui == 'true' && steps.human_override.outputs.active != 'true'
           )
-        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
+        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
         with:
           # Inference via Amazon Bedrock. Model id form (bare, regional `us.`
           # inference profile, no `[1m]` tag) is load-bearing — see the
@@ -612,7 +612,7 @@ jobs:
 
             THIS IS A UX REVIEW, NOT A CODE OR DESIGN REVIEW. Three other
             automated reviewers already cover line-level correctness, security,
-            and style (Opus 4.8 / GPT 5.6) and design-level problem/solution
+            and style (Opus 5 / GPT 5.6) and design-level problem/solution
             fit (Design Review). Do NOT duplicate them: no correctness bugs, no
             security findings, no style/naming/import nits, no "is this the
             right architecture". Your lens is exclusively what a HUMAN USING
@@ -658,6 +658,20 @@ jobs:
                  patterns: panel/sidebar toggles, close affordances, header
                  layout, list rows, iconography. A user who has learned the
                  rest of the product must not find this page strange.
+               - PLACEMENT — every new or moved control, row, page, menu
+                 entry or setting sits where a user LOOKING FOR IT would go
+                 first, next to the controls that do the same job. Judge
+                 this across the whole app, not one panel: settings tabs,
+                 sidebar sections, menus, modals, the command palette. Ask
+                 what the control is ABOUT (money, an account, appearance, a
+                 channel, a session) and check that its neighbours are about
+                 the same thing. Name the surface that is about that thing
+                 and already holds its siblings; if one exists, placing the
+                 control anywhere else is a finding. A placement the PR
+                 defends only by where a reporter, an issue or an author
+                 asked for it is NOT a design decision and is itself a
+                 finding: the request says the control must be reachable,
+                 not where it lives.
                - EARN EVERY ELEMENT — every button, label, and line of copy
                  has a job a user needs done. Anything present without one is
                  a finding.
@@ -1037,9 +1051,13 @@ jobs:
             The FIRST line is machine-parsed — emit it verbatim, value only:
             UX-Verdict: <PASS | CONCERNS | BLOCK>
 
-            Then a blank line and ONE bold punchline (≤25 words): the single
-            most important takeaway — for PASS, why the experience holds; for
-            CONCERNS/BLOCK, the core UX problem in one breath.
+            Then a blank line and ONE bold punchline (≤25 words). It OPENS with
+            the problem: for CONCERNS/BLOCK, the core UX problem in one breath,
+            problem first — never `<what works>, but <problem>`, because the
+            reader stops at the comma and the finding is what came after it.
+            For PASS, the ONE thing a human should still verify before merge,
+            or exactly `Nothing to check.` — never why the experience holds; a
+            reviewer that argues the author's case is not reviewing.
 
             Then include a section ONLY if it has real content (omit the
             heading entirely when empty — never write "None" sections):
@@ -1166,6 +1184,16 @@ jobs:
               summary="$(jq -rs '[ .[] | (if type=="array" then .[] else . end) | select(.result != null) ] | (last.result // "")' "$EXEC_FILE" 2>/dev/null || true)"
             fi
           fi
+          # Publish only the review. The contract makes the verdict header the
+          # FIRST line, but a model that narrates before it ("All facts verified.
+          # Composing the final review.") ships that narration into a public
+          # comment above the punchline. Trim to the header when one is present;
+          # without one the text is left whole so the no-verdict path below still
+          # sees what the model wrote. Here-strings, not pipes: a long summary
+          # cannot manufacture a SIGPIPE status under `pipefail`.
+          if grep -qiE '^UX-Verdict:' <<< "$summary"; then
+            summary="$(awk 'f || tolower($0) ~ /^ux-verdict:/ { f = 1; print }' <<< "$summary")"
+          fi
           # An evidence step that failed because an attachment download
           # failed leaves no transcript either (the model never ran), but that
           # outcome IS this run's result for the head and has a remedy, so it
@@ -1200,6 +1228,16 @@ jobs:
           if [ -n "$summary" ] && ! grep -qF "[UX-REVIEWED] $HEAD" <<< "$summary"; then
             echo "verdict header present but no [UX-REVIEWED] $HEAD marker; treating as UNKNOWN"
             verdict="UNKNOWN"
+          fi
+          # The contract caps the prose at ~150 words outside the collapsed
+          # inventory: a review twice that long is one whose findings sit under
+          # text nobody reads. Count it and say so in the job log and annotations;
+          # the verdict and the comment are unaffected.
+          if [ "$verdict" != "UNKNOWN" ]; then
+            words="$(awk '/<details>/ { skip = 1 } !skip { print } /<\/details>/ { skip = 0 }' <<< "$summary" | wc -w | tr -d ' ')"
+            if [ "${words:-0}" -gt 300 ]; then
+              echo "::warning title=UX Review over length::$words words outside the inventory; the contract caps the review at ~150. Findings past the cap are the ones nobody reads."
+            fi
           fi
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           case "$verdict" in
@@ -1283,7 +1321,7 @@ jobs:
               !seen && $0 ~ header { seen = 1; next }
               !seen { next }
               seen == 1 && NF { print; seen = 2; next }
-              /^### / { watch = ($0 ~ /^### Watch[[:space:]]*$/) }
+              /^### / { watch = ($0 ~ /^### (Watch|Not justified as shipped)[[:space:]]*$/) }
               watch { print }
             ' "$file")"
             printf '%s' "${digest:0:2000}"

@@ -9,11 +9,14 @@ Covers:
 The scripts live under the packaged builtin skill and are NOT importable as a
 package, so we load them by path with importlib. Everything here is stdlib.
 """
+import configparser
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -24,6 +27,13 @@ SKILL_DIR = REPO_ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" 
 SCRIPTS_DIR = SKILL_DIR / "scripts"
 PROFILES_DIR = SKILL_DIR / "profiles"
 
+# The one type-check spelling every caller must agree on. `website/tsconfig.json`
+# is `files: []` + references, so the project has to be named; and it is named
+# with `-p`, not `-b`, because tsconfig.app.json carries an incremental cache
+# that build mode's own-inputs-only staleness check would wrongly trust across a
+# dependency change. See test_floor_typechecks_the_way_ci_does.
+TSC_APP_PROJECT = "tsc -p tsconfig.app.json"
+
 
 def _load(module_name, filename):
     return load_skill_script(module_name, SCRIPTS_DIR / filename)
@@ -31,6 +41,40 @@ def _load(module_name, filename):
 
 resolve_profile = _load("_pp_resolve_profile", "resolve_profile.py")
 pr_status = _load("_pp_pr_status", "pr_status.py")
+
+
+#: Confines every real git in the resolver tests -- the fixture's and the
+#: script's -- to the scratch repository: the operator's global and system
+#: config are pointed away (a ``commit.gpgsign``, ``init.templateDir`` or
+#: ``core.hooksPath`` there would reach the fixture's own ``git init``/``commit``),
+#: and an inherited ``GIT_DIR`` cannot redirect ``-C <repo>`` elsewhere.
+_HERMETIC_GIT = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+_GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
+
+
+def _hermetic_git(monkeypatch) -> dict[str, str]:
+    """Pin the containment above into this process (read by the script's own git)
+    and return a copy for a child the test spawns directly."""
+    for name in _GIT_LOCATION_VARS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in _HERMETIC_GIT.items():
+        monkeypatch.setenv(name, value)
+    return dict(os.environ)
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def _seed_repo(repo: Path) -> None:
+    """A repository at *repo* with an identity, ready for the test's own commit."""
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
 
 
 # --------------------------------------------------------------------------
@@ -46,14 +90,13 @@ def test_generic_fallback_on_empty_repo(tmp_path):
     assert prof["single_commit"] is False
 
 
-def test_profile_is_loaded_from_base_ref_not_worktree(tmp_path):
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+def test_profile_is_loaded_from_base_ref_not_worktree(tmp_path, monkeypatch):
+    _hermetic_git(monkeypatch)
+    _seed_repo(tmp_path)
     profile = tmp_path / ".prepare-pr.toml"
     profile.write_text("[project]\nsingle_commit = true\n")
-    subprocess.run(["git", "add", ".prepare-pr.toml"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    _git(tmp_path, "add", ".prepare-pr.toml")
+    _git(tmp_path, "commit", "-qm", "base")
     profile.write_text("[project]\nsingle_commit = false\n")
 
     resolved = resolve_profile.resolve(str(tmp_path), base_ref="HEAD")
@@ -62,13 +105,12 @@ def test_profile_is_loaded_from_base_ref_not_worktree(tmp_path):
     assert resolved["single_commit"] is True
 
 
-def test_branch_only_profile_is_ignored_when_base_has_none(tmp_path):
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+def test_branch_only_profile_is_ignored_when_base_has_none(tmp_path, monkeypatch):
+    _hermetic_git(monkeypatch)
+    _seed_repo(tmp_path)
     (tmp_path / "README.md").write_text("base\n")
-    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-qm", "base")
     (tmp_path / ".prepare-pr.toml").write_text("[project]\nsingle_commit = true\n")
 
     resolved = resolve_profile.resolve(str(tmp_path), base_ref="HEAD")
@@ -77,17 +119,16 @@ def test_branch_only_profile_is_ignored_when_base_has_none(tmp_path):
     assert resolved["single_commit"] is False
 
 
-def test_branch_deleting_a_review_workflow_cannot_drop_the_lane(tmp_path):
+def test_branch_deleting_a_review_workflow_cannot_drop_the_lane(tmp_path, monkeypatch):
     """Auto-detection is pinned to the base ref too: deleting a review workflow
     in the checkout must not remove that reviewer from the resolved profile."""
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    _hermetic_git(monkeypatch)
+    _seed_repo(tmp_path)
     wf = tmp_path / ".github" / "workflows"
     wf.mkdir(parents=True)
     (wf / "codex-review.yml").write_text("name: review\n")
-    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
     (wf / "codex-review.yml").unlink()
 
     resolved = resolve_profile.resolve(str(tmp_path), base_ref="HEAD")
@@ -97,37 +138,39 @@ def test_branch_deleting_a_review_workflow_cannot_drop_the_lane(tmp_path):
     assert resolved["reviewers"][0]["contract"] == ".github/workflows/codex-review.yml"
 
 
-def test_unresolvable_base_ref_is_a_hard_error(tmp_path):
+def test_unresolvable_base_ref_is_a_hard_error(tmp_path, monkeypatch):
     """A base ref that names nothing must fail loudly, never silently hand
     resolution back to the branch checkout."""
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    _hermetic_git(monkeypatch)
+    _seed_repo(tmp_path)
     (tmp_path / "README.md").write_text("base\n")
-    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-qm", "base")
 
     with pytest.raises(RuntimeError, match="cannot resolve base ref"):
         resolve_profile.resolve(str(tmp_path), base_ref="no-such-ref")
 
 
-def test_cli_without_base_ref_pins_to_the_remote_default_branch(tmp_path):
+def test_cli_without_base_ref_pins_to_the_remote_default_branch(tmp_path, monkeypatch):
     """The documented no-argument invocation must not read reviewer authority
     from the branch checkout when a remote base exists to pin to."""
+    env = _hermetic_git(monkeypatch)
     upstream = tmp_path / "upstream"
     upstream.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=upstream, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=upstream, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=upstream, check=True)
+    _seed_repo(upstream)
     (upstream / ".prepare-pr.toml").write_text("[project]\nsingle_commit = true\n")
-    subprocess.run(["git", "add", ".prepare-pr.toml"], cwd=upstream, check=True)
-    subprocess.run(["git", "commit", "-qm", "base"], cwd=upstream, check=True)
+    _git(upstream, "add", ".prepare-pr.toml")
+    _git(upstream, "commit", "-qm", "base")
     clone = tmp_path / "clone"
-    subprocess.run(["git", "clone", "-q", str(upstream), str(clone)], check=True)
+    _git(tmp_path, "clone", "-q", str(upstream), str(clone))
     (clone / ".prepare-pr.toml").write_text("[project]\nsingle_commit = false\n")
 
+    # The script as a process, from the clone it is handed rather than from
+    # pytest's CWD: its git must find only the fixture.
     proc = subprocess.run(
         [sys.executable, str(SCRIPTS_DIR / "resolve_profile.py"), str(clone)],
+        cwd=clone,
+        env=env,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -186,7 +229,7 @@ def test_kirocrew_markers_load_bundled_profile(tmp_path):
     assert prof["readiness"]["status_context"] == "PR Readiness"
     models = {r["name"]: r["model"] for r in prof["reviewers"]}
     assert models["gpt"] == "gpt-5.6-sol"
-    assert models["opus"] == "claude-opus-4.8"
+    assert models["opus"] == "claude-opus-5"
 
 
 def test_opus_profile_model_matches_the_ci_workflow():
@@ -286,9 +329,10 @@ def _ci_workflow_run_text() -> str:
     """Every blocking CI workflow, with comment-only lines removed.
 
     Every scan here matches a COMMAND, never a comment. ci.yml explains in
-    prose why the Type check step uses `tsc -b` and not `npm run typecheck`,
-    so a naive grep for `npm run <script>` finds a script CI deliberately does
-    NOT run -- the same trap as reading a ratchet number out of a comment.
+    prose why the Type check step spells out `tsc -p tsconfig.app.json` and not
+    `npm run typecheck`, so a naive grep for `npm run <script>` finds a script CI
+    deliberately does NOT run -- the same trap as reading a ratchet number out of
+    a comment.
 
     Both blocking workflows are read, not just ci.yml. The cheap lint gates now
     live in fast-gate.yml and ci.yml blocks on it through `await-fast-gate`, so a
@@ -305,6 +349,41 @@ def _ci_workflow_run_text() -> str:
             )
         )
     return "\n".join(parts)
+
+
+def test_gate_python_floor_matches_project_metadata():
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    config = configparser.ConfigParser()
+    config.read(REPO_ROOT / "setup.cfg", encoding="utf-8")
+    assert project["project"]["requires-python"] == ">=3.12"
+    assert config["options"]["python_requires"] == ">=3.12"
+
+
+@pytest.mark.parametrize("version", [(3, 9, 0), (3, 10, 20), (3, 11, 15), (3, 12, 0), (3, 13, 0)])
+def test_first_floor_gate_checks_and_reports_python(version, tmp_path):
+    data = json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))
+    argv = shlex.split(data["gates"][0])
+    assert argv[:2] == ["python3", "-c"] and len(argv) == 3
+    reported_version = ".".join(map(str, version))
+    prelude = (
+        f"import sys; sys.version_info = {version!r}; "
+        f"sys.version = {reported_version!r}; sys.executable = 'fixture-python'; "
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", prelude + argv[2]],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=10,
+    )
+    assert reported_version in result.stdout
+    assert "executable: fixture-python" in result.stdout
+    if version >= (3, 12):
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1
+        assert "require Python >=3.12" in result.stderr
 
 
 def test_every_floor_command_names_a_real_target():
@@ -355,6 +434,10 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     exempt_scripts = {
         # Chooses WHICH tests to run for the changed surface; not itself a gate.
         "scripts/ci-surface-tests.py",
+        # Linux-only E2E orchestration, not a static scan: boots isolated
+        # gateways and browsers after CI provisions its namespace capability.
+        # Keep real E2E proof in CI, not in the repeated local scan floor.
+        "scripts/ci_e2e_parallel.py",
         # Generates the manifest. verify_vendor_manifest.py is the checker, and
         # that one is in the floor.
         "scripts/vendor_manifest.sh",
@@ -373,6 +456,13 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         # bounded CI step records unavailable evidence on failure; local
         # prepare-pr must not download a model or claim a calibration score.
         "scripts/ci-member-memory-benchmark.py",
+        # Reports Python advisories against a baseline and cannot fail a build on
+        # what it finds, so by this floor's own rule -- only repeatable
+        # verdict-producing gates belong here -- it is not a floor gate. It also
+        # queries an advisory database over the network, so putting it in the
+        # pre-push floor would make every contributor's push depend on that
+        # service being up in order to print a number nobody is blocked on.
+        "scripts/check_python_audit.py",
     }
 
     invoked = set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", run_text))
@@ -435,7 +525,8 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         # exemption, so keep the reason accurate.
         "node": "diagnostic blob-reconcile step; the gating bundle-size step is in gates[]",
     }
-    tools = set(re.findall(r"(?m)^\s*run: ([a-z][a-z0-9_-]+) ", run_text))
+    # exec replaces the shell; classify its payload, not the shell builtin.
+    tools = set(re.findall(r"(?m)^\s*run: (?:exec\s+)?([a-z][a-z0-9_-]+) ", run_text))
     tool_missing = sorted(
         t for t in tools - set(exempt_tools) if not re.search(rf"\b{re.escape(t)}\b", floor)
     )
@@ -444,6 +535,20 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         "Add each to profiles/kirocrew.json gates[] in its CI-exact form, or "
         "add it to exempt_tools here with the reason it is not a local gate."
     )
+
+
+@pytest.mark.parametrize(
+    "command, missing",
+    [
+        ("exec uncovered-static-check --verify", "uncovered-static-check"),
+        ("exec python scripts/check_uncovered_static.py", "scripts/check_uncovered_static.py"),
+    ],
+)
+def test_floor_still_rejects_uncovered_scans_behind_exec(monkeypatch, command, missing):
+    run_text = _ci_workflow_run_text() + f"\n    run: {command}\n"
+    monkeypatch.setattr(sys.modules[__name__], "_ci_workflow_run_text", lambda: run_text)
+    with pytest.raises(AssertionError, match=re.escape(missing)):
+        test_ci_blocking_scans_are_covered_by_the_floor()
 
 
 def test_test_gates_are_diff_scoped_and_carry_a_base_ref():
@@ -521,19 +626,32 @@ def test_scoped_runner_self_test_passes():
 
 
 def test_floor_typechecks_the_way_ci_does():
-    """The floor spells out `tsc -b` rather than going through an npm script.
+    """The floor names the app project directly rather than going through an npm
+    script, and it names it with `-p`, not `-b`.
 
-    Build mode is what makes the check real: the root tsconfig is `files: []`
-    plus project references, and references are followed only by `-b`, so any
-    single-project invocation there compiles an EMPTY program and passes
-    unconditionally. Naming the command directly means the floor cannot be
-    changed out from under itself by an edit to `package.json` -- the same reason
-    ci.yml's Type check step spells it out too.
+    Naming the project is what makes the check real: the root tsconfig is
+    `files: []` plus project references, so a bare `tsc --noEmit` there compiles
+    an EMPTY program and passes unconditionally. Spelling the command out means
+    the floor cannot be changed out from under itself by an edit to
+    `package.json` -- the same reason ci.yml's Type check step spells it out too.
+
+    `-p` rather than `-b` because `tsconfig.app.json` carries an incremental
+    cache: build mode judges "up to date" from the project's own inputs only, so
+    a changed dependency `.d.ts` with an untouched `src/` is reported up to date
+    with 0 errors (measured: `-b` 0 errors in 0.3 s where `-p` and a cold run both
+    reported 1822). `-p` re-hashes every program file, node_modules included.
     """
     gates = "\n".join(
         json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))["gates"]
     )
-    assert "tsc -b" in gates, "the gate floor no longer type-checks with `tsc -b`"
+    assert TSC_APP_PROJECT in gates, (
+        f"the gate floor no longer type-checks with `{TSC_APP_PROJECT}`"
+    )
+    assert "tsc -b" not in gates, (
+        "the floor type-checks in build mode; with the incremental cache in "
+        "tsconfig.app.json, `-b` reports a changed dependency `.d.ts` as up to date "
+        "without re-checking anything"
+    )
     assert "run typecheck" not in gates, (
         "the floor reaches type-checking through an npm script, so a package.json "
         "edit can silently change what this gate runs"
@@ -541,31 +659,78 @@ def test_floor_typechecks_the_way_ci_does():
 
 
 def test_typecheck_script_actually_type_checks():
-    """`npm run typecheck` must run in BUILD mode, or it checks nothing at all.
+    """`npm run typecheck` must name the app project, or it checks nothing at all.
 
     `website/tsconfig.json` is a solution-style config -- `{"files": [], "references":
-    [...]}`. TypeScript follows `references` only in build mode, so `tsc --noEmit`
-    there compiles an empty program: measured 0 files listed, exit 0 with a genuine
-    type error present in `src/App.tsx`. `npm run check` chains this script, so the
-    one command that looks like a pre-push gate would pass over the whole tree.
+    [...]}`. A bare `tsc --noEmit` there compiles an empty program: measured 0 files
+    listed, exit 0 with a genuine type error present in `src/App.tsx`. `npm run
+    check` chains this script, so the one command that looks like a pre-push gate
+    would pass over the whole tree.
 
     Nothing else pins the spelling, so without this a revert to `tsc --noEmit`
-    restores a gate that is enforced in appearance only.
+    restores a gate that is enforced in appearance only, and a revert to `tsc -b`
+    restores one that skips a changed dependency (see
+    test_floor_typechecks_the_way_ci_does).
     """
     scripts = json.loads(
         (REPO_ROOT / "website" / "package.json").read_text(encoding="utf-8")
     )["scripts"]
     typecheck = scripts["typecheck"]
 
-    assert "tsc -b" in typecheck, (
-        f"website `typecheck` script is {typecheck!r}; it must use build mode "
-        "(`tsc -b`) because the root tsconfig has `files: []` and a "
-        "non-build invocation there type-checks zero files"
+    assert TSC_APP_PROJECT in typecheck, (
+        f"website `typecheck` script is {typecheck!r}; it must name the app project "
+        f"(`{TSC_APP_PROJECT}`) because the root tsconfig has `files: []` and a "
+        "bare invocation there type-checks zero files"
+    )
+    assert "tsc -b" not in typecheck, (
+        f"website `typecheck` script is {typecheck!r}; build mode's up-to-date check "
+        "ignores dependency changes once tsconfig.app.json has an incremental cache"
     )
     assert "--noEmit" not in typecheck, (
         f"website `typecheck` script is {typecheck!r}; `--noEmit` selects "
         "single-project mode, which compiles an empty program against the "
         "solution-style root tsconfig"
+    )
+
+
+def test_ci_type_check_step_spells_the_type_check_like_the_floor():
+    """ci.yml's Type check step and the floor must run the same command.
+
+    The CI-coverage scan above mirrors `scripts/` and `npm run` invocations, but
+    the type check is a bare `npx tsc` line, so nothing else notices when one
+    side changes spelling. Both sides must name the app project with `-p`; a
+    return to `tsc -b` on either side reintroduces the false green that build
+    mode's up-to-date check gives a changed dependency once the incremental
+    cache exists.
+    """
+    run_text = _ci_workflow_run_text()
+    tsc_lines = [ln.strip() for ln in run_text.splitlines() if "tsc " in ln]
+    assert tsc_lines, "no `tsc` command visible in the blocking CI workflows"
+    assert any(TSC_APP_PROJECT in ln for ln in tsc_lines), (
+        f"CI type-checks with {tsc_lines!r}, not `{TSC_APP_PROJECT}`"
+    )
+    assert not any("tsc -b" in ln for ln in tsc_lines), (
+        f"CI type-checks in build mode ({tsc_lines!r}); `-b` trusts the incremental "
+        "cache across a dependency change"
+    )
+
+
+def test_named_project_is_the_root_tsconfigs_only_reference():
+    """`-p tsconfig.app.json` checks exactly one project; the root must list only it.
+
+    `tsc -b` on the solution root followed every reference. `-p` does not, so if
+    a second project is ever added to `website/tsconfig.json` every caller here
+    (package.json build/typecheck, ci.yml, the prepare-pr floor) would skip it
+    without any of them failing. This test turns that silent skip into a
+    decision: extend the callers, or go back to a spelling that follows
+    references and re-examine the cache.
+    """
+    root = json.loads((REPO_ROOT / "website" / "tsconfig.json").read_text(encoding="utf-8"))
+    assert root.get("files") == [], "root tsconfig is expected to be solution-style"
+    refs = [r["path"].lstrip("./") for r in root.get("references", [])]
+    assert refs == ["tsconfig.app.json"], (
+        f"website/tsconfig.json references {refs!r}; every `{TSC_APP_PROJECT}` caller "
+        "checks only tsconfig.app.json, so a new reference is a project no gate sees"
     )
 
 
@@ -736,11 +901,10 @@ def test_symlinked_config_is_refused(tmp_path):
 # --------------------------------------------------------------------------
 # TreeReader interface parity
 # --------------------------------------------------------------------------
-def test_tree_reader_worktree_and_pinned_parity(tmp_path):
+def test_tree_reader_worktree_and_pinned_parity(tmp_path, monkeypatch):
     """WorktreeReader and PinnedTreeReader share the TreeReader contract."""
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    _hermetic_git(monkeypatch)
+    _seed_repo(tmp_path)
 
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'parity'\n")
     (tmp_path / "package.json").write_text('{"scripts": {"build": "npm run build"}}')
@@ -749,8 +913,8 @@ def test_tree_reader_worktree_and_pinned_parity(tmp_path):
     (wf / "test-review.yml").write_text("name: test\n")
     (wf / "other.yaml").write_text("name: other\n")
 
-    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "initial")
 
     wt_reader = resolve_profile.WorktreeReader(str(tmp_path))
     pinned_reader = resolve_profile.PinnedTreeReader(str(tmp_path), "HEAD")

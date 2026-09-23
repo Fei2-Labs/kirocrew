@@ -1,14 +1,11 @@
 /**
  * Opt-in native OS toast for "a background chat finished".
  *
- * Companion to the turn-complete chime in `notificationEvent.ts`, and
- * deliberately NOT the same gate. `shouldChimeOnTurnDone()` ignores focus and
- * visibility on purpose — every finished turn is audible, active chat or not —
- * so reusing it here would re-litigate that policy. A toast is louder than a
- * chime: it persists in the OS notification centre and it names WHICH session
- * finished, which is the whole point for a user tracking several background
- * threads. So it stays default-OFF and fires only while the user is away from
- * the window.
+ * The caller first checks conversation attention in `notificationEvent.ts`.
+ * This helper applies the separate native-toast preference, permission, and
+ * away checks. Unlike a chime, a toast persists in the OS notification centre
+ * and names WHICH session needs the user, so it stays default-OFF and fires
+ * only while the user is away from the window.
  *
  * The preference lives in localStorage rather than gateway config because it is
  * a per-device browser capability — one machine may have OS notifications muted
@@ -16,6 +13,7 @@
  * Settings > Notifications.
  */
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
+import { isWindowAway } from './windowAway'
 
 /** localStorage key holding the opt-in. Absent — or anything but `'1'` —
  *  means off, so a corrupt or half-written value degrades to the default
@@ -69,8 +67,7 @@ export function shouldNotifyOnChatComplete(opts: {
   if (!opts.slot || opts.reconnecting) return false
   if (!loadChatCompleteNotify()) return false
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false
-  // "Away" needs both axes: `hidden` covers minimized / another virtual desktop
-  // / a background tab, while `hasFocus()` covers a window that is fully
-  // visible but sitting behind another application.
-  return document.hidden || !document.hasFocus()
+  // The shared "away" predicate (both axes: hidden, and visible-but-unfocused);
+  // see windowAway.ts for why one axis is not enough.
+  return isWindowAway()
 }

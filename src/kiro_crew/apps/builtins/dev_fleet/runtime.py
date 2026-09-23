@@ -10,9 +10,10 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.dev_fleet import npm_preflight, sync_runner
@@ -118,7 +119,7 @@ def _find_cli() -> list[str]:
     ``__main__`` also performs the SSL-cert / UTF-8-console setup that must run
     before ``kiro_crew.cli`` is imported, so it is the only correct ``-m`` entry.
     """
-    return [sys.executable, "-m", "kiro_crew"]
+    return platform_compat.isolated_python_argv("-m", "kiro_crew")
 
 
 # Git hardening injected as ENVIRONMENT (same precedence as `git -c`, which
@@ -437,8 +438,16 @@ async def _run_cmd(
     env: dict | None = None,
     timeout: int = 30,
     mode: str = "standard",
+    pre_spawn: Callable[[], Awaitable[str | None]] | None = None,
 ) -> tuple[int, str, str]:
     """Run a subprocess asynchronously, return (returncode, stdout, stderr).
+
+    ``pre_spawn`` is a last gate evaluated AFTER sandbox preparation and IMMEDIATELY
+    before the child is spawned — the spawn is the only await that follows it. It
+    returns ``None`` to proceed or a reason to refuse (``(-1, "", reason)``). The
+    worktree removal passes its lease renewal here, so "the gateway still excludes
+    a cutover from this worktree" is proven with nothing of unbounded duration —
+    the preparation hop included — left between the proof and the mutation.
 
     Every spawn routes through ``sandboxed_spawn_argv`` (OS isolation +
     credential-scrubbed env): these commands run against agent-influenced
@@ -454,7 +463,11 @@ async def _run_cmd(
     # PATH begins with agent-writable dirs, where a planted git/gh shim
     # would otherwise run with workflow credentials on every auto-refresh.
     if cmd and "/" not in cmd[0]:
-        trusted = _trusted_bin(cmd[0])
+        # A cache miss stats and resolves candidates under _TRUSTED_PATH: filesystem
+        # work, so it hops off the loop like the preparation step below.
+        trusted = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _trusted_bin, cmd[0]
+        )
         if trusted is None:
             return -1, "", (f"{_UNRESOLVED_TOOL_PREFIX}{cmd[0]!r} in {_TRUSTED_PATH}")
         cmd = [trusted, *cmd[1:]]
@@ -473,6 +486,15 @@ async def _run_cmd(
     except RuntimeError as exc:
         # Fail closed: no sandbox backend and unsandboxed exec not opted in.
         return -1, "", f"sandbox unavailable: {exc}"
+    if pre_spawn is not None:
+        refusal = await pre_spawn()
+        if refusal is not None:
+            if cleanup:
+                try:
+                    os.unlink(cleanup)
+                except OSError:
+                    pass
+            return -1, "", refusal
     try:
         proc = await create_subprocess_limited(
             *cmd,
@@ -977,6 +999,22 @@ _POSIX_SAFE_ENV_KEYS = (
     "TMPDIR",
     "XDG_RUNTIME_DIR",
     "DBUS_SESSION_BUS_ADDRESS",
+    # A registry URL, not a credential: it is how an operator points every
+    # Dev Fleet npm step (the preflight rehearsal AND the real `npm ci` /
+    # `npm run build`) at a public registry or a private mirror when the
+    # host's ~/.npmrc default registry is unreachable or its token has
+    # expired. npm_preflight's own docstring insists its flags MIRROR the
+    # real install step, so this must reach both or they resolve
+    # differently. Do NOT add any `NPM_CONFIG_*_AUTHTOKEN`, `NPM_TOKEN`,
+    # `_auth`-suffixed key, `NPM_CONFIG_USERCONFIG` (points at a file that
+    # may hold a token), or a wildcard `NPM_CONFIG_*` — those are
+    # credentials or can carry them, and this allowlist exists so
+    # worktree-controlled build scripts cannot read gateway credentials.
+    # `_build_env` additionally validates the VALUE of this key before
+    # forwarding it — see `_sanitized_npm_registry_env` — since URL syntax
+    # itself permits a userinfo-embedded credential, a query, or a fragment
+    # that "not a credential" does not rule out.
+    "NPM_CONFIG_REGISTRY",
 )
 
 # Windows counterparts of the POSIX set above, written in the spelling Microsoft
@@ -1035,6 +1073,37 @@ def _is_safe_env_key(key: str) -> bool:
     return platform_compat.env_key_allowed(key, _SAFE_ENV_KEYS)
 
 
+def _sanitized_npm_registry_env(value: str) -> "str | None":
+    """Validate an operator-set npm registry URL before it reaches a
+    worktree-controlled build subprocess.
+
+    The allowlist comment above the ``NPM_CONFIG_REGISTRY`` entry asserts it
+    is "a registry URL, not a credential", but URL syntax itself permits
+    userinfo (``https://user:token@host/``), a query string, or a fragment —
+    any of which can carry a secret through exactly the boundary that
+    allowlist exists to hold. A value can also carry embedded whitespace
+    (e.g. a control character or a second smuggled value) that survives
+    ``urlsplit`` inside the netloc/path rather than being rejected by it.
+    Returns *value* unchanged only when it is a bare ``http``/``https``
+    origin plus path with none of those, and ``None`` otherwise so the
+    caller drops the key outright (fail closed) rather than forward a
+    value that is not purely a location.
+    """
+    if not value or any(ch.isspace() for ch in value):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if not parsed.netloc or "@" in parsed.netloc:
+        return None
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return None
+    return value
+
+
 def _build_env(*, with_credentials: bool = False) -> dict:
     """Allowlisted base environment for build/CLI subprocesses.
 
@@ -1074,6 +1143,9 @@ def _build_env(*, with_credentials: bool = False) -> dict:
     remove one on the assumption that the other covers it.
     """
     out = {k: v for k, v in os.environ.items() if _is_safe_env_key(k)}
+    _registry_value = out.get("NPM_CONFIG_REGISTRY")
+    if _registry_value is not None and _sanitized_npm_registry_env(_registry_value) is None:
+        del out["NPM_CONFIG_REGISTRY"]
     out["PATH"] = _TRUSTED_PATH if with_credentials else _build_path()
     out.update(_GIT_ENV_NEUTRALIZERS)
     if with_credentials and _GIT_TRUSTED_HELPERS:
@@ -1134,6 +1206,7 @@ __all__ = (
     "_run_cmd",
     "_run_uninterruptible",
     "_sanitize_helper_value",
+    "_sanitized_npm_registry_env",
     "_sel",
     "_start_run",
     "_toolchain_bin",

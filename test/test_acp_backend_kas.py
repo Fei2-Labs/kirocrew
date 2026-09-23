@@ -26,19 +26,25 @@ from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
-    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_SESSION_EVICTION,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
     PROVIDER_LABEL_KAS,
 )
-from kiro_crew.config.loader import KiroCrewConfig, build_provider_factory
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.providers import acp as providers_acp
 from kiro_crew.providers.acp import AcpProvider, provider_label
 from kiro_crew.session import SessionManager
+
+#: The backends served by AcpRuntime rather than by one AcpClient per session,
+#: stated independently of the frozenset the provider property reads. A test that
+#: compared the property against that same frozenset would agree with itself no
+#: matter which harnesses were in it.
+ON_THE_ACP_RUNTIME = {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX}
 
 
 def _build_provider(backend: str) -> AcpProvider:
@@ -51,19 +57,7 @@ def _build_provider(backend: str) -> AcpProvider:
 
 
 class TestBackendPredicates:
-    """The ``is_*_backend`` predicates name individual harnesses, and
-    ``is_acp_runtime_backend`` names AcpRuntime membership — a SEPARATE set.
-
-    The provider sites that used to read ``not is_claude_backend`` now read
-    ``is_acp_runtime_backend`` (harness-parity H5/H6). In the original
-    three-backend world (``{kiro, claude, kas}``) the two were accidentally
-    equivalent: kiro+kas were the AcpRuntime members and claude was not, so
-    "runtime" and "not claude" meant the same thing. That equivalence is NOT an
-    invariant — it is the coincidence H6 exists to break. A backend that is
-    neither claude NOR on the AcpRuntime (copilot, opencode: one process per
-    session, like claude) makes the two diverge, and that divergence is what
-    keeps the opt-in capability sets from silently capturing the new harness.
-    """
+    """The three predicates are mutually exclusive and total over the known set."""
 
     def test_empty_backend_is_kiro(self):
         provider = _build_provider(ACP_BACKEND_KIRO)
@@ -88,43 +82,81 @@ class TestBackendPredicates:
 
     @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
     def test_exactly_one_predicate_holds_for_every_known_backend(self, backend):
-        # Every known backend needs its own POSITIVE predicate (H5). A backend with
-        # none makes this sum 0, which is how goose's arrival was caught: without a
-        # predicate it is identifiable only as "not the others", the negation the
-        # harness-parity rules exist to forbid.
         provider = _build_provider(backend)
         held = [
             provider.is_kiro_backend,
             provider.is_claude_backend,
             provider.is_kas_backend,
-            provider.is_copilot_backend,
             provider.is_codex_backend,
-            provider.is_goose_backend,
             provider.is_opencode_backend,
             provider.is_pi_backend,
+            provider.is_goose_backend,
+            provider.is_deepseek_backend,
+            provider.is_copilot_backend,
         ]
         assert sum(held) == 1
 
     @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
-    def test_acp_runtime_backend_is_named_set_membership(self, backend):
-        # Was asserted as `is_acp_runtime_backend is (not is_claude_backend)`,
-        # which held only while claude was the ONLY non-runtime backend. A second
-        # non-runtime backend (codex, on AcpClient) falsifies the equivalence
-        # without changing any behaviour — and an equivalence-to-a-negation is
-        # what harness parity H5 forbids in the first place. The durable
-        # invariant is membership in the named set.
-        provider = _build_provider(backend)
-        assert provider.is_acp_runtime_backend is (backend in ACP_BACKENDS_ACP_RUNTIME)
+    def test_acp_runtime_backend_answers_positive_set_membership(self, backend):
+        """The property IS membership in ACP_BACKENDS_ACP_RUNTIME, over every known
+        backend rather than a hand-picked three.
 
-    def test_codex_is_not_on_the_acp_runtime(self):
-        """The membership the parametrised test above defers to, pinned so it holds.
+        The narrower form this replaces asserted the property equalled ``not
+        is_claude_backend``, which holds only while claude is the single harness off
+        the shared runtime. Several harnesses are off it, and one that is NOT claude
+        is on it, so that equality is an accident of one snapshot of the table --
+        and an accident is the thing a membership edit can satisfy without meaning
+        to. Membership is the durable statement (harness-parity H5/H6).
 
-        codex-acp is one process per session, so it belongs on AcpClient. Adding it
-        to ACP_BACKENDS_ACP_RUNTIME would route an activated codex session onto
-        AcpRuntime + AcpSessionHandle — the wrong transport for a per-session Node
-        adapter — and without this assertion that edit would land green.
+        The expected members are spelled in ``ON_THE_ACP_RUNTIME`` above rather than
+        read back off the set the property consults, so opting a harness in has to
+        be written twice to land green; the equality assertion below is what ties
+        the two spellings together.
         """
-        assert _build_provider(ACP_BACKEND_CODEX).is_acp_runtime_backend is False
+        provider = _build_provider(backend)
+        assert provider.is_acp_runtime_backend is (backend in ON_THE_ACP_RUNTIME)
+        assert ON_THE_ACP_RUNTIME == set(ACP_BACKENDS_ACP_RUNTIME)
+
+    def test_a_harness_off_the_runtime_need_not_be_claude(self):
+        """The backends where the negation and the membership disagree.
+
+        These are non-claude harnesses that are also off the shared runtime, so
+        ``not is_claude_backend`` answers True where the property answers False.
+        They are the evidence that the positive form carries information the
+        negation does not -- without at least one of them the two spellings would be
+        interchangeable and the block above would pin nothing.
+        """
+        off_the_runtime = sorted(ACP_BACKENDS_KNOWN - ON_THE_ACP_RUNTIME - {ACP_BACKEND_CLAUDE})
+        assert off_the_runtime, (
+            "every backend off the shared runtime is claude, so the property and "
+            "``not is_claude_backend`` cannot be told apart -- pin membership against "
+            "a harness that distinguishes them or this block is vacuous"
+        )
+        for backend in off_the_runtime:
+            provider = _build_provider(backend)
+            assert provider.is_claude_backend is False
+            assert provider.is_acp_runtime_backend is False
+
+    def test_codex_is_on_the_runtime_and_separately_in_the_eviction_set(self):
+        """codex is a member that is not kiro-shaped, and two sets answer for it.
+
+        One codex-acp process serves N sessions and keeps them apart, which is the
+        whole question ACP_BACKENDS_ACP_RUNTIME asks -- so the shared-runtime start
+        path is the right transport for it, and a provider that answered False here
+        would open one adapter per session.
+
+        Transport membership does not by itself grant a teardown that disposes a
+        session; that is ACP_BACKENDS_SESSION_EVICTION's question, and codex answers
+        it on its own evidence: its teardown verb is ``session/close``, after which
+        the sessionId stops answering (measured live). Both are pinned here to keep
+        the two questions from collapsing into one: a call site that read the
+        transport answer where the eviction answer belongs would admit the next
+        runtime-capable harness whose teardown frees nothing.
+        """
+        assert _build_provider(ACP_BACKEND_CODEX).is_acp_runtime_backend is True
+        assert ACP_BACKEND_CODEX in ACP_BACKENDS_ACP_RUNTIME
+        assert ACP_BACKEND_CODEX in ACP_BACKENDS_SESSION_EVICTION
+        assert ACP_BACKEND_KIRO in ACP_BACKENDS_SESSION_EVICTION
 
 
 class TestUnknownBackendRejected:
@@ -142,9 +174,7 @@ class TestUnknownBackendRejected:
                 AcpProvider(acp_backend="Kas")  # case matters
         message = str(exc.value)
         assert ACP_BACKEND_KAS in message
-        # The message lists what is ACCEPTED, so a known-but-withheld id must not
-        # appear in it: naming one would advertise a value the gate then refuses.
-        assert ACP_BACKEND_GOOSE not in message
+        assert ACP_BACKEND_CLAUDE in message
 
 
 class TestProviderLabel:
@@ -167,7 +197,8 @@ class TestProviderLabel:
         the suite as claude — silently corrupting session-map persistence.
         """
         mock_provider = MagicMock(spec=AcpProvider)
-        mock_provider.backend = ACP_BACKEND_KIRO
+        mock_provider.client = MagicMock()
+        mock_provider.client.backend = ACP_BACKEND_KIRO
         assert provider_label(mock_provider) == PROVIDER_LABEL_DEFAULT
 
 
@@ -219,7 +250,7 @@ class TestConfigThreading:
     def test_configured_kas_reaches_the_provider(self):
         cfg = KiroCrewConfig()
         cfg.agent.acp_backend = ACP_BACKEND_KAS
-        provider = build_provider_factory(cfg)(session_key="test:kas", agent="")
+        provider = cfg.create_provider_factory()(session_key="test:kas", agent="")
         assert provider.is_kas_backend is True
         assert provider.client.backend == ACP_BACKEND_KAS
 
@@ -269,7 +300,7 @@ class TestConfigRoundTrip:
         cfg = _load_agent_config({"acp_backend": ACP_BACKEND_KAS}, tmp_path)
         assert cfg.agent.acp_backend == ACP_BACKEND_KAS
         assert cfg.to_dict()["agent"]["acp_backend"] == ACP_BACKEND_KAS
-        provider = build_provider_factory(cfg)(session_key="test:rt", agent="")
+        provider = cfg.create_provider_factory()(session_key="test:rt", agent="")
         assert provider.is_kas_backend is True
 
     @pytest.mark.parametrize("bad", ["kiro-cli", "KAS", "claude_code", 7, None, []])

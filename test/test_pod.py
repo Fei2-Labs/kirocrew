@@ -7,15 +7,18 @@ import ast
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew import platform_compat
 from kiro_crew.pod import cli as pod_cli
@@ -833,21 +836,55 @@ class TestPortAllocation:
         Worth pinning rather than assuming: an un-runnable probe RAISES precisely
         because descriptor exhaustion is a real state, so a scan leaking one
         per peer would be feeding the very failure it sits in front of.
+
+        Asserted by spying on `os.open`/`os.close` and pairing what THIS scan
+        acquired under the pods directory, rather than by a `/proc/self/fd`
+        census: that census measures the whole xdist worker at two instants, so
+        two descriptors merely open at the second sample -- a pool thread holding
+        a file and a socket, a log rotation, a metrics export -- fail a pod-port
+        test for a reason that has nothing to do with pods. The pairing needs no
+        repeat loop either; the loop only existed to out-amplify census noise.
         """
         c = self._plane(tmp_path, monkeypatch)
         c.pods_dir.mkdir(parents=True, exist_ok=True)
         (c.pods_dir / "adir.env").mkdir()
         c.env_file("real").write_text("PORT='7877'\n")
 
-        def _open_fds() -> int:
-            return len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else -1
+        opened: list[int] = []
+        closed: list[int] = []
+        real_open, real_close = os.open, os.close
 
-        before = _open_fds()
-        for _ in range(50):
-            rt._ports_claimed_by_other_pods(c, "mine")
-        after = _open_fds()
-        if before != -1:
-            assert after <= before + 1, f"descriptors grew from {before} to {after}"
+        def tracking_open(target, *args, **kwargs):
+            fd = real_open(target, *args, **kwargs)
+            if str(target).startswith(str(c.pods_dir)):
+                opened.append(fd)
+            return fd
+
+        def tracking_close(fd):
+            closed.append(fd)
+            return real_close(fd)
+
+        # A private context, not the shared `monkeypatch` fixture: that instance is
+        # the one `_plane` pins this plane's env vars through, and undoing it here
+        # would take the plane down with the spies.
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(os, "open", tracking_open)
+            patched.setattr(os, "close", tracking_close)
+            assert rt._ports_claimed_by_other_pods(c, "mine") == {7877: "real"}
+
+        # The leak property itself, which holds on every platform: whatever this
+        # scan opened under the pods directory, it also closed.
+        assert opened, "the scan opened nothing -- the spy missed the read seam"
+        assert set(opened) <= set(closed), f"the scan leaked a descriptor: {opened} vs {closed}"
+        # The DIRECTORY branch is POSIX-only, and that is a property of the OS
+        # rather than of this scan: Windows has no `O_DIRECTORY` and refuses
+        # `os.open` on a directory outright, so the non-regular refusal there is
+        # reached by the open RAISING and never holds a descriptor at all. Only
+        # where a directory can be opened is there a second fd to account for --
+        # and that branch, which rejects only after opening, is where a leak
+        # would hide, so it is worth pinning exactly where it exists.
+        if os.name != "nt":
+            assert len(opened) == 2, f"expected one open per peer entry, got {opened}"
 
     @pytest.mark.skipif(
         not platform_compat.IS_POSIX, reason="symlink creation needs elevation on Windows"
@@ -2635,6 +2672,46 @@ class TestEveryBootPathWriteRefusesAPlantedLink:
 
         assert victim.read_text() == "keep me"
 
+    def test_a_directory_link_at_the_seed_config_is_refused(self, tmp_path: Path) -> None:
+        """Same guard, with the shape a Windows writer can actually plant.
+
+        A junction is directory-only, so it cannot alias a host FILE -- but a
+        live one at ``config.json`` answered True to ``exists()`` and False to
+        ``is_symlink()``, so the create-only guard read it as "already
+        configured" and the pod booted with a directory where its config should
+        be. Built with the product's own link helper so each platform exercises
+        its own shape (junction on an unelevated Windows shard)."""
+        somewhere = tmp_path / "somewhere"
+        somewhere.mkdir()
+        home = tmp_path / "home"
+        home.mkdir()
+        platform_compat.symlink_or_junction(str(somewhere), str(home / "config.json"))
+        assert platform_compat.is_link_or_junction(home / "config.json")
+
+        with pytest.raises(rt.PodError, match="symbolic link or junction"):
+            rt.write_pod_config(home, "")
+
+        assert not any(somewhere.iterdir()), "wrote through the link"
+
+    def test_a_junction_shaped_seed_config_is_refused_on_every_platform(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The junction SHAPE, simulated so POSIX shards pin the guard too: the
+        OS junction oracle ``platform_compat._ISJUNCTION`` recognises one real,
+        empty directory while every ``pathlib`` predicate keeps its true answer
+        (``is_symlink()`` False, ``exists()`` True). The old guard returned
+        silently here."""
+        home = tmp_path / "home"
+        home.mkdir()
+        entry = home / "config.json"
+        entry.mkdir()
+        monkeypatch.setattr(platform_compat, "_ISJUNCTION", lambda p: Path(p) == entry)
+        assert platform_compat.is_link_or_junction(entry)
+        assert not entry.is_symlink()
+
+        with pytest.raises(rt.PodError, match="junction"):
+            rt.write_pod_config(home, "")
+
     def test_a_normal_home_still_gets_its_config_and_workspace(self, tmp_path: Path) -> None:
         """The other half: hardening must not break the ordinary path."""
         home = tmp_path / "home"
@@ -4134,6 +4211,114 @@ class TestOrphanSymlinkSafety:
         assert "symlink" in capsys.readouterr().out
 
 
+class TestOrphanJunctionSafety:
+    """The same threat as :class:`TestOrphanSymlinkSafety`, in the shape it takes on
+    Windows. A directory symlink there needs SeCreateSymbolicLinkPrivilege, so the
+    only link an unelevated same-user writer can plant under pod_root is a
+    JUNCTION -- which answers True to ``is_dir()`` and False to ``is_symlink()``.
+    Every ``is_symlink()`` guard in the orphan / reclaim path was therefore blind
+    to exactly the link that can occur. Each case runs twice: once
+    through the product's own ``symlink_or_junction`` helper (the real shape on the
+    Windows shards, a symlink elsewhere), once with the junction shape SIMULATED so
+    POSIX shards pin the guard as well -- the OS junction oracle
+    ``platform_compat._ISJUNCTION`` recognises one real directory while every
+    ``pathlib`` predicate keeps its true answer."""
+
+    @staticmethod
+    def _plane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PodConfig:
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        c = PodConfig.load()
+        c.pod_root.mkdir(parents=True, exist_ok=True)
+        return c
+
+    @staticmethod
+    def _fake_junction(monkeypatch: pytest.MonkeyPatch, entry: Path) -> None:
+        entry.mkdir()
+        monkeypatch.setattr(platform_compat, "_ISJUNCTION", lambda p: Path(p) == entry)
+        assert platform_compat.is_link_or_junction(entry)
+        assert entry.is_dir() and not entry.is_symlink()
+
+    def test_orphan_homes_never_lists_a_directory_link(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        c = self._plane(tmp_path, monkeypatch)
+        (c.pod_root / "live").mkdir()
+        platform_compat.symlink_or_junction(str(c.pod_root / "live"), str(c.pod_root / "alias"))
+        monkeypatch.setattr(rt, "active_names", lambda cc: {"live"})
+        assert rt.orphan_homes(c) == []
+
+    def test_orphan_homes_never_lists_a_junction_shaped_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        c = self._plane(tmp_path, monkeypatch)
+        self._fake_junction(monkeypatch, c.pod_root / "alias")
+        monkeypatch.setattr(rt, "active_names", lambda cc: set())
+        assert rt.orphan_homes(c) == []
+
+    def test_cleanup_home_refuses_a_directory_link_as_a_link(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """rc 2 and named as a link. On Windows the old guard resolved the
+        junction to the live sibling, passed containment, and -- because stdlib
+        rmtree refuses a junction root -- spun the whole retry window before
+        reporting the sibling's files as "something is still writing there"."""
+        c = self._plane(tmp_path, monkeypatch)
+        victim = c.pod_root / "live"
+        victim.mkdir()
+        (victim / "sessions.db").write_text("precious")
+        platform_compat.symlink_or_junction(str(victim), str(c.pod_root / "alias"))
+
+        assert rt.cleanup_home(c, "alias") == 2
+
+        assert (victim / "sessions.db").exists(), "followed the link and deleted the target"
+        out = capsys.readouterr().out
+        assert "junction" in out and "still writing" not in out
+
+    def test_cleanup_home_refuses_a_junction_shaped_entry_on_every_platform(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Simulated shape. The old guard passed the entry as a plain child of
+        pod_root and rmtree'd it: rc 0 over a planted link."""
+        c = self._plane(tmp_path, monkeypatch)
+        entry = c.pod_root / "alias"
+        self._fake_junction(monkeypatch, entry)
+        monkeypatch.setattr(
+            rt.shutil, "rmtree", lambda p, ignore_errors=False: pytest.fail("deleted a link")
+        )
+
+        assert rt.cleanup_home(c, "alias") == 2
+
+        assert entry.exists()
+        assert "junction" in capsys.readouterr().out
+
+    def test_a_dangling_junction_shaped_swap_is_reported_as_a_link(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """The post-delete residue check. An entry swapped to a junction between
+        the pre-check and the delete survives rmtree (refused, silently under
+        ignore_errors); the old ``is_symlink()`` residue test then spun the whole
+        retry window and reported the entry's contents as survivors instead of
+        naming the link. Simulated so every platform pins it: the swap happens
+        inside the faked rmtree, and the oracle recognises the swapped entry."""
+        c = self._plane(tmp_path, monkeypatch)
+        entry = c.pod_root / "swapped"
+        entry.mkdir()  # a real dir at pre-check time
+        calls: list[int] = []
+
+        def _swap_then_refuse(p, ignore_errors=False):
+            calls.append(1)
+            # Net effect of the interleaving: the entry is now a junction, which
+            # rmtree refuses. Teach the oracle that from here on.
+            monkeypatch.setattr(platform_compat, "_ISJUNCTION", lambda q: Path(q) == entry)
+
+        monkeypatch.setattr(rt.shutil, "rmtree", _swap_then_refuse)
+        rc = rt.cleanup_home(c, "swapped")
+        assert rc == 1, "a surviving entry must be a reported failure, never rc 0"
+        assert len(calls) == 1, "a swapped link must stop the retry window at once"
+        out = capsys.readouterr().out
+        assert "junction" in out and "still writing" not in out
+
+
 class TestDownSamplesStateUnderTheLock:
     """`was_up` / `had_home` decide whether a failed stop is fatal, so sampling
     them before taking the lock let a concurrent `up` invalidate the answer: we
@@ -4428,8 +4613,118 @@ class TestRuntimeHelpers:
                 return b'{"token":"tok-xyz"}'
 
         monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda cfg, name, port: 4242)
+        monkeypatch.setattr(rt, "unix_socket_urlopen", lambda *a, **k: _Resp())
         monkeypatch.setattr(rt, "loopback_urlopen", lambda *a, **k: _Resp())
         assert rt.mint_token(c, "demo", "1h") == "tok-xyz"
+
+    def test_mint_token_uses_attested_loopback_on_windows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows mints through the ownership-attested loopback port only."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        home = c.home_dir("demo")
+        home.mkdir(parents=True)
+        (home / ".local_secret").write_text("s3cret")
+
+        class _Resp:
+            def __enter__(self) -> "_Resp":
+                return self
+
+            def __exit__(self, *a: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b'{"token":"tok-tcp"}'
+
+        tcp_calls: list[object] = []
+
+        def _tcp(req: object, timeout: float) -> "_Resp":
+            tcp_calls.append(req)
+            return _Resp()
+
+        monkeypatch.setattr(rt, "IS_WINDOWS", True)
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
+        monkeypatch.setattr(rt, "loopback_urlopen", _tcp)
+        monkeypatch.setattr(
+            rt,
+            "unix_socket_urlopen",
+            lambda *a, **k: pytest.fail("Windows must not use the unix opener"),
+        )
+        monkeypatch.setattr(
+            rt,
+            "pod_socket_path",
+            lambda *a, **k: pytest.fail("Windows must not build a unix socket path"),
+        )
+        monkeypatch.setattr(
+            rt,
+            "_attested_gateway_verifier",
+            lambda *a, **k: pytest.fail("Windows must not build a unix peer verifier"),
+        )
+
+        assert rt.mint_token(c, "demo", "1h") == "tok-tcp"
+        assert len(tcp_calls) == 1
+        req = tcp_calls[0]
+        assert req.get_header("X-local-secret") == "s3cret"  # type: ignore[attr-defined]
+
+    def test_mint_token_sends_the_secret_only_over_the_pod_socket(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The X-Local-Secret request rides the pod's AF_UNIX socket, never TCP.
+
+        A TCP transport would attest ownership and then open a
+        SEPARATE loopback connection carrying the secret: a pod exiting inside
+        that window frees the port for any local user, and loopback TCP has no
+        peer-credential API to tell the squatter from the gateway. The socket
+        lives inside the pod's owner-only home, so delivery there cannot reach
+        another user -- and `unix_socket_urlopen` has no TCP handler, making
+        "no fallback" structural. This test pins both properties: the TCP
+        opener is never consulted, and the secret-bearing request lands on
+        exactly the pod's own socket path.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        home = c.home_dir("demo")
+        home.mkdir(parents=True)
+        (home / ".local_secret").write_text("s3cret")
+
+        class _Resp:
+            def __enter__(self) -> "_Resp":
+                return self
+
+            def __exit__(self, *a: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b'{"token":"tok-uds"}'
+
+        tcp_calls: list[object] = []
+        uds_calls: list[dict[str, object]] = []
+
+        def _tcp(*a: object, **k: object) -> "_Resp":
+            tcp_calls.append(a)
+            return _Resp()
+
+        def _uds(
+            req: object, timeout: float, *, socket_path: object, verify_peer: object = None
+        ) -> "_Resp":
+            uds_calls.append({"req": req, "socket_path": socket_path, "verify_peer": verify_peer})
+            return _Resp()
+
+        monkeypatch.setattr(rt, "IS_WINDOWS", False)
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda cfg, name, port: 4242)
+        monkeypatch.setattr(rt, "loopback_urlopen", _tcp)
+        monkeypatch.setattr(rt, "unix_socket_urlopen", _uds)
+
+        assert rt.mint_token(c, "demo", "1h") == "tok-uds"
+        assert tcp_calls == []  # the secret-bearing call has no TCP path at all
+        port = rt.derive_port(c, "demo")
+        assert uds_calls[0]["socket_path"] == rt.pod_socket_path(c, "demo", port)
+        assert callable(uds_calls[0]["verify_peer"])  # peer check rides every send
+        req = uds_calls[0]["req"]
+        assert req.get_header("X-local-secret") == "s3cret"  # urllib-normalized key
 
     def test_mint_token_refuses_a_foreign_port_holder(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -4632,9 +4927,9 @@ class TestCliVerbs:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
     ) -> None:
         monkeypatch.setenv("HOME", str(tmp_path))
-        # This test asserts the LINUX path, so satisfy the platform gate — the
-        # suite must exercise it on macOS/Windows runners too.
-        monkeypatch.setattr(rt, "require_systemd", lambda: None)
+        # This test asserts the Linux install path, so satisfy the verb-entry
+        # backend gate. The low-level systemctl stub below owns reload behavior.
+        monkeypatch.setattr(rt, "require_backend", lambda: None)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
         recorded: list[tuple] = []
         monkeypatch.setattr(
@@ -4652,7 +4947,7 @@ class TestCliVerbs:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("HOME", str(tmp_path))
-        monkeypatch.setattr(rt, "require_systemd", lambda: None)
+        monkeypatch.setattr(rt, "require_backend", lambda: None)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=1))
         recorded: list[tuple] = []
         monkeypatch.setattr(
@@ -4684,6 +4979,7 @@ class TestUpVerb:
         monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "env"))
         # Force git resolution to miss so the root fallback resolves deterministically.
         monkeypatch.setattr(rt, "_git_worktrees", lambda ref: {})
+        monkeypatch.setattr(rt, "require_backend", lambda: None)
         # Insulate `_up` from the HOST's real port occupancy. `allocate_port`
         # bind-probes, so without this a developer's own pod sitting on the
         # derived port would push these tests down the fallback path and they
@@ -5272,16 +5568,189 @@ class TestReviewRound1Fixes:
             def read(self) -> bytes:
                 return b'{"token":"t"}'
 
-        def _urlopen(req: object, timeout: int = 5) -> "_Resp":
+        def _urlopen(
+            req: object,
+            timeout: int = 5,
+            *,
+            socket_path: object = None,
+            verify_peer: object = None,
+        ) -> "_Resp":
             captured["url"] = req.full_url  # type: ignore[attr-defined]
             return _Resp()
 
         # Mint now requires positive ownership proof; this test is about the URL
         # it builds, so grant the proof rather than exercising the guard here.
         monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda cfg, name, port: 4242)
+        monkeypatch.setattr(rt, "unix_socket_urlopen", _urlopen)
         monkeypatch.setattr(rt, "loopback_urlopen", _urlopen)
         rt.mint_token(c, "demo", "1 h")
         assert "ttl=1%20h" in captured["url"]
+
+
+class TestMintPeerVerification:
+    """Connect-time peer verification on the pod's unix socket.
+
+    ``port_owner`` proves the pid RECORD is fresh; these tests pin the other
+    half: the process ANSWERING the socket file must be that recorded pid, as
+    read from the kernel's peer credentials on the connected socket, before a
+    single HTTP byte (and the ``X-Local-Secret`` header behind it) is sent.
+    """
+
+    def _grant_record_freshness(self, monkeypatch: pytest.MonkeyPatch, pid: int) -> None:
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda cfg, name, port: pid)
+
+    def test_verifier_refuses_a_mismatched_peer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        self._grant_record_freshness(monkeypatch, 4242)
+        monkeypatch.setattr(rt, "get_peer_pid", lambda sock: 9999)
+        verify = rt._attested_gateway_verifier(c, "demo", 7999, Path("/x/sock"))
+        with pytest.raises(rt.PodError, match="refusing to send"):
+            verify(object())
+
+    def test_verifier_refuses_when_attestation_expires_before_connect(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The connected peer needs a fresh record, not only a matching pid."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        attestations = iter((4242, None))
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda cfg, name, port: next(attestations))
+        monkeypatch.setattr(rt, "get_peer_pid", lambda sock: 4242)
+        verify = rt._attested_gateway_verifier(c, "demo", 7999, Path("/x/sock"))
+        with pytest.raises(rt.PodError, match="not the currently attested gateway"):
+            verify(object())
+
+    def test_verifier_refuses_an_unreadable_peer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``None`` from the kernel is a refusal, never a pass (deny-by-default)."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        self._grant_record_freshness(monkeypatch, 4242)
+        monkeypatch.setattr(rt, "get_peer_pid", lambda sock: None)
+        verify = rt._attested_gateway_verifier(c, "demo", 7999, Path("/x/sock"))
+        with pytest.raises(rt.PodError, match="unidentifiable process"):
+            verify(object())
+
+    def test_verifier_refuses_when_no_pid_is_attested(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No provable record at send time = no verifier at all, fail closed."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda cfg, name, port: None)
+        with pytest.raises(rt.PodOwnershipUnproven):
+            rt._attested_gateway_verifier(c, "demo", 7999, Path("/x/sock"))
+
+    def test_verifier_accepts_the_attested_peer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        self._grant_record_freshness(monkeypatch, 4242)
+        monkeypatch.setattr(rt, "get_peer_pid", lambda sock: 4242)
+        verify = rt._attested_gateway_verifier(c, "demo", 7999, Path("/x/sock"))
+        assert verify(object()) is None  # no raise = the send may proceed
+
+    @staticmethod
+    def _serve_once(server_sock: socket.socket, received: list[bytes]) -> threading.Thread:
+        """Accept one connection and record whatever arrives (empty = refused)."""
+
+        def _run() -> None:
+            try:
+                conn, _ = server_sock.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(2)
+                data = b""
+                try:
+                    while b"\r\n\r\n" not in data:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        data += chunk
+                except OSError:
+                    pass
+                received.append(data)
+                if data:
+                    body = b'{"token":"tok-live"}'
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: %d\r\n\r\n%s" % (len(body), body)
+                    )
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        return thread
+
+    def _mint_against_live_listener(
+        self, monkeypatch: pytest.MonkeyPatch, attested_pid: int
+    ) -> tuple[list[bytes], "rt.PodError | None"]:
+        """Drive the REAL kernel peer check: a live in-process unix listener
+        (peer pid = ``os.getpid()``) answers the pod's derived socket path,
+        while the attested record names *attested_pid*. Only record freshness
+        is granted; ``get_peer_pid`` runs unpatched against the real socket.
+        """
+        if platform_compat.IS_WINDOWS:
+            pytest.skip("AF_UNIX transport is POSIX-only")
+        root = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "podpeer-", dir=short_tmp_base()))
+        try:
+            monkeypatch.setenv("KIROCREW_POD_ROOT", str(root))
+            c = PodConfig.load()
+            home = c.home_dir("demo")
+            home.mkdir(parents=True)
+            (home / ".local_secret").write_text("s3cret")
+            port = rt.derive_port(c, "demo")
+            socket_path = rt.pod_socket_path(c, "demo", port)
+            socket_path.parent.mkdir(parents=True, exist_ok=True)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                server.bind(str(socket_path))
+                server.listen(1)
+                received: list[bytes] = []
+                thread = self._serve_once(server, received)
+                self._grant_record_freshness(monkeypatch, attested_pid)
+                error: rt.PodError | None = None
+                try:
+                    assert rt.mint_token(c, "demo", "1h") == "tok-live"
+                except rt.PodError as exc:
+                    error = exc
+                server.close()
+                thread.join(timeout=5)
+                return received, error
+            finally:
+                server.close()
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_mint_refuses_a_rebound_socket_before_any_bytes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rebind window: a same-UID process rebinds the socket path.
+
+        The listener is real and answering, the pid record is fresh, but the
+        kernel says the peer is this test process, not the attested gateway
+        (pid 1). The mint must refuse AND the listener must observe zero bytes
+        -- the request line, let alone the secret header, never went out.
+        """
+        received, error = self._mint_against_live_listener(monkeypatch, attested_pid=1)
+        assert error is not None and "refusing to send" in str(error)
+        assert received in ([], [b""])  # connection at most; never a byte of HTTP
+
+    def test_mint_sends_when_the_kernel_names_the_attested_peer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Benign path, no new denials: attest THIS process, the real
+        ``SO_PEERCRED``/``LOCAL_PEERPID`` read agrees, the mint completes."""
+        received, error = self._mint_against_live_listener(monkeypatch, attested_pid=os.getpid())
+        assert error is None
+        assert len(received) == 1 and b"X-Local-Secret: s3cret" in received[0]
 
 
 class TestReviewRound2Fix:
@@ -5592,6 +6061,20 @@ class TestPlatformGuard:
     journalctl call funnels through.
     """
 
+    @pytest.fixture(autouse=True)
+    def _linux_systemctl_seams(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep Linux-shaped probe tests deterministic on Windows and macOS."""
+        monkeypatch.setattr(rt, "IS_LINUX", True)
+        monkeypatch.setattr(rt, "IS_MACOS", False)
+        monkeypatch.setattr(rt, "IS_WINDOWS", False)
+        monkeypatch.setattr(rt.sys, "platform", "linux")
+        monkeypatch.setattr(rt.shutil, "which", lambda _n: "/usr/bin/systemctl")
+        monkeypatch.setattr(
+            platform_compat,
+            "trusted_system_bin",
+            lambda name: "/usr/bin/systemctl" if name == "systemctl" else None,
+        )
+
     def test_require_systemd_refuses_off_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(rt, "IS_LINUX", False)
         monkeypatch.setattr(rt.sys, "platform", "darwin")
@@ -5614,11 +6097,244 @@ class TestPlatformGuard:
     ) -> None:
         monkeypatch.setattr(rt, "IS_LINUX", True)
         monkeypatch.setattr(rt.shutil, "which", lambda _n: "/usr/bin/systemctl")
-        # Third gate: a reachable session bus (see TestSessionBus).
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
         monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
         (tmp_path / "bus").touch()
-        rt.require_systemd()  # must not raise
+        monkeypatch.setattr(
+            rt,
+            "probe_user_bus",
+            lambda: pytest.fail("require_systemd must not spawn the user-bus probe"),
+        )
+
+        rt.require_systemd()
+
+    def test_user_bus_probe_classifies_reachable_degraded_manager(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        (tmp_path / "bus").touch()
+        monkeypatch.setattr(
+            rt,
+            "_run",
+            lambda _cmd, **_kwargs: _cp(stdout="degraded\n", returncode=1),
+        )
+
+        result = rt.probe_user_bus()
+
+        assert result.status == rt.USER_BUS_REACHABLE
+        assert result.detail == "degraded"
+
+    def test_user_bus_probe_classifies_outer_sandbox_denial(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        (tmp_path / "bus").touch()
+        monkeypatch.setattr(
+            rt,
+            "_run",
+            lambda _cmd, **_kwargs: _cp(
+                returncode=1,
+                stderr="Failed to connect to bus: Permission denied\n",
+            ),
+        )
+
+        result = rt.probe_user_bus()
+
+        assert result.status == rt.USER_BUS_SANDBOXED_AWAY
+        assert result.detail == "Failed to connect to bus: Permission denied"
+        message = rt.user_bus_failure_message(result)
+        assert "outer layer" in message
+        assert "container" in message
+        assert "launcher shim" in message
+        assert "host shell" in message
+
+    def test_stale_explicit_bus_address_is_operational_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stale = "unix:path=/run/user/4242/stale-bus"
+        detail = "Failed to connect to bus: No such file or directory"
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", stale)
+        monkeypatch.setattr(
+            rt,
+            "_run",
+            lambda _cmd, **_kwargs: _cp(returncode=1, stderr=detail),
+        )
+
+        result = rt.probe_user_bus()
+
+        assert result.status == rt.USER_BUS_ERROR
+        assert result.detail == detail
+        with pytest.raises(rt.PodError) as exc:
+            rt.require_backend()
+        assert not isinstance(exc.value, rt.PodBackendAbsent)
+        assert detail in str(exc.value)
+
+    def test_stale_explicit_bus_address_still_gets_the_manager_remedy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Operationally unknown, yet the remedy names what a stale address needs.
+
+        The class must stay a plain :class:`rt.PodError` — a stale address is
+        never proof that no backend exists, and that proof is what authorizes
+        destructive worktree removal. Only the text changes: the old one told the
+        caller to rerun the command that had just failed.
+        """
+        stale = "unix:path=/run/user/4242/stale-bus"
+        detail = "Failed to get D-Bus connection: Connection refused"
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", stale)
+        monkeypatch.setenv("USER", "tester")
+        monkeypatch.setattr(rt.os, "getuid", lambda: 4242, raising=False)
+        monkeypatch.setattr(
+            rt,
+            "_run",
+            lambda _cmd, **_kwargs: _cp(returncode=1, stderr=detail),
+        )
+
+        result = rt.probe_user_bus()
+        message = rt.user_bus_failure_message(result)
+
+        assert result.status == rt.USER_BUS_ERROR
+        assert "stale" in message
+        assert "loginctl enable-linger tester" in message
+        assert "sudo loginctl enable-linger 4242" in message
+        assert "./dev-backend.sh" in message
+        # The circular instruction is gone.
+        assert "fix that error before using pod commands" not in message
+        assert detail in message
+
+    def test_a_present_socket_keeps_the_generic_probe_remedy(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The socket exists, so a stopped per-user manager is not the diagnosis."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        (tmp_path / "bus").touch()
+        detail = "Failed to connect to bus: Connection reset by peer"
+        monkeypatch.setattr(
+            rt,
+            "_run",
+            lambda _cmd, **_kwargs: _cp(returncode=1, stderr=detail),
+        )
+
+        message = rt.user_bus_failure_message(rt.probe_user_bus())
+
+        assert "fix that error before using pod commands" in message
+        assert "enable-linger" not in message
+
+    def test_user_bus_probe_preserves_an_unclassified_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        (tmp_path / "bus").touch()
+        monkeypatch.setattr(
+            rt,
+            "_run",
+            lambda _cmd, **_kwargs: _cp(
+                returncode=1,
+                stderr="Failed to connect to bus: Connection reset by peer\n",
+            ),
+        )
+
+        result = rt.probe_user_bus()
+
+        assert result.status == rt.USER_BUS_ERROR
+        assert result.detail == "Failed to connect to bus: Connection reset by peer"
+
+    def test_user_bus_probe_classifies_exec_failure_as_operational_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(rt, "IS_MACOS", False)
+        monkeypatch.setattr(rt, "IS_WINDOWS", False)
+        monkeypatch.setattr(rt, "IS_LINUX", True)
+        monkeypatch.setattr(rt.shutil, "which", lambda _n: "/usr/bin/systemctl")
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        (tmp_path / "bus").touch()
+
+        def broken_systemctl(_cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            raise FileNotFoundError("systemctl shim interpreter is missing")
+
+        monkeypatch.setattr(rt, "_run", broken_systemctl)
+
+        result = rt.probe_user_bus()
+
+        assert result.status == rt.USER_BUS_ERROR
+        with pytest.raises(rt.PodError) as exc:
+            rt.require_backend()
+        assert not isinstance(exc.value, rt.PodBackendAbsent)
+        assert "systemctl shim interpreter is missing" in str(exc.value)
+
+    def test_user_bus_probe_does_not_treat_generic_enoent_as_no_session(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(rt, "IS_MACOS", False)
+        monkeypatch.setattr(rt, "IS_WINDOWS", False)
+        monkeypatch.setattr(rt, "IS_LINUX", True)
+        monkeypatch.setattr(rt.shutil, "which", lambda _n: "/usr/bin/systemctl")
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        (tmp_path / "bus").touch()
+        detail = (
+            "systemctl: error while loading shared libraries: "
+            "libsystemd-shared.so: No such file or directory"
+        )
+        monkeypatch.setattr(
+            rt,
+            "_run",
+            lambda _cmd, **_kwargs: _cp(returncode=127, stderr=detail),
+        )
+
+        result = rt.probe_user_bus()
+
+        assert result.status == rt.USER_BUS_ERROR
+        with pytest.raises(rt.PodError) as exc:
+            rt.require_backend()
+        assert not isinstance(exc.value, rt.PodBackendAbsent)
+        assert detail in str(exc.value)
+
+    def test_pod_up_reports_bus_denial_before_worktree_resolution(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(rt, "IS_LINUX", True)
+        monkeypatch.setattr(rt.shutil, "which", lambda _n: "/usr/bin/systemctl")
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/4242/bus")
+        monkeypatch.setattr(
+            rt,
+            "_run",
+            lambda _cmd, **_kwargs: _cp(
+                returncode=1,
+                stderr="Failed to connect to bus: Permission denied\n",
+            ),
+        )
+        monkeypatch.setattr(
+            pod_cli,
+            "_resolve_or_die",
+            lambda *_args, **_kwargs: pytest.fail("worktree resolution ran before bus probe"),
+        )
+        audits: list[tuple[str, str, str, str]] = []
+        monkeypatch.setattr(
+            pod_cli,
+            "_audit",
+            lambda operation, outcome, resources, *, error="": audits.append(
+                (operation, outcome, resources, error)
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            pod_cli.dispatch(argparse.Namespace(pod_action="up", name="busdiag-live-smoke"))
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "outer layer" in err
+        assert "host shell" in err
+        assert "Failed to connect to bus: Permission denied" in err
+        assert len(audits) == 1
+        assert audits[0][:3] == (
+            "pod.up",
+            "failure",
+            "name=busdiag-live-smoke",
+        )
+        assert "Permission denied" in audits[0][3]
 
     def test_systemctl_gated_before_spawn(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The guard runs BEFORE the subprocess, so no spawn is attempted."""
@@ -5628,6 +6344,97 @@ class TestPlatformGuard:
         with pytest.raises(rt.PodError):
             rt.systemctl("list-units")
         assert spawned == []
+
+    def test_unit_queries_do_not_run_user_bus_probe(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(rt, "IS_MACOS", False)
+        monkeypatch.setattr(rt, "IS_WINDOWS", False)
+        monkeypatch.setattr(rt, "IS_LINUX", True)
+        monkeypatch.setattr(rt.shutil, "which", lambda _n: "/usr/bin/systemctl")
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        (tmp_path / "bus").touch()
+        monkeypatch.setattr(
+            rt,
+            "probe_user_bus",
+            lambda: pytest.fail("unit queries must not run the user-bus probe"),
+        )
+        spawned: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs) -> subprocess.CompletedProcess:
+            spawned.append(cmd)
+            if "show" in cmd:
+                return _cp(stdout="MainPID=4242\n")
+            return _cp(returncode=0)
+
+        monkeypatch.setattr(rt, "_run", fake_run)
+
+        assert rt.systemctl("daemon-reload").returncode == 0
+        assert rt.is_active(cfg, "alpha") is True
+        assert rt.main_pid(cfg, "alpha") == 4242
+        assert len(spawned) == 3
+        assert all("is-system-running" not in cmd for cmd in spawned)
+
+    def test_systemctl_spawns_only_the_trusted_absolute_binary(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(rt, "IS_MACOS", False)
+        monkeypatch.setattr(rt, "IS_WINDOWS", False)
+        monkeypatch.setattr(rt, "IS_LINUX", True)
+        impostor_dir = tmp_path / "bin"
+        impostor_dir.mkdir()
+        impostor = impostor_dir / "systemctl"
+        impostor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        impostor.chmod(0o755)
+        monkeypatch.setenv("PATH", str(impostor_dir))
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        (tmp_path / "bus").touch()
+        monkeypatch.setattr(
+            platform_compat,
+            "trusted_system_bin",
+            lambda name: "/usr/bin/systemctl" if name == "systemctl" else None,
+        )
+        spawned: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs) -> subprocess.CompletedProcess:
+            spawned.append(cmd)
+            return _cp(stdout="running\n")
+
+        monkeypatch.setattr(rt, "_run", fake_run)
+
+        assert rt.probe_user_bus().status == rt.USER_BUS_REACHABLE
+        assert rt.systemctl("is-active", rt.pod_unit(cfg, "alpha")).returncode == 0
+        assert [cmd[0] for cmd in spawned] == ["/usr/bin/systemctl", "/usr/bin/systemctl"]
+        assert all(cmd[0] != str(impostor) for cmd in spawned)
+
+    def test_missing_trusted_systemctl_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(rt, "IS_MACOS", False)
+        monkeypatch.setattr(rt, "IS_WINDOWS", False)
+        monkeypatch.setattr(rt, "IS_LINUX", True)
+        monkeypatch.setattr(rt.shutil, "which", lambda _n: str(tmp_path / "systemctl"))
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        (tmp_path / "bus").touch()
+        monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda _name: None)
+        monkeypatch.setattr(
+            rt,
+            "_run",
+            lambda _cmd, **_kwargs: pytest.fail("an untrusted systemctl was spawned"),
+        )
+
+        result = rt.probe_user_bus()
+
+        assert result.status == rt.USER_BUS_ERROR
+        assert "trusted system" in result.detail
+        with pytest.raises(rt.PodError) as exc:
+            rt.require_backend()
+        assert not isinstance(exc.value, rt.PodBackendAbsent)
+        with pytest.raises(rt.PodError, match="trusted system"):
+            rt.systemctl("list-units")
 
     def test_recent_journal_gated(self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch) -> None:
         """journalctl is a sibling of systemctl, not routed through it — gate it too."""
@@ -5721,6 +6528,14 @@ class TestSessionBus:
         self._bus(monkeypatch, tmp_path / "run", exists=True)
         assert rt._systemctl_env()["XDG_RUNTIME_DIR"] == str(tmp_path / "run")
 
+    def test_systemctl_diagnostics_use_the_c_locale(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._bus(monkeypatch, tmp_path / "run", exists=True)
+        monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+
+        assert rt._systemctl_env()["LC_ALL"] == "C"
+
     def test_has_session_bus_trusts_an_explicit_address(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -5728,6 +6543,77 @@ class TestSessionBus:
         self._bus(monkeypatch, tmp_path / "run", exists=False)
         monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:abstract=/tmp/dbus-abc")
         assert rt.has_session_bus() is True
+
+    def test_uncheckable_transports_are_never_called_stale(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Only ``unix:path=`` names something to stat, so nothing else is judged.
+
+        ``session_bus_socket()`` falls back to the conventional path for an
+        address it cannot resolve, and that path existing is what keeps the
+        generic remedy. A transport with no filesystem identity must not be
+        described as a stopped per-user manager.
+        """
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        (tmp_path / "bus").touch()
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:abstract=/tmp/dbus-abc")
+        monkeypatch.setattr(
+            rt,
+            "_run",
+            lambda _cmd, **_kwargs: _cp(
+                returncode=1, stderr="Failed to connect to bus: Connection refused"
+            ),
+        )
+
+        assert rt.has_session_bus() is True
+        assert rt.session_bus_socket() == str(tmp_path / "bus")
+        assert "stale" not in rt.user_bus_failure_message(rt.probe_user_bus())
+
+    def test_present_socket_named_by_the_address_is_the_path_reported(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A refusal names the path actually judged, not a conventional one."""
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir(parents=True, exist_ok=True)
+        sock = elsewhere / "bus"
+        sock.touch()
+        self._bus(monkeypatch, tmp_path / "run", exists=False)
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={sock}")
+        assert rt.session_bus_socket() == str(sock)
+
+    def test_percent_escaped_address_path_is_decoded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """D-Bus percent-escapes address values, so a raw compare would miss."""
+        spaced = tmp_path / "run dir"
+        spaced.mkdir(parents=True, exist_ok=True)
+        sock = spaced / "bus"
+        sock.touch()
+        self._bus(monkeypatch, tmp_path / "run", exists=False)
+        escaped = str(sock).replace(" ", "%20")
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={escaped}")
+        assert rt.session_bus_socket() == str(sock)
+
+    def test_no_session_remedy_is_actionable_for_the_actor_who_can_act(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``loginctl`` needs the SYSTEM bus, so it is not always self-service.
+
+        A caller that cannot reach a bus cannot run ``loginctl`` either, and
+        ``sudo loginctl enable-linger <name>`` fails outright where root's name
+        lookup does not resolve the account. The message therefore also names the
+        privileged uid form and a preview path that needs no systemd at all.
+        """
+        sock = self._bus(monkeypatch, tmp_path / "run", exists=False)
+        monkeypatch.setenv("USER", "tester")
+        monkeypatch.setattr(rt.os, "getuid", lambda: 4242, raising=False)
+
+        message = rt.user_bus_failure_message(
+            rt.UserBusProbe(rt.USER_BUS_NO_SESSION, str(sock), "")
+        )
+        assert "loginctl enable-linger tester" in message
+        assert "sudo loginctl enable-linger 4242" in message
+        assert "./dev-backend.sh" in message
 
     def test_require_systemd_explains_a_missing_bus(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -5745,16 +6631,24 @@ class TestSessionBus:
         # Keyed on the socket's absence, not on matching systemctl's stderr.
         assert "No medium found" not in msg
 
-    def test_missing_bus_is_reported_before_any_spawn(
+    def test_missing_bus_is_reported_without_spawning(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        monkeypatch.setattr(rt, "IS_MACOS", False)
+        monkeypatch.setattr(rt, "IS_WINDOWS", False)
         monkeypatch.setattr(rt, "IS_LINUX", True)
         monkeypatch.setattr(rt.shutil, "which", lambda _n: "/usr/bin/systemctl")
         self._bus(monkeypatch, tmp_path / "run", exists=False)
         spawned: list[list[str]] = []
-        monkeypatch.setattr(rt, "_run", lambda cmd, **k: spawned.append(cmd))
-        with pytest.raises(rt.PodError):
-            rt.systemctl("list-units")
+        monkeypatch.setattr(rt, "_run", lambda cmd, **_kwargs: spawned.append(cmd))
+
+        result = rt.probe_user_bus()
+        assert result.status == rt.USER_BUS_NO_SESSION
+        assert result.detail == ""
+        with pytest.raises(rt.PodBackendAbsent):
+            rt.require_systemd()
+        with pytest.raises(rt.PodBackendAbsent):
+            rt.require_backend()
         assert spawned == []
 
     def test_systemctl_env_is_the_only_env_source_for_systemd_calls(self) -> None:
@@ -6108,6 +7002,7 @@ class TestBootTimeSettings:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
         monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "env"))
         monkeypatch.setattr(rt, "_git_worktrees", lambda ref: {})
+        monkeypatch.setattr(rt, "require_backend", lambda: None)
         _ready_worktree(tmp_path / "wts", "demo")
         monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: active)

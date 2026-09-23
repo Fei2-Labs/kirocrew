@@ -37,6 +37,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -63,7 +64,7 @@ _BANNED_AFTER_CLI_IMPORT = (
 )
 
 
-def test_cli_import_does_not_load_heavy_modules() -> None:
+def test_cli_import_does_not_load_heavy_modules(tmp_path: Path) -> None:
     """Ratchet: ``import kiro_crew.cli`` must stay free of the deferred modules.
 
     If this fails, a module-scope import (direct or transitive) reached one of
@@ -77,8 +78,15 @@ def test_cli_import_does_not_load_heavy_modules() -> None:
         "present = [m for m in banned if m in sys.modules]; "
         "print(repr(present))"
     )
+    # cwd=tmp_path: a child inherits pytest's CWD (the checkout) unless told
+    # otherwise; the interpreter resolves kiro_crew from the installed package,
+    # not from the directory it runs in, so nothing here needs the checkout.
     res = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=tmp_path,
     )
     assert res.returncode == 0, f"import kiro_crew.cli failed:\n{res.stderr}"
     present = ast.literal_eval(res.stdout.strip())
@@ -133,6 +141,32 @@ def test_every_deferred_dispatch_import_resolves(module: str, name: str) -> None
     assert hasattr(mod, name), f"main() imports {name} from {module}, which lacks it"
 
 
+def _read_line(
+    proc: subprocess.Popen, subcommand: str, what: str, budget: float = 30.0
+) -> str:
+    """One handshake line within ``budget``, or a named failure — never a blocked worker.
+
+    A bare ``proc.stdout.readline()`` on a server that boots but neither answers
+    nor closes stdout blocks until the suite's ``--timeout=120`` fires, which
+    reports as an un-attributed pytest timeout instead of the "no <what>
+    response" assertion this helper's caller is written to make — and on Windows
+    pytest-timeout has no SIGALRM, so it kills the xdist worker outright, the
+    caller's ``finally`` never runs, and the ``python -m kiro_crew`` child is
+    left alive holding the worker's pipes. Reading on a daemon thread with a
+    join deadline converts that lost RUN into a failed TEST that names itself.
+    30s is generous for a cold interpreter plus server boot and stays well
+    under the suite timeout, so the failure lands here and not on the worker.
+    """
+    stream = proc.stdout
+    assert stream is not None
+    box: list[str] = []
+    reader = threading.Thread(target=lambda: box.append(stream.readline()), daemon=True)
+    reader.start()
+    reader.join(budget)
+    assert box, f"{subcommand}: no {what} response within {budget}s"
+    return box[0]
+
+
 def _stdio_roundtrip(subcommand: str, tmp_path: Path) -> list[str]:
     """Start ``kirocrew <subcommand>`` over stdio; return the tools/list names."""
     proc = subprocess.Popen(
@@ -141,6 +175,9 @@ def _stdio_roundtrip(subcommand: str, tmp_path: Path) -> list[str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        # Confined to the test's directory: the server is pinned to a
+        # throwaway home already, and its cwd must not be the checkout either.
+        cwd=tmp_path,
         env={
             **os.environ,
             "KIROCREW_HOME": str(tmp_path / "home"),
@@ -160,21 +197,31 @@ def _stdio_roundtrip(subcommand: str, tmp_path: Path) -> list[str]:
         assert proc.stdin is not None and proc.stdout is not None
         proc.stdin.write(json.dumps(init) + "\n")
         proc.stdin.flush()
-        line = proc.stdout.readline()
+        line = _read_line(proc, subcommand, "initialize")
         assert line, f"{subcommand}: no initialize response (stderr: {proc.stderr.read()[:500]})"
         resp = json.loads(line)
         assert resp.get("id") == 1 and "result" in resp, f"bad initialize response: {resp}"
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n")
         proc.stdin.flush()
-        line2 = proc.stdout.readline()
+        line2 = _read_line(proc, subcommand, "tools/list")
         assert line2, f"{subcommand}: no tools/list response"
         resp2 = json.loads(line2)
         assert resp2.get("id") == 2 and "result" in resp2, f"bad tools/list response: {resp2}"
         return [t["name"] for t in resp2["result"]["tools"]]
     finally:
-        proc.terminate()
-        proc.wait(timeout=10)
+        # Escalate, and never raise from the finally: a TimeoutExpired out of
+        # `wait()` would REPLACE the real assertion failure above with a
+        # teardown error and still abandon the server. SIGTERM is fatal to
+        # `run_mcp_stdio_loop` (it installs no handler), so the kill step is
+        # the belt-and-braces case of a child wedged in boot.
+        for step in (proc.terminate, proc.kill):
+            try:
+                step()
+                proc.wait(timeout=10)
+                break
+            except subprocess.TimeoutExpired:
+                continue
 
 
 @pytest.mark.parametrize("subcommand", ["mcp-core", "mcp-cron"])

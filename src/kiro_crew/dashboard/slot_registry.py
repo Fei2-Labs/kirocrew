@@ -50,8 +50,19 @@ class SlotRegistry:
 
     @staticmethod
     def live_slot_count(owner: Any) -> int:
-        """Count published and allocated-but-unpublished slots."""
-        return len(owner._slots) + len(owner._slots_under_construction)
+        """Count published and allocated-but-unpublished slots, each once.
+
+        An under-construction slot stays REGISTERED in ``_slots`` throughout its
+        hydration (so a concurrent same-key resume dedups against it), so it is in
+        BOTH ``_slots`` and ``_slots_under_construction`` at once. Counting the two
+        lengths naively double-counts every in-flight resume/import, which would
+        refuse admissible imports/forks/creates near the live-slot ceiling with
+        fewer than that many real slots. Subtract the overlap so each slot counts
+        once: published slots, plus any construction reservation not yet in
+        ``_slots`` (a reservation taken before registration, if one ever exists).
+        """
+        under = getattr(owner, "_slots_under_construction", None) or set()
+        return len(owner._slots) + len(under - owner._slots.keys())
 
     @staticmethod
     def creator_slot_count(owner: Any, creator_key: str) -> int:
@@ -84,7 +95,7 @@ class SlotRegistry:
         # may mutate the registry.  Snapshotting prevents a read-only scan from
         # failing with ``RuntimeError: dictionary changed size``.
         return frozenset(
-            effective_session_key(slot) for slot in list(owner._slots.values()) if slot.running
+            effective_session_key(slot) for slot in list(owner._slots.values()) if slot.turn_running
         )
 
     @staticmethod

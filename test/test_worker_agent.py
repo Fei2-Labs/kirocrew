@@ -15,7 +15,6 @@ procedure it does not run.
 from __future__ import annotations
 
 import ast
-import functools
 import json
 import logging
 import os
@@ -23,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from source_corpus import parsed_candidates, source_texts
 
 from kiro_crew import agent
 from kiro_crew.agent_files import (
@@ -33,39 +33,71 @@ from kiro_crew.agent_files import (
     PIPELINE_CONDUCTOR_AGENT_FILENAME,
     WORKER_AGENT_FILENAME,
 )
+from kiro_crew.agent_sdk.drivers.acp import derived_agent_permissions
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
+
+#: A release that accepts a spec ``permissions`` block, and one that refuses it,
+#: expressed against the floor so raising it cannot strand these tests.
+_ACCEPTS = SPEC_PERMISSIONS_MIN_VERSION
+_REFUSES = (SPEC_PERMISSIONS_MIN_VERSION[0], SPEC_PERMISSIONS_MIN_VERSION[1] - 1, 0)
+_INHERITED_PERMISSIONS = {"rules": [{"capability": "web_fetch", "effect": "deny"}]}
 
 
-@functools.lru_cache(maxsize=1)
+def _pin_spec_permissions_cli(monkeypatch, which):
+    """Pin what the shared writer gate believes the installed kiro-cli is.
+
+    ``_write_derived_permissions`` reads ``installed_kiro_cli_version``
+    function-locally from ``kiro_crew.kiro_cli``, so the patch lands there.
+    ``which`` is ``"accepts"``, ``"refuses"`` or ``"unknown"``.
+    """
+    version = {"accepts": _ACCEPTS, "refuses": _REFUSES, "unknown": None}[which]
+    monkeypatch.setattr("kiro_crew.kiro_cli.installed_kiro_cli_version", lambda: version)
+
+
+# One xdist worker for the whole module: the four enumeration gates below share ONE read of
+# src/ (~1,550 files, 0.9 s and ~187 MB of text while it is warm), and under `--dist
+# loadgroup` an unmarked module is spread across workers -- so those four can land on four
+# workers, each paying the read again and each holding its own copy of the corpus at the
+# same time. Grouping keeps it single-copy per run; the copy itself is released at module
+# teardown by `conftest._release_source_corpus_after_module`.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_worker_agent")
+
+
 def _package_sources() -> tuple[tuple[Path, str], ...]:
-    """Every ``kiro_crew`` module, read ONCE for the whole session.
+    """Every ``kiro_crew`` module except ``agent.py``, off the shared corpus read.
 
     Four enumeration tests below reason over the package, and one traversal serves all of
     them. A walk per test is thousands of small reads each -- seconds on Linux and far
     worse on the Windows shards, whose job budget is 40 minutes for a quarter of a
     100k-test suite. The rule-shaped assertions are what matter; repeating the traversal
     is not part of them.
+
+    The sharing is ``test/source_corpus.py``'s and NOT an ``lru_cache`` of our own,
+    because the text of the ~1,550 modules under ``src/`` is ~115 MB of retained ``str``
+    and only the corpus helper's copy can be released: ``test/conftest.py``'s
+    ``_release_source_corpus_after_module`` calls ``_clear_caches()`` at module teardown,
+    but a second tuple of ours holding those same ``str`` objects would keep every one of
+    them alive for the rest of the xdist worker's life, paid by every later test that
+    worker runs. So this stays uncached -- rebuilding a tuple of ~1,550 references costs
+    nothing measurable -- and the ``agent.py`` exclusion stays HERE with the gates rather
+    than in the shared helper, because which files a gate polices is that gate's contract
+    (and ``agent.py``, defining every name these gates hunt for, would match them all).
     """
-    from kiro_crew import agent as agent_mod
-
-    root = Path(agent_mod.__file__).resolve().parent
-    return tuple(
-        (path, path.read_text(encoding="utf-8"))
-        for path in sorted(root.rglob("*.py"))
-        if path.name != "agent.py"  # the definitions themselves
-    )
+    return tuple((path, text) for path, text in source_texts() if path.name != "agent.py")
 
 
-@functools.lru_cache(maxsize=None)
-def _package_tree(path: Path) -> "ast.Module":
-    """One module's AST, parsed once per session.
+@pytest.fixture(autouse=True)
+def _accepting_kiro_cli(monkeypatch):
+    """Pin an ACCEPTING kiro-cli for every worker test by default.
 
-    Per file rather than for the whole package: parsing every module eagerly costs more
-    than the walks this cache replaced. Callers prefilter on the TEXT first -- a file that
-    never mentions an identifier cannot reference it -- so only the handful of modules that
-    could match are parsed at all, and the AST is left doing the one job it is needed for:
-    telling a real reference apart from a mention in a docstring.
+    The worker writer now gates its ``permissions`` write on the installed
+    kiro-cli, like the conductors and the default spec. Almost every test here
+    asserts the derived block, and CI's absent binary reads as "unknown" and
+    withholds it -- so without this pin those assertions would fail for a host
+    reason rather than a code one. The one test that exercises the gate itself
+    re-pins a refusing and an unknown version over this default.
     """
-    return ast.parse(dict(_package_sources())[path])
+    _pin_spec_permissions_cli(monkeypatch, "accepts")
 
 
 @pytest.fixture()
@@ -156,9 +188,10 @@ def test_the_worker_prompt_says_only_decision_is_an_instruction(specs):
     assert "user message" in lowered
 
 
-def test_the_worker_prompt_carries_the_verbosity_placeholder(specs):
-    """Without the token the dashboard verbosity setting never reaches this agent."""
-    assert "{{VERBOSITY_BLOCK}}" in specs[WORKER_AGENT_FILENAME]["prompt"]
+def test_the_worker_prompt_does_not_carry_the_retired_verbosity_token(specs):
+    """Reply style arrives as session-context chrome for every agent; a token
+    left here would reach the model as a literal."""
+    assert "{{VERBOSITY_BLOCK}}" not in specs[WORKER_AGENT_FILENAME]["prompt"]
 
 
 def test_the_worker_prompt_says_done_is_a_claim(specs):
@@ -177,6 +210,45 @@ def test_the_worker_spec_derives_its_kas_permissions_from_the_filtered_grants(sp
     for ref in worker["allowedTools"]:
         if ref.startswith("@kirocrew-work/"):
             assert ref.split("/", 1)[1] in rendered, ref
+
+
+def test_the_worker_permissions_field_is_gated_on_the_installed_kiro_cli(tmp_path, monkeypatch):
+    """Written on an accepting release, withheld on a refusing or unknown one.
+
+    The worker spec gates its ``permissions`` write on the installed kiro-cli,
+    sharing the default spec's gate: a kiro-cli whose schema predates the field
+    would otherwise refuse the WHOLE spec and fall back to broader default
+    grants. ``permissions`` is not a mirrored key, so a withheld write leaves the
+    key absent rather than a stale block, and ``allowedTools`` -- the field
+    kiro-cli reads -- is untouched either way.
+    """
+    monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+    inherited_config = agent.build_agent_config()
+    inherited_config["permissions"] = _INHERITED_PERMISSIONS
+    monkeypatch.setattr(
+        agent,
+        "build_agent_config",
+        lambda: json.loads(json.dumps(inherited_config)),
+    )
+
+    def _install() -> dict[str, Any]:
+        agent._install_worker_agent()
+        return json.loads((tmp_path / WORKER_AGENT_FILENAME).read_text(encoding="utf-8"))
+
+    _pin_spec_permissions_cli(monkeypatch, "accepts")
+    accepting = _install()
+    assert accepting.get("permissions"), "an accepting CLI must get the block"
+    assert accepting["permissions"] != _INHERITED_PERMISSIONS
+    assert accepting["permissions"] == derived_agent_permissions(
+        accepting["allowedTools"], WORKER_AGENT_FILENAME
+    )
+    assert accepting["allowedTools"], "the grant list is never withheld"
+
+    for refusing in ("refuses", "unknown"):
+        _pin_spec_permissions_cli(monkeypatch, refusing)
+        data = _install()
+        assert "permissions" not in data, f"{refusing} CLI must get no block"
+        assert data["allowedTools"], "the grant list is never withheld"
 
 
 def test_the_worker_filename_is_owned_and_wired(specs, tmp_path):
@@ -317,6 +389,7 @@ def test_the_grant_tuples_cover_the_server_and_share_only_the_read():
     assert agent._LEDGER_CONDUCTOR_WORK_GRANTS == (
         "@kirocrew-work/work_ledger_read",
         "@kirocrew-work/work_ledger_record",
+        "@kirocrew-work/work_ledger_rebuild",
         "@kirocrew-work/work_brief",
     )
     assert agent._WORKER_WORK_GRANTS == (
@@ -916,8 +989,20 @@ def test_the_work_server_is_exempt_from_that_exclusion(worker_from_installed_def
 
 def test_the_unassignable_set_is_derived_from_the_registry(monkeypatch):
     """Derived rather than listed, so an opt-in server added tomorrow is withheld by
-    default instead of reaching the worker until somebody notices."""
-    assert agent._worker_unassignable_servers() == frozenset({"kirocrew-dashboard"})
+    default instead of reaching the worker until somebody notices.
+
+    ``kirocrew-crew-log`` is the case that exercised it: a read-only opt-in server
+    added later, withheld from the mirror with no edit here beyond widening this
+    assertion. A worker has no use for another session's crew log -- its own channel
+    to its conductor is the work ledger.
+
+    ``kirocrew-debug`` is withheld on the same derivation. Its host-wide views are
+    gated in the route to the owner's own dashboard tab, so a worker would reach
+    only refusals; granting it would spend the worker's context on tools that
+    cannot answer it."""
+    assert agent._worker_unassignable_servers() == frozenset(
+        {"kirocrew-dashboard", "kirocrew-crew-log", "kirocrew-debug", "kirocrew-panel"}
+    )
     monkeypatch.setitem(
         agent._MANAGED_MCP_SERVERS,
         "kirocrew-hypothetical",
@@ -1052,7 +1137,11 @@ def test_a_mirrored_auto_approve_cannot_carry_an_excluded_cron_verb(tmp_path, mo
     without ever touching ``allowedTools``, so filtering grants alone leaves
     ``cron_add`` auto-approved — and the ceiling pass does not close it either,
     because that one is whole-server and keeps the key whenever the server is
-    allowed."""
+    allowed.
+
+    The grant is hand-added, so the opt-in is pinned on: the subject is the
+    per-verb narrowing of a grant that exists, not whether one may exist."""
+    _pin_honour_auto_approve(monkeypatch, True)
     monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
     spec = json.loads(json.dumps(_DEFAULT_SPEC_ON_DISK))
     spec["mcpServers"]["kirocrew-cron"]["autoApprove"] = [
@@ -1401,9 +1490,25 @@ def test_an_auto_approve_pattern_that_reaches_an_excluded_verb_is_dropped(
     assert "autoApprove" not in worker["mcpServers"]["kirocrew-cron"], approved
 
 
+def _pin_honour_auto_approve(monkeypatch, honour: bool) -> None:
+    """Pin ``mcp.honour_auto_approve`` for a grant no spec declares."""
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig()
+    cfg.mcp.honour_auto_approve = honour
+    monkeypatch.setattr(live, "snapshot", lambda: cfg)
+
+
 def test_an_auto_approve_naming_only_reading_verbs_survives(tmp_path, monkeypatch):
     """Nothing is narrowed for its own sake: a name that cannot reach an excluded verb
-    keeps its exemption."""
+    keeps its exemption.
+
+    The grant here is hand-added to the default spec rather than declared by the
+    managed registry, so ``mcp.honour_auto_approve`` is pinned on: the subject is
+    the per-verb narrowing, and the undeclared-grant floor would otherwise drop
+    the whole list before the narrowing has anything to narrow."""
+    _pin_honour_auto_approve(monkeypatch, True)
     monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
     spec = json.loads(json.dumps(_DEFAULT_SPEC_ON_DISK))
     spec["mcpServers"]["kirocrew-cron"]["autoApprove"] = ["cron_list", "cron_pause"]
@@ -1648,16 +1753,19 @@ def test_every_spawn_path_goes_through_the_freshness_gate():
 
     materialize = {}
     fresh = {}
-    for path, source in _package_sources():
-        # Text prefilter, then AST for the candidates only. A module whose text never
-        # mentions the name cannot reference it, and the AST is what tells a call site
-        # apart from a docstring mention.
-        names = [
-            n for n in ("ensure_agent_materialized", "require_fresh_derived_spec") if n in source
-        ]
-        tree = _package_tree(path) if names else None
-        materialize[path] = _refs(tree, "ensure_agent_materialized") if tree else 0
-        fresh[path] = _refs(tree, "require_fresh_derived_spec") if tree else 0
+    # Text prefilter, then AST for the candidates only. A module whose text never mentions
+    # either name cannot reference it, so a file the corpus does not yield scores 0 for
+    # both -- what the old `tree = None` branch recorded -- and the AST is left doing the
+    # one job it is needed for: telling a real reference apart from a docstring mention.
+    # `parsed_candidates` yields one tree at a time and retains none, so the ASTs do not
+    # outlive the loop the way a per-path AST cache here did.
+    for path, _source, tree in parsed_candidates(
+        require_any=("ensure_agent_materialized", "require_fresh_derived_spec")
+    ):
+        if path.name == "agent.py":  # the definitions themselves, not a spawn path
+            continue
+        materialize[path] = _refs(tree, "ensure_agent_materialized")
+        fresh[path] = _refs(tree, "require_fresh_derived_spec")
 
     callers = {p for p, n in materialize.items() if n}
     assert callers, "no spawn path calls the materialization self-heal at all"
@@ -1730,10 +1838,13 @@ def test_the_gate_is_not_inside_a_try_at_any_spawn_site():
     gates = ("require_fresh_derived_spec", "require_unchanged_derived_spec")
     offenders: list[str] = []
     checked: set[str] = set()
-    for path, source in _package_sources():
-        if not any(gate in source for gate in gates):
+    # Same narrowed read as the enumeration above: only a file whose text spells one of
+    # the gates can hold a `try` around a call to it, and the tree is dropped after each
+    # file instead of being retained per path.
+    for path, _source, tree in parsed_candidates(require_any=gates):
+        if path.name == "agent.py":  # the definitions themselves, not a spawn site
             continue
-        for node in ast.walk(_package_tree(path)):
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Try):
                 continue
             names = {
@@ -1919,6 +2030,7 @@ def test_a_re_derive_during_the_hosts_own_pre_spawn_work_does_not_kill_the_sessi
     rt._work_dir = tmp_path / "wd"
     rt._model = None
     rt._sandbox_mode = "auto"
+    rt._member_context = False
     # ``_harness`` is a cached property over the backend, so the stub is installed
     # through the cache slot the runtime itself fills.
     rt._harness_resolved = _EditingHarness()
@@ -2732,24 +2844,56 @@ def test_the_client_bracket_judges_the_snapshot_its_own_spawn_captured(monkeypat
 def test_every_set_mode_send_goes_through_the_one_bracketed_helper():
     """A ``set_mode`` naming an agent is a load of that agent's spec, so it needs the
     same bracket the spawn has -- and there is exactly ONE body that provides it. Both
-    session-start paths (create and resume) call it; neither sends the mode method
-    itself. A protocol written twice is two protocols the moment one copy is edited, so
-    the pin is on the single helper plus the rule that nothing else sends the method."""
+    session-start paths (create and resume) reach it; no body on either path sends the
+    mode method itself. A protocol written twice is two protocols the moment one copy is
+    edited, so the pin is on the single helper plus the rule that nothing else sends the
+    method. Activation may sit in a body the entry point hands off to -- ``create_session``
+    finishes in ``_finish_create_session``, which the late-adoption collector calls too --
+    so the walk FOLLOWS the ``self`` calls instead of naming one method."""
     import ast
     import inspect
     import textwrap
 
     from kiro_crew.acp import runtime as runtime_mod
 
+    def _tree(fn):
+        return ast.parse(textwrap.dedent(inspect.getsource(fn)))
+
+    def _handoffs(fn):
+        return {
+            n.func.attr
+            for n in ast.walk(_tree(fn))
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "self"
+        }
+
+    def _sends_the_mode(fn):
+        return any(
+            isinstance(n, ast.Call)
+            and any(isinstance(a, ast.Name) and a.id == "METHOD_SET_MODE" for a in n.args)
+            for n in ast.walk(_tree(fn))
+        )
+
     helper = runtime_mod.AcpRuntime._activate_mode_bracketed
-    for method in (runtime_mod.AcpRuntime.create_session, runtime_mod.AcpRuntime.load_session):
-        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
-        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-        assert (
-            "METHOD_SET_MODE" not in names
-        ), f"{method.__qualname__} sends set_mode itself instead of through the helper"
-        assert helper.__name__ in attrs, f"{method.__qualname__} does not activate via the helper"
+    for entry in (runtime_mod.AcpRuntime.create_session, runtime_mod.AcpRuntime.load_session):
+        on_path: set[str] = set()
+        pending = [entry.__name__]
+        while pending:
+            name = pending.pop()
+            fn = getattr(runtime_mod.AcpRuntime, name, None)
+            if name in on_path or not inspect.isfunction(fn):
+                continue
+            on_path.add(name)
+            pending.extend(_handoffs(fn))
+        assert helper.__name__ in on_path, f"{entry.__qualname__} does not activate via the helper"
+        senders_on_path = sorted(
+            n for n in on_path if _sends_the_mode(getattr(runtime_mod.AcpRuntime, n))
+        )
+        assert senders_on_path == [
+            helper.__name__
+        ], f"{entry.__qualname__} sends set_mode outside the helper: {senders_on_path}"
 
     # The whole module SENDS the method from exactly one place: the helper. The
     # transport's own method-name table (a dict literal mapping the constant to a
@@ -2837,7 +2981,7 @@ def test_a_revocation_between_the_payload_build_and_activation_is_caught(tmp_pat
     revoked = json.loads(json.dumps(_DEFAULT_SPEC_ON_DISK))
     revoked["mcpServers"].pop("builder-mcp")
 
-    async def _payload(agent_name, *, member_dispatch=False):
+    async def _payload(agent_name, *, member_dispatch=False, session_key=""):
         # The projection's gate, then the payload built from what it verified -- spec A.
         snapshot = agent.require_fresh_derived_spec(agent_name, str(tmp_path / "wd"))
         # The revocation lands AFTER the definition is registered and BEFORE activation.
@@ -2951,6 +3095,7 @@ class _FakeHandle:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.drained = False
+        self.native_context_documents = {}
 
     def store_session_config(self, resp):
         return None
@@ -2991,6 +3136,8 @@ def _runtime_for_create_session(monkeypatch, tmp_path, sent, terminated):
     rt._agent = "kirocrew"
     rt._crew_agent = "kirocrew"
     rt._work_dir = tmp_path / "wd"
+    rt._member_context = False
+    rt._native_launch_sources = {}
     rt._mcp_gateway_overlay = None
     rt._agent_capabilities = {}
     rt._session_queues = {}
@@ -3010,7 +3157,7 @@ def _runtime_for_create_session(monkeypatch, tmp_path, sent, terminated):
         sent.append(method)
         return resp
 
-    async def _kas_custom_agents(agent, *, member_dispatch=False):
+    async def _kas_custom_agents(agent, *, member_dispatch=False, session_key=""):
         # The kiro backend builds no wire surface, so it carries no payload and no payload
         # snapshot -- which is what makes the set_mode line itself the consumed load.
         from kiro_crew.acp.harness import SessionExtras

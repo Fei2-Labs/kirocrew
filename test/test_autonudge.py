@@ -5173,13 +5173,16 @@ class TestSentinelPathRepair:
         # Idempotent: a second pass must not append another segment either.
         assert _an.repair_sentinel_path(_an.repair_sentinel_path(original)) == original
 
-    def test_unnormalized_path_escaping_legacy_is_preserved(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("home_parent", ["plain", ".kiro/crew/scratch"])
+    def test_unnormalized_path_escaping_legacy_is_preserved(
+        self, tmp_path, monkeypatch, home_parent
+    ):
         """``~/.kirocrew/../workspace/STOP`` normalizes OUTSIDE the legacy root.
 
         A purely lexical prefix test would treat it as legacy-contained and
         rewrite an external workspace sentinel to the wrong location.
         """
-        home = tmp_path / "home"
+        home = tmp_path / home_parent / "home"
         current = home / ".kiro" / "crew"
         current.mkdir(parents=True)
         monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
@@ -5190,7 +5193,7 @@ class TestSentinelPathRepair:
         # Preserved verbatim — it normalizes outside the legacy root, so there is
         # nothing to re-home, and rewriting it would point at the wrong place.
         assert repaired == original
-        assert ".kiro/crew" not in repaired
+        assert not Path(repaired).resolve().is_relative_to(current.resolve())
 
     def test_live_legacy_rooted_workspace_is_not_rehomed(self, tmp_path, monkeypatch):
         """An absolute workspace dir INSIDE the legacy tree must be left alone.
@@ -5477,34 +5480,47 @@ class TestPersistenceIsOffLoopAndOrdered:
         assert writes == []
 
     @pytest.mark.asyncio
-    async def test_cancelled_removal_holds_the_lock_until_the_write_settles(self, tmp_path):
+    @pytest.mark.parametrize("delay_start", [False, True])
+    async def test_cancelled_removal_holds_the_lock_until_the_write_settles(
+        self, tmp_path, delay_start
+    ):
         svc = AutoNudgeService(base_dir=tmp_path)
         doomed = await svc.add(slot_key="dashboard:a", message="a", idle_secs=60, max_cycles=1)
 
         order: list[str] = []
         release = threading.Event()
+        entered = asyncio.Event()
+        loop = asyncio.get_running_loop()
         real_write = svc._write_state
 
         def _slow_write(payload):
             order.append("write-start")
-            release.wait(2.0)
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(2.0):
+                raise AssertionError("test did not release the writer")
             real_write(payload)
             order.append("write-done")
 
         svc._write_state = _slow_write  # type: ignore[method-assign]
 
-        remover = asyncio.create_task(svc.remove(doomed.id))
-        await asyncio.sleep(0.05)
-        remover.cancel()
-        await asyncio.sleep(0.05)
+        async def _remove():
+            if delay_start:
+                # Exercise a dispatch later than the old 50ms cancellation sleep.
+                await asyncio.sleep(0.1)
+            await svc.remove(doomed.id)
 
-        assert svc._lock.locked(), "lock released while the write was in flight"
-
-        release.set()
+        remover = asyncio.create_task(_remove())
         try:
-            await remover
-        except (asyncio.CancelledError, BaseException):
-            pass
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            remover.cancel()
+            # Deliver cancellation without spending the writer's deadline asleep.
+            await asyncio.sleep(0)
+            assert svc._lock.locked(), "lock released while the write was in flight"
+            assert not remover.done(), "cancellation escaped before the write settled"
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(remover, timeout=2.0)
 
         assert order == ["write-start", "write-done"], order
 
@@ -5737,3 +5753,203 @@ def test_every_nudge_able_channel_has_a_fire_adapter():
     for prefix in ("slack:", "discord:", "webex:"):
         channel = prefix.rstrip(":")
         assert hasattr(GatewayOrchestrator, f"_fire_{channel}_nudge"), channel
+
+
+@pytest.mark.asyncio
+async def test_structural_terminal_stop_from_on_fire_does_not_rearm(tmp_path):
+    """When a fire cycle's callback STOPS the loop (as the gateway's
+    structural-terminal guard does: ``update(active=False, ...)`` then returns
+    a refused/undelivered result), ``_run_fire_cycle`` must NOT re-arm it.
+
+    This is the end-to-end contract behind the malformed-storm fix. The gateway
+    guard refuses to dispatch a nudge whose prior delivered turn was rejected as
+    malformed and stops the loop; the service must honour that stop instead of
+    treating an undelivered cycle as a transient failure to retry. Otherwise the
+    loop would back off and fire again -- the very storm the guard exists to end.
+    """
+    fired: list[NudgeLoop] = []
+
+    async def on_fire(loop):
+        # Stand in for _fire_dashboard_nudge hitting the structural-terminal
+        # guard: it stops the loop and reports the cycle as NOT delivered.
+        fired.append(loop)
+        await service.update(loop.id, active=False, stopped_reason=_an.STRUCTURAL_TERMINAL_REASON)
+        return False
+
+    service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+    loop = NudgeLoop(
+        id="loop-structural",
+        slot_key="chat-1-123",
+        message="check the PR",
+        idle_secs=30,
+    )
+    service._loops[loop.id] = loop
+    try:
+        await service._timer(loop, delay=0)
+        assert fired == [loop], "the cycle must have fired once"
+        # The loop was stopped by the callback, so it must not be re-armed and
+        # must not count the undelivered cycle.
+        assert loop.active is False
+        assert loop.stopped_reason == _an.STRUCTURAL_TERMINAL_REASON
+        assert loop.id not in service._timers, "a stopped loop must not re-arm"
+        assert loop.cycle_count == 0, "an undelivered cycle must not be counted"
+    finally:
+        service.stop()
+
+
+def test_structural_terminal_reason_is_replaceable():
+    """A structural-terminal stop is system-imposed, so a later directive re-arm
+    may displace it -- the remedy is a NEW conversation, which /clear provides."""
+    loop = NudgeLoop(
+        id="loop-x",
+        slot_key="chat-1-123",
+        message="m",
+        idle_secs=30,
+        active=False,
+        stopped_reason=_an.STRUCTURAL_TERMINAL_REASON,
+    )
+    assert _an._stopped_row_is_replaceable(loop) is True
+
+
+@pytest.mark.asyncio
+async def test_structural_stop_does_not_overwrite_a_manual_pause(tmp_path):
+    """A structural stop landing AFTER a manual pause must not clobber it.
+
+    Race: the user pauses a loop (update active=False -> "manual") while a nudge
+    cycle is in flight; that cycle then hits the malformed rejection and the fire
+    path calls update(active=False, stopped_reason="structural_terminal"). If
+    structural_terminal were NOT a terminal-bound reason, that second update
+    would OVERWRITE the manual pause with a REPLACEABLE reason, so a later
+    directive could revive a loop the user explicitly paused. Membership in
+    _TERMINAL_BOUND_REASONS makes update's already-inactive no-op branch preserve
+    the manual pause instead. (A manual pause is NOT replaceable, so the loop
+    stays paused until the user acts.)
+    """
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = NudgeLoop(id="loop-race", slot_key="chat-1-123", message="m", idle_secs=30)
+    service._loops[loop.id] = loop
+    try:
+        # 1) user pause lands first
+        await service.update(loop.id, active=False, stopped_reason="manual")
+        assert loop.active is False
+        assert loop.stopped_reason == "manual"
+        # 2) the in-flight cycle's structural stop arrives after the pause
+        await service.update(loop.id, active=False, stopped_reason=_an.STRUCTURAL_TERMINAL_REASON)
+        # The manual pause is preserved (not clobbered), so it stays NOT
+        # replaceable and a directive cannot silently revive it.
+        assert loop.stopped_reason == "manual"
+        assert _an._stopped_row_is_replaceable(loop) is False
+    finally:
+        service.stop()
+
+
+@pytest.mark.asyncio
+async def test_message_change_advances_config_generation_and_fences_stale_stop(tmp_path):
+    """The atomic (id, generation) fence: a structural stop carrying a generation
+    captured BEFORE an instruction change must be refused; one carrying the
+    current generation must apply. Covers the A->B->A race that value-identity
+    on the message alone cannot tell apart.
+    """
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = NudgeLoop(id="loop-gen", slot_key="chat-1-123", message="A", idle_secs=30)
+    service._loops[loop.id] = loop
+    try:
+        assert loop.config_generation == 0
+        fired_gen = loop.config_generation  # captured at fire time (A)
+
+        # A -> B -> A via monitor_update; each real change advances the generation.
+        await service.update(loop.id, message="B")
+        assert loop.config_generation == 1
+        await service.update(loop.id, message="A")
+        assert loop.config_generation == 2, "re-committed A is a NEW generation"
+
+        # A stale completion of the ORIGINAL A (fired_gen=0) is refused by the
+        # fence, so the loop is NOT stopped even though its message is again "A".
+        await service.update(
+            loop.id,
+            active=False,
+            stopped_reason=_an.STRUCTURAL_TERMINAL_REASON,
+            expected_generation=fired_gen,
+        )
+        assert loop.active is True, "a stale-generation structural stop was wrongly applied"
+
+        # A completion carrying the CURRENT generation does apply.
+        await service.update(
+            loop.id,
+            active=False,
+            stopped_reason=_an.STRUCTURAL_TERMINAL_REASON,
+            expected_generation=loop.config_generation,
+        )
+        assert loop.active is False
+        assert loop.stopped_reason == _an.STRUCTURAL_TERMINAL_REASON
+
+        # A no-op same-message save does NOT advance the generation.
+        gen_before = loop.config_generation
+        await service.update(loop.id, message="A")
+        assert loop.config_generation == gen_before
+
+        # Revival advances the generation (a fresh run, old verdict cannot follow).
+        await service.update(loop.id, active=True)
+        assert loop.active is True
+        assert loop.config_generation == gen_before + 1
+    finally:
+        service.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [None, "3", -1, True, 2.5, [1]])
+async def test_load_normalizes_a_corrupt_config_generation_to_zero(tmp_path, bad):
+    """A persisted config_generation that is null / string / negative / bool /
+    non-int must be normalized to 0 at load, so a later `+= 1` or the equality
+    fence cannot raise TypeError mid-mutation (partial update + HTTP 500)."""
+    import json
+
+    store = {
+        "loops": [
+            {
+                "id": "loop-badgen",
+                "slot_key": "chat-1-123",
+                "message": "m",
+                "idle_secs": 30,
+                "active": True,
+                "config_generation": bad,
+            }
+        ]
+    }
+    (tmp_path / "autonudge.json").write_text(json.dumps(store), encoding="utf-8")
+    service = AutoNudgeService(base_dir=tmp_path)
+    await service.start()
+    try:
+        loop = service._loops["loop-badgen"]
+        assert loop.config_generation == 0
+        assert isinstance(loop.config_generation, int) and not isinstance(
+            loop.config_generation, bool
+        )
+    finally:
+        service.stop()
+
+
+@pytest.mark.asyncio
+async def test_load_keeps_a_valid_config_generation(tmp_path):
+    """A valid non-negative int config_generation survives load unchanged."""
+    import json
+
+    store = {
+        "loops": [
+            {
+                "id": "loop-goodgen",
+                "slot_key": "chat-1-123",
+                "message": "m",
+                "idle_secs": 30,
+                "active": True,
+                "config_generation": 4,
+            }
+        ]
+    }
+    (tmp_path / "autonudge.json").write_text(json.dumps(store), encoding="utf-8")
+    service = AutoNudgeService(base_dir=tmp_path)
+    await service.start()
+    try:
+        assert service._loops["loop-goodgen"].config_generation == 4
+    finally:
+        service.stop()

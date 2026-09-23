@@ -9,39 +9,22 @@ from ._component import ManagerComponent
 if TYPE_CHECKING:
     from ..subagent import (
         _ON_DONE_TIMEOUT,
-        _OUTBOX_RESULT_SUMMARY_LEN,
         _RESET_TIMEOUT,
-        _TERMINAL_RETRY_SECONDS,
-        EXECUTION_LEASE_SECONDS,
-        OUTCOME_INTERRUPTED,
         SUBAGENT_COMPLETION_PREFIX,
-        AuthorityOutcomeUncertain,
-        CoordinatorDecision,
-        OutboxEvent,
-        RunCompletion,
-        RunOutcome,
         Stats,
         SubagentInfo,
         _done_result,
         _injection_notice_outcome,
-        _OutboxDeliveryContext,
         _redact,
-        _TerminalCommitRejected,
         _timeout_context,
         _ws_result_path,
         asyncio,
-        clear_tombstone,
-        dashboard_slot_key,
-        json,
         logger,
         mark_delivered,
         os,
         platform_compat,
-        redact_credentials,
-        redact_exfiltration_urls,
         sel,
         subprocess_executor,
-        time,
     )
 
 
@@ -50,434 +33,75 @@ class TerminalCoordinator(ManagerComponent):
 
     __slots__ = ()
 
-    async def _coordinator_record_process_impl(
-        self,
-        info: SubagentInfo,
-        process_id: int,
-        process_start_id: str,
-        process_owned: bool,
-    ) -> None:
-        """Persist fenced process identity before it can authorize recovery cleanup."""
+    def _record_crew_log_terminal(self, info: SubagentInfo) -> None:
+        """Close *info*'s entry in the PARENT session's crew log, once.
 
-        fence = info._coordinator_fence
-        if fence is None:
-            raise RuntimeError("coordinator execution fence is missing")
-        result = await self._manager._coordinator.record_process(
-            info.id,
-            fence,
-            info._coordinator_version,
-            process_id,
-            process_start_id,
-            process_owned,
-        )
-        if result.value is None or result.decision is CoordinatorDecision.REJECTED:
-            raise RuntimeError(f"coordinator process record refused: {result.reason.value}")
-        info._coordinator_version = result.value.version
-        info._coordinator_process_protected = bool(process_owned and process_start_id)
+        Called from the exclusive one-shot terminal report, so a child cannot be
+        closed twice however the race between the reaper and ``_run``'s ``finally``
+        resolves.
 
-    async def _clear_terminal_process_impl(self, info: SubagentInfo) -> bool:
-        """Release a terminal row's child guard after local teardown succeeds."""
+        The closer is chosen from the runtime's own three-way ``outcome`` and never
+        re-derived from error-nullability: ``completed`` closes as a completion, and
+        ``stopped`` and ``failed`` both close through ``subagent/failed`` carrying
+        which one it was. A stop is not a success and must not read as one, and it
+        is not an error either.
 
-        fence = info._coordinator_fence
-        if fence is None:
-            return False
+        The parent session and the turn that asked are read back from the origin
+        pinned at the dispatch, and released here -- the parent is very likely on a
+        different turn by now, and asking which one would file this outcome under a
+        turn that did not cause it. An unknown origin means the dispatch was never
+        recorded (the flag was off then, or the parent could not be resolved), and
+        the emitter's empty-session-id no-op drops the closer rather than inventing
+        an opener for it.
+
+        Every name is imported inside the body: this method does not end in
+        ``_impl``, so it keeps this module's globals, where the facade's imports
+        exist only under ``TYPE_CHECKING``.
+        """
+        from kiro_crew.crew_log import emit as crew_log_emit
+        from kiro_crew.subagent import logger as _logger
+
         try:
-            result = await self._manager._coordinator.clear_recovered_process(
-                info.id,
-                fence,
-                info._coordinator_version,
-            )
-        except Exception:
-            logger.warning(
-                "Subagent %s terminal process cleanup could not be recorded",
-                info.id,
-                exc_info=True,
-            )
-            return False
-        if result.value is None or result.decision is CoordinatorDecision.REJECTED:
-            logger.warning(
-                "Subagent %s terminal process cleanup refused: %s",
-                info.id,
-                result.reason.value,
-            )
-            return False
-        info._coordinator_version = result.value.version
-        info._coordinator_process_protected = False
-        return True
-
-    async def _record_process_identity_impl(self, info: SubagentInfo, session_key: str) -> None:
-        """Persist protected process identity before any child prompt can run."""
-
-        pid = self._manager._sessions.get_pid(session_key)
-        if not isinstance(pid, int) or pid <= 0:
-            return
-        info._pid = pid
-        pid_start_id = await asyncio.to_thread(platform_compat.process_start_time, pid) or ""
-        # Ownership follows the TOKEN, not the PID. `process_start_time` answers
-        # None on Windows and for a child that has already exited, and the
-        # coordinator refuses an owned record carrying no start token
-        # (INVALID_TRANSITION) -- which would abort the run before the child is
-        # ever prompted. Claiming ownership without the token would be worse
-        # still: the PID-reuse guard is the whole authority for terminating this
-        # process tree on restart, so an unverifiable identity must record as
-        # UNOWNED rather than assert an authority nothing can confirm.
-        process_owned = bool(pid_start_id)
-        try:
-            await self._manager._write_state_off_loop(
-                info,
-                "PID record",
-                pid=pid,
-                pid_recorded_at=time.time(),
-                pid_start_id=pid_start_id,
-                process_owned=process_owned,
-            )
-        except Exception:
-            logger.debug("Failed to mirror PID for %s", info.id, exc_info=True)
-        # No fence guard: a missing fence is an invariant violation, and
-        # `_coordinator_record_process` is the seam that must refuse it. A
-        # local skip would let a child prompt run with no durable process
-        # identity recorded.
-        await self._manager._coordinator_record_process(
-            info,
-            pid,
-            pid_start_id,
-            process_owned,
-        )
-
-    async def _coordinator_mark_starting_impl(self, info: SubagentInfo) -> None:
-        """Acquire the first durable lifecycle transition before child startup."""
-
-        if info._coordinator_started or info._coordinator_fence is None:
-            return
-        command = info._coordinator_command
-        if command is None:
-            raise RuntimeError("coordinator execution command is missing")
-        try:
-            result = await self._manager._coordinator.mark_starting(
-                command,
-                info._coordinator_fence,
-                info._coordinator_version,
-            )
-        except Exception:
-            result = await self._manager._coordinator.mark_starting(
-                command,
-                info._coordinator_fence,
-                info._coordinator_version,
-            )
-        if result.value is None or result.decision is CoordinatorDecision.REJECTED:
-            raise RuntimeError(f"coordinator start refused: {result.reason.value}")
-        info._coordinator_version = result.value.version
-        info._coordinator_started = True
-
-    async def _coordinator_mark_running_impl(self, info: SubagentInfo) -> None:
-        """Commit that a child session exists before prompting it."""
-
-        if info._coordinator_running or info._coordinator_fence is None:
-            return
-        try:
-            result = await self._manager._coordinator.mark_running(
-                info.id,
-                info._coordinator_fence,
-                info._coordinator_version,
-            )
-        except Exception:
-            result = await self._manager._coordinator.mark_running(
-                info.id,
-                info._coordinator_fence,
-                info._coordinator_version,
-            )
-        if result.value is None or result.decision is CoordinatorDecision.REJECTED:
-            raise RuntimeError(f"coordinator running transition refused: {result.reason.value}")
-        info._coordinator_version = result.value.version
-        info._coordinator_running = True
-
-    def _start_coordinator_heartbeat_impl(self, info: SubagentInfo) -> None:
-        fence = info._coordinator_fence
-        if fence is None or info.id in self._manager._lease_tasks:
-            return
-        renew_fence = fence
-
-        async def _renew() -> None:
-            cadence = EXECUTION_LEASE_SECONDS / 3
-            while True:
-                await asyncio.sleep(cadence)
-                try:
-                    renewed = await self._manager._coordinator.renew(
-                        info.id,
-                        renew_fence,
-                        time.time() + EXECUTION_LEASE_SECONDS,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Subagent %s coordinator lease renewal failed",
-                        info.id,
-                        exc_info=True,
-                    )
-                    continue
-                if not renewed:
-                    logger.error("Subagent %s lost its coordinator execution lease", info.id)
-                    return
-
-        task = asyncio.create_task(_renew())
-        self._manager._lease_tasks[info.id] = task
-
-        def _forget(done: asyncio.Task[None]) -> None:
-            if self._manager._lease_tasks.get(info.id) is done:
-                self._manager._lease_tasks.pop(info.id, None)
-
-        task.add_done_callback(_forget)
-
-    async def _stop_coordinator_heartbeat_impl(self, run_id: str) -> None:
-        lease_task = self._manager._lease_tasks.pop(run_id, None)
-        if lease_task is None:
-            return
-        lease_task.cancel()
-        await asyncio.gather(lease_task, return_exceptions=True)
-
-    def _coordinator_outcome_impl(self, info: SubagentInfo) -> RunOutcome:
-        if info.user_stopped:
-            return RunOutcome.STOPPED
-        if info.error:
-            return RunOutcome.FAILED
-        return RunOutcome.COMPLETED
-
-    def _completion_payload_impl(self, info: SubagentInfo) -> str:
-        task, _ = redact_exfiltration_urls(info.task)
-        task, _ = redact_credentials(task)
-        error, _ = redact_exfiltration_urls(info.error)
-        error, _ = redact_credentials(error)
-        summary, _ = redact_exfiltration_urls(
-            _done_result(info.result)[:_OUTBOX_RESULT_SUMMARY_LEN]
-        )
-        summary, _ = redact_credentials(summary)
-        return json.dumps(
-            {
-                "id": info.id,
-                "parent_session_key": info.parent_session_key,
-                "agent": info.agent,
-                "task": task[:1000],
-                "outcome": info.outcome,
-                "error": error[:2000],
-                "result_path": info.result_path,
-                "result_summary": summary,
-                "result_truncated": bool(
-                    info.result_truncated or len(info.result) > _OUTBOX_RESULT_SUMMARY_LEN
-                ),
-                "user_stopped": info.user_stopped,
-                "silent": info.silent,
-                "batch_id": info.batch_id,
-                "batch_total": info.batch_total,
-                "elapsed": info.elapsed,
-                "conversation_key": info.conversation_key,
-                "resolved_model": info.resolved_model,
-                "requested_model": _redact(info.requested_model),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-
-    async def _commit_terminal_event_impl(self, info: SubagentInfo) -> OutboxEvent | None:
-        fence = info._coordinator_fence
-        if fence is None:
-            return None
-        try:
-            result = await self._manager._coordinator.complete(
-                RunCompletion(
-                    run_id=info.id,
-                    outcome=self._manager._coordinator_outcome(info),
-                    result_path=info.result_path,
-                    error=_redact(info.error),
-                    event_type="subagent_completion",
-                    destination=info.parent_session_key,
-                    payload_json=self._manager._completion_payload(info),
-                    terminal_at=time.time(),
-                ),
-                fence,
-                info._coordinator_version,
-            )
-        except Exception:
-            logger.exception("Subagent %s terminal coordinator commit failed", info.id)
-            return None
-        if result.decision is CoordinatorDecision.REJECTED:
-            logger.error(
-                "Subagent %s terminal coordinator commit refused: %s",
-                info.id,
-                result.reason.value,
-            )
-            raise _TerminalCommitRejected(result.reason.value)
-        if result.value is None:
-            return None
-        info._coordinator_version = result.value.run_version
-        info._delivery_event_id = result.value.event_id
-        return result.value
-
-    def _info_from_outbox_impl(self, event: OutboxEvent) -> SubagentInfo:
-        payload = json.loads(event.payload_json)
-        if not isinstance(payload, dict):
-            raise ValueError("subagent completion payload must be an object")
-        info = SubagentInfo(
-            id=str(payload.get("id") or event.run_id),
-            task=str(payload.get("task") or ""),
-            parent_session_key=str(payload.get("parent_session_key") or event.destination),
-            agent=str(payload.get("agent") or ""),
-            done=True,
-            result=str(payload.get("result_summary") or ""),
-            result_path=str(payload.get("result_path") or ""),
-            result_truncated=bool(payload.get("result_truncated")),
-            error=str(payload.get("error") or ""),
-            user_stopped=bool(payload.get("user_stopped")),
-            silent=bool(payload.get("silent")),
-            elapsed=float(payload.get("elapsed") or 0.0),
-            conversation_key=str(payload.get("conversation_key") or ""),
-            resolved_model=str(payload.get("resolved_model") or ""),
-            requested_model=str(payload.get("requested_model") or ""),
-        )
-        if payload.get("outcome") == RunOutcome.INTERRUPTED.value:
-            info._recovered_outcome = OUTCOME_INTERRUPTED
-        # Batch progress lives in the gateway's volatile digest state. After a
-        # restart, replay each stable event independently instead of inventing
-        # a fresh one-member wave from persisted batch labels.
-        info._delivery_event_id = event.event_id
-        return info
-
-    async def _deliver_outbox_event_impl(self, event: OutboxEvent) -> bool:
-        """Hand one claimed event to existing routing, returning acceptance."""
-
-        context = self._manager._outbox_contexts.get(event.event_id)
-        if context is None:
-            context = self._manager._outbox_live_contexts.pop(event.run_id, None)
-            if context is None:
-                info = self._manager._info_from_outbox(event)
-                live_batch = self._manager._outbox_live_run_batches.pop(event.run_id, None)
-                if live_batch is not None:
-                    info.batch_id, info.batch_total = live_batch
-                uncertain = self._manager._agents.get(event.run_id)
-                if uncertain is not None and uncertain._coordinator_claim_uncertain:
-                    self._manager._agents[event.run_id] = info
-                context = _OutboxDeliveryContext(
-                    info=info,
-                    source="Subagent outbox",
-                    injection_timeout_reason="durable completion delivery timed out",
-                    mark_delivered_on_success=True,
-                    settle_digest=True,
-                    teardown_done=None,
-                )
-            else:
-                self._manager._outbox_live_run_batches.pop(event.run_id, None)
-            self._manager._outbox_contexts[event.event_id] = context
-        info = context.info
-        info._delivery_event_id = event.event_id
-        # A deferred destination already accepted this stable event into its
-        # own queue or digest. Exact claims remain available to the eventual
-        # consumer for acknowledgement, but a background drain must not replay
-        # lifecycle callbacks or count the same wave member twice.
-        if info._digest_held or info._delivery_queued:
-            return False
-        info._delivery_failed = False
-        if not context.effects_fired:
-            await self._manager._fire_event(
-                "subagent_done",
-                info,
-                {
-                    "elapsed": info.elapsed,
-                    "error": _redact(info.error) if info.error else None,
-                    "stopped": info.user_stopped,
-                    "outcome": info.outcome,
-                    "task": _redact(info.task),
-                    "agent": _redact(info.agent),
-                    "child_session": info.conversation_key or f"subagent:{info.id}",
-                    "model": info.resolved_model,
-                    "requested_model": _redact(info.requested_model),
-                    "result": _done_result(info.result),
-                    "event_id": event.event_id,
-                },
-            )
-            context.effects_fired = True
-        if self._manager._on_done:
-            info._delivery_retry = context.callback_started
-            context.callback_started = True
-            try:
-                await asyncio.wait_for(self._manager._on_done(info), timeout=_ON_DONE_TIMEOUT)
-            except asyncio.TimeoutError:
-                logger.error(
-                    "%s: completion injection timed out for %s after %.0fs",
-                    context.source,
-                    info.id,
-                    _ON_DONE_TIMEOUT,
-                )
-                try:
-                    await self._manager._sessions.reset(info.parent_session_key)
-                except Exception:
-                    logger.debug(
-                        "Failed to reset parent session %s after injection timeout",
-                        info.parent_session_key,
-                        exc_info=True,
-                    )
-                self._manager.notify_injection_failed(
-                    info,
-                    reason=context.injection_timeout_reason,
-                )
-                return False
-            except Exception:
-                logger.exception("%s: announce failed for %s", context.source, info.id)
-                return False
-        if info._delivery_failed:
-            # NOT an exception: the event stays claimable and its context is
-            # retained, so the next drain resumes the same delivery instead of
-            # replaying the destination from scratch.
-            return False
-        info._delivery_retry = False
-        info._delivery_batch_progress = None
-        info._delivery_batch_final = False
-        info._reported_to_parent = True
-        if info._digest_held or info._delivery_queued:
-            return False
-        if context.settle_digest:
-            await self._manager._settle_digest_holds(info)
-        if context.mark_delivered_on_success and info.outcome == "completed":
-            teardown_done = context.teardown_done
-            if teardown_done is not None and not teardown_done.is_set():
-                try:
-                    await asyncio.wait_for(teardown_done.wait(), timeout=_RESET_TIMEOUT + 30)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Subagent %s: teardown did not complete before the "
-                        "delivered tombstone; writing it anyway",
-                        info.id,
-                    )
-            try:
-                await asyncio.to_thread(mark_delivered, info.id)
-            except Exception:
-                logger.debug("Failed to mark subagent %s delivered", info.id, exc_info=True)
-            try:
-                slot_key = dashboard_slot_key(info.parent_session_key)
-                if slot_key:
-                    _ws_result_path(slot_key, info.id).unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to clean workspace result for %s", info.id, exc_info=True)
-        self._manager._outbox_contexts.pop(event.event_id, None)
-        return True
-
-    async def _reject_waiting_before_terminal_impl(self, info: SubagentInfo, error: str) -> None:
-        """Persist a pre-start rejection while its run lease protects terminal delivery."""
-
-        while True:
-            try:
-                await self._manager.command_authority.reject_waiting_execution(
-                    info.id,
-                    error,
-                    stop_heartbeat=False,
-                )
+            if not crew_log_emit.enabled():
                 return
-            except asyncio.CancelledError:
-                raise
-            except AuthorityOutcomeUncertain:
-                logger.warning(
-                    "Subagent %s waiting rejection commit failed; retrying",
-                    info.id,
-                    exc_info=True,
+            sid, _asking_turn = crew_log_emit.child_origin(info.id)
+            if not sid:
+                # Pinned but never opened -- a spawn the approval gate declined.
+                # It closes nothing, and the pin is dropped here rather than left
+                # for the FIFO to evict.
+                crew_log_emit.forget_child_origin(info.id)
+                return
+            # The pin is READ here and released in the finally, after the entry is
+            # handed to the writer. It is the only thing covering the gap the
+            # normal path opens: `done` flips in the run loop, which drops the
+            # child from the manager's running set, and this method runs later
+            # from the report task -- so between them the child is neither running
+            # nor owed, and a repair reading there would close it as `unknown`
+            # ahead of the outcome below. Releasing after the handover means the
+            # writer's debt takes over from the pin with no instant in between.
+            # Reporting stays one-shot without the pop: every route here is gated
+            # on `_claim_finalize`, which hands out one token.
+            elapsed_ms = int(max(0.0, float(info.elapsed or 0.0)) * 1000)
+            outcome = info.outcome
+            if outcome == "completed":
+                crew_log_emit.on_subagent_completed(sid, agent_id=info.id, duration_ms=elapsed_ms)
+            else:
+                crew_log_emit.on_subagent_failed(
+                    sid,
+                    agent_id=info.id,
+                    reason=info.error or "",
+                    outcome=outcome,
+                    duration_ms=elapsed_ms,
                 )
-                await asyncio.sleep(_TERMINAL_RETRY_SECONDS)
+        except Exception:
+            _logger.debug("crew log: closing a subagent entry failed", exc_info=True)
+        finally:
+            # Unconditional: a pin this method fails to release is a child the
+            # repair would treat as live forever.
+            try:
+                crew_log_emit.forget_child_origin(info.id)
+            except Exception:
+                _logger.debug("crew log: releasing a child origin failed", exc_info=True)
 
     def _claim_finalize_impl(self, info: SubagentInfo, *, supersede_recovery: bool = False) -> bool:
         """Claim the exclusive right to report ``info``'s terminal outcome.
@@ -512,10 +136,20 @@ class TerminalCoordinator(ManagerComponent):
         has its own one-shot token (:meth:`_release_slot`); three concerns, three
         guards. Session teardown stays keyed on ``reaped``.
         """
-        return self._manager._lifecycle.claim_report(
-            info,
-            supersede_recovery=supersede_recovery,
-        )
+        if info._recovering and not supersede_recovery:
+            return False
+        if info._finalized:
+            return False
+        if info._recovering:
+            # A terminal reap/stop SUPERSEDES a pending cancel-recovery respawn:
+            # the agent is being killed, so there is nothing left to respawn.
+            # Clearing the flag here is what keeps `False` from meaning two
+            # different things to this caller ("someone else already reported"
+            # vs "withheld for a respawn that will report later") — the exact
+            # conflation this token exists to remove.
+            info._recovering = False
+        info._finalized = True
+        return True
 
     async def _report_terminal_impl(
         self,
@@ -526,9 +160,7 @@ class TerminalCoordinator(ManagerComponent):
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-        process_stopped: "asyncio.Event | None" = None,
-        tombstone_error_on_success: bool = False,
-    ) -> None:
+    ) -> bool:
         """Deliver ``info``'s one-shot terminal report as a single unit.
 
         This is the exact work the finalize claim guards: fire the
@@ -552,88 +184,20 @@ class TerminalCoordinator(ManagerComponent):
         arguments rather than unified away. The WS payload is identical (both
         set ``info.elapsed`` before calling), so it is built from ``info`` here.
         """
-        if info._coordinator_fence is not None:
-            context = _OutboxDeliveryContext(
-                info=info,
-                source=source,
-                injection_timeout_reason=injection_timeout_reason,
-                mark_delivered_on_success=mark_delivered_on_success,
-                settle_digest=settle_digest,
-                teardown_done=teardown_done,
-            )
-            self._manager._outbox_live_contexts[info.id] = context
-            event = None
-            while event is None:
-                try:
-                    event = await self._manager._commit_terminal_event(info)
-                except _TerminalCommitRejected:
-                    if self._manager._outbox_live_contexts.get(info.id) is context:
-                        self._manager._outbox_live_contexts.pop(info.id, None)
-                    await self._manager._stop_coordinator_heartbeat(info.id)
-                    await self._manager.command_authority.stop_execution_heartbeat(info.id)
-                    try:
-                        await asyncio.to_thread(clear_tombstone, info.id)
-                    except Exception:
-                        logger.debug(
-                            "Failed to re-admit stale-fence result %s to recovery",
-                            info.id,
-                            exc_info=True,
-                        )
-                    return
-                if event is None:
-                    await asyncio.sleep(_TERMINAL_RETRY_SECONDS)
-            if self._manager._outbox_live_contexts.get(info.id) is context:
-                self._manager._outbox_live_contexts.pop(info.id, None)
-            if not info._reported_to_parent:
-                self._manager._outbox_contexts.setdefault(event.event_id, context)
-            try:
-                await self._manager._stop_coordinator_heartbeat(info.id)
-            finally:
-                await self._manager.command_authority.stop_execution_heartbeat(info.id)
-            if info._reported_to_parent:
-                return
-            if process_stopped is not None:
-                if teardown_done is not None and not teardown_done.is_set():
-                    try:
-                        await asyncio.wait_for(teardown_done.wait(), timeout=_RESET_TIMEOUT + 30)
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "Subagent %s teardown did not settle its protected process",
-                            info.id,
-                        )
-                        return
-                if not process_stopped.is_set():
-                    return
-                if not await self._clear_terminal_process_impl(info):
-                    return
-            while True:
-                try:
-                    attempts = await self._manager._outbox_delivery.drain_once(
-                        event_id=event.event_id
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.warning(
-                        "Subagent %s durable completion routing failed",
-                        info.id,
-                        exc_info=True,
-                    )
-                else:
-                    # A returned attempt means the fence was durably settled:
-                    # either delivered or released for the periodic outbox
-                    # drainer. The terminal reporter owns only this immediate
-                    # attempt and must not wait through the released lease.
-                    if attempts:
-                        return
-                    if info._reported_to_parent or info._digest_held or info._delivery_queued:
-                        return
-                await asyncio.sleep(_TERMINAL_RETRY_SECONDS)
-
         # A queued synthetic terminal is registered before all sibling reports
         # are scheduled, with ``done=False`` as a batch-completion hold. The
         # exclusive report task owns the terminal transition; flipping here
         # means only the last sibling can observe the batch as fully settled.
+        #
+        # The crew log entry is handed over before this flip, but that order is
+        # NOT what protects the log, and reading it that way was wrong: on the
+        # normal completion path the run loop has already set `done` well before
+        # this method runs, so by here the flip is a no-op re-flip and the child
+        # left the manager's running set long ago. What covers that gap is the
+        # child's origin pin, which `_record_crew_log_terminal` holds until the
+        # closer is handed to the writer. This flip stays ahead of the event for
+        # the paths that reach a terminal without the run loop.
+        self._record_crew_log_terminal(info)
         info.done = True
         await self._manager._fire_event(
             "subagent_done",
@@ -657,46 +221,62 @@ class TerminalCoordinator(ManagerComponent):
                 # Carry the requested pin on the terminal report too, redacted
                 # like the spawn frame: after a reconnect the completed card is
                 # rebuilt from this event alone, so without it the live-downgrade
-                # amber chip would silently vanish from a downgraded finished run
-                # (Opus/Design/First-Principles review on #5326).
+                # amber chip would silently vanish from a downgraded finished run.
                 "requested_model": _redact(info.requested_model),
                 "result": _done_result(info.result),
+                # WHY the run ended and whether ``result`` is a partial, so the
+                # parent does not infer success from ``error`` being unset.
+                "stop_reason": info.stop_reason,
+                "stop_class": info.stop_class,
+                "partial": info.partial,
             },
         )
         if not self._manager._on_done:
-            return
+            return True
+        if info.id in getattr(self._manager, "_teardown_cancelled_ids", ()):
+            # The parent this would report to has been retired. ``_on_done``
+            # resolves the parent key through the session registry and injects,
+            # which CREATES a session when none is live — so delivering here
+            # rebuilds the conversation the teardown just took down and seeds it
+            # with a retired run's terminal text. The ``subagent_done`` event above
+            # has already gone out, so a dashboard watching the card still sees it
+            # end; what is skipped is the injection into a conversation that is
+            # over. The run's own result file and tombstone are unaffected.
+            # Releasing the hold is part of the same statement. A wave member parks
+            # its siblings' announces on its own digest (``_digest_held_at``,
+            # ``_digest_settle_ids``), and the reaper's hold-expiry sweep arms a
+            # ``force_digest_flush`` for a batch whose hold has aged out. That flush
+            # builds a SYNTHETIC record with a fresh id, so the gate above can never
+            # match it: it would reach ``_on_done`` on its own and rebuild the retired
+            # parent's conversation minutes after this skip. Dropping this run out of
+            # the hold, and marking the siblings it was holding, leaves no injector
+            # armed for the wave. The siblings are NOT marked delivered -- their results
+            # never reached a parent, so orphan reconciliation must still be able to
+            # find them.
+            info._digest_held_at = 0.0
+            held, info._digest_settle_ids = info._digest_settle_ids, []
+            if held:
+                self._manager._teardown_cancelled_ids.update(held)
+            logger.info("Reaper: skipping parent delivery for %s — its parent ended", info.id)
+            # The gate has now done its job for this run: the delivery it existed to stop
+            # has been stopped, and ``_on_done`` was never called, so none of the gateway's
+            # injection paths can fire for it either. Discarding here is what keeps the gate
+            # from depending on its age backstop in the ordinary case -- an id is retained
+            # until the run's delivery is actually suppressed rather than for a fixed span.
+            self._manager._teardown_cancelled_ids.discard(info.id)
+            return True
         try:
             await asyncio.wait_for(self._manager._on_done(info), timeout=_ON_DONE_TIMEOUT)
-            if tombstone_error_on_success and info._delivery_failed:
-                # A synchronous router can exhaust its own retries and return
-                # normally after flagging failure. The shadow fallback has no
-                # durable outbox event, so a tombstone here would suppress the
-                # only remaining delivery owner: restart reconciliation.
-                return
             # The outcome has REACHED the parent. Recorded before any further
             # await so a shutdown cancellation landing in the teardown wait or
             # the tombstone write below is not mistaken for a lost delivery by
             # `cancel_all()` (which would re-deliver it on the next start).
             info._reported_to_parent = True
-            if (
-                tombstone_error_on_success
-                and info.error
-                and not info._delivery_queued
-                and not info._digest_held
-            ):
-                try:
-                    await asyncio.to_thread(self._manager._write_tombstone, info, "error")
-                except Exception:
-                    logger.debug(
-                        "Failed to tombstone reported shadow fallback %s",
-                        info.id,
-                        exc_info=True,
-                    )
             if settle_digest:
                 # _on_done returned without raising, so the wave digest (if this
                 # was the final member) has been handed off. Only NOW settle the
                 # held members' delivery tombstones.
-                await self._manager._settle_digest_holds(info)
+                self._manager._settle_digest_holds(info)
             # Digest-held wave members are NOT marked delivered here: their
             # result has not reached the parent yet (the gateway marks them when
             # the digest fires), so a restart mid-wave leaves them visible to
@@ -738,7 +318,7 @@ class TerminalCoordinator(ManagerComponent):
                 # "delivered" tombstone excludes it from orphan reconciliation;
                 # the reaper prunes it after agent.subagent_result_ttl_secs.
                 try:
-                    await asyncio.to_thread(mark_delivered, info.id)
+                    mark_delivered(info.id)
                 except Exception:
                     logger.debug("Failed to mark subagent %s delivered", info.id, exc_info=True)
                 # Clean up workspace result file (agent-{id}.md in parent dir).
@@ -755,6 +335,7 @@ class TerminalCoordinator(ManagerComponent):
                         _ws_result_path(slot_key, info.id).unlink(missing_ok=True)
                 except Exception:
                     logger.debug("Failed to clean workspace result for %s", info.id, exc_info=True)
+            return True
         except asyncio.TimeoutError:
             logger.error(
                 "%s: completion injection timed out for %s after %.0fs",
@@ -774,8 +355,10 @@ class TerminalCoordinator(ManagerComponent):
                     exc_info=True,
                 )
             self._manager.notify_injection_failed(info, reason=injection_timeout_reason)
+            return False
         except Exception:
             logger.exception("%s: announce failed for %s", source, info.id)
+            return False
 
     async def _run_terminal_report_impl(
         self,
@@ -786,9 +369,7 @@ class TerminalCoordinator(ManagerComponent):
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-        process_stopped: "asyncio.Event | None" = None,
-        tombstone_error_on_success: bool = False,
-    ) -> None:
+    ) -> bool:
         """Spawn the shielded terminal report and block until it completes.
 
         Convenience for callers that have no cancellable ``await`` between
@@ -800,7 +381,7 @@ class TerminalCoordinator(ManagerComponent):
         await and :meth:`_await_report` after, so the report task is already
         live (and shielded) no matter where the cancellation lands.
         """
-        await self._manager._await_report(
+        return await self._manager._await_report(
             self._manager._spawn_terminal_report(
                 info,
                 source=source,
@@ -808,8 +389,6 @@ class TerminalCoordinator(ManagerComponent):
                 mark_delivered_on_success=mark_delivered_on_success,
                 settle_digest=settle_digest,
                 teardown_done=teardown_done,
-                process_stopped=process_stopped,
-                tombstone_error_on_success=tombstone_error_on_success,
             )
         )
 
@@ -822,31 +401,54 @@ class TerminalCoordinator(ManagerComponent):
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-        process_stopped: "asyncio.Event | None" = None,
-        tombstone_error_on_success: bool = False,
-    ) -> "asyncio.Task":  # type: ignore[type-arg]
+    ) -> "asyncio.Task[bool]":
         """Launch :meth:`_report_terminal` on a strongly-referenced task.
 
         Returns immediately (no ``await``) so the caller can start the report
         BEFORE its own teardown awaits, guaranteeing the report exists and is
         held alive independently of the caller's fate. The task is retained in
-        ``self._manager._report_tasks`` (so it cannot be garbage-collected while its
+        ``self._report_tasks`` (so it cannot be garbage-collected while its
         awaiter is cancelled, and so ``cancel_all()`` can drain it) and
         self-removes on completion.
         """
-        return self._manager._lifecycle.spawn_report(
-            info,
-            lambda: self._manager._report_terminal(
+        task = asyncio.create_task(
+            self._manager._report_terminal(
                 info,
                 source=source,
                 injection_timeout_reason=injection_timeout_reason,
                 mark_delivered_on_success=mark_delivered_on_success,
                 settle_digest=settle_digest,
                 teardown_done=teardown_done,
-                process_stopped=process_stopped,
-                tombstone_error_on_success=tombstone_error_on_success,
-            ),
+            )
         )
+        self._manager._report_tasks.add(task)
+        # Owner map so `cancel_all()` can identify WHOSE outcome it is about to
+        # abandon (and re-admit it to orphan recovery). Kept alongside the set
+        # rather than replacing it: `_report_tasks` is the strong reference that
+        # keeps the task alive, and both are cleared by the one done callback.
+        self._manager._report_owners[task] = info
+
+        def _forget(t: "asyncio.Task") -> None:  # type: ignore[type-arg]
+            self._manager._report_tasks.discard(t)
+            owner = self._manager._report_owners.pop(t, None)
+            self._manager._run_events._forget_finished_live_state(info)
+            if owner is None:
+                return
+            failed = t.cancelled()
+            if not failed:
+                try:
+                    failed = t.result() is False
+                except asyncio.CancelledError:
+                    failed = True
+                except Exception:
+                    failed = True
+            if failed:
+                self._manager._latch_report_failure(owner)
+            else:
+                self._manager._clear_report_failure(owner)
+
+        task.add_done_callback(_forget)
+        return task
 
     def _release_slot_impl(self, info: SubagentInfo) -> bool:
         """Claim the exclusive right to free ``info``'s concurrency slot.
@@ -864,10 +466,14 @@ class TerminalCoordinator(ManagerComponent):
         ``_running_count`` and permanently starving the spawn queue. An explicit
         one-shot token makes the count independent of report and record ordering.
 
-        Recovery uses the scheduler's atomic capacity check and reoccupation
-        after the interrupted run's ``finally`` has released its old slot.
+        Note the recovery respawn's own ``_running_count += 1`` re-admit is
+        unaffected: it runs after the interrupted run's ``finally`` has already
+        released, and this token is per-``SubagentInfo``.
         """
-        return self._manager._scheduler.claim_release(info)
+        if info._slot_released:
+            return False
+        info._slot_released = True
+        return True
 
     async def _force_reap_impl(
         self, agent_id: str, info: SubagentInfo, elapsed: float, *, reason: str = ""
@@ -884,7 +490,7 @@ class TerminalCoordinator(ManagerComponent):
         # `_reap_started`, NOT `reaped`: setting `reaped` this early makes a run
         # woken by our own session reset skip its error synthesis and report a
         # false SUCCESS before we own the record. See `_reap_started`.
-        self._manager._lifecycle.begin_reap(info)
+        info._reap_started = True
         # A pending cancel-recovery respawn is moot — this agent is being killed.
         # Cancel it rather than letting it sit in its bounded handshake wait
         # (_RESET_TIMEOUT + 60s) only to discover `reaped` and bare-return.
@@ -892,12 +498,6 @@ class TerminalCoordinator(ManagerComponent):
         recovery_task = self._manager._tasks.pop(f"{agent_id}:recovery", None)
         if recovery_task and not recovery_task.done():
             recovery_task.cancel()
-
-        # A protected coordinator row keeps its terminal event unclaimable until
-        # teardown is proven.  Preserve that proof across the terminal commit;
-        # otherwise the reaper waits forever while its own process guard blocks
-        # the immediate outbox drain.
-        process_stopped = asyncio.Event() if info._coordinator_process_protected else None
 
         if info._session_sharing:
             # Session-sharing subagent: NEVER SIGKILL the shared runtime —
@@ -937,30 +537,9 @@ class TerminalCoordinator(ManagerComponent):
         else:
             # Kill the process FIRST so the pipe unblocks, then cancel the task.
             try:
-                reset_session = await asyncio.wait_for(
+                await asyncio.wait_for(
                     self._manager._sessions.reset(session_key), timeout=_RESET_TIMEOUT
                 )
-                if reset_session and process_stopped is not None:
-                    try:
-                        run = await self._manager._coordinator.get_run(info.id)
-                        if (
-                            run is not None
-                            and run.process_owned
-                            and run.process_id > 1
-                            and not await asyncio.to_thread(
-                                platform_compat.pid_exists, run.process_id
-                            )
-                        ):
-                            process_stopped.set()
-                    except Exception:
-                        # Session reset success only proves the registry entry was
-                        # removed.  Recovery keeps the PID fence when process
-                        # absence cannot be established independently.
-                        logger.warning(
-                            "Reaper: protected process check failed for %s",
-                            agent_id,
-                            exc_info=True,
-                        )
             except asyncio.TimeoutError:
                 logger.warning("Reaper: reset hung for %s, attempting SIGKILL", agent_id)
                 await self._manager._sigkill_session(session_key)
@@ -988,15 +567,16 @@ class TerminalCoordinator(ManagerComponent):
             # intentional-cancel contract: visible when the task's
             # CancelledError arm runs. The recovery scheduler reads the earlier
             # `_reap_started` instead, so it is not affected by this placement.
-            self._manager._lifecycle.mark_reaped(info)
+            info.reaped = True
             self._manager._cancel_task_intentionally(task, info, reason=reason or "reaped")
 
         # No live task to cancel above (already exited) — the reap still owns
         # teardown bookkeeping from here, so mark it now.
-        self._manager._lifecycle.mark_reaped(info)
+        info.reaped = True
         # Guard 1 of 3 — the terminal RECORD (done/error/stat/tombstone/cost) is
         # first-arrival-wins on `info.done`, so it is never written twice.
-        if self._manager._lifecycle.claim_record(info):
+        if not info.done:
+            info.done = True
             if not info.error and not info.user_stopped:
                 # A user stop is neutral — never synthesize a reap error for it.
                 if approval_parked:
@@ -1020,7 +600,8 @@ class TerminalCoordinator(ManagerComponent):
         # slot but — unlike normal completion — does NOT otherwise pump the queue,
         # so queued spawns would sit stranded until an unrelated agent finished.
         # Drain here so the freed slot is used immediately.
-        if self._manager._scheduler.release(info):
+        if self._manager._release_slot(info):
+            self._manager._running_count = max(0, self._manager._running_count - 1)
             self._manager._drain_queue()
 
         try:
@@ -1063,7 +644,6 @@ class TerminalCoordinator(ManagerComponent):
                     f"delivery timed out after {int(_ON_DONE_TIMEOUT)}s (reaper)"
                 ),
                 mark_delivered_on_success=False,
-                process_stopped=process_stopped,
                 # This member's own result is NOT marked delivered (it was
                 # reaped, not completed) — but if it was the wave member whose
                 # `_on_done` flushed the batch digest, its SIBLINGS' successful
@@ -1091,15 +671,13 @@ class TerminalCoordinator(ManagerComponent):
         ``taskkill.exe``.
         """
         try:
-            # Resolve through the session facade so this leaf keeps no ACP edge.
-            from kiro_crew.session import _load_child_process_helpers
-
-            (
+            # circular import: subagent → acp.client → session → subagent
+            from kiro_crew.acp.client import (
                 _capture_child_records,
                 _get_child_pids,
-                _kill_escaped_children,
                 _is_our_child,
-            ) = _load_child_process_helpers()
+                _kill_escaped_children,
+            )
 
             session = self._manager._sessions._sessions.get(session_key)
             if not session:
@@ -1180,7 +758,17 @@ class TerminalCoordinator(ManagerComponent):
         report could not be injected, including runs cancelled or rejected
         before they ever executed.
         """
-        info._delivery_failed = True
+        if info.id in getattr(self._manager, "_teardown_cancelled_ids", ()):
+            # Same statement as the terminal-report gate: this run's parent has
+            # been retired, so there is no conversation for a failure notice to
+            # belong to. The notice is queued into the parent's slot and drained
+            # into the LLM's context on the parent key's next turn, so leaving it
+            # queued would surface a retired run's completion text inside whatever
+            # conversation that key serves next. This is the single choke point
+            # for every failure-announce caller (the ``_on_done`` timeout here and
+            # the gateway's injection paths), so gating it once covers them all.
+            logger.info("Reaper: skipping failure announce for %s — its parent ended", info.id)
+            return
         try:
             # Lazy: the dashboard layer must not be imported by a core module at
             # import time.

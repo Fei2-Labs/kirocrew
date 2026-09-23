@@ -17,11 +17,14 @@ from pathlib import Path
 
 from skill_script_helpers import load_skill_script
 
-from kiro_crew import agent
+from conftest import make_dir_link
+from kiro_crew import agent, platform_compat
 from kiro_crew.agent_files import (
     OWNED_KIRO_AGENT_FILES,
     PIPELINE_CONDUCTOR_AGENT_FILENAME,
 )
+from kiro_crew.agent_sdk.drivers.acp import derived_agent_permissions
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
 
 SKILL_DIR = (
     Path(__file__).resolve().parents[1]
@@ -31,10 +34,30 @@ SKILL_DIR = (
     / "pipeline-conductor"
 )
 
+#: A release that accepts a spec ``permissions`` block, and one that refuses it,
+#: expressed against the floor so raising it cannot strand these tests.
+_ACCEPTS = SPEC_PERMISSIONS_MIN_VERSION
+_REFUSES = (SPEC_PERMISSIONS_MIN_VERSION[0], SPEC_PERMISSIONS_MIN_VERSION[1] - 1, 0)
+_INHERITED_PERMISSIONS = {"rules": [{"capability": "web_fetch", "effect": "deny"}]}
+
+
+def _pin_spec_permissions_cli(monkeypatch, which):
+    """Pin what the shared writer gate believes the installed kiro-cli is.
+
+    ``_write_derived_permissions`` reads ``installed_kiro_cli_version``
+    function-locally from ``kiro_crew.kiro_cli``, so the patch lands there.
+    Without it CI's absent binary reads as "unknown" and the field is withheld,
+    failing a shared permissions assertion for a host reason. ``which`` is
+    ``"accepts"``, ``"refuses"`` or ``"unknown"``.
+    """
+    version = {"accepts": _ACCEPTS, "refuses": _REFUSES, "unknown": None}[which]
+    monkeypatch.setattr("kiro_crew.kiro_cli.installed_kiro_cli_version", lambda: version)
+
 
 class TestPipelineConductorInstaller:
-    def _install(self, tmp_path, monkeypatch, *, may_auto_approve=None):
+    def _install(self, tmp_path, monkeypatch, *, may_auto_approve=None, cli_version="accepts"):
         monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+        _pin_spec_permissions_cli(monkeypatch, cli_version)
         monkeypatch.setattr(
             agent,
             "build_agent_config",
@@ -47,6 +70,7 @@ class TestPipelineConductorInstaller:
                 },
                 "tools": ["fs_write", "@kirocrew-core"],
                 "allowedTools": ["@kirocrew-core"],
+                "permissions": _INHERITED_PERMISSIONS,
             },
         )
         monkeypatch.setattr(
@@ -71,11 +95,11 @@ class TestPipelineConductorInstaller:
         missing from that allowlist silently rots when Playwright servers move."""
         assert PIPELINE_CONDUCTOR_AGENT_FILENAME in OWNED_KIRO_AGENT_FILES
 
-    def test_prompt_carries_the_verbosity_placeholder(self, tmp_path, monkeypatch):
-        """Custom agents get their OWN prompt, so the token must appear here or
-        the user's verbosity setting silently never reaches this agent."""
+    def test_prompt_does_not_carry_the_retired_verbosity_token(self, tmp_path, monkeypatch):
         data = self._install(tmp_path, monkeypatch)
-        assert "{{VERBOSITY_BLOCK}}" in data["prompt"]
+        # Reply style now arrives as session-context chrome for every
+        # agent; a token left here would reach the model as a literal.
+        assert "{{VERBOSITY_BLOCK}}" not in data["prompt"]
 
     def test_prompt_drives_patrol_with_monitor_start_not_wait(self, tmp_path, monkeypatch):
         data = self._install(tmp_path, monkeypatch)
@@ -120,12 +144,34 @@ class TestPipelineConductorInstaller:
             "@kirocrew-dashboard/session_send",
             "@kirocrew-dashboard/session_stop",
             "@kirocrew-dashboard/chat_folder_move_session",
+            # Deliberately NOT granted here: the pipeline procedure does not
+            # file itself yet (the goal and security conductors do), and a
+            # grant nothing in the skill exercises is surface without a user.
+            "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard",
             "execute_bash",
         ):
             assert gated not in allowed, gated
         assert "@kirocrew-dashboard" in data["tools"]  # mounted, so gated verbs still work
         assert "execute_bash" in data["tools"]
+
+    def test_skill_does_not_name_the_self_filing_verb_it_is_not_granted(self):
+        """Grant and procedure move together. ``chat_folder_file_self`` is
+        withheld from this agent (see the gated list above), so its skill must
+        not instruct a call that would prompt on every unattended cycle. When
+        the pipeline procedure adopts the goal/agent folder shape, both this
+        pin and the grant change in the same PR."""
+        from pathlib import Path
+
+        skill = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "kiro_crew"
+            / "builtin_skills"
+            / "pipeline-conductor"
+            / "SKILL.md"
+        )
+        assert "chat_folder_file_self" not in skill.read_text(encoding="utf-8")
 
     def test_core_grants_are_named_verbs_never_the_whole_server(self, tmp_path, monkeypatch):
         """Untrusted content feeds every auto-approved call on an unattended
@@ -200,6 +246,27 @@ class TestPipelineConductorInstaller:
         assert "@kirocrew-core/monitor_start" not in data["allowedTools"]
         withheld = [e for e in events if e.get("operation") == "mcp_auto_approve_withheld"]
         assert withheld and withheld[0]["source"] == "_install_pipeline_conductor_agent"
+
+    def test_the_permissions_field_is_gated_on_the_installed_kiro_cli(self, tmp_path, monkeypatch):
+        """Written on an accepting release, withheld on a refusing or unknown one.
+
+        The pipeline conductor spec gates its ``permissions`` write on the
+        installed kiro-cli, sharing the default spec's gate: a kiro-cli whose
+        schema predates the field would otherwise refuse the WHOLE spec and fall
+        back to broader default grants. ``allowedTools`` is untouched either way.
+        """
+        accepting = self._install(tmp_path, monkeypatch, cli_version="accepts")
+        assert accepting.get("permissions"), "an accepting CLI must get the block"
+        assert accepting["permissions"] != _INHERITED_PERMISSIONS
+        assert accepting["permissions"] == derived_agent_permissions(
+            accepting["allowedTools"], PIPELINE_CONDUCTOR_AGENT_FILENAME
+        )
+        assert accepting["allowedTools"], "the grant list is never withheld"
+
+        for refusing in ("refuses", "unknown"):
+            data = self._install(tmp_path, monkeypatch, cli_version=refusing)
+            assert "permissions" not in data, f"{refusing} CLI must get no block"
+            assert data["allowedTools"], "the grant list is never withheld"
 
 
 class TestFleetProbe:
@@ -1699,8 +1766,9 @@ class TestFleetProbe:
     # ── 2d: cwd-scoped banned scan ────────────────────────────────────────────
 
     def _proc(self, tmp_path: Path, pid: str, argv: bytes, cwd: Path | None) -> Path:
-        """One fake ``/proc/<pid>``. ``cwd`` is written as a SYMLINK because that
-        is what the kernel exposes and what the probe reads.
+        """One fake ``/proc/<pid>``. ``cwd`` is written as a reparse link (a
+        junction on Windows) because that is what the kernel exposes and what
+        the probe reads.
 
         A ``stat`` file is always written: every live process on a real system
         has one, and the probe reads its ``starttime`` (field 22) as the process
@@ -1718,7 +1786,7 @@ class TestFleetProbe:
         (proc / pid / "stat").write_text(f"{pid} (proc) R " + " ".join(stat_tail) + "\n", "ascii")
         if cwd is not None:
             cwd.mkdir(parents=True, exist_ok=True)
-            os.symlink(str(cwd), str(proc / pid / "cwd"))
+            make_dir_link(proc / pid / "cwd", cwd)
         return proc
 
     def test_a_banned_match_outside_the_fleet_is_foreign_not_banned(
@@ -2033,8 +2101,8 @@ class TestFleetProbe:
         for target in (Path(os.sep), store.parent):
             link = tmp_path / f"link-{abs(hash(str(target))) % 1000}"
             if link.is_symlink() or link.exists():
-                link.unlink()
-            os.symlink(str(target), str(link))
+                platform_compat.unlink_link_or_junction(link)
+            make_dir_link(link, target)
             cfg.write_text(
                 json.dumps({"sessions": [], "fleet_worktrees": [str(link)]}), encoding="utf-8"
             )
@@ -2327,7 +2395,7 @@ class TestFleetProbe:
         real = tmp_path / "real-fleet" / "wt-a"
         real.mkdir(parents=True)
         link = tmp_path / "via-link"
-        os.symlink(str(tmp_path / "real-fleet"), str(link))
+        make_dir_link(link, tmp_path / "real-fleet")
         # The process reports the REAL path; the config names the symlinked one.
         proc = self._proc(tmp_path, "5100", b"pytest\x00test/x.py\x00", real)
         cfg = self._config(tmp_path, monkeypatch, [], fleet_worktrees=[str(link / "wt-a")])

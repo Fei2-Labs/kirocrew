@@ -22,10 +22,11 @@ capability mechanism inside the boundary. That top-level path survives as a pure
 re-export shim, so ``acp/client.py`` still calls through it by attribute and the
 tests that patch it still reach what the client calls.
 
-**Enforcement scope.** Two mechanisms are ENFORCED here --
-:data:`~kiro_crew.agent_sdk.backends.Routing.SESSION_CONFIG` and
-:data:`~kiro_crew.agent_sdk.backends.Routing.VERIFIED_SEEDED_SETTINGS` -- because
-they are the two this core implements end to end. ``AGENT_SPEC`` needs no
+**Enforcement scope.** Three mechanisms are ENFORCED here --
+:data:`~kiro_crew.agent_sdk.backends.Routing.SESSION_CONFIG`,
+:data:`~kiro_crew.agent_sdk.backends.Routing.VERIFIED_SEEDED_SETTINGS` and
+:data:`~kiro_crew.agent_sdk.backends.Routing.VERIFIED_GATE_EXTENSION` -- because
+they are the three this core implements end to end. ``AGENT_SPEC`` needs no
 enforcement (it holds by construction), and ``SEEDED_SETTINGS`` is
 declared-but-unenforced, and the reason is a read-back
 gap rather than a missing writer. ``AcpClient._write_claude_local_settings`` does
@@ -57,11 +58,14 @@ import os
 from enum import Enum
 from pathlib import PurePosixPath
 
+from kiro_crew import platform_compat
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CODEX,
-    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_LAUNCH,
+    ACP_BACKEND_PI,
     Routing,
+    gate_probe_command_for,
     permission_config_for,
     permission_setting_for,
     routing_for,
@@ -75,7 +79,28 @@ logger = logging.getLogger(__name__)
 #: harness declaring an implemented mechanism is enforced automatically, and
 #: adding a mechanism here without implementing it would assert a guarantee
 #: nothing performs.
-ENFORCED_ROUTINGS: frozenset = frozenset({Routing.SESSION_CONFIG, Routing.VERIFIED_SEEDED_SETTINGS})
+#:
+#: KNOWN SEAM GAP, recorded here because this is where a reader meets it.
+#: :func:`is_enforced` reads this set to answer TWO different questions: "does a
+#: non-ROUTED verdict refuse this session?" and, through
+#: :func:`adapter_hidden_credential_dirs`, "does this harness get the OS credential
+#: mask?". Those are not the same question. The mask compensates for a harness whose
+#: passive READS bypass the gate, which is a property of the harness, not of whether
+#: its routing verdict is capable of refusing. They agree for every harness carried
+#: today, so nothing is wrong now and nothing here is a workaround -- but a harness
+#: that needs the mask while declaring a mechanism that cannot refuse would get
+#: neither, and one that refuses without doing passive reads would carry a mask it
+#: does not need. Splitting them is a change to a security control and belongs in its
+#: own change; tracked at
+#: docs/system-specs/modules/harness-onboarding.md#worked-example-the-deepseek-harness,
+#: which records the run that surfaced it.
+ENFORCED_ROUTINGS: frozenset = frozenset(
+    {
+        Routing.SESSION_CONFIG,
+        Routing.VERIFIED_SEEDED_SETTINGS,
+        Routing.VERIFIED_GATE_EXTENSION,
+    }
+)
 
 #: What is NOT consulted when a harness's tool calls bypass the gate. Named in
 #: full in the refusal, because "bypasses the security gate" does not tell an
@@ -84,12 +109,20 @@ UNENFORCED_CONTROLS = (
     "the bundled denied-command rules, the sensitive-path block and the governance ceiling"
 )
 
-#: Operator-facing harness labels. Local rather than imported: the refusal text is
-#: the only consumer, and a Codex host must never be told to run ``kiro-cli
-#: login``-style advice aimed at a different harness.
+#: Operator-facing harness labels. The refusal text is the only consumer, and a
+#: Codex host must never be told to run ``kiro-cli login``-style advice aimed at a
+#: different harness.
+#:
+#: Rows for the harnesses that serve ACP from their own binary come from their
+#: ``ACP_BACKEND_LAUNCH`` records, which already carry the display name for the
+#: install panel -- so a harness of that shape has one name, in one place, rather
+#: than one here and one there that can disagree. The two Node adapters keep rows of
+#: their own: neither has a launch record, and the name an operator knows the harness
+#: by is not its adapter's package name.
 _LABELS: dict = {
     ACP_BACKEND_CODEX: "OpenAI Codex",
-    ACP_BACKEND_OPENCODE: "OpenCode",
+    ACP_BACKEND_PI: "Pi",
+    **{backend: record.label for backend, record in sorted(ACP_BACKEND_LAUNCH.items())},
 }
 
 #: The credential store each enforced harness must still be able to read.
@@ -116,6 +149,25 @@ ADAPTER_OWN_CREDENTIAL_LEAVES: dict = {
     for declaration in host_auth.AGENT_AUTH_DECLARATIONS
     if declaration.adapter_own_leaves
 }
+
+#: Gate-artifact leaf the pi harness child must execute from.
+#:
+#: ``pi-gate`` holds only the launcher and sealed extension Crew writes. The pi
+#: child must execute the launcher and read the extension, while the read gate
+#: still fences the AGENT's own file tools from the leaf, so excluding it from this
+#: mask separates two readers instead of weakening the floor. Every non-pi child's
+#: mask still covers the leaf. A future secret must never be placed under
+#: ``pi-gate``; one that must live there needs its own masked leaf, as
+#: ``run/voice-runtime`` does.
+#:
+#: Spelled CREW-HOME-RELATIVE, without a data-home prefix. The prefixes are applied
+#: in :func:`adapter_hidden_credential_dirs` from ``security.crew_home_prefixes()``,
+#: the same source the floor projects its own entries through. Writing the product
+#: out here would be the hand-maintained spelling list
+#: ``sandbox_credential_targets`` names as the drift it exists to prevent: a third
+#: data-home spelling would be covered by the floor and missed here, and the pi
+#: harness would stop starting on exactly the layout nobody tests.
+PI_GATE_ARTIFACT_LEAF = "pi-gate"
 
 #: Files re-exposed READ-ONLY inside a directory the mask hides, home-relative.
 #:
@@ -214,9 +266,18 @@ def adapter_hidden_credential_dirs(backend: str) -> tuple:
     step, and a floor entry added later is covered with no edit here.
 
     The harness's own credential store is excluded, because the adapter must read
-    it to authenticate. That asymmetry is intentional and safe: the floor still
-    blocks the AGENT's file tools from that leaf, so the two controls cover
-    different readers rather than cancelling each other.
+    it to authenticate. A NARROW set of Crew runtime leaves is excluded for every
+    backend, because an in-sandbox Crew reader needs them and they hold no credential
+    -- :func:`kiro_crew.sandbox.crew_host_runtime_leaves` owns that set, and the
+    governance ceilings and consent records are deliberately NOT in it: they are
+    inputs to an authorization decision, so they stay masked and an in-sandbox
+    resolution fails closed. A gate-artifact leaf is excluded for the ONE backend
+    whose child must execute Crew's launcher there, which is narrower than the set
+    above on purpose: every other child's mask still covers it.
+
+    All three asymmetries are intentional and safe: the floor still blocks the AGENT's
+    file tools from each leaf, so the controls cover different readers rather than
+    cancelling each other.
 
     ``.ssh`` arrives through the floor and it has a cost: git-over-SSH inside such
     a session stops working, because the private key is unreadable to the child.
@@ -237,8 +298,11 @@ def adapter_hidden_credential_dirs(backend: str) -> tuple:
         return ()
     # Imported here rather than at module scope: this is a LEAF that
     # ``acp/client.py`` imports at import time, and security.py is a large module
-    # whose cost belongs on the one call that needs it.
-    from kiro_crew.security import sandbox_credential_targets
+    # whose cost belongs on the one call that needs it. ``sandbox`` is deferred for
+    # the same reason -- and because it already is, one call below, for
+    # ``credential_mask_applies``.
+    from kiro_crew.sandbox import crew_host_runtime_leaves
+    from kiro_crew.security import crew_home_prefixes, sandbox_credential_targets
 
     # Delegated rather than projected under ``Path.home()`` here: a credential the
     # operator relocated with ``KIROCREW_HOME`` / ``CLAUDE_CONFIG_DIR`` /
@@ -246,7 +310,29 @@ def adapter_hidden_credential_dirs(backend: str) -> tuple:
     # would hand the sandbox a path that denies nothing while the live secret stayed
     # readable. ``sandbox_credential_targets`` owns the same anchor rules as the read
     # gate, so this mask cannot drift from the floor it compensates for.
-    return sandbox_credential_targets(tuple(ADAPTER_OWN_CREDENTIAL_LEAVES.get(backend, ())))
+    #
+    # The credential store's leaves are already floor-spelled. The other two sets are
+    # spelled CREW-HOME-RELATIVE and gain each data-home prefix HERE, through the same
+    # ``crew_home_prefixes`` the floor projects its own entries with -- writing either
+    # product out at its source would be the hand-maintained spelling list this
+    # function exists to avoid, and a third data-home spelling would be covered by the
+    # floor and missed here.
+    prefixes = crew_home_prefixes()
+    host_runtime = {
+        f"{prefix}/{leaf}" for prefix in prefixes for leaf in crew_host_runtime_leaves()
+    }
+    # Per BACKEND, and deliberately not folded into the set above: only the harness
+    # whose child execs the launcher needs this leaf, so every other child keeps it
+    # masked. That is a narrower grant than the shared set can express.
+    gate_artifacts = (
+        {f"{prefix}/{PI_GATE_ARTIFACT_LEAF}" for prefix in prefixes}
+        if backend == ACP_BACKEND_PI
+        else set()
+    )
+    excluded_leaves = tuple(
+        sorted(set(ADAPTER_OWN_CREDENTIAL_LEAVES.get(backend, ())) | host_runtime | gate_artifacts)
+    )
+    return sandbox_credential_targets(excluded_leaves)
 
 
 def adapter_expose_files(backend: str, hidden: tuple) -> tuple:
@@ -343,6 +429,13 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
 
     Returns for a harness this core does not enforce, so the first-class path and
     every unenforced harness reach the spawn unchanged.
+
+    Native Windows has no Crew OS sandbox backend that can apply the mask, so the
+    refusal there names that limitation and points at Kiro CLI rather than at
+    ``agent.sandbox``: changing the configured tier cannot enable a backend this
+    host does not have. The generic set-standard-or-strict remedy is kept for
+    hosts where a backend can exist. Neither message consults
+    ``sandbox_allow_unsandboxed_exec``.
     """
     if not is_enforced(backend):
         return
@@ -358,6 +451,16 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
     # with its credential mask dropped.
     if credential_mask_applies(mode):
         return
+    # Platform copy only: the verdict above already decided the session cannot
+    # start. Recommending standard/strict is advice that cannot succeed on native
+    # Windows, where Crew has no OS sandbox backend to apply the mask.
+    if platform_compat.IS_WINDOWS:
+        raise ToolGateUnroutable(
+            "{} cannot run on native Windows because Kiro Crew has no supported OS "
+            "sandbox backend here to protect credential files; changing agent.sandbox "
+            "cannot enable it. Select Kiro CLI in Settings → Agent Backend and start "
+            "a new session.".format(label_for(backend))
+        )
     raise ToolGateUnroutable(
         "{} routes tool calls through an enforced permission route whose "
         "compensating control is an OS-level credential mask, but this session would "
@@ -434,6 +537,28 @@ def routing_verdict(backend: str) -> tuple:
             "harness's own resolved configuration back before the first prompt",
         )
 
+    if routing is Routing.VERIFIED_GATE_EXTENSION:
+        probe = gate_probe_command_for(backend)
+        if not probe:
+            # Registration bug, same class as the two above: nothing to look for in
+            # the read-back means nothing that could fail it.
+            return (
+                Verdict.INDETERMINATE,
+                "the harness declares gate-extension routing but names no probe command",
+            )
+        # ROUTED on a PROMISE, like its two siblings: the harness process the
+        # extension would load into does not exist yet. The CHECK is
+        # ``gate_extension_issue`` fed the harness's own command registry, which
+        # MUST run after the harness is told the extension path and before the
+        # first prompt. Port this verdict without that caller and the harness
+        # reports routed while running every tool call unasked.
+        return (
+            Verdict.ROUTED,
+            "the client loads Kiro Crew's gate extension into the harness and reads "
+            f"the harness's own command registry back for {probe!r} before the "
+            "first prompt",
+        )
+
     if routing is Routing.SEEDED_SETTINGS:
         # Declared, not enforced here -- and the gap is the READ-BACK, not a missing
         # writer. ``_write_claude_local_settings`` does seed the mode, but only into
@@ -484,6 +609,20 @@ def remediation_for(backend: str) -> str:
             return (
                 f"Install a {label_for(backend)} adapter that advertises ACP session "
                 f"config option {option_id!r} with value {value!r}."
+            )
+    if routing is Routing.VERIFIED_GATE_EXTENSION:
+        probe = gate_probe_command_for(backend)
+        if probe:
+            # The only thing an operator can act on: the harness either did not
+            # start with the extension flag Kiro Crew passed, or loaded the
+            # command from somewhere other than Kiro Crew's own file. Both point
+            # at the harness install or at an extension of the operator's that
+            # shadows the probe name.
+            return (
+                f"{label_for(backend)} did not report Kiro Crew's gate extension as "
+                f"loaded from Kiro Crew's own file. Make sure the harness accepts an "
+                f"extension on its command line, and that no extension of your own "
+                f"registers a command named {probe!r}."
             )
     return ""
 
@@ -557,6 +696,52 @@ def seeded_setting_issue(backend: str, observed: object) -> str:
     return ""
 
 
+def gate_extension_issue(backend: str, observed_commands: object, extension_path: str) -> str:
+    """Why *backend*'s gate extension is not loaded, from the harness's own command list.
+
+    ``""`` means the harness reported Kiro Crew's probe command, sourced from
+    *extension_path* -- the file Kiro Crew shipped and named on the command line.
+
+    *observed_commands* is what the harness's OWN command registry returned when
+    asked: a list of entries, each carrying a ``name`` and, for an extension
+    command, a ``sourceInfo`` whose ``path`` is the file it loaded from. Taken as
+    an argument rather than fetched here for the same reason
+    :func:`seeded_setting_issue` takes its observation: the driver owns the
+    process, this owns the decision, so the refusal and the doctor row agree.
+
+    Matching the NAME alone is not enough and the reason is not hypothetical: the
+    harness loads extensions from the operator's own directories too, and an
+    operator extension that happens to register the probe name would make an
+    absent gate read as present. So the source path is required to be Kiro
+    Crew's file. Anything short of that -- name absent, name present from another
+    file, an unparseable registry -- refuses.
+    """
+    if routing_for(backend) is not Routing.VERIFIED_GATE_EXTENSION:
+        return ""
+    probe = gate_probe_command_for(backend)
+    if not probe:
+        return "the harness declares gate-extension routing but names no probe command"
+    if not isinstance(observed_commands, list):
+        return "the harness's command registry could not be read"
+    sources: list = []
+    for entry in observed_commands:
+        if not isinstance(entry, dict) or entry.get("name") != probe:
+            continue
+        info = entry.get("sourceInfo")
+        sources.append(info.get("path") if isinstance(info, dict) else None)
+    if not sources:
+        return (
+            f"the harness's command registry does not list {probe!r}, so Kiro Crew's "
+            "gate extension did not load and tools would run unasked"
+        )
+    if extension_path not in sources:
+        return (
+            f"the harness lists {probe!r} but from a file that is not Kiro Crew's "
+            "gate extension, so the gate that would ask is not the one shipped here"
+        )
+    return ""
+
+
 def enforce_runtime_routing(
     backend: str,
     reason: str,
@@ -612,6 +797,7 @@ __all__ = [
     "adapter_hidden_credential_dirs",
     "enforce_runtime_routing",
     "enforce_sandbox_floor",
+    "gate_extension_issue",
     "is_enforced",
     "label_for",
     "remediation_for",

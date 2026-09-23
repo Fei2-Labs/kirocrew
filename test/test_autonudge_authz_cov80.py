@@ -30,8 +30,6 @@ from kiro_crew.autonudge_authz import (
 from kiro_crew.constants import MAX_BANNER_CHARS
 from kiro_crew.monitoring.models import MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS, MonitorState
 
-pytestmark = pytest.mark.asyncio
-
 
 class RecordingSvc:
     """Minimal AutoNudgeService stand-in for both chokepoints."""
@@ -50,6 +48,10 @@ class RecordingSvc:
         self.updated: list[dict] = []
 
     def get_by_slot(self, slot_key: str) -> Any:
+        return self._loop
+
+    def get_by_id(self, loop_id: str) -> Any:
+        """Present because the update chokepoint calls it DIRECTLY, not behind a probe."""
         return self._loop
 
     async def add(self, **kw: Any) -> Any:
@@ -107,6 +109,7 @@ def broken_sel(monkeypatch: pytest.MonkeyPatch) -> None:
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.asyncio
 async def test_update_without_service_is_a_503_error_event(audits: list[dict]) -> None:
     loop, error, status = await authorize_and_update_nudge(
         svc=None, loop_id="l1", message="hi", source="dashboard"
@@ -115,6 +118,7 @@ async def test_update_without_service_is_a_503_error_event(audits: list[dict]) -
     assert [a["outcome"] for a in audits] == ["error"]
 
 
+@pytest.mark.asyncio
 async def test_update_requires_a_loop_id(audits: list[dict]) -> None:
     loop, error, status = await authorize_and_update_nudge(
         svc=RecordingSvc(), loop_id="   ", message="hi", source="dashboard"
@@ -123,6 +127,7 @@ async def test_update_requires_a_loop_id(audits: list[dict]) -> None:
     assert audits and audits[0]["outcome"] == "denied"
 
 
+@pytest.mark.asyncio
 async def test_update_rejects_runtime_budget_over_the_ceiling(audits: list[dict]) -> None:
     svc = RecordingSvc()
     loop, error, status = await authorize_and_update_nudge(
@@ -135,6 +140,7 @@ async def test_update_rejects_runtime_budget_over_the_ceiling(audits: list[dict]
     assert svc.updated == []  # never applied
 
 
+@pytest.mark.asyncio
 async def test_update_audit_failure_does_not_break_the_denial(broken_sel: None) -> None:
     """A dead SEL must not turn a 400 into a 500: the warn-and-continue fallback
     keeps the caller's error contract intact."""
@@ -144,6 +150,7 @@ async def test_update_audit_failure_does_not_break_the_denial(broken_sel: None) 
     assert loop is None and status == 400 and error == "loop_id required"
 
 
+@pytest.mark.asyncio
 async def test_update_audits_then_reraises_a_service_failure(audits: list[dict]) -> None:
     """``svc.update`` blowing up must leave an ``error`` event behind before the
     exception propagates — a silent failure would lose the security record."""
@@ -159,6 +166,7 @@ async def test_update_audits_then_reraises_a_service_failure(audits: list[dict])
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.asyncio
 async def test_add_without_service_is_a_503_error_event(audits: list[dict]) -> None:
     loop, error, status = await authorize_and_add_nudge(
         svc=None, state=_state(), slot_key="chat-1-1", message="watch", source="dashboard"
@@ -167,6 +175,7 @@ async def test_add_without_service_is_a_503_error_event(audits: list[dict]) -> N
     assert [a["outcome"] for a in audits] == ["error"]
 
 
+@pytest.mark.asyncio
 async def test_add_requires_both_slot_key_and_message(audits: list[dict]) -> None:
     svc = RecordingSvc()
     loop, error, status = await authorize_and_add_nudge(
@@ -180,6 +189,7 @@ async def test_add_requires_both_slot_key_and_message(audits: list[dict]) -> Non
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["crew", "member"])
 async def test_add_rejects_dashboard_modes_without_direct_turn_ingress(
     audits: list[dict], mode: str
@@ -202,6 +212,7 @@ async def test_add_rejects_dashboard_modes_without_direct_turn_ingress(
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("memory_mode", ["incognito", "temporary"])
 async def test_add_rejects_restricted_dashboard_sessions(
     audits: list[dict], memory_mode: str
@@ -222,6 +233,7 @@ async def test_add_rejects_restricted_dashboard_sessions(
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_dashboard_admission_rechecks_mode_and_memory_boundary(
     audits: list[dict], tmp_path: Path
 ) -> None:
@@ -248,6 +260,7 @@ async def test_dashboard_admission_rechecks_mode_and_memory_boundary(
     assert not admission_check()
 
 
+@pytest.mark.asyncio
 async def test_add_rejects_a_non_integer_runtime_budget(audits: list[dict]) -> None:
     svc = RecordingSvc()
     loop, error, status = await authorize_and_add_nudge(
@@ -262,6 +275,7 @@ async def test_add_rejects_a_non_integer_runtime_budget(audits: list[dict]) -> N
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_audit_failure_does_not_break_the_denial(broken_sel: None) -> None:
     svc = RecordingSvc()
     loop, error, status = await authorize_and_add_nudge(
@@ -271,6 +285,7 @@ async def test_add_audit_failure_does_not_break_the_denial(broken_sel: None) -> 
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_rejects_an_unroutable_slack_session(audits: list[dict]) -> None:
     """A Slack loop with no routable session would fire into the void — and the
     ``sessions`` registry being absent entirely must deny, not crash."""
@@ -296,6 +311,7 @@ async def test_add_rejects_an_unroutable_slack_session(audits: list[dict]) -> No
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_denies_discord_when_the_transport_is_not_running(audits: list[dict]) -> None:
     svc = RecordingSvc()
     loop, error, status = await authorize_and_add_nudge(
@@ -309,6 +325,7 @@ async def test_add_denies_discord_when_the_transport_is_not_running(audits: list
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_denies_webex_when_the_transport_is_not_running(audits: list[dict]) -> None:
     """Deny-by-default, mirroring the Discord branch: an authenticated caller must
     not be able to mint a loop that DMs an arbitrary Webex user through the agent."""
@@ -324,6 +341,7 @@ async def test_add_denies_webex_when_the_transport_is_not_running(audits: list[d
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_denies_a_non_dm_webex_session(audits: list[dict]) -> None:
     """A space session is a shared audience, so it is never an arm target."""
     svc = RecordingSvc()
@@ -342,6 +360,7 @@ async def test_add_denies_a_non_dm_webex_session(audits: list[dict]) -> None:
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_denies_a_webex_user_off_the_allowlist(audits: list[dict]) -> None:
     svc = RecordingSvc()
     transport = SimpleNamespace(
@@ -359,6 +378,7 @@ async def test_add_denies_a_webex_user_off_the_allowlist(audits: list[dict]) -> 
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_denies_a_webex_key_that_is_not_the_users_current_session(
     audits: list[dict],
 ) -> None:
@@ -381,6 +401,7 @@ async def test_add_denies_a_webex_key_that_is_not_the_users_current_session(
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_webex_rechecks_session_ownership_at_commit_time(
     audits: list[dict], tmp_path: Path
 ) -> None:
@@ -415,6 +436,7 @@ async def test_add_webex_rechecks_session_ownership_at_commit_time(
     assert not admission_check()
 
 
+@pytest.mark.asyncio
 async def test_add_denies_a_non_dm_discord_session(audits: list[dict]) -> None:
     """Only DM sessions are nudge-able; a guild/channel-shaped key must be
     refused before the allowlist check so it can never reach a public channel."""
@@ -434,6 +456,7 @@ async def test_add_denies_a_non_dm_discord_session(audits: list[dict]) -> None:
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_denies_discord_when_the_current_session_lookup_raises(
     audits: list[dict],
 ) -> None:
@@ -456,6 +479,7 @@ async def test_add_denies_discord_when_the_current_session_lookup_raises(
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "slot_key",
     [
@@ -486,6 +510,7 @@ async def test_add_rejects_a_channel_transport_it_cannot_authorize(
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_rejects_a_sensitive_stop_sentinel_path(audits: list[dict]) -> None:
     """``stop_sentinel_path`` is unlinked by the loop, so a credential path would
     turn an arm request into a delete of the caller's key material."""
@@ -502,6 +527,7 @@ async def test_add_rejects_a_sensitive_stop_sentinel_path(audits: list[dict]) ->
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_defaults_the_sentinel_for_a_channel_loop(
     audits: list[dict], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -526,6 +552,7 @@ async def test_add_defaults_the_sentinel_for_a_channel_loop(
     assert not sentinel.exists()  # stale sentinel cleared before arming
 
 
+@pytest.mark.asyncio
 async def test_add_audits_then_reraises_a_service_failure(audits: list[dict]) -> None:
     svc = RecordingSvc(add_error=OSError("store wedged"))
     with pytest.raises(OSError, match="store wedged"):
@@ -544,6 +571,7 @@ async def test_add_audits_then_reraises_a_service_failure(audits: list[dict]) ->
     assert "svc.add failed: OSError" in audits[-1]["error"]
 
 
+@pytest.mark.asyncio
 async def test_add_monitor_returns_conflict_when_a_wake_is_inflight(
     audits: list[dict],
 ) -> None:
@@ -570,6 +598,7 @@ async def test_add_monitor_returns_conflict_when_a_wake_is_inflight(
     assert [event["outcome"] for event in audits] == ["invoked", "denied"]
 
 
+@pytest.mark.asyncio
 async def test_update_monitor_conflict_records_a_denied_audit(
     audits: list[dict],
 ) -> None:
@@ -597,6 +626,7 @@ async def test_update_monitor_conflict_records_a_denied_audit(
     assert [event["outcome"] for event in audits] == ["invoked", "denied"]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value", "status"),
     [("mode", "crew", 409), ("memory_mode", "temporary", 403)],
@@ -622,6 +652,7 @@ async def test_update_monitor_rechecks_current_dashboard_admission(
     assert [event["outcome"] for event in audits] == ["invoked", "denied"]
 
 
+@pytest.mark.asyncio
 async def test_update_monitor_rejects_redaction_expansion_over_limit(
     audits: list[dict], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -658,6 +689,7 @@ async def test_update_monitor_rejects_redaction_expansion_over_limit(
     assert svc.patches == []
 
 
+@pytest.mark.asyncio
 async def test_add_monitor_rejects_redaction_expansion_over_limit(
     audits: list[dict], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -703,6 +735,7 @@ async def test_add_monitor_rejects_redaction_expansion_over_limit(
     assert svc.added == []
 
 
+@pytest.mark.asyncio
 async def test_add_monitor_conflict_preserves_existing_legacy_stop_sentinel(
     audits: list[dict], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -739,6 +772,7 @@ async def test_add_monitor_conflict_preserves_existing_legacy_stop_sentinel(
     assert sentinel.read_text(encoding="utf-8") == "stop"
 
 
+@pytest.mark.asyncio
 async def test_add_monitor_forwards_conditional_restart_identity(
     audits: list[dict],
 ) -> None:
@@ -771,6 +805,7 @@ async def test_add_monitor_forwards_conditional_restart_identity(
     assert captured["expected_existing_config_generation"] == 4
 
 
+@pytest.mark.asyncio
 async def test_legacy_add_cannot_replace_a_structured_wake_in_flight(
     audits: list[dict],
 ) -> None:
@@ -798,6 +833,7 @@ async def test_legacy_add_cannot_replace_a_structured_wake_in_flight(
     assert svc.get_by_slot("chat-1-1") is existing
 
 
+@pytest.mark.asyncio
 async def test_legacy_create_only_reaches_the_service_lock(audits: list[dict]) -> None:
     svc = RecordingSvc()
 
@@ -814,6 +850,7 @@ async def test_legacy_create_only_reaches_the_service_lock(audits: list[dict]) -
     assert svc.added[0]["replace_existing"] is False
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["update", "stop"])
 async def test_monitor_audit_sink_is_resolved_off_the_event_loop(
     monkeypatch: pytest.MonkeyPatch, operation: str
@@ -860,6 +897,7 @@ async def test_monitor_audit_sink_is_resolved_off_the_event_loop(
 # ── update(): the remaining payload-shape denials ──
 
 
+@pytest.mark.asyncio
 async def test_update_rejects_a_non_string_message(audits: list[dict]) -> None:
     svc = RecordingSvc()
     loop, error, status = await authorize_and_update_nudge(
@@ -869,6 +907,7 @@ async def test_update_rejects_a_non_string_message(audits: list[dict]) -> None:
     assert svc.updated == []
 
 
+@pytest.mark.asyncio
 async def test_update_rejects_an_oversized_message(audits: list[dict]) -> None:
     svc = RecordingSvc()
     loop, error, status = await authorize_and_update_nudge(
@@ -878,6 +917,7 @@ async def test_update_rejects_an_oversized_message(audits: list[dict]) -> None:
     assert svc.updated == []
 
 
+@pytest.mark.asyncio
 async def test_update_rejects_a_fractional_idle_secs(audits: list[dict]) -> None:
     """59.9 must be refused, not silently truncated to 59."""
     svc = RecordingSvc()
@@ -888,6 +928,7 @@ async def test_update_rejects_a_fractional_idle_secs(audits: list[dict]) -> None
     assert svc.updated == []
 
 
+@pytest.mark.asyncio
 async def test_update_rejects_an_uncastable_numeric_field(audits: list[dict]) -> None:
     """A value int() cannot take must land as a 400, not an unhandled 500."""
     svc = RecordingSvc()
@@ -898,6 +939,7 @@ async def test_update_rejects_an_uncastable_numeric_field(audits: list[dict]) ->
     assert svc.updated == []
 
 
+@pytest.mark.asyncio
 async def test_update_rejects_a_stringified_active_flag(audits: list[dict]) -> None:
     """bool("false") is True, so accepting a string would flip a pause into a
     resume on a loop that runs tools unattended."""
@@ -909,6 +951,7 @@ async def test_update_rejects_a_stringified_active_flag(audits: list[dict]) -> N
     assert svc.updated == []
 
 
+@pytest.mark.asyncio
 async def test_update_reports_a_missing_loop_as_404(audits: list[dict]) -> None:
     svc = RecordingSvc(loop=None)  # svc.update() finds nothing
     loop, error, status = await authorize_and_update_nudge(

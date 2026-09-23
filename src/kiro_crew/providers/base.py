@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from typing import Any, Literal, Protocol, runtime_checkable
+from functools import cached_property
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 # Event kinds — re-exported from the single source of truth
 from kiro_crew.acp.types import (  # noqa: F401
@@ -29,6 +30,15 @@ from kiro_crew.acp.types import (  # noqa: F401
 )
 from kiro_crew.acp.types import AcpEvent as LLMEvent  # noqa: F401
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
+from kiro_crew.essential_delivery import EssentialDelivery
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # Type-only: this module's runtime imports are deliberately just acp.types
+    # and constants, and recovery.ladder pulls in mcp_gateway + metrics.
+    from pathlib import Path
+
+    from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
+    from kiro_crew.recovery.ladder import InfraError
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
 
@@ -69,6 +79,13 @@ class SessionMcpReport(Protocol):
 
     def payload(self) -> dict | None: ...
 
+    #: One line naming the servers this session cannot use, empty when it can use
+    #: them all. Declared beside ``payload`` because a consumer outside the ACP
+    #: layer cannot reach the renderer any other way: the agent-SDK boundary gate
+    #: refuses it a new ACP import, so the capability has to be nameable HERE or
+    #: it is reachable only by probing an attribute.
+    def problem_summary(self, *, include_reasons: bool = True) -> str: ...
+
     def record_event(
         self, kind: str, server_name: str, error: str = "", *, fanout_no_owner: bool = False
     ) -> bool: ...
@@ -76,6 +93,31 @@ class SessionMcpReport(Protocol):
 
 class LLMProvider(ABC):
     """Abstract LLM backend."""
+
+    @cached_property
+    def essential_delivery(self) -> EssentialDelivery:
+        """Private prompt receipts belong to this provider, never the builder."""
+        return EssentialDelivery()
+
+    @property
+    def context_incarnation(self) -> object:
+        """Identity of the native conversation retaining injected instructions."""
+        return (id(self), self.session_id)
+
+    @property
+    def context_provider_type(self) -> str:
+        """Actual provider label used by context assembly, not global config."""
+        return "acp"
+
+    @property
+    def native_steering(self) -> bool:
+        """Whether the serving harness owns conditional steering selection."""
+        return False
+
+    @property
+    def native_context_documents(self) -> dict[str, str]:
+        """Exact documents supplied at native startup, empty without evidence."""
+        return {}
 
     @abstractmethod
     async def start(self) -> None:
@@ -129,6 +171,15 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def is_kiro_backend(self) -> bool:
+        """True only when the provider positively identifies as kiro-cli.
+
+        The safe default is False: adapters added later cannot accidentally earn
+        Kiro-only behavior merely by omitting this capability.
+        """
+        return False
+
+    @property
     def is_claude_backend(self) -> bool:
         """True when this provider drives claude-agent-acp."""
         return False
@@ -169,6 +220,21 @@ class LLMProvider(ABC):
         """
         return False
 
+    @property
+    def last_infra_error(self) -> InfraError | None:
+        """The L1 verdict on the LAST tool result, or None for "no verdict".
+
+        Declared here so the session layer never has to probe an adapter for the
+        attribute: the default None is the SAFE value, the same rule as
+        ``last_compaction_transient``. A provider that cannot classify tool
+        results gives up the turn exactly as it did before L1 existed.
+
+        Read-only on purpose — the classifying layer (``AcpSessionHandle``) is
+        the sole writer, so no caller can fabricate a verdict to force a tool
+        re-issue.
+        """
+        return None
+
     def context_window_tokens(self) -> int:
         """Return the real served context window in tokens (0 if unknown).
 
@@ -186,19 +252,13 @@ class LLMProvider(ABC):
         """
         return 0
 
-    def rate_limit_payload(self) -> dict[str, Any] | None:
-        """Plan rate-limit state for the account, or None when not reported.
+    def rate_limit_payload(self) -> dict[str, object] | None:
+        """Plan rate-limit state, or None when provider reports none."""
+        return None
 
-        A serialized :class:`~kiro_crew.acp.types.AcpRateLimit` — the ABC returns
-        the dict rather than the dataclass so a non-ACP provider is not made to
-        import ACP types to satisfy the seam.
-
-        Declared here with a safe default (H8: a new provider capability lands
-        on the ABC, never as a ``hasattr`` probe on the Kiro path) because most
-        harnesses report no quota at all: kiro-cli bills in credits through a
-        different method entirely, and codex-acp and goose send nothing. Those
-        providers inherit None and the dashboard omits the row.
-        """
+    @property
+    def backend(self) -> str | None:
+        """Live harness id, or None when provider is not ACP-backed."""
         return None
 
     @property
@@ -269,6 +329,16 @@ class LLMProvider(ABC):
         return ""
 
     @property
+    def member_capabilities_supported(self) -> bool:
+        """Whether a dedicated startup can load a complete member agent spec."""
+        return False
+
+    @property
+    def loaded_capability_template(self) -> str:
+        """Confirmed active full-spec template; empty means no loading evidence."""
+        return ""
+
+    @property
     def exit_code(self) -> int | None:
         """Last child-process exit code, or None if no process or still running."""
         return None
@@ -336,13 +406,9 @@ class LLMProvider(ABC):
     # provider. Declaring them here with a safe default means a provider that
     # lacks the capability (a non-ACP backend, a warm-pool stub) returns the
     # default instead of forcing a ``getattr`` probe onto the Kiro path or
-    # AttributeError-ing. Concrete providers override and typed callers use the
-    # contract directly; test doubles should conform to the same interface.
-
-    @property
-    def backend(self) -> str | None:
-        """Live harness id (``""`` for kiro-cli, ``None`` when not ACP)."""
-        return None
+    # AttributeError-ing. Concrete providers override; the caller-side
+    # ``getattr``/``hasattr`` guards remain where they additionally defend
+    # against test doubles (AsyncMock) that are not LLMProvider instances.
 
     def has_active_turn(self) -> bool:
         """True if a prompt is in flight and not yet cancelled. Default False."""
@@ -393,6 +459,37 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def tool_search_settings(self) -> "ToolSearchSettings | None":
+        """The operator's MCP Tool Search choice this provider spawned with, or
+        ``None`` when it carries none.
+
+        Read by whoever builds a runtime on this provider's behalf (a companion
+        runtime for a sub-agent) so that runtime is handed the SAME setting the
+        parent's handshake sent, rather than being left to the host's default.
+        Declared here with a safe default rather than probed off the instance
+        (harness-parity H14): a provider that never threaded the setting answers
+        ``None`` and the runtime it seeds stays exactly as before. The ACP
+        provider answers with its resolved ``ToolSearchSettings``.
+        """
+        return None
+
+    @property
+    def work_scratch_dir(self) -> "Path | None":
+        """The ``$KIROCREW_SCRATCH`` directory the process serving this session
+        exposes, or ``None`` when it has none.
+
+        Read by whoever spawns a process on this session's behalf (a companion
+        runtime, a dedicated sub-agent process) so that process mounts the SAME
+        directory and the session tree keeps one work directory
+        (``agent_scratch``). Declared here with a safe default rather than probed
+        off the instance (harness-parity H14): a provider that never allocated
+        scratch answers ``None`` and the child starts its own directory, exactly
+        as before the capability existed. The ACP providers answer the directory
+        their live process was spawned with.
+        """
+        return None
+
+    @property
     def manual_compact_unsupported_backend(self) -> str | None:
         """Backend id when this provider cannot serve a manual ``/compact``,
         ``None`` when the command is fine to dispatch.
@@ -407,6 +504,48 @@ class LLMProvider(ABC):
         ``ACP_BACKENDS_COMPACT`` membership. Consumers must act only on a
         non-empty ``str`` value, so a mocked provider's attribute never reads
         as a refusal."""
+        return None
+
+    @property
+    def compaction_self_managed(self) -> bool:
+        """Whether the harness itself bounds this session's context.
+
+        The third compaction question, and the one that separates the two
+        declines. ``manual_compact_unsupported_backend`` says Crew may not send
+        ``/compact``; ``compaction_unmanaged_backend`` says Crew will recycle
+        instead. A backend that answers the first and not the second is EITHER a
+        harness that summarizes unasked, OR a harness nobody has classified yet —
+        indistinguishable from those two answers alone, and they deserve
+        different words and different log levels.
+
+        Default ``True`` — a provider that has not spoken is taken to manage its
+        own context, which is the reading that changes no message and no level.
+        Declared here rather than probed off the instance (harness-parity H14);
+        the ACP implementations answer from
+        ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`` membership."""
+        return True
+
+    @property
+    def compaction_unmanaged_backend(self) -> str | None:
+        """Backend id when NOTHING compacts this session, ``None`` otherwise.
+
+        The strictly narrower half of
+        :attr:`manual_compact_unsupported_backend`, and the two answer different
+        questions. That one asks whether CREW may send a ``/compact`` prompt. This
+        one asks what happens when Crew may not: a harness that summarizes on its
+        own initiative and reports it on the wire needs nothing from Crew, while a
+        harness that reports nothing needs the session recycled or its context grows
+        until the window ends the conversation for it.
+
+        Default ``None`` — a provider that has not positively named such a backend
+        is left alone, because this is the one answer that ENDS a conversation and
+        it must never be reached by default. Declared here with a safe default
+        rather than probed off the instance (harness-parity H14); the ACP
+        implementations answer from ``ACP_BACKENDS_CONTEXT_RECYCLE`` membership,
+        which names its members rather than taking whatever the other two sets
+        leave over. Consumers must act only on a non-empty ``str`` value, so a
+        mocked provider's attribute never reads as a claim that nothing
+        compacts."""
         return None
 
     @property
@@ -468,6 +607,12 @@ class LLMProvider(ABC):
         False when effort is unsupported. Default False."""
         return False
 
-    async def clear_effort(self) -> bool:
-        """Clear the slot's reasoning-effort override for the current model. Default False."""
+    async def clear_effort(self) -> bool | None:
+        """Clear the slot's reasoning-effort override for the current model.
+
+        True applied a default LIVE, False needs a session reset to reach it, and
+        None means NOTHING changed -- neither the workspace overlay nor the
+        provider's own map -- so the caller must commit no new slot value and
+        reset nothing. Default False.
+        """
         return False

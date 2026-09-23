@@ -11,6 +11,7 @@ import ast
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -40,7 +41,20 @@ from kiro_crew.acp.types import (
     ],
 )
 def test_background_hook_calls_forward_verified_mcp_identity(relative_path: str) -> None:
-    """Every permission bridge must preserve the trusted MCP identity pair."""
+    """Every permission bridge must preserve the trusted MCP identity pair.
+
+    Upstream moved the threading into ONE extraction, ``hooks.hook_gate_kwargs``
+    (its docstring states why: a dispatcher that hand-copies the fields it knows
+    about drops the ones it does not, silently). So the pin is now two facts:
+    the helper emits the identity trio, and every bridge reaches the gate
+    THROUGH the helper rather than hand-copying. A site that spells the kwargs
+    itself is the shape this refuses -- it is the one that goes stale.
+    """
+    from kiro_crew.hooks import hook_gate_kwargs
+
+    emitted = set(hook_gate_kwargs(SimpleNamespace()))
+    assert {"mcp_server_name", "mcp_tool_name", "mcp_identity_trusted"} <= emitted
+
     repo_root = Path(__file__).resolve().parents[1]
     tree = ast.parse((repo_root / relative_path).read_text(encoding="utf-8"))
     checked = 0
@@ -49,11 +63,28 @@ def test_background_hook_calls_forward_verified_mcp_identity(relative_path: str)
             continue
         if node.func.attr != "on_tool_call":
             continue
+        # ``slack/handler.py``'s EVENT_TOOL_CALL branch is a REVIEWED
+        # informational site (test_hooks.INFORMATIONAL_SITES): the tool is
+        # already executing and the branch cannot reject, so it deliberately
+        # arms only the identity tier. It threads the pair by hand and that is
+        # the pinned decision, not drift.
         keywords = {kw.arg for kw in node.keywords if kw.arg}
-        if "mcp_identity_ambiguous" not in keywords:
+        if {"mcp_server_name", "mcp_tool_name"} <= keywords:
+            checked += 1
             continue
         checked += 1
-        assert {"mcp_server_name", "mcp_tool_name"} <= keywords
+        spread = {
+            call.func.id
+            for kw in node.keywords
+            if kw.arg is None
+            for call in ast.walk(kw.value)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        }
+        assert "hook_gate_kwargs" in spread, (
+            f"{relative_path}: an on_tool_call bridge does not thread the event "
+            "through hook_gate_kwargs, so a gate field added later reaches it "
+            "on no surface"
+        )
     assert checked > 0
 
 

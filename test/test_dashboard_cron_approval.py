@@ -215,6 +215,12 @@ class TestCronListFields:
         mock_job.name = "test"
         mock_job.message = "msg"
         mock_job.enabled = True
+        # Serialized alongside `enabled`, because the two together are what tell a
+        # user pause apart from an execution auto-pause.
+        mock_job.user_paused = False
+        # Read to derive the owning `app`; a MagicMock here would flow into the
+        # payload as one, which is the failure this stub's comment below describes.
+        mock_job.created_by = ""
         mock_job.last_status = "ok"
         mock_job.agent_id = ""
         mock_job.channel = "C123"
@@ -223,6 +229,7 @@ class TestCronListFields:
         mock_job.strict_schedule = False
         mock_job.hide_in_chat = False
         mock_job.minimal_context = False
+        mock_job.persistent_session = True
         mock_job.schedule = CronSchedule(kind="every", every_secs=300)
         mock_job.last_run_ts = None
         mock_job.last_result = None
@@ -243,6 +250,7 @@ class TestCronListFields:
         mock_job.last_error = ""
         mock_job.model = ""
         mock_job.folder_id = ""
+        mock_job.chat_folder_id = ""
         mock_job.session_key = ""
         mock_job.source_preset = ""
         mock_job.source_template_prompt = ""
@@ -267,6 +275,7 @@ class TestCronListFields:
         assert job_data["silent"] is True
         assert job_data["hide_in_chat"] is False
         assert job_data["minimal_context"] is False
+        assert job_data["persistent_session"] is True
         assert job_data["channel"] == "C123"
         assert job_data["skip_dates"] is None
         # server_tz top-level field exposes the dashboard's local TZ for client rendering

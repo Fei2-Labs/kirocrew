@@ -181,6 +181,13 @@ async def _auth_mw(request, handler):
 
 
 def _make_client(monkeypatch, tmp_path):
+    """An unstarted client over a freshly wired app.
+
+    Set ``client.app["state"]`` (and any other app state) BEFORE
+    ``await client.start_server()``: starting the server freezes the
+    application, and aiohttp deprecates -- and will eventually refuse --
+    every ``app[...] =`` write after that point.
+    """
     _redirect_state(monkeypatch, tmp_path)
     app = web.Application(middlewares=[_auth_mw])
     routes.register_routes(app)
@@ -2352,9 +2359,9 @@ async def test_detail_payload_reports_live_running_state(tmp_path, monkeypatch):
         def get_or_create_slot(self, name, app=""):
             return _slot
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.get(f"{_BASE}/specs/live")
         body = await resp.json()
     finally:
@@ -2462,9 +2469,9 @@ async def test_handoff_refuses_when_authorization_is_unavailable(tmp_path, monke
         def get_slot(self, key):
             return None
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.post(f"{_BASE}/specs/s/handoff")
     finally:
         await client.close()
@@ -2512,9 +2519,9 @@ async def test_handoff_refuses_when_authorization_raises(tmp_path, monkeypatch):
         def get_slot(self, key):
             return None
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.post(f"{_BASE}/specs/s/handoff")
     finally:
         await client.close()
@@ -3426,9 +3433,9 @@ async def test_detail_refuses_when_the_spec_is_recreated_mid_request(tmp_path, m
             scoped.append(name)
             return slot
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.get(f"{_BASE}/specs/moved")
     finally:
         await client.close()
@@ -3464,9 +3471,9 @@ async def test_detail_serves_normally_when_nothing_changes(tmp_path, monkeypatch
         def get_or_create_slot(self, name, app=""):
             return slot
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.get(f"{_BASE}/specs/steady")
         body = await resp.json()
     finally:
@@ -3697,9 +3704,9 @@ async def test_handoff_confirms_identity_before_acquiring_the_slot(tmp_path, mon
             touched.append(name)
             raise AssertionError("slot acquired despite the spec being replaced")
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.post(f"{_BASE}/specs/swap/handoff")
     finally:
         await client.close()
@@ -3753,9 +3760,9 @@ async def test_message_refuses_a_recreated_spec(tmp_path, monkeypatch):
         def get_or_create_slot(self, name, app=""):
             raise AssertionError("slot acquired for a replaced spec")
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         # The SPA sends the spec_dir it rendered -- that CLIENT-captured identity is
         # what makes the stale tab detectable.
         resp = await client.post(
@@ -3947,9 +3954,9 @@ async def test_detail_refuses_when_the_slot_is_foreign(tmp_path, monkeypatch):
         def get_or_create_slot(self, name, app=""):
             raise AssertionError("must not create over a foreign slot")
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.get(f"{_BASE}/specs/hijacked")
         body = await resp.json()
     finally:
@@ -4013,32 +4020,43 @@ async def test_cancelled_persistence_cannot_be_overtaken(tmp_path):
     doomed = await svc.add(slot_key="dashboard:a", message="a", idle_secs=60, max_cycles=1)
 
     order: list[str] = []
+    started = asyncio.Event()
     release = threading.Event()
+    loop = asyncio.get_running_loop()
     real_write = svc._write_state
 
     def _slow_write(payload):
         order.append("write-start")
-        release.wait(2.0)  # hold the worker inside the write
+        loop.call_soon_threadsafe(started.set)
+        # A wedge backstop, not an automatic successful release of the writer.
+        if not release.wait(10):
+            raise TimeoutError("test did not release the persistence worker")
         real_write(payload)
         order.append("write-done")
 
     svc._write_state = _slow_write  # type: ignore[method-assign]
 
     remover = asyncio.create_task(svc.remove(doomed.id))
-    await asyncio.sleep(0.05)  # let the write begin
-    remover.cancel()
-    await asyncio.sleep(0.05)
+    try:
+        # Removal has asynchronous prerequisites before persistence. Cancelling
+        # during those is not cancellation of an in-flight write.
+        await asyncio.wait_for(started.wait(), 10)
+        remover.cancel()
+        await asyncio.sleep(0)  # deliver cancellation, without guessing elapsed time
 
-    # The lock must still be held: a competing writer cannot get in yet.
-    assert svc._lock.locked(), "service lock released while the write was in flight"
-
-    release.set()
-    with contextlib.suppress(asyncio.CancelledError, BaseException):
-        await remover
+        # The lock must still be held: a competing writer cannot get in yet.
+        assert svc._lock.locked(), "service lock released while the write was in flight"
+        assert not remover.done(), "cancellation did not wait for the persistence worker"
+    finally:
+        release.set()
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(remover, 10)
+        finally:
+            svc._cancel_timer(doomed.id)
 
     assert order == ["write-start", "write-done"], order
-    # Cancellation still propagated to the caller.
-    assert remover.cancelled() or remover.done()
+    assert remover.cancelled()  # cancellation still propagates after the drain
 
 
 # ── handoff unwinds when the index commit raises ─────────────────────────────
@@ -4120,9 +4138,9 @@ async def test_handoff_unwinds_when_the_index_commit_raises(tmp_path, monkeypatc
             slots["spec-builder-boom"] = slot
             return slot
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.post(f"{_BASE}/specs/boom/handoff")
     finally:
         await client.close()
@@ -4278,9 +4296,9 @@ async def test_failed_handoff_keeps_a_pre_existing_conversation(tmp_path, monkey
         def get_or_create_slot(self, name, app=""):
             return existing
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.post(f"{_BASE}/specs/chatty/handoff")
     finally:
         await client.close()
@@ -4321,9 +4339,9 @@ async def test_delete_commits_the_index_before_closing_the_session(tmp_path, mon
         def get_slot(self, key):
             return slots.get(key)
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         with contextlib.suppress(Exception):
             await client.delete(f"{_BASE}/specs/keepme")
     finally:
@@ -4388,9 +4406,9 @@ async def test_messages_refuses_a_foreign_transcript(tmp_path, monkeypatch):
         def get_or_create_slot(self, name, app=""):
             raise AssertionError("must not create over a foreign slot")
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.get(f"{_BASE}/specs/shared/messages")
         body = await resp.json()
     finally:
@@ -4530,9 +4548,9 @@ async def test_create_refuses_when_the_spec_is_replaced_during_slot_setup(tmp_pa
         def get_or_create_slot(self, name, app=""):
             return slot
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.post(
             f"{_BASE}/specs", json={"name": "racy", "working_dir": str(wd), "spec_type": "quick"}
         )
@@ -4636,9 +4654,9 @@ async def test_message_identity_comes_from_the_client(tmp_path, monkeypatch):
         def get_or_create_slot(self, name, app=""):
             raise AssertionError("slot acquired for a stale client")
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         # A stale tab claims the OLD spec_dir; the index now points elsewhere.
         stale = await client.post(
             f"{_BASE}/specs/m/message", json={"text": "hi", "spec_dir": str(old_dir)}
@@ -4710,9 +4728,9 @@ async def test_controls_reject_a_stale_client_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_teardown_worker_slot", lambda *a, **k: _noop())
     monkeypatch.setattr(routes, "_remove_nudge_loop", lambda *a, **k: _noop())
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         ex = await client.post(f"{_BASE}/specs/c/execute", json={"spec_dir": stale})
         st = await client.post(f"{_BASE}/specs/c/stop", json={"spec_dir": stale})
         rm = await client.delete(f"{_BASE}/specs/c?spec_dir={stale}")
@@ -5079,9 +5097,9 @@ async def test_delete_aborts_when_the_loop_cannot_be_removed(tmp_path, monkeypat
     torn_down: list[str] = []
     monkeypatch.setattr(routes, "_teardown_worker_slot", lambda *a, **k: _noop_await(torn_down))
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/doomed")
     finally:
         await client.close()
@@ -5117,9 +5135,9 @@ async def test_stop_reports_failure_instead_of_a_halt_that_did_not_happen(tmp_pa
 
     monkeypatch.setattr(routes, "_halt_execution", _boom)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.post(f"{_BASE}/specs/running/stop", json={})
     finally:
         await client.close()
@@ -5222,9 +5240,9 @@ async def test_delete_restores_the_spec_when_archiving_fails(tmp_path, monkeypat
 
     monkeypatch.setattr(cp, "save_slot_off_loop", _archive_boom)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.delete(f"{_BASE}/specs/keepme")
     finally:
         await client.close()
@@ -5678,9 +5696,9 @@ async def test_second_handoff_is_refused_while_executing(tmp_path, monkeypatch):
             def get_or_create_slot(self, name, app=""):
                 return slot
 
+        client.app["state"] = _State()
         await client.start_server()
         try:
-            client.app["state"] = _State()
             resp = await client.post(f"{_BASE}/specs/busy/execute", json={})
             # Read the body BEFORE closing: the stream dies with the client.
             status, body = resp.status, await resp.json()
@@ -5818,9 +5836,9 @@ async def test_authorization_failure_reverts_the_recorded_execution_state(tmp_pa
             slots[slot.key] = slot
             return slot
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.post(f"{_BASE}/specs/nope/execute", json={})
         status = resp.status
     finally:
@@ -5902,9 +5920,9 @@ async def test_deletion_during_authorization_removes_the_armed_loop(tmp_path, mo
             slots[slot.key] = slot
             return slot
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.post(f"{_BASE}/specs/gone/execute", json={})
         status = resp.status
     finally:
@@ -6066,9 +6084,9 @@ async def test_delete_tombstones_before_dropping_the_entry(tmp_path, monkeypatch
 
     monkeypatch.setattr(routes, "_mutate_index", _watched)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/bye")
         status = resp.status
     finally:
@@ -6094,9 +6112,9 @@ async def test_failed_delete_clears_the_tombstone(tmp_path, monkeypatch):
 
     monkeypatch.setattr(routes, "_teardown_worker_slot", _teardown_fails)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/stay")
         status = resp.status
     finally:
@@ -6264,9 +6282,9 @@ async def test_create_abort_does_not_drop_a_replacement_spec(tmp_path, monkeypat
 
     monkeypatch.setattr(routes, "_ensure_worker_slot", _ensure_then_replace)
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         resp = await client.post(
             f"{_BASE}/specs",
             json={
@@ -6331,9 +6349,9 @@ async def test_index_derived_strings_are_redacted_on_egress(tmp_path, monkeypatc
         }
     )
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         listing = await (await client.get(f"{_BASE}/specs")).json()
         detail = await (await client.get(f"{_BASE}/specs/leaky")).json()
     finally:
@@ -6368,9 +6386,9 @@ async def test_malformed_timestamps_do_not_break_the_listing(tmp_path, monkeypat
         }
     )
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.get(f"{_BASE}/specs")
         status, body = resp.status, await resp.json()
     finally:
@@ -6581,9 +6599,9 @@ async def test_timestamps_are_validated_on_egress(tmp_path, monkeypatch):
         }
     )
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         body = await (await client.get(f"{_BASE}/specs")).json()
     finally:
         await client.close()
@@ -6627,9 +6645,9 @@ async def test_failed_archive_restores_the_original_name_and_key(tmp_path, monke
 
     monkeypatch.setattr(routes, "_teardown_worker_slot", _archive_fails)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/keeper")
         status, body = resp.status, await resp.json()
     finally:
@@ -6671,9 +6689,9 @@ async def test_a_reserved_name_cannot_be_taken_mid_delete(tmp_path, monkeypatch)
         "busy", expect_spec_dir=str(spec_dir), expect_slot_key="spec-builder-busy-11112222"
     )
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         listed = await (await client.get(f"{_BASE}/specs")).json()
         resp = await client.post(
             f"{_BASE}/specs",
@@ -6713,9 +6731,9 @@ async def test_removal_failure_keeps_the_spec_hidden_for_a_retry(tmp_path, monke
     monkeypatch.setattr(routes, "_teardown_worker_slot", _ok_teardown)
     monkeypatch.setattr(routes, "_mutate_index", _fail_the_removal)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/stuck")
         status, body = resp.status, await resp.json()
     finally:
@@ -6811,9 +6829,9 @@ async def test_list_serves_only_allowlisted_statuses(tmp_path, monkeypatch):
         }
     )
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         body = await (await client.get(f"{_BASE}/specs")).json()
     finally:
         await client.close()
@@ -6858,9 +6876,9 @@ async def test_non_finite_timestamps_do_not_poison_the_list_response(tmp_path, m
         }
     )
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         raw = await (await client.get(f"{_BASE}/specs")).text()
     finally:
         await client.close()
@@ -7163,9 +7181,9 @@ async def test_message_during_delete_is_refused_not_dispatched(tmp_path, monkeyp
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a))
     assert await routes._mark_deleting("doomed", expect_spec_dir=sd, expect_slot_key="")
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.post(f"{_BASE}/specs/doomed/message", json={"text": "keep editing"})
         body = await resp.json()
     finally:
@@ -7308,9 +7326,9 @@ async def test_predispatch_repin_uses_captured_key_when_client_sends_none(tmp_pa
     monkeypatch.setattr(routes, "_ensure_worker_slot", _ensure_then_recreate)
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         # NO slot_key in the body -- the older-client shape the pin must not trust.
         resp = await client.post(f"{_BASE}/specs/s/message", json={"text": "edit files"})
         body = await resp.json()
@@ -8400,9 +8418,9 @@ async def test_approve_records_the_version_and_the_user(tmp_path, monkeypatch):
     _seed_spec(tmp_path, files={"requirements.md": "# reviewed"})
     digest = routes._sha256_text("# reviewed")
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/approve",
             json={**_spec_identity(), "phase": "requirements", "hash": digest},
@@ -8424,9 +8442,9 @@ async def test_approve_refuses_a_hash_that_is_not_the_current_document(tmp_path,
     client = _make_client(monkeypatch, tmp_path)
     _seed_spec(tmp_path, files={"requirements.md": "# actually on disk"})
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/approve",
             json={
@@ -8464,9 +8482,9 @@ async def test_approve_refuses_a_same_path_spec_recreated_during_hash_read(tmp_p
 
     monkeypatch.setattr(routes, "_read_spec_text", _replace_identity)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/approve",
             json={
@@ -8522,9 +8540,9 @@ async def test_approve_rejects_a_phase_outside_the_approvable_two(phase, tmp_pat
     client = _make_client(monkeypatch, tmp_path)
     _seed_spec(tmp_path, files={"requirements.md": "# r"})
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/approve",
             json={**_spec_identity(), "phase": phase, "hash": "0" * 64},
@@ -8571,9 +8589,9 @@ async def test_task_run_dispatches_one_scoped_turn(tmp_path, monkeypatch):
     sent: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         detail = await (await client.get(f"{_BASE}/specs/live")).json()
         target = detail["tasks"][1]
         resp = await client.post(
@@ -8603,9 +8621,9 @@ async def test_task_run_identifies_the_selected_duplicate_occurrence(tmp_path, m
     sent: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         detail = await (await client.get(f"{_BASE}/specs/live")).json()
         target = detail["tasks"][1]
         resp = await client.post(
@@ -8636,9 +8654,9 @@ async def test_task_run_revalidates_the_task_after_slot_setup(tmp_path, monkeypa
     monkeypatch.setattr(routes, "_ensure_worker_slot", _setup_then_edit)
     monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/live/task",
             json={**_spec_identity(), "index": 0, "hash": routes._sha256_text("original task")},
@@ -8662,9 +8680,9 @@ async def test_task_run_refuses_a_task_whose_text_moved(tmp_path, monkeypatch):
     sent: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/live/task",
             json={
@@ -8693,9 +8711,9 @@ async def test_task_run_uses_the_same_redacted_identity_the_detail_endpoint_serv
     monkeypatch.setattr(routes, "_redact", lambda text: text.replace("sk-secret", "[redacted]"))
     monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         detail = await (await client.get(f"{_BASE}/specs/live")).json()
         task = detail["tasks"][0]
         resp = await client.post(
@@ -8724,9 +8742,9 @@ async def test_task_run_hashes_raw_text_when_redaction_hides_a_change(tmp_path, 
     )
     monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         detail = await (await client.get(f"{_BASE}/specs/live")).json()
         task = detail["tasks"][0]
         (spec_dir / "tasks.md").write_text("- [ ] rotate secret-new\n")
@@ -8754,9 +8772,9 @@ async def test_task_run_is_refused_while_the_whole_list_is_building(tmp_path, mo
     monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
     monkeypatch.setattr(routes, "_effective_status", _always_executing)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/live/task",
             json={**_spec_identity(), "index": 0, "hash": routes._sha256_text("add the tests")},
@@ -8791,9 +8809,9 @@ async def test_task_run_refuses_a_handoff_that_claims_during_slot_setup(tmp_path
     monkeypatch.setattr(routes, "_ensure_worker_slot", _ensure_after_handoff_claim)
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: sent.append("sent"))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/live/task",
             json={**_spec_identity(), "index": 0, "hash": routes._sha256_text("add the tests")},
@@ -8836,9 +8854,9 @@ async def test_concurrent_task_runs_dispatch_only_once(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_dispatch_turn", _mark_running)
     body = {**_spec_identity(), "index": 0, "hash": routes._sha256_text("add the tests")}
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         first = asyncio.create_task(client.post(f"{_BASE}/specs/live/task", json=body))
         second = asyncio.create_task(client.post(f"{_BASE}/specs/live/task", json=body))
         await asyncio.wait_for(first_waiting.wait(), timeout=5)
@@ -8904,9 +8922,9 @@ async def test_task_slot_materialization_serializes_delete_capture(tmp_path, mon
     monkeypatch.setattr(routes, "_remove_nudge_loop", _remove_loop)
     monkeypatch.setattr(routes, "_teardown_worker_slot", _capture_teardown)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         body = {**_spec_identity(), "index": 0, "hash": routes._sha256_text("add the tests")}
         task_request = asyncio.create_task(client.post(f"{_BASE}/specs/live/task", json=body))
         await asyncio.wait_for(ensure_waiting.wait(), timeout=5)
@@ -8972,9 +8990,9 @@ async def test_task_final_snapshot_serializes_the_whole_plan_claim(tmp_path, mon
     monkeypatch.setattr(routes, "_dispatch_turn", _mark_running)
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: object())
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         body = {**_spec_identity(), "index": 0, "hash": routes._sha256_text("add the tests")}
         task_request = asyncio.create_task(client.post(f"{_BASE}/specs/live/task", json=body))
         await asyncio.wait_for(snapshot_waiting.wait(), timeout=5)
@@ -9045,9 +9063,9 @@ async def test_task_final_snapshot_serializes_delete_reservation(tmp_path, monke
     monkeypatch.setattr(routes, "_remove_nudge_loop", _remove_loop)
     monkeypatch.setattr(routes, "_teardown_worker_slot", _teardown)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         body = {**_spec_identity(), "index": 0, "hash": routes._sha256_text("add the tests")}
         task_request = asyncio.create_task(client.post(f"{_BASE}/specs/live/task", json=body))
         await asyncio.wait_for(snapshot_waiting.wait(), timeout=5)
@@ -9074,9 +9092,9 @@ async def test_task_run_refuses_between_orchestration_stages(tmp_path, monkeypat
     sent: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: sent.append("sent"))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/live/task",
             json={**_spec_identity(), "index": 0, "hash": routes._sha256_text("add the tests")},
@@ -9099,9 +9117,9 @@ async def test_task_run_refuses_a_task_already_checked_off(tmp_path, monkeypatch
     _seed_spec(tmp_path, files={"tasks.md": "- [x] already finished\n"})
     state, _ = _state_for("live")
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/live/task",
             json={
@@ -9130,9 +9148,9 @@ async def test_title_relabels_without_touching_the_identity(tmp_path, monkeypatc
     client = _make_client(monkeypatch, tmp_path)
     spec_dir, _ = _seed_spec(tmp_path)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/title",
             json={**_spec_identity(), "title": "Checkout rewrite"},
@@ -9156,9 +9174,9 @@ async def test_archive_marks_the_spec_without_deleting_it(tmp_path, monkeypatch)
     client = _make_client(monkeypatch, tmp_path)
     spec_dir, _ = _seed_spec(tmp_path, files={"requirements.md": "# keep me"})
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         assert (
             await client.post(
                 f"{_BASE}/specs/live/archive",
@@ -9194,9 +9212,9 @@ async def test_archive_is_refused_while_the_spec_is_building(tmp_path, monkeypat
     _seed_spec(tmp_path, extra={"status": "executing"})
     monkeypatch.setattr(routes, "_effective_status", _always_executing)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/archive",
             json={**_spec_identity(), "archived": True},
@@ -9224,9 +9242,9 @@ async def test_duplicate_copies_the_documents_into_a_fresh_spec(tmp_path, monkey
     sent: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda st, slot, msg: sent.append(msg))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "live-copy"},
@@ -9261,9 +9279,9 @@ async def test_duplicate_refuses_while_the_source_agent_is_writing(tmp_path, mon
     slots[routes._slot_key("live")].running = True
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: None)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "live-copy"},
@@ -9303,9 +9321,9 @@ async def test_duplicate_refuses_a_mixed_source_document_snapshot(tmp_path, monk
     monkeypatch.setattr(routes, "_read_spec_text", _change_plan_between_reads)
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: None)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "mixed-copy"},
@@ -9335,9 +9353,9 @@ async def test_duplicate_redacts_the_returned_spec_directory(tmp_path, monkeypat
     )
     monkeypatch.setattr(routes, "_dispatch_turn", lambda _state, _slot, _message: None)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "live-copy"},
@@ -9376,9 +9394,9 @@ async def test_duplicate_publishes_recovery_provenance_before_index_reservation(
     monkeypatch.setattr(routes, "_mutate_index", _assert_provenance)
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: None)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "live-copy"},
@@ -9454,9 +9472,9 @@ async def test_duplicate_preserves_an_existing_empty_document(tmp_path, monkeypa
     _seed_spec(tmp_path, files={"requirements.md": "# reqs", "design.md": ""})
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: None)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "live-copy"},
@@ -9489,9 +9507,9 @@ async def test_duplicate_refuses_an_existing_document_that_cannot_be_read(tmp_pa
     )
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: None)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "incomplete-copy"},
@@ -9511,9 +9529,9 @@ async def test_duplicate_refuses_a_name_already_in_use(tmp_path, monkeypatch):
     client = _make_client(monkeypatch, tmp_path)
     _seed_spec(tmp_path, files={"requirements.md": "# reqs"})
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         same = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "live"},
@@ -9537,9 +9555,9 @@ async def test_duplicate_refuses_a_spec_with_no_documents_yet(tmp_path, monkeypa
     client = _make_client(monkeypatch, tmp_path)
     _seed_spec(tmp_path)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "empty-copy"},
@@ -9575,9 +9593,9 @@ async def test_duplicate_reserves_its_name_before_populating_the_destination(tmp
     monkeypatch.setattr(routes, "_create_spec_doc", _held_save)
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args, **_kwargs: None)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         duplicate_request = asyncio.create_task(
             client.post(
                 f"{_BASE}/specs/live/duplicate",
@@ -9638,9 +9656,9 @@ async def test_duplicate_refuses_when_the_destination_changes_after_reservation(
     monkeypatch.setattr(routes, "_mutate_index", _move_settings_after_reservation)
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args, **_kwargs: None)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "live-copy"},
@@ -9682,9 +9700,9 @@ async def test_duplicate_rolls_back_only_files_it_created_after_a_partial_failur
 
     monkeypatch.setattr(routes, "_create_spec_doc", _fail_second)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "partial-copy"},
@@ -9719,9 +9737,9 @@ async def test_duplicate_preserves_a_published_copy_when_index_finalization_fail
 
     monkeypatch.setattr(routes, "_mutate_index", _fail_finish)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "recoverable-copy"},
@@ -9755,9 +9773,9 @@ async def test_duplicate_contains_an_index_finalization_exception(tmp_path, monk
 
     monkeypatch.setattr(routes, "_mutate_index", _raise_finish)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "recoverable-copy"},
@@ -9789,9 +9807,9 @@ async def test_duplicate_keeps_its_committed_copy_when_slot_setup_is_refused(tmp
 
     monkeypatch.setattr(routes, "_ensure_worker_slot", _refuse_slot)
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await client.post(
             f"{_BASE}/specs/live/duplicate",
             json={**_spec_identity(), "new_name": "committed-copy"},
@@ -9830,9 +9848,9 @@ async def test_new_mutations_refuse_a_stale_client_identity(
     client = _make_client(monkeypatch, tmp_path)
     _seed_spec(tmp_path, files={"requirements.md": "# r", "tasks.md": "- [ ] t\n"})
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await getattr(client, method)(
             f"{_BASE}/specs/live/{path}",
             json={**body, "spec_dir": "/somewhere/else", "slot_key": "spec-builder-live-deadbeef"},
@@ -9864,9 +9882,9 @@ async def test_new_mutations_require_a_complete_client_identity(
     client = _make_client(monkeypatch, tmp_path)
     _seed_spec(tmp_path, files={"requirements.md": "# r", "tasks.md": "- [ ] t\n"})
 
+    client.app["state"] = _state_for("live")[0]
     await client.start_server()
     try:
-        client.app["state"] = _state_for("live")[0]
         resp = await getattr(client, method)(f"{_BASE}/specs/live/{path}", json=body)
         payload = await resp.json()
     finally:
@@ -10312,9 +10330,9 @@ async def test_partial_slot_teardown_keeps_the_delete_reserved(tmp_path, monkeyp
 
     monkeypatch.setattr(routes, "_teardown_worker_slot", _partially_teardown)
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         response = await client.delete(
             f"{_BASE}/specs/s",
             json={"spec_dir": spec_dir, "slot_key": slot_key},
@@ -10413,9 +10431,9 @@ async def test_legacy_delete_refuses_same_path_replacement_before_reservation(
         routes, "_aload_index_with_decision_alias_status", _replace_then_check_aliases
     )
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         response = await client.delete(f"{_BASE}/specs/legacy")
         body = await response.json()
     finally:
@@ -10574,9 +10592,9 @@ async def test_reusing_an_id_for_a_different_question_does_not_inherit_the_answe
 
     state, _slot = _slot_stub()
     state._background_tasks = set()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         first = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -10657,9 +10675,9 @@ async def test_a_claim_for_an_absent_decision_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -10690,9 +10708,9 @@ async def test_a_claim_is_refused_when_decision_state_is_unreadable(tmp_path, mo
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -10749,9 +10767,9 @@ async def test_a_claim_left_pending_by_a_crash_is_replayed_only_by_a_post(tmp_pa
     monkeypatch.setattr(routes, "_dispatch_turn", _dispatch)
     state, _slot = _slot_stub()
     state._background_tasks = set()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         detail_resp = await client.get(f"{_BASE}/specs/s")
         detail = await detail_resp.json()
         assert detail_resp.status == 200, detail
@@ -10828,9 +10846,9 @@ async def test_crash_replay_preserves_a_maximum_length_decision_option(tmp_path,
     monkeypatch.setattr(routes, "_dispatch_turn", _dispatch)
     state, _slot = _slot_stub()
     state._background_tasks = set()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         detail_resp = await client.get(f"{_BASE}/specs/s")
         detail = await detail_resp.json()
         assert detail_resp.status == 200, detail
@@ -10894,9 +10912,9 @@ async def test_replay_abandons_an_answer_for_a_question_that_was_replaced(tmp_pa
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
     state, _slot = _slot_stub()
     state._background_tasks = set()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.get(f"{_BASE}/specs/s")
         payload = await resp.json()
         assert resp.status == 200, payload
@@ -11180,9 +11198,9 @@ async def test_a_channel_turn_replacing_the_question_during_claim_cannot_receive
         return outcome
 
     monkeypatch.setattr(routes, "_claim_decision", _claim_while_channel_turn_replaces_question)
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -11279,9 +11297,9 @@ async def test_recovery_replays_an_unconsumed_delivery_without_a_second_chat_row
             "meta": {"spec_decision_delivery_id": "delivery-relayed"},
         }
     ]
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         detail_resp = await client.get(f"{_BASE}/specs/s")
         detail = await detail_resp.json()
         assert detail_resp.status == 200, detail
@@ -11571,9 +11589,9 @@ async def test_second_answer_to_one_decision_is_refused(tmp_path, monkeypatch):
 
     state, _slot = _slot_stub()
     state._background_tasks = set()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         body = {"spec_dir": spec_dir, "slot_key": slot_key, "decision_id": "transport"}
         first = await client.post(
             f"{_BASE}/specs/s/message",
@@ -11614,9 +11632,9 @@ async def test_concurrent_answers_to_one_decision_dispatch_once(tmp_path, monkey
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         body = {"spec_dir": spec_dir, "slot_key": slot_key, "decision_id": "transport"}
         results = await asyncio.gather(
             client.post(
@@ -11645,9 +11663,9 @@ async def test_a_plain_message_is_never_locked(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         body = {"spec_dir": spec_dir, "slot_key": slot_key}
         one = await client.post(f"{_BASE}/specs/s/message", json={**body, "text": "looks good"})
         two = await client.post(f"{_BASE}/specs/s/message", json={**body, "text": "looks good"})
@@ -11685,8 +11703,8 @@ async def test_a_re_emitted_pending_decision_reads_as_answered(tmp_path, monkeyp
 
     app = web.Application(middlewares=[_auth_mw])
     routes.register_routes(app)
+    app["state"] = _slot_stub()[0]
     async with TestClient(TestServer(app)) as client:
-        client.app["state"] = _slot_stub()[0]
         resp = await client.get(f"{_BASE}/specs/s")
         data = await resp.json()
 
@@ -11717,8 +11735,8 @@ async def test_a_recorded_answer_is_redacted_on_egress(tmp_path, monkeypatch):
 
     app = web.Application(middlewares=[_auth_mw])
     routes.register_routes(app)
+    app["state"] = _slot_stub()[0]
     async with TestClient(TestServer(app)) as client:
-        client.app["state"] = _slot_stub()[0]
         resp = await client.get(f"{_BASE}/specs/s")
         data = await resp.json()
 
@@ -11770,9 +11788,9 @@ async def test_a_full_ledger_refuses_rather_than_dispatching_unrecorded(tmp_path
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -11862,9 +11880,9 @@ async def test_the_ledger_key_matches_the_id_the_detail_read_serves(tmp_path, mo
     monkeypatch.setattr(routes, "_dispatch_turn", _dispatch)
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         # The SPA echoes back the id the detail read gave it, verbatim.
         served = routes._normalize_spec_state(
             json.loads((Path(spec_dir) / ".spec-state.json").read_text())
@@ -11906,9 +11924,9 @@ async def test_an_answer_without_its_option_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -11947,9 +11965,9 @@ async def test_the_card_shows_the_option_not_the_whole_prompt(tmp_path, monkeypa
 
     state, _slot = _slot_stub()
     state._background_tasks = set()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         client_prompt = "Decision — “Inbound transport”: HTTPS"
         resp = await client.post(
             f"{_BASE}/specs/s/message",
@@ -12010,9 +12028,9 @@ async def test_a_delete_that_lands_after_the_repin_strands_no_claim(tmp_path, mo
     monkeypatch.setattr(routes, "_touch_spec", _touch_then_reserve)
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -12060,9 +12078,9 @@ async def test_an_answer_is_refused_while_the_agent_is_running(tmp_path, monkeyp
 
     state, slot = _slot_stub()
     slot.running = True
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -12095,9 +12113,9 @@ async def test_a_plain_message_still_queues_behind_a_running_turn(tmp_path, monk
 
     state, slot = _slot_stub()
     slot.running = True
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={"spec_dir": spec_dir, "slot_key": slot_key, "text": "also check the auth flow"},
@@ -12203,9 +12221,9 @@ async def test_deleting_a_spec_forgets_its_answers(tmp_path, monkeypatch):
         )
     )[0] == routes._CLAIM_RECORDED
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/s")
     finally:
         await client.close()
@@ -12251,9 +12269,9 @@ async def test_an_unreadable_ledger_refuses_the_write_instead_of_erasing_it(tmp_
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -12348,8 +12366,8 @@ async def test_the_detail_read_serves_the_recorded_answer(tmp_path, monkeypatch)
 
     app = web.Application(middlewares=[_auth_mw])
     routes.register_routes(app)
+    app["state"] = _slot_stub()[0]
     async with TestClient(TestServer(app)) as client:
-        client.app["state"] = _slot_stub()[0]
         data = await (await client.get(f"{_BASE}/specs/s")).json()
 
     decision = data["state"]["decisions"][0]
@@ -12387,9 +12405,9 @@ async def test_a_failed_index_removal_puts_the_answers_back(tmp_path, monkeypatc
 
     monkeypatch.setattr(routes, "_mutate_index", _fail_the_final_pop)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/s")
         payload = await resp.json()
     finally:
@@ -12436,9 +12454,9 @@ async def test_no_turn_can_start_while_an_answer_is_being_recorded(tmp_path, mon
     monkeypatch.setattr(routes, "_claim_decision", _claim_while_another_dispatcher_waits)
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -12496,9 +12514,9 @@ async def test_deleting_a_spec_retains_its_turn_lock(tmp_path, monkeypatch):
     lock = routes._turn_lock(spec_dir)
     assert routes._turn_key(spec_dir) in routes._TURN_LOCKS
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/s")
     finally:
         await client.close()
@@ -12538,9 +12556,9 @@ async def test_a_same_path_reimport_during_the_read_is_refused(tmp_path, monkeyp
 
     monkeypatch.setattr(routes, "_collect_spec_documents", _collect_then_reimport)
 
+    client.app["state"] = _slot_stub()[0]
     await client.start_server()
     try:
-        client.app["state"] = _slot_stub()[0]
         resp = await client.get(f"{_BASE}/specs/s")
         payload = await resp.json()
     finally:
@@ -12568,9 +12586,9 @@ async def test_a_failed_ledger_write_is_a_named_refusal_not_a_500(tmp_path, monk
     monkeypatch.setattr(routes, "_save_decisions", _no_space)
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -12615,9 +12633,9 @@ async def test_a_raised_index_removal_still_restores_the_answers(tmp_path, monke
 
     monkeypatch.setattr(routes, "_mutate_index", _raise_on_the_final_pop)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/s")
         payload = await resp.json()
     finally:
@@ -12654,9 +12672,9 @@ async def test_the_delete_holds_the_turn_lock(tmp_path, monkeypatch):
 
     monkeypatch.setattr(routes, "_forget_decisions", _forget_while_another_dispatcher_waits)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/s")
     finally:
         await client.close()
@@ -12824,9 +12842,9 @@ async def test_a_delete_whose_cleanup_fails_still_deletes(tmp_path, monkeypatch)
 
     monkeypatch.setattr(routes, "_save_decisions", _boom)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/s")
         payload = await resp.json()
     finally:
@@ -12848,9 +12866,9 @@ async def test_a_delete_clears_the_record_after_the_index_entry(tmp_path, monkey
         )
     )[0] == routes._CLAIM_RECORDED
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/s")
     finally:
         await client.close()
@@ -12941,9 +12959,9 @@ async def test_an_alias_name_for_the_same_folder_cannot_re_answer(tmp_path, monk
     dispatched: list = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s-alias/message",
             json={
@@ -13048,9 +13066,9 @@ async def test_macos_single_path_rewrite_cannot_fork_the_decision_ledger(tmp_pat
         expect_slot_key=slot_key,
     )
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         detail = await client.get(f"{_BASE}/specs/s")
         detail_body = await detail.json()
         deleted = await client.delete(f"{_BASE}/specs/s")
@@ -13130,9 +13148,9 @@ async def test_macos_case_alias_conflict_refuses_detail_and_delete(tmp_path, mon
     alias_slot_key = routes._new_slot_key("s-alias")
     _add_case_alias(spec_dir, alias_slot_key)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         detail = await client.get(f"{_BASE}/specs/s")
         detail_body = await detail.json()
         deleted = await client.delete(f"{_BASE}/specs/s")
@@ -13175,9 +13193,9 @@ async def test_alias_added_during_delete_prevents_the_index_pop(tmp_path, monkey
 
     monkeypatch.setattr(routes, "_teardown_worker_slot", _teardown_with_alias)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         response = await client.delete(f"{_BASE}/specs/s")
         body = await response.json()
     finally:
@@ -13392,9 +13410,9 @@ async def test_a_delete_clears_the_record_for_that_folder_only(tmp_path, monkeyp
     }
     routes._save_decisions(store)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/s")
     finally:
         await client.close()
@@ -13426,9 +13444,9 @@ async def test_deleting_one_alias_leaves_the_shared_record_alone(tmp_path, monke
     index["s-alias"] = {**index["s"], "slot_key": alias_key}
     routes._save_index(index)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/s")
     finally:
         await client.close()
@@ -13478,9 +13496,9 @@ async def test_an_alias_mid_turn_blocks_the_answer(tmp_path, monkeypatch):
 
     state.get_slot = _get_slot
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -13552,9 +13570,9 @@ async def test_an_alias_turn_that_starts_and_finishes_during_claim_defers_the_an
 
     monkeypatch.setattr(routes, "_mark_decision_relayed", _mark_while_alias_turn_runs)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -13614,9 +13632,9 @@ async def test_deleting_one_alias_keeps_the_shared_turn_lock(tmp_path, monkeypat
     index["s-alias"] = {**index["s"], "slot_key": routes._new_slot_key("s-alias")}
     routes._save_index(index)
 
+    client.app["state"] = None
     await client.start_server()
     try:
-        client.app["state"] = None
         resp = await client.delete(f"{_BASE}/specs/s")
     finally:
         await client.close()
@@ -13667,9 +13685,9 @@ async def test_an_alias_added_while_message_waits_for_the_turn_lock_is_seen(tmp_
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     request_task = None
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         request_task = asyncio.create_task(
             client.post(
                 f"{_BASE}/specs/s/message",
@@ -13721,9 +13739,9 @@ async def test_an_alias_added_while_handoff_waits_for_the_turn_lock_is_seen(tmp_
     monkeypatch.setattr(routes, "authorize_and_add_nudge", _authorized)
 
     request_task = None
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         request_task = asyncio.create_task(
             client.post(f"{_BASE}/specs/s/handoff", json={"spec_dir": spec_dir})
         )
@@ -13812,9 +13830,9 @@ async def test_stop_that_finishes_before_handoff_gets_the_lock_prevents_dispatch
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     handoff = None
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         handoff = asyncio.create_task(
             client.post(
                 f"{_BASE}/specs/s/handoff",
@@ -14979,9 +14997,9 @@ async def test_legacy_message_pins_its_name_derived_slot_before_alias_scan(tmp_p
         lambda *_args, **_kwargs: dispatched.append("sent"),
     )
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         response = await client.post(
             f"{_BASE}/specs/s/message",
             json={"spec_dir": str(spec_dir), "text": "continue"},
@@ -15038,9 +15056,9 @@ async def test_stop_revokes_a_message_after_its_final_scan_captured_old_identity
         lambda *_args, **_kwargs: dispatched.append("sent"),
     )
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         request = asyncio.create_task(
             client.post(
                 f"{_BASE}/specs/s/message",
@@ -15106,9 +15124,9 @@ async def test_stop_targets_the_published_slot_after_index_identity_rewrite(tmp_
         halted.append(kwargs.get("only_slot"))
 
     monkeypatch.setattr(routes, "_halt_execution", _halted)
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         response = await client.post(
             f"{_BASE}/specs/s/stop",
             json={"spec_dir": spec_dir, "slot_key": old_slot_key},
@@ -15191,9 +15209,9 @@ async def test_teardown_targets_an_idle_published_autonudge_after_identity_rewri
     )
     routes._save_index({"t": rewritten})
 
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         body = {
             "spec_dir": rewritten_dir,
             "slot_key": replacement_slot_key,
@@ -15280,9 +15298,9 @@ async def test_stop_arriving_during_authorization_unwinds_before_dispatch(tmp_pa
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     handoff = stop = None
+    client.app["state"] = _State()
     await client.start_server()
     try:
-        client.app["state"] = _State()
         handoff = asyncio.create_task(
             client.post(
                 f"{_BASE}/specs/s/handoff",
@@ -15338,9 +15356,9 @@ async def test_an_alias_mid_turn_blocks_an_ordinary_message(tmp_path, monkeypatc
     real_get_slot = state.get_slot
     state.get_slot = lambda k: busy if k == alias_key else real_get_slot(k)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={"spec_dir": spec_dir, "slot_key": slot_key, "text": "just a note"},
@@ -15386,9 +15404,9 @@ async def test_a_completed_alias_turn_during_repin_blocks_an_ordinary_message(
     dispatched: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={"spec_dir": spec_dir, "slot_key": slot_key, "text": "just a note"},
@@ -15428,9 +15446,9 @@ async def test_an_alias_missing_its_persisted_slot_key_refuses_a_message(tmp_pat
     real_get_slot = state.get_slot
     state.get_slot = lambda key: busy if key == alias_key else real_get_slot(key)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={"spec_dir": spec_dir, "slot_key": slot_key, "text": "just a note"},
@@ -15484,9 +15502,9 @@ async def test_an_alias_mid_turn_blocks_a_handoff(tmp_path, monkeypatch):
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(f"{_BASE}/specs/s/handoff", json={"spec_dir": spec_dir})
         payload = await resp.json()
     finally:
@@ -15534,9 +15552,9 @@ async def test_a_completed_alias_turn_during_authorization_blocks_a_handoff(tmp_
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(f"{_BASE}/specs/s/handoff", json={"spec_dir": spec_dir})
         payload = await resp.json()
     finally:
@@ -15577,9 +15595,9 @@ async def test_handoff_refuses_when_its_own_slot_starts_during_authorization(tmp
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(f"{_BASE}/specs/s/handoff", json={"spec_dir": spec_dir})
         payload = await resp.json()
     finally:
@@ -15625,9 +15643,9 @@ async def test_handoff_refuses_when_its_own_slot_starts_during_the_final_repin(
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(f"{_BASE}/specs/s/handoff", json={"spec_dir": spec_dir})
         payload = await resp.json()
     finally:
@@ -15720,9 +15738,9 @@ async def test_an_alias_with_an_armed_build_blocks_the_answer(tmp_path, monkeypa
 
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: _Svc())
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={
@@ -15770,9 +15788,9 @@ async def test_a_finished_alias_loop_does_not_block(tmp_path, monkeypatch):
 
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: _Svc())
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs/s/message",
             json={"spec_dir": spec_dir, "slot_key": slot_key, "text": "just a note"},
@@ -15871,9 +15889,9 @@ async def test_creating_a_spec_clears_an_orphaned_record_at_its_path(tmp_path, m
     # The fixture must be readable through the redirect, or this test proves nothing.
     assert await _recorded_answers(str(spec_dir)) == {"transport": "HTTPS"}
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs",
             json={"name": "reborn", "working_dir": str(project), "spec_type": "feature"},
@@ -15926,9 +15944,9 @@ async def test_creating_a_spec_keeps_a_live_alias_answers(tmp_path, monkeypatch)
     )
     assert await _recorded_answers(str(spec_dir)) == {"transport": "HTTPS"}
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs",
             json={"name": "shared", "working_dir": str(project), "spec_type": "feature"},
@@ -15969,9 +15987,9 @@ async def test_importing_existing_documents_keeps_their_answers(tmp_path, monkey
     routes._save_index({})
     assert await _recorded_answers(str(spec_dir)) == {"transport": "HTTPS"}
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs",
             json={
@@ -16038,9 +16056,9 @@ async def test_create_refuses_when_a_stale_record_survives_the_clear(tmp_path, m
 
     monkeypatch.setattr(routes, "_save_decisions", _boom)
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs",
             json={"name": "stuck", "working_dir": str(project), "spec_type": "feature"},
@@ -16081,9 +16099,9 @@ async def test_create_refuses_when_the_ledger_is_unreadable(tmp_path, monkeypatc
     routes._save_index({})
     monkeypatch.setattr(routes, "_read_decisions", lambda: ({}, False))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         resp = await client.post(
             f"{_BASE}/specs",
             json={"name": "fresh", "working_dir": str(project), "spec_type": "feature"},
@@ -16275,9 +16293,9 @@ async def test_stop_waits_for_an_in_flight_decision_answer(tmp_path, monkeypatch
     monkeypatch.setattr(routes, "_halt_execution", _halt_spy)
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         async with routes._turn_lock(dir_key):
             stop = asyncio.ensure_future(client.post(f"{_BASE}/specs/s/stop", json={}))
             with pytest.raises(asyncio.TimeoutError):
@@ -16348,9 +16366,9 @@ async def test_stop_refuses_a_spec_recreated_at_the_same_path(tmp_path, monkeypa
     monkeypatch.setattr(routes, "_halt_execution", _halt_spy)
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         async with routes._turn_lock(dir_key):
             stop = asyncio.ensure_future(client.post(f"{_BASE}/specs/s/stop", json={}))
             await asyncio.sleep(0.75)  # let it reach the lock and block there
@@ -16414,9 +16432,9 @@ async def test_create_waits_for_the_directory_turn_lock(tmp_path, monkeypatch):
     routes._save_index({})
     dir_key = routes._decision_key(str(spec_dir))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         async with routes._turn_lock(dir_key):
             post = asyncio.ensure_future(
                 client.post(
@@ -16584,9 +16602,9 @@ async def test_create_dispatches_its_seed_before_anything_else_can_run(tmp_path,
     dispatched: list = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         async with routes._turn_lock(dir_key):
             post = asyncio.ensure_future(
                 client.post(
@@ -16656,9 +16674,9 @@ async def test_an_option_the_decision_no_longer_offers_is_refused(tmp_path, monk
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         # "HTTPS" was on the card this client rendered; the decision now offers neither.
         status, payload = await _answer(
             client, state, spec_dir=spec_dir, slot_key=slot_key, option="HTTPS"
@@ -16706,9 +16724,9 @@ async def test_a_decision_replaced_while_the_answer_waits_for_the_lock_is_refuse
     monkeypatch.setattr(routes, "_turn_lock", lambda _key: _ProbedLock())
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         post = asyncio.create_task(
             client.post(
                 f"{_BASE}/specs/s/message",
@@ -16766,9 +16784,9 @@ async def test_an_option_the_decision_still_offers_is_accepted(tmp_path, monkeyp
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         status, payload = await _answer(
             client, state, spec_dir=spec_dir, slot_key=slot_key, option="HTTPS"
         )
@@ -16796,9 +16814,9 @@ async def test_a_decision_with_no_declared_options_accepts_any_answer(tmp_path, 
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: None)
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         status, payload = await _answer(
             client, state, spec_dir=spec_dir, slot_key=slot_key, option="anything at all"
         )
@@ -16816,9 +16834,9 @@ async def test_a_decision_absent_from_state_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: None)
 
     state, _slot = _slot_stub()
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         status, payload = await _answer(
             client, state, spec_dir=spec_dir, slot_key=slot_key, option="HTTPS"
         )
@@ -16893,9 +16911,9 @@ async def test_create_refuses_a_second_name_for_the_same_normalized_directory(
     dispatched: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_a, **_kw: dispatched.append("x"))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         first = await client.post(
             f"{_BASE}/specs",
             json={"name": "CaseSpec", "working_dir": str(project), "spec_type": "feature"},
@@ -16941,9 +16959,9 @@ async def test_create_refuses_a_macos_case_alias_for_the_same_directory(tmp_path
     dispatched: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_a, **_kw: dispatched.append("x"))
 
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         responses = await asyncio.gather(
             client.post(
                 f"{_BASE}/specs",
@@ -17013,9 +17031,9 @@ async def test_create_refuses_an_equivalent_orphan_ledger_before_inserting(
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_a, **_kw: dispatched.append("x"))
 
     project = Path(spec_dir).parents[2]
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         response = await client.post(
             f"{_BASE}/specs",
             json={
@@ -17059,9 +17077,9 @@ async def test_create_refuses_an_unreadable_ledger_before_inserting(
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *_a, **_kw: dispatched.append("x"))
 
     project = Path(spec_dir).parents[2]
+    client.app["state"] = state
     await client.start_server()
     try:
-        client.app["state"] = state
         response = await client.post(
             f"{_BASE}/specs",
             json={

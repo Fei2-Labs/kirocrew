@@ -1,6 +1,6 @@
 ---
 name: kirocrew-worktree-dev
-description: "HARD RULE for developing the Kiro Crew source repo ITSELF (not users' projects): develop, build and verify in a git worktree, never against the live gateway. Covers environment setup, build/dist ordering, feature flags, isolated previews, cleanup and publication authorization; prepare-pr owns the PR workflow."
+description: "HARD RULE for developing the Kiro Crew source repo ITSELF (not users' projects): develop, build and verify in a git worktree, never against the live gateway. Covers env setup, build/dist ordering, feature flags, isolated previews, cleanup, publish authorization; prepare-pr owns the PR workflow."
 triggers: kirocrew worktree, kirocrew build gate, kirocrew dev, kirocrew source, contribute to kirocrew, kirocrew repo
 repo_scope: src/kiro_crew
 ---
@@ -43,33 +43,36 @@ make it green. For test authoring, flakes, isolation or suite speed, load
 `writing-tests` and the owning section of
 `docs/system-specs/common/testing-conventions.md` before fixing the test.
 
-During iteration, run `python3 scripts/local-gate.py` from the worktree.
-`--dry-run` prints the plan, `--base REF` selects a base and `--full` forces both
-surfaces. Do not hand-narrow its classification: meta, mixed or unreadable diffs
-fall back to the full gate. The script is an ITERATION gate, never a push gate.
-Before publication, MUST load [prepare-pr](../prepare-pr/SKILL.md) and run its
-complete resolved `gates[]` floor from the base-ref profile. That skill alone owns
-PR preparation, local reviewers, history, dispositions and push-to-green steps.
+During iteration, run `python3 scripts/local-gate.py` from the worktree. It
+runs the tests RELATED to the diff on both surfaces with a bounded worker count
+and never escalates to a full suite -- meta, mixed and large diffs all get a
+related set; an unreadable diff exits 2 and runs nothing. The full suite is CI's
+job; `--full` exists for a human who asks. `--dry-run` prints the plan,
+`--base REF` selects a base. Before publication, MUST load
+[prepare-pr](../prepare-pr/SKILL.md) and run its complete resolved `gates[]`
+floor from the base-ref profile. That skill alone owns PR preparation, local
+reviewers, history, dispositions and push-to-green steps.
 
 Minimum manual checks, not a replacement for that floor:
 
 ```bash
-python -m pytest -q
+python3 scripts/local-gate.py
 isort --check-only src/kiro_crew test
 flake8 src/kiro_crew test
 mypy src/kiro_crew/
 cd website
-npx tsc -b
+npx tsc -p tsconfig.app.json
 npx vitest run
 cd ..
 ```
 
 - Rebuild and stage frontend dist BEFORE backend tests that read static assets.
-- Full pytest uses `setup.cfg`'s `-n auto --dist loadgroup` and
-  `--max-worker-restart=2`. Keep grouping for `xdist_group` serialization. The
-  root conftest budgets workers by free memory and concurrent runs; explicit
-  `-n <N>` bypasses it. Check host headroom before a full suite. A scoped
-  subagent may use serial targeted tests; the parent owns aggregate gates.
+- A bare `python -m pytest` (the full suite, for a human who wants it) uses
+  `setup.cfg`'s `-n auto --dist loadgroup` and `--max-worker-restart=2`. Keep
+  grouping for `xdist_group` serialization. The root conftest budgets workers by
+  free memory and concurrent runs; explicit `-n <N>` bypasses it. Check host
+  headroom before a full suite. The gate scripts pass their own bounded `-n`.
+  A scoped subagent may use serial targeted tests; the parent owns aggregate gates.
 - To omit coverage during iteration without dropping the parallel safeguards:
 
   ```bash
@@ -155,6 +158,12 @@ refused, while a path is the sanitized config-only form. Other boot flags:
 
 Pods need Linux `systemd --user` or macOS `launchd`; run `kirocrew pod install`
 once per host. See [pod platform requirements](../../../pod/README.md).
+Every verb above talks to that per-user service manager, so an agent session
+behind an outer sandbox with its own user namespace gets `Permission denied` from
+all of them; `systemctl --user is-system-running` says which case you are in. The
+`pod_up` / `pod_down` / `pod_status` / `pod_ls` tools do the same work through the
+gateway, which holds the host bus, and `pod_up` returns the `{base_url, token,
+port}` handle directly. They need the Dev Fleet app enabled.
 `pod ls`, `status`, `logs`, `provision`, `prune`, `exec` and `api` cover inspection,
 provisioning, removal of gone worktrees, in-pod commands and HTTP probes.
 Without a service manager, or for a foreground debugger, run `./dev-backend.sh`

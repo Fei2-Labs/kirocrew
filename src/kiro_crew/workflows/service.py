@@ -37,9 +37,14 @@ from kiro_crew.llm_helpers import (
 )
 from kiro_crew.member_memory_auth import private_memory_store_for_session
 from kiro_crew.task_planner import decompose_yaml
+from kiro_crew.workflow_memory import (
+    WorkflowMemoryError,
+    WorkflowScope,
+    admission_errors,
+)
 
 from .agent_exec import build_agent_fn
-from .agent_pool import build_pooled_agent_fn
+from .agent_pool import admitted_agent_fn, build_pooled_agent_fn
 from .events import EventStream
 from .library import (
     SOURCE_FORMAT_PYTHON,
@@ -96,6 +101,12 @@ ctx.nudge(idle_secs=?, message=?), ctx.budget, ctx.args. Nothing else exists on
 ctx in this runtime — any other ctx attribute or method fails at runtime, so do
 not invent one.
 
+BUDGET — ctx.budget is a host-owned Budget object, NOT a number or a timeout.
+Never assign to or delete ctx.budget. The caller sets the run's token ceiling
+with budget_total when starting the workflow. Read ctx.budget.total,
+ctx.budget.spent(), or ctx.budget.remaining() to inspect it. Keep any script-local
+limit in a local variable instead of replacing the runtime object.
+
 ASYNC vs SYNC — get this right or the script crashes at runtime:
   * AWAIT these (they are async): ctx.agent(...), ctx.parallel(...),
     ctx.pipeline(...).
@@ -148,8 +159,9 @@ Before you reply, RE-READ your script and fix these specific failure modes: (1) 
 ``.get()``, or attribute access on an awaited
 ctx.agent/parallel/pipeline result that is not first bound to a
 variable and None-guarded; (3) any use of a name that
-is not a listed builtin, ctx, or a helper you defined. Reply ONLY when the script
-is clean on all three.
+is not a listed builtin, ctx, or a helper you defined; (4) any assignment to or
+deletion of ctx.budget (keep the host-owned Budget object). Reply ONLY when the
+script is clean on all four.
 
 Author the workflow for this task:
 
@@ -157,37 +169,6 @@ Author the workflow for this task:
 
 {references}
 """
-
-
-async def _memory_admission_error(*session_keys: str) -> Optional[dict[str, Any]]:
-    """Refuse private parents until every workflow worker can retain their binding.
-
-    This is the gateway's protected session resolver, never an agent-template or
-    environment lookup. Check before allocating authors, pools or run records;
-    unreadable identity is a refusal rather than permission to use Global V1.
-    """
-    for session_key in dict.fromkeys(key for key in session_keys if key):
-        try:
-            private_store = await asyncio.to_thread(private_memory_store_for_session, session_key)
-        except Exception:
-            message = "The workflow's memory binding could not be verified. No agents were started."
-            code = "workflow_memory_unavailable"
-        else:
-            if not private_store:
-                continue
-            message = (
-                "Workflows cannot yet retain a member's private memory. "
-                "Run this work in the member's chat instead."
-            )
-            code = "workflow_private_memory_unsupported"
-        return {
-            "ok": False,
-            "error": message,
-            "errors": [message],
-            "code": code,
-            "admission_rejected": True,
-        }
-    return None
 
 
 class WorkflowService:
@@ -208,16 +189,15 @@ class WorkflowService:
         timeout_secs: Optional[int] = None,
         definition_library: Any = None,
         task_runner: Any = None,
+        task_admission: Any = None,
+        context_builder: Any = None,
         _load_persisted: bool = True,
     ) -> None:
-        # Durable store: runs are mirrored to disk so they survive gateway
-        # restarts. Pass persist=False (or store=None) to keep a purely in-memory
-        # registry — used by tests that don't want filesystem side effects.
+        # Durable startup must not silently become an empty/in-memory registry:
+        # legacy run files may exist even when their inventory is unreadable.
+        # Tests and standalone callers can explicitly choose persist=False.
         if store is None and persist:
-            try:
-                store = WorkflowRunStore()
-            except Exception:  # noqa: BLE001 - persistence is best-effort
-                store = None
+            store = WorkflowRunStore()
         self.registry = RunRegistry(store=store)
         self._definition_library = (
             definition_library if definition_library is not None else WorkflowDefinitionLibrary()
@@ -231,6 +211,7 @@ class WorkflowService:
         if on_event is not None:
             self.registry.set_on_event(on_event)
         self._sessions = sessions
+        self._context_builder = context_builder
         self._task_runner = task_runner
         # Injected by the gateway: an async ``(*, slot_key, message, idle_secs,
         # max_cycles) -> None`` that runs the SHARED authorize_and_add_nudge
@@ -257,17 +238,21 @@ class WorkflowService:
         # workflows/agent_pool.py). The pool is per-run and torn down when the run
         # ends. Off => the original cold-start-per-call path (build_agent_fn).
         self._pool_agents = pool_agents
+        # Durable task queue (``taskq.adapters.runner.RunnerAdmission``): when
+        # attached, every ``ctx.agent()`` call of every run is a
+        # ``workflow_agent`` row admitted through the shared lane (write-
+        # before-ack, defer on memory pressure, bounded by the effective cap).
+        # None keeps the pool's own fixed semaphore as the only bound.
+        self._task_admission = task_admission
+        self._adopt_inflight: Any = None
         self._seq = 0
         self._host_streams: dict[str, EventStream] = {}
         # Rehydrate any persisted runs from a prior process, and continue the
         # run-id sequence past the highest seen so new ids never collide.
         if _load_persisted:
-            try:
-                n = self.registry.load_persisted()
-                if n:
-                    self._seq = self._max_persisted_seq()
-            except Exception:  # noqa: BLE001
-                pass
+            n = self.registry.load_persisted()
+            if n:
+                self._seq = self._max_persisted_seq()
 
     @classmethod
     async def create(cls, **kwargs: Any) -> WorkflowService:
@@ -324,10 +309,14 @@ class WorkflowService:
                     hi = max(hi, int(tail))
         return hi
 
-    def _new_run_id(self) -> str:
-        # Deterministic, monotonic per process (no time/random — resume-stable).
-        self._seq += 1
-        return f"wf_{self._seq:06d}"
+    async def _new_run_id(self) -> str:
+        from kiro_crew.workflow_memory import allocate_run_id
+
+        # The worker owns the whole lock transaction even if this await is
+        # cancelled. _seq is only the recovered lower bound, never authority.
+        candidate = await asyncio.to_thread(allocate_run_id, self._seq)
+        self._seq = max(self._seq, int(candidate[3:]))
+        return candidate
 
     async def begin_host_run(
         self,
@@ -339,6 +328,8 @@ class WorkflowService:
         driver: str,
         author: str = "",
         session_key: str = "",
+        expected_store: str | None = None,
+        execution_context=None,
         capabilities: tuple[str, ...] = (),
         workflow_id: str = "",
         workflow_slug: str = "",
@@ -351,12 +342,28 @@ class WorkflowService:
         Host runs publish lifecycle and progress only. Their driver keeps all
         product semantics, including planning, approvals, retries, and cleanup.
         """
-        run_id = self._new_run_id()
+        from kiro_crew.workflow_memory import capture_admission_execution
+
+        captured_execution = await capture_admission_execution(
+            self._context_builder, session_key, author, execution_context=execution_context
+        )
+        run_id = await self._new_run_id()
+        memory_scope = await WorkflowScope.admit(
+            run_id,
+            self._context_builder,
+            session_key,
+            author,
+            expected_store=expected_store,
+            execution_context=captured_execution,
+        )
         handle = RunHandle(
             run_id=run_id,
             name=name or run_id,
             author=author,
-            session_key=session_key,
+            session_key=memory_scope.origin,
+            execution_binding_version=1,
+            execution_context=memory_scope.execution_context,
+            memory_mode=memory_scope.memory_mode,
             source=source,
             source_format=source_format,
             driver=driver,
@@ -369,7 +376,7 @@ class WorkflowService:
             derived_from_workflow_id=derived_from_workflow_id,
             derived_from_revision=derived_from_revision,
         )
-        self.registry.register(handle, persist=False)
+        await self.registry.register_async(handle, persist=False)
         stream = EventStream(run_id)
         self._host_streams[run_id] = stream
         script_hash = hashlib.sha256(source.encode("utf-8")).hexdigest() if source else ""
@@ -384,18 +391,13 @@ class WorkflowService:
             ),
             persist=False,
         )
-        persist_task = asyncio.create_task(self.registry.persist_async(run_id))
         try:
-            await asyncio.shield(persist_task)
+            await self.registry.persist_async(run_id)
         except BaseException:
-            # The worker write cannot be cancelled once dispatched. Drain it
-            # before deleting so a late atomic replace cannot resurrect a host
-            # run whose registration never returned to its driver.
-            try:
-                await asyncio.shield(persist_task)
-            finally:
-                self._host_streams.pop(run_id, None)
-                await asyncio.shield(self.registry.delete_async(run_id))
+            # persist_async drains even repeated cancellation before returning,
+            # so deletion cannot race a late registration write.
+            self._host_streams.pop(run_id, None)
+            await self.registry.delete_async(run_id)
             raise
         return run_id
 
@@ -678,7 +680,62 @@ class WorkflowService:
             # The underlying shielded add stays supervised by AutoNudgeService.
             await asyncio.gather(*still_pending, return_exceptions=True)
 
-    def _runner(self, run_id: str, *, timeout_secs: Optional[int] = None) -> WorkflowRunner:
+    def attach_task_admission(self, admission: Any) -> None:
+        """Attach (or detach with ``None``) the shared runner admission.
+
+        Attaching also settles the ``workflow_agent`` rows a dead incarnation
+        left behind: a workflow run restarts through its own registry
+        (``rerun_subtree`` replays finished calls from the cache), never by
+        re-running one agent call from its row, so every orphaned call row
+        ends terminal rather than re-dispatching -- ``failed`` (or
+        ``unknown_side_effect``) for one that was running, ``cancelled`` for one
+        that was accepted and never claimed, which no dispatcher would ever
+        pick up because this kind has none.
+        """
+        self._task_admission = admission
+        if admission is None or getattr(admission, "store", None) is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._adopt_inflight = loop.create_task(self.adopt_task_rows())
+
+    async def adopt_task_rows(self) -> Any:
+        """Settle orphaned ``workflow_agent`` rows; None when no store is attached.
+
+        One sweep at a time: a call overlapping the one ``attach_task_admission``
+        started joins it instead of settling the same rows twice.
+        """
+        inflight = self._adopt_inflight
+        if inflight is not None and not inflight.done() and inflight is not asyncio.current_task():
+            return await inflight
+        admission = self._task_admission
+        store = getattr(admission, "store", None) if admission is not None else None
+        if store is None:
+            return None
+        from kiro_crew.taskq.adapters.runner import adopt_orphaned_rows
+        from kiro_crew.taskq.model import KIND_WORKFLOW_AGENT
+
+        return await asyncio.to_thread(
+            adopt_orphaned_rows,
+            store,
+            kinds=(KIND_WORKFLOW_AGENT,),
+            resume=lambda _rec: False,
+        )
+
+    @property
+    def task_admission(self) -> Any:
+        return self._task_admission
+
+    def _runner(
+        self,
+        run_id: str,
+        *,
+        timeout_secs: Optional[int] = None,
+        memory_scope: Any = None,
+        session_key: str = "",
+    ) -> WorkflowRunner:
         # ``timeout_secs`` overrides the service default for THIS run only (clamped
         # into [MIN, MAX] so a per-run value can lengthen the ceiling but never
         # remove it). None → the service default.
@@ -698,6 +755,11 @@ class WorkflowService:
             # logs land inside the stream contract (terminal events are last).
             await self._drain_nudge_tasks(run_id)
 
+        # The app identity binds the calling app's OWN spawn profile (precedence
+        # #1 in resolve_active_scope), which is the argument the subagent
+        # admission gate threads. It rides the run's execution context; a run
+        # with no app carries "", which is what a non-app spawn passes.
+        app = getattr(getattr(memory_scope, "execution_context", None), "app", "") or ""
         agent_fn: Optional[Callable[[str, dict], Any]] = None
         pool: Any = None
         if self._pool_agents:
@@ -710,6 +772,10 @@ class WorkflowService:
                     run_id=run_id,
                     max_workers=workers,
                     max_starting=min(workers, 2),
+                    memory_scope=memory_scope,
+                    context_builder=self._context_builder,
+                    session_key=session_key,
+                    app=app,
                 )
             except Exception:  # noqa: BLE001 - never let pooling break run start
                 agent_fn, pool = None, None
@@ -721,7 +787,24 @@ class WorkflowService:
         # Pooling off, or its init raised: cold-start a session per call instead.
         # Keyed on ``agent_fn``, so a pool that yields no executor is not used.
         if agent_fn is None:
-            agent_fn = build_agent_fn(self._sessions, run_id=run_id)
+            agent_fn = build_agent_fn(
+                self._sessions,
+                run_id=run_id,
+                memory_scope=memory_scope,
+                context_builder=self._context_builder,
+                session_key=session_key,
+                app=app,
+            )
+        # Both paths meter through the task queue when one is attached: the
+        # lane (not the pool's semaphore alone) is what the adaptive controller
+        # moves, and the row is what survives a restart.
+        if self._task_admission is not None:
+            admission = self._task_admission
+            if memory_scope is not None and memory_scope.memory_mode != "persistent":
+                admission = admission.in_memory()
+            agent_fn = admitted_agent_fn(
+                agent_fn, admission, run_id=run_id, session_key=session_key
+            )
 
         async def _teardown() -> None:
             # Safety net (drain is a no-op if pre_terminal already ran; covers
@@ -737,23 +820,36 @@ class WorkflowService:
             ports=ports,
             pre_terminal=_drain,
             on_complete=_teardown,
+            execution_guard=memory_scope.validate if memory_scope is not None else None,
         )
 
+    @admission_errors
     async def author(
         self,
         intent: str,
         *,
         author: str = "",
         on_progress: Optional[Callable[[str], None]] = None,
+        _memory_scope: WorkflowScope | None = None,
+        expected_store: str | None = None,
     ) -> dict:
         """Turn a NL intent into a validated workflow script (or report errors).
 
         ``on_progress(msg)`` streams human-readable authoring progress (each
         attempt, retries) so author-in-run can surface it live in the sidebar/chat.
         """
-        refused = await _memory_admission_error(author)
-        if refused is not None:
-            return refused
+        memory_scope = _memory_scope
+        if memory_scope is None:
+            from kiro_crew.workflow_memory import capture_admission_execution
+
+            execution = await capture_admission_execution(self._context_builder, author)
+            memory_scope = await WorkflowScope.admit(
+                await self._new_run_id(),
+                self._context_builder,
+                author,
+                expected_store=expected_store,
+                execution_context=execution,
+            )
 
         def _say(msg: str) -> None:
             if on_progress is not None:
@@ -779,9 +875,12 @@ class WorkflowService:
             # A fresh key per attempt prevents a half-created session from being
             # reclaimed after a timeout. SessionManager owns provider hard-kill
             # cleanup when startup fails before registration.
-            key = f"wf-author:{self._new_run_id()}:a{startup_attempt}"
+            key = f"wf-author:{memory_scope.run_id}:a{startup_attempt}"
             try:
-                provider, *_ = await self._sessions.get_or_create(key, agent="kirocrew-lite")
+                await memory_scope.prepare(self._context_builder, key)
+                provider, author_is_new, _resumed = await self._sessions.get_or_create(
+                    key, agent="kirocrew-lite"
+                )
             except Exception as exc:
                 try:
                     await self._sessions.destroy(key)
@@ -839,9 +938,24 @@ class WorkflowService:
                 prompt = _AUTHOR_SYSTEM.format(intent=intent, references=references)
                 if errors:
                     prompt += f"\n\nYour previous script was INVALID: {'; '.join(errors)}. Fix it."
+                from kiro_crew.messaging.identity import publish_turn_identity
+
+                await publish_turn_identity(self._sessions, key)
+                prompt = await memory_scope.prompt(
+                    self._context_builder,
+                    key,
+                    prompt,
+                    is_new=author_is_new,
+                    provider=provider,
+                    resumed=_resumed,
+                    agent="kirocrew-lite",
+                    cwd=None,
+                )
                 text = await stream_and_collect(
                     provider, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
                 )
+                await memory_scope.validate()
+                author_is_new = False
                 source = _strip_fence(text)
                 vr = validate(source)
                 if vr.ok:
@@ -873,6 +987,7 @@ class WorkflowService:
                 # exception that brought execution here.
                 logger.warning("workflow author teardown failed", exc_info=True)
 
+    @admission_errors
     async def start_from_intent(
         self,
         intent: str,
@@ -881,6 +996,8 @@ class WorkflowService:
         args: Optional[dict] = None,
         author: str = "",
         session_key: str = "",
+        expected_store: str | None = None,
+        execution_context=None,
         budget_total: Optional[int] = None,
         timeout_secs: Optional[int] = None,
     ) -> dict:
@@ -896,21 +1013,47 @@ class WorkflowService:
         """
         if not intent.strip():
             return {"error": "intent is required"}
-        refused = await _memory_admission_error(session_key, author)
-        if refused is not None:
-            return refused
+        from kiro_crew.workflow_memory import capture_admission_execution
+
+        captured_execution = await capture_admission_execution(
+            self._context_builder, session_key, author, execution_context=execution_context
+        )
         if self._admission_closed():
             return {"error": "gateway admission is closed"}
-        run_id = self._new_run_id()
+        run_id = await self._new_run_id()
+        memory_scope = await WorkflowScope.admit(
+            run_id,
+            self._context_builder,
+            session_key,
+            author,
+            expected_store=expected_store,
+            execution_context=captured_execution,
+        )
+        if self._admission_closed():
+            return {"error": "gateway admission is closed"}
 
         async def _author_fn(
             it: str, *, on_progress: Optional[Callable[[str], None]] = None
         ) -> dict:
-            return await self.author(it, author=author, on_progress=on_progress)
+            return await self.author(
+                it,
+                author=author,
+                on_progress=on_progress,
+                _memory_scope=memory_scope,
+            )
 
-        await self._runner(run_id, timeout_secs=timeout_secs).run_background(
+        started = await self._runner(
+            run_id,
+            timeout_secs=timeout_secs,
+            memory_scope=memory_scope,
+            session_key=session_key,
+        ).run_background(
             "",  # no source — author inside the run
             registry=self.registry,
+            admission_closed=self._admission_closed,
+            execution_binding_version=1,
+            execution_context=memory_scope.execution_context,
+            memory_mode=memory_scope.memory_mode,
             run_id=run_id,
             now=self._now_fn(),
             name=name or run_id,
@@ -921,8 +1064,11 @@ class WorkflowService:
             intent=intent,
             author_fn=_author_fn,
         )
+        if not started:
+            return {"error": "gateway admission is closed"}
         return {"run_id": run_id, "name": name or ""}
 
+    @admission_errors
     async def start(
         self,
         source: str,
@@ -931,6 +1077,8 @@ class WorkflowService:
         args: Optional[dict] = None,
         author: str = "",
         session_key: str = "",
+        expected_store: str | None = None,
+        execution_context=None,
         budget_total: Optional[int] = None,
         timeout_secs: Optional[int] = None,
         workflow_id: str = "",
@@ -945,15 +1093,36 @@ class WorkflowService:
         vr = validate(source)
         if not vr.ok:
             return {"error": "; ".join(vr.errors), "errors": vr.errors}
-        refused = await _memory_admission_error(session_key, author)
-        if refused is not None:
-            return refused
+        from kiro_crew.workflow_memory import capture_admission_execution
+
+        captured_execution = await capture_admission_execution(
+            self._context_builder, session_key, author, execution_context=execution_context
+        )
         if self._admission_closed():
             return {"error": "gateway admission is closed"}
-        run_id = self._new_run_id()
-        await self._runner(run_id, timeout_secs=timeout_secs).run_background(
+        run_id = await self._new_run_id()
+        memory_scope = await WorkflowScope.admit(
+            run_id,
+            self._context_builder,
+            session_key,
+            author,
+            expected_store=expected_store,
+            execution_context=captured_execution,
+        )
+        if self._admission_closed():
+            return {"error": "gateway admission is closed"}
+        started = await self._runner(
+            run_id,
+            timeout_secs=timeout_secs,
+            memory_scope=memory_scope,
+            session_key=session_key,
+        ).run_background(
             source,
             registry=self.registry,
+            admission_closed=self._admission_closed,
+            execution_binding_version=1,
+            execution_context=memory_scope.execution_context,
+            memory_mode=memory_scope.memory_mode,
             run_id=run_id,
             now=self._now_fn(),
             name=name or (vr.meta or {}).get("name", "") or run_id,
@@ -965,6 +1134,8 @@ class WorkflowService:
             workflow_slug=workflow_slug,
             workflow_revision=workflow_revision,
         )
+        if not started:
+            return {"error": "gateway admission is closed"}
         return {"run_id": run_id, "name": name or (vr.meta or {}).get("name", "")}
 
     def list_definitions(self, search: str = "") -> list[dict[str, Any]]:
@@ -1156,6 +1327,7 @@ class WorkflowService:
             }
         return {"ok": True, "definition": definition}
 
+    @admission_errors
     async def start_definition(
         self,
         workflow_ref: str,
@@ -1164,19 +1336,30 @@ class WorkflowService:
         args: Optional[dict[str, Any]] = None,
         author: str = "",
         session_key: str = "",
+        expected_store: str | None = None,
+        execution_context=None,
         budget_total: Optional[int] = None,
         timeout_secs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Run the exact current revision of a named saved workflow."""
-        refused = await _memory_admission_error(session_key, author)
-        if refused is not None:
-            return refused
+        from kiro_crew.workflow_memory import capture_admission_execution
+
+        captured_execution = await capture_admission_execution(
+            self._context_builder, session_key, author, execution_context=execution_context
+        )
         definition = await asyncio.to_thread(self.get_definition, workflow_ref)
         if definition is None:
             return {"error": f"no such saved workflow: {workflow_ref}", "not_found": True}
         run_args = dict(args or {})
         effective_input = input_text or str(run_args.get("input", ""))
         if definition.get("format") == SOURCE_FORMAT_TASK_PLAN:
+            private_store = (
+                captured_execution.store.legacy_name if captured_execution.member_id else ""
+            )
+            if expected_store is not None and private_store != expected_store:
+                raise WorkflowMemoryError("Workflow caller memory changed during admission")
+            if private_store and self._context_builder is None:
+                raise WorkflowMemoryError("Private workflow context is unavailable")
             if self._task_runner is None:
                 return {
                     "error": "task runner is not available for this workflow",
@@ -1186,7 +1369,8 @@ class WorkflowService:
                 definition,
                 input_text=effective_input,
                 author=author,
-                session_key=session_key,
+                session_key=session_key or author,
+                execution_context=captured_execution,
             )
             if "run_id" in started:
                 started.update(
@@ -1200,7 +1384,9 @@ class WorkflowService:
         if input_text:
             run_args["input"] = input_text
         started = await self.start(
-            str(definition["source"]),
+            source=str(definition["source"]),
+            expected_store=expected_store,
+            execution_context=captured_execution,
             name=str(definition.get("name", "")),
             args=run_args,
             author=author,
@@ -1233,6 +1419,7 @@ class WorkflowService:
     async def cancel(self, run_id: str) -> bool:
         return await self.registry.cancel(run_id)
 
+    @admission_errors
     async def rerun_subtree(
         self,
         run_id: str,
@@ -1240,6 +1427,8 @@ class WorkflowService:
         *,
         source: Optional[str] = None,
         timeout_secs: Optional[int] = None,
+        caller_session: str = "",
+        owner: bool = False,
     ) -> dict:
         """Re-run a prior workflow, replaying agent calls BEFORE ``from_index`` from
         cache and re-executing from there ("restart parts" at runtime).
@@ -1257,9 +1446,24 @@ class WorkflowService:
         prior = self.registry.get(run_id)
         if prior is None:
             return {"error": f"no such run: {run_id}"}
-        refused = await _memory_admission_error(prior.session_key, prior.author)
-        if refused is not None:
-            return refused
+        from kiro_crew.workflow_memory import authorize_run
+
+        prior_scope = await authorize_run(
+            run_id,
+            caller_session,
+            owner=owner,
+            required=bool(prior.execution_binding_version),
+            record=prior.to_store_json(),
+        )
+        if prior_scope is None:
+            # Legacy source is executable input, never a private assignment.
+            if any(
+                [
+                    await asyncio.to_thread(private_memory_store_for_session, key)
+                    for key in (prior.session_key, prior.author)
+                ]
+            ):
+                raise WorkflowMemoryError("Legacy workflow has no protected private assignment")
         stripped = (source or "").strip()
         edited = bool(stripped and stripped != (prior.source or "").strip())
         run_source = source if stripped else prior.source
@@ -1271,21 +1475,60 @@ class WorkflowService:
                 return {"error": "; ".join(vr.errors), "errors": vr.errors}
         if self._admission_closed():
             return {"error": "gateway admission is closed"}
-        new_id = self._new_run_id()
+        new_id = await self._new_run_id()
+        origin = prior_scope.origin if prior_scope is not None else prior.session_key
+        inherited_modes: tuple[str, ...] = ()
+        if prior_scope is not None:
+            prior_mode = prior_scope.memory_mode
+            if not isinstance(prior_mode, str) or prior_mode not in (
+                "persistent",
+                "incognito",
+                "temporary",
+            ):
+                raise WorkflowMemoryError("Workflow memory mode is unavailable")
+            inherited_modes = (prior_mode,)
+        resolver = (
+            getattr(self._context_builder, "memory_mode_for_session", None)
+            if isinstance(getattr(self._context_builder, "_session_memory_modes", None), dict)
+            else None
+        )
+        if resolver is not None and caller_session:
+            try:
+                inherited_modes += (await resolver(caller_session),)
+            except (OSError, ValueError) as exc:
+                raise WorkflowMemoryError("Workflow caller memory mode is unavailable") from exc
+        memory_scope = await WorkflowScope.admit(
+            new_id,
+            self._context_builder,
+            execution_context=prior_scope.execution_context if prior_scope is not None else None,
+            origin=origin,
+            inherited_modes=inherited_modes,
+        )
+        if self._admission_closed():
+            return {"error": "gateway admission is closed"}
         # An edited script can't safely replay the old prefix (call indices shift),
         # so force a fresh run; an unedited rerun keeps the replay cache.
         replay_before = 0 if edited else max(0, from_index)
         replay_results = {} if edited else dict(prior.agent_results)
         label = "rerun-edited" if edited else f"rerun@{from_index}"
-        await self._runner(new_id, timeout_secs=timeout_secs).run_background(
+        started = await self._runner(
+            new_id,
+            timeout_secs=timeout_secs,
+            memory_scope=memory_scope,
+            session_key=origin,
+        ).run_background(
             run_source,
             registry=self.registry,
+            admission_closed=self._admission_closed,
+            execution_binding_version=1,
+            execution_context=memory_scope.execution_context,
+            memory_mode=memory_scope.memory_mode,
             run_id=new_id,
             now=self._now_fn(),
             name=f"{prior.name} ({label})",
             args=prior.args,
-            author=prior.author,
-            session_key=prior.session_key,
+            author=origin,
+            session_key=origin,
             replay_results=replay_results,
             replay_before=replay_before,
             source_is_original=edited or prior.source_is_original,
@@ -1293,6 +1536,8 @@ class WorkflowService:
             workflow_slug="" if edited else prior.workflow_slug,
             workflow_revision=0 if edited else prior.workflow_revision,
         )
+        if not started:
+            return {"error": "gateway admission is closed"}
         return {
             "run_id": new_id,
             "from": run_id,

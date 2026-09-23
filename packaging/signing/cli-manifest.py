@@ -61,11 +61,32 @@ class ManifestError(ValueError):
     """A manifest or trust-root contract violation."""
 
 
+def _absolute(path: str | Path) -> Path:
+    """*path* anchored to the caller's cwd, so a later cwd change cannot move it.
+
+    Every openssl invocation below runs with its cwd pinned to the temp dir (see
+    ``_run_openssl``), so a path that is still relative when it reaches openssl
+    is resolved against the WRONG directory: the publish workflow's
+    ``--public-key packaging/signing/cli-manifest-public.pem`` would be looked
+    up under the temp dir and openssl would report the miss as a rejected key.
+    Anchor once, at the boundary where the path enters this module, and openssl
+    only ever sees absolute paths.
+    """
+    return Path(path).absolute()
+
+
 def _run_openssl(args: list[str]) -> bytes:
     try:
         proc = subprocess.run(
             ["openssl", *args],
             check=False,
+            # Every path handed to openssl here is absolute (``_absolute`` at
+            # each entry point), so the working directory is not an input --
+            # but an unpinned one is an OUTPUT location: whatever a given
+            # openssl build drops beside itself (an RNG seed file, a debug
+            # artifact) would otherwise land in the caller's cwd, which under
+            # pytest is the repository checkout.
+            cwd=tempfile.gettempdir(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -98,6 +119,7 @@ def _run_aws_json(args: list[str]) -> dict[str, Any]:
 
 
 def _public_key_der(public_key: Path) -> bytes:
+    public_key = _absolute(public_key)
     if not public_key.is_file():
         raise ManifestError("CLI manifest public key is missing")
     raw = public_key.read_bytes()
@@ -122,6 +144,16 @@ def _canonical_json(value: dict[str, str]) -> bytes:
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
     ).encode("ascii")
+
+
+# Shared with the feature-videos publisher (``scripts/feature-videos/_manifest.py``),
+# which loads this file by path and signs a different document with the same key,
+# canonical form, runners and KMS flow. Public names, so the sharing is a stated
+# contract rather than a reach into module internals.
+canonical_json = _canonical_json
+public_key_der = _public_key_der
+run_openssl = _run_openssl
+MAX_SIGNATURE_BYTES = _MAX_SIGNATURE_BYTES
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -217,13 +249,36 @@ def _validate_signed_payload(payload: dict[str, Any]) -> dict[str, str]:
     return normalized
 
 
+def _installer_normalized_base(artifact_base: str) -> str:
+    """Normalize *artifact_base* the way the code that INSTALLS a wheel does.
+
+    ``cli.sh`` applies ``${ARTIFACT_BASE%/}`` and ``wheel_engine`` interpolates
+    the caller's base unchanged, so both drop at most ONE trailing slash before
+    building the canonical wheel URL.  ``str.rstrip("/")`` drops every one of
+    them, and that difference is a false green rather than a cosmetic one: given
+    ``https://host//`` the installers expect ``https://host//cli/...`` while an
+    rstripping gate expects ``https://host/cli/...``, so the gate would pass a
+    feed that every installer then refuses -- the exact failure this gate exists
+    to prevent.  Model the installer, then refuse a base that is still not
+    canonical instead of silently binding to a URL no installer reproduces.
+    """
+    normalized = artifact_base[:-1] if artifact_base.endswith("/") else artifact_base
+    if normalized.endswith("/"):
+        raise ManifestError(
+            "artifact base must not end in repeated slashes: the installers strip "
+            "exactly one, so a feed accepted against this base would be refused "
+            "at install time"
+        )
+    return normalized
+
+
 def _validate_target_binding(
     payload: dict[str, str], *, expected_channel: str, artifact_base: str
 ) -> None:
     if payload["channel"] != expected_channel:
         raise ManifestError("CLI manifest channel does not match the expected channel")
 
-    normalized_base = artifact_base.rstrip("/")
+    normalized_base = _installer_normalized_base(artifact_base)
     parsed_base = urlsplit(normalized_base)
     if (
         parsed_base.scheme != "https"
@@ -310,11 +365,21 @@ def _assemble_command(args: argparse.Namespace) -> None:
 def _verify_command(args: argparse.Namespace) -> None:
     """Verify a SIGNED manifest (e.g. a live channel feed) end to end.
 
-    Mirrors what cli.sh enforces at install time: schema validation, the
+    Used by publish-installer.yml to prove every live feed is installable by the
+    strict installer BEFORE it replaces the live cli.sh: schema validation, the
     pinned-key fingerprint, the embedded signature over the canonical payload,
-    and binding to the requested channel and artifact base. Used by
-    publish-installer.yml to prove every live feed is installable by the strict
-    installer BEFORE it replaces the live cli.sh.
+    and binding to the requested channel and artifact base.
+
+    The contract with cli.sh is one-directional, and the direction is the whole
+    point: whatever this command ACCEPTS, the installer must also accept.  It
+    may be stricter -- it caps the payload at 16 KiB against the installer's
+    64 KiB, caps every field at 2048 characters, and refuses a ``min_version``
+    above the version it ships -- because a gate that rejects a feed the
+    installer would have taken costs a publisher one loud failure.  It may never
+    be laxer, because that direction publishes a feed that bricks installs and
+    reports success while doing it.  ``test_cli_manifest_signature.py`` drives
+    one shared fixture set through this command AND through a real ``cli.sh``
+    run to hold that direction, so the two cannot drift apart silently.
     """
     manifest_any = _load_json(args.manifest)
     if not isinstance(manifest_any, dict):
@@ -359,19 +424,16 @@ def _verify_command(args: argparse.Namespace) -> None:
     print(f"verified: {args.manifest} signed by {expected_key_id}")
 
 
-def _kms_sign_command(args: argparse.Namespace) -> None:
-    payload_any = _load_json(args.payload)
-    payload = _validate_signed_payload(payload_any)
-    canonical = _canonical_json(payload)
-    if args.payload.read_bytes() != canonical:
-        raise ManifestError("CLI manifest payload is not canonical JSON")
+def kms_sign_digest(key_arn: str, pinned_der: bytes, digest: bytes) -> bytes:
+    """Sign a SHA-256 *digest* with the KMS key at *key_arn*, pinned to *pinned_der*.
 
-    pinned_der = _public_key_der(args.public_key)
-    expected_key_id = f"sha256:{hashlib.sha256(pinned_der).hexdigest()}"
-    if payload["key_id"] != expected_key_id:
-        raise ManifestError("CLI manifest payload does not name the committed public key")
-
-    public_response = _run_aws_json(["kms", "get-public-key", "--key-id", args.key_arn])
+    The KMS key's public half must byte-match the committed one before anything
+    is signed: a mistyped ARN would otherwise sign with some other key and
+    produce an envelope every consumer refuses. Shared by the CLI manifest
+    signer and the feature-videos publisher (``scripts/feature-videos``), which
+    sign different documents with the same key and the same checks.
+    """
+    public_response = _run_aws_json(["kms", "get-public-key", "--key-id", key_arn])
     if public_response.get("KeyUsage") != "SIGN_VERIFY":
         raise ManifestError("CLI manifest KMS key must have SIGN_VERIFY usage")
     if public_response.get("KeySpec") not in {"RSA_3072", "RSA_4096"}:
@@ -389,13 +451,12 @@ def _kms_sign_command(args: argparse.Namespace) -> None:
     if not hmac.compare_digest(kms_der, pinned_der):
         raise ManifestError("configured KMS key does not match the committed public key")
 
-    digest = hashlib.sha256(canonical).digest()
     sign_response = _run_aws_json(
         [
             "kms",
             "sign",
             "--key-id",
-            args.key_arn,
+            key_arn,
             "--message",
             base64.b64encode(digest).decode("ascii"),
             "--message-type",
@@ -410,9 +471,24 @@ def _kms_sign_command(args: argparse.Namespace) -> None:
     if not isinstance(encoded_signature, str):
         raise ManifestError("AWS KMS did not return a signature")
     try:
-        signature = base64.b64decode(encoded_signature, validate=True)
+        return base64.b64decode(encoded_signature, validate=True)
     except ValueError as exc:
         raise ManifestError("AWS KMS returned an invalid signature") from exc
+
+
+def _kms_sign_command(args: argparse.Namespace) -> None:
+    payload_any = _load_json(args.payload)
+    payload = _validate_signed_payload(payload_any)
+    canonical = _canonical_json(payload)
+    if args.payload.read_bytes() != canonical:
+        raise ManifestError("CLI manifest payload is not canonical JSON")
+
+    pinned_der = _public_key_der(args.public_key)
+    expected_key_id = f"sha256:{hashlib.sha256(pinned_der).hexdigest()}"
+    if payload["key_id"] != expected_key_id:
+        raise ManifestError("CLI manifest payload does not name the committed public key")
+
+    signature = kms_sign_digest(args.key_arn, pinned_der, hashlib.sha256(canonical).digest())
 
     with tempfile.TemporaryDirectory(prefix="kirocrew-cli-manifest-") as temporary:
         signature_path = Path(temporary) / "signature.bin"
@@ -452,33 +528,33 @@ def _parser() -> argparse.ArgumentParser:
         default="",
         help="optional fleet floor: installs below this bare release must update",
     )
-    payload.add_argument("--public-key", type=Path, required=True)
-    payload.add_argument("--output", type=Path, required=True)
+    payload.add_argument("--public-key", type=_absolute, required=True)
+    payload.add_argument("--output", type=_absolute, required=True)
     payload.set_defaults(handler=_payload_command)
 
     assemble = subparsers.add_parser(
         "assemble", help="verify a detached signature and write the signed manifest"
     )
-    assemble.add_argument("--payload", type=Path, required=True)
-    assemble.add_argument("--signature", type=Path, required=True)
-    assemble.add_argument("--public-key", type=Path, required=True)
-    assemble.add_argument("--output", type=Path, required=True)
+    assemble.add_argument("--payload", type=_absolute, required=True)
+    assemble.add_argument("--signature", type=_absolute, required=True)
+    assemble.add_argument("--public-key", type=_absolute, required=True)
+    assemble.add_argument("--output", type=_absolute, required=True)
     assemble.set_defaults(handler=_assemble_command)
 
     kms_sign = subparsers.add_parser(
         "kms-sign", help="sign the canonical payload with a non-exportable AWS KMS key"
     )
-    kms_sign.add_argument("--payload", type=Path, required=True)
+    kms_sign.add_argument("--payload", type=_absolute, required=True)
     kms_sign.add_argument("--key-arn", required=True)
-    kms_sign.add_argument("--public-key", type=Path, required=True)
-    kms_sign.add_argument("--output", type=Path, required=True)
+    kms_sign.add_argument("--public-key", type=_absolute, required=True)
+    kms_sign.add_argument("--output", type=_absolute, required=True)
     kms_sign.set_defaults(handler=_kms_sign_command)
 
     verify = subparsers.add_parser(
         "verify", help="verify a signed manifest against the pinned public key"
     )
-    verify.add_argument("--manifest", type=Path, required=True)
-    verify.add_argument("--public-key", type=Path, required=True)
+    verify.add_argument("--manifest", type=_absolute, required=True)
+    verify.add_argument("--public-key", type=_absolute, required=True)
     verify.add_argument("--expected-channel", choices=CHANNELS, required=True)
     verify.add_argument("--artifact-base", required=True)
     verify.set_defaults(handler=_verify_command)
@@ -486,7 +562,7 @@ def _parser() -> argparse.ArgumentParser:
     key_info = subparsers.add_parser(
         "key-info", help="print the public values that must be pinned in cli.sh"
     )
-    key_info.add_argument("--public-key", type=Path, required=True)
+    key_info.add_argument("--public-key", type=_absolute, required=True)
     key_info.set_defaults(handler=_key_info_command)
     return parser
 

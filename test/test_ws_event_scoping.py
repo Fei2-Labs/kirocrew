@@ -29,12 +29,6 @@ from kiro_crew.dashboard.ws_event_scope import (
     ws_event_allowed,
 )
 
-# One xdist worker for the whole module: every test here derives from ONE module-cached
-# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
-# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
-# per full run for this file alone. Grouping keeps the cache single-copy per run.
-pytestmark = pytest.mark.xdist_group(name="tree_scan_test_ws_event_scoping")
-
 
 @pytest.fixture(autouse=True)
 def _clear_module_caches():
@@ -2484,8 +2478,19 @@ class TestEventTableCompleteness:
             if "/builtins/" in str(path):
                 continue  # app code, not gateway fan-out
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except (SyntaxError, UnicodeDecodeError):
+                source = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            # A call to a gated name carries that identifier in the source text, so
+            # a file naming none of them has nothing for the AST walk to find. Parsing
+            # only the files that can match (~35 of ~1,170) turns a 4-6 s full-tree
+            # parse into ~0.5 s without narrowing what the guard can see: the filter
+            # is derived from ``gated``, so a name added there widens it too.
+            if not any(name in source for name in gated):
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
                 continue
             # Module-level ``NAME = "literal"`` bindings, so a constant passed
             # as the event type is resolved rather than skipped.
@@ -2606,21 +2611,33 @@ class TestUntaggedOriginIsNotUser:
         )
 
     def test_resume_takes_the_persisted_origin_not_the_resumer(self):
-        """The resume endpoint must read metadata BEFORE creating the slot.
+        """The resume endpoint must read metadata BEFORE it creates the slot.
 
         Creating the slot from the request identity and reading the history
-        metadata a dozen lines later, so resuming a persisted cron conversation
-        from the dashboard produced a USER-tagged slot and `slots:user` handed its
-        replayed content to any app holding that scope.
+        metadata a dozen lines later relabels a resumed cron conversation as
+        USER, and `slots:user` then hands its replayed content to any app holding
+        that scope. Resume creates its slot by calling
+        ``_materialise_slot_from_history`` (which owns the ``get_or_create_slot``
+        and passes ``origin=str(meta.get("origin", ""))``), so the invariant is
+        that resume reads ``get_metadata`` before that call. Anchoring on the
+        call site rather than the ``origin=`` string keeps this correct now that
+        the creation lives in the shared helper: the persisted-origin declaration
+        is separately pinned by ``test_every_handler_slot_creation_declares_an_origin``.
         """
         import kiro_crew.dashboard.chat_handlers as _ch
 
         src = Path(_ch.__file__).read_text(encoding="utf-8")
-        meta_read = src.index("meta = state.conversation_log.get_metadata(history_key)")
-        resume_create = src.index('origin=str(meta.get("origin", ""))')
+        # Search from the resume handler's definition so the helper (defined
+        # earlier in the file) is not what the indices land on.
+        resume_def = src.index("async def api_chat_slot_resume(")
+        meta_read = src.index(
+            "meta = state.conversation_log.get_metadata(history_key)", resume_def
+        )
+        resume_create = src.index("_materialise_slot_from_history(", resume_def)
         assert meta_read < resume_create, (
-            "the resume path must read the persisted metadata before it creates "
-            "the slot, or the origin it passes cannot come from that metadata"
+            "the resume path must read the persisted metadata before it calls "
+            "_materialise_slot_from_history, or the origin that call passes cannot "
+            "come from that metadata"
         )
 
     def test_cron_injection_declares_cron(self):

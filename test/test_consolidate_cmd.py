@@ -310,7 +310,9 @@ class TestOnSessionExpire:
         asyncio.run(sm._expire_idle(60))
 
         # reset still called despite callback failure
-        mock_reset.assert_called_once_with("expired-key", skip_if_busy=True)
+        mock_reset.assert_called_once_with(
+            "expired-key", skip_if_busy=True, skip_if_injecting=True
+        )
 
 
 class TestGatewayExpireWiring:
@@ -418,7 +420,9 @@ class TestExpireIdleSelFailure:
         asyncio.run(sm._expire_idle(60))
 
         callback.assert_not_called()
-        mock_reset.assert_called_once_with("expired-sel", skip_if_busy=True)
+        mock_reset.assert_called_once_with(
+            "expired-sel", skip_if_busy=True, skip_if_injecting=True
+        )
 
     @patch("kiro_crew.session.sel")
     @patch("kiro_crew.session.SessionManager.reset", new_callable=AsyncMock)
@@ -453,4 +457,6 @@ class TestExpireIdleSelFailure:
         asyncio.run(sm._expire_idle(60))
 
         callback.assert_called_once_with("expired-cb")
-        mock_reset.assert_called_once_with("expired-cb", skip_if_busy=True)
+        mock_reset.assert_called_once_with(
+            "expired-cb", skip_if_busy=True, skip_if_injecting=True
+        )

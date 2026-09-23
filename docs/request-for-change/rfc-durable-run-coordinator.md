@@ -1,29 +1,31 @@
 ---
 title: Durable Run Coordinator — typed lifecycle, idempotent commands, and recoverable delivery
-status: in-progress
+status: superseded
 revision: v1
 author: Kyle Seaman, with Codex
 created: 2026-08-22
 last-audited: 2026-08-22
-audited-at: 09b58e9b4
+audited-at: c4f253891
 doc-pr:
 implementation-prs: []
 tracking-issues: []
 supersedes: []
-superseded-by: []
+superseded-by: [rfc-overload-resilience.md]
 ---
 # RFC: Durable Run Coordinator — typed lifecycle, idempotent commands, and recoverable delivery
 
-- Status: implemented locally — PRs 1–7 are prepared as a stack. Keyed
-  execution carries a renewable run fence through `starting`, `running`, and
-  atomic terminal/outbox commit; fenced delivery retries reuse one stable event
-  identity. Restart recovery imports legacy folders read-only, takes over only
-  expired leases, reports uncertain work as interrupted, and never replays it.
+- Status: superseded by
+  [`rfc-overload-resilience.md`](rfc-overload-resilience.md) (its §13 decision
+  Q1). The `runs` / `commands` / `outbox` store proposed below ships as tables of
+  `$KIROCREW_HOME/tasks/tasks.db` (`src/kiro_crew/taskq/`), with the outbox as
+  `task_events(kind="deliver")`; the in-memory manager and run folders described
+  here are imported into it by `taskq.migrate.import_legacy` on first boot. No
+  `RunCoordinator` port was built — this document is kept as the intent behind
+  that store. The owning spec is
+  [`../system-specs/modules/taskq.md`](../system-specs/modules/taskq.md).
 - Author: Kyle Seaman, with Codex
 - Created: 2026-08-22
-- Audited against: PR 1 commit `09b58e9b4`, PR 2 commit `ffe2b0f76`, PR 3 commit
-  `6db805ec2`, PR 4 commit `458472368`, PR 5 commit `ee198e741`, PR 6 commit
-  `391ccd202`, and local branch `run-coordinator-recovery` for PR 7
+- Audited against: `c4f253891`
 - Related: `docs/system-specs/modules/subagent.md`,
   `docs/system-specs/modules/session.md`, and
   `docs/request-for-change/rfc-orchestrator-chat-sessions.md`
@@ -172,8 +174,8 @@ The code is split along lifecycle boundaries rather than by transport:
 | `run_coordinator/memory.py` | Deterministic in-memory implementation used by contract and lifecycle tests |
 | `run_coordinator/sqlite.py` | SQLite schema, migration runner, transactions, WAL setup, and fenced updates |
 | `run_coordinator/legacy.py` | Shadow writer, parity checker, importer, and compatibility artifact policy |
-| `subagent_lifecycle.py` | Terminal arbitration, shielded report ownership, and teardown gates |
-| `subagent_scheduler.py` | Admission, queue order, capacity lease, and drain readiness |
+| `subagent_lifecycle.py` | Run-finalization state machine and terminal event construction |
+| `subagent_scheduler.py` | Admission, queue order, capacity lease, and queue draining |
 | `subagent.py` | Backward-compatible facade plus local ACP/session executor |
 | gateway delivery adapter | Claims outbox events, calls the existing parent/DM delivery paths, and acknowledges accepted events |
 
@@ -276,19 +278,13 @@ to logs or metrics.
 | `status TEXT NOT NULL` | `pending`, `claimed`, `applied`, or `rejected` |
 | `attempt INTEGER NOT NULL` | Dispatch attempt count |
 | `owner_id TEXT` | Current command claimant |
-| `claim_expires_at REAL` | Independent command-claim expiry |
-| `claim_epoch INTEGER` | Fences stale command effects without changing the run lease |
-| `result_json TEXT NOT NULL` | Bounded transport response used for exact replay/lookup |
+| `lease_epoch INTEGER` | Fences execution against stale ownership |
 | `created_at REAL NOT NULL` | Acceptance time |
 | `updated_at REAL NOT NULL` | Last transition time |
 
 Reusing an idempotency key with the same payload returns the original command
 decision and run ID. Reusing it with a different payload is a typed conflict and
 never mutates the run.
-
-Control commands may target runs created before coordinator cutover, so the
-command target is not constrained by a foreign key to `runs`. Execution
-submissions still create their run and command atomically.
 
 #### `outbox`
 
@@ -327,13 +323,6 @@ The first public port is intentionally small:
 ```python
 class RunCoordinator(Protocol):
     async def submit(self, request: SubmitRun) -> SubmitResult: ...
-    async def submit_control(self, request: SubmitControl) -> CoordinatorResult[CommandReceipt]: ...
-    async def get_command_by_key(self, key: str) -> CommandReceipt | None: ...
-    async def claim_command(self, command_id: str, owner: OwnerLease) -> CommandClaim | None: ...
-    async def finish_command(
-        self, fence: CommandFence, status: CommandStatus,
-        rejection_reason: str = "", result_json: str = ""
-    ) -> CoordinatorResult[RunCommand]: ...
     async def claim_commands(self, owner: OwnerLease, limit: int) -> list[CommandClaim]: ...
     async def mark_starting(
         self, command: RunCommand, fence: RunFence, expected_version: int
@@ -345,13 +334,7 @@ class RunCoordinator(Protocol):
         self, completion: RunCompletion, fence: RunFence, expected_version: int
     ) -> CoordinatorResult[OutboxEvent]: ...
     async def renew(self, run_id: str, fence: RunFence, until: float) -> bool: ...
-    async def claim_outbox(
-        self,
-        owner: OwnerLease,
-        limit: int,
-        event_id: str = "",
-        acknowledgement: bool = False,
-    ) -> list[OutboxEvent]: ...
+    async def claim_outbox(self, owner: OwnerLease, limit: int) -> list[OutboxEvent]: ...
     async def release_outbox(
         self, fence: DeliveryFence, available_at: float
     ) -> CoordinatorResult[OutboxEvent]: ...
@@ -364,8 +347,7 @@ typed commands and records. Synchronous SQLite work is wrapped in bounded
 `asyncio.to_thread()` calls; a connection is not shared concurrently across
 event-loop tasks.
 
-`CommandClaim` contains the claimed command and an independent `CommandFence`;
-execution-dispatch claims may also carry an acquired `RunFence`.
+`CommandClaim` contains both the claimed command and the acquired `RunFence`.
 `DeliveryFence` contains `event_id`, `owner_id`, and `claim_epoch`; reclaiming an
 expired event increments the epoch, so an older delivery task owned by the same
 gateway incarnation cannot acknowledge the newer claim. Lifecycle mutations
@@ -407,21 +389,12 @@ One transaction:
 
 1. verifies the fence and legal transition;
 2. writes `observed_state=terminal` and the outcome;
-3. inserts a stable outbox event (pending for asynchronous delivery, or already
-   delivered when the synchronous response is the delivery); and
+3. inserts a stable pending outbox event; and
 4. marks the execution command applied.
 
 Repeating the same completion returns the existing event. A conflicting second
 outcome is rejected and recorded as a diagnostic; first durable terminal
 outcome wins, matching the current terminal-record guard.
-
-The execution command's same-fence empty-result fill also verifies the current
-run owner and lease epoch. Recovery takeover therefore fences an old executor
-even when its command claim record still carries the earlier matching epoch.
-Synchronous non-batch admission rejection commits an already-delivered event so
-the counted HTTP error is not followed by a duplicate parent turn. Batch
-rejections keep a pending event with their wave metadata and route through the
-normal completion consumer.
 
 #### Delivery
 
@@ -555,10 +528,9 @@ Branch: `run-coordinator-boundaries`
 - Replace private-field tests for moved behavior with boundary tests, retaining
   targeted regression tests for the known reap/report interleavings.
 
-**Exit criteria:** `SubagentManager` no longer owns queue policy, report-task
-lifetime, or teardown-gate state; current public and wire behavior is
-byte-for-byte compatible; race tests prove one terminal record, one report
-claim, and one slot release.
+**Exit criteria:** `SubagentManager` no longer owns queue policy or terminal
+transition rules; current public and wire behavior is byte-for-byte compatible;
+race tests prove one terminal record, one report claim, and one slot release.
 
 ### PR 4 — SQLite store, migrations, and shadow parity
 
@@ -592,18 +564,6 @@ Branch: `run-coordinator-commands`
 does not start a second child; key/payload conflicts fail closed; queue capacity
 and approval outcomes match legacy behavior; old callers still work.
 
-**Local status:** implemented. Execution and control commands use independent
-durable claim fences; controls do not mutate a live executor lease. SQLite
-schema v3 stores claim/result state and supports commands targeting pre-cutover
-runs. The MCP/gateway boundary validates stable identity and resolves uncertain
-responses through durable lookup. A claimed control without a stored result is
-never replayed after expiry: the authority returns an outcome-uncertain response
-because the legacy side effect may already have happened. Queued and
-approval-waiting executions remain `CLAIMED` until their manager task actually
-starts; that boundary durably applies the command before releasing its
-pre-execution lease. Exact retries of rejected executions replay the stored
-response instead of falling through to a generic legacy conflict.
-
 ### PR 6 — transactional completion and delivery outbox
 
 Branch: `run-coordinator-outbox`
@@ -618,14 +578,6 @@ Branch: `run-coordinator-outbox`
 lost terminal event; redelivery never repeats execution; existing completion
 envelope consumers ignore or use the additive `event_id`; delivery retry and
 fallback remain bounded.
-
-**Local status:** implemented. Exact execution claims acquire a renewable run
-lease while controls retain independent command-only fences. The manager commits
-`starting` before child startup, `running` before prompting, and terminal state
-plus one outbox row before callbacks. Direct acceptance is fenced and
-acknowledged; dashboard-queued and digest-held events stay pending until their
-existing consumption hooks settle the same event. Payloads contain bounded
-summary/routing data and the full-result path.
 
 ### PR 7 — coordinator-first restart recovery and legacy import
 
@@ -642,22 +594,6 @@ terminal commit, destination acceptance, and delivery acknowledgement converges
 to a documented state; a stale owner cannot commit after takeover; uncertain
 execution is reported once without automatic replay; legacy-only installs
 upgrade without losing retained results.
-
-**Local status:** implemented. Schema v4 records the source version on imported
-runs, and schema v5 records process identity and ownership inside the protected
-coordinator store. The importer reads known legacy fields without modifying
-source files and is idempotent against native coordinator rows; agent-writable
-legacy process fields never authorize termination, non-finite timestamps are
-skipped per folder, and legacy destinations never manufacture pending outbox
-work. A dedicated child does not receive a prompt until its fenced process
-identity is durably stored; failure aborts execution while the legacy state
-mirror remains best-effort. Recovery claims expired
-nonterminal leases with a fresh epoch, signals only a coordinator-owned PID with
-an exact fenced start identity, retains partial output, commits `interrupted`,
-emits a SEL termination audit, and drains terminal outbox work separately. The
-periodic reaper retries leases that had not expired at startup while excluding
-locally active run IDs. A hermetic sleeper-process test exercises the real
-takeover/termination path.
 
 ### Deferred cleanup after the compatibility window
 

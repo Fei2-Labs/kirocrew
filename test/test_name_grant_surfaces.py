@@ -37,6 +37,7 @@ from kiro_crew.acp.types import (
     AcpEvent,
 )
 from kiro_crew.context import ContextBuilder
+from kiro_crew.execution_context import execution_for_store
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, HookManager, ToolHookResult
 from kiro_crew.messaging import (
     APPROVAL_INTERACTIVE,
@@ -49,6 +50,34 @@ from kiro_crew.providers.base import LLMEvent
 from kiro_crew.task_models import Project, Task
 
 _REFUSAL = name_grant.Refusal(name_grant.SHADOWED, "head resolves to a shadowing file")
+
+
+@pytest.fixture(autouse=True)
+def _close_subagent_managers(monkeypatch):
+    """Close every ``SubagentManager`` built in a test.
+
+    Construction opens the durable task queue (a SQLite connection and its
+    writer thread); nothing in these unit tests closes it, so each manager
+    leaked those descriptors. Track every instance and release it at teardown.
+    """
+    import kiro_crew.subagent as _subagent_mod
+
+    created = []
+    orig_init = _subagent_mod.SubagentManager.__init__
+
+    def _tracking_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(_subagent_mod.SubagentManager, "__init__", _tracking_init)
+    try:
+        yield
+    finally:
+        for mgr in created:
+            try:
+                mgr.close()
+            except Exception:
+                pass
 
 
 def _stub_verdict(monkeypatch, refusal):
@@ -244,22 +273,21 @@ async def _execute_one_task(tmp_path, provider, *, on_tool_approval):
     task = Task(index=1, title="T", description="d")
     run.tasks = [task]
     sessions = _mock_sessions(provider)
-    # No provider-config patch: this fork labels the telemetry provider from the
-    # live client (``_runtime_provider_label``) instead of reading the global
-    # config, so there is no ``KiroCrewConfig`` seam on this path to stub.
-    await task_executor.execute_task(
-        run=run,
-        task=task,
-        sessions=sessions,
-        ctx=_auto_approve_ctx(),
-        agent="",
-        on_tool_approval=on_tool_approval,
-        auto_test=False,
-        test_cmd=None,
-        work_dir=Path(tmp_path),
-        on_notify=AsyncMock(),
-        session_key="k",
-    )
+    with patch.object(task_executor.KiroCrewConfig, "load") as cfg:
+        cfg.return_value.agent.provider = "acp"
+        await task_executor.execute_task(
+            run=run,
+            task=task,
+            sessions=sessions,
+            ctx=_auto_approve_ctx(),
+            agent="",
+            on_tool_approval=on_tool_approval,
+            auto_test=False,
+            test_cmd=None,
+            work_dir=Path(tmp_path),
+            on_notify=AsyncMock(),
+            session_key="k",
+        )
 
 
 class TestTaskRunnerSurface:
@@ -333,6 +361,8 @@ class TestSubagentSurface:
         sessions = MagicMock()
         sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
         sessions.get_approval_policy = MagicMock(return_value="")
+        sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
         sessions.release_subagent_runtime = AsyncMock()
 
         ctx = MagicMock()
@@ -340,16 +370,13 @@ class TestSubagentSurface:
         ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult(action=TOOL_AUTO_APPROVE))
 
         manager = SubagentManager(sessions=sessions, ctx_builder=ctx, default_turn_limit=1)
-        info = SubagentInfo(id="ng01", task="t", parent_session_key="dashboard:default")
-        # A run driven straight into ``_run_inner`` skips the coordinator claim
-        # that normally stamps the execution fence, and the fence is required
-        # before process identity may be persisted.
-        info._coordinator_fence = MagicMock()
-        # ...and the coordinator lifecycle transitions it would drive have no
-        # registered run to move, so the fork's facade wrappers are stubbed.
-        manager._coordinator_mark_starting = AsyncMock()
-        manager._coordinator_mark_running = AsyncMock()
-        manager._coordinator_record_process = AsyncMock()
+        info = SubagentInfo(
+            execution_context=execution_for_store(""),
+            id="ng01",
+            task="t",
+            parent_session_key="dashboard:default",
+        )
+        manager._log_spawned(info)
         manager._agents["ng01"] = info
         return manager, info, provider
 

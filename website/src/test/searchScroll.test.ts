@@ -1,12 +1,15 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeAll } from 'vitest'
 import {
   pickSearchScrollBehavior,
   RAPID_STEP_MS,
   scrollCurrentMatchIntoView,
+  scrollRangeToCenter,
   pollRowSettled,
   glideOnceStep,
   attachUserScrollIntent,
 } from '../utils/searchScroll'
+import { applySearchHighlights, clearSearchHighlights, getCurrentSearchRange } from '../utils/domHighlight'
+import { installHighlightApiStub } from './highlightApiStub'
 
 describe('pickSearchScrollBehavior', () => {
   it('snaps (auto) when stepping faster than the threshold', () => {
@@ -521,20 +524,130 @@ describe('attachUserScrollIntent', () => {
     detach()
   })
 
-  it('derives touch direction from the finger path, with no guess on the first move', () => {
-    const touchAt = (clientY: number) =>
-      new TouchEvent('touchmove', {
+  it('derives touch direction from the finger path, anchored on touchstart', () => {
+    const touchAt = (kind: 'touchstart' | 'touchmove', clientY: number) =>
+      new TouchEvent(kind, {
         touches: [new Touch({ identifier: 1, target: document.body, clientY })],
       })
     const { el, onUser, detach } = harness()
-    // First move has no baseline: no direction rather than a guess.
-    el.dispatchEvent(touchAt(300))
-    expect(onUser).toHaveBeenLastCalledWith(undefined)
+    // touchstart takes the baseline, so even the FIRST move has a direction.
+    el.dispatchEvent(touchAt('touchstart', 300))
     // Finger moving DOWN the screen scrolls the content UP.
-    el.dispatchEvent(touchAt(340))
+    el.dispatchEvent(touchAt('touchmove', 340))
     expect(onUser).toHaveBeenLastCalledWith('up')
-    el.dispatchEvent(touchAt(310))
+    el.dispatchEvent(touchAt('touchmove', 310))
     expect(onUser).toHaveBeenLastCalledWith('down')
+    detach()
+  })
+
+  it('a move with no baseline at all still reports no direction rather than a guess', () => {
+    const { el, onUser, detach } = harness()
+    // A touchmove whose touch list is unreadable, and a first move that never
+    // saw a touchstart: neither may invent a direction.
+    el.dispatchEvent(new Event('touchmove'))
+    expect(onUser).toHaveBeenLastCalledWith()
+    el.dispatchEvent(
+      new TouchEvent('touchmove', {
+        touches: [new Touch({ identifier: 1, target: document.body, clientY: 300 })],
+      }),
+    )
+    expect(onUser).toHaveBeenLastCalledWith(undefined)
+    detach()
+  })
+
+  it('does not carry one gesture’s baseline into the next, which inverted its first move', () => {
+    // The baseline used to live for the whole attachment, so the first move of
+    // every later gesture was measured against wherever the previous finger was
+    // LIFTED. Lift at y=500, touch down at y=200 and drag to 260: a scroll into
+    // older history reported 'down'. That first move is the one the phone's
+    // clamp-release gate looks for at the start of a scroll-up, and the gesture
+    // only self-corrected on its second move.
+    const touchAt = (kind: 'touchstart' | 'touchmove' | 'touchend', clientY?: number) =>
+      new TouchEvent(kind, {
+        touches: typeof clientY === 'number'
+          ? [new Touch({ identifier: 1, target: document.body, clientY })]
+          : [],
+      })
+    const { el, onUser, detach } = harness()
+    // Gesture 1: finger up the screen -> content down (newer).
+    el.dispatchEvent(touchAt('touchstart', 700))
+    el.dispatchEvent(touchAt('touchmove', 600))
+    el.dispatchEvent(touchAt('touchmove', 500))
+    expect(onUser).toHaveBeenLastCalledWith('down')
+    el.dispatchEvent(touchAt('touchend'))
+    // Gesture 2 starts far from where gesture 1 ended, and goes the other way.
+    el.dispatchEvent(touchAt('touchstart', 200))
+    el.dispatchEvent(touchAt('touchmove', 260))
+    expect(onUser).toHaveBeenLastCalledWith('up')
+    detach()
+  })
+
+  it('a second finger does not rebase the first finger’s path', () => {
+    // A pinch or a stray second thumb lands mid-drag. Rebasing the baseline onto
+    // that finger's starting point would invert the very next move, and dropping
+    // it when one of the two lifts would blind the finger still on the glass.
+    const ev = (kind: string, ys: number[]) =>
+      new TouchEvent(kind, {
+        touches: ys.map((clientY, i) =>
+          new Touch({ identifier: i, target: document.body, clientY })),
+      })
+    const { el, onUser, detach } = harness()
+    el.dispatchEvent(ev('touchstart', [200]))
+    el.dispatchEvent(ev('touchmove', [260]))
+    expect(onUser).toHaveBeenLastCalledWith('up')
+    // Second finger lands far up the screen: the baseline must not move to it.
+    el.dispatchEvent(ev('touchstart', [260, 50]))
+    el.dispatchEvent(ev('touchmove', [320, 110]))
+    expect(onUser).toHaveBeenLastCalledWith('up')
+    // One finger lifts, one remains: still the same gesture, and the survivor
+    // is the finger the baseline was already tracking, so its path continues.
+    el.dispatchEvent(ev('touchend', [320]))
+    el.dispatchEvent(ev('touchmove', [380]))
+    expect(onUser).toHaveBeenLastCalledWith('up')
+    detach()
+  })
+
+  it('lifting the FIRST of two fingers rebases onto the one still on the glass', () => {
+    // The mirror of the case above, and the one it did not cover. `touches[0]`
+    // names the tracked finger, so when finger 0 lifts, finger 1 inherits that
+    // slot: holding finger 0's Y measures finger 1's next move against a finger
+    // that is gone. Finger 1 sits far UP the screen here, so a kept baseline
+    // reports 'down' for a finger that is in fact moving down the glass, i.e.
+    // scrolling UP into older history -- the one input the clamp-release gate
+    // reads at the start of a scroll-up.
+    const ev = (kind: string, ys: number[]) =>
+      new TouchEvent(kind, {
+        touches: ys.map((clientY, i) =>
+          new Touch({ identifier: i, target: document.body, clientY })),
+      })
+    const { el, onUser, detach } = harness()
+    el.dispatchEvent(ev('touchstart', [500]))
+    el.dispatchEvent(ev('touchmove', [560]))
+    expect(onUser).toHaveBeenLastCalledWith('up')
+    // Second finger lands high up the screen; the baseline stays on finger 0.
+    el.dispatchEvent(ev('touchstart', [560, 120]))
+    // Finger 0 lifts. Finger 1, at 120, becomes touches[0].
+    el.dispatchEvent(ev('touchend', [120]))
+    // Finger 1 drags DOWN the glass, which scrolls up into older history.
+    el.dispatchEvent(ev('touchmove', [180]))
+    expect(onUser).toHaveBeenLastCalledWith('up')
+    detach()
+  })
+
+  it('a cancelled gesture drops its baseline too', () => {
+    const touchAt = (kind: 'touchstart' | 'touchmove' | 'touchcancel', clientY?: number) =>
+      new TouchEvent(kind, {
+        touches: typeof clientY === 'number'
+          ? [new Touch({ identifier: 1, target: document.body, clientY })]
+          : [],
+      })
+    const { el, onUser, detach } = harness()
+    el.dispatchEvent(touchAt('touchstart', 700))
+    el.dispatchEvent(touchAt('touchmove', 600))
+    el.dispatchEvent(touchAt('touchcancel'))
+    // No baseline survives the cancel, so the next move cannot invent one.
+    el.dispatchEvent(touchAt('touchmove', 300))
+    expect(onUser).toHaveBeenLastCalledWith(undefined)
     detach()
   })
 
@@ -560,7 +673,10 @@ describe('attachUserScrollIntent', () => {
     const { el, onUser, detach } = harness()
     detach()
     el.dispatchEvent(new Event('wheel'))
+    el.dispatchEvent(new Event('touchstart'))
     el.dispatchEvent(new Event('touchmove'))
+    el.dispatchEvent(new Event('touchend'))
+    el.dispatchEvent(new Event('touchcancel'))
     el.dispatchEvent(new Event('pointerdown'))
     el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown' }))
     expect(onUser).not.toHaveBeenCalled()
@@ -603,5 +719,107 @@ describe('attachUserScrollIntent', () => {
     expect(step.mock.calls.length).toBe(callsAtAbort)
     detach()
     cancel()
+  })
+})
+
+// The current match is a Range painted by domHighlight, not a <mark> element
+// (the transcript never wraps matched text in a node of its own), so centering
+// reads the range's rect and drives each scrollable ancestor directly.
+describe('scrollCurrentMatchIntoView: range-based target', () => {
+  beforeAll(() => { installHighlightApiStub() })
+
+  function rect(top: number, height = 20): DOMRect {
+    return { top, height, bottom: top + height, left: 0, right: 0, width: 0, x: 0, y: top, toJSON: () => ({}) } as DOMRect
+  }
+
+  /** Append one paragraph of plain text to `host` (built with createElement +
+   *  textContent, never an HTML sink). */
+  function para(host: HTMLElement, text: string): void {
+    const p = document.createElement('p')
+    p.textContent = text
+    host.appendChild(p)
+  }
+
+  /** A scroller with layout numbers happy-dom does not compute. */
+  function scroller(opts: { top: number; height: number; scrollHeight: number }): HTMLElement {
+    const el = document.createElement('div')
+    el.style.overflowY = 'auto'
+    Object.defineProperty(el, 'clientHeight', { value: opts.height })
+    Object.defineProperty(el, 'scrollHeight', { value: opts.scrollHeight })
+    el.getBoundingClientRect = () => rect(opts.top, opts.height)
+    document.body.appendChild(el)
+    return el
+  }
+
+  function paintCurrent(host: HTMLElement, term: string, top: number): Range {
+    applySearchHighlights(host, term, false, 0)
+    const r = getCurrentSearchRange()!
+    r.getBoundingClientRect = () => rect(top)
+    return r
+  }
+
+  it('scrollRangeToCenter centres the range inside its scrollable ancestor', () => {
+    const box = scroller({ top: 0, height: 200, scrollHeight: 1000 })
+    para(box, 'find me')
+    const r = paintCurrent(box, 'me', 500)
+    scrollRangeToCenter(r)
+    // range mid 510, scroller centre 100 → scroll down by 410
+    expect(box.scrollTop).toBe(410)
+    clearSearchHighlights(box); box.remove()
+  })
+
+  it('scrollRangeToCenter falls through to the window when no ancestor scrolls', () => {
+    const host = document.createElement('div')
+    para(host, 'find me')
+    document.body.appendChild(host)
+    const r = paintCurrent(host, 'me', 600)
+    const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => {})
+    scrollRangeToCenter(r)
+    expect(scrollBy).toHaveBeenCalledTimes(1)
+    const [, dy] = scrollBy.mock.calls[0] as [number, number]
+    expect(dy).toBe(610 - window.innerHeight / 2)
+    scrollBy.mockRestore()
+    clearSearchHighlights(host); host.remove()
+  })
+
+  it('the converge poll measures the current range and steps the scroller', () => {
+    const box = scroller({ top: 0, height: 200, scrollHeight: 1000 })
+    para(box, 'alpha beta')
+    paintCurrent(box, 'beta', 500)
+    const d = makeDriver()
+    const cancel = scrollCurrentMatchIntoView(box, { raf: d.raf, now: d.now, maxMs: 5000 })
+    d.flush(1)
+    expect(box.scrollTop).toBe(410)
+    cancel()
+    clearSearchHighlights(box); box.remove()
+  })
+
+  it('a current range outside `root` is not this poll\'s target', () => {
+    const box = scroller({ top: 0, height: 200, scrollHeight: 1000 })
+    para(box, 'alpha beta')
+    const other = document.createElement('div')
+    para(other, 'beta')
+    document.body.appendChild(other)
+    paintCurrent(other, 'beta', 500)
+    const d = makeDriver()
+    const cancel = scrollCurrentMatchIntoView(box, { raf: d.raf, now: d.now, maxMs: 5000 })
+    d.flush(3)
+    expect(box.scrollTop).toBe(0)
+    cancel()
+    clearSearchHighlights(other); other.remove(); box.remove()
+  })
+
+  it('idles (no step) while the painted node has left the document', () => {
+    const box = scroller({ top: 0, height: 200, scrollHeight: 1000 })
+    para(box, 'alpha beta')
+    paintCurrent(box, 'beta', 500)
+    // A re-render swapped the paragraph's text node out from under the range.
+    box.querySelector('p')!.textContent = 'alpha beta gamma'
+    const d = makeDriver()
+    const cancel = scrollCurrentMatchIntoView(box, { raf: d.raf, now: d.now, maxMs: 5000 })
+    d.flush(3)
+    expect(box.scrollTop).toBe(0)
+    cancel()
+    clearSearchHighlights(box); box.remove()
   })
 })

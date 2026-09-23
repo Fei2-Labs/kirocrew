@@ -30,6 +30,7 @@ from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
 from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
 from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
+    reject_if_slot_under_construction,
     slot_history_key,
 )
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
@@ -92,6 +93,9 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
     request_app = request.get("app", "")
     if not slot:
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    under_construction = reject_if_slot_under_construction(state, slot)
+    if under_construction is not None:
+        return under_construction
 
     # App ownership check — mirror fork's contract so apps can't rewind
     # slots they don't own.
@@ -345,6 +349,10 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
                     slot,
                     redacted_content,
                     _directive_user_origin=not bool(request_app),
+                    # See ``api_chat``: an observed app must be NAMED, because the
+                    # actor resolver's fallback is ``user``. ``""`` is the
+                    # parameter's own default and reads as "not named".
+                    _turn_actor="app" if request_app else "",
                 )
                 return
             # Rewind rejected. A send diverted to the queue by this

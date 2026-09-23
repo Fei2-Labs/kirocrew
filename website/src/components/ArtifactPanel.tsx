@@ -21,6 +21,7 @@ import type { Artifact } from '../types'
 
 import { i18nT } from '../i18n/t'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+import { isEditableTarget } from '../utils/editableTarget'
 interface Props {
   slug: string
   /** Kind captured at open time; the live query overrides it once loaded. */
@@ -71,8 +72,11 @@ const STACKED_SIDEBAR_STYLE: React.CSSProperties = { maxHeight: 280, minHeight: 
 
 /** Submit-to-chat bar with an optional "Add instruction" affordance. The
  *  free-form note is threaded through as the `extraPrompt` arg only when the
- *  toggle is open, and cleared after submit. */
-function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = true }: {
+ *  toggle is open, and cleared after submit.
+ *
+ *  Exported so the standalone artifact page can put the SAME bar in the comments
+ *  sidebar's footer, rather than growing a second one that drifts. */
+export function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = true }: {
   count: number; submitting: boolean; onSubmit: (extraPrompt?: string) => void
   /** Bleed to the panel edges (non-fullscreen, inside the negative-margin
    *  content wrapper). Fullscreen uses its own padding, so omit it there. */
@@ -116,7 +120,7 @@ function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = tru
           value={extraPrompt}
           onChange={e => setExtraPrompt(e.target.value)}
           rows={2}
-          className="mt-2 w-full bg-bg-elevated border border-border rounded-md px-2.5 py-1.5 text-text text-[13px] font-body outline-none resize-none focus-ring leading-[18px]"
+          className="mt-2 w-full bg-bg-elevated border border-border rounded-md px-2.5 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
         />
       )}
     </div>
@@ -281,8 +285,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
       // Don't hijack Esc while the user is in an editable field (e.g. the
       // add-instruction textarea) — let the field handle it instead of
       // closing/exiting the panel out from under them.
-      const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+      if (isEditableTarget(e)) return
       if (fullscreen) setFullscreen(false); else onClose()
     }
     document.addEventListener('keydown', h)

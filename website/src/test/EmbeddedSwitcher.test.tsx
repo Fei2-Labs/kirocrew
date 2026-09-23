@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { screen, waitFor, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
@@ -20,6 +23,7 @@ const model = (over: Partial<HostModel> = {}): HostModel => ({
   activeId: 'cd-1',
   self: null,
   macInset: false,
+  winInset: false,
   electron: true,
   pinnedCrews: [],
   stableOrder: false,
@@ -32,6 +36,7 @@ beforeEach(() => {
 })
 afterEach(() => {
   document.documentElement.classList.remove('embedded-mac-inset')
+  document.documentElement.classList.remove('embedded-win-inset')
 })
 
 describe('EmbeddedInstanceTabBar (option B)', () => {
@@ -43,7 +48,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     renderWithProviders(<InstanceTabBar variant="inline" />, { store })
 
     // Local + the relayed instance tab both render.
-    await userEvent.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /Switch crew/i }))
     expect(screen.getByRole('menuitemradio', { name: /Local/ })).toBeTruthy()
     const cloud = screen.getByRole('menuitemradio', { name: /Cloud One/ })
     expect(cloud).toBeTruthy()
@@ -54,7 +59,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       '*',
     )
 
-    await userEvent.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /Switch crew/i }))
     await userEvent.click(screen.getByRole('menuitemradio', { name: /Local/ }))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-switch-instance', id: null }),
@@ -67,7 +72,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       instances: { warm: {}, activeId: null, mru: [], unread: {}, host: null },
     })
     const { container } = renderWithProviders(<InstanceTabBar variant="inline" />, { store })
-    expect(container.querySelector('[aria-label="Remote instances"]')).toBeNull()
+    expect(container.querySelector('[aria-label="Remote crews"]')).toBeNull()
   })
 
   it('honors the relayed pin set: a pinned crew renders as a chip beside the dropdown', async () => {
@@ -83,7 +88,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     // the trailing chevron that reaches every OTHER crew.
     const row = screen.getByTestId('crew-chip-row')
     expect(row.textContent).toMatch(/Cloud One/)
-    expect(screen.getByRole('button', { name: /Switch instance/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Switch crew/i })).toBeTruthy()
   })
 
   it('renders no chip row when the parent relays an empty pin set', () => {
@@ -105,7 +110,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       },
     })
     renderWithProviders(<InstanceTabBar variant="inline" />, { store })
-    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
     const toggle = await screen.findByTestId('crew-stable-order-toggle')
     expect(toggle).toBeTruthy()
     expect(toggle.getAttribute('aria-checked')).toBe('true')
@@ -123,7 +128,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       },
     })
     const { container } = renderWithProviders(<InstanceTabBar variant="inline" />, { store })
-    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
     await screen.findByRole('menuitemradio', { name: /Cloud One/ })
     expect(screen.queryByTestId('crew-stable-order-toggle')).toBeNull()
     // Ordering falls back to the pre-relay default: the active crew still leads.
@@ -142,7 +147,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     })
     renderWithProviders(<InstanceTabBar variant="inline" />, { store })
 
-    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
     await userEvent.click(await screen.findByTestId('crew-stable-order-toggle'))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-set-stable-order', on: true }),
@@ -186,7 +191,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     // A pane cannot write the parent's preference store from its own iframe
     // realm, so pinning here must travel up as a message rather than persist
     // locally — otherwise the pane would drift from every other bar.
-    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
     await userEvent.click(await screen.findByTestId('crew-pin-cd-1'))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-set-crew-pin', id: 'cd-1' }),
@@ -217,6 +222,60 @@ describe('EmbeddedHostBridge (option B relay)', () => {
     expect(store.getState().instances.host?.macInset).toBe(true)
     expect(store.getState().instances.host?.stableOrder).toBe(true)
     expect(document.documentElement.classList.contains('embedded-mac-inset')).toBe(true)
+  })
+
+  it('applies the Windows caption inset when the host relays winInset', async () => {
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<EmbeddedHostBridge />, { store })
+
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model({ winInset: true }) },
+        }),
+      )
+    })
+    await waitFor(() => expect(store.getState().instances.host?.tabs).toHaveLength(1))
+    expect(store.getState().instances.host?.winInset).toBe(true)
+    expect(document.documentElement.classList.contains('embedded-win-inset')).toBe(true)
+  })
+
+  it('keeps the embedded Windows reserves in lock-step with the local .win-electron rule (CSS pin)', () => {
+    // jsdom applies no stylesheet, so the widths are pinned against the
+    // index.css source, the same way App.focusMode.test.tsx pins the local
+    // pair. 142 lives in four rules; the local two already have a drift check,
+    // and this is the drift check for the embedded two.
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'index.css'), 'utf8')
+    const localHeader = css.match(/\.win-electron header\.topbar-glass\{[\s\S]*?padding-right:(\d+)px/)
+    const embeddedHeader = css.match(/\.embedded-win-inset header\.topbar-glass\{padding-right:(\d+)px\}/)
+    const embeddedReserve = css.match(/\.embedded-win-inset \.mc-focus-mode \.focus-caption-reserve\{padding-right:(\d+)px\}/)
+    expect(embeddedHeader).not.toBeNull()
+    expect(embeddedReserve).not.toBeNull()
+    // Same band the LOCAL header clears: the embedded header is the same
+    // surface rendered by a different document, so the two must not drift.
+    expect(embeddedHeader![1]).toBe(localHeader![1])
+    expect(embeddedReserve![1]).toBe(embeddedHeader![1])
+  })
+
+  it('reads a model without winInset as false — an older host has no Windows inset to relay', async () => {
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<EmbeddedHostBridge />, { store })
+
+    const { winInset: _omitted, ...withoutWinInset } = model()
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...withoutWinInset },
+        }),
+      )
+    })
+    await waitFor(() => expect(store.getState().instances.host?.tabs).toHaveLength(1))
+    expect(store.getState().instances.host?.winInset).toBe(false)
+    expect(document.documentElement.classList.contains('embedded-win-inset')).toBe(false)
   })
 
   it('ignores messages that are not from the direct parent', async () => {

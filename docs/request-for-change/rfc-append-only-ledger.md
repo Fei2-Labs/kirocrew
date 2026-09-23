@@ -1,11 +1,11 @@
 ---
 title: Append-only ledger — one record per unit, every view a fold
-status: in-progress
+status: partial
 revision: v2
 author: mingweic, with Kiro
 created: 2026-09-11
-last-audited: 2026-09-11
-audited-at: 2f1e2f54a
+last-audited: 2026-09-22
+audited-at: 80bd0a81f
 doc-pr: 10090
 implementation-prs: [10091]
 tracking-issues: []
@@ -15,13 +15,15 @@ superseded-by: []
 
 # RFC: Append-only ledger — one record per unit, every view a fold
 
-Status: in-progress. The storage below, and the first emitter that writes to it, land
-together in [#10091](https://github.com/kirodotdev/KiroCrew/pull/10091). Nothing is on
-main yet: there `members.py` writes pointer entries with no `type` and no `seq`, and
-`work_ledger.py` and `session_ledger.py` each keep their own head. This is the storage
-under *Crew Mode: Agent-to-Agent Session Collaboration* §8, a companion design outside
-this tree whose sections are cited below as "Crew Mode §N"; scope is Kiro Crew's public
-tree.
+> **Naming:** the mechanism this RFC specifies is called the **crew log** (agreed
+> with Joe Guo, 2026-09-17). Where the text below says "ledger" for the per-unit
+> append-only file, read "crew log". The RFC's file name and title are left as they
+> were so external links keep resolving; only the name of the thing changed.
+
+Status: partial. The `kiro_crew.crew_log` store, session emitter, projections,
+routes, and message entries are on main behind `KIROCREW_CREW_LOG`. The flag
+remains opt-in, while the legacy transcript and conductor work-ledger stores
+still exist, so the full cutover described below is incomplete.
 
 ## 1. Introduction: five heads, no history
 
@@ -49,8 +51,15 @@ the code (`session_ledger.py`, `work_ledger.py`): a **ledger** is the append-onl
 - FR-5 A projection folds one ledger and carries its `seq` as version; a reconnect
   truncates.
 - FR-6 A phase change without a reason is a defect (Crew Mode §7).
-- FR-7 Safe to surface: no secrets, transcript bodies, machine paths or host names in
-  public fields; a `ref` instead.
+- FR-7 Safe to surface: no secrets, machine paths or host names in public fields; a `ref`
+  instead. Message BODIES are in scope and are written, because they are redacted before
+  they reach the file -- exfiltration URLs then credentials, in the writer rather than at
+  the call sites, so a new call site cannot forget -- and a redaction that fails yields the
+  empty string, never the input. Bodies on disk are GATED: `KIROCREW_CREW_LOG` may
+  not default to on until session trash and permanent delete reach a session's ledger
+  directory and `StorageReport` counts its bytes. Until both land, "delete this
+  conversation" would not delete it and the disk-use surface would understate it, which are
+  product promises rather than costs. Tracked as kirodotdev/KiroCrew#10705.
 - FR-8 Cold load synthesizes closers for open intervals.
 - NFR-1 Cheap to fold: checkpoints on disk; state never replays everything.
 - NFR-2 The backend extracts, the frontend loads pages; no client folds a ledger.
@@ -98,7 +107,7 @@ Crew activity ledger:
 | family | types | pointer |
 |---|---|---|
 | shipped | `member/*`, `activity/record`, `slot/*`, `patrol/*` | `slot/*` → the session |
-| messages | `message/received`, `message/sent` | body → the transcript store |
+| messages | `message/received`, `message/sent` | redacted body in the ledger; transcript position via `ref` once the bridge lands (not written in PR 1) |
 | tree | `crew/child-attached`, `crew/parent-attached`, `*-detached` | — |
 | signed | `crew:<parent>/dispatch`, `crew:<child>/report` | report → the child's segment |
 | topics | `crew/topic-*`, `crew/forwarded`, `crew/run-state` | topic → its work session |
@@ -113,8 +122,14 @@ message" is a summary with no `thread` whose `ref` points at the thread.
 
 Session ledger: `session/opened|closed`, `turn/started|completed {usage, credits}`,
 `step/*`, `tool/*`, `approval/requested|decided`, `model/selected`, `compaction/applied`,
-`remote/placed|lost`. Bodies stay in the transcript store; the ledger indexes them by
-`ref`.
+`remote/placed|lost`. Bodies are DUAL-WRITTEN into the session ledger: each is redacted,
+then written whole, or split across `message/chunk` entries the citing entry names in
+`chunks` when it cannot fit one line. The transcript file remains the authoritative read
+path until the seeding step (`session/seeded`) imports it and the file stops being written.
+For that bridge period the `ref` on a message entry is to point at its transcript position
+so the two records can be reconciled while both exist -- NOT YET WRITTEN: PR 1 emits the
+body alone, and `ref` and `session/seeded` arrive with the bridge (see Delivery). A
+consumer must not be built against the reconciliation contract until then.
 
 ## 5. Projections and pages
 
@@ -172,11 +187,17 @@ a ledger from `session/opened`.
 **PR 1** ([#10091](https://github.com/kirodotdev/KiroCrew/pull/10091)) is the whole storage
 layer, for both kinds: the files, the envelope with `src`, `thread` and `ref`, the headers,
 type ownership, guest namespaces, `get` and `iter_from`, page by `seq`, page by `thread`,
-`resolve` with `ok` and `gone`, torn-tail repair that closes an open interval on open with a
+`resolve` with `ok`, `gone`, `pruned` and `corrupt` -- retention and damage are separate
+answers, because a reader told the lines were pruned stops looking -- torn-tail repair that closes an open interval on open with a
 deterministic closer — an interrupted turn gets `turn/completed {stop_reason: interrupted}`
 stamped at the last real entry's time, so two readers of the same bytes agree — and the
 OS-masked `ledgers/` leaf. Its first writer ships with it: the session emitter behind
-`KIROCREW_SESSION_LEDGER=1`, default off. A session-kind entry carries its turn identity in
+`KIROCREW_CREW_LOG=1`, default off, INCLUDING message bodies. The `ref` back-pointer
+to a transcript position and the `session/seeded` import are migration steps and follow;
+until then the transcript file is still written and still the read path. There is no
+streaming-delta emitter: redacting one delta at a time cannot see a credential split across
+two of them, and `message/chunk` is written only by the oversize-body split, over text
+already redacted whole. A session-kind entry carries its turn identity in
 `data.turn` (and `data.step`), known at emit time, and leaves `thread` unset.
 
 **PR 2** is projections and checkpoints, the dashboard paging endpoints and frames, the
@@ -190,3 +211,66 @@ of the crew store's JSON files and of the work ledger, and the secretaries.
    `gone`.
 3. An `ignorable` marker so a reader refuses to reconstruct on an unknown required type.
 4. App and cron kinds: same envelope, emitters not landed.
+
+## Amendment 2026-09-16 — the layering
+
+Three corrections to the sections above, from implementing them. The model is one base
+envelope plus session-only and crew-only halves, and the sections were written with the two
+halves mixed. `docs/system-specs/modules/crew-log-core.md` sections 4, 4a, 4b and 6 are the
+current specification of all three.
+
+**The signed family is two plain crew-owned types.** §4's `crew:<parent>/dispatch` and
+`crew:<child>/report` are `crew/dispatch` and `crew/report`. A type carries the fact; the
+writer is `src`, so `crew:qa` reporting and `crew:docs` reporting write one type into one
+parent ledger and are told apart by who signed them. Spelling the writer into the type would
+make the same fact a different type per writer -- a fold would parse the type to group two
+children's reports on one item, and the ownership registry would grow an entry per crew. The
+two contracts carry required fields: `crew/dispatch` needs `data.target`, because a dispatch
+naming nobody is a row the `board` fold cannot place, and `crew/report` needs a `ref` into
+the child's segment, because `board` and `budget` take status and credits off the report
+without opening the child's ledger and the `ref` is what makes that checkable. Both are
+stated in section 4b.
+
+**Authorization hangs off `src`, not off the type prefix.** FR-3's "a guest writes only in
+its namespace" holds for an app, whose `app:<name>/` type prefix is the one guest type
+namespace and its whole permission. A guest CREW is authorized by its `src` instead: it
+writes the crew kind's built-in domains, and `crew:<name>/<action>` is refused as a
+malformed type. This layer still checks no relationship — it has no crew tree, so whether
+`crew:qa` is really a child of the ledger it writes into arrives with the grants in §6.
+
+**`src` is validated per kind.** §3 lists the emitters as one set for both kinds. They are
+two: a session ledger takes `gateway` and `acp`, a crew ledger takes `gateway`,
+`dashboard`, `patrol`, `crew:<name>` and `app:<name>`. One shared list accepts `patrol`
+inside a single session's turn history, and `src` is what a reader attributes an entry to.
+`session:<id>` is accepted by neither kind: no emitter writes it, and adding a source to a
+kind is additive, since no reader validates `src`.
+
+## Amendment 2026-09-16 — the vocabulary trim
+
+Three corrections to the sections above, from implementing them. The body is left as
+written; where the two disagree, this section is what holds.
+
+**The session vocabulary is nine types shorter.** §4 and the storage spec named types with
+no site that could honestly produce them, or that would record a second time a fact another
+entry already carries. Gone: `session/seeded`, `message/steered`, `tool/searched`,
+`tool/loaded`, `skill/searched`, `skill/loaded`, `summary/written`, `remote/placed`,
+`remote/lost`, and `digest` as a `background/completed.kind`. The vocabulary is therefore a
+statement about what the log contains rather than about what it might one day contain,
+which is what makes a reader's declared type set worth anything. Any of them returns when a
+real source exists. Three domains empty out with them and leave `TYPE_OWNERSHIP`: `skill`,
+`summary`, `remote`. The `remote` HEADER field is unrelated and stays.
+
+**The parallel lifecycle-event stream is retired, not coexisting.** §1 counts "a lifecycle
+event schema with no writer" among the five heads this design replaces, and §3 records that
+the two envelopes are field-compatible so one projection could fold both. That package had
+no emitter, no reader and no directory on any host, and each of its kinds names a fact this
+format owns as a `type` -- so it is deleted rather than kept as a second vocabulary every
+future emitter would have to choose between. A fact with no unit to belong to (a script
+cron, gateway lifecycle) gets a `gateway`-kind ledger when something needs to record one.
+
+**The format is pre-release, not frozen.** The storage spec froze the wire format in the
+commit that introduced it. `KIROCREW_SESSION_LEDGER` defaults off and no user data exists on
+disk, so a shape change breaks nothing and the freeze bought only the appearance of one. The
+freeze point is the release that turns the flag on by default: from there a reader may hold
+files, so that change is the one that decides the compatibility strategy -- additive fields
+plus the `ignorable` skip, or migrations -- and `version` is the escape hatch it spends.

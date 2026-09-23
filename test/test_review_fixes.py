@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+from conftest import forget_env_at_teardown
 from kiro_crew.security import audit_bash_command
 
 
@@ -310,11 +311,14 @@ class TestObserveModeAuthFilter:
 class TestLoaderChmodWarning:
     """Guard test for loader.py chmod warning on failure (L1219-1222)."""
 
-    def test_chmod_enforced_on_open_permissions(self, tmp_path: object) -> None:
+    def test_chmod_enforced_on_open_permissions(self, tmp_path: object, monkeypatch) -> None:
         from pathlib import Path
 
         from kiro_crew.config.loader import KiroCrewConfig
 
+        # load_credentials() seeds os.environ with every key it reads, so the
+        # fixture key below would otherwise outlive this test.
+        forget_env_at_teardown(monkeypatch, "TEST_KEY")
         tmp = Path(str(tmp_path))
         env_file = tmp / ".env"
         env_file.write_text("TEST_KEY=value\n")

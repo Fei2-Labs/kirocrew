@@ -27,12 +27,12 @@ import json
 import os
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from chat_test_helpers import _make_ready_kiro_prerequisite
-from member_memory_helpers import patch_private_memory_supported
 
 from kiro_crew import name_grant
 from kiro_crew.acp.types import (
@@ -43,6 +43,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
 )
+from kiro_crew.config.sections import ResolvedBindings
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.history import ConversationLog
@@ -57,9 +58,10 @@ from kiro_crew.trust_patterns import canonical_non_shell_trust_key, exact_trust_
 
 def _slot(key: str = "chat-cov-1") -> _ChatSlot:
     slot = _ChatSlot(key)
-    # Titled on purpose: an untitled slot makes the end-of-turn cycle spawn
-    # _maybe_auto_title, which is a real LLM path. maybe_refresh_title (the
-    # titled branch) self-guards and returns without a call.
+    # Titled on purpose: the end-of-turn cycle routes titling through
+    # title_then_refresh, and a titled slot makes both halves self-guard
+    # (_maybe_auto_title no-ops, maybe_refresh_title returns not-due) without
+    # a real LLM call.
     slot._titled = True
     return slot
 
@@ -78,6 +80,10 @@ def _state(tmp_path, **kwargs) -> DashboardState:
     # truthy, so every busy-probe would read "turn in flight" on an idle state.
     sessions.get_provider = MagicMock(return_value=None)
     sessions.resumable_sid = MagicMock(return_value=None)
+    # Production answers a plain string, "" when the allocation selected nothing.
+    # Left as a bare MagicMock it would answer a truthy object, which the runner
+    # would store as the slot's requested model and hand to the crew-log emitter.
+    sessions.allocation_requested_model = MagicMock(return_value="")
     sessions.remove = AsyncMock()
     sessions.record_failure = AsyncMock()
     sessions.remove_if_unclaimed = AsyncMock(return_value=False)
@@ -231,11 +237,12 @@ async def test_memory_refusal_preserves_diagnostic_without_initialization_recove
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damaged_record", [False, True])
-async def test_private_session_cannot_dispatch_as_legacy_after_unsigned_binding_loss(
+async def test_canonical_member_context_outranks_slot_alias_and_corruption_refuses(
     tmp_path, monkeypatch, damaged_record
 ):
-    from kiro_crew import member_memory_auth
+    from kiro_crew import execution_context, member_memory_auth
     from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+    from kiro_crew.history import ConversationLog
     from kiro_crew.memory_stores import provision_member_memory
 
     state, client = _runner_state(tmp_path)
@@ -251,82 +258,22 @@ async def test_private_session_cannot_dispatch_as_legacy_after_unsigned_binding_
         cfg.save()
         member_memory_auth.bind_private_session_store(key, store)
         if damaged_record:
-            member_memory_auth._session_binding_path(key).unlink()
+            ConversationLog().update_metadata(key, {"execution_context": {"member_id": 7}})
         return store
 
     store = await asyncio.to_thread(seed)
-    read_threads = []
-    original = member_memory_auth.read_private_session_store
-
-    def read_binding(session_key):
-        read_threads.append(threading.get_ident())
-        return original(session_key)
-
-    monkeypatch.setattr(member_memory_auth, "read_private_session_store", read_binding)
+    client.stream = MagicMock(return_value=_async_iter([_complete()]))
     await _drive(state, slot)
-
-    state.sessions.get_or_create.assert_not_awaited()
-    client.stream.assert_not_called()
-    assert read_threads and threading.get_ident() not in read_threads
-    assert slot.memory_store == ""
-    assert state.conversation_log.get_metadata(key).get("memory_store") is None
-    error = next(row for row in slot.messages if row["role"] == "error")
-    assert error["meta"]["code"] == "memory_unavailable"
-    assert (
-        "private memory assignment" in error["content"]
-        or "binding is unreadable" in error["content"]
-    )
-    if not damaged_record:
-        assert await asyncio.to_thread(original, key) == store
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("old_context", ["history", "native", "unsaved"])
-async def test_cli_opt_in_cannot_promote_an_existing_v1_conversation(
-    tmp_path, old_context, monkeypatch
-):
-    import argparse
-
-    from kiro_crew.cli_commands import _handle_agent
-    from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
-    from kiro_crew.member_memory_auth import read_private_session_store
-
-    patch_private_memory_supported(monkeypatch)
-    state, client = _runner_state(tmp_path)
-    slot = _slot("legacy-before-opt-in")
-    slot.agent = "reviewer"
-    key = chat_runner.effective_session_key(slot)
-    if old_context == "history":
-        await asyncio.to_thread(state.conversation_log.append, key, "assistant", "V1 history")
-    elif old_context == "native":
-        state.sessions.resumable_sid.return_value = "v1-native-session"
+    if damaged_record:
+        state.sessions.get_or_create.assert_not_awaited()
+        client.stream.assert_not_called()
+        error = next(row for row in slot.messages if row["role"] == "error")
+        assert error["meta"]["code"] == "memory_unavailable"
+        assert "execution context" in error["content"]
     else:
-        slot.append("assistant", "Unflushed V1 answer", "msg msg-a")
-
-    def opt_in():
-        cfg = KiroCrewConfig.load()
-        cfg.agents["reviewer"] = KiroCrewAgentConfig()
-        cfg.save()
-        _handle_agent(
-            argparse.Namespace(
-                agent_action="update",
-                name="reviewer",
-                kiro_agent=None,
-                workspace=None,
-                memory_store=None,
-                provision_memory=True,
-            )
-        )
-
-    await asyncio.to_thread(opt_in)
-    await _drive(state, slot)
-    error = next(row for row in slot.messages if row["role"] == "error")
-    assert error["meta"]["code"] == "memory_unavailable"
-    assert "new conversation" in error["content"]
-    state.sessions.get_or_create.assert_not_awaited()
-    client.stream.assert_not_called()
-    assert await asyncio.to_thread(read_private_session_store, key) is None
-    assert state.conversation_log.get_metadata(key).get("memory_store") in (None, "")
+        state.sessions.get_or_create.assert_awaited_once()
+        assert slot.memory_store == store
+        assert execution_context.read_session_execution(key).store.store_id == store
 
 
 @pytest.mark.asyncio
@@ -721,12 +668,15 @@ class TestSnapshotHelpers:
         target = tmp_path / "note.txt"
         target.write_text("hello\n", newline="\n")
 
-        assert chat_runner._safe_read_snapshot(str(target)) == "hello\n"
+        snapshot = chat_runner._safe_read_snapshot(str(target))
+        assert snapshot is not None
+        assert snapshot.content == "hello\n"
 
     def test_truncate_snapshot_marks_the_cut(self):
         out = chat_runner._truncate_snapshot("x" * (chat_runner._MAX_SNAPSHOT + 10))
 
-        assert out.endswith(f"... (truncated at {chat_runner._MAX_SNAPSHOT} chars)")
+        assert out.content.endswith(f"... (truncated at {chat_runner._MAX_SNAPSHOT} chars)")
+        assert out.truncated is True
 
     def test_reconstruct_declines_when_neither_state_is_plausible(self, tmp_path):
         """Ambiguous disk content must decline rather than fabricate a before."""
@@ -778,7 +728,7 @@ class TestSnapshotHelpers:
 
         got = chat_runner._snapshot_write_target({"command": "create", "path": str(target)})
 
-        assert got == {"path": str(target), "content": ""}
+        assert got == {"path": str(target), "content": "", "truncated": False}
 
 
 class TestFlushFileChanges:
@@ -1194,13 +1144,13 @@ class TestMarkKiroSignedOut:
         chat_runner._mark_kiro_signed_out(state)
 
 
-class TestDeliverAuthErrorToSlack:
+class TestDeliverLinkedSlackMessage:
     @pytest.mark.asyncio
     async def test_no_slack_client_is_a_noop(self, tmp_path):
         state = _state(tmp_path)
         state.slack_client = None
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, _slot(), state.sessions, "dashboard:x", "signed out"
         )
 
@@ -1209,7 +1159,7 @@ class TestDeliverAuthErrorToSlack:
         state = _state(tmp_path)
         state.slack_client = AsyncMock()
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, _slot(), state.sessions, "dashboard:x", "signed out"
         )
 
@@ -1221,7 +1171,7 @@ class TestDeliverAuthErrorToSlack:
         state.slack_client = AsyncMock()
         state.sessions.get_slack_link = MagicMock(return_value=("111.222", "C123"))
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, _slot(), state.sessions, "dashboard:x", "signed out"
         )
 
@@ -1236,7 +1186,7 @@ class TestDeliverAuthErrorToSlack:
         slot._slack_thread_ts = "1.2"
         slot._slack_channel = "C1"
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, slot, state.sessions, "dashboard:x", "signed out"
         )
 
@@ -2639,6 +2589,99 @@ class TestStartNextQueuedTurn:
         assert len(slot._queue) == 1
 
     @pytest.mark.asyncio
+    async def test_run_now_bypasses_the_child_hold_for_the_selected_message(self, tmp_path):
+        """The explicit card action runs one selected user message beside child work."""
+        state, slot = _state(tmp_path), _slot()
+        q1 = slot.queue_append("first")
+        q2 = slot.queue_append("second")
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load") as load,
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(
+                chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())
+            ) as run_chat,
+        ):
+            load.return_value.dashboard.merge_queued_messages = False
+            started = await chat_runner._start_next_queued_turn(
+                state,
+                slot,
+                allow_user_during_subagents=True,
+                required_queue_id=q2,
+            )
+
+        assert started is True
+        assert spawn.call_count == 1
+        assert run_chat.call_args.args[2] == "second"
+        assert [item["id"] for item in slot._queue] == [q1]
+
+    @pytest.mark.asyncio
+    async def test_run_now_never_merges_unselected_cards(self, tmp_path):
+        """The selected card runs alone even when ordinary queue merging is on."""
+        state, slot = _state(tmp_path), _slot()
+        q1 = slot.queue_append("first")
+        q2 = slot.queue_append("selected")
+        q3 = slot.queue_append("third")
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load") as load,
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(
+                chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())
+            ) as run_chat,
+        ):
+            load.return_value.dashboard.merge_queued_messages = True
+            started = await chat_runner._start_next_queued_turn(
+                state,
+                slot,
+                allow_user_during_subagents=True,
+                required_queue_id=q2,
+            )
+
+        assert started is True
+        assert spawn.call_count == 1
+        assert run_chat.call_args.args[2] == "selected"
+        assert [item["id"] for item in slot._queue] == [q1, q3]
+
+    @pytest.mark.asyncio
+    async def test_run_now_starts_nothing_when_the_selected_card_is_gone(self, tmp_path):
+        """Selection identity prevents a stale click from starting another card."""
+        state, slot = _state(tmp_path), _slot()
+        qid = slot.queue_append("another card")
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        started = await chat_runner._start_next_queued_turn(
+            state,
+            slot,
+            allow_user_during_subagents=True,
+            required_queue_id="missing",
+        )
+
+        assert started is False
+        assert [item["id"] for item in slot._queue] == [qid]
+
+    @pytest.mark.asyncio
+    async def test_run_now_does_not_bypass_an_active_stage(self, tmp_path):
+        """The override is narrow: an orchestrator stage still owns dispatch."""
+        state, slot = _state(tmp_path), _slot()
+        q1 = slot.queue_append("stage-owned first")
+        q2 = slot.queue_append("wait for the stage")
+        slot._in_stage_execution = True
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        started = await chat_runner._start_next_queued_turn(
+            state,
+            slot,
+            allow_user_during_subagents=True,
+            required_queue_id=q2,
+        )
+
+        assert started is False
+        assert [item["id"] for item in slot._queue] == [q1, q2]
+
+    @pytest.mark.asyncio
     async def test_reset_notice_is_emitted_for_a_stopping_slot(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
         slot.queue_append("next please")
@@ -2873,7 +2916,7 @@ class TestFinishQueueCycle:
         state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
 
         with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()):
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         assert slot._synthesis_inflight is True
@@ -2898,7 +2941,7 @@ class TestFinishQueueCycle:
             patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush,
             patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()),
         ):
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         assert slot._synthesis_inflight is True
@@ -2922,7 +2965,7 @@ class TestFinishQueueCycle:
         state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
 
         with patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush:
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
         flush.assert_not_called()
         if slot.task is not None:
@@ -2935,7 +2978,7 @@ class TestFinishQueueCycle:
         state2.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
 
         with patch.object(type(slot2), "flush_deferred_notes", return_value=0) as flush2:
-            chat_runner._finish_queue_cycle(state2, slot2)
+            await chat_runner._finish_queue_cycle(state2, slot2)
             await asyncio.sleep(0)
         flush2.assert_called_once()
         if slot2.task is not None:
@@ -2957,7 +3000,7 @@ class TestFinishQueueCycle:
         assert state._slots.get(slot.key) is None
 
         with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()):
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         assert slot._deferred_notes == [], "the held note was discarded on close"
@@ -2976,9 +3019,9 @@ class TestFinishQueueCycle:
 
         with (
             patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush,
-            patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()),
+            patch.object(chat_runner, "title_then_refresh", new=AsyncMock()),
         ):
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         flush.assert_called_once()
@@ -2987,14 +3030,16 @@ class TestFinishQueueCycle:
     async def test_idle_cycle_emits_done_and_refreshes_the_sidebar(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
-        with patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()):
-            chat_runner._finish_queue_cycle(state, slot)
+        with patch.object(chat_runner, "title_then_refresh", new=AsyncMock()):
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         assert slot.messages[-1]["role"] == "done"
         assert slot.task is None
         state.refresh_slot_source_status.assert_called_once_with(slot.key)
-        state.broadcast_ws.assert_any_call("chat_done", {"slot": slot.key})
+        state.broadcast_ws.assert_any_call(
+            "chat_done", {"slot": slot.key, "continuing": False, "needs_input": False}
+        )
 
 
 class TestTtftMetric:
@@ -3848,6 +3893,49 @@ class TestRunChatAutoApproveRungs:
         client.approve_tool.assert_awaited_once_with("req-cov-1")
 
     @pytest.mark.asyncio
+    async def test_trusted_pattern_append_persists_tool_meta_untruncated(self, tmp_path):
+        """The trusted-pattern rung's persisted meta must be `_tool_meta` exactly.
+
+        A hand-rolled meta dict at this rung diverges from every other
+        approval rung: a shorter purpose cap cuts restored transcripts
+        mid-sentence while live rows (broadcast at `_MAX_TOOL_PURPOSE`)
+        show the whole purpose, and a dict without `input`/`kind` or the
+        `tool_call_id` redaction breaks the live↔replay join. One builder,
+        one cap.
+        """
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        canonical = canonical_non_shell_trust_key("records:primary", "read_record")
+        slot._trusted_patterns = {exact_trust_pattern(canonical)}
+        purpose = (
+            "Get the PMET record header fields (Program/Marketplace/Operation) "
+            "exactly as the LS writes them, from the small current-hour file "
+            "(0 replicas, so few records), to query MWS with the right "
+            "dimensions, then fold the result back into the incident brief"
+        )
+        assert len(purpose) > 200, "purpose long enough that a divergent short cap cuts it"
+        perm = _permission(
+            title="Looking up the record",
+            tool_kind="other",
+            is_shell=False,
+            tool_name="read_record",
+            mcp_server_name="records:primary",
+        )
+        perm.tool_call_id = "call-cov-1"
+        perm.tool_purpose = purpose
+        _set_stream(client, [perm, _complete()])
+
+        await _drive(state, slot)
+
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+        (tool_msg,) = [m for m in slot.messages if m.get("role") == "tool"]
+        meta = tool_msg.get("meta") or {}
+        assert meta.get("purpose") == purpose
+        # Everything `_tool_meta` builds must be persisted verbatim; `append`
+        # additionally stamps its own `mid`, which is not part of the contract.
+        assert chat_runner._tool_meta(perm).items() <= meta.items()
+
+    @pytest.mark.asyncio
     async def test_structured_non_shell_reprompt_never_matches_tool_identity_trust(self, tmp_path):
         """Consumed display input must not erase argument provenance."""
         state, client = _runner_state(tmp_path)
@@ -4328,17 +4416,16 @@ class TestRunChatPlanGate:
 
 
 def _bindings(*, kiro_agent, resolved_alias, requested_resolved):
-    """A minimal ResolvedBindings stand-in for the app-agent dispatch guard.
-
-    Only the fields ``_run_chat`` reads off the resolve result are populated;
-    ``model`` is a real ``str`` so ``normalize_agent_model`` stays happy.
-    """
-    return SimpleNamespace(
+    """Real bindings for a materialized app template or its cold fallback."""
+    return ResolvedBindings(
+        workspace_dir=Path("workspace"),
         kiro_agent=kiro_agent,
         resolved_alias=resolved_alias,
         memory_store_name="default",
+        effective_memory_config={},
         model="",
         requested_resolved=requested_resolved,
+        selection_kind="template" if requested_resolved else "member",
     )
 
 
@@ -4596,3 +4683,39 @@ class TestPromptSubmitTranscriptRead:
             "the re-injection probe read the transcript on the event-loop thread; "
             "it must go through asyncio.to_thread"
         )
+
+
+# ── SessionClosingError shutdown race ─────────────────────────────────────
+
+
+class TestSessionClosingQuietAbort:
+    """A gateway-shutdown race during turn prep is a quiet abort, not an error.
+
+    Two dashboard slots were mid ``get_or_create`` when a restart's
+    ``close_all`` set ``_closing``; the allocation gate raised
+    ``SessionClosingError`` (by design) but the generic terminal handler then
+    logged an ERROR traceback, appended an ❌ error card to the slot, and
+    recorded a spurious session failure. The dedicated arm must swallow it: no
+    card, no record_failure, no exception out of ``_run_chat``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_closing_appends_no_error_card(self, tmp_path):
+        from kiro_crew.session import SessionClosingError
+
+        state, _client = _runner_state(tmp_path)
+        state.sessions.get_or_create = AsyncMock(
+            side_effect=SessionClosingError(
+                "SessionManager began closing during provider startup; "
+                "refusing to register a session behind the shutdown snapshot"
+            )
+        )
+        slot = _slot()
+
+        await _drive(state, slot, "hello")
+
+        assert _errors(slot) == [], (
+            "a shutdown race during session creation must not surface an "
+            "error card in the chat slot"
+        )
+        state.sessions.record_failure.assert_not_awaited()

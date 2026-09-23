@@ -72,6 +72,34 @@ describe('ModelEffortDropdown — visible models shortcut', () => {
     expect(onRetryModelVisibility).toHaveBeenCalledOnce()
   })
 
+  it('reports a failed remote roster read and retries in place', () => {
+    // A remote-bound session whose peer capability request errored: without
+    // this surface the picker's only signal is the empty list's "No matches",
+    // which claims the crew has no models rather than that the read failed.
+    const onRetryModels = vi.fn()
+    wrap(<ModelEffortDropdown {...baseProps} models={[]} modelsFailed onRetryModels={onRetryModels} />)
+    expect(screen.getByRole('alert')).toHaveTextContent("Couldn't load the remote crew's models.")
+    // No hand-off next to the composer: navigating away could discard a draft.
+    expect(screen.queryByRole('button', { name: 'Ask the agent' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(onRetryModels).toHaveBeenCalledOnce()
+  })
+
+  it('disables the Retry button while the in-place retry is in flight', () => {
+    // `failed` stays true for the whole refetch round trip, so without this
+    // the button looks dead: nothing on screen acknowledges the click.
+    wrap(
+      <ModelEffortDropdown
+        {...baseProps}
+        models={[]}
+        modelsFailed
+        retryingModels
+        onRetryModels={vi.fn()}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled()
+  })
+
   it('is optional and opens management from between the list and effort controls', () => {
     const onManageModels = vi.fn()
     wrap(<ModelEffortDropdown {...baseProps} hasEffort onManageModels={onManageModels} />)

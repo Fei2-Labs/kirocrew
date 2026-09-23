@@ -37,7 +37,8 @@ import Markdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
-import { rehypeSanitize, remarkVerbatimUnknownTags } from '../../../../components/MarkdownRenderer'
+import { rehypeSanitize, rehypeStableRootKeys, remarkVerbatimUnknownTags } from '../../../../components/MarkdownRenderer'
+import { capWhitespaceRuns, remarkBoundDepth, rehypeBoundRawDepth } from '../../../../utils/markdownDepthBound'
 import { mdImageDestToPath } from '../../../../utils/fileTokens'
 import { copyToClipboard } from '../../../../utils/clipboard'
 import { classifyPlatform } from '../../../../hooks/useGatewayPlatform'
@@ -1671,6 +1672,9 @@ const LocalImage: React.FC<{ path: string; onClickImage?: (src: string) => void 
  */
 const StreamingMarkdown = React.memo<{ content: string }>(({ content }) => {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  // The whitespace-run cap (see markdownDepthBound) is applied per TEXT
+  // segment below, after widget extraction, so a widget body reaches
+  // WidgetFrame byte-identical -- its <pre> indentation included.
   const cleaned = content.replace(/^\n+/, '')
   // If there's a complete widget in the stream, render it
   if (hasWidgets(cleaned)) {
@@ -1684,20 +1688,20 @@ const StreamingMarkdown = React.memo<{ content: string }>(({ content }) => {
           // Last text segment after final widget — still streaming
           if (i > lastWidget) {
             const stripped = seg.content.replace(/<mcwidget[\s\S]*$/, '')
-            const prepared = fixStreamingFences(stripped)
+            const prepared = fixStreamingFences(capWhitespaceRuns(stripped))
             return <React.Fragment key={i}>
               <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{prepared}</Markdown>
               <span style={{ animation: 'blink 1s step-end infinite', display: 'inline-flex', verticalAlign: 'middle' }}><PawPrint size={11} /></span>
             </React.Fragment>
           }
-          return <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{seg.content}</Markdown>
+          return <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(seg.content)}</Markdown>
         })}
       </>
     )
   }
   // Strip any partial/unclosed <mcwidget tag during streaming
   const stripped = cleaned.replace(/<mcwidget[\s\S]*$/, '')
-  const prepared = fixStreamingFences(stripped)
+  const prepared = fixStreamingFences(capWhitespaceRuns(stripped))
   return (
     <>
       <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{prepared}</Markdown>
@@ -1708,8 +1712,9 @@ const StreamingMarkdown = React.memo<{ content: string }>(({ content }) => {
 
 /** Ensure blank line before fences glued to text, and close any unclosed fence. */
 function fixStreamingFences(s: string): string {
-  // Ensure blank line before opening fences glued to preceding text
-  s = s.replace(/([^\n])(\n?)(```\w*\n)/g, (_, pre, nl, fence) =>
+  // The info string is the whole backtick-free line, including attributes and
+  // a leading space, matching the dashboard's FENCE_OPEN.
+  s = s.replace(/([^\n])(\n?)(```[^`\n]*\n)/g, (_, pre, nl, fence) =>
     nl ? pre + nl + fence : pre + '\n\n' + fence
   )
   // If there's an odd number of ``` fences, the last one is unclosed — close it
@@ -1718,7 +1723,11 @@ function fixStreamingFences(s: string): string {
   return s
 }
 
-const MD_REMARK = [remarkGfm, remarkVerbatimUnknownTags]
+// `remarkBoundDepth` first: it bounds the parsed tree's depth inside parse(),
+// ahead of remark-gfm's recursive post-parse transform. Shared with the
+// core renderer, for the same reason the sanitizer is: this panel parses
+// the same untrusted message content through the same kind of pipeline.
+const MD_REMARK = [remarkBoundDepth, remarkGfm, remarkVerbatimUnknownTags]
 /**
  * Raw HTML must be ADMITTED, then SANITIZED — in that order.
  *
@@ -1728,7 +1737,13 @@ const MD_REMARK = [remarkGfm, remarkVerbatimUnknownTags]
  * The sanitizer is the core's, imported rather than copied: admitting raw HTML
  * is exactly the point where a second, drifting allowlist would become a hole.
  */
-const MD_REHYPE = [rehypeRaw, rehypeSanitize]
+// ``rehypeStableRootKeys`` goes LAST, after ``rehypeSanitize``, and the order is
+// load-bearing rather than cosmetic: the sanitizer keeps only allowlisted
+// attributes, and ``style`` is on neither the global list nor any list for
+// ``div``. Ahead of it the wrapper would lose ``display: contents`` and become a
+// real layout box around every block, which is a visible regression that the
+// keys it stabilises would not reveal.
+const MD_REHYPE = [rehypeBoundRawDepth, rehypeRaw, rehypeSanitize, rehypeStableRootKeys]
 
 /**
  * Typed against react-markdown's own `Components`, so each override receives the
@@ -1756,7 +1771,9 @@ const mdComponents: Components = {
   th: (p) => <th style={{ border: '1px solid var(--border)', padding: '3px 6px', textAlign: 'left', fontWeight: 600 }} {...p} />,
   td: (p) => <td style={{ border: '1px solid var(--border)', padding: '3px 6px' }} {...p} />,
   code: (p) => {
-    const match = /language-(\w+)/.exec(p.className || '')
+    // Whole class token, not its leading `\w+` run: `language-error-report`
+    // labels as `error-report`, not `error` (same rule as MarkdownRenderer).
+    const match = /language-(\S+)/.exec(p.className || '')
     if (match) {
       return <MochiCodeBlock lang={match[1]} code={String(p.children).replace(/\n$/, '')} />
     }
@@ -2084,8 +2101,14 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
                       ellipsis would re-collide the very labels the 64-char budget
                       distinguishes. minWidth:0 lets the flex item shrink;
                       overflowWrap:'anywhere' lets an unbreakable run (a sha, a
-                      base64 arg) wrap instead of clipping past the panel edge. */}
-                  <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+                      base64 arg) wrap instead of clipping past the panel edge.
+                      whiteSpace:'pre-wrap' because the default COLLAPSES runs of
+                      whitespace, which for an exact-string grant is an elision
+                      one character wide: `grep "a  b" f` would render as
+                      `grep "a b" f` while granting the two-space string. The
+                      budget clamp above is a layout decision for this narrow
+                      column; collapsing whitespace earns nothing anywhere. */}
+                  <span style={{ minWidth: 0, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
                     {i18nT('apps.mochi.approval.trust_this_command', { cmd: truncateCommandLabel(req.fullCommand) })}
                   </span></button>
               )}
@@ -2196,14 +2219,14 @@ export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: strin
                     return <>
                       {segments.map((seg, i) => seg.type === 'widget'
                         ? <WidgetFrame key={i} html={seg.content} title={seg.title} />
-                        : <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{seg.content}</Markdown>
+                        : <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(seg.content)}</Markdown>
                       )}
                       {images.map((p, i) => <LocalImage key={`img-${i}`} path={p} onClickImage={onImageClick} />)}
                     </>
                   }
 
                   return <>
-                    {cleanText && <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{cleanText}</Markdown>}
+                    {cleanText && <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(cleanText)}</Markdown>}
                     {images.map((p, i) => <LocalImage key={i} path={p} onClickImage={onImageClick} />)}
                   </>
                 })()

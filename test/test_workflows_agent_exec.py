@@ -14,11 +14,14 @@ See GATES (M6) and docs/system-specs/modules/workflows.md.
 
 from __future__ import annotations
 
+import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import kiro_crew.workflows.agent_exec as agent_exec
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.workflows.agent_exec import build_agent_fn
 
 pytestmark = pytest.mark.asyncio
@@ -106,7 +109,7 @@ async def test_two_default_calls_get_distinct_sessions() -> None:
     assert all(k.startswith("wf:wf_y:") for k in keys)
 
 
-async def test_opts_and_defaults_flow_into_get_or_create() -> None:
+async def test_opts_and_defaults_flow_into_get_or_create(tmp_path, monkeypatch) -> None:
     sessions = FakeSessions()
     fn = build_agent_fn(sessions, run_id="wf_z", default_agent="researcher", default_model="m1")
 
@@ -118,11 +121,26 @@ async def test_opts_and_defaults_flow_into_get_or_create() -> None:
         "extra_env": None,
     }
 
-    await fn("p", {"agent": "coder", "model": "m2", "cwd": "/tmp/x"})  # opts override
+    # A per-call cwd answers the same allowlist ``spawn_run`` answers (a step is a
+    # spawn), so the override is exercised under a root the operator allows. What
+    # flows through is the resolved realpath, as on the spawn path.
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    monkeypatch.setattr(
+        KiroCrewConfig,
+        "load",
+        classmethod(
+            lambda cls: SimpleNamespace(
+                agent=SimpleNamespace(subagent_cwd_allowed_roots=[os.path.realpath(str(tmp_path))])
+            )
+        ),
+    )
+
+    await fn("p", {"agent": "coder", "model": "m2", "cwd": str(work_dir)})  # opts override
     assert sessions.created[-1][1] == {
         "agent": "coder",
         "model": "m2",
-        "cwd": "/tmp/x",
+        "cwd": os.path.realpath(str(work_dir)),
         "extra_env": None,
     }
 
@@ -190,3 +208,29 @@ async def test_agent_step_persists_usage_row_with_surface() -> None:
     assert kwargs["agent"] == "researcher"
     assert kwargs["context_used"] == 42
     assert kwargs["context_window"] == 200000
+
+
+@pytest.mark.parametrize("opts", [{}, {"session": "chain-A"}])
+async def test_identity_is_published_before_each_agent_turn(monkeypatch, opts):
+    from kiro_crew.messaging import identity
+
+    sessions = FakeSessions()
+    events = []
+
+    async def publish(owner, key):
+        assert owner is sessions
+        assert sessions.created[-1][0] == key
+        events.append(("publish", key))
+
+    async def stream(provider, message, **kwargs):
+        assert events[-1] == ("publish", provider.key)
+        events.append(("stream", provider.key))
+        return "done"
+
+    monkeypatch.setattr(identity, "publish_turn_identity", publish)
+    monkeypatch.setattr(agent_exec, "stream_and_collect", stream)
+    agent = build_agent_fn(sessions, run_id="wf_identity")
+    assert await agent("first", opts) == "done"
+    assert await agent("second", opts) == "done"
+    assert [event for event, _ in events] == ["publish", "stream", "publish", "stream"]
+    assert sessions.released == [key for key, _ in sessions.created]

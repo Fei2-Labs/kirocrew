@@ -468,7 +468,10 @@ def test_explicit_cli_target_bypasses_collect_ignore(tmp_path) -> None:
         # run's options. An inherited `--basetemp` there points at an ancestor of
         # this child's cwd (its tmp_path), which pytest rejects as a usage error
         # (exit 4) before it ever evaluates collect_ignore -- turning this
-        # collection-semantics assertion into a spurious failure.
+        # collection-semantics assertion into a spurious failure. The child gets
+        # its own basetemp under this test's tmp_path instead, so it never shares
+        # (or prunes) the per-user `pytest-of-<user>` tree with the outer run's
+        # xdist workers or with another run on the host.
         child_env = {k: v for k, v in os.environ.items() if k != "PYTEST_ADDOPTS"}
         return subprocess.run(
             [
@@ -481,6 +484,7 @@ def test_explicit_cli_target_bypasses_collect_ignore(tmp_path) -> None:
                 "-p",
                 "no:randomly",
                 "--no-cov",
+                f"--basetemp={tmp_path / 'basetemp'}",
                 *target,
             ],
             cwd=tmp_path,

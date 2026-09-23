@@ -3,10 +3,11 @@
 `redact_credentials` is the redaction boundary: a regression here writes live
 credentials into persisted chat history. The optimisation it guards is pure
 control flow — a pre-filter that skips a scan already known to be empty, one
-shared base64 scan feeding two passes, and a chunk decode that does not
-re-scan its own input. None of it may change output, so this module pins the
-ORIGINAL three-pass implementation as a reference oracle and asserts the live
-function is byte-identical to it, on both the returned text AND the warnings.
+shared base64 scan feeding two passes, a chunk decode that does not re-scan
+its own input, and a bisect-backed span subtraction. None of it may change
+output, so this module pins a plain, unoptimised three-pass implementation as
+a reference oracle and asserts the live function is byte-identical to it, on
+both the returned text AND the warnings.
 
 The oracle deliberately reuses the module's own compiled patterns and gate
 helpers, so what it isolates is exactly the control-flow change. Pattern edits
@@ -31,6 +32,7 @@ from kiro_crew.security import (
     _PREFILTER_MIN_LEN,
     _PRINTABLE_BYTES,
     _REDACTED_CREDENTIAL_TAG,
+    _REDACTED_ENCODED_CREDENTIAL_TAG,
     _SECRET_PRINTABLE_DECODE_RATIO,
     _contains_bare_secret,
     _decode_b64_chunk,
@@ -39,57 +41,128 @@ from kiro_crew.security import (
     _might_contain_credential,
     redact_credentials,
 )
+from kiro_crew.security.redaction import (
+    _HTML_REF_AMP,
+    _HTML_REF_EQUALS,
+    _HTML_REF_QUEST,
+    _TOKEN_PARAM_NAME_RE,
+    _TOKEN_PARAM_VALUE_CLASS,
+)
+
+# Mirror the live pass-4 wrapper exactly while keeping the oracle's span and
+# control-flow implementation independent. The name fold is ASCII-scoped so
+# parser-distinct Unicode lookalikes are not treated as `token`.
+_REFERENCE_TOKEN_PARAM_SEP_RE = rf"(?:[?&]|{_HTML_REF_AMP}|{_HTML_REF_QUEST})"
+_REFERENCE_TOKEN_PARAM_EQ_RE = rf"(?:=|{_HTML_REF_EQUALS})"
+_REFERENCE_TOKEN_PARAM_RE = re.compile(
+    rf"{_REFERENCE_TOKEN_PARAM_SEP_RE}(?ai:{_TOKEN_PARAM_NAME_RE})"
+    rf"{_REFERENCE_TOKEN_PARAM_EQ_RE}({_TOKEN_PARAM_VALUE_CLASS}+)"
+)
 
 # ── Reference oracle: the implementation as it stood before the optimisation ──
 
 
+def _reference_uncovered(
+    start: int, end: int, taken: list[tuple[int, int, str]]
+) -> list[tuple[int, int]]:
+    """The parts of ``[start, end)`` no span in *taken* covers, by plain scan.
+
+    Deliberately linear and bisect-free so it shares nothing with the live
+    ``_uncovered`` helper beyond the definition of the answer.
+    """
+    gaps: list[tuple[int, int]] = []
+    cursor = start
+    for s, e, _ in sorted(taken):
+        if e <= cursor or s >= end:
+            continue
+        if s > cursor:
+            gaps.append((cursor, s))
+        cursor = max(cursor, e)
+    if cursor < end:
+        gaps.append((cursor, end))
+    return gaps
+
+
 def _reference_redact_credentials(text: str) -> tuple[str, list[str]]:
-    """The original three-pass body. Do not "optimise" this.
+    """The three-pass body, positioned by span, with no shortcuts. Do not "optimise" this.
 
-    Pass 1 is the ONE deliberate divergence from the pre-optimisation source.
-    The original wrote ``result.replace(matched, tag, 1)``, which replaces the
-    first occurrence of the matched *text* rather than the span the regex
-    actually matched. When an earlier, NON-matching lookalike contains the
-    matched text as a substring (``xM<jwt>`` before a boundary-anchored
-    ``M<jwt>``), the original redacted the innocent lookalike and left the real
-    credential in the output in plaintext -- a genuine leak, not a cosmetic
-    difference. See ``test_matched_span_is_redacted_not_an_earlier_lookalike``.
+    Every pass records ``(start, end, tag)`` against the ORIGINAL ``text`` and
+    the string is rebuilt once at the end. The pre-optimisation source wrote
+    ``result.replace(matched, tag, 1)`` in every pass, which replaces the first
+    occurrence of the matched *text* rather than the span the regex actually
+    matched. When an earlier, NON-matching lookalike contains the matched text
+    as a substring (``xM<jwt>`` before a boundary-anchored ``M<jwt>``; a
+    decodable base64 chunk inside a longer run that does not decode; a bare key
+    inside a longer run the slash ceiling declines), that shape redacted the
+    innocent host and left the real credential in the output in plaintext -- a
+    genuine leak, not a cosmetic difference. See
+    ``test_matched_span_is_redacted_not_an_earlier_lookalike`` and the two
+    ``test_hosted_*`` tests beside it.
 
-    Passes 2 and 3 keep the ``.replace(..., 1)`` shape because they scan the
-    ORIGINAL ``text`` and select spans by value, and because production keeps
-    them as separate passes deliberately (see the comment in
-    ``security.redact_credentials``); their latent equivalent is out of scope
-    here and is NOT fixed by this oracle.
+    Precedence between passes is positional: pass 1 outranks pass 2 outranks
+    pass 3, and a later pass redacts only the part of its span an earlier pass
+    has not already claimed. Pass 2 warns for every chunk that decodes to a
+    credential (its warning counts credentials found, as the original did);
+    pass 3 warns only when it splices something.
     """
     warnings: list[str] = []
-    result = text
+    taken: list[tuple[int, int, str]] = []
 
-    # 1. plaintext credential patterns — ungated full scan, positionally exact
-    def _redact_one(m: "re.Match[str]") -> str:
+    # 1. plaintext credential patterns — ungated full scan
+    for m in _CREDENTIAL_PATTERNS.finditer(text):
         warnings.append(f"Redacted credential pattern ({len(m.group())} chars)")
-        return _REDACTED_CREDENTIAL_TAG
-
-    result = _CREDENTIAL_PATTERNS.sub(_redact_one, result)
+        taken.append((m.start(), m.end(), _REDACTED_CREDENTIAL_TAG))
 
     # 2. base64-encoded credentials — own scan, decode via the generic helper
+    pass2: list[tuple[int, int, str]] = []
     for m in _B64_CHUNK_RE.finditer(text):
         chunk = m.group()
         decoded = _decode_b64_safe(chunk)
         if decoded:
-            result = result.replace(chunk, "[REDACTED: encoded credential]", 1)
             warnings.append(f"Redacted base64-encoded credential ({len(chunk)} chars)")
+            for start, end in _reference_uncovered(m.start(), m.end(), taken):
+                pass2.append((start, end, "[REDACTED: encoded credential]"))
+    taken = sorted(taken + pass2)
 
     # 3. bare 40-char AWS secret keys — own separate scan
+    pass3: list[tuple[int, int, str]] = []
     for m in _BARE_SECRET_RUN_RE.finditer(text):
         run = m.group()
         if not _contains_bare_secret(run):
             continue
-        if run not in result:
+        gaps = _reference_uncovered(m.start(), m.end(), taken)
+        if not gaps:
             continue
-        result = result.replace(run, _REDACTED_CREDENTIAL_TAG, 1)
+        for start, end in gaps:
+            pass3.append((start, end, _REDACTED_CREDENTIAL_TAG))
         warnings.append(f"Redacted bare secret key ({len(run)} chars)")
+    taken = sorted(taken + pass3)
 
-    return result, warnings
+    # 4. `?token=` / `&token=` parameter values — ungated full scan, value
+    # group only, skipping a value that is already a fixed credential tag.
+    pass4: list[tuple[int, int, str]] = []
+    for m in _REFERENCE_TOKEN_PARAM_RE.finditer(text):
+        # Byte identity only: trust the two fixed credential literals, never a shape.
+        if any(
+            text.startswith(tag, m.start(1))
+            for tag in ("[REDACTED: credential]", "[REDACTED: encoded credential]")
+        ):
+            continue
+        gaps = _reference_uncovered(m.start(1), m.end(1), taken)
+        if not gaps:
+            continue
+        for start, end in gaps:
+            pass4.append((start, end, _REDACTED_CREDENTIAL_TAG))
+        warnings.append(f"Redacted token parameter value ({m.end(1) - m.start(1)} chars)")
+
+    out: list[str] = []
+    cursor = 0
+    for start, end, tag in sorted(taken + pass4):
+        out.append(text[cursor:start])
+        out.append(tag)
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out), warnings
 
 
 # ── One sample per top-level branch of _CREDENTIAL_PATTERNS, in branch order ──
@@ -231,6 +304,20 @@ _SHORT_DECODE_BLOB = base64.b64encode(bytes([0x80] * 30)).decode()
 _ENCODED_CRED_STEM = (
     base64.b64encode(f"aws_secret_access_key={AWS_SECRET}".encode()).decode().rstrip("=")
 )
+# ── Hosting shapes: a redactable value that ALSO occurs inside an earlier, longer
+# run which is itself NOT redactable. Redacting by value lands the tag inside the
+# host and leaves the standalone credential in plaintext. ──
+# Pass 2: 42 raw bytes -> 56 base64 chars, no padding, so prefixing one
+# alphabet char yields a 57-char run that cannot decode (length % 4 == 1).
+_HOSTED_ENCODED_CRED = base64.b64encode(b"ghp_" + b"a" * 38).decode()
+_ENCODED_CRED_HOST = "Q" + _HOSTED_ENCODED_CRED
+# Pass 3: a key-shaped 40-char token carrying FOUR slashes. Standing alone it is a
+# bare secret (a 40-char run is the token somebody wrote, so the separator ceiling
+# does not apply); inside a 41-char run every window either is this token (four
+# slashes, over the ceiling) or starts on the leading slash (five), so the host
+# run is declined and survives.
+_SLASHY_SECRET = "wJalrXUtnF/MI/K7MDENG/bPxRf/CYEXAMPLEKEY"
+_SLASHY_SECRET_HOST = "/" + _SLASHY_SECRET
 
 
 def _corpus() -> list[str]:
@@ -255,6 +342,29 @@ def _corpus() -> list[str]:
         # bare 40-char AWS secret keys
         AWS_SECRET,
         f"key is {AWS_SECRET} ok",
+        # a bare secret AS a `?token=` value: pass 3 claims the value, pass 4
+        # must find no gap. This is the mutation pin for the
+        # `taken = sorted(taken + pass3)` fold ahead of pass 4 — without it,
+        # pass 4 re-claims the same span, `_splice` gets overlapping spans and
+        # the output doubles the tag, which the byte-identical differential
+        # then catches. Legacy-equivalent: legacy pass 3 replaces the same
+        # value and pass 4 does not exist there, so outputs agree.
+        f"?token={AWS_SECRET}",
+        # Percent-encoded and HTML-reference near misses stay legacy-equivalent:
+        # none becomes a token-parameter delimiter after the one decode performed
+        # by its owning parser stage.
+        "?to%6Aen=x",
+        "?to%6gen=x",
+        "&amptoken=Xk9fQ2mP4nR7sT1v",
+        "&Amp;token=Vb3nHj8LqW2zYc5d",
+        "&questtoken=Wq7dRt2xKp9mZv4c",
+        "?token&equalsQp4mXk9fR2vN7sT1",
+        "&amp;amp;token=Mn8qR3tV6xZ1cK5p",
+        "%26token=Yc5dVb3nHj8LqW2z",
+        "?token%3DXk9fQ2mP4nR7sT1v",
+        "&#382token=Vb3nHj8LqW2zYc5d",
+        "?token&#61123abcWq7dRt2xKp9mZv4c",
+        "&#00000000038;token=Qp4mXk9fR2vN7sT1",
         # the sliding-window cases the existing comment calls out explicitly
         glued,
         AWS_SECRET + "A",
@@ -332,11 +442,150 @@ def _corpus() -> list[str]:
         _ENCODED_CRED_STEM + "==",
         _ENCODED_CRED_STEM,
         f"payload {_ENCODED_CRED_STEM}= end",
+        # ── positional shapes on which redacting by value happened to land right ──
+        # The standalone credential comes FIRST, so the value's first occurrence
+        # is its own span and the legacy redactor agrees with the by-span one.
+        f"{_HOSTED_ENCODED_CRED} {_ENCODED_CRED_HOST}",
+        f"{_SLASHY_SECRET} {_SLASHY_SECRET_HOST}",
+        # The same value twice, once inside a labelled match and once bare: the
+        # bare one is judged on its own span, not on whether the value remains.
+        f"aws_secret_access_key={AWS_SECRET} {AWS_SECRET}",
+        f"{AWS_SECRET} aws_secret_access_key={AWS_SECRET}",
     ]
     return cases
 
 
-CORPUS = _corpus()
+# Every shape on which the legacy by-value redactor and the by-span one
+# disagree, paired with the plaintext the legacy output KEEPS and the by-span
+# output removes. Kept apart from `_corpus()` so the legacy-equivalence test
+# below can assert agreement on everything else and disagreement on exactly
+# these.
+LEGACY_DIVERGENT_SHAPES: tuple[tuple[str, str], ...] = (
+    # A decodable chunk hosted inside an earlier non-decodable run (pass 2): the
+    # legacy tag lands inside the host and the WHOLE standalone chunk survives.
+    (f"{_ENCODED_CRED_HOST} {_HOSTED_ENCODED_CRED}", f" {_HOSTED_ENCODED_CRED}"),
+    # A bare key hosted inside an earlier declined run (pass 3): same, the whole
+    # standalone key survives.
+    (f"{_SLASHY_SECRET_HOST} {_SLASHY_SECRET}", f" {_SLASHY_SECRET}"),
+    # A glued key whose tail is the first word of the label that follows it.
+    # Legacy skips the run (its tail is gone), then the labelled value's own
+    # pass-3 lookup lands inside the run by coincidence of equal text and
+    # redacts exactly the key, leaving the glue around it. With a DIFFERENT
+    # labelled value that coincidence is gone and the glued key leaks whole; the
+    # by-span redactor removes the whole run either way.
+    (f"D{AWS_SECRET}ZGHUT8aws_secret_access_key={AWS_SECRET}", "ZGHUT8"),
+    # A run whose head pass 1 took (`sk-proj-` consumes alphanumerics up to the
+    # first slash): legacy skips the run and the key's 26-char tail survives.
+    (f"sk-proj-{'a' * 20}Z{AWS_SECRET}", AWS_SECRET[14:]),
+    # Pass-4 shapes: an OPAQUE `?token=` / `&token=` value. Divergent for a
+    # different reason than the rows above -- the legacy oracle is the shipped
+    # pre-pass-4 behaviour, so it has no parameter-name pass at all and keeps
+    # the value verbatim; the live redactor and the by-span reference both
+    # remove it. The value is deliberately non-`eyJ` and far under the 40-char
+    # bare-secret floor, so no shape-based pass can mask the divergence.
+    (
+        "open https://host.example.com/?token=Xk9fQ2mP4nR7sT1v now",
+        "Xk9fQ2mP4nR7sT1v",
+    ),
+    (
+        "https://h.example/x?a=1&token=Vb3nHj8LqW2zYc5d&b=2",
+        "Vb3nHj8LqW2zYc5d",
+    ),
+    # The parameter NAME folds case; the value bytes do not.
+    (
+        "see https://h.example/?TOKEN=Wq7dRt2xKp9mZv4c now",
+        "Wq7dRt2xKp9mZv4c",
+    ),
+    # Standard query parsers percent-decode names after splitting raw `&`/`=`.
+    # These single-encoded names therefore authenticate as `token`, while the
+    # legacy oracle has no token-parameter pass and keeps each opaque value.
+    (
+        "see https://h.example/?to%6ben=Qp4mXk9fR2vN7sT1 now",
+        "Qp4mXk9fR2vN7sT1",
+    ),
+    (
+        "see https://h.example/?%74%6F%6B%65%6E=Mn8qR3tV6xZ1cK5p now",
+        "Mn8qR3tV6xZ1cK5p",
+    ),
+    (
+        "see https://h.example/?to%6Ben=Yc5dVb3nHj8LqW2z now",
+        "Yc5dVb3nHj8LqW2z",
+    ),
+    # HTML references decoded in an attribute before query parsing are the same
+    # pass-4 token parameter as their raw `&`, `?`, and `=` spellings. The
+    # pre-pass-4 legacy oracle keeps each opaque value, while live and reference
+    # pass 4 remove it.
+    ("see &amp;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &AMP;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &amp%74oken=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &AMP%74oken=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#38;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#38token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#0000000038;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#x26;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#X26token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#x0000000026;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &quest;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#63;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#63token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#0000000063;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#x3F;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#X3ftoken=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see &#x000000003F;token=Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see ?token&equals;Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see ?token&#61;Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see ?token&#61Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see ?token&#0000000061;Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see ?token&#x3D;Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see ?token&#X3dXk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+    ("see ?token&#x000000003D;Xk9fQ2mP4nR7sT1v now", "Xk9fQ2mP4nR7sT1v"),
+)
+
+LEGACY_EQUIVALENT_CORPUS = _corpus()
+CORPUS = LEGACY_EQUIVALENT_CORPUS + [text for text, _ in LEGACY_DIVERGENT_SHAPES]
+
+
+# ── The by-value redactor this change retires, kept verbatim as a second oracle ──
+
+
+def _legacy_redact_credentials(text: str) -> tuple[str, list[str]]:
+    """Passes 2 and 3 as they shipped before the by-span rewrite. Do not fix this.
+
+    This is the SHIPPED behaviour, leak included, so that the rewrite's two
+    claims are both checked in CI rather than asserted in a PR body: on every
+    shape where redacting by value happened to land on the right span, the
+    by-span redactor is byte-identical to it, warnings included
+    (``test_by_span_agrees_with_legacy_wherever_legacy_landed_right``); and on
+    each divergent shape the legacy redactor keeps plaintext the by-span one
+    removes (``test_legacy_diverges_on_every_by_span_shape``). The by-span
+    oracle above shares its algorithm with the live function, so it cannot
+    carry either claim on its own.
+    """
+    warnings: list[str] = []
+    result = text
+
+    def _redact_one(m: "re.Match[str]") -> str:
+        warnings.append(f"Redacted credential pattern ({len(m.group())} chars)")
+        return _REDACTED_CREDENTIAL_TAG
+
+    result = _CREDENTIAL_PATTERNS.sub(_redact_one, result)
+
+    for m in _B64_CHUNK_RE.finditer(text):
+        chunk = m.group()
+        if _decode_b64_safe(chunk):
+            result = result.replace(chunk, "[REDACTED: encoded credential]", 1)
+            warnings.append(f"Redacted base64-encoded credential ({len(chunk)} chars)")
+
+    for m in _BARE_SECRET_RUN_RE.finditer(text):
+        run = m.group()
+        if not _contains_bare_secret(run):
+            continue
+        if run not in result:
+            continue
+        result = result.replace(run, _REDACTED_CREDENTIAL_TAG, 1)
+        warnings.append(f"Redacted bare secret key ({len(run)} chars)")
+
+    return result, warnings
 
 
 # ── Differential assertions ──
@@ -345,6 +594,42 @@ CORPUS = _corpus()
 @pytest.mark.parametrize("text", CORPUS, ids=range(len(CORPUS)))
 def test_output_is_byte_identical_to_reference(text: str) -> None:
     assert redact_credentials(text) == _reference_redact_credentials(text)
+
+
+def test_reference_token_entity_case_matches_whatwg_decoding() -> None:
+    """The independent pass-4 wrapper keeps named refs case-sensitive."""
+    opaque = "Xk9fQ2mP4nR7sT1v"
+    for name in ("&PERCNT;74oken", "&PerCnt;74oken"):
+        text = f"?{name}={opaque}"
+        assert redact_credentials(text) == _reference_redact_credentials(text) == (text, [])
+
+    for name in ("&percnt;74oken", "&#X25;74oken"):
+        text = f"?{name}={opaque}"
+        expected = (
+            f"?{name}=[REDACTED: credential]",
+            ["Redacted token parameter value (16 chars)"],
+        )
+        assert redact_credentials(text) == _reference_redact_credentials(text) == expected
+
+
+@pytest.mark.parametrize("text", LEGACY_EQUIVALENT_CORPUS, ids=range(len(LEGACY_EQUIVALENT_CORPUS)))
+def test_by_span_agrees_with_legacy_wherever_legacy_landed_right(text: str) -> None:
+    """Outside the leak shapes, the rewrite changes nothing: text nor warning order."""
+    assert redact_credentials(text) == _legacy_redact_credentials(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "legacy_keeps"),
+    LEGACY_DIVERGENT_SHAPES,
+    ids=range(len(LEGACY_DIVERGENT_SHAPES)),
+)
+def test_legacy_diverges_on_every_by_span_shape(text: str, legacy_keeps: str) -> None:
+    """Each divergent shape is a real pin: legacy keeps plaintext the rewrite removes."""
+    legacy_text, _ = _legacy_redact_credentials(text)
+    live_text, _ = redact_credentials(text)
+    assert legacy_text != live_text
+    assert legacy_keeps in legacy_text, "corpus assumption: the legacy redactor kept this"
+    assert legacy_keeps not in live_text, "the by-span redactor left plaintext behind"
 
 
 def test_matched_span_is_redacted_not_an_earlier_lookalike() -> None:
@@ -367,12 +652,104 @@ def test_matched_span_is_redacted_not_an_earlier_lookalike() -> None:
     assert warnings == [f"Redacted credential pattern ({len(token)} chars)"]
 
 
+def test_hosted_encoded_credential_is_redacted_at_its_own_span() -> None:
+    """Pass 2 must redact the chunk that decoded, not an earlier host of it.
+
+    ``_ENCODED_CRED_HOST`` is one alphabet char glued to the encoded credential:
+    a 57-char run that cannot decode, so pass 2 skips it and it survives. The
+    standalone chunk that follows DOES decode. ``result.replace(chunk, tag, 1)``
+    found the chunk's first occurrence -- inside the host -- and the real
+    encoded credential was emitted verbatim.
+    """
+    assert not _decode_b64_chunk(_ENCODED_CRED_HOST), "corpus assumption: the host cannot decode"
+    assert _decode_b64_chunk(_HOSTED_ENCODED_CRED), "corpus assumption: the chunk decodes"
+    text = f"{_ENCODED_CRED_HOST} {_HOSTED_ENCODED_CRED}"
+    assert not _CREDENTIAL_PATTERNS.search(text), "corpus assumption: pass 1 stays out"
+
+    redacted, warnings = redact_credentials(text)
+
+    assert f" {_HOSTED_ENCODED_CRED}" not in redacted, "the encoded credential survived redaction"
+    assert redacted == f"{_ENCODED_CRED_HOST} {_REDACTED_ENCODED_CREDENTIAL_TAG}"
+    assert warnings == [f"Redacted base64-encoded credential ({len(_HOSTED_ENCODED_CRED)} chars)"]
+
+
+def test_hosted_bare_secret_is_redacted_at_its_own_span() -> None:
+    """Pass 3 must redact the run that was judged a key, not an earlier host.
+
+    ``_SLASHY_SECRET_HOST`` is a slash glued to a four-slash key: every 40-char
+    window of the 41-char run carries more slashes than the fragment ceiling
+    allows, so the host is declined and survives. The standalone key that
+    follows is exactly 40 chars, exempt from the ceiling, and IS a bare secret.
+    The ``run not in result`` guard saw the key's text inside the host and
+    ``result.replace(run, tag, 1)`` redacted the host instead.
+    """
+    assert not _contains_bare_secret(_SLASHY_SECRET_HOST), "corpus assumption: the host is declined"
+    assert _contains_bare_secret(_SLASHY_SECRET), "corpus assumption: the key is a bare secret"
+    text = f"{_SLASHY_SECRET_HOST} {_SLASHY_SECRET}"
+    assert not _CREDENTIAL_PATTERNS.search(text), "corpus assumption: pass 1 stays out"
+    assert not any(
+        _decode_b64_chunk(m.group()) for m in _B64_CHUNK_RE.finditer(text)
+    ), "corpus assumption: pass 2 stays out"
+
+    redacted, warnings = redact_credentials(text)
+
+    assert f" {_SLASHY_SECRET}" not in redacted, "the bare key survived redaction"
+    assert redacted == f"{_SLASHY_SECRET_HOST} {_REDACTED_CREDENTIAL_TAG}"
+    assert warnings == [f"Redacted bare secret key ({len(_SLASHY_SECRET)} chars)"]
+
+
+def test_partly_claimed_run_keeps_no_plaintext() -> None:
+    """A later pass redacts whatever of its span an earlier pass left standing.
+
+    A key glued to the ``aws`` of a following ``aws_secret_access_key=`` label
+    forms one base64 run whose last three chars pass 1 claims. The run as a
+    whole is a bare secret; skipping it because part of it is gone would leave
+    the glued key in plaintext, and re-redacting the claimed tail would
+    corrupt the pass-1 tag. Only the unclaimed head is spliced.
+    """
+    run = f"D{AWS_SECRET}ZGHUT8aws"
+    text = f"D{AWS_SECRET}ZGHUT8aws_secret_access_key={AWS_SECRET}"
+    assert [m.group() for m in _B64_CHUNK_RE.finditer(text)] == [run, AWS_SECRET]
+    assert _contains_bare_secret(run), "corpus assumption: the glued run is a bare secret"
+
+    redacted, warnings = redact_credentials(text)
+
+    assert AWS_SECRET not in redacted
+    assert redacted == f"{_REDACTED_CREDENTIAL_TAG}{_REDACTED_CREDENTIAL_TAG}"
+    assert warnings == [
+        f"Redacted credential pattern ({len(text) - len(run) + 3} chars)",
+        f"Redacted bare secret key ({len(run)} chars)",
+    ]
+
+
+def test_redact_credentials_never_substitutes_by_value() -> None:
+    """The redactor splices spans; ``str.replace`` on a matched value is the defect class.
+
+    Walks the function's AST rather than its text so the docstring, which names
+    the defect it retired, does not count.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(redact_credentials)))
+    replace_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "replace"
+    ]
+    assert replace_calls == [], "redact_credentials must position every redaction by span"
+
+
 def test_corpus_actually_exercises_every_pass() -> None:
     """A differential corpus that never triggers a pass proves nothing about it."""
     kinds = {w.split("(")[0].strip() for text in CORPUS for w in redact_credentials(text)[1]}
     assert "Redacted credential pattern" in kinds
     assert "Redacted base64-encoded credential" in kinds
     assert "Redacted bare secret key" in kinds
+    assert "Redacted token parameter value" in kinds
 
 
 def test_warnings_never_carry_secret_material() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,7 +28,31 @@ from kiro_crew.taskrunner import (
 from kiro_crew.workflows.service import WorkflowService
 from kiro_crew.workflows.store import WorkflowRunStore
 
+# Bound for a wait on state that MUST arrive but whose latency the host controls
+# (an executor hop, an fsync). Returns as soon as the state is observed, so the
+# value only matters when the test is about to fail by name instead of hanging.
+_GENEROUS_DEADLINE = 30.0
+
 # ── Fixtures ──
+
+
+def _non_git_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str) -> Path:
+    """A directory ``init_workspace`` must treat as NOT a repository, on any host.
+
+    "Non-git dir" is not a property ``tmp_path`` has everywhere: a harness that
+    pins ``TMPDIR`` under the checkout gives it a real ``.git`` among its
+    ancestors, ``git rev-parse --is-inside-work-tree`` answers yes, and the run
+    then adds a REAL worktree and task branch to the enclosing repository -- the
+    very thing the non-git path exists to avoid. ``GIT_CEILING_DIRECTORIES`` is
+    git's own seam for that upward walk (discovery stops below the named
+    directory) and the spawn inherits ``os.environ``, so the state is constructed
+    here rather than assumed of the host. The directory is a CHILD of the ceiling
+    because git checks its starting directory before consulting the ceiling.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    work = tmp_path / name
+    work.mkdir()
+    return work
 
 
 def _make_mock_sessions() -> MagicMock:
@@ -71,6 +96,50 @@ def _make_mock_provider(text: str = "done") -> MagicMock:
     provider.reject_tool = AsyncMock()
     provider.context_usage_pct = MagicMock(return_value=0.0)
     return provider
+
+
+@asynccontextmanager
+async def _at_workflow_checkpoint(runner, operation, release, checkpoint="_workflow_begin"):
+    """Finish real workflow setup before timing the cancellation trigger.
+
+    Registration allocates a protected ID and persists off-loop, including ACL
+    work on Windows. That setup is not the persistence/publication cancellation
+    being tested. Keep it real, but hold its last checkpoint until the test is
+    ready to start its one-second entry-event wait.
+    """
+    ready = asyncio.get_running_loop().create_future()
+    proceed = asyncio.Event()
+    original = getattr(runner, checkpoint)
+
+    async def prepared(run, *args, **kwargs):
+        await original(run, *args, **kwargs)
+        assert run.workflow_run_id
+        assert runner._workflow_service.status(run.workflow_run_id) is not None
+        ready.set_result(None)
+        await proceed.wait()
+
+    with patch.object(runner, checkpoint, prepared):
+        task = asyncio.create_task(operation)
+        try:
+            done, _ = await asyncio.wait(
+                (ready, task), timeout=_GENEROUS_DEADLINE, return_when=asyncio.FIRST_COMPLETED
+            )
+            if task in done:
+                task.result()  # Surface setup exceptions instead of an unrelated event timeout.
+                pytest.fail("Operation ended before reaching the workflow checkpoint")
+            assert ready in done, f"Workflow setup did not reach {checkpoint}"
+            proceed.set()
+            yield task
+        finally:
+            proceed.set()
+            release.set()
+            ready.cancel()
+            if not task.done():
+                task.cancel()
+            done, _ = await asyncio.wait((task,), timeout=_GENEROUS_DEADLINE)
+            assert task in done, "Cancellation test left its operation running"
+            if not task.cancelled():
+                task.exception()  # Retrieve failures even when the entry-event wait failed.
 
 
 # ── Step / TaskRun dataclass tests ──
@@ -162,9 +231,8 @@ class TestWorkflowRunIntegration:
     ) -> None:
         runner = TaskRunner(sessions=_make_mock_sessions(), auto_test=False, work_dir=tmp_path)
 
-        with patch(
-            "kiro_crew.context.inherit_session_memory",
-            AsyncMock(side_effect=asyncio.CancelledError()),
+        with patch.object(
+            runner, "_bind_run_execution", AsyncMock(side_effect=asyncio.CancelledError())
         ):
             with pytest.raises(asyncio.CancelledError):
                 await runner.plan("cancel during inherited memory")
@@ -228,13 +296,15 @@ class TestWorkflowRunIntegration:
                 await persistence_release.wait()
 
         runner._apersist_runs = block_placeholder_persistence  # type: ignore[method-assign]
-        starting = asyncio.create_task(runner.start_background(spec_path))
-        await asyncio.wait_for(persistence_started.wait(), timeout=1)
-        starting.cancel()
-        persistence_release.set()
+        async with _at_workflow_checkpoint(
+            runner, runner.start_background(spec_path), persistence_release
+        ) as starting:
+            await asyncio.wait_for(persistence_started.wait(), timeout=1)
+            starting.cancel()
+            persistence_release.set()
 
-        with pytest.raises(asyncio.CancelledError):
-            await starting
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(starting), timeout=10)
 
         assert persist_calls == 2
 
@@ -262,20 +332,23 @@ class TestWorkflowRunIntegration:
             return_value=[Step(index=1, title="Implement", description="make the change")]
         )
         publication_started = asyncio.Event()
+        publication_release = asyncio.Event()
 
         async def block_plan_source(_run_id: str, _source: str, *, source_format: str = "") -> bool:
             del source_format
             publication_started.set()
-            await asyncio.Future()
+            await publication_release.wait()
             return True
 
         workflows.set_source = block_plan_source  # type: ignore[method-assign]
-        planning = asyncio.create_task(runner.plan("implement the feature"))
-        await asyncio.wait_for(publication_started.wait(), timeout=1)
-        planning.cancel()
+        async with _at_workflow_checkpoint(
+            runner, runner.plan("implement the feature"), publication_release
+        ) as planning:
+            await asyncio.wait_for(publication_started.wait(), timeout=1)
+            planning.cancel()
 
-        with pytest.raises(asyncio.CancelledError):
-            await planning
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(planning), timeout=10)
 
         assert runner._runs == {}
         assert workflows.list_runs() == []
@@ -298,9 +371,13 @@ class TestWorkflowRunIntegration:
         runner._decompose = AsyncMock(
             return_value=[Step(index=1, title="Implement", description="make the change")]
         )
-        persist_started = threading.Event()
+        # The hook runs on the persist worker thread, so it reports back to the
+        # loop with call_soon_threadsafe rather than parking a second executor
+        # thread on a threading.Event.
+        loop = asyncio.get_running_loop()
+        persist_started = asyncio.Event()
         allow_persist = threading.Event()
-        persist_finished = threading.Event()
+        persist_finished = asyncio.Event()
         lifecycle: list[str] = []
         original_atomic_write = taskrunner_module.atomic_write
         first_write = True
@@ -310,10 +387,10 @@ class TestWorkflowRunIntegration:
             if first_write and path == runner._runs_path():
                 first_write = False
                 lifecycle.append("persist_started")
-                persist_started.set()
-                assert allow_persist.wait(timeout=5)
+                loop.call_soon_threadsafe(persist_started.set)
+                assert allow_persist.wait(timeout=_GENEROUS_DEADLINE)
                 lifecycle.append("persist_finished")
-                persist_finished.set()
+                loop.call_soon_threadsafe(persist_finished.set)
             original_atomic_write(path, content, fsync=fsync)
 
         original_delete = runner._workflow_delete_link
@@ -325,19 +402,27 @@ class TestWorkflowRunIntegration:
         monkeypatch.setattr(taskrunner_module, "atomic_write", block_first_write)
         runner._workflow_delete_link = observe_delete  # type: ignore[method-assign]
 
-        planning = asyncio.create_task(runner.plan("implement the feature"))
-        assert await asyncio.to_thread(persist_started.wait, 2)
-        planning.cancel()
+        # _workflow_set_plan is the last workflow-store write before the runs.json
+        # persist, so the entry wait below covers only the to_thread hop into the
+        # hook, not the fsync-backed setup whose duration the host controls.
+        async with _at_workflow_checkpoint(
+            runner,
+            runner.plan("implement the feature"),
+            allow_persist,
+            checkpoint="_workflow_set_plan",
+        ) as planning:
+            await asyncio.wait_for(persist_started.wait(), timeout=_GENEROUS_DEADLINE)
+            planning.cancel()
 
-        async def release_after_rollback_gets_one_turn() -> None:
-            await asyncio.sleep(0)
-            allow_persist.set()
+            async def release_after_rollback_gets_one_turn() -> None:
+                await asyncio.sleep(0)
+                allow_persist.set()
 
-        release = asyncio.create_task(release_after_rollback_gets_one_turn())
-        with pytest.raises(asyncio.CancelledError):
-            await planning
-        await release
-        assert await asyncio.to_thread(persist_finished.wait, 2)
+            release = asyncio.create_task(release_after_rollback_gets_one_turn())
+            with pytest.raises(asyncio.CancelledError):
+                await planning
+            await release
+            await asyncio.wait_for(persist_finished.wait(), timeout=_GENEROUS_DEADLINE)
 
         assert lifecycle.index("persist_finished") < lifecycle.index("workflow_deleted")
         assert runner._runs == {}
@@ -361,6 +446,7 @@ class TestWorkflowRunIntegration:
         spec_path = tmp_path / "cancel-during-setup.yaml"
         spec_path.write_text("agents:\n  test:\n    prompt: run tests\n", encoding="utf-8")
         persist_started = asyncio.Event()
+        persist_release = asyncio.Event()
         persist_calls = 0
 
         async def cancel_first_persist() -> None:
@@ -368,14 +454,19 @@ class TestWorkflowRunIntegration:
             persist_calls += 1
             if persist_calls == 1:
                 persist_started.set()
-                await asyncio.Future()
+                await persist_release.wait()
 
         runner._apersist_runs = cancel_first_persist  # type: ignore[method-assign]
-        task = asyncio.create_task(runner.run(spec_path, task_id="cancelled_setup", source="yaml"))
-        await asyncio.wait_for(persist_started.wait(), timeout=1)
-        task.cancel()
+        async with _at_workflow_checkpoint(
+            runner,
+            runner.run(spec_path, task_id="cancelled_setup", source="yaml"),
+            persist_release,
+            checkpoint="_workflow_rebind",
+        ) as task:
+            await asyncio.wait_for(persist_started.wait(), timeout=1)
+            task.cancel()
 
-        run = await task
+            run = await asyncio.wait_for(asyncio.shield(task), timeout=10)
 
         assert run.status == "cancelled"
         assert runner._runs[run.task_id].status == "cancelled"
@@ -1134,7 +1225,7 @@ class TestRun:
             work_dir=tmp_path,
         )
 
-        with patch.object(runner, "self_review", return_value=True):
+        with patch("kiro_crew.task_executor.self_review", return_value=True):
             result = await runner.run(spec)
 
         assert result.status == "completed"
@@ -1366,7 +1457,7 @@ class TestResourceManagement:
         def track_release(key):
             call_order.append(f"release:{key}")
 
-        async def track_reset(key):
+        async def track_reset(key, **kwargs):
             call_order.append(f"reset:{key}")
 
         sessions.release = track_release
@@ -2200,6 +2291,79 @@ class TestExtractLesson:
         lessons = store.load_all()
         assert len(lessons) == 1
         assert "lowercase" in lessons[0].rule.lower()
+
+    @pytest.mark.asyncio
+    async def test_volatile_lesson_is_not_reported_as_learned(self, tmp_path: Path) -> None:
+        """A refused JSONL write must not notify or update the run ledger."""
+        from kiro_crew.learn import LessonStore
+
+        store = LessonStore(base_dir=tmp_path)
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(
+            sessions=sessions, auto_test=False, work_dir=tmp_path, lesson_store=store
+        )
+        runner._notify = AsyncMock()
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s")
+        step = Step(index=1, title="X", description="d", error="boom")
+
+        with patch.object(
+            runner,
+            "_call_llm_for_lesson",
+            return_value={
+                "rule": "use automatic model selection",
+                "negative": "use gpt-5.6-sol",
+                "category": "preference",
+            },
+        ):
+            await runner._extract_lesson(step, run)
+
+        assert store.load_all() == []
+        assert run.lessons_learned == []
+        runner._notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_private_volatile_lesson_is_not_reported_as_learned(self, tmp_path: Path) -> None:
+        """A refused private vector write must not notify or update the run ledger."""
+        from kiro_crew.vector_memory import LessonWriteOutcome, LessonWriteResult
+
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        runner._notify = AsyncMock()
+        context = MagicMock()
+        context.ensure_store = AsyncMock(return_value=MagicMock())
+        runner._ctx = context
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", task_id="private")
+        step = Step(index=1, title="X", description="d", error="boom")
+
+        with (
+            patch(
+                "kiro_crew.member_memory_auth.read_private_session_store",
+                return_value="member-store",
+            ),
+            patch("kiro_crew.context.inherit_session_memory", new=AsyncMock()),
+            patch.object(
+                runner,
+                "_call_llm_for_lesson",
+                return_value={
+                    "rule": "use automatic model selection",
+                    "negative": "use gpt-5.6-sol",
+                    "category": "preference",
+                },
+            ),
+            patch(
+                "kiro_crew.taskrunner.run_in_embed_pool",
+                new=AsyncMock(
+                    return_value=LessonWriteResult(
+                        LessonWriteOutcome.REFUSED,
+                        "volatile_session_fact",
+                    )
+                ),
+            ),
+        ):
+            await runner._extract_lesson(step, run)
+
+        assert run.lessons_learned == []
+        runner._notify.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_extract_lesson_no_store(self) -> None:
@@ -3466,7 +3630,7 @@ class TestParallelGroups:
 
         runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
 
-        with patch.object(runner, "self_review", return_value=True):
+        with patch("kiro_crew.task_executor.self_review", return_value=True):
             result = await runner.run(spec)
 
         assert result.status == "completed"
@@ -3508,12 +3672,11 @@ class TestGitCoord:
         )
 
     @pytest.mark.asyncio
-    async def test_init_workspace_no_repo(self, tmp_path: Path) -> None:
+    async def test_init_workspace_no_repo(self, tmp_path: Path, monkeypatch) -> None:
         """init_workspace in a non-git dir → run in place, no git init."""
         from kiro_crew import git_coord
 
-        work_dir = tmp_path / "work"
-        work_dir.mkdir()
+        work_dir = _non_git_dir(tmp_path, monkeypatch, "work")
         (work_dir / "hello.txt").write_text("hi")
 
         run = TaskRun(spec_path="/t.md", spec_content="s")
@@ -4578,12 +4741,11 @@ class TestGitCoord:
         await git_coord.finalize(run)
 
     @pytest.mark.asyncio
-    async def test_non_git_workspace_git_ops_are_noops(self, tmp_path: Path) -> None:
+    async def test_non_git_workspace_git_ops_are_noops(self, tmp_path: Path, monkeypatch) -> None:
         """A non-git workspace runs in place; all git helpers are safe no-ops."""
         from kiro_crew import git_coord
 
-        work_dir = tmp_path / "plain"
-        work_dir.mkdir()
+        work_dir = _non_git_dir(tmp_path, monkeypatch, "plain")
         (work_dir / "a.py").write_text("x = 1")
 
         run = TaskRun(spec_path="/t.md", spec_content="s")

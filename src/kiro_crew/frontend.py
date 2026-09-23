@@ -39,15 +39,15 @@ _SIBLING_DIR_NAME = "KiroCrewWebsite"
 # the slowest HEALTHY build while still FIRING BEFORE the caller's own deadline --
 # a budget that never fires cannot report anything.
 #
-# 300s does not cover the build. `npm run build` is `tsc -b` followed by a
-# production bundle; on one developer machine it took 75-98s as a repeat build but
-# 328s and 420s on the first build after `npm ci` -- and it is that slow case the
-# budget has to clear, because the caller which hits this most, Dev Fleet's
-# Pull+Build, always builds immediately after `npm ci`. The type-check is the bulk
-# of it and does not amortize: the app project sets `noEmit`, so build mode looks
-# for an output file that never exists (`tsc -b --dry --verbose`: "out of date
-# because output file 'src/App.js' does not exist") and re-checks the whole app
-# every run. Shrinking that work is the real cure and is not attempted here.
+# 300s does not cover the build. `npm run build` is `tsc -p tsconfig.app.json`
+# followed by a production bundle; on one developer machine it took 75-98s as a
+# repeat build but 328s and 420s on the first build after `npm ci` -- and it is
+# that slow case the budget has to clear, because the caller which hits this most,
+# Dev Fleet's Pull+Build, always builds immediately after `npm ci`. The type-check
+# is the bulk of it. It keeps an incremental cache beside tsconfig.app.json that
+# survives `npm ci`, so a repeat build re-checks only what changed -- but a cold
+# clone has no cache, and a Pull+Build that moved the lockfile re-hashes the new
+# node_modules, so the budget is sized for the uncached case.
 #
 # The CEILING is that same caller: dev_fleet's stream watchdog kills the whole
 # sync run at ``runtime._RUN_DEADLINE_S`` (1800s), counted from fetch -- before
@@ -68,6 +68,19 @@ _SIBLING_DIR_NAME = "KiroCrewWebsite"
 # `npm ci` is a separate raw step this does not bound at all.
 _INSTALL_TIMEOUT = 300
 _BUILD_TIMEOUT = 900
+#: Allowance for the copy/swap that follows the install and build inside the same
+#: staging-lock holder. Generous relative to a tree copy so a loaded host does
+#: not turn a working holder into a refused contender.
+_STAGING_SWAP_ALLOWANCE = 120
+#: How long a contender waits for ``_staging_lock``. The holder legitimately
+#: spans an ``npm ci``, an ``npm run build`` and the copy/swap, so the wait must
+#: outlast their sum: ``platform_compat``'s default ceiling is sized for a
+#: sub-second critical section and would refuse a contender while the holder is
+#: still working rather than because it is stuck. Derived from the bounds it must
+#: cover so the two cannot drift apart.
+_STAGING_LOCK_TIMEOUT = float(
+    _INSTALL_TIMEOUT + _BUILD_TIMEOUT + _STAGING_SWAP_ALLOWANCE
+)
 #: How long to wait for a killed install tree to actually exit before restoring
 #: over it. Short by design: the group has already been SIGKILLed, so this only
 #: covers reaping, and waiting longer would delay a recovery that is already late.
@@ -320,8 +333,14 @@ def _staging_lock(static_parent: Path) -> Iterator[None]:
         # required=True: Windows msvcrt acquisition failures are otherwise
         # swallowed, and running without exclusion is the very outage this
         # lock exists to prevent.
+        # timeout: this holder runs an install and a build, far past the default
+        # ceiling, so a contender must wait for the work rather than be refused
+        # while it is still in progress.
         with platform_compat.file_lock(
-            lock_fh.fileno(), exclusive=True, required=True
+            lock_fh.fileno(),
+            exclusive=True,
+            required=True,
+            timeout=_STAGING_LOCK_TIMEOUT,
         ):
             yield
 
@@ -335,7 +354,7 @@ def _npm_build_and_stage_locked(
     """Run ``npm run build`` then stage it. Caller holds the staging lock.
 
     The build is spawned in its own process group and the whole tree is reaped
-    on timeout. ``npm run build`` is ``tsc -b && vite build``, so killing only
+    on timeout. ``npm run build`` is ``tsc -p tsconfig.app.json && vite build``, so killing only
     npm would leave vite writing ``website/dist`` after this function returns
     and the lock releases — a surviving writer makes the lock's exclusion
     meaningless, since a peer could then stage a tree vite is still rewriting.

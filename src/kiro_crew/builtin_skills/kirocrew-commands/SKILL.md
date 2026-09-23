@@ -254,14 +254,16 @@ writes.
 | `kirocrew learn add "rule text"` | Save a lesson (category: knowledge) |
 | `kirocrew learn add "rule text" --category tool` | Save with category (tool/preference/knowledge) |
 | `kirocrew learn add "rule text" --negative "avoid X"` | Save with negative example |
-| `kirocrew learn remove "query"` | Remove lessons matching substring |
+| `kirocrew learn remove "query"` | Remove lessons matching substring (add `--repo-scope FRAG` to remove only that scope, `--repo-scope ""` for global only) |
 | `kirocrew memory list` | Show semantic memory entries |
 | `kirocrew memory search "query"` | Search episodic memories |
 | `kirocrew memory stats` | Show memory statistics |
 | `kirocrew memory audit` | Scan memory for suspicious content |
-| `kirocrew memory export` | Export all memory to JSON (stdout) |
+| `kirocrew memory export` | Export the default store's rows to JSON (stdout) |
 | `kirocrew memory export -o file.json` | Export to file |
+| `kirocrew memory export --store <name>` | Export a named store's rows instead |
 | `kirocrew memory import file.json` | Import memory from JSON |
+| `kirocrew memory import --store <name> file.json` | Import into a named store instead |
 | `kirocrew memory migrate` | Migrate legacy markdown memory to vector store |
 | `kirocrew memory show [preferences\|projects\|history]` | Show the markdown memory layer (default: all three; `--format md\|json`, `--since YYYY-MM-DD` for history) |
 | `kirocrew knowledge dedup` | Preview cross-source duplicate knowledge documents (dry-run) |

@@ -75,9 +75,12 @@ export default function ErrorNotice({
   onDismiss,
   variant = 'block',
   askAgent = false,
+  askAgentLabel,
+  footer,
   onHandoff,
   className = '',
   messageClassName = '',
+  messageTooltip,
   testId,
 }: {
   /** DOM id for controls, including menu hand-offs, that describe themselves with this alert. */
@@ -114,6 +117,21 @@ export default function ErrorNotice({
    */
   askAgent?: boolean
   /**
+   * Scoped label for the hand-off link ("Ask the agent about this refusal").
+   * When several notices coexist on one screen, identical default labels leave
+   * the user unable to tell which link asks about which problem. Ignored when
+   * `askAgent` is off.
+   */
+  askAgentLabel?: string
+  /**
+   * Rendered INSIDE the banner, under the message (block variant only) — for
+   * a follow-on line that answers the message above it (a resolved outcome, a
+   * next step). Outside the border it reads as a detached caption; inside,
+   * the answer visibly belongs to the question. Import ReactNode consumers
+   * pass plain elements; falsy renders nothing.
+   */
+  footer?: React.ReactNode
+  /**
    * Forwarded to the hand-off button: runs only once the hand-off has actually
    * proceeded. For a notice rendered inside an OVERLAY that would otherwise sit
    * over the chat the hand-off navigates to (a modal, the remote-crew error
@@ -129,6 +147,16 @@ export default function ErrorNotice({
    * from the raw output beside it.
    */
   messageClassName?: string
+  /**
+   * Native `title` for the `message` span, for a call site that TRUNCATES the
+   * message (`messageClassName="truncate"`) to hold a fixed row height. A clipped
+   * error is unrecoverable without this: `role="alert"` reads the whole text to
+   * assistive tech, but a sighted user sees only what fits, and for a server
+   * sentence that is exactly the half naming what to do about it. Pass the full
+   * message. Left unset, no tooltip is rendered -- an untruncated message needs
+   * none, and a duplicate tooltip on a fully visible line is noise.
+   */
+  messageTooltip?: string
   /**
    * `data-testid` for the root element. Several notices can share one surface
    * (a page-level read failure above a row's own mutation failure), and a
@@ -149,12 +177,13 @@ export default function ErrorNotice({
       >
         <AlertTriangle size={14} className="shrink-0" aria-hidden="true" />
         {title && <strong className="font-semibold">{title}</strong>}
-        <span className={`min-w-0 ${messageClassName}`} style={{ overflowWrap: 'anywhere' }}>{message}</span>
+        <span className={`min-w-0 ${messageClassName}`} style={{ overflowWrap: 'anywhere' }} title={messageTooltip}>{message}</span>
         {askAgent && (
           <AskAgentButton
             report={report}
             message={message}
             onHandoff={onHandoff}
+            label={askAgentLabel}
           />
         )}
         {onDismiss && (
@@ -183,13 +212,17 @@ export default function ErrorNotice({
         {title && <strong className="font-semibold">{title} </strong>}
         {/* Wrapped only when asked: the bare text node is the shape every
             existing consumer's tests read. */}
-        {messageClassName ? <span className={messageClassName}>{message}</span> : message}
+        {messageClassName || messageTooltip
+          ? <span className={messageClassName} title={messageTooltip}>{message}</span>
+          : message}
+        {footer && <div className="mt-1 font-normal">{footer}</div>}
       </div>
       {askAgent && (
         <AskAgentButton
           report={report}
           message={message}
           onHandoff={onHandoff}
+          label={askAgentLabel}
           className="mt-[1px]"
         />
       )}

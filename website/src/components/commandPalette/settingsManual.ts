@@ -1,4 +1,14 @@
 import type { ManualSettingEntry } from './settingsTypes'
+import connectionsRegistry from '../../../../src/kiro_crew/connections/registry.json'
+
+/** The registry fields this file reads; the full shape lives in pages/connections/registry.ts. */
+type ConnectionsRegistryRow = { slug: string; name: string; auth?: { mode?: string } }
+
+/** Registry id of the Settings → OAuth Apps card for one pre-registered provider.
+ *  Shared with the gallery card's deep link so the two cannot drift. */
+export function connectionsOAuthClientEntryId(slug: string): string {
+  return `connections.oauth-client-${slug}`
+}
 
 /**
  * Hand-curated settings-registry entries (Search Everywhere — Settings
@@ -27,6 +37,41 @@ import type { ManualSettingEntry } from './settingsTypes'
  * locale.
  */
 export const SETTINGS_MANUAL: ManualSettingEntry[] = [
+  // The Decisions (Jev) card's three per-point consent switches.
+  //
+  // Declared here rather than extracted because the card draws them from ONE component
+  // on whichever point's panel is open, labelled from a map keyed by the scope the
+  // gateway says that point needs -- so there is no literal label prop for the walker to
+  // read. The ids are the ones the flat card's extracted entries carried, so a bookmark
+  // or a palette history entry saved against them still resolves.
+  //
+  // Every one is GOVERNED: each id is also in `settingsSearchCore.DECISIONS_SETTING_IDS`,
+  // so a search that KNOWS `capabilities.decisions` is denied offers none of them, and a
+  // user with the feature available can still find the switch they are looking for.
+  {
+    id: 'developer.also-send-tool-call-arguments-so-jev-can-flag-risky-calls',
+    labelKey: 'pages.developer.featurePreviewsTab.decisions_tool_args',
+    descriptionKey: 'pages.developer.featurePreviewsTab.decisions_tool_args_desc',
+    tab: 'developer',
+    type: 'toggle',
+    occurrence: 1,
+  },
+  {
+    id: 'developer.also-send-the-conversation-and-tool-call-inputs-so-jev-can-score-compaction',
+    labelKey: 'pages.developer.featurePreviewsTab.decisions_compaction',
+    descriptionKey: 'pages.developer.featurePreviewsTab.decisions_compaction_desc',
+    tab: 'developer',
+    type: 'toggle',
+    occurrence: 1,
+  },
+  {
+    id: 'developer.also-send-snippets-of-recalled-memories-so-jev-can-drop-the-ones-that-do-not-help',
+    labelKey: 'pages.developer.featurePreviewsTab.decisions_memory_text',
+    descriptionKey: 'pages.developer.featurePreviewsTab.decisions_memory_text_desc',
+    tab: 'developer',
+    type: 'toggle',
+    occurrence: 1,
+  },
   {
     // Override of the one primitive the extractor DOES see in SecurityPanel:
     // without `section=apps` the deep link lands on the security rail with the
@@ -272,4 +317,23 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     type: 'input',
     occurrence: 1,
   },
+  // Settings → OAuth Apps renders one card per PRE-REGISTERED registry
+  // provider, so the cards are data, not JSX the extractor can see. Derive an
+  // entry per provider from the registry itself: the gallery's "Configure OAuth
+  // app" link deep-links by this id, and `settingId` is what lets the highlight
+  // wait for the card to mount after its async fetch instead of substituting a
+  // same-label field on another provider's card. `labelSuffix` carries the
+  // provider name so search finds "OAuth app — GitHub".
+  ...(connectionsRegistry as ConnectionsRegistryRow[])
+    .filter(provider => provider.auth?.mode === 'preregistered')
+    .map<ManualSettingEntry>(provider => ({
+      id: connectionsOAuthClientEntryId(provider.slug),
+      labelKey: 'pages.settings.connectionsPanel.oauth_app',
+      labelSuffix: provider.name,
+      descriptionKey: 'pages.settings.connectionsPanel.oauth_app_search_description',
+      tab: 'connections',
+      type: 'input',
+      occurrence: 1,
+      settingId: `connections-oauth-client-${provider.slug}`,
+    })),
 ]

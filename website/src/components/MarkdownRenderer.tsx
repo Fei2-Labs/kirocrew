@@ -1,15 +1,21 @@
+import { mermaidFontCss } from './mermaidFontCss'
+import { downloadBlob } from '../utils/download'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from './ui/dropdown-menu'
 import React, { createContext, useContext, memo, useEffect, useMemo, useRef, useId, useCallback, useState } from 'react'
 import Clickable from './Clickable'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { X, Download, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, FileSpreadsheet, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
+import { X, Download, Loader2, MoreHorizontal, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, FileSpreadsheet, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
 import { copyCode, copyToClipboard } from '../utils/clipboard'
+import { capWhitespaceRuns, remarkBoundDepth, rehypeBoundRawDepth } from '../utils/markdownDepthBound'
 import { hastTableToCsv, hastTableToMarkdown } from '../utils/tableClipboard'
-import { canonicalChatHref, sessionKeyFrom, sessionKeyFromChatHref } from '../utils/sessionKeys'
+import { canonicalChatHref, chatHrefSid, namesASession, sessionKeyFrom, sessionKeyFromShort } from '../utils/sessionKeys'
 import ReactMarkdown from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkAutolinkRules from '../utils/remarkAutolinkRules'
+import { remarkLatexDelimiters } from '../utils/remarkLatexDelimiters'
+import { pairedCloseIndices, singleTagName } from '../utils/htmlTagGrammar'
 import remarkCjkFriendly from 'remark-cjk-friendly'
 import remarkCjkFriendlyGfmStrikethrough from 'remark-cjk-friendly-gfm-strikethrough'
 import remarkMath from 'remark-math'
@@ -496,6 +502,7 @@ import { CodeBlock } from './CodeBlock'
 import { ExcalidrawBlock } from './ExcalidrawBlock'
 import DiagramLightbox from './DiagramLightbox'
 import { usePinchZoom } from '../hooks/usePinchZoom'
+import { isEditableTarget } from '../utils/editableTarget'
 
 /** Forward the `data-sourcepos` attribute from rehypeSourcepos onto the
  *  rendered element. Used in every MD_COMPONENTS override; returns an
@@ -555,6 +562,11 @@ const LIST_STYLE_TYPE: Record<string, string> = {
 const MERMAID_ACTION_BTN_CLS =
   'p-1.5 rounded-md bg-bg-elevated/90 border border-border text-muted hover:text-text cursor-pointer'
 
+/** The longest a Mermaid draw waits on `document.fonts.ready` before it draws
+ *  in the fallback face anyway and leaves the loaded face to the one late
+ *  redraw. Why a cap, and why this number: see `whenFontsReady` in MermaidBlock. */
+export const MERMAID_FONTS_READY_CAP_MS = 2500
+
 const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ref = useRef<HTMLDivElement>(null)
@@ -563,8 +575,59 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
   // Rendered SVG markup, kept for the enlarge viewer. Empty until a successful
   // render and reset on failure, so the enlarge affordance only ever exists
   // for (and targets) the diagram currently on screen.
-  const [svg, setSvg] = useState('')
+  const [{ svg, code: renderedCode }, setRendered] = useState({ svg: '', code: '' })
   const [enlarged, setEnlarged] = useState(false)
+  const moreRef = useRef<HTMLButtonElement>(null)
+  const enlargeAfterMenu = useRef(false)
+  const [downloadFailed, setDownloadFailed] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const downloadDiagram = async (format: 'svg' | 'png') => {
+    if (!svg || renderedCode !== code) return
+    setDownloading(true)
+    let snapshotHost: HTMLDivElement | undefined
+    try {
+      let basename = ref.current?.querySelector(':scope > svg > title')?.textContent?.normalize('NFKC')
+        .replace(/[^\p{L}\p{N}_-]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 80)
+      if (!basename || /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i.test(basename)) basename = 'mermaid-diagram'
+      let blob: Blob
+      if (format === 'svg') {
+        blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' })
+      } else {
+        const node = ref.current
+        if (!node) throw new Error('diagram not mounted')
+        // Freeze pixels' inputs before any await; a rerender may replace the live SVG.
+        const snapshot = node.cloneNode(true) as HTMLDivElement
+        const originals = [node, ...node.querySelectorAll<HTMLElement | SVGElement>('*')]
+        const copies = [snapshot, ...snapshot.querySelectorAll<HTMLElement | SVGElement>('*')]
+        originals.forEach((element, index) => {
+          const style = getComputedStyle(element)
+          for (const property of Array.from(style)) copies[index].style.setProperty(property, style.getPropertyValue(property))
+        })
+        const backgroundColor = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()
+        snapshotHost = document.createElement('div')
+        Object.assign(snapshotHost.style, { position: 'absolute', left: '-100000px', top: '0', pointerEvents: 'none' })
+        snapshotHost.setAttribute('aria-hidden', 'true')
+        // Isolate SVG IDs/styles from Mermaid's next render, while retaining layout.
+        snapshotHost.attachShadow({ mode: 'closed' }).appendChild(snapshot)
+        document.body.appendChild(snapshotHost)
+        const { toBlob } = await import('html-to-image')
+        const image = await toBlob(snapshot, {
+          pixelRatio: 2,
+          fontEmbedCSS: await mermaidFontCss(snapshot),
+          backgroundColor,
+        })
+        if (!image) throw new Error('canvas encoder returned null')
+        blob = image
+      }
+      downloadBlob(blob, `${basename}.${format}`)
+      setDownloadFailed(false)
+    } catch {
+      setDownloadFailed(true)
+    } finally {
+      snapshotHost?.remove()
+      setDownloading(false)
+    }
+  }
   // Which of the two views is on screen. The diagram host below stays MOUNTED
   // either way and is hidden with the `hidden` ATTRIBUTE rather than unmounted:
   // the render effect is guarded on `renderedRef.current === code`, so a
@@ -665,9 +728,86 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
     // round again. Without ResizeObserver there is nothing to wait on, so the
     // result stands as it did before this change rather than rendering in a
     // loop.
+    //
+    // The box is one precondition of a trustworthy measurement; the FONTS are
+    // the other. The body face is swap-loaded (`display=swap` on the Google
+    // Fonts stylesheet in index.html), so text already painted -- the SVG's
+    // <foreignObject> labels included -- is repainted in the loaded face when it
+    // arrives, while the node and edge-label boxes keep the widths mermaid
+    // measured in the fallback face: every long label clipped at its right edge
+    // (#12480), deterministically for any diagram drawn while that load is in
+    // flight, which is every diagram in the transcript on a cold load. So the
+    // measurement also waits for `document.fonts.ready`, the same gate
+    // CliPanel and useFontOptions use before they measure text. `ready` settles
+    // when no load is PENDING, which leaves two ways for a face to land after
+    // the measurement, and the set is watched for both: a face whose
+    // unicode-range is first exercised by the diagram's own glyphs starts
+    // loading only once mermaid lays the label out, inside render(), so a
+    // `loadingdone` in flight or a load still pending at the end discards that
+    // SVG; and when the swap-loaded STYLESHEET is itself the late arrival (the
+    // dashboard is served from a local gateway, the font origin is the one slow
+    // resource), no face exists to be pending when `ready` is read, the diagram
+    // is drawn in the fallback face and the swap repaints it when the stylesheet
+    // lands -- so the watch outlives the draw, and the first `loadingdone` after
+    // it redraws the diagram. Either way ONE more attempt, which itself waits
+    // for the pending load, and the watch is spent. One, not a loop: a face
+    // that keeps loading, or a set that never settles, would otherwise redraw
+    // the diagram forever, and the second measurement already saw every glyph
+    // the first one exercised. Where `document.fonts` is absent (the test DOM,
+    // older engines) there is nothing to wait for and the gate is a no-op.
+    //
+    // The wait on `ready` is CAPPED at MERMAID_FONTS_READY_CAP_MS. `ready`
+    // settles only once no load is pending, and a font file whose packets are
+    // dropped -- not refused; a refusal fails fast and settles it -- keeps its
+    // FontFace pending for the browser's network timeout, tens of seconds or
+    // more. Uncapped, the gate would show NOTHING for every diagram on that cold
+    // load for the whole window, where drawing at once showed clipped but
+    // readable labels. Past the cap the diagram is drawn in the fallback face
+    // and the late-arrival path below takes over: the watch outlives the draw,
+    // so when the face does land its `loadingdone` redraws the diagram once in
+    // the loaded face -- the same final frame the stylesheet-late case reaches
+    // -- so the cap costs one fallback-face frame and no correctness. A load
+    // still pending when a CAPPED render ends is the very load the gate gave up
+    // on, so it does not count as a face that moved: one more attempt would
+    // only wait out the cap again and spend the single redraw that the late
+    // `loadingdone` needs. 2.5 s because in the harness's cold loads the face
+    // is requested at about +0.35 s and the transcript renders at about
+    // +1.3-1.6 s, so a face still pending when the gate is read is already a
+    // second into its fetch and 2.5 s more covers a live fetch several times
+    // over; it stays under the 3 s block period the CSS Fonts spec grants
+    // `font-display: block` before fallback text shows, and under the harness's
+    // 4 s hold, so its font-files pass exercises this path.
+    const fonts = document.fonts as FontFaceSet | undefined
+    let capTimer: ReturnType<typeof setTimeout> | undefined
+    /** Resolves when `ready` settles or the cap elapses, whichever is first;
+     *  `true` means the cap won and the draw to come measures in the fallback face. */
+    const whenFontsReady = (): Promise<boolean> => {
+      if (!fonts) return Promise.resolve(false)
+      return new Promise<boolean>(resolve => {
+        let done = false
+        const finish = (capped: boolean) => {
+          if (done) return
+          done = true
+          clearTimeout(capTimer)
+          capTimer = undefined
+          resolve(capped)
+        }
+        capTimer = setTimeout(() => finish(true), MERMAID_FONTS_READY_CAP_MS)
+        void fonts.ready.then(() => finish(false))
+      })
+    }
+    let fontsRetried = false
+    let rendering = false
+    let fontLanded = false
+    let onFontLoaded: (() => void) | undefined
+    const releaseFontWatch = () => {
+      if (onFontLoaded) fonts?.removeEventListener('loadingdone', onFontLoaded)
+      onFontLoaded = undefined
+    }
     const attempt = (mermaid: MermaidApi): Promise<{ svg: string } | null> =>
       whenBoxed()
-        .then(() => {
+        .then(whenFontsReady)
+        .then(capped => {
           if (!live) return null
           let lostBox = false
           if (typeof ResizeObserver === 'function') {
@@ -676,12 +816,15 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
             })
             watch.observe(host)
           }
+          fontLanded = false
+          rendering = true
           // Re-initialized per render so a theme switch between two diagrams is
           // picked up; initialize() is cheap and idempotent.
           initMermaid(mermaid)
           return mermaid.render(`mermaid-${id}`, code)
-            .then(result => ({ result, lostBox }))
+            .then(result => ({ result, lostBox, fontLanded, capped }))
             .finally(() => {
+              rendering = false
               watch?.disconnect()
               watch = undefined
             })
@@ -690,54 +833,80 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
           if (!step || !live) return null
           const boxless = step.lostBox || host.getClientRects().length === 0
           if (boxless && typeof ResizeObserver === 'function') return attempt(mermaid)
+          const fontMoved = step.fontLanded || (!step.capped && fonts?.status === 'loading')
+          if (fontMoved && !fontsRetried) {
+            fontsRetried = true
+            releaseFontWatch()
+            return attempt(mermaid)
+          }
           return step.result
         })
-    whenBoxed()
-      .then(loadMermaid)
-      .then(attempt)
-      .then(result => {
-        if (!result || !ref.current) return
-        settled = true
-        const range = document.createRange()
-        range.selectNodeContents(ref.current)
-        range.deleteContents()
-        ref.current.appendChild(range.createContextualFragment(result.svg))
-        setSvg(result.svg)
-      })
-      .catch(() => {
-        if (!live || !ref.current) return
-        settled = true
-        // The host is EMPTIED rather than filled with a hand-built <pre>. The
-        // source is rendered declaratively below for both states that show it
-        // (`failed || showSource`), so there is exactly one element -- and one set
-        // of styles -- meaning "this diagram's source as text". Building a second
-        // one here left two spellings of the same thing, kept in sync by hand,
-        // which diverges the first time either is retouched.
-        ref.current.textContent = ''
-        setSvg('')
-        setEnlarged(false)
-        // Reset so the failed state has ONE shape. Not to prevent stranding: the
-        // source below now lives OUTSIDE the hidden host, so neither value of
-        // `showSource` can strand the reader. It is that a later successful render
-        // should show the diagram it just produced rather than silently staying on
-        // text, and while no diagram exists neither does the toggle that would
-        // bring the reader back.
-        setShowSource(false)
-        setFailed(true)
-      })
+    const install = (result: { svg: string } | null) => {
+      if (!result || !live || !ref.current) return
+      settled = true
+      const range = document.createRange()
+      range.selectNodeContents(ref.current)
+      range.deleteContents()
+      ref.current.appendChild(range.createContextualFragment(result.svg))
+      setRendered({ svg: result.svg, code })
+    }
+    const fail = () => {
+      if (!live || !ref.current) return
+      settled = true
+      // The host is EMPTIED rather than filled with a hand-built <pre>. The
+      // source is rendered declaratively below for both states that show it
+      // (`failed || showSource`), so there is exactly one element -- and one set
+      // of styles -- meaning "this diagram's source as text". Building a second
+      // one here left two spellings of the same thing, kept in sync by hand,
+      // which diverges the first time either is retouched.
+      ref.current.textContent = ''
+      setRendered({ svg: '', code: '' })
+      setEnlarged(false)
+      // Reset so the failed state has ONE shape. Not to prevent stranding: the
+      // source below now lives OUTSIDE the hidden host, so neither value of
+      // `showSource` can strand the reader. It is that a later successful render
+      // should show the diagram it just produced rather than silently staying on
+      // text, and while no diagram exists neither does the toggle that would
+      // bring the reader back.
+      setShowSource(false)
+      setFailed(true)
+    }
+    const draw = () => whenBoxed().then(loadMermaid).then(attempt).then(install).catch(fail)
+    if (fonts) {
+      onFontLoaded = () => {
+        // Mid-render: read at the end of that render. After the draw: the late
+        // stylesheet case above, or a face the capped gate stopped waiting for
+        // -- redraw once, and the watch is spent. While still waiting for a box
+        // or for `ready`, the render to come measures in the landed face
+        // already, so there is nothing to do.
+        if (rendering) {
+          fontLanded = true
+          return
+        }
+        if (!settled || fontsRetried || !live) return
+        fontsRetried = true
+        releaseFontWatch()
+        void draw()
+      }
+      fonts.addEventListener('loadingdone', onFontLoaded)
+    }
+    void draw()
     return () => {
       // Torn down before anything was drawn: abandon this chain and forget the
       // code too, or the guard above would make the next run (a new code
       // string, or StrictMode's dev-only replay of this effect) skip a diagram
       // that never rendered. Once the SVG or the failure notice is on screen
-      // there is nothing to abandon, and the guard keeps doing its job.
-      if (settled) return
+      // there is nothing to abandon, and the guard keeps doing its job -- but
+      // the font watch, and a redraw it may have started, still end here.
       live = false
       observer?.disconnect()
       observer = undefined
       watch?.disconnect()
       watch = undefined
-      renderedRef.current = ''
+      clearTimeout(capTimer)
+      capTimer = undefined
+      releaseFontWatch()
+      if (!settled) renderedRef.current = ''
     }
   }, [code, id])
 
@@ -786,13 +955,13 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
           that left the default state is still reachable without hovering.
 
           AT MOST TWO BUTTONS IN EVERY REACHABLE STATE, by construction rather
-          than by counting: the diagram view is toggle + enlarge, the source view
+          than by counting: the diagram view is toggle + actions, the source view
           is toggle + copy (enlarge would open a viewer for the view just left),
           and a failed render is copy alone, there being no rendered diagram to
           toggle to. Copy rides with the SOURCE for a second reason: on the
           rendered diagram the object of "copy" is ambiguous -- the picture or the
           text behind it -- and beside the source text it is not. */}
-      <div className={`absolute top-1.5 right-1.5 flex items-center gap-1 transition-opacity ${showSource ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'} ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
+      <div className={`absolute top-1.5 right-1.5 flex items-center gap-1 transition-opacity ${showSource || downloading ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'} ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
         {svg && (
           <button
             data-testid="mermaid-source-toggle"
@@ -808,12 +977,7 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
             <FileCode className="lucide-inline" aria-hidden="true" />
           </button>
         )}
-        {/* Copies the SOURCE, never the rendered image, and only where the source
-            is on screen: the source view, and a failed render, where it is what a
-            reader most wants to take away. Copying the image is not offered at
-            all -- this surface leaves mermaid's `htmlLabels` at its default, so
-            labels live in `<foreignObject>`, which browsers refuse to paint in an
-            image context; see `DiagramLightbox`'s note on the same constraint. */}
+        {/* Copy remains source-only; rendered-image downloads live in the menu. */}
         {(showSource || failed) && (
           <button
             data-testid="mermaid-copy-source"
@@ -827,15 +991,50 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
           </button>
         )}
         {svg && !showSource && (
-          <button
-            data-testid="mermaid-enlarge"
-            aria-label={i18nT('components.diagramLightbox.enlarge_diagram')}
-            title={i18nT('components.diagramLightbox.enlarge_diagram')}
-            className={MERMAID_ACTION_BTN_CLS}
-            onClick={() => setEnlarged(true)}
-          >
-            <Maximize2 className="lucide-inline" aria-hidden="true" />
-          </button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                ref={moreRef}
+                aria-busy={downloading}
+                aria-disabled={downloading}
+                onPointerDown={event => { if (downloading) event.preventDefault() }}
+                onKeyDown={event => {
+                  if (downloading && ['Enter', ' ', 'ArrowDown'].includes(event.key)) event.preventDefault()
+                }}
+                data-testid="mermaid-more-actions"
+                aria-label={i18nT('components.markdownRenderer.diagram_actions')}
+                title={i18nT('components.markdownRenderer.diagram_actions')}
+                className={MERMAID_ACTION_BTN_CLS}
+              >
+                {downloading
+                  ? <Loader2 className="lucide-inline animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                  : <MoreHorizontal className="lucide-inline" aria-hidden="true" />}
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" onCloseAutoFocus={event => {
+              if (!enlargeAfterMenu.current) return
+              event.preventDefault()
+              enlargeAfterMenu.current = false
+              // Seat focus on the lasting trigger before the viewer captures it.
+              // Opening during onSelect would let the menu steal focus back.
+              moreRef.current?.focus({ preventScroll: true })
+              setEnlarged(true)
+            }}>
+              <DropdownMenuItem data-testid="mermaid-enlarge" onSelect={() => { enlargeAfterMenu.current = true }}>
+                <Maximize2 className="lucide-inline" aria-hidden="true" />
+                {i18nT('components.diagramLightbox.enlarge_diagram')}
+              </DropdownMenuItem>
+              <DropdownMenuItem data-testid="mermaid-download-svg" disabled={downloading || renderedCode !== code} onSelect={() => { void downloadDiagram('svg') }}>
+                <Download className="lucide-inline" aria-hidden="true" />
+                {i18nT('components.markdownRenderer.download_svg')}
+              </DropdownMenuItem>
+              <DropdownMenuItem data-testid="mermaid-download-png" disabled={downloading || renderedCode !== code} onSelect={() => { void downloadDiagram('png') }}>
+                <Download className="lucide-inline" aria-hidden="true" />
+                {i18nT('components.markdownRenderer.download_png')}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
       </div>
       {/* A SEPARATED REGION below the action row, deliberately NOT a third
@@ -849,6 +1048,16 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
           No hand-off, for exactly the reason given at the render notice above --
           this renderer is embedded in hosts holding unsaved drafts it cannot
           identify, so navigating away could discard what the user typed. */}
+      {/* No hand-off: the containing file editor or composer may hold unsaved drafts. */}
+      {downloadFailed && (
+        <ErrorNotice
+          variant="inline"
+          className="mt-2"
+          message={i18nT('components.markdownRenderer.download_failed')}
+          onDismiss={() => setDownloadFailed(false)}
+          testId="mermaid-download-error"
+        />
+      )}
       {copyState === 'failed' && (
         <ErrorNotice
           variant="inline"
@@ -957,10 +1166,20 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       sessionCandidate = decodeURIComponent(href)
     } catch { /* keep it a normal link */ }
   }
-  // Whether this href NAMES a same-origin chat session at all, independent of
-  // whether that session is currently reachable (open). A closed/unknown key is
-  // still a chat-session href — it just does not resolve in the open-tabs roster.
-  const sessionHrefKey = sessionCandidate ? sessionKeyFromChatHref(sessionCandidate) : null
+  // The session parameter this href carries, verbatim. Handed to
+  // `resolveSessionChip` below rather than a pre-resolved key, because that
+  // helper owns which spellings name a session — so a short `?sid=chat-1380`
+  // resolves here exactly as the same short name does in a backtick chip.
+  const sessionHrefSid = sessionCandidate ? chatHrefSid(sessionCandidate) : null
+  // Whether this href NAMES a same-origin chat session at all, by SHAPE, and
+  // independent of whether that session is currently reachable (open). A
+  // closed/unknown one is still a chat-session href — it just does not resolve in
+  // the open-tabs roster. Both spellings count, and the union is `namesASession`'s
+  // rather than re-spelled here: declining only the full key left an authored
+  // `?sid=chat-9999` to navigate to exactly the dead session view this interception
+  // exists to prevent (#9914), and a spelling added to the resolver alone would
+  // re-open that hole if this gate kept its own copy of the grammar.
+  const sessionHrefNamesSession = !!sessionHrefSid && namesASession(sessionHrefSid)
   // Whether this renderer is wired to route sessions at all — the SAME predicate
   // `resolveSessionChip` guards on (`onSessionOpen` AND `sessions`), so the link
   // affordance and the click handler can never disagree. Both must be present:
@@ -972,7 +1191,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   const sessionRouting = !!(sessionActions.onSessionOpen && sessionActions.sessions)
   // Same gate as the inline chip, so a link and a bare key naming one session
   // cannot disagree about whether it is reachable.
-  const sessionLink = sessionHrefKey ? resolveSessionChip(sessionHrefKey, sessionActions) : null
+  const sessionLink = sessionHrefSid ? resolveSessionChip(sessionHrefSid, sessionActions) : null
   // The attribute carries the canonical key: a modified click goes to the browser,
   // and an authored `dashboard_…` sid would open a session `?sid=` cannot resolve.
   const sessionHref = sessionLink && sessionCandidate ? canonicalChatHref(sessionCandidate, sessionLink.key) : null
@@ -999,7 +1218,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
     if (sessionLink) {
       e.preventDefault()
       sessionActions.onSessionOpen!(sessionLink.key)
-    } else if (sessionHrefKey && sessionRouting) {
+    } else if (sessionHrefNamesSession && sessionRouting) {
       e.preventDefault()
     }
   }
@@ -1097,16 +1316,28 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       {...sp(node)}
       href={sessionHref ?? href}
       // A `/chat?sid=` href is never a path, so the session branch wins outright.
-      // `sessionHrefKey` (not `sessionLink`) gates the handler so a session link
-      // that does not resolve — a closed/unknown key, or the active session's own
-      // key — is still intercepted and declined rather than left to navigate the
-      // browser to a dead `?sid=` view (#9914) or a duplicate tab.
-      onClick={sessionHrefKey ? onSessionClick : (pathResolution.candidate ? onPathClick : undefined)}
+      // One predicate gates the handler, because a link that RESOLVES necessarily
+      // names a session by shape too — so the two branches inside the handler
+      // split the same population rather than needing different gates: resolvable
+      // switches in place, and one that names a session but does not resolve (a
+      // closed or unknown key, a short name no open session answers to, or the
+      // active session's own key) is intercepted and declined rather than left to
+      // navigate the browser to a dead `?sid=` view (#9914) or a duplicate tab.
+      onClick={sessionHrefNamesSession ? onSessionClick : (pathResolution.candidate ? onPathClick : undefined)}
       title={sessionLink
         ? `${sessionLink.title}\n${i18nT('components.markdownRenderer.click_to_switch_to_this_session')}`
         : undefined}
       {...(ext ? {} : { target: '_blank', rel: 'noopener noreferrer' })}
-      className="text-accent underline underline-offset-2 decoration-accent/40 hover:decoration-accent"
+      // A session link that names a session but cannot open one drops the live-link
+      // affordance rather than keeping it and doing nothing. The click is swallowed
+      // deliberately (#9914: navigating a dead `?sid=` is worse than not moving), so
+      // the accent underline was promising an action that never came — every time,
+      // for every old transcript naming a session that has since closed. Muted and
+      // unadorned is the same answer the backtick chip gives an unresolved key: no
+      // affordance, and the href stays intact so a modified click still works.
+      className={sessionHrefNamesSession && !sessionLink && sessionRouting
+        ? 'text-muted'
+        : 'text-accent underline underline-offset-2 decoration-accent/40 hover:decoration-accent'}
     >
       <InsideLinkCtx.Provider value={true}>{children}</InsideLinkCtx.Provider>
     </a>
@@ -1156,6 +1387,11 @@ type SessionActions = {
   onSessionOpen?: (key: string) => void
   sessions?: ReadonlyMap<string, string>
   activeSession?: string
+  /** Epoch seconds this message was written at, when the host knows it. Only the
+   *  SHORT-name lookup uses it, to refuse a slot minted after the text naming it
+   *  (see `sessionKeyFromShort`). Absent on surfaces that render markdown with no
+   *  message identity, and there NO short name resolves — the full key still does. */
+  writtenAtEpoch?: number
 }
 const SessionActionCtx = createContext<SessionActions>({})
 
@@ -1173,10 +1409,16 @@ const SessionActionCtx = createContext<SessionActions>({})
  *     not honour a chip here;
  *   - the key names the session the reader is ALREADY in, where a click would be
  *     a visible no-op.
+ *
+ * A SHORT name (`chat-1380`, no timestamp) resolves through the same roster. The
+ * roster was already the authority for whether a chip may exist, so letting it
+ * also say which session a nickname means adds no new trust: a name it does not
+ * answer for is refused by the second rule above, like any other unknown key.
  */
 function resolveSessionChip(raw: string, actions: SessionActions): { key: string; title: string } | null {
   if (!actions.onSessionOpen || !actions.sessions) return null
   const key = sessionKeyFrom(raw)
+    ?? sessionKeyFromShort(raw, actions.sessions.keys(), actions.writtenAtEpoch)
   if (!key || key === actions.activeSession) return null
   const title = actions.sessions.get(key)
   if (title === undefined) return null
@@ -1804,7 +2046,12 @@ const MD_COMPONENTS: Components = {
     const { 'data-fenced': fenced, ...rest } = props as Record<string, unknown>
     if (fenced === undefined) return <InlineCode {...rest}>{children}</InlineCode>
 
-    const match = /language-(\w+)/.exec(className || '')
+    // remark-rehype stamps `language-<first word of the info string>`; keep the
+    // whole tag (`error-report`, `c++`, `asp.net`), not just its leading `\w+`
+    // run, so the header label and highlighter hint match what the author
+    // wrote. A class token has no whitespace, so `\S+` is the whole tag. Same
+    // rule as FENCE_OPEN (useBlockAssembler) / fixCodeFences.
+    const match = /language-(\S+)/.exec(className || '')
     const lang = match?.[1]
     const codeStr = String(children).replace(/\n$/, '')
 
@@ -1938,6 +2185,10 @@ function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; prob
   const { copied, flash } = useCopiedFlash()
   const [confirmedGone, setConfirmedGone] = useState(false)
   useEffect(() => {
+    // The verdict belongs to THIS probeUrl. A reused instance handed a different
+    // one must not keep the previous path's "confirmed missing" wording while its
+    // own probe is still in flight.
+    setConfirmedGone(false)
     if (!probeUrl) return
     let cancelled = false
     fetch(probeUrl, { method: 'HEAD' })
@@ -2026,6 +2277,20 @@ function ImgWithFallback({
 }: React.ImgHTMLAttributes<HTMLImageElement> & ExtraProps) {
   const [errored, setErrored] = useState(false)
   const [loaded, setLoaded] = useState(false)
+  // Both flags describe the outcome of loading THIS `src`, so neither may
+  // outlive it. React reuses an instance whenever the element at a key keeps its
+  // type, so a reused image can be handed a different `src`; without this a good
+  // image inherits a previous one's failure and renders as broken, with nothing
+  // to clear it short of a full remount. Adjusted during render rather than in an
+  // effect, per React's own guidance for resetting state on a prop change: an
+  // effect runs after paint, so it would show one frame of the previous image's
+  // outcome. Setting state here is a bail-out when the value is unchanged.
+  const [outcomeSrc, setOutcomeSrc] = useState(src)
+  if (outcomeSrc !== src) {
+    setOutcomeSrc(src)
+    setErrored(false)
+    setLoaded(false)
+  }
   const basePath = useContext(BasePathCtx)
   const compact = useContext(CompactImagesCtx)
   const version = useContext(ImageVersionCtx)
@@ -2430,40 +2695,10 @@ export function rehypeSanitize() {
   }
 }
 
-/** A whole mdast `html` node that is exactly ONE tag: `<x>`, `</x>`, `<x a b>`,
- * `<x/>`. Attribute values are quote-aware, so a value may itself contain `>`
- * (`<x a="b>c">`); without that, such a tag misses this test and falls to the
- * lossy escapedNodeTree() path. A bare attribute may hold `/` (`<x a/b>`) so
- * this accepts everything the previous blanket `[^>]*` did. The leading
- * `[a-zA-Z]` excludes comments (`<!-- -->`) and doctypes, which keep their
- * existing handling. */
-const SINGLE_TAG_RE =
-  /^<\/?([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[^\s=>]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*))?)*)\s*\/?>$/
-
-/** Tag name of a single-tag html node, or undefined when it is not one. */
-function singleTagName(value: string): string | undefined {
-  return SINGLE_TAG_RE.exec(value)?.[1]?.toLowerCase()
-}
-
 /** Showable verbatim. Executable tags keep their `[unsupported: x]` marker; every
  * other unknown tag diverts, because a text node is inert wherever it lands. */
 function divertibleTag(tag: string): boolean {
   return !UNSAFE_RECONSTRUCT_TAGS.has(tag)
-}
-
-/** Index of the sibling that closes `tag`, tracking same-tag nesting; -1 if unclosed. */
-function matchingCloseIndex(kids: MdastNode[], start: number, tag: string): number {
-  let depth = 0
-  for (let j = start + 1; j < kids.length; j++) {
-    const k = kids[j]
-    if (k.type !== 'html' || typeof k.value !== 'string') continue
-    if (singleTagName(k.value) !== tag) continue
-    if (k.value.startsWith('</')) {
-      if (depth === 0) return j
-      depth--
-    } else if (!k.value.endsWith('/>')) depth++
-  }
-  return -1
 }
 
 /** Render non-allowlisted single tags VERBATIM instead of reconstructing them.
@@ -2485,19 +2720,27 @@ function matchingCloseIndex(kids: MdastNode[], start: number, tag: string): numb
  * parser — it ends up a text node, which React escapes on render, so the React
  * #290 guard still holds.
  */
+/** Allowlisted tags whose text content is verbatim, never prose (see remarkLatexDelimiters). */
+const VERBATIM_CONTENT_TAGS = new Set(['code', 'pre', 'kbd', 'samp', 'var', 'tt', 'textarea', 'svg', 'math'])
+
 export function remarkVerbatimUnknownTags() {
   return (tree: MdastNode) => {
     const walk = (node: MdastNode) => {
       const kids = node.children
       if (!kids) return
+      // Pairing is computed ONCE per sibling list (linear), never per opener:
+      // a run of unclosed unknown openers must not cost a suffix scan each.
+      let pairs: Map<number, number> | null = null
       for (let i = 0; i < kids.length; i++) {
         const child = kids[i]
         if (child.type === 'html' && typeof child.value === 'string') {
           const tag = singleTagName(child.value)
           if (tag && !ALLOWED_TAGS.has(tag) && divertibleTag(tag)) {
-            const paired = child.value.startsWith('</') || child.value.endsWith('/>')
-              ? -1
-              : matchingCloseIndex(kids, i, tag)
+            let paired = -1
+            if (!child.value.startsWith('</') && !child.value.endsWith('/>')) {
+              pairs ??= pairedCloseIndices(kids)
+              paired = pairs.get(i) ?? -1
+            }
             if (paired > i) {
               // A closed container: divert the whole span, so allowlisted tags
               // inside it stay literal instead of rendering as live elements.
@@ -2532,10 +2775,22 @@ export function remarkVerbatimUnknownTags() {
 // delimiters are classified), and the strikethrough companion AFTER, because it
 // extends gfm's own `~~` construct.
 const REMARK_PLUGINS: PluggableList = [
+  // FIRST: bounds the parsed tree's depth as part of parse(), ahead of
+  // remark-gfm's own post-parse transform, which recurses over the tree.
+  // Input-controlled nesting otherwise overflows the call stack there.
+  remarkBoundDepth,
   remarkCjkFriendly,
   remarkGfm,
   remarkCjkFriendlyGfmStrikethrough,
   [remarkMath, { singleDollarTextMath: false }],
+  // LaTeX-native `\( … \)` / `\[ … \]` → the same math nodes remark-math emits,
+  // from ELIGIBLE TEXT NODES only (code, html, link destinations and reference
+  // definitions are other node types and are never touched). After remark-math
+  // so `$$` math is already tokenized; before the verbatim pass -- and told
+  // which paired tags that pass will show as literal source, so text inside
+  // them is never converted (a `<customBlock>` shown verbatim must not carry
+  // a rendered KaTeX span in the middle of its source).
+  [remarkLatexDelimiters, { verbatimTag: (tag: string) => VERBATIM_CONTENT_TAGS.has(tag) || !ALLOWED_TAGS.has(tag) }],
   // After gfm so an autolink literal is already a `link` node, but BEFORE the
   // verbatim pass, which retypes an unknown tag to text and hides it.
   remarkAutolinkRules,
@@ -2706,7 +2961,10 @@ function rehypeUnwrapBlocks() {
   }
 }
 
-const REHYPE_PLUGINS: PluggableList = [[rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeKatex]
+// `rehypeBoundRawDepth` sits ahead of `rehypeRaw`: raw HTML that would nest
+// past the depth bound is downgraded to text before rehype-raw's recursive
+// hast conversion can overflow on it.
+const REHYPE_PLUGINS: PluggableList = [rehypeBoundRawDepth, [rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeKatex]
 
 // Matches one source line break plus any leading tabs/spaces, so a trailing
 // space before the break doesn't survive as its own text node. Mirrors the
@@ -2791,9 +3049,46 @@ function rehypeSourcepos() {
     walk(tree)
   }
 }
-const REHYPE_PLUGINS_WITH_SOURCEPOS: PluggableList = [[rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeKatex, rehypeSourcepos]
+const REHYPE_PLUGINS_WITH_SOURCEPOS: PluggableList = [rehypeBoundRawDepth, [rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeKatex, rehypeSourcepos]
 // NOTE: remark plugin config is shared via REMARK_PLUGINS above (singleDollarTextMath:
 // false). The sourcepos variant only differs in the rehype chain.
+
+/** Give every root-level block a key that depends on its POSITION, not on the
+ *  tags of its siblings.
+ *
+ *  `hast-util-to-jsx-runtime` keys each child `<tagName>-<count of that tagName
+ *  so far>`, so a block's key depends on what its earlier siblings are. When a
+ *  later streaming line reclassifies an EARLIER line -- a `===` underline turns
+ *  the paragraph above it into a heading -- that earlier sibling stops being a
+ *  `p`, every later paragraph's counter shifts down, and React unmounts and
+ *  remounts blocks whose own text never changed. A settled paragraph losing its
+ *  node loses the reader's selection and restarts its animations, and the browser
+ *  lays the replacement out afresh.
+ *
+ *  Wrapping each root child in one uniform element makes that counter a
+ *  positional index, so a block keeps its key for as long as it keeps its place.
+ *  `display: contents` leaves the wrapper without a box, so margins, margin
+ *  collapsing and descendant selectors see the tree they saw before. Applied on
+ *  every render rather than only while streaming: a wrapper that appeared or
+ *  vanished when the stream ended would itself remount every block, which is the
+ *  thing this prevents.
+ */
+export function rehypeStableRootKeys() {
+  return (tree: HastRoot) => {
+    let wrapped = false
+    const children = tree.children.map((child): RootContent => {
+      if (child.type !== 'element') return child
+      wrapped = true
+      return {
+        type: 'element',
+        tagName: 'div',
+        properties: { style: 'display: contents' },
+        children: [child],
+      }
+    })
+    if (wrapped) tree.children = children
+  }
+}
 
 /** Number of trailing characters glowed while a message streams. */
 const GLOW_TAIL_CHARS = 30
@@ -3830,13 +4125,18 @@ export function fixCodeFences(s: string): string {
     if (inFence || num === undefined) return match
     return num + '\\.' + trail
   })
-  // Ensure blank line before opening fences that are glued to preceding text
-  s = s.replace(/([^\n])(\n?)(```\w*\n)/g, (_, pre, nl, fence) =>
+  // Ensure blank line before opening fences that are glued to preceding text.
+  // The info string is the whole backtick-free line, including attributes and
+  // a leading space, matching FENCE_OPEN in useBlockAssembler.
+  s = s.replace(/([^\n])(\n?)(```[^`\n]*\n)/g, (_, pre, nl, fence) =>
     nl ? pre + nl + fence : pre + '\n\n' + fence
   )
   // Split closing fences glued to trailing text: ```358KB → ```\n358KB
-  // Preserves valid opening fences (```diff, ```json5, ```c++) via negative lookahead
-  s = s.replace(/^(```)(?![a-zA-Z][\w+#-]*\s*$)(.+)$/gm, '$1\n$2')
+  // Preserves valid opening fences (```diff, ``` python, ```c++, ```asp.net)
+  // via negative lookahead: optional info-string whitespace may precede a tag
+  // that starts with a letter and continues as a backtick-free info string,
+  // while a size like ```358KB still splits.
+  s = s.replace(/^(```)(?!\s*[a-zA-Z][^`]*$)(.+)$/gm, '$1\n$2')
   // Split opening fences glued to uppercase text
   s = s.replace(/```([A-Z])/g, '```\n$1')
   return s
@@ -3957,6 +4257,19 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
   // streaming transitions or when the agent emits protocol markup as text.
   // Both passes preserve mentions inside inline-code spans.
   let clean = stripStrayToolUseTags(stripStrayWidgetTags(content))
+  // Cap whitespace runs before parsing. Tree depth is bounded on the parsed
+  // tree (see markdownDepthBound), but the parser's own per-line container
+  // scan is O(depth), so a list indented to hundreds of levels costs seconds
+  // before any tree exists. Lexical, construct-agnostic, and an identity on
+  // any message without a whitespace run wider than 256 columns.
+  //
+  // Gated off in sourcePos mode, like every other column-shifting pass in
+  // this function: `data-sourcepos` maps a DOM selection back to source
+  // coordinates, and a shortened run would shift every later column on that
+  // line and anchor a comment to the wrong occurrence. The crash bound does
+  // not depend on the cap (the tree bounds hold either way); only the
+  // parser-time bound is given up on that surface.
+  if (!sourcePos) clean = capWhitespaceRuns(clean)
   // `glow` marks the live streaming tail block: while streaming, hold back an
   // incomplete trailing table so it doesn't paint as pipe text then snap into a
   // <table> when the delimiter row arrives.
@@ -3976,6 +4289,10 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
     if (smooth) tail.push(rehypeStreamingReveal)
     rehypePlugins = [...baseRehype, ...tail]
   }
+  // Last, so it wraps the root shape every other plugin has finished producing:
+  // an earlier position would let a later plugin read `div` where it expects the
+  // block itself.
+  rehypePlugins = [...rehypePlugins, rehypeStableRootKeys]
   // `fixCodeFences` runs FIRST: its later passes CREATE code blocks the raw
   // source did not have (blank line before a fence glued to preceding text,
   // splitting a closing fence glued to trailing text). Rewriting boundaries
@@ -4071,7 +4388,7 @@ import WidgetFrame from './WidgetFrame'
 import WidgetPlaceholder from './WidgetPlaceholder'
 
 import { i18nT } from '../i18n/t'
-import { fmtNumber } from '../i18n/format'
+import { fmtNumber, toDate } from '../i18n/format'
 /** Try to extract a file path from chat text immediately preceding a diff
  * block. Tools sometimes emit "Created /path/to/file:" or "Modified ..."
  * before a bare diff with no +++/--- headers; this hint lets DiffBlock's
@@ -4101,7 +4418,7 @@ function extractPathHintFromText(text: string | undefined): string | undefined {
   return undefined
 }
 
-function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, widgetIndex, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; widgetIndex?: number; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean }) {
+function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle, readOnlyCode }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean; readOnlyCode?: boolean }) {
   switch (block.type) {
     case 'diff': {
       const pathHint = prevBlock?.type === 'markdown'
@@ -4127,8 +4444,8 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
         ? `${slotKey}:${messageTs}:${block.startLine}`
         : undefined
       const node = collapseDiffs
-        ? <FoldableDiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} foldKey={foldKey} />
-        : <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} />
+        ? <FoldableDiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} foldKey={foldKey} />
+        : <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} />
       // Smooth mode: wrap so the block height eases as lines arrive. The wrapper
       // is mounted for the whole message lifecycle (smooth is constant) so the
       // child never remounts when streaming flips to complete.
@@ -4156,14 +4473,21 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
         const mdNode = <MarkdownContentCard content={block.content} lang={block.language} />
         return smooth ? <SmoothResize enabled={!block.complete}>{mdNode}</SmoothResize> : mdNode
       }
-      const node = <EditableCodeBlock code={block.content} lang={block.language} complete={block.complete} />
+      // `readOnlyCode`: the content is a record the reader must not be able to
+      // touch -- an approval's command awaiting authorization. EditableCodeBlock's
+      // Raw scratch editor edits a local copy that is never written back, so a
+      // pencil there lets someone edit the block and then Approve the ORIGINAL
+      // command while looking at their edit. Plain CodeBlock keeps copy only.
+      const node = readOnlyCode
+        ? <CodeBlock code={block.content} lang={block.language} complete={block.complete} />
+        : <EditableCodeBlock code={block.content} lang={block.language} complete={block.complete} />
       // Height-grow only — streaming code renders as one plain <pre> text node
       // so per-line content animation isn't applied here.
       return smooth ? <SmoothResize enabled={!block.complete}>{node}</SmoothResize> : node
     }
     case 'widget':
       return block.complete
-        ? <WidgetFrame html={block.content} title={block.language} slug={block.slug} messageTs={messageTs} widgetIndex={widgetIndex} slotKey={slotKey} />
+        ? <WidgetFrame html={block.content} title={block.language} slug={block.slug} messageTs={messageTs} slotKey={slotKey} />
         : <WidgetPlaceholder title={block.language} />
     case 'markdown':
       // `live` = this block is the streaming tail (see MarkdownRenderer). ORed
@@ -4173,7 +4497,7 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
   }
 }
 
-export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean }) {
+export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false, readOnlyCode = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean; /** Render fenced code with the plain CodeBlock (copy only) instead of EditableCodeBlock. For content the reader must not be able to alter in place -- an approval's command beside its Approve control. */ readOnlyCode?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
   // One message = one config-rule scan pool. The blocks below each mount their
@@ -4210,29 +4534,37 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
    *  this component does. */
   const pathActions = useMemo<PathActions>(() => ({ onFileOpen, onFolderOpen }), [onFileOpen, onFolderOpen])
   const sessionActions = useMemo<SessionActions>(
-    () => ({ onSessionOpen, sessions, activeSession }),
-    [onSessionOpen, sessions, activeSession],
+    // The write time the SHORT-name chip needs. Absent, non-absolute, or
+    // unparseable yields undefined, and a short name then resolves to NOTHING —
+    // fail closed, because this is compared against server-clock slot mint epochs
+    // and a wrong comparison opens the wrong conversation silently.
+    //
+    // Validated, not trusted: `messageTs` is DECLARED `string` but crosses an API
+    // boundary that does not enforce it, and the transcript endpoint really does
+    // send epoch NUMBERS (see the fixture in `playwright/voice-recovery.spec.ts`).
+    // Calling a string method on that value threw and blanked the transcript, so
+    // the shape is checked here rather than assumed.
+    //
+    // A number is an epoch and already absolute; `toDate` owns the
+    // seconds-vs-milliseconds rule for the whole app, so it is not re-guessed here.
+    // A STRING has to carry `Z` or an explicit `±HH:MM`: `Date.parse('2026-09-11T23:39:00')`
+    // reads a bare local time, so the same row would mean a different instant per
+    // viewer timezone, and a viewer behind UTC shifts it forward far enough to let a
+    // slot minted after the row pass the check.
+    () => {
+      const raw: unknown = messageTs
+      const absolute = typeof raw === 'number'
+        || (typeof raw === 'string' && /(?:Z|[+-]\d{2}:?\d{2})$/.test(raw.trim()))
+      const when = absolute ? toDate(raw as string | number) : null
+      return {
+        onSessionOpen,
+        sessions,
+        activeSession,
+        writtenAtEpoch: when ? Math.floor(when.getTime() / 1000) : undefined,
+      }
+    },
+    [onSessionOpen, sessions, activeSession, messageTs],
   )
-
-  // Pre-compute the widget index for each widget block (0-based ordinal of
-  // widgets within this message). WidgetFrame uses (messageTs, widgetIndex)
-  // to derive a stable slug when the agent didn't emit an explicit one, so
-  // bookmark state survives refreshes and prevents save→refresh duplicates.
-  // Memoized so each BlockRenderer gets a stable widgetIndex reference
-  // between renders, so it doesn't defeat memo() if anyone later wraps
-  // BlockRenderer.
-  //
-  // Must run before any conditional return — Rules of Hooks. (rawMode flips
-  // via a settings toggle which usually re-mounts this component anyway,
-  // but we keep hook order strict for safety.)
-  const widgetIndices = useMemo(() => {
-    const out: number[] = new Array(blocks.length).fill(-1)
-    let n = 0
-    for (let i = 0; i < blocks.length; i++) {
-      if (blocks[i].type === 'widget') { out[i] = n; n++ }
-    }
-    return out
-  }, [blocks])
 
   // Index of the last markdown block — the streaming tail that gets the glow
   // (only when `glow` is set). -1 if the message ends in a non-markdown block.
@@ -4321,7 +4653,6 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             key={block.startLine != null ? `line-${block.startLine}` : `idx-${i}`}
             block={block} prevBlock={blocks[i - 1]} onFileOpen={onFileOpen} sourcePos={sourcePos}
             messageTs={messageTs}
-            widgetIndex={widgetIndices[i] >= 0 ? widgetIndices[i] : undefined}
             slotKey={slotKey}
             glow={glow && i === lastMarkdownIdx}
             // Same gate `glow` uses — the last markdown block of a streaming
@@ -4335,6 +4666,7 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             softBreaks={softBreaks}
             collapseDiffs={collapseDiffs}
             mdCardToggle={mdCardToggle}
+            readOnlyCode={readOnlyCode}
           />
         ))}
       </ImageVersionCtx.Provider>
@@ -4385,14 +4717,6 @@ const LIGHTBOX_PAGE_DISTANCE = 64
  *  not commit but must not feel dead either — a silent no-op reads as broken. */
 const LIGHTBOX_RUBBER_BAND_DIVISOR = 4
 
-/** True when a keyboard event originates from an editable element, so global
- *  printable-key shortcuts (like the lightbox 'd' download) don't hijack typing. */
-function isEditableTarget(target: EventTarget | null): boolean {
-  const el = target as HTMLElement | null
-  if (!el || typeof el.tagName !== 'string') return false
-  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable === true
-}
-
 /** Derive a download filename for a lightbox image. Local images are served
  *  as `/api/file-raw?path=<abs>`, so prefer the basename of that path; for
  *  other URLs fall back to the pathname basename, then the alt text. */
@@ -4422,14 +4746,7 @@ async function downloadLightboxImage(image: LightboxImage): Promise<void> {
     const res = await fetch(image.src)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const blob = await res.blob()
-    const objUrl = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = objUrl
-    a.download = name
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    setTimeout(() => URL.revokeObjectURL(objUrl), 1000)
+    downloadBlob(blob, name)
   } catch {
     window.open(image.src, '_blank', 'noopener,noreferrer')
   }
@@ -4758,16 +5075,16 @@ export function Lightbox() {
       } else if (e.key === 'ArrowRight') {
         e.preventDefault()
         setState(s => (s && s.index < s.images.length - 1 ? { ...s, index: s.index + 1 } : s))
-      } else if ((e.key === '+' || e.key === '=') && !isEditableTarget(e.target) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      } else if ((e.key === '+' || e.key === '=') && !isEditableTarget(e) && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault()
         zoomIn()
-      } else if ((e.key === '-' || e.key === '_') && !isEditableTarget(e.target) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      } else if ((e.key === '-' || e.key === '_') && !isEditableTarget(e) && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault()
         zoomOut()
-      } else if (e.key === '0' && !isEditableTarget(e.target) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      } else if (e.key === '0' && !isEditableTarget(e) && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault()
         setZoom(LIGHTBOX_ZOOM_MIN)
-      } else if ((e.key === 'd' || e.key === 'D') && !isEditableTarget(e.target)) {
+      } else if ((e.key === 'd' || e.key === 'D') && !isEditableTarget(e)) {
         e.preventDefault()
         const cur = stateRef.current
         if (cur) void downloadLightboxImage(cur.images[cur.index])

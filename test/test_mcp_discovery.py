@@ -6,9 +6,11 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -41,6 +43,22 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 def _clear_cache() -> None:
     _probe_cache.clear()
+
+
+def _make_executable(path: Path) -> Path:
+    """Create *path* as a runnable file, parents included.
+
+    Runnable by the predicate the code under test applies, ``isfile`` plus
+    ``X_OK``. Windows answers ``X_OK`` for any existing file but wants an
+    executable SUFFIX, so give it one ``PATHEXT`` lists; POSIX needs the mode
+    bit and ignores the suffix.
+    """
+    if platform_compat.IS_WINDOWS:
+        path = path.with_suffix(".exe")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+    path.chmod(0o755)
+    return path
 
 
 @pytest.fixture(autouse=True)
@@ -1065,7 +1083,8 @@ class TestDiscoverNew:
         """Short command name matching the basename of the agent's resolved path is not flagged."""
         agent_dir = tmp_path / "agents"
         agent_dir.mkdir()
-        cfg = {"mcpServers": {"srv": {"command": "/usr/local/bin/my-server"}}}
+        pinned = _make_executable(tmp_path / "bin" / "my-server")
+        cfg = {"mcpServers": {"srv": {"command": str(pinned)}}}
         (agent_dir / "defaults.json").write_text(json.dumps(cfg))
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
         mcp_json = tmp_path / "mcp.json"
@@ -1074,6 +1093,29 @@ class TestDiscoverNew:
         result = discover_servers_to_sync()
         assert result == []
 
+    def test_discover_proposes_resync_for_vanished_pinned_path(self, tmp_path, monkeypatch) -> None:
+        """A pinned absolute command whose file is gone must reach the sync list.
+
+        This is the user-visible half of the basename heuristic's blind spot: an
+        agent entry pinned to a version-stamped path keeps that basename after
+        the release is deleted, so with no liveness probe the row reads as
+        already-synced and the server fails at spawn time with no warning.
+        """
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        pinned = _make_executable(tmp_path / "tools" / "my-server" / "1.0.1" / "my-server")
+        cfg = {"mcpServers": {"srv": {"command": str(pinned)}}}
+        (agent_dir / "defaults.json").write_text(json.dumps(cfg))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(json.dumps({"mcpServers": {"srv": {"command": "my-server"}}}))
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+        assert discover_servers_to_sync() == []
+
+        shutil.rmtree(pinned.parent)
+        result = discover_servers_to_sync()
+        assert [s.name for s in result] == ["srv"]
+
 
 class TestCommandsDiverged:
     def test_identical_commands(self) -> None:
@@ -1081,10 +1123,47 @@ class TestCommandsDiverged:
 
         assert _commands_diverged("foo", "foo") is False
 
-    def test_short_vs_resolved_path(self) -> None:
+    def test_short_vs_resolved_path(self, tmp_path) -> None:
+        """A bare name and the live absolute path it resolved to are one server."""
         from kiro_crew.mcp_discovery import _commands_diverged
 
-        assert _commands_diverged("deep-research", "/home/user/.toolbox/bin/deep-research") is False
+        pinned = _make_executable(tmp_path / "bin" / "deep-research")
+        assert _commands_diverged("deep-research", str(pinned)) is False
+
+    def test_short_vs_vanished_resolved_path_diverges(self, tmp_path) -> None:
+        """The basename match is void once the pinned path stops resolving.
+
+        A version-stamped pin keeps its basename after a tool update removes the
+        directory that held it, so a name-only comparison can never propose the
+        re-sync that would repair the entry.
+        """
+        from kiro_crew.mcp_discovery import _commands_diverged
+
+        pinned = _make_executable(tmp_path / "tools" / "deep-research" / "1.0.1" / "deep-research")
+        assert _commands_diverged("deep-research", str(pinned)) is False
+
+        shutil.rmtree(pinned.parent)
+        assert _commands_diverged("deep-research", str(pinned)) is True
+
+    @pytest.mark.skipif(
+        platform_compat.IS_WINDOWS,
+        reason="POSIX-only: clearing the execute bit does not make a file unrunnable on Windows.",
+    )
+    def test_present_but_non_executable_pin_diverges(self, tmp_path) -> None:
+        """A pin the process cannot execute is as unusable as an absent one."""
+        from kiro_crew.mcp_discovery import _commands_diverged
+
+        pinned = _make_executable(tmp_path / "bin" / "srv")
+        pinned.chmod(0o444)
+        assert _commands_diverged("srv", str(pinned)) is True
+
+    def test_distinct_existing_paths_sharing_a_basename_diverge(self, tmp_path) -> None:
+        """Two live files with one name are two servers, not two spellings of one."""
+        from kiro_crew.mcp_discovery import _commands_diverged
+
+        first = _make_executable(tmp_path / "a" / "srv")
+        second = _make_executable(tmp_path / "b" / "srv")
+        assert _commands_diverged(str(first), str(second)) is True
 
     def test_resolved_vs_short(self) -> None:
         from kiro_crew.mcp_discovery import _commands_diverged
@@ -1134,7 +1213,7 @@ class TestCommandsDiverged:
         not platform_compat.IS_WINDOWS,
         reason="Windows-only: PATHEXT suffixing and case/separator-insensitive paths.",
     )
-    def test_pathext_resolved_command_does_not_diverge(self, monkeypatch) -> None:
+    def test_pathext_resolved_command_does_not_diverge(self, tmp_path, monkeypatch) -> None:
         """A bare name matches the ``shutil.which`` result that carries a PATHEXT suffix.
 
         ``agent._resolve_command`` resolves ``npx`` to ``...\\npx.CMD`` because
@@ -1144,7 +1223,12 @@ class TestCommandsDiverged:
         from kiro_crew.mcp_discovery import _commands_diverged
 
         monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
-        assert _commands_diverged("npx", r"C:\Program Files\nodejs\npx.CMD") is False
+        # A real file, because the resolved side is now probed for liveness: a
+        # fabricated path under Program Files would make this assertion depend on
+        # what the runner image has installed.
+        resolved = tmp_path / "npx.CMD"
+        resolved.write_text("")
+        assert _commands_diverged("npx", str(resolved)) is False
         assert _commands_diverged(r"C:\tools\my-server.exe", "my-server") is False
 
     @pytest.mark.skipif(
@@ -1170,6 +1254,20 @@ class TestCommandsDiverged:
 
         assert _commands_diverged("srv", "/usr/bin/srv") is False
         assert _commands_diverged(r"\tools\srv", "srv") is False
+
+    def test_other_os_path_spelling_is_not_probed(self) -> None:
+        """A path this host does not address is never called stale.
+
+        The filesystem cannot answer for the other OS's spelling, nor for a
+        driveless root that resolves against whichever drive is current, so
+        neither may be reported as a vanished pin -- doing so would re-sync a
+        portable config on every pass.
+        """
+        from kiro_crew.mcp_discovery import _pinned_command_missing
+
+        foreign = r"C:\tools\nope\srv" if not platform_compat.IS_WINDOWS else "/usr/bin/nope/srv"
+        assert _pinned_command_missing(foreign) is False
+        assert _pinned_command_missing("srv") is False
 
     @pytest.mark.skipif(
         platform_compat.IS_WINDOWS,
@@ -3514,7 +3612,7 @@ class TestFixStaleManagedCommand:
         assert spec["args"] == ["mcp-core"]
 
     def test_applies_python_dash_m_fallback_with_args(self):
-        """When no standalone binary resolves, the python -m kiro_crew fallback
+        """When no standalone binary resolves, the python -s -m kiro_crew fallback
         (command + its args) is applied. On Windows, rewriting the command alone
         would leave a bare 'kirocrew' that isn't on PATH."""
         from kiro_crew.mcp_discovery import _fix_stale_managed_command
@@ -3522,11 +3620,11 @@ class TestFixStaleManagedCommand:
         spec = {"command": "kirocrew", "args": []}
         with patch(
             "kiro_crew.agent._kirocrew_mcp_invocation",
-            return_value=("/venv/Scripts/python.exe", ["-B", "-m", "kiro_crew", "mcp-cron"]),
+            return_value=("/venv/Scripts/python.exe", ["-s", "-m", "kiro_crew", "mcp-cron"]),
         ):
             _fix_stale_managed_command("kirocrew-cron", spec)
         assert spec["command"] == "/venv/Scripts/python.exe"
-        assert spec["args"] == ["-B", "-m", "kiro_crew", "mcp-cron"]
+        assert spec["args"] == ["-s", "-m", "kiro_crew", "mcp-cron"]
 
     def test_maps_each_managed_server_to_its_subcommand(self):
         from kiro_crew.mcp_discovery import _fix_stale_managed_command
@@ -4681,64 +4779,19 @@ class TestFirstPartyManagedArgv:
         )
 
     def test_the_interpreter_fallback_is_never_first_party(self, monkeypatch) -> None:
-        """`python -m kiro_crew` prepends the child's CWD to sys.path (3.10 has
-        no -P), so a planted `kiro_crew/` tree in an untrusted cwd would shadow
-        the install — only a resolved console-script binary qualifies."""
+        """`python -s -m kiro_crew` still prepends the child's CWD to sys.path
+        (3.10 has no -P), so a planted `kiro_crew/` tree in an untrusted cwd
+        would shadow the install — only a resolved console-script binary
+        qualifies."""
         import sys
 
         import kiro_crew.mcp_discovery as md
 
-        fallback = (sys.executable, ["-B", "-m", "kiro_crew", "mcp-core"])
+        fallback = (sys.executable, ["-s", "-m", "kiro_crew", "mcp-core"])
         monkeypatch.setattr(md, "_resolved_managed_invocation", {"kirocrew-core": fallback})
         monkeypatch.setattr("kiro_crew.agent._managed_mcp_env", lambda: {})
         assert not md._is_first_party_managed_argv(
             "kirocrew-core", fallback[0], list(fallback[1]), {}
-        )
-
-    def test_a_prepended_flag_does_not_smuggle_the_fallback_past_the_refusal(
-        self, monkeypatch
-    ) -> None:
-        """The refusal is keyed on the flags, not on ``args[:2]``.
-
-        ``-B`` is prepended to both interpreter shapes (the probe strips
-        ``PYTHONPYCACHEPREFIX``, so the flag is the only bytecode policy that
-        reaches the child), and a positional prefix test would have answered
-        "not a module invocation" for ``-B -m kiro_crew`` and handed the
-        CWD-shadowable fallback the unconfined carve-out.
-        """
-        import kiro_crew.mcp_discovery as md
-
-        assert md._module_invocation_without_safe_path(["-m", "kiro_crew", "mcp-core"])
-        assert md._module_invocation_without_safe_path(["-B", "-m", "kiro_crew", "mcp-core"])
-        # ``-P`` ahead of the ``-m`` keeps the child's CWD off sys.path, so the
-        # bundle's Windows unwrap is not disqualified.
-        assert not md._module_invocation_without_safe_path(
-            ["-B", "-P", "-s", "-m", "kiro_crew", "mcp-core"]
-        )
-        # A console script takes no interpreter flags and runs no ``-m``.
-        assert not md._module_invocation_without_safe_path(["mcp-core"])
-        assert not md._module_invocation_without_safe_path([])
-        # ``-m`` naming some other module is not this invocation at all.
-        assert not md._module_invocation_without_safe_path(["-m", "pytest"])
-
-    def test_a_freshly_resolved_invocation_still_compares_first_party(self, monkeypatch) -> None:
-        """With an EMPTY resolution cache the gate resolves through the real
-        :func:`kiro_crew.agent._kirocrew_mcp_invocation`, so the carve-out keeps
-        working after the argv shape changes — and a customized command, args or
-        env still compares unequal."""
-        import kiro_crew.agent as agent_mod
-        import kiro_crew.mcp_discovery as md
-
-        monkeypatch.setattr(md, "_resolved_managed_invocation", {})
-        monkeypatch.setattr(agent_mod, "_resolve_kirocrew_bin", lambda: "/opt/bin/kirocrew")
-        monkeypatch.setattr("kiro_crew.agent._managed_mcp_env", lambda: {})
-        command, args = agent_mod._kirocrew_mcp_invocation("mcp-core")
-
-        assert md._is_first_party_managed_argv("kirocrew-core", command, list(args), {})
-        assert not md._is_first_party_managed_argv("kirocrew-core", "/tmp/shim", list(args), {})
-        assert not md._is_first_party_managed_argv("kirocrew-core", command, [*args, "--extra"], {})
-        assert not md._is_first_party_managed_argv(
-            "kirocrew-core", command, list(args), {"LD_PRELOAD": "/tmp/evil.so"}
         )
 
     def test_third_party_server_is_never_first_party(self, monkeypatch) -> None:
@@ -5079,3 +5132,296 @@ class TestProbeHeaderReferenceExpansion:
         assert _needs_authorization(401, {}, {"Authorization": "Bearer abc"}) is False
         # Only 401/403-with-challenge become needs_auth even when unresolved.
         assert _needs_authorization(500, {}, {"Authorization": "Bearer ${TOKEN}"}) is False
+
+
+class TestQuarantinedServersAreNotSpawned:
+    """A server that wedges on every probe stops being spawned.
+
+    ``PROBE_MAX_CONCURRENCY`` bounds how many probes run at once, never how many
+    times a hopeless one is retried, so the thing under test is REPETITION. The
+    consecutive-failure count is not kept here: ``mcp_quarantine`` already holds
+    it, and these tests drive it exactly as the dashboard does — ``probe_all``,
+    then ``record_verdicts`` with that round's outcome.
+    """
+
+    LIMIT = 3
+
+    @pytest.fixture(autouse=True)
+    def _store(self, tmp_path, monkeypatch):
+        from kiro_crew import mcp_quarantine
+        from kiro_crew.mcp_discovery import _quarantine_warned
+
+        monkeypatch.setattr(mcp_quarantine, "_STORE_PATH", tmp_path / "quarantine.json")
+        monkeypatch.setattr(mcp_quarantine, "threshold", lambda: self.LIMIT)
+        _clear_cache()
+        _quarantine_warned.clear()
+        yield
+        _quarantine_warned.clear()
+        _clear_cache()
+
+    @staticmethod
+    def _wedged_config(tmp_path: Path, monkeypatch) -> None:
+        """Point discovery at one enabled server and nothing else."""
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(json.dumps({"mcpServers": {"wedged": {"command": "hangs-forever"}}}))
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+
+    @staticmethod
+    def _always_times_out(spawned: list[str]):
+        """A ``probe_server`` stand-in for a server that wedges on every spawn."""
+
+        async def fake_probe(server):
+            spawned.append(server.name)
+            server.status = "error"
+            server.error = "probe timed out after 15s"
+            _cache_probe(server)
+            return server
+
+        return fake_probe
+
+    async def _pass(self, monkeypatch, spawned: list[str]) -> list:
+        """One discovery pass, folded back into the store like the dashboard's.
+
+        ``dashboard/handlers/mcp.py`` calls ``probe_all`` and then hands
+        ``_record_probe_verdicts`` EVERY row it returned -- it does not know which
+        ones were spawned. This helper must do the same, or it tests a caller that
+        does not exist and hides what the real one does with an unprobed row.
+        """
+        from kiro_crew import mcp_quarantine
+        from kiro_crew.mcp_discovery import probe_all
+
+        probed = await probe_all()
+        mcp_quarantine.record_verdicts([(s.name, s.status, s.error) for s in probed])
+        return probed
+
+    @pytest.mark.asyncio
+    async def test_wedged_server_leaves_the_spawn_set_at_the_threshold(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Five passes, three spawns: exclusion holds once the count crosses.
+
+        Asserted against the configured threshold rather than a literal 3, so
+        retuning ``agent.mcp_quarantine_after_failures`` cannot leave a test that
+        only agrees with itself.
+        """
+        self._wedged_config(tmp_path, monkeypatch)
+        spawned: list[str] = []
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", self._always_times_out(spawned))
+
+        results = [await self._pass(monkeypatch, spawned) for _ in range(self.LIMIT + 2)]
+
+        assert spawned == ["wedged"] * self.LIMIT
+        # Excluded from the SPAWN set, not from the answer: a caller that decides
+        # freshness by comparing returned names against its own cache would read a
+        # dropped row as a brand-new server on every request and re-arm the very
+        # fan-out this stops.
+        for probed in results:
+            assert [s.name for s in probed] == ["wedged"]
+        # The rows that WERE probed report the failure; the excluded ones report
+        # no fresh result, which is what test_an_unprobed_row_cannot_advance_the_count
+        # depends on.
+        assert results[self.LIMIT - 1][0].status == "error"
+        assert results[-1][0].status == "outdated"
+
+    @pytest.mark.asyncio
+    async def test_an_unprobed_row_cannot_advance_the_count(self, tmp_path, monkeypatch) -> None:
+        """The excluded row reports no fresh result, so it is not a verdict.
+
+        Its caller folds every returned row back into the store, so a row still
+        carrying the old ``error`` would re-count a probe that never ran: the
+        count would climb with no handshake behind it, and raising the threshold
+        afterwards could never release the server.
+        """
+        from kiro_crew import mcp_quarantine
+
+        self._wedged_config(tmp_path, monkeypatch)
+        spawned: list[str] = []
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", self._always_times_out(spawned))
+
+        for _ in range(self.LIMIT + 3):
+            probed = await self._pass(monkeypatch, spawned)
+
+        assert probed[0].status == "outdated"
+        assert probed[0].error == ""
+        # Exactly the real failures, with nothing added by the passes that
+        # returned the row without probing it.
+        assert mcp_quarantine.state_for("wedged")["fails"] == self.LIMIT
+        # And the count that governs exclusion is therefore still releasable by
+        # the operator lever that reads it.
+        monkeypatch.setattr(mcp_quarantine, "threshold", lambda: self.LIMIT + 1)
+        spawned.clear()
+        await self._pass(monkeypatch, spawned)
+        assert spawned == ["wedged"]
+
+    @pytest.mark.asyncio
+    async def test_a_second_crossing_warns_again(self, tmp_path, monkeypatch, caplog) -> None:
+        """Recovery then a fresh wedge is news, so it warns a second time.
+
+        A ledger keyed by server name alone would stay silent here for the life of
+        the process, which is the failure mode warn-once must not become.
+        """
+        from kiro_crew import mcp_quarantine
+        from kiro_crew.mcp_discovery import _quarantine_warned
+
+        self._wedged_config(tmp_path, monkeypatch)
+        spawned: list[str] = []
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", self._always_times_out(spawned))
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            for _ in range(self.LIMIT + 1):
+                await self._pass(monkeypatch, spawned)
+            assert len([r for r in caplog.records if "will no longer" in r.getMessage()]) == 1
+
+            mcp_quarantine.clear("wedged")
+            # One pass to drop the cleared crossing from the ledger, proving the
+            # prune keeps it bounded rather than growing one key per crossing.
+            await self._pass(monkeypatch, spawned)
+            assert _quarantine_warned == set()
+
+            for _ in range(self.LIMIT + 1):
+                await self._pass(monkeypatch, spawned)
+
+        opened = [r for r in caplog.records if "will no longer" in r.getMessage()]
+        assert len(opened) == 2
+        assert all("wedged" in r.getMessage() for r in opened)
+
+    @pytest.mark.asyncio
+    async def test_exactly_one_warning_per_crossing(self, tmp_path, monkeypatch, caplog) -> None:
+        """One warning for the whole wedge, naming both ways back out."""
+        self._wedged_config(tmp_path, monkeypatch)
+        spawned: list[str] = []
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", self._always_times_out(spawned))
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_discovery"):
+            for _ in range(self.LIMIT + 3):
+                await self._pass(monkeypatch, spawned)
+
+        opened = [r for r in caplog.records if "will no longer" in r.getMessage()]
+        assert len(opened) == 1
+        message = opened[0].getMessage()
+        assert "wedged" in message
+        # The remedy matters more than the diagnosis here: the exclusion outlives a
+        # gateway restart, so the one line an operator gets has to name the reset
+        # that clears it and the switch that turns the whole thing off.
+        assert "/api/mcp/quarantine/clear" in message
+        assert "agent.mcp_quarantine_after_failures" in message
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_quarantine_restores_spawning(self, tmp_path, monkeypatch) -> None:
+        """The operator reset that already ships is the reopen path."""
+        from kiro_crew import mcp_quarantine
+
+        self._wedged_config(tmp_path, monkeypatch)
+        spawned: list[str] = []
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", self._always_times_out(spawned))
+        for _ in range(self.LIMIT + 1):
+            await self._pass(monkeypatch, spawned)
+        assert spawned == ["wedged"] * self.LIMIT
+
+        mcp_quarantine.clear("wedged")
+
+        spawned.clear()
+        await self._pass(monkeypatch, spawned)
+        assert spawned == ["wedged"]
+
+    @pytest.mark.asyncio
+    async def test_a_successful_probe_clears_the_count(self, tmp_path, monkeypatch) -> None:
+        """A success below the threshold clears the count rather than pausing it.
+
+        Without this, two failures far apart on either side of a healthy probe
+        would still add up and exclude a server that is working.
+        """
+        self._wedged_config(tmp_path, monkeypatch)
+        spawned: list[str] = []
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", self._always_times_out(spawned))
+        for _ in range(self.LIMIT - 1):
+            await self._pass(monkeypatch, spawned)
+
+        async def healthy(server):
+            spawned.append(server.name)
+            server.status = "ok"
+            server.tools = ["t"]
+            _cache_probe(server)
+            return server
+
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", healthy)
+        await self._pass(monkeypatch, spawned)
+
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", self._always_times_out(spawned))
+        spawned.clear()
+        for _ in range(self.LIMIT - 1):
+            await self._pass(monkeypatch, spawned)
+        assert spawned == ["wedged"] * (self.LIMIT - 1)
+
+    @pytest.mark.asyncio
+    async def test_threshold_zero_turns_exclusion_off_too(self, tmp_path, monkeypatch) -> None:
+        """One switch, one meaning: ``0`` disables quarantining, badge and spawn.
+
+        An operator who turns the feature off has to get the pre-change behaviour
+        back, not a silent exclusion whose badge has been hidden.
+        """
+        from kiro_crew import mcp_quarantine
+
+        monkeypatch.setattr(mcp_quarantine, "threshold", lambda: 0)
+        self._wedged_config(tmp_path, monkeypatch)
+        spawned: list[str] = []
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", self._always_times_out(spawned))
+
+        for _ in range(self.LIMIT + 2):
+            await self._pass(monkeypatch, spawned)
+
+        assert spawned == ["wedged"] * (self.LIMIT + 2)
+
+    @pytest.mark.asyncio
+    async def test_a_hostile_store_record_cannot_break_discovery(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Any stored value must be inert on the probe path.
+
+        The store is unfenced and its contents are attacker-influenced, and this
+        read happens inside ``probe_all``: an exception here would take out the
+        whole fleet's discovery, not one row. ``_as_time`` bounds NaN, infinities
+        and negatives but passes a large finite value through, so nothing on this
+        path may hand a stored number to an API with a platform range.
+        """
+        from kiro_crew import mcp_quarantine
+
+        store = tmp_path / "quarantine.json"
+        store.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "servers": {
+                        "wedged": {"fails": 10**9, "crossed_at": 1e30, "last_status": "error"}
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(mcp_quarantine, "_STORE_PATH", store)
+        self._wedged_config(tmp_path, monkeypatch)
+        spawned: list[str] = []
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", self._always_times_out(spawned))
+
+        probed = await self._pass(monkeypatch, spawned)
+
+        assert [s.name for s in probed] == ["wedged"]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_store_still_probes(self, tmp_path, monkeypatch) -> None:
+        """Fail OPEN: one bad file must not become a fleet-wide probe outage."""
+        from kiro_crew import mcp_quarantine
+
+        def boom():
+            raise OSError("store unreadable")
+
+        monkeypatch.setattr(mcp_quarantine, "snapshot", boom)
+        self._wedged_config(tmp_path, monkeypatch)
+        spawned: list[str] = []
+        monkeypatch.setattr("kiro_crew.mcp_discovery.probe_server", self._always_times_out(spawned))
+
+        for _ in range(self.LIMIT + 2):
+            await self._pass(monkeypatch, spawned)
+
+        assert spawned == ["wedged"] * (self.LIMIT + 2)

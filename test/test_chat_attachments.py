@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
 from kiro_crew.chat_attachments import (
     MAX_ATTACHMENT_BYTES,
+    _encode_destination,
     attachments_dir,
     persist_inline_images,
     purge_staged_attachments,
@@ -51,6 +53,16 @@ def _write_png(path, data=PNG_BYTES):
     return path
 
 
+def _dest(path):
+    """A stored path as this module now spells it in a markdown destination.
+
+    Identity on POSIX. On Windows the separators are forward slashes, because
+    the native spelling is not a fixed point of the parser that reads the row
+    back -- see ``_commonmark_unescape`` and the cases at the end of this file.
+    """
+    return str(path).replace(os.sep, "/")
+
+
 def _stored_files(sessions):
     target = attachments_dir(sessions, STEM)
     return sorted(p.name for p in target.iterdir()) if target.exists() else []
@@ -69,7 +81,7 @@ def test_local_png_is_copied_and_the_path_rewritten(sessions, tmp_path):
     copied = attachments_dir(sessions, STEM) / stored[0]
     assert copied.read_bytes() == PNG_BYTES
     # The persisted text names the copy, not the scratch path.
-    assert str(copied) in out
+    assert _dest(copied) in out
     assert str(source) not in out
     # Copy, never move: the agent's own file is exactly as it was.
     assert source.read_bytes() == PNG_BYTES
@@ -88,7 +100,7 @@ def test_same_image_twice_is_stored_once_and_both_refs_rewritten(sessions, tmp_p
 
     assert len(_stored_files(sessions)) == 1
     copied = attachments_dir(sessions, STEM) / _stored_files(sessions)[0]
-    assert out == f"![x]({copied}) and ![y]({copied})"
+    assert out == f"![x]({_dest(copied)}) and ![y]({_dest(copied)})"
 
 
 def test_remote_and_data_destinations_are_untouched(sessions):
@@ -254,7 +266,7 @@ def test_a_title_repeating_the_path_does_not_hide_the_destination(sessions, tmp_
     stored = _stored_files(sessions)
     assert len(stored) == 1
     copied = attachments_dir(sessions, STEM) / stored[0]
-    assert out == f'![x]({copied} "{source}")'
+    assert out == f'![x]({_dest(copied)} "{source}")'
 
 
 def test_a_destination_that_cannot_be_stored_still_counts_against_the_cap(
@@ -296,7 +308,7 @@ def test_an_escaped_destination_is_rewritten_not_orphaned(sessions, tmp_path):
     stored = _stored_files(sessions)
     assert len(stored) == 1
     copied = attachments_dir(sessions, STEM) / stored[0]
-    assert out == f"![x]({copied})"
+    assert out == f"![x]({_dest(copied)})"
 
 
 def test_a_repeat_after_the_cap_is_still_rewritten(sessions, tmp_path, monkeypatch):
@@ -313,7 +325,7 @@ def test_a_repeat_after_the_cap_is_still_rewritten(sessions, tmp_path, monkeypat
     stored = _stored_files(sessions)
     assert len(stored) == 1
     copied = attachments_dir(sessions, STEM) / stored[0]
-    assert out == f"![a]({copied}) ![b]({second}) ![a2]({copied})"
+    assert out == f"![a]({_dest(copied)}) ![b]({second}) ![a2]({_dest(copied)})"
 
 
 def test_a_repeated_reference_is_read_once_per_row(sessions, tmp_path, monkeypatch):
@@ -381,7 +393,7 @@ def test_a_repeated_image_is_not_charged_twice_to_the_budget(sessions, tmp_path,
     stored = _stored_files(sessions)
     assert len(stored) == 1
     copied = attachments_dir(sessions, STEM) / stored[0]
-    assert out == f"![x]({copied}) ![y]({copied})"
+    assert out == f"![x]({_dest(copied)}) ![y]({_dest(copied)})"
 
 
 def test_a_path_needing_markdown_quoting_is_angle_wrapped(tmp_path):
@@ -393,7 +405,7 @@ def test_a_path_needing_markdown_quoting_is_angle_wrapped(tmp_path):
     out = persist_inline_images(f"![s]({source})", sessions_dir=sessions, stem=STEM)
 
     stored = next(attachments_dir(sessions, STEM).iterdir())
-    assert out == f"![s](<{stored}>)"
+    assert out == f"![s](<{_dest(stored)}>)"
 
 
 def test_fenced_and_escaped_references_are_left_as_written(sessions, tmp_path):
@@ -479,6 +491,42 @@ def test_same_text_modulo_images_pairs_a_preserved_copy_with_its_original(sessio
     assert same_text_modulo_images(right, right, sessions_dir=sessions, stem=STEM)
 
 
+def test_same_text_modulo_images_pairs_a_copy_stored_on_a_unc_data_home(monkeypatch, tmp_path):
+    r"""The roaming-profile case: the stored copy's own destination is ``//...``.
+
+    A markdown destination cannot carry ``\\fileserver\...`` -- the CommonMark
+    parser reading it drops the backslashes -- so ``_posix_separators`` spells a
+    stored Windows path with forward slashes, and on a roaming profile the data
+    home is itself a share, which makes that spelling ``//fileserver/...``. Read
+    as a protocol-relative URL, the stored side contributes no reference at all:
+    ``stored_seen`` stays false, the two id-matched rows fail to corroborate, and
+    the pair the two write boundaries exist to collapse becomes two history rows.
+
+    Purely lexical throughout (no path here is written), and every spelling is
+    forward-slash with ``peek_data_home`` patched, so the gate answers the same on
+    the Linux CI box as on Windows -- the reason the UNC-gate tests give.
+    """
+    from kiro_crew.messaging import outbound_files as module
+
+    monkeypatch.setattr(module, "os", type("OS", (), {"name": "nt"})(), raising=False)
+    unc_home = "//fileserver/home/me/.kiro/crew"
+    monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: Path(unc_home))
+
+    unc_sessions = f"{unc_home}/sessions"
+    stored = f"{unc_sessions}/{STEM}.attachments/0123456789abcdef-shot.png"
+    scratch = tmp_path / "scratch" / "shot.png"  # never written; the agent's own copy
+    left = f"see ![s]({scratch}) done"
+    right = f"see ![s]({stored}) done"
+    assert same_text_modulo_images(left, right, sessions_dir=Path(unc_sessions), stem=STEM)
+    assert same_text_modulo_images(right, left, sessions_dir=Path(unc_sessions), stem=STEM)
+    # A share this gateway does not write to is still not a local path, so it
+    # corroborates nothing -- the allowlist, not the `//`, is what decides.
+    foreign = f"//evil/share/{STEM}.attachments/0123456789abcdef-shot.png"
+    assert not same_text_modulo_images(
+        left, f"see ![s]({foreign}) done", sessions_dir=Path(unc_sessions), stem=STEM
+    )
+
+
 def test_same_text_modulo_images_does_not_pair_different_text_or_unstored_paths(sessions, tmp_path):
     stored = attachments_dir(sessions, STEM) / "0123456789abcdef-shot.png"
     scratch = tmp_path / "scratch" / "shot.png"
@@ -528,3 +576,132 @@ def test_a_long_run_of_image_openers_is_left_alone_quickly(sessions, tmp_path):
     assert not _stored_files(sessions)
     # And the corroboration helper takes the same exit.
     assert not same_text_modulo_images(text, text + " ", sessions_dir=sessions, stem=STEM)
+
+
+# ---------------------------------------------------------------------------
+# A destination has to survive the parser that reads it back.
+# ---------------------------------------------------------------------------
+
+#: CommonMark's backslash rule, mirrored here so the cases below can state the
+#: property directly: inside a link destination a backslash before ASCII
+#: punctuation is an ESCAPE and is dropped; before anything else it is literal.
+#: The dashboard's markdown parser applies this to every destination this module
+#: writes, so a destination resolves to the file it names only when it is a FIXED
+#: POINT of the rule.
+_ASCII_PUNCT = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
+
+def _commonmark_unescape(dest):
+    """*dest* as a CommonMark parser resolves it. Mirrors :data:`_ASCII_PUNCT`."""
+    out = []
+    i = 0
+    while i < len(dest):
+        if dest[i] == "\\" and i + 1 < len(dest) and dest[i + 1] in _ASCII_PUNCT:
+            out.append(dest[i + 1])
+            i += 2
+            continue
+        out.append(dest[i])
+        i += 1
+    return "".join(out)
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        # The default data home is ~/.kiro/crew, so a native destination always
+        # carries a backslash-then-dot sequence. This is the ordinary case.
+        r"C:\Users\me\.kiro\crew\sessions\chat.attachments\0123456789abcdef-shot.png",
+        r"\\nas\team\.kiro\crew\sessions\chat.attachments\0123456789abcdef-shot.png",
+    ],
+    ids=["drive", "unc"],
+)
+def test_a_windows_destination_is_written_so_the_parser_reads_it_back(stored):
+    """Separators are written as ``/`` -- the spelling the reader resolves.
+
+    Driven through the encoder rather than :func:`persist_inline_images` so the
+    case runs on every platform: a drive-letter path is not absolute off Windows,
+    so the end-to-end route below cannot reach the rewrite there at all.
+    """
+    # Guard the guard: the native spelling is NOT a fixed point of the parser's
+    # own rule, so the assertion after it cannot pass vacuously.
+    assert _commonmark_unescape(stored) != stored
+
+    encoded = _encode_destination(stored, angle_wrapped=False)
+
+    assert _commonmark_unescape(encoded) == encoded
+    assert encoded == stored.replace("\\", "/")
+
+
+def test_a_posix_destination_is_returned_by_identity():
+    """Nothing changes off Windows: there are no separators to rewrite."""
+    posix = "/home/me/.kiro/crew/sessions/chat.attachments/0123456789abcdef-shot.png"
+    assert _encode_destination(posix, angle_wrapped=False) == posix
+    assert _commonmark_unescape(posix) == posix
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive-letter path is absolute on Windows only")
+def test_a_persisted_windows_reference_resolves_to_the_file_it_stored(tmp_path):
+    """End to end on a real Windows filesystem, with the home shaped as shipped.
+
+    The defect this pins: the rewritten destination named the attachment under
+    ``.kiro``, the parser read that separator-then-dot as an escape, and the
+    dashboard asked ``/api/file-raw`` for a path one directory level short of the
+    file -- so every persisted image rendered broken.
+    """
+    sessions = tmp_path / ".kiro" / "crew" / "sessions"
+    sessions.mkdir(parents=True)
+    source = _write_png(tmp_path / "scratch" / "shot.png")
+
+    out = persist_inline_images(f"![s]({source})", sessions_dir=sessions, stem=STEM)
+
+    stored = next(attachments_dir(sessions, STEM).iterdir())
+    dest = out[out.index("](") + 2 : -1]
+    assert "\\" not in dest
+    # What the reader resolves is the file that was actually written.
+    assert Path(_commonmark_unescape(dest)) == stored
+
+
+def test_persisting_an_already_rewritten_row_changes_nothing(sessions, tmp_path):
+    """The fixed point, on every platform: a second pass re-encodes to itself.
+
+    This is what lets the slot save re-serialize its whole window on every flush,
+    and what makes the repair below safe to run on every persisted row.
+    """
+    source = _write_png(tmp_path / "scratch" / "shot.png")
+
+    once = persist_inline_images(f"![s]({source})", sessions_dir=sessions, stem=STEM)
+    twice = persist_inline_images(once, sessions_dir=sessions, stem=STEM)
+
+    assert twice == once
+    assert len(_stored_files(sessions)) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive-letter path is absolute on Windows only")
+def test_a_row_holding_the_pre_repair_spelling_is_repaired_in_place(tmp_path):
+    """Rows already on disk are reached, because this is where they are rewritten.
+
+    A build that wrote the destination natively left a row whose reader resolves
+    a DIFFERENT path. Such a row names a file that is already stored, so nothing
+    is copied -- but the destination is re-encoded, and the row heals the next
+    time it is persisted.
+
+    The home is shaped as shipped (``~/.kiro/crew``): it is the dot-led segment
+    that makes the native spelling unreadable, so a sessions directory without
+    one could not express the defect at all.
+    """
+    sessions = tmp_path / ".kiro" / "crew" / "sessions"
+    sessions.mkdir(parents=True)
+    source = _write_png(tmp_path / "scratch" / "shot.png")
+    persist_inline_images(f"![s]({source})", sessions_dir=sessions, stem=STEM)
+    stored = next(attachments_dir(sessions, STEM).iterdir())
+
+    legacy = f"![s]({stored})"  # str(Path) -- exactly what the old encoder emitted
+    # Guard the guard: the legacy row really is unreadable as written.
+    assert Path(_commonmark_unescape(legacy[legacy.index("](") + 2 : -1])) != stored
+
+    out = persist_inline_images(legacy, sessions_dir=sessions, stem=STEM)
+
+    dest = out[out.index("](") + 2 : -1]
+    assert Path(_commonmark_unescape(dest)) == stored
+    # Repair only: no second copy of bytes that were already stored.
+    assert len(_stored_files(sessions)) == 1

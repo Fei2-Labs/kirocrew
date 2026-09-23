@@ -288,23 +288,26 @@ class TestAcpBackendOverride:
         assert provider.client._model == "opus-4.8-1m"
 
     def test_spec_auto_does_not_resolve_through_kiro_agent_files(self) -> None:
-        """Backend-owned namespaces leave auto to the selected adapter."""
+        """Backend-owned namespaces leave auto to the selected adapter.
+
+        REWRITTEN at the 2026-09-21 sync. This asserted the MECHANISM -- that the
+        adapter path never reads a Kiro agent file at all -- by making both
+        resolvers raise. Upstream replaced that with ``model_scope``: the pin is
+        read and then SCOPED to the namespace that will run it
+        (``model_scope.scoped_pin``), which is a strictly better answer because it
+        also catches a pin arriving from a dashboard slot, a place this mechanism
+        never covered. Asserting "never read" now fails on a design that reaches
+        the same outcome by a sounder route, so the pin moves to the OUTCOME: an
+        unpinned adapter session inherits the adapter's own default. Verified the
+        outcome holds identically on pure upstream before rewriting.
+        """
         from kiro_crew.acp.types import ACP_BACKEND_GOOSE
 
         cfg = KiroCrewConfig()
         cfg.agent.acp_backend = ACP_BACKEND_GOOSE
-        with (
-            patch.object(
-                KiroCrewConfig,
-                "_resolve_agent_model",
-                side_effect=AssertionError("adapter read the Kiro global agent file"),
-            ),
-            patch.object(
-                KiroCrewConfig,
-                "_resolve_named_agent_model",
-                side_effect=AssertionError("adapter read a named Kiro agent file"),
-            ),
-        ):
+        # Nothing pinned anywhere: no override, no agent-spec model, and the
+        # global left at the sentinel. The adapter must pick for itself.
+        with patch.object(KiroCrewConfig, "_resolve_named_agent_model", return_value=""):
             provider = build_provider_factory(cfg)(
                 session_key="subagent:child",
                 agent="reviewer",
@@ -319,11 +322,11 @@ class TestAcpBackendOverride:
         cfg = KiroCrewConfig()
         cfg.agent.acp_backend = ACP_BACKEND_GOOSE
         cfg.agent.model = "backend-owned-model"
-        with patch.object(
-            KiroCrewConfig,
-            "_resolve_named_agent_model",
-            side_effect=AssertionError("adapter read a named Kiro agent file"),
-        ):
+        # Same rewrite as the sibling above: the agent-spec tier is CONSULTED and
+        # then loses, rather than being unreachable. An empty answer there is the
+        # "nothing pinned in this tier" spelling, so the concrete adapter global
+        # below it wins -- which is the precedence this test exists to pin.
+        with patch.object(KiroCrewConfig, "_resolve_named_agent_model", return_value=""):
             provider = build_provider_factory(cfg)(
                 session_key="subagent:child",
                 agent="reviewer",

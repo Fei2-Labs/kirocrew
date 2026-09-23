@@ -1,3 +1,5 @@
+import type { Notification } from '../types'
+
 /** Shared contract between useWebSocket.ts (dispatcher) and useNotificationSound.ts (listener). */
 export const MC_NOTIFICATION_EVENT = 'mc-notification' as const
 export const MC_SOUND_SETTINGS_CHANGED_EVENT = 'mc-notification-sound-changed' as const
@@ -25,33 +27,59 @@ export function dispatchMcNotification(kind: string): void {
 }
 
 /**
- * Sound kind for agent turn completion. Synthesized by the websocket layer on
- * `chat_done` — it never appears in the notification feed (no Redux entry, no
- * toast, no badge); it exists only so useNotificationSound can key a per-category
- * sound for "the agent finished replying".
+ * Sound kind for a conversation handing the floor back to the user. The
+ * persisted 'turn' key preserves per-category preferences. This sound-only
+ * event adds no notification-feed record, toast, or badge.
  */
 export const TURN_DONE_KIND = 'turn' as const
 
 /**
- * Sound kind for tool-approval prompts. Synthesized by the websocket layer on
- * `approval` frames — the agent is blocked waiting for a user decision. Uses
- * a distinct preset from turn-complete so the user can distinguish "needs my
- * action" from "finished, no action needed" without looking.
+ * Sound kind for a tool approval or explicit question. Synthesized by the
+ * websocket layer when the agent needs a user decision. Uses a distinct preset
+ * so the user can distinguish "needs my action" from "finished".
  */
 export const APPROVAL_KIND = 'approval' as const
 
 /**
- * Whether a finished turn warrants a chime. Policy: every real turn
- * completion chimes — active chat or background, focused or not — so the
- * user always gets an audible cue when any session finishes. Two
- * suppressions remain: slot-less events (no real turn behind them) and
- * reconnect catch-up replays (mirrors the markSlotUnread suppression;
- * stale completions replayed on reconnect must not chime-storm — the
- * unread badges already cover them).
+ * A turn sound means the conversation has stopped or needs an answer, not
+ * merely that one model turn returned. Continuation comes from the terminal
+ * frame, with live activity selectors as the fallback for older frames.
+ * Reconnect replay and slot-less frames never request audio.
  */
 export function shouldChimeOnTurnDone(opts: {
   slot: string | undefined | null
   reconnecting: boolean
+  continuing?: boolean
+  needsInput?: boolean
 }): boolean {
-  return !!opts.slot && !opts.reconnecting
+  return !!opts.slot && !opts.reconnecting && (!!opts.needsInput || !opts.continuing)
+}
+
+/**
+ * A feed `notification` frame the socket received LIVE — after this tab
+ * mounted, outside a reconnect catch-up replay. The in-app banner
+ * (`components/notifications/NotificationBanner.tsx`) listens for this, not
+ * for the Redux `addNotification` action, because the store also fills from
+ * the boot `fetchNotifications` snapshot and from replays, and a banner for a
+ * note the user already has in the bell would announce history as news.
+ * The dispatcher (useWebSocket) owns the replay half of that rule — it is the
+ * only place that knows the socket is catching up; the listener owns the
+ * silenced/passive/current-view half.
+ */
+export const MC_LIVE_NOTIFICATION_EVENT = 'mc-live-notification' as const
+
+export interface McLiveNotificationDetail {
+  note: Notification
+}
+
+export function dispatchLiveNotification(note: Notification): void {
+  try {
+    const detail: McLiveNotificationDetail = { note }
+    window.dispatchEvent(new CustomEvent(MC_LIVE_NOTIFICATION_EVENT, { detail }))
+  } catch (err) {
+    // Same last-resort surface as dispatchMcNotification: a broken banner
+    // listener must not take the socket handler down with it.
+    // eslint-disable-next-line no-console
+    console.warn('mc-live-notification listener error', err)
+  }
 }

@@ -38,9 +38,25 @@ _SYNTHETIC_UNVERIFIED = "example-acp"
 
 
 class TestGooseDescriptor:
-    def test_goose_is_known_but_withheld_from_the_initial_preview(self) -> None:
+    def test_goose_is_known_and_now_selectable(self) -> None:
+        """goose LEFT the withheld set at the 2026-09-21 sync.
+
+        It was withheld while its readiness verdict would have been UNKNOWN with
+        nothing an operator could act on. Upstream then met both conditions
+        ``NOT_SHIPPED_SELECTABLE`` names, and states them on
+        ``BASELINE_SELECTABLE_BACKENDS``: ``backend_install`` probes for the
+        ``goose`` binary (verified here -- the probe answers ``missing`` with
+        component ``goose``, which is actionable), and its tool calls are ROUTED
+        and the routing VERIFIED -- ``GOOSE_MODE=approve`` resolves above goose's
+        own config file and the client reads the resolved mode back off the
+        session response (``Routing.VERIFIED_SEEDED_SETTINGS``).
+
+        So this pins the CURRENT disposition rather than the old one. What must
+        not regress is the pairing: selectable only while that routing holds --
+        ``test_goose_routing_is_permission_request`` below is the other half.
+        """
         assert ACP_BACKEND_GOOSE in ACP_BACKENDS_KNOWN
-        assert ACP_BACKEND_GOOSE not in selectable_backends()
+        assert ACP_BACKEND_GOOSE in selectable_backends()
 
     def test_goose_routing_is_permission_request(self) -> None:
         descriptor = backends.descriptor_for(ACP_BACKEND_GOOSE)
@@ -232,7 +248,22 @@ async def test_goose_skips_session_load_when_native_resume_is_unavailable(
     ) -> dict:
         if req_id == 1:
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
-        return {"sessionId": "fresh-goose"}
+        # The modes block is REQUIRED on a goose session response. Upstream's
+        # ``_verify_goose_routing`` reads the resolved mode back off this very
+        # response and refuses an omitted block as INDETERMINATE -- deliberately,
+        # per its own pin ``test_a_response_with_no_modes_block_refuses_rather_
+        # than_passing``: goose always reports one, so its absence means the
+        # response is not the shape that read was verified against. This fixture
+        # predates that read-back (the fork had only the set_mode pin), so it
+        # omitted the block; supplying the measured shape is what keeps this test
+        # about SESSION LOAD rather than about the routing refusal.
+        return {
+            "sessionId": "fresh-goose",
+            "modes": {
+                "currentModeId": "approve",
+                "availableModes": [{"id": "auto"}, {"id": "approve"}],
+            },
+        }
 
     client._send_request = AsyncMock(side_effect=fake_send)
     client._wait_for_response = AsyncMock(side_effect=fake_wait)

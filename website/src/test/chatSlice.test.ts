@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest'
 import type { ChatMessage, SubagentActivity, ToolActivity } from '../types'
 import type { RootState } from '../store'
 import reducer, {
+  TOOL_OUTPUT_MAX_CHARS,
+  clampToolOutput,
   setActiveSlot,
   setPendingInput,
   appendMessage,
@@ -346,18 +348,22 @@ describe('chatSlice reducers', () => {
     })
   })
 
-  it('setSlotStatusDetail updates kind, text, and ts', () => {
+  it('setSlotStatusDetail updates kind and ts, and keeps a server status label', () => {
     const now = Date.now()
-    const state = reducer(initial, setSlotStatusDetail({ slot: 'test-slot', kind: 'thinking', text: 'Thinking…', ts: now }))
+    const state = reducer(initial, setSlotStatusDetail({ slot: 'test-slot', kind: 'thinking', ts: now }))
     expect(state.slotStatusDetail['test-slot'].kind).toBe('thinking')
-    expect(state.slotStatusDetail['test-slot'].text).toBe('Thinking…')
+    // A fixed phase stores no copy: the label is resolved from `kind` at render time.
+    expect(state.slotStatusDetail['test-slot']).toEqual({ kind: 'thinking', ts: now })
     expect(state.slotStatusDetail['test-slot'].ts).toBe(now)
     // Tool name optional
-    const state2 = reducer(state, setSlotStatusDetail({ slot: 'test-slot', kind: 'tool', text: 'Tool: read', toolName: 'read', ts: now }))
+    const state2 = reducer(state, setSlotStatusDetail({ slot: 'test-slot', kind: 'tool', purpose: 'Tool: read', toolName: 'read', ts: now }))
     expect(state2.slotStatusDetail['test-slot'].toolName).toBe('read')
     // Idle clears
-    const state3 = reducer(state2, setSlotStatusDetail({ slot: 'test-slot', kind: 'idle', text: 'Ready', ts: now }))
+    const state3 = reducer(state2, setSlotStatusDetail({ slot: 'test-slot', kind: 'idle', ts: now }))
     expect(state3.slotStatusDetail['test-slot'].kind).toBe('idle')
+    // A server-supplied status is the one non-tool phase that carries a label.
+    const state4 = reducer(state3, setSlotStatusDetail({ slot: 'test-slot', kind: 'thinking', label: 'Compacting…', ts: now }))
+    expect(state4.slotStatusDetail['test-slot']).toEqual({ kind: 'thinking', label: 'Compacting…', ts: now })
   })
 
   it('clearMessages resets messages and pagination', () => {
@@ -1566,9 +1572,13 @@ describe('subagent reducers', () => {
     expect(state.subagents['a1'].streaming).toBe('hello world')
   })
 
-  it('sseSubagentBatchChunks ignores unknown agent', () => {
+  it('sseSubagentBatchChunks recovers an unknown agent rather than dropping its text', () => {
+    // A chunk frame is part of the only evidence the panel gets between one
+    // spawn frame and one done frame, so it mints the entry it needs instead of
+    // discarding the text. The minted start time is flagged as assumed.
     const state = reducer(withSlot, sseSubagentBatchChunks({ chunks: [{ slot: 'slot-1', id: 'unknown', text: 'data' }] }))
-    expect(state.subagents['unknown']).toBeUndefined()
+    expect(state.subagents['unknown'].streaming).toBe('data')
+    expect(state.subagents['unknown'].startedAtAssumed).toBe(true)
   })
 
   it('sseSubagentTool updates lastTool and status', () => {
@@ -1689,6 +1699,148 @@ describe('activity viewer reducers', () => {
   it('sseToolResult is noop without prior tool entry', () => {
     const state = reducer(withSlot, sseToolResult({ slot: 'slot-1', output: 'orphan' }))
     expect(state.toolLog).toHaveLength(0)
+  })
+
+  it('sseToolResult stores an output at the ceiling verbatim, with no seam', () => {
+    let state = reducer(withSlot, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: '' }))
+    const exact = 'a'.repeat(TOOL_OUTPUT_MAX_CHARS)
+    state = reducer(state, sseToolResult({ slot: 'slot-1', output: exact }))
+    expect(state.toolLog[0].output).toBe(exact)
+    expect(state.toolLog[0].output_cut).toBeUndefined()
+  })
+
+  it('sseToolResult clamps an oversize output to head + tail and records the seam', () => {
+    let state = reducer(withSlot, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: '' }))
+    const head = 'H'.repeat(60_000)
+    const middle = 'M'.repeat(500_000)
+    const tail = 'T'.repeat(60_000)
+    state = reducer(state, sseToolResult({ slot: 'slot-1', output: head + middle + tail }))
+    const out = state.toolLog[0].output ?? ''
+    // Bounded, and by a wide margin: the middle is gone.
+    expect(out.length).toBeLessThan(TOOL_OUTPUT_MAX_CHARS + 64)
+    expect(out).not.toContain('M')
+    // Head first, tail last, one newline between.
+    expect(out.startsWith('H')).toBe(true)
+    expect(out.endsWith('T')).toBe(true)
+    // The store holds NO rendered marker: that is a locale string and belongs
+    // to the renderer. The seam is structural.
+    expect(out).not.toContain('truncated')
+    expect(state.toolLog[0].output_cut).toEqual({ at: 48_001, count: 620_000 - 48_000 - 12_000 })
+    expect(out[state.toolLog[0].output_cut!.at - 1]).toBe('\n')
+  })
+
+  it('sseToolResult clamps the background slot log the same way', () => {
+    let state = reducer(withSlot, sseToolActivity({ slot: 'slot-2', tool: 'sh', kind: 'execute', purpose: '', input_preview: '' }))
+    state = reducer(state, sseToolResult({ slot: 'slot-2', output: 'Z'.repeat(TOOL_OUTPUT_MAX_CHARS * 4) }))
+    const entry = state.slotActivity['slot-2'].toolLog[0]
+    expect((entry.output ?? '').length).toBeLessThan(TOOL_OUTPUT_MAX_CHARS + 64)
+    expect(entry.output_cut).toEqual({ at: 48_001, count: TOOL_OUTPUT_MAX_CHARS * 4 - 60_000 })
+  })
+
+  it('a later result at or under the ceiling clears a stale seam', () => {
+    let state = reducer(withSlot, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: '', tool_call_id: 'tc-re' }))
+    state = reducer(state, sseToolResult({ slot: 'slot-1', output: 'Z'.repeat(TOOL_OUTPUT_MAX_CHARS * 2), tool_call_id: 'tc-re' }))
+    expect(state.toolLog[0].output_cut).toBeDefined()
+    state = reducer(state, sseToolResult({ slot: 'slot-1', output: 'short', tool_call_id: 'tc-re' }))
+    expect(state.toolLog[0].output).toBe('short')
+    // A leftover offset would make the renderer split the new text.
+    expect(state.toolLog[0].output_cut).toBeUndefined()
+  })
+
+  it('clampToolOutput snaps both cuts to line breaks and counts the elided characters', () => {
+    // 17-character lines ("line 00001 passed" + "\n" = 18 per row), so neither
+    // 48 000 nor length-12 000 lands on a row boundary.
+    const rows = Array.from({ length: 6_000 }, (_, i) => `line ${String(i + 1).padStart(5, '0')} passed`)
+    const raw = rows.join('\n')
+    expect(raw.length).toBeGreaterThan(TOOL_OUTPUT_MAX_CHARS)
+    const { text, cut } = clampToolOutput(raw)
+    expect(cut).not.toBeNull()
+    const head = text.slice(0, cut!.at - 1)
+    const tail = text.slice(cut!.at)
+    // The seam sits on its own newline, and every line on either side of it is
+    // a whole source row: no mid-line fragment right above or right below.
+    expect(text[cut!.at - 1]).toBe('\n')
+    expect(head.split('\n').at(-1)).toMatch(/^line \d{5} passed$/)
+    expect(tail.split('\n')[0]).toMatch(/^line \d{5} passed$/)
+    expect(text.split('\n')[0]).toBe(rows[0])
+    expect(text.split('\n').at(-1)).toBe(rows[rows.length - 1])
+    expect(text.length).toBeLessThanOrEqual(TOOL_OUTPUT_MAX_CHARS)
+    // Head and tail are verbatim slices, and the count is exactly what sits
+    // between them.
+    expect(raw.startsWith(head)).toBe(true)
+    expect(raw.endsWith(tail)).toBe(true)
+    expect(cut!.count).toBe(raw.length - head.length - tail.length)
+    expect(text).toBe(head + '\n' + tail)
+  })
+
+  it('clampToolOutput keeps the raw offsets when a slice has no line break', () => {
+    const raw = 'H'.repeat(60_000) + 'T'.repeat(60_000)
+    const { text, cut } = clampToolOutput(raw)
+    expect(text).toBe('H'.repeat(48_000) + '\n' + 'T'.repeat(12_000))
+    expect(cut).toEqual({ at: 48_001, count: 60_000 })
+    // A single trailing newline must not empty the tail.
+    const oneLine = 'x'.repeat(100_000) + '\n'
+    expect(clampToolOutput(oneLine).text.endsWith('\n' + 'x'.repeat(11_999) + '\n')).toBe(true)
+  })
+
+  it('clampToolOutput limits line snapping to the window around each raw cut', () => {
+    const farBeforeHead = 'H'.repeat(200) + '\n' + 'x'.repeat(119_799)
+    const headOut = clampToolOutput(farBeforeHead)
+    expect(headOut.text.slice(0, 48_000)).toBe(farBeforeHead.slice(0, 48_000))
+    expect(headOut.text[48_000]).toBe('\n')
+    expect(headOut.cut).toEqual({ at: 48_001, count: 60_000 })
+
+    const farAfterTail = 'x'.repeat(113_000) + '\n' + 'T'.repeat(6_999)
+    const tailOut = clampToolOutput(farAfterTail)
+    expect(tailOut.text.endsWith('\n' + farAfterTail.slice(108_000))).toBe(true)
+    expect(tailOut.cut?.count).toBe(60_000)
+  })
+
+  it('clampToolOutput returns the input untouched under the ceiling', () => {
+    expect(clampToolOutput('short')).toEqual({ text: 'short', cut: null })
+    const exact = 'a'.repeat(TOOL_OUTPUT_MAX_CHARS)
+    expect(clampToolOutput(exact)).toEqual({ text: exact, cut: null })
+  })
+
+  it('clampToolOutput materializes the exact clamped text through Array#join', () => {
+    const raw = 'H'.repeat(60_000) + 'T'.repeat(60_000)
+    const expected = raw.slice(0, 48_000) + '\n' + raw.slice(108_000)
+    expect(clampToolOutput(raw).text).toBe(expected)
+    expect(clampToolOutput.toString()).toMatch(/\.join\((['"])\1\)/)
+  })
+
+  it('sseToolActivity clamps an oversize input_preview on push and on is_update merge', () => {
+    const big = 'I'.repeat(TOOL_OUTPUT_MAX_CHARS * 4)
+    let state = reducer(withSlot, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: big, tool_call_id: 'tc-in' }))
+    expect(state.toolLog[0].input?.length).toBeLessThan(TOOL_OUTPUT_MAX_CHARS + 64)
+    expect(state.toolLog[0].input).not.toContain('truncated')
+    expect(state.toolLog[0].input_cut).toEqual({ at: 48_001, count: TOOL_OUTPUT_MAX_CHARS * 4 - 60_000 })
+    state = reducer(state, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: 'J'.repeat(TOOL_OUTPUT_MAX_CHARS * 4), tool_call_id: 'tc-in', is_update: true }))
+    expect(state.toolLog).toHaveLength(1)
+    expect(state.toolLog[0].input?.length).toBeLessThan(TOOL_OUTPUT_MAX_CHARS + 64)
+    expect(state.toolLog[0].input?.startsWith('J')).toBe(true)
+    expect(state.toolLog[0].input_cut).toEqual({ at: 48_001, count: TOOL_OUTPUT_MAX_CHARS * 4 - 60_000 })
+    // An update that brings the input back under the ceiling drops the seam.
+    state = reducer(state, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: '{"command":"ls"}', tool_call_id: 'tc-in', is_update: true }))
+    expect(state.toolLog[0].input).toBe('{"command":"ls"}')
+    expect(state.toolLog[0].input_cut).toBeUndefined()
+  })
+
+  it('an unclamped push carries no input_cut key at all', () => {
+    const state = reducer(withSlot, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: 'ls' }))
+    expect('input_cut' in state.toolLog[0]).toBe(false)
+  })
+
+  it('streamed answer chunks are not duplicated into the tool log', () => {
+    // Nothing renders a tool-log copy of the answer stream, and one per turn
+    // grew without bound on both the active and background paths.
+    let state = reducer(withSlot, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'hello ', seq: 1 }))
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'world', seq: 2 }))
+    expect(state.toolLog).toHaveLength(0)
+    expect(state.messages.find(m => m.role === 'streaming')?.content).toBe('hello world')
+    state = reducer(state, sseChatMessage({ slot: 'slot-2', role: 'chunk', content: 'background', seq: 1 }))
+    expect(state.slotActivity['slot-2']?.toolLog ?? []).toHaveLength(0)
+    expect(state.slotMessages['slot-2'].find(m => m.role === 'streaming')?.content).toBe('background')
   })
 
   it('sseActivityEvent adds system event to toolLog', () => {
@@ -1839,22 +1991,63 @@ describe('permission cls parsing and approval resolution', () => {
   it('resolveByApprovalId marks permission as approved', () => {
     const cls = JSON.stringify({ request_id: 'req-1' })
     let state = reducer(mkState(), sseChatMessage({ slot, role: 'permission', content: 'approve?', cls }))
-    state = reducer(state, resolveByApprovalId({ id: 'req-1', decision: 'approved' }))
+    state = reducer(state, resolveByApprovalId({ slot, id: 'req-1', decision: 'approved' }))
     expect(state.messages[0].meta?.resolved).toBe('approved')
   })
 
   it('resolveByApprovalId marks permission as rejected', () => {
     const cls = JSON.stringify({ request_id: 'req-2' })
     let state = reducer(mkState(), sseChatMessage({ slot, role: 'permission', content: 'approve?', cls }))
-    state = reducer(state, resolveByApprovalId({ id: 'req-2', decision: 'rejected' }))
+    state = reducer(state, resolveByApprovalId({ slot, id: 'req-2', decision: 'rejected' }))
     expect(state.messages[0].meta?.resolved).toBe('rejected')
   })
 
   it('resolveByApprovalId is no-op for unknown id', () => {
     const cls = JSON.stringify({ request_id: 'req-3' })
     let state = reducer(mkState(), sseChatMessage({ slot, role: 'permission', content: 'approve?', cls }))
-    state = reducer(state, resolveByApprovalId({ id: 'req-unknown' }))
+    state = reducer(state, resolveByApprovalId({ slot, id: 'req-unknown' }))
     expect(state.messages[0].meta?.resolved).toBeUndefined()
+  })
+
+  it('resolveByApprovalId does not downgrade a decided row to stale', () => {
+    // A stale retirement carries no outcome (expired wait, 404, or a reconcile
+    // snapshot that no longer lists the id). Arriving after a real decision it
+    // is old news, not a new fact, and must leave the decision in place.
+    const cls = JSON.stringify({ request_id: 'req-decided' })
+    let state = reducer(mkState(), sseChatMessage({ slot, role: 'permission', content: 'approve?', cls }))
+    state = reducer(state, resolveByApprovalId({ slot, id: 'req-decided', decision: 'approved' }))
+    state = reducer(state, resolveByApprovalId({ slot, id: 'req-decided', decision: 'stale' }))
+    expect(state.messages[0].meta?.resolved).toBe('approved')
+  })
+
+  it('resolveByApprovalId lets a real decision overwrite stale on the selected registry', () => {
+    // The guard is directional: a decision that lands after a stale marker is
+    // the outcome the card was waiting for, so that direction stays open. A
+    // registry-qualified resolution must update the matching collision row.
+    let state = reducer(mkState(), sseChatMessage({
+      slot, role: 'permission', content: 'runner?', meta: { approval_id: 'req-late' },
+    }))
+    state = reducer(state, sseChatMessage({
+      slot, role: 'permission', content: 'coordinator?',
+      meta: { approval_id: 'req-late', registry: 'coordinator' },
+    }))
+    state = reducer(state, resolveByApprovalId({
+      slot, id: 'req-late', decision: 'stale', registry: 'coordinator',
+    }))
+    expect(state.messages[0].meta?.resolved).toBeUndefined()
+    expect(state.messages[1].meta?.resolved).toBe('stale')
+    state = reducer(state, resolveByApprovalId({
+      slot, id: 'req-late', decision: 'rejected', registry: 'coordinator',
+    }))
+    expect(state.messages[0].meta?.resolved).toBeUndefined()
+    expect(state.messages[1].meta?.resolved).toBe('rejected')
+  })
+
+  it('resolveByApprovalId still marks a pending row stale', () => {
+    const cls = JSON.stringify({ request_id: 'req-pending' })
+    let state = reducer(mkState(), sseChatMessage({ slot, role: 'permission', content: 'approve?', cls }))
+    state = reducer(state, resolveByApprovalId({ slot, id: 'req-pending', decision: 'stale' }))
+    expect(state.messages[0].meta?.resolved).toBe('stale')
   })
 
   it('resolved permission is filterable by meta.resolved', () => {
@@ -1862,7 +2055,7 @@ describe('permission cls parsing and approval resolution', () => {
     const cls2 = JSON.stringify({ request_id: 'req-b' })
     let state = reducer(mkState(), sseChatMessage({ slot, role: 'permission', content: 'tool1', cls: cls1 }))
     state = reducer(state, sseChatMessage({ slot, role: 'permission', content: 'tool2', cls: cls2 }))
-    state = reducer(state, resolveByApprovalId({ id: 'req-a', decision: 'approved' }))
+    state = reducer(state, resolveByApprovalId({ slot, id: 'req-a', decision: 'approved' }))
     const pending = state.messages.filter(m => m.role === 'permission' && !m.meta?.resolved)
     expect(pending).toHaveLength(1)
     expect(pending[0].meta?.approval_id).toBe('req-b')
@@ -2111,7 +2304,7 @@ describe('slotHistory — session navigation stack', () => {
       loadingOlder: true,
       lastChunkSeq: 99,
       _wsChunkedDuringFetch: true,
-      slotStatusDetail: { x: { kind: 'tool', text: 'hi', ts: 1 } },
+      slotStatusDetail: { x: { kind: 'tool', purpose: 'hi', ts: 1 } },
       voicePlaying: true,
       voiceAudio: 'base64data',
     }

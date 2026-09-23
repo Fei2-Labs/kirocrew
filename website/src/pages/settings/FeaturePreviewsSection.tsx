@@ -5,7 +5,9 @@ import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/
 import { FeaturePreviewIntroButton, type FeaturePreviewIntro } from '../../components/FeaturePreviewIntroDialog'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_CREW, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
+import { DecisionsCard } from './DecisionsCard'
 import { i18nT } from '../../i18n/t'
+
 
 /**
  * Settings > Developer > Feature Previews — opt in to surfaces that ship in the
@@ -14,9 +16,9 @@ import { i18nT } from '../../i18n/t'
  * Formerly its own tab on the standalone Developer page (`/developer`). It moved
  * here because the switch that HOLDS an unreleased feature belongs next to the
  * switch that REVEALS the developer tooling (Developer Mode, one section up):
- * both are per-device consent gates, and a reader looking for "how do I turn
- * the unfinished thing on" looks in Settings, not on an internals page they
- * first have to unlock. `DeveloperPage.tsx` redirects the old
+ * both are consent gates, and a reader looking for "how do I turn the unfinished
+ * thing on" looks in Settings, not on an internals page they first have to
+ * unlock. `DeveloperPage.tsx` redirects the old
  * `/developer?tab=feature-previews` link here.
  *
  * The USER-FACING copy says "features" and "pages", never "surfaces": `Surface`
@@ -50,11 +52,20 @@ import { i18nT } from '../../i18n/t'
  * page it holds. The PAGE stays un-advertised: `getAdvertisedSurfaces()` and
  * the Search Everywhere Pages provider still filter it until the flag is on.
  *
- * No `configKey` on these toggles, deliberately. That prop names a
- * `config.json` path so `<SettingRef>` chips can deep-link, and preview flags
- * are per-device localStorage keys by design (`previewFlags.ts` explains why
- * they are NOT backend config). Search deep-links still reach each toggle
- * through its registry id + `data-setting-label`, which need no configKey.
+ * No `configKey` on the four `previewFlags.ts` toggles, deliberately: that prop
+ * is what makes a `<SettingRef>` chip deep-link here and what feeds
+ * `settingsRegistry.gen.ts`, and a per-device localStorage flag has no config
+ * path to name at all. Search deep-links still reach every toggle through its
+ * registry id + `data-setting-label`, which need no configKey.
+ *
+ * The Decisions toggle (now in `DecisionsCard.tsx`) carries no `configKey` either,
+ * for a different reason: it writes no config path. Its value is the KEYSTONE
+ * `decisions_consent.json`, reached through `/api/decisions/consent`, because
+ * `config.json` is writable by an auto-approved agent shell and consent to send
+ * message text off the machine must not be (see `decisionsPreview.ts`). A
+ * `configKey` naming a config path nothing reads would be the drift the
+ * `test_settingref_schema_fixture.py` guard exists to catch, so its absence here
+ * is asserted by `decisionsPreview.test.ts`.
  *
  * Each card may also carry a "See what it looks like" button (`FeaturePreviewIntroButton`)
  * opening a dialog with a REAL capture of the surface the flag reveals, a
@@ -245,6 +256,15 @@ export function FeaturePreviewsSection() {
           onChange={v => setPreviewFlag(PREVIEW_INSTANCE_SESSIONS, v)}
         />
       </SettingsCard>
+      {/* LAST, and the only card here whose switch is not a per-device flag: it
+          writes the KEYSTONE `decisions_consent.json`, not a config path. It lives in
+          `DecisionsCard.tsx` because it is a list and a detail rather than one row,
+          and that file's own doc comment carries why. */}
+      {/* Mounted SYNCHRONOUSLY. Settings search highlights a control by probing the
+          DOM for it and gives up after 100 ms, so a card behind a chunk boundary was a
+          deep link that rang nothing. The card's own per-point detail panel is the part
+          that is lazy -- see `DecisionsCard.tsx`. */}
+      <DecisionsCard />
     </SettingsSection>
     </div>
   )

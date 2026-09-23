@@ -157,6 +157,150 @@ describe('diffOffThread computePairPatch', () => {
     ).rejects.toMatchObject({ name: 'AbortError' })
     expect(StubWorker.instances).toHaveLength(0)
   })
+
+  /** The key carries both file bodies, so the char budget is what bounds the
+   *  cache's footprint — the entry cap alone lets eight large-file diffs pin
+   *  hundreds of MB. */
+  describe('char budget', () => {
+    it('evicts the oldest entries until the footprint fits the budget', async () => {
+      const mod = await import('../pierre/diffOffThread')
+      const { computePairPatch, CACHE_MAX_CHARS, _diffCacheChars } = mod
+      // An entry costs key (both bodies) + patch, and the patch carries `big`
+      // again as a context line, so each pair is ~36% of the budget: two fit,
+      // the third must evict the first.
+      const big = 'x'.repeat(Math.floor(CACHE_MAX_CHARS * 0.12))
+      const oldA = file('a.ts', big + '\nold-a\n')
+      const newA = file('a.ts', big + '\nnew-a\n')
+      await computePairPatch(oldA, newA)
+      await computePairPatch(file('b.ts', big + '\nold-b\n'), file('b.ts', big + '\nnew-b\n'))
+      const twoEntries = _diffCacheChars()
+      expect(twoEntries).toBeLessThanOrEqual(CACHE_MAX_CHARS)
+      expect(twoEntries).toBeGreaterThan(CACHE_MAX_CHARS / 2)
+      await computePairPatch(file('c.ts', big + '\nold-c\n'), file('c.ts', big + '\nnew-c\n'))
+      expect(_diffCacheChars()).toBeLessThanOrEqual(CACHE_MAX_CHARS)
+      // Pair A was the oldest and had to go: asking again recomputes.
+      const postSpy = vi.spyOn(StubWorker.instances[0], 'postMessage')
+      await computePairPatch(oldA, newA)
+      expect(postSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('a pair larger than the whole budget is served but never cached', async () => {
+      const { computePairPatch, CACHE_MAX_CHARS, _diffCacheChars } = await import('../pierre/diffOffThread')
+      const huge = 'y'.repeat(CACHE_MAX_CHARS)
+      const oldF = file('h.ts', huge + '\nold\n')
+      const newF = file('h.ts', huge + '\nnew\n')
+      const patch = await computePairPatch(oldF, newF)
+      expect(patch).toContain('+new')
+      expect(_diffCacheChars()).toBe(0)
+      const postSpy = vi.spyOn(StubWorker.instances[0], 'postMessage')
+      await computePairPatch(oldF, newF)
+      expect(postSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('a cache hit refreshes recency without changing the footprint', async () => {
+      const { computePairPatch, _diffCacheChars } = await import('../pierre/diffOffThread')
+      const oldF = file('r.ts', 'a\n')
+      const newF = file('r.ts', 'b\n')
+      await computePairPatch(oldF, newF)
+      const before = _diffCacheChars()
+      expect(before).toBeGreaterThan(0)
+      await computePairPatch(oldF, newF)
+      expect(_diffCacheChars()).toBe(before)
+    })
+
+    it('keeps exact retention through repeated eviction, bypass, abort and recreation', async () => {
+      const { computePairPatch, CACHE_MAX_CHARS, _diffCacheChars } = await import('../pierre/diffOffThread')
+      expect(CACHE_MAX_CHARS).toBe(4_000_000)
+      const post = vi.spyOn(StubWorker.prototype, 'postMessage')
+      const pair = (name: string, size = 480_000) => {
+        const bulk = '文'.repeat(size)
+        const oldFile = file(name, bulk + '\nold\n')
+        const newFile = file(name, bulk + '\nnew\n')
+        const response = handlePairDiffRequest({
+          id: 0, oldName: name, newName: name,
+          oldContents: oldFile.contents, newContents: newFile.contents,
+        })
+        if (!response.ok) throw new Error(response.error)
+        // Four JSON strings plus two brackets and three commas. Account from
+        // the fixture and real patch, never from the cache's running counter.
+        const chars = [name, name, oldFile.contents, newFile.contents]
+          .reduce((sum, text) => sum + JSON.stringify(text).length, 5) + response.patch.length
+        return { oldFile, newFile, patch: response.patch, chars }
+      }
+      type Pair = ReturnType<typeof pair>
+      let retained: Pair[] = []
+      const check = () => {
+        expect(_diffCacheChars()).toBe(retained.reduce((sum, entry) => sum + entry.chars, 0))
+        expect(_diffCacheChars()).toBeLessThanOrEqual(4_000_000)
+      }
+      const request = async (entry: Pair, hit: boolean, cacheable = true) => {
+        const calls = post.mock.calls.length
+        expect(await computePairPatch(entry.oldFile, entry.newFile)).toBe(entry.patch)
+        expect(post.mock.calls.length - calls).toBe(hit ? 0 : 1)
+        if (cacheable) {
+          // These fixtures each cost between one third and one half of the
+          // budget: exactly two fit. Keep a separate expected two-entry LRU.
+          expect(entry.chars).toBeGreaterThan(4_000_000 / 3)
+          expect(entry.chars).toBeLessThan(4_000_000 / 2)
+          retained = [...retained.filter(item => item !== entry), entry].slice(-2)
+        }
+        check()
+      }
+      try {
+        for (let cycle = 0; cycle < 3; cycle++) {
+          const a = pair(`a-${cycle}.ts`)
+          const b = pair(`b-${cycle}.ts`)
+          const c = pair(`c-${cycle}.ts`)
+          await request(a, false)
+          await request(b, false)
+          await request(a, true) // Refresh A: inserting C must evict B, not A.
+          await request(c, false)
+          await request(a, true)
+          await request(c, true)
+          await request(b, false) // Evicted B is recomputed; A now leaves.
+          const huge = pair(`huge-${cycle}.ts`, 1_400_000)
+          expect(huge.chars).toBeGreaterThan(4_000_000)
+          await request(huge, false, false)
+          await request(huge, false, false)
+          await request(c, true) // Oversized bypass must preserve useful entries.
+
+          const controller = new AbortController()
+          const abandoned = computePairPatch(file(`abort-${cycle}`, 'old\n'), file(`abort-${cycle}`, 'new\n'), controller.signal)
+          const workers = StubWorker.instances.length
+          controller.abort() // Before the stub's queued response, without sleeps.
+          await expect(abandoned).rejects.toMatchObject({ name: 'AbortError' })
+          expect(StubWorker.terminated).toBe(cycle + 1)
+          check() // A late response from the old worker cannot populate the cache.
+          await request(b, true)
+          expect(StubWorker.instances).toHaveLength(workers)
+          await request(a, false)
+          expect(StubWorker.instances).toHaveLength(workers + 1)
+          await request(b, true)
+        }
+      } finally {
+        post.mockRestore()
+      }
+    })
+
+    it('two concurrent misses for one pair count its footprint once', async () => {
+      const { computePairPatch, _diffCacheChars } = await import('../pierre/diffOffThread')
+      const oldF = file('c.ts', 'a\n')
+      const newF = file('c.ts', 'b\n')
+      // Both issued before either resolves, so both miss and both store.
+      const [p1, p2] = await Promise.all([computePairPatch(oldF, newF), computePairPatch(oldF, newF)])
+      expect(p1).toBe(p2)
+      const once = _diffCacheChars()
+      expect(once).toBeGreaterThan(0)
+      // A sequential re-request is a hit: the footprint is the single-entry cost.
+      await computePairPatch(oldF, newF)
+      expect(_diffCacheChars()).toBe(once)
+      // A fresh module holding exactly one such entry reports the same cost.
+      vi.resetModules()
+      const fresh = await import('../pierre/diffOffThread')
+      await fresh.computePairPatch(oldF, newF)
+      expect(fresh._diffCacheChars()).toBe(once)
+    })
+  })
 })
 
 describe('diffWorker attachPairDiffHandler', () => {

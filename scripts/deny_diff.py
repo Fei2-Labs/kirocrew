@@ -30,9 +30,9 @@ What counts as "refused"
 The whole composite the tool gate applies to a shell command, in its order, not
 just the rule catalog -- see :data:`_TIERS`. Each of those checks returns a denial
 at ``hooks.on_tool_call``, so a gate that measured only the last would go green on
-a tightening of the first three and the green badge would then stand as evidence
+a tightening of the first two and the green badge would then stand as evidence
 the question was asked. The reported tier says which one decided, because "the
-path fence refused it" and "a catalog rule matched it" need different fixes.
+sensitive-command tier refused it" and "a catalog rule matched it" need different fixes.
 ``enabled_ids``/``denied_regexes`` are left at their defaults, which fails closed
 to every built-in rule enabled -- the strictest posture an operator can be
 running, and the only one that needs no config.
@@ -103,9 +103,13 @@ from pathlib import Path
 #: subprocess call, not part of the CLI a caller composes.
 _WORKER_FLAG = "--_classify-worker"
 
-#: Row kinds the seed may carry. Only ``shell`` is classifiable -- see the module
-#: docstring.
-_KINDS = frozenset({"shell", "flow", "cron"})
+#: Row kinds the seed may carry. Only ``shell`` is classifiable HERE -- see the
+#: module docstring. A ``test`` row is a pytest selector the security conductor's
+#: own ``verify_fix.py`` runs; this gate counts it as non-shell and skips it, the
+#: same as ``flow`` and ``cron``. It is listed so a corpus carrying one loads:
+#: an unknown kind is a hard ``DenyDiffError``, which would fail this gate on a
+#: row that is none of its business.
+_KINDS = frozenset({"shell", "test", "flow", "cron"})
 
 #: Platform selectors a row may declare.
 _PLATFORMS = frozenset({"any", "posix", "windows"})
@@ -120,16 +124,15 @@ _PLATFORMS = frozenset({"any", "posix", "windows"})
 #: would otherwise reach this file, so the differential would keep passing while
 #: quietly covering less of the product than it says.
 _TIERS: tuple[tuple[str, str], ...] = (
-    ("sensitive-path", "is_sensitive_path"),
+    # No path tier: the gate reads a PATH there and a shell command is command text,
+    # which ``hooks.on_tool_call`` deliberately does not match paths in (the OS
+    # sandbox holds the credential stores away from the shell). Measuring it here
+    # would refuse a valid golden command whenever the resolver stalled.
     ("sensitive-bash", "is_sensitive_bash_command"),
     ("exfil", "audit_bash_exfiltration"),
     ("deny-rules", "is_denied"),
 )
 
-#: Reason reported for a tier whose check answers True/False rather than a string.
-#: The path fence is the one such check, and a bare ``True`` would otherwise render
-#: as an empty refusal in the report.
-_BOOL_TIER_REASON = "Blocked: access to sensitive path"
 
 #: Seconds a single classification child may take for the WHOLE corpus. One
 #: child classifies every row, so this bounds the gate at two spawns, not two
@@ -152,6 +155,16 @@ _INHERITED_HOME_OVERRIDE_ENV_VARS = (
     # OpenCode's credential home follows the XDG data directory; a relocated token
     # must not reach the classification child any more than a default one does.
     "XDG_DATA_HOME",
+    # pi's whole agent directory, credential store included, follows this one.
+    "PI_CODING_AGENT_DIR",
+    # goose's file-based secret store follows the XDG config directory, which is a
+    # different one from the data directory above: on that harness the config home
+    # is where the secret lives.
+    "XDG_CONFIG_HOME",
+    # DeepSeek Harness relocates its WHOLE home, credential store included, from one
+    # variable. Same reasoning as the entry above, and the source test pins this tuple
+    # against the harness declarations so a new override cannot be forgotten here.
+    "DSH_HOME",
 )
 
 
@@ -182,7 +195,8 @@ class Verdict:
     """What one ref's deny composite said about one command.
 
     ``tier`` names which of :data:`_TIERS` decided, so a reader knows whether to
-    look at the path fence or at the rule catalog. Empty when nothing refused.
+    look at the sensitive-command tier, the exfiltration auditor or the rule catalog.
+    Empty when nothing refused.
     """
 
     denied: bool
@@ -326,6 +340,10 @@ def resolve_checkout(repo_root: Path, ref: str, dest: Path) -> Path:
             ref,
             "src",
         ],
+        # ``-C`` already scopes git to the repository; ``cwd`` makes that the
+        # child's working directory too, so nothing it drops relative to it can
+        # land in whatever directory the caller happened to run the gate from.
+        cwd=repo_root,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -355,6 +373,7 @@ def _rev_parse(repo_root: Path, ref: str) -> str:
     """
     proc = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "--short", ref],
+        cwd=repo_root,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -420,6 +439,10 @@ def classify(
     proc = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), _WORKER_FLAG],
         input=json.dumps(request),
+        # The classifier runs from the tree it classifies, not from wherever the
+        # gate was launched: anything it drops relative to its CWD (a .pyc the
+        # env below already forbids, an audit file) lands in the throwaway tree.
+        cwd=checkout,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -532,10 +555,7 @@ def _worker_main() -> int:
                 break
             if not outcome:
                 continue
-            # The path fence answers True/False; the other three answer a reason or
-            # None. Both shapes mean "refused", and a bare True must not render as
-            # an empty refusal.
-            reason = _BOOL_TIER_REASON if outcome is True else str(outcome)
+            reason = str(outcome)
             row = {"denied": True, "reason": reason[:_REASON_CHARS], "tier": name}
             break
         verdicts.append(row)

@@ -30,10 +30,12 @@ from __future__ import annotations
 TIP_DOC_ALLOWLIST: frozenset[str] = frozenset(
     {
         "agents.md",
+        "apps.md",
         "artifacts.md",
         "browser-control.md",
         "computer-use.md",
         "configuration.md",
+        "connections.md",
         "cron-and-scheduling.md",
         "dashboard.md",
         "deploy-web.md",
@@ -42,6 +44,7 @@ TIP_DOC_ALLOWLIST: frozenset[str] = frozenset(
         "feature-tips.md",
         "imessage-integration.md",
         "feishu-integration.md",
+        "issue-radar-pipeline.md",
         "knowledge-library-how-it-works.md",
         "mcp-apps.md",
         "memory-and-learning.md",

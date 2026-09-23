@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, memo, type ReactNode } from 'react'
 import { CheckCircle, Handshake, Ban, Wrench, AlertTriangle } from 'lucide-react'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import { purposeFromToolArgs } from '../../utils/toolPurpose'
+import { deriveToolCallTitle } from '../../utils/toolCallTitle'
 import { ToolInputText } from '../../components/ToolInputText'
 import ErrorNotice from '../../components/ErrorNotice'
 import { ApiError } from '../../api/client'
@@ -79,6 +80,29 @@ function extractPreview(meta?: Record<string, unknown>): string {
   return purposeFromToolArgs(meta)
 }
 
+/**
+ * The argument-derived title for the call being approved (`List files in src`,
+ * `Session send: <target>`), or '' when no template applied. Shown as a heading
+ * ABOVE the verbatim command, never instead of it: the human vets the bytes
+ * that will run, and a prose title on its own is exactly the shape users
+ * rejected in claude-agent-acp#1068. Reads the optional `tool_kind` /
+ * `tool_name` / `mcp_server` the backend stamps on the permission meta and
+ * falls back to the title alone when a card predates them.
+ */
+function derivedHeading(meta?: Record<string, unknown>): string {
+  if (!meta) return ''
+  const str = (v: unknown) => (typeof v === 'string' ? v : '')
+  const d = deriveToolCallTitle({
+    title: str(meta.tool_title),
+    kind: str(meta.tool_kind),
+    rawInput: meta.tool_input,
+    isShell: meta.is_shell === '1' || meta.is_shell === true,
+    toolName: str(meta.tool_name),
+    mcpServer: str(meta.mcp_server),
+  })
+  return d.derived ? d.title : ''
+}
+
 /** Collapsible row that wraps tool/thinking/permission messages — always collapsed unless autoExpand. */
 const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExpand, disclosureKey, hasPermission, isRunning, children, permissionMeta, permissionMetas, pendingPermCount, onApprove, onApproveBatch, canTrust, onViewActivity, activityOpen }: CollapsibleToolGroupProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
@@ -124,6 +148,9 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
 
   const preview = needsAttention ? sanitizeLlmOutput(extractPreview(permissionMeta)) : ''
   const truncated = preview.length > 150 ? preview.slice(0, 150) + '…' : preview
+  // Heading over the single-call preview; '' when the command is already the
+  // clearest statement of the call (nothing to add above the <pre>).
+  const heading = needsAttention ? sanitizeLlmOutput(derivedHeading(permissionMeta)) : ''
 
   // Per-call previews for batch mode: one row per pending call, so the row shows
   // EVERY command "Approve all N" will resolve — in FULL, not truncated (a
@@ -191,20 +218,20 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
   return (
     <div className="my-1">
       <button
-        className={`flex items-center gap-2 px-4 py-2 rounded-md text-[13px] leading-5 font-mono text-muted bg-card ring-1 ring-inset forced-colors:border cursor-pointer transition-all w-full text-left ${needsAttention ? 'ring-amber-400 hover:ring-amber-300' : localResolved ? 'ring-ok/60 hover:ring-ok/80' : 'ring-border hover:ring-border-strong'} hover:text-text`}
+        className={`flex items-center gap-2 px-4 py-2 rounded-md text-[13px] leading-5 font-mono text-muted bg-card ring-1 ring-inset forced-colors:border cursor-pointer transition-all w-full text-left ${needsAttention ? 'ring-warn hover:ring-warn/80' : localResolved ? 'ring-ok/60 hover:ring-ok/80' : 'ring-border hover:ring-border-strong'} hover:text-text`}
         onClick={() => { userToggled.current = true; setExpanded(e => !e) }}
         aria-expanded={expanded}
         aria-label={`${expanded ? i18nT('pages.chat.collapsibleToolGroup.collapse') : i18nT('pages.chat.collapsibleToolGroup.expand')} ${labelText}`}
       >
         {needsAttention ? (
           <span className="relative w-2.5 h-2.5 flex-shrink-0" aria-label={i18nT('pages.chat.collapsibleToolGroup.approval_needed')}>
-            <span className="absolute inset-0 rounded-full bg-amber-400 animate-ping opacity-60" />
-            <span className="relative block w-2.5 h-2.5 rounded-full bg-amber-400" />
+            <span className="absolute inset-0 rounded-full bg-warn animate-ping opacity-60" />
+            <span className="relative block w-2.5 h-2.5 rounded-full bg-warn" />
           </span>
         ) : localResolved ? (
           <span className="w-2.5 h-2.5 rounded-full bg-ok flex-shrink-0" aria-label={i18nT('pages.chat.collapsibleToolGroup.resolved')} />
         ) : isRunning ? (
-          <span className="w-2.5 h-2.5 rounded-full bg-green-400 animate-pulse flex-shrink-0" aria-label={i18nT('pages.chat.collapsibleToolGroup.running')} />
+          <span className="w-2.5 h-2.5 rounded-full bg-ok animate-pulse flex-shrink-0" aria-label={i18nT('pages.chat.collapsibleToolGroup.running')} />
         ) : (
           <span className={`transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`}>▶</span>
         )}
@@ -219,7 +246,7 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
           actionable buttons — a dead end exactly while the agent is parked
           waiting on the user (#5487). */}
       {needsAttention && (onApprove || onApproveBatch) && (isBatch ? batchPreviews.length > 0 : !!truncated) && (
-        <div className="mt-1 ml-4 pl-3 shadow-[inset_2px_0_0_0_theme(colors.amber.400)] forced-colors:border-l-2">
+        <div className="mt-1 ml-4 pl-3 shadow-[inset_2px_0_0_0_var(--color-amber-400)] forced-colors:border-l-2">
           {isBatch ? (
             <>
               {/* Batch: preview EVERY pending call so "Approve all N" is not a
@@ -237,7 +264,10 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
               </div>
             </>
           ) : (
-            <pre className="bg-bg-hover rounded-md px-3 py-2 text-[13px] leading-5 font-mono overflow-x-auto whitespace-pre-wrap break-all max-h-[4.5em] overflow-y-auto mb-2"><ToolInputText text={truncated} /></pre>
+            <>
+              {heading && <div className="text-[12px] leading-5 text-muted mb-1" data-testid="approval-derived-title">{heading}</div>}
+              <pre className="bg-bg-hover rounded-md px-3 py-2 text-[13px] leading-5 font-mono overflow-x-auto whitespace-pre-wrap break-all max-h-[4.5em] overflow-y-auto mb-2"><ToolInputText text={truncated} /></pre>
+            </>
           )}
         </div>
       )}

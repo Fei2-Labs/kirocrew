@@ -82,9 +82,9 @@ export function __resetCatalogCache(): void {
 /** Panel file → tab key mapping (derived from SettingsPage.tsx switch).
  *  Only panels that actually render inside a Settings tab are mapped — the
  *  fork is KiroACP-only and de-Amazoned, so upstream's Provider / Secretary /
- *  Sync / TaskKeeper panels are absent, and SharedMcpGatewayToggle /
- *  McpPoolableServers live on the standalone Developer page (not a Settings
- *  tab), so they are intentionally excluded to avoid dead deep-links.
+ *  Sync / TaskKeeper panels are absent, and controls that live on the
+ *  standalone Developer page rather than a Settings tab (e.g. McpManagement)
+ *  are intentionally excluded to avoid dead deep-links.
  *
  *  Entries may carry `params` — extra query params the deep link needs for
  *  the panel to actually mount (the Channels tab is a list-detail view, so
@@ -113,6 +113,7 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'ComputerUsePanel.tsx': 'computer-use',
   'InstancesPanel.tsx': 'instances',
   'SecurityPanel.tsx': 'security',
+  'ConnectionsPanel.tsx': 'connections',
   'SecretsPanel.tsx': 'secrets',
   'NotificationsPanel.tsx': 'notifications',
   'ShortcutsPanel.tsx': 'shortcuts',
@@ -154,6 +155,23 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   // search cannot find is the coverage gap settingsCoverage.test.ts exists to
   // close — and the hit reaches the labelled opt-in switch, not the page.
   'FeaturePreviewsSection.tsx': 'developer',
+  // The Decisions (Jev) card, which FeaturePreviewsSection mounts. Its own file
+  // because it is a list and a detail rather than one row, and mapped here for the
+  // reason the section above is: a control on a Settings pane that search cannot
+  // find is the coverage gap this map exists to close.
+  //
+  // Every entry it yields is GOVERNED, unlike the rest of this map: the fleet
+  // ceiling `capabilities.decisions` can withdraw the whole card, so
+  // `settingsSearchCore.DECISIONS_SETTING_IDS` withholds these ids from a search
+  // that knows the feature is denied. A control added here without being added
+  // there would advertise a row the page does not draw — `settingsSearchGovernance`
+  // asserts the two stay in step.
+  'DecisionsCard.tsx': 'developer',
+  // The card's per-point DETAIL panel, split into its own module so the card can
+  // stay synchronous while this rides a lazy boundary. Mapped to the same tab: a
+  // control added to it belongs to the same deep link, and leaving it unmapped
+  // would mean the extractor never looks at the file at all.
+  'DecisionsPointPanel.tsx': 'developer',
   'AboutPanel.tsx': 'about',
   'SttSettings.tsx': 'voice',
   // The `instances` tab mounts RemoteCrewPanel (SettingsPage.tsx), which also

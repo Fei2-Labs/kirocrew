@@ -256,6 +256,17 @@ class TestToLlmEventFieldPropagation:
         assert ev.diff_old_text is None
         assert ev.diff_path == ""
 
+    def test_to_llm_event_preserves_todo_snapshot(self):
+        """Dropping todo clears the task panel and records an empty plan update."""
+        todo = {
+            "description": "Repair provider boundary",
+            "tasks": [{"id": "1", "text": "forward snapshot", "completed": False}],
+        }
+
+        out = AcpProvider._to_llm_event(AcpEvent(kind="todo_update", todo=todo))
+
+        assert out.todo == todo
+
     @pytest.mark.asyncio
     async def test_stream_propagates_tool_final_and_subagent_fields(self):
         provider = _build_provider(backend=ACP_BACKEND_CLAUDE)
@@ -325,12 +336,7 @@ class TestToLlmEventFieldParity:
 
     # Fields that are intentionally NOT forwarded through _to_llm_event.
     # Each entry must document why it is excluded.
-    _INTENTIONALLY_DROPPED: set[str] = {
-        # ``todo`` is consumed directly by the dashboard websocket handler
-        # (EVENT_TODO_UPDATE) and never needs to survive the LLMProvider
-        # stream interface — chat_runner does not inspect it.
-        "todo",
-    }
+    _INTENTIONALLY_DROPPED: set[str] = set()
 
     @staticmethod
     def _distinguishable(field: "dataclasses.Field") -> object | None:
@@ -716,6 +722,74 @@ class TestEffortControl:
         provider._client.send_command.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_kiro_clear_effort_keeps_the_entry_when_the_overlay_lock_is_busy(self):
+        # Nothing changed: not the file, and not the map once the entry goes
+        # back. Neither bool can say that -- both make the handler commit the
+        # cleared slot value, so the UI would read "default" over an overlay
+        # that still holds the level. None is the third outcome, which the
+        # handler answers with a retryable 409 and no commit.
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        with patch("kiro_crew.providers.acp._clear_cli_overlay_effort", return_value=False):
+            ok = await provider.clear_effort()
+        assert ok is None
+        assert provider._effort_per_model["claude-opus-4.7"] == "high"
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kiro_clear_to_default_does_not_push_when_the_overlay_write_fails(self):
+        # Clearing to a workspace default writes the overlay and pushes live. The
+        # FILE is what a respawn reads, so a live push over a write that did not
+        # persist reports a default the next spawn replaces with the level just
+        # cleared. Nothing is pushed, the override goes back, and the third
+        # outcome tells the handler to commit nothing.
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        provider._effort_defaults = {"claude-opus-4.7": "low"}
+        with patch.object(type(provider), "_apply_effort_overlay", return_value=False):
+            ok = await provider.clear_effort()
+        assert ok is None
+        assert provider._effort_per_model["claude-opus-4.7"] == "high"
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kiro_effort_rollback_follows_the_file_when_the_rewrite_fails(self):
+        # The live push failed, so change_effort rolls the prior level back and
+        # rewrites the overlay to match. When THAT rewrite also fails the file
+        # keeps the attempted level and construction re-seeds from it, so the map
+        # follows the file instead of reporting an undo the next spawn contradicts.
+        from kiro_crew.acp.client import AcpError
+
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {"claude-opus-4.7": "low"}
+        provider._client.send_command = AsyncMock(side_effect=AcpError("push failed"))
+        calls = []
+
+        def _apply(self_, **kwargs):
+            calls.append(kwargs)
+            # The pre-push write persists; the rollback rewrite loses the lock.
+            return len(calls) == 1
+
+        with patch.object(type(provider), "_apply_effort_overlay", _apply):
+            with pytest.raises(AcpError):
+                await provider.change_effort("xhigh")
+        assert provider._effort_per_model["claude-opus-4.7"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_kiro_change_effort_does_not_push_when_the_overlay_write_fails(self):
+        # The FILE is what a respawn reads, so pushing live over a write that did
+        # not persist reports a change the next reset undoes. The override is
+        # rolled back and the caller is told, rather than the session running a
+        # level the workspace does not hold.
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {}
+        with patch.object(type(provider), "_apply_effort_overlay", return_value=False):
+            with pytest.raises(RuntimeError, match="could not persist effort"):
+                await provider.change_effort("high")
+        assert "claude-opus-4.7" not in provider._effort_per_model
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_claude_clear_effort_returns_false_for_reset(self):
         # claude-agent-acp has no "reset to default" config value, so clearing
         # must return False to trigger a session reset; it must NOT push.
@@ -887,6 +961,15 @@ class TestStartKiroRuntimeResume:
         mock_runtime.spawn = AsyncMock()
         mock_runtime.kill = AsyncMock()
         mock_runtime.saw_not_logged_in = MagicMock(return_value=False)
+        # Answered explicitly alongside the auth latch: this module's three
+        # startup translations ask the sandbox latch first, and an unstubbed
+        # MagicMock answers truthy -- which would turn every generic startup
+        # failure in this file into a sandbox verdict.
+        mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
+        # The shared translation settles the stderr drain before it reads
+        # the latch, so this has to be awaitable: a plain MagicMock raises
+        # "object MagicMock can't be used in 'await' expression".
+        mock_runtime.settle_stderr = AsyncMock()
         boom = RuntimeError("session limit reached")
         mock_runtime.create_session = AsyncMock(side_effect=boom)
 
@@ -947,6 +1030,8 @@ class TestKiroStartupMetric:
         mock_runtime.pid = 4321
         mock_runtime.spawn = AsyncMock(side_effect=spawn_exc)
         mock_runtime.saw_not_logged_in = MagicMock(return_value=bool(spawn_exc))
+        mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
+        mock_runtime.settle_stderr = AsyncMock()
         mock_runtime.kill = AsyncMock()
         mock_runtime.create_session = AsyncMock(return_value=mock_handle)
         rec = _CapturingRecorder()
@@ -993,6 +1078,8 @@ class TestKiroStartupMetric:
         mock_runtime = MagicMock()
         mock_runtime.spawn = AsyncMock(side_effect=AcpRuntimeError("boom"))
         mock_runtime.saw_not_logged_in = MagicMock(return_value=True)
+        mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
+        mock_runtime.settle_stderr = AsyncMock()
         mock_runtime.kill = AsyncMock()
         rec = _CapturingRecorder()
         with (
@@ -1048,6 +1135,8 @@ class TestFixBDeadRuntimeRespawn:
         new_runtime.is_alive = MagicMock(return_value=True)
         new_runtime.create_session = AsyncMock(return_value=new_handle)
         new_runtime.saw_not_logged_in = MagicMock(return_value=False)
+        new_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
+        new_runtime.settle_stderr = AsyncMock()
 
         provider._client._resume_session_id = "old-sess-id"
 
@@ -1145,6 +1234,62 @@ class TestLoadSessionWithRetry:
         assert rt.load_session.await_count == 1  # a genuine failure is not retried
         assert sleep_mock.await_count == 0
 
+    # The exact RPC error kiro-cli returns on the dashboard hard-stop path: the
+    # killed holder's exit handler unlinks the lock between the new holder's
+    # create and its confirming re-read.
+    _LOCK_FILE_RACE = (
+        "RPC error: {'code': -32603, 'message': 'Internal error', 'data': "
+        "'Failed to start session: failed to re-read lock file "
+        '"/home/u/.kiro/sessions/cli/ee21.lock": No such file or directory '
+        "(os error 2)'}"
+    )
+
+    @pytest.mark.asyncio
+    async def test_lock_file_race_is_retried_and_recovers(self):
+        """A missing-lock-file re-read failure is a transient race with the dying
+        holder, not a genuine load failure: retry, and resume losslessly once
+        the holder is gone instead of demoting the tab to conversation-log
+        replay for the rest of its life."""
+        provider = _build_provider(backend="")
+        handle = object()
+        rt = self._runtime(
+            AsyncMock(side_effect=[RuntimeError(self._LOCK_FILE_RACE), handle]),
+        )
+        with patch("kiro_crew.providers.acp.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            got = await provider._load_session_with_retry(rt, "/s.json", "sid", None, None)
+        assert got is handle
+        assert rt.load_session.await_count == 2
+        assert sleep_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_lock_file_race_exhausts_and_falls_back(self):
+        from kiro_crew.providers.acp import _RESUME_MAX_ATTEMPTS
+
+        provider = _build_provider(backend="")
+        rt = self._runtime(AsyncMock(side_effect=RuntimeError(self._LOCK_FILE_RACE)))
+        with patch("kiro_crew.providers.acp.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            got = await provider._load_session_with_retry(rt, "/s.json", "sid", None, None)
+        assert got is None  # Phase 2 (fresh session + history replay) still applies
+        assert rt.load_session.await_count == _RESUME_MAX_ATTEMPTS
+        assert sleep_mock.await_count == _RESUME_MAX_ATTEMPTS - 1
+
+    def test_transient_classifier_is_narrow(self):
+        """Only the two known lock shapes are transient. An unrelated 'No such
+        file' (a missing session file) and a PERMANENT lock failure (permission
+        denied on the lock path) must both still fail fast: a wrong 'transient'
+        verdict there costs the whole 1s+2s+4s backoff before the identical
+        fresh-session fallback."""
+        from kiro_crew.providers.acp import _is_transient_resume_lock_error as transient
+
+        assert transient(RuntimeError("Session is ACTIVE in another process"))
+        assert transient(RuntimeError(self._LOCK_FILE_RACE))
+        assert transient(RuntimeError("Failed to Re-Read Lock File: gone"))
+        assert not transient(RuntimeError("failed to open lock file: Permission denied"))
+        assert not transient(RuntimeError("corrupt lock file"))
+        assert not transient(RuntimeError("session file not found: No such file or directory"))
+        assert not transient(RuntimeError("session/load parse error"))
+        assert not transient(RuntimeError(""))
+
     @pytest.mark.asyncio
     async def test_dead_runtime_stops_retry(self):
         provider = _build_provider(backend="")
@@ -1195,6 +1340,8 @@ class TestToolSearchResumeCompatibility:
         runtime.spawn = AsyncMock()
         runtime.is_alive = MagicMock(return_value=True)
         runtime.saw_not_logged_in = MagicMock(return_value=False)
+        runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
+        runtime.settle_stderr = AsyncMock()
         runtime.kill = AsyncMock()
         runtime.load_session = AsyncMock(return_value=handle if load_succeeds else None)
         runtime.create_session = AsyncMock(return_value=handle)
@@ -1392,10 +1539,12 @@ def test_to_llm_event_preserves_mcp_identity_trusted():
         is_shell=False,
         mcp_server_name="example-server",
         tool_name="get-item",
+        tool_identity_trusted=True,
         mcp_identity_trusted=True,
     )
     assert src.child_mcp_identity_trusted is True
     out = AcpProvider._to_llm_event(src)
+    assert out.tool_identity_trusted is True
     assert out.mcp_identity_trusted is True
     assert out.child_mcp_identity_trusted is True
     assert out.child_unconditional_grant_eligible is True
@@ -1410,6 +1559,7 @@ def test_to_llm_event_preserves_mcp_identity_trusted():
         tool_name="get-item",
     )
     out_untrusted = AcpProvider._to_llm_event(src_untrusted)
+    assert out_untrusted.tool_identity_trusted is False
     assert out_untrusted.mcp_identity_trusted is False
     assert out_untrusted.child_mcp_identity_trusted is False
 

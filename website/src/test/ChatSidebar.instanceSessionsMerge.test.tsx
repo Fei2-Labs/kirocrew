@@ -119,6 +119,8 @@ globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.res
 
 import ChatSidebar from '../pages/ChatSidebar'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
+import { recordError } from '../utils/errorReport'
 import type { ChatSlot, ChatHistoryItem } from '../types'
 import type { RootState } from '../store'
 
@@ -236,7 +238,7 @@ function renderSidebar({
   return { ...view, store, setActiveSlot: (active: string) => view.rerender(tree(active)) }
 }
 
-describe('ChatSidebar – remote instance sessions merge into the list', () => {
+describe('ChatSidebar – remote crew sessions merge into the list', () => {
   // `mockReset` + re-declared default, not `mockClear`: the failure cases here
   // queue rejections, and an unconsumed `mockRejectedValueOnce` (or a persistent
   // `mockRejectedValue`) survives `mockClear` and poisons the NEXT case — which
@@ -322,7 +324,7 @@ describe('ChatSidebar – remote instance sessions merge into the list', () => {
     localStorage.setItem(PREVIEW_INSTANCE_SESSIONS, '1')
     // The other half of the same honesty rule, and the one that used to vanish
     // entirely: when `['instances']` itself fails there is no instance to name, so
-    // the "checking remote instances…" line simply disappeared and the list looked
+    // the "checking remote crews…" line simply disappeared and the list looked
     // complete. No peer query is ever created in this state, which is why one
     // banner covers both failures.
     listInstancesMock.mockRejectedValueOnce(new Error('crew refused to list instances'))
@@ -331,7 +333,7 @@ describe('ChatSidebar – remote instance sessions merge into the list', () => {
     const notice = await screen.findByTestId('instance-sessions-error')
     expect(notice.textContent).toMatch(/could not be listed/i)
     expect(notice.textContent).toContain('crew refused to list instances')
-    expect(container.textContent).not.toMatch(/checking remote instances/i)
+    expect(container.textContent).not.toMatch(/checking remote crews/i)
   })
 
   it('shows no remote-sessions error banner while the preview flag is off', async () => {
@@ -708,6 +710,43 @@ describe('ChatSidebar – remote instance sessions merge into the list', () => {
     expect(remoteRow!.querySelectorAll('.animate-spin')).toHaveLength(1)
   })
 
+  it('renders the crew\'s OWN refusal on a failed adopt, not a fixed "could not reach"', async () => {
+    // `remote_bind_failed` is ONE code for every refusal on the bind leg: a dead
+    // tunnel, but also a version-parity refusal from a crew that is up and answering.
+    // Only the backend's sentence tells them apart, so the row must show that
+    // sentence. A fixed "Could not reach astro" here told the user to reconnect a
+    // crew that was reachable, and hid the line naming which end to update.
+    localStorage.setItem(PREVIEW_INSTANCE_SESSIONS, '1')
+    const reason = 'This crew runs Kiro Crew 0.6.0 but this machine runs 0.7.0. '
+      + 'A session only runs on a crew at the same major.minor version — update whichever end is behind.'
+    // What `client.ts::apiFailure` does for a real 502 before it throws: journal the
+    // status and code keyed by the message, which is the only field that survives
+    // the thunk boundary (see `adoptFailureText`'s doc).
+    recordError({
+      source: 'api', message: reason, status: 502, code: 'remote_bind_failed',
+      endpoint: '/api/chat/slots', detail: JSON.stringify({ error: reason, code: 'remote_bind_failed' }),
+    })
+    vi.mocked(api.createChatSlot).mockRejectedValueOnce(new ApiError(502, reason))
+    const { container } = renderSidebar()
+
+    await waitFor(() => expect(container.textContent).toContain('REMOTE middle row'))
+    const remoteRow = Array.from(container.querySelectorAll('[data-session-row]'))
+      .find(row => row.textContent?.includes('REMOTE middle row'))
+    fireEvent.click(remoteRow!)
+
+    await waitFor(() =>
+      expect(remoteRow!.querySelector('[data-testid="session-peer-adopt-error"]')).not.toBeNull())
+    const noticeEl = remoteRow!.querySelector('[data-testid="session-peer-adopt-error"]')!
+    const shown = noticeEl.textContent ?? ''
+    expect(shown).toContain('0.6.0')
+    expect(shown).toContain('0.7.0')
+    expect(shown).not.toMatch(/could not reach/i)
+    // The row is one line wide and clips the sentence (`session-row-fixed-height`),
+    // so the whole reason must also ride a `title` tooltip -- the clipped half is
+    // the one that says what to do.
+    expect(noticeEl.querySelector('[title]')?.getAttribute('title')).toBe(reason)
+  })
+
   it('keeps the PEER identity on the adopted row, so it is one row and not two', async () => {
     // The UX blocker this answers: adopt used to mount the new local slot under its
     // own key, so the row the user clicked was replaced by a sibling and both showed
@@ -746,7 +785,7 @@ describe('ChatSidebar – remote instance sessions merge into the list', () => {
     expect(localRow!.querySelector('[data-testid="session-peer-destination"]')).toBeNull()
   })
 
-  it('says it is checking remote instances while the first remote fetch is outstanding', async () => {
+  it('says it is checking remote crews while the first remote fetch is outstanding', async () => {
     localStorage.setItem(PREVIEW_INSTANCE_SESSIONS, '1')
     let releaseSlots: ((rows: unknown[]) => void) | undefined
     instanceChatSlotsMock.mockReturnValueOnce(
@@ -756,12 +795,12 @@ describe('ChatSidebar – remote instance sessions merge into the list', () => {
 
     // Same honesty rule the unreachable-instance notice exists for: until the
     // peer answers, the list is incomplete and must not imply otherwise.
-    await waitFor(() => expect(container.textContent).toMatch(/checking remote instances/i))
+    await waitFor(() => expect(container.textContent).toMatch(/checking remote crews/i))
     releaseSlots?.([
       { key: 'chat-9', title: 'REMOTE arrived row', last_turn_ts: new Date(Date.now() - 120_000).toISOString() },
     ])
     await waitFor(() => expect(container.textContent).toContain('REMOTE arrived row'))
-    expect(container.textContent).not.toMatch(/checking remote instances/i)
+    expect(container.textContent).not.toMatch(/checking remote crews/i)
   })
 
   it('reveals the LOCAL session when a colliding remote row sorts above it', async () => {

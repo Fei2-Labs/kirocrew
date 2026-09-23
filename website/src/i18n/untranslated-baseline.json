@@ -763,10 +763,6 @@
       "expression": 1,
       "template": 4
     },
-    "pages/settings/McpPoolableServers.tsx": {
-      "total": 2,
-      "template": 2
-    },
     "pages/settings/NotificationsPanel.tsx": {
       "total": 3,
       "template": 3

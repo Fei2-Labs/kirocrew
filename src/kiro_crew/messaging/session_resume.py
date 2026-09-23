@@ -86,33 +86,21 @@ _AGENT_SENTINELS = frozenset({"default", "auto"})
 
 
 def session_agent_from_metadata(meta: dict) -> str:
-    """Return a provider template, translating a positively owned member alias.
+    """Return a captured execution template, or an ordinary V1 agent spelling.
 
-    Dashboard history records the member alias in ``agent``. Channel-native
-    history records a provider template there instead. Only private memory's
-    declared owner disambiguates these namespaces; unowned V1 remains unchanged.
-    The execution path separately validates the actual memory before acquisition.
+    Store labels never identify a member. Malformed member records are refused
+    by execution admission; hydration does not repair or reassign their owner.
     """
-    recorded = str((meta or {}).get("agent") or "").strip()
-    store = (meta or {}).get("memory_store")
-    if isinstance(store, str) and store not in ("", "default"):
-        try:
-            from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
+    from kiro_crew.execution_context import execution_from_record
 
-            cfg = KiroCrewConfig.load()
-            record = cfg.memory_stores.get(store)
-            owner = getattr(record, "owner_member", "")
-            if (
-                owner
-                and getattr(record, "memory_version", 1) == 2
-                and (recorded == owner or not recorded or recorded.casefold() in _AGENT_SENTINELS)
-            ):
-                binding = resolve_agent_bindings(cfg, owner, validate_memory_files=False)
-                return binding.kiro_agent or cfg.agent.default_agent or "kirocrew"
-        except Exception:
-            # The strict session-memory check refuses broken private bindings
-            # before a provider starts. Hydration alone never repairs/rebinds it.
-            logger.debug("resume: member template lookup failed", exc_info=True)
+    try:
+        execution = execution_from_record(meta or {}, required=False)
+    except (TypeError, ValueError):
+        logger.debug("resume: execution context is malformed")
+        return ""
+    if execution is not None:
+        return execution.template_id
+    recorded = str((meta or {}).get("agent") or "").strip()
     return "" if recorded.casefold() in _AGENT_SENTINELS else recorded
 
 
@@ -131,6 +119,31 @@ def persisted_session_agent(conv_log: Any | None, session_key: str) -> str:
         logger.debug("resume: could not read persisted agent for %s", session_key, exc_info=True)
         return ""
     return session_agent_from_metadata(meta)
+
+
+def session_title_of(conv_log: Any | None, session_key: str, channel: str = "") -> str:
+    """The stored title for *session_key*, or the bare key as a stable fallback.
+
+    Discord, Teams and Telegram each grew their own copy of this read, so a fix
+    to the unwrap or the fallback landed in one and missed the others. The read
+    shape lives here for the same reason ``persisted_session_agent`` does: the
+    three adapters differ in addressing and wording, not in how they name a
+    resumed conversation.
+
+    Metadata access is blocking; async callers run this helper off the event loop
+    (see ``persisted_session_agent``). *channel* only names the caller in its
+    debug line, so a channel's log attribution survives the consolidation.
+    """
+    title = ""
+    if conv_log is not None:
+        try:
+            meta = conv_log.get_metadata(session_key)
+            title = str((meta or {}).get("title") or "")
+        except Exception:
+            logger.debug("%s resume: title lookup failed", channel or "session", exc_info=True)
+    # The picker's fallback for an untitled session, so a bootstrapped record
+    # names the conversation the way the user saw it listed.
+    return title or session_key.removeprefix("dashboard:")
 
 
 class ResumeReleaseError(RuntimeError):

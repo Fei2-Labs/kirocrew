@@ -1,6 +1,7 @@
 import { useRef, useEffect } from 'react'
-import { Check } from 'lucide-react'
+import { Check, LoaderCircle } from 'lucide-react'
 
+import { JEV_ROUTE_MODEL } from '../lib/jevRoute'
 import { isPricedMultiplier } from '../providers/modelList'
 import type { ModelInfo } from '../providers/types'
 import { fmtNumber } from '../i18n/format'
@@ -20,6 +21,24 @@ export type ModelItem =
 
 /** The multiplier Auto is pinned at, and the baseline the badges are relative to. */
 const BASELINE = 1
+
+/**
+ * What a row SHOWS for its model.
+ *
+ * Every real row shows its own id, verbatim: the id is what the user
+ * cross-references against `kiro-cli chat --list-models`, the composer chip and
+ * the config file, so translating or prettifying it would break that match.
+ *
+ * `auto:jev` is the one row that is not a model. It is a request to let Jev pick
+ * one per turn, and its wire id exists only so the gateway can recognise the
+ * choice — showing it would put an internal spelling where a user expects a name.
+ * A catalog key resolved HERE rather than a label carried on the row, for the same
+ * reason Auto's description is: a string baked in at fetch time would freeze the
+ * language in the React Query cache.
+ */
+function rowLabel(name: string): string {
+  return name === JEV_ROUTE_MODEL ? i18nT('components.modelDropdownList.auto_jev') : name
+}
 
 /**
  * ASCII 'x', not the multiplication sign U+00D7 (`×`).
@@ -104,8 +123,21 @@ const TIER_BORDER: Record<ReturnType<typeof costTier>, string> = {
 }
 
 /** Shared model list used in dropdown portals across AgentsPage and ChatPage */
-export default function ModelDropdownList({ models, activeModel, onSelect }: {
+export default function ModelDropdownList({ models, activeModel, onSelect, loading = false, failed = false }: {
   models: ModelItem[]; activeModel: string; onSelect: (name: string) => void
+  /** True while the list's SOURCE is still being fetched — a remote-bound
+   *  session whose peer capability read is in flight or being re-polled. An
+   *  empty list then renders as a loading row rather than "No matches": empty
+   *  claims the peer offers no models, which is not what a still-pending read
+   *  says, and the misread is sticky — the user closes the picker and stops
+   *  trying. Filter no-match on a POPULATED list is unaffected. */
+  loading?: boolean
+  /** True when the list's SOURCE read errored. The wrapper renders its own
+   *  ErrorNotice + Retry, so an empty failed list renders NOTHING here:
+   *  "No matches" beside "couldn't load" is two contradictory messages for
+   *  one state. `failed` wins over `loading`; a POPULATED list still renders
+   *  its rows. */
+  failed?: boolean
 }) {
   const activeRef = useRef<HTMLButtonElement>(null)
   useEffect(() => {
@@ -119,7 +151,10 @@ export default function ModelDropdownList({ models, activeModel, onSelect }: {
         return (
           <button key={m.name} ref={active ? activeRef : undefined} role="option" aria-selected={active} tabIndex={-1} className={`w-full text-left px-2.5 py-2 flex flex-col gap-0.5 rounded-md cursor-pointer transition-all border-none bg-transparent ${active ? 'bg-accent-subtle' : 'hover:bg-bg-hover'}`} onClick={() => onSelect(m.name)}>
             <div className="flex items-center gap-2">
-              <span data-model-name className={`text-[13px] font-mono font-semibold truncate ${active ? 'text-accent' : 'text-text'}`}>{m.name}</span>
+              {/* `data-model-name` carries the ID, not the label: the harnesses and
+                  the keyboard-nav tests select rows by the value that is sent, and a
+                  translated label would make that selector locale-dependent. */}
+              <span data-model-name data-model-id={m.name} className={`text-[13px] font-mono font-semibold truncate ${active ? 'text-accent' : 'text-text'}`}>{rowLabel(m.name)}</span>
               {active && <span className="text-accent text-[12px]"><Check className="lucide-inline" /></span>}
               {/* Credit multiplier. Rendered only when the backend reported a
                   usable one — a cold-start or pre-feature cached row has none,
@@ -161,7 +196,23 @@ export default function ModelDropdownList({ models, activeModel, onSelect }: {
           </button>
         )
       })}
-      {models.length === 0 && <div className="px-3 py-2 text-[13px] text-muted italic">{i18nT('components.modelDropdownList.no_matches')}</div>}
+      {models.length === 0 && !failed && (
+        loading
+          ? (
+            /* aria-busy marks the region as still populating, and the polite
+               live region announces the wait once instead of leaving a screen
+               reader with a silent empty listbox. */
+            <div
+              aria-busy="true"
+              aria-live="polite"
+              className="flex items-center gap-2 px-3 py-2 text-[13px] text-muted italic"
+            >
+              <LoaderCircle className="lucide-inline shrink-0 animate-spin" aria-hidden />
+              {i18nT('components.modelDropdownList.loading_models')}
+            </div>
+          )
+          : <div className="px-3 py-2 text-[13px] text-muted italic">{i18nT('components.modelDropdownList.no_matches')}</div>
+      )}
     </div>
   )
 }

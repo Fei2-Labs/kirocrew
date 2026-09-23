@@ -75,12 +75,25 @@ def _pipeline(store: KnowledgeStore, probe: _GateProbe) -> MagicMock:
     return pipeline
 
 
+def _seed_bg_tasks(app: web.Application) -> None:
+    """Create the handlers' background-task registry while the app is mutable.
+
+    The ingest and sync handlers keep their fire-and-forget tasks alive in
+    ``app["_bg_tasks"]`` and create the set on first use; that first use is a
+    request, i.e. after the test server has frozen the app, and aiohttp
+    deprecates an ``app[...]`` write at that point. ``_drain`` reads the same
+    set to wait for the tasks.
+    """
+    app["_bg_tasks"] = set()
+
+
 def _make_app(store: KnowledgeStore, pipeline: MagicMock) -> web.Application:
     app = web.Application()
     state = MagicMock()
     state.knowledge_store = store
     app["state"] = state
     app["knowledge_pipeline"] = pipeline
+    _seed_bg_tasks(app)
     app.router.add_post("/api/knowledge/ingest", kn.ingest_file)
     return app
 
@@ -282,6 +295,7 @@ async def test_manual_resync_holds_the_gate_until_the_task_has_claimed(
     app["state"] = state
     app["knowledge_pipeline"] = pipeline
     app["knowledge_sync"] = MagicMock(get_connector=MagicMock(return_value=None))
+    _seed_bg_tasks(app)
     app.router.add_post("/api/knowledge/sources/{id}/sync", kn.sync_source)
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(f"/api/knowledge/sources/{sid}/sync")

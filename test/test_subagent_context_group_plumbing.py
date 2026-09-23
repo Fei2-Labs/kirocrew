@@ -14,6 +14,8 @@ context rebuilding entirely, so the flags cannot apply to it.
 
 from __future__ import annotations
 
+import ast
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -27,7 +29,6 @@ from kiro_crew.subagent import (
 )
 from kiro_crew.subagent_manager.continuation import ContinuationCoordinator
 from kiro_crew.subagent_persistence import create_agent_folder, read_state
-from kiro_crew.subagent_scheduler import AdmissionDecision
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
 # looks short of memory, which is the runner's state, not this test's input.
@@ -39,6 +40,7 @@ def _mock_sessions() -> MagicMock:
     sessions.get_pid = MagicMock(return_value=None)
     sessions.get_approval_policy = MagicMock(return_value="auto")
     sessions.get_agent = MagicMock(return_value="")
+    sessions.get_agent_selection = MagicMock(return_value=("template", ""))
     sessions.has_session = MagicMock(return_value=True)
     sessions.release = MagicMock()
     sessions.reset = AsyncMock()
@@ -91,11 +93,53 @@ class TestFlagsReachTheRecord:
 class TestQueueRoundTrip:
     """A queued spawn must start with the scope its caller chose."""
 
+    def test_delegation_evidence_survives_queue_and_dispatch(self):
+        mgr = _mgr()
+        mgr._should_stagger_queue = MagicMock(return_value=(True, False))
+        evidence = {
+            "reason": "parent_parallel",
+            "details": "parent owns backend",
+            "source": "model_claim",
+        }
+        info = mgr.spawn("child owns docs", delegation=evidence)
+        assert info is not None and info.queued
+        assert info.delegation == evidence
+        assert mgr._queue[0]["delegation"] == evidence
+        captured = {}
+        mgr.spawn = lambda **kwargs: captured.update(kwargs)
+        mgr._max_concurrent = 4
+        mgr._running_count = 0
+        mgr._spawn_stagger_secs = 0.0
+        mgr._drain_queue()
+        assert captured["delegation"] == evidence
+
+    @pytest.mark.asyncio
+    async def test_started_run_persists_model_declared_evidence(self):
+        mgr = _mgr()
+        mgr._run = AsyncMock()
+        evidence = {
+            "reason": "user_requested",
+            "details": "Please use one reviewer",
+            "source": "model_claim",
+        }
+        info = mgr.spawn("review", delegation=evidence)
+        assert info is not None and not info.queued
+        assert info.delegation == evidence
+        assert (await asyncio.to_thread(read_state, info.id))["delegation"] == evidence
+
     def test_queue_entry_carries_flags(self):
         mgr = _mgr()
         # Force the stagger gate so the spawn queues instead of starting.
-        mgr._scheduler.admission = MagicMock(  # type: ignore[method-assign]
-            return_value=AdmissionDecision(True, False, 0.0)
+        #
+        # Mocks ``_should_stagger_queue`` rather than ``_scheduler.admission``:
+        # upstream SUPERSEDED that seam with ``_admission.capacity_view()``,
+        # which is the richer answer (it lifts the cap for the child reserve
+        # while a parent waits under an adaptive squeeze). The scheduler still
+        # owns the queue -- what moved is who decides ADMISSION. This test only
+        # needs the spawn to queue, so it pins the decision, not the mechanism
+        # that reaches it.
+        mgr._should_stagger_queue = MagicMock(  # type: ignore[method-assign]
+            return_value=(True, False)
         )
         info = mgr.spawn("summarize this log", include_memory=False)
         assert info is not None and info.queued is True
@@ -108,8 +152,9 @@ class TestQueueRoundTrip:
     def test_queued_placeholder_reports_the_scope(self):
         """spawn_list shows queued members too, so the record must carry it."""
         mgr = _mgr()
-        mgr._scheduler.admission = MagicMock(  # type: ignore[method-assign]
-            return_value=AdmissionDecision(True, False, 0.0)
+        # Same seam move as in test_queue_entry_carries_flags above.
+        mgr._should_stagger_queue = MagicMock(  # type: ignore[method-assign]
+            return_value=(True, False)
         )
         info = mgr.spawn("summarize this log", include_lessons=False)
         assert info is not None
@@ -118,8 +163,9 @@ class TestQueueRoundTrip:
     def test_drained_spawn_receives_the_flags(self):
         """The drain forwards the FULL kwarg set, flags included."""
         mgr = _mgr()
-        mgr._scheduler.admission = MagicMock(  # type: ignore[method-assign]
-            return_value=AdmissionDecision(True, False, 0.0)
+        # Same seam move as in test_queue_entry_carries_flags above.
+        mgr._should_stagger_queue = MagicMock(  # type: ignore[method-assign]
+            return_value=(True, False)
         )
         mgr.spawn("validate this finding", include_memory=False, include_project=False)
         captured: dict[str, object] = {}
@@ -131,7 +177,13 @@ class TestQueueRoundTrip:
         mgr._max_concurrent = 4
         mgr._running_count = 0
         mgr._spawn_stagger_secs = 0.0
-        mgr._scheduler.admission.return_value = AdmissionDecision(False, True, 0.0)
+        # Let the drain through. It no longer consults the stagger seam mocked
+        # above: upstream's pump gates on ``_admission.capacity_view().any_slot``
+        # directly, so the drain's own gate is the thing to open here. Mocking
+        # the superseded seam left the queue un-drained and the spawn never ran.
+        mgr._should_stagger_queue = MagicMock(  # type: ignore[method-assign]
+            return_value=(False, True)
+        )
         mgr._drain_queue()
         assert captured["include_memory"] is False
         assert captured["include_lessons"] is True
@@ -150,9 +202,7 @@ class TestContinuationInheritsScope:
 
     def test_inherits_from_the_live_record(self):
         mgr = _mgr()
-        original = SubagentInfo(
-            id="conv1", task="t", include_memory=False, include_project=False
-        )
+        original = SubagentInfo(id="conv1", task="t", include_memory=False, include_project=False)
         mgr._agents["conv1"] = original
         assert mgr._inherited_context_groups("conv1") == (False, True, False)
 
@@ -167,9 +217,7 @@ class TestContinuationInheritsScope:
     def test_all_groups_withheld_is_not_confused_with_a_legacy_run(self, monkeypatch):
         """An empty recorded scope means "all withheld", not "unknown"."""
         mgr = _mgr()
-        monkeypatch.setattr(
-            "kiro_crew.subagent.read_state", lambda _id: {"context_groups": ""}
-        )
+        monkeypatch.setattr("kiro_crew.subagent.read_state", lambda _id: {"context_groups": ""})
         assert mgr._inherited_context_groups("stripped") == (False, False, False)
 
     def test_run_predating_the_field_defaults_to_all_on(self, monkeypatch):
@@ -180,13 +228,17 @@ class TestContinuationInheritsScope:
     def test_continue_conversation_forwards_the_inherited_scope(self, monkeypatch):
         """End-to-end: the flags reach spawn(), not just the helper."""
         mgr = _mgr()
-        mgr._agents["conv2"] = SubagentInfo(id="conv2", task="t", include_memory=False)
+        evidence = {"reason": "specialist", "details": "blind review", "source": "model_claim"}
+        mgr._agents["conv2"] = SubagentInfo(
+            id="conv2", task="t", include_memory=False, delegation=evidence
+        )
         monkeypatch.setattr(mgr, "_conversation_busy", lambda _k: None)
         monkeypatch.setattr(mgr._sessions, "resumable_sid", lambda _k: "sid-1")
         monkeypatch.setattr(mgr, "_promote_conversation", lambda *_a: None)
         captured: dict[str, object] = {}
         monkeypatch.setattr(mgr, "spawn", lambda *_a, **kw: captured.update(kw))
         mgr.continue_conversation("conv2", "follow up")
+        assert captured["delegation"] == evidence
         assert captured["include_memory"] is False
         assert captured["include_lessons"] is True
         assert captured["include_project"] is True
@@ -217,9 +269,7 @@ class TestContinuationInheritsScope:
 
         # No caller cwd -> nothing invented here; spawn applies its own default.
         # A recorded state.json must NOT be consulted on this path.
-        monkeypatch.setattr(
-            "kiro_crew.subagent.read_state", lambda _id: {"cwd": str(proj)}
-        )
+        monkeypatch.setattr("kiro_crew.subagent.read_state", lambda _id: {"cwd": str(proj)})
         captured.clear()
         mgr.continue_conversation("conv3", "follow up")
         assert captured["cwd"] == ""
@@ -232,9 +282,7 @@ class TestContinuationInheritsScope:
         mgr = _mgr()
         proj = tmp_path / "alpha"
         proj.mkdir()
-        monkeypatch.setattr(
-            "kiro_crew.subagent.read_state", lambda _id: {"cwd": str(proj)}
-        )
+        monkeypatch.setattr("kiro_crew.subagent.read_state", lambda _id: {"cwd": str(proj)})
         assert mgr.recorded_cwd("conv9") == str(proj)
 
         # A project that does not exist is forwarded ANYWAY, so `spawn` refuses
@@ -244,7 +292,8 @@ class TestContinuationInheritsScope:
         # A loud refusal is recoverable; a silent write to the wrong tree is not.
         gone = tmp_path / "deleted-project"
         monkeypatch.setattr(
-            "kiro_crew.subagent.read_state", lambda _id: {"cwd": str(gone)},
+            "kiro_crew.subagent.read_state",
+            lambda _id: {"cwd": str(gone)},
         )
         assert mgr.recorded_cwd("conv9") == str(gone)
         # Only a run that never recorded a cwd yields "": for it the pool default
@@ -252,17 +301,27 @@ class TestContinuationInheritsScope:
         monkeypatch.setattr("kiro_crew.subagent.read_state", lambda _id: {})
         assert mgr.recorded_cwd("conv9") == ""
 
-        # And the synchronous path carries no probe of its own. Comments are
-        # stripped first: the method explains the hazard by naming the call, and a
-        # scan that counted prose would fail on its own documentation.
+        # And the synchronous path carries no probe of its own -- the sync entry
+        # plus the prelude it shares with the async one, which is where every
+        # check and every state read now live. Comments are stripped first: the
+        # code explains the hazard by naming the call, and a scan that counted
+        # prose would fail on its own documentation.
         src = Path(ContinuationCoordinator.__module__.replace(".", "/") + ".py")
         src = (Path(__file__).parents[1] / "src" / src).read_text(encoding="utf-8")
-        body = src.split("def continue_conversation_impl")[1].split("\n    def ")[0]
-        code = "\n".join(
-            ln for ln in body.splitlines() if not ln.lstrip().startswith("#")
+        bodies = {
+            node.name: ast.get_source_segment(src, node) or ""
+            for node in ast.walk(ast.parse(src))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        body = "\n".join(
+            bodies[name] for name in ("continue_conversation_impl", "_continue_prelude_impl")
         )
+        code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
         assert "is_dir(" not in code, "a blocking probe is back on the event loop"
         assert "read_state(" in code, "premise: the seed read is still there to compare"
+        assert (
+            "_continue_prelude(" in bodies["continue_conversation_impl"]
+        ), "premise: the sync entry still runs the shared prelude"
 
 
 class TestScopePersistence:
@@ -294,9 +353,7 @@ class TestScopePersistence:
         create_agent_folder("r3", task="t", context_groups="lessons")
         assert (read_state("r3") or {}).get("context_groups") == "lessons"
 
-    def test_scope_survives_to_inheritance_without_the_live_record(
-        self, tmp_path, monkeypatch
-    ):
+    def test_scope_survives_to_inheritance_without_the_live_record(self, tmp_path, monkeypatch):
         """The real write -> real read path, not a patched read_state."""
         monkeypatch.setattr("kiro_crew.subagent_persistence._subagents_dir", lambda: tmp_path)
         mgr = _mgr()

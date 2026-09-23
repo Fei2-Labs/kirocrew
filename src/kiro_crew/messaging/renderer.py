@@ -17,7 +17,13 @@ a widget-capable renderer that skips the helper fails that test.
 Channels declaring ``max_buttons=0`` render no widget and route the whole
 trailer through :func:`render_options_as_text`, which reaches the same helper
 with zero widget slots: every choice becomes a numbered line the user answers by
-typing, rather than being deleted along with the trailer.
+typing, rather than being deleted along with the trailer. Four channels deliver the
+numbered list -- Weixin, iMessage and Feishu through this function, WeCom through
+its own streaming-aware copy (see below) -- and
+``test/test_options_cap_contract.py`` drives each one. WhatsApp declares ``max_buttons=0`` and does NOT: its renderer strips a
+complete trailer (``whatsapp/turn_renderer.py::_strip_options``) and the choices
+are lost, which is a gap rather than a position -- so a ``0`` here is not on its
+own a promise that the list survives.
 
 Webex is the widget channel that ALSO always ships the numbered text: it declares
 Adaptive Card actions, but the inbound half of a press rides an undocumented
@@ -44,7 +50,12 @@ from kiro_crew.constants import (
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.tables import render_tables, render_tables_with_metadata
 from kiro_crew.messaging.transport import TransportCapabilities
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    CREDENTIAL_REDACTION_TAGS,
+    EXFILTRATION_REDACTION_TAG_PREFIX,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 
 # Abstract output event kinds.
 TEXT_CHUNK = "text_chunk"
@@ -71,7 +82,14 @@ class OutputEvent:
     # tool_call announces it, prompt_choice asks permission for it. Carrying them
     # on the prompt is what lets a renderer name the tool the request is actually
     # about instead of the last one it happened to see.
-    title: str = ""  # tool_call / prompt_choice (tool name / "Running: X")
+    title: str = ""  # tool_call / prompt_choice (display title: derived, or "Running: X")
+    # tool_call: the tool's PROGRAMMATIC identity (`_meta.kiro.toolName`), kept
+    # apart from ``title`` because the title is display copy — derived from the
+    # arguments, localisable, and free to change — while a renderer's behaviour
+    # rules (the Slack `wait` stream rollover) must key on what the tool IS.
+    # Empty when the transport sent no identity; renderers then fall back to the
+    # title, which is what they matched on before the identity travelled.
+    tool_name: str = ""
     tool_kind: str = ""  # tool_call (e.g. "read"/"execute" — drives phase emoji)
     tool_purpose: str = ""  # tool_call / prompt_choice (human-readable purpose)
     options: list[dict[str, Any]] = field(default_factory=list)  # prompt_choice
@@ -309,6 +327,83 @@ def credential_redaction_notice(count: int) -> str:
     )
 
 
+def redaction_notice(cred_count: int, url_count: int) -> str:
+    """The notice a channel sends after delivering text EITHER redactor rewrote.
+
+    Every channel delivery surface runs two body rewriters over the text it
+    ships -- ``security.redact_exfiltration_urls`` then
+    ``security.redact_credentials`` -- so the placeholder a reader sees can come
+    from either. ``cred_count`` is the number of ``CREDENTIAL_REDACTION_TAGS``
+    placeholders in the delivered text; ``url_count`` is the number of
+    ``EXFILTRATION_REDACTION_TAG_PREFIX`` placeholders (that tag interpolates the
+    redacted domain, so callers count it by prefix, never by equality). Like
+    :func:`credential_redaction_notice`, this carries NO secret bytes and no
+    redacted URL: only the counts are used, so the domain the tag names never
+    reaches the sentence.
+
+    Worded BY KIND because the remedies differ: a credential needs the secret
+    re-entered where the command runs; a rewritten URL needs the original link
+    re-checked from a trusted source. Telling a reader whose URL was rewritten to
+    "supply the secret yourself" names a remedy that cannot help them, which is
+    the gap this closes. The credential-only sentence is delegated to
+    :func:`credential_redaction_notice` unchanged, so a surface that adopts this
+    builder ships byte-identical wording for the case it already covered.
+
+    Same delivery contract as the credential notice: plain text, no markup, no
+    emoji, one string for every channel, sent as its own message BELOW the
+    answer. At least one count must be non-zero -- the caller gates on that, and
+    a zero/zero call is a caller bug rather than a silent empty message.
+    """
+    if cred_count < 0 or url_count < 0 or not (cred_count or url_count):
+        raise ValueError("redaction_notice needs at least one placeholder to describe")
+    if not url_count:
+        return credential_redaction_notice(cred_count)
+    subjects: list[str] = []
+    if cred_count:
+        subjects.append("a credential" if cred_count == 1 else f"{cred_count} credentials")
+    subjects.append("a suspicious URL" if url_count == 1 else f"{url_count} suspicious URLs")
+    subject = " and ".join(subjects)
+    subject = subject[0].upper() + subject[1:]
+    verb = "was" if (cred_count + url_count) == 1 else "were"
+    if cred_count:
+        remedy = (
+            "supply the secret yourself on the machine where you run it, and "
+            "re-check any redacted URL against a trusted source."
+        )
+    else:
+        remedy = "re-check the original URL against a trusted source before using it."
+    return (
+        f"Security notice: {subject} in the message above {verb} replaced with a "
+        f"redaction placeholder. Any command or link shown will not work if you "
+        f"paste it as-is; {remedy}"
+    )
+
+
+def count_redaction_tags(text: str) -> tuple[int, int]:
+    """Count both redaction placeholder kinds in delivered text.
+
+    Returns ``(cred_count, url_count)`` — the two arguments
+    :func:`redaction_notice` takes, in its order. Every delivery surface that
+    posts a notice needs the same two tallies over the text that actually
+    shipped, and each kind counts differently: a credential tag is a CLOSED set
+    of constant strings (``CREDENTIAL_REDACTION_TAGS``), matched exactly and
+    summed so an encoded-credential-only answer is not missed, while the URL
+    tag interpolates the redacted domain and so has no constant form — it is
+    counted by ``EXFILTRATION_REDACTION_TAG_PREFIX`` prefix, never by equality.
+
+    One shared counter exists so a surface cannot adopt half the tally: a
+    site that counts credentials but forgets the URL prefix (or vice versa)
+    posts a notice worded for the wrong remedy, which is the gap the two-kind
+    notice closes. Count from the DELIVERED text rather than a redactor's
+    warnings list: chunked surfaces redact on the way out, so re-redacting the
+    assembled answer reports nothing while the placeholders are plainly
+    visible in what shipped.
+    """
+    cred_count = sum(text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
+    url_count = text.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+    return cred_count, url_count
+
+
 def _choice_display_safe(text: str, capabilities: TransportCapabilities | None) -> str:
     """The choice-label display sink, target-aware when the target is known.
 
@@ -519,10 +614,16 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
 def render_options_as_text(text: str, capabilities: TransportCapabilities) -> str:
     """Rewrite a trailing ``[OPTIONS:]`` trailer in *text* as numbered text.
 
-    The whole trailer handling for a channel that renders no widget, so every
-    channel that renders none shares one implementation instead of a copy each.
+    The whole trailer handling for a channel that renders no widget, so a channel
+    that renders none shares one implementation instead of keeping a copy each.
     Returns the body only; the widget half of :func:`apply_options_cap` has
     nothing to keep at ``max_buttons == 0``.
+
+    Three of the five zero-widget channels call it: Weixin, iMessage and Feishu.
+    WeCom reaches the same outcome through its own ``_render_options_as_text``, for
+    the ``hide_partial`` reason below, so it does not call this one. WhatsApp is the
+    channel that reaches the outcome NOWHERE: its renderer strips the trailer
+    instead, so its choices never arrive here or anywhere.
 
     Parsing is :func:`split_options_trailer`, at its buffered default: this path's
     callers do not stream — they buffer a whole turn and send once — so an
@@ -545,6 +646,13 @@ class Renderer(ABC):
     """Maps abstract ``OutputEvent``s onto a transport's native surface."""
 
     channel_type: str = ""
+    #: Programmatic identity of the tool call ``on_tool_call`` is currently
+    #: rendering (``OutputEvent.tool_name``), set by :meth:`dispatch` before the
+    #: hook runs. ``on_tool_call`` receives the DISPLAY title; a renderer whose
+    #: behaviour depends on which tool ran (Slack's ``wait`` stream rollover)
+    #: reads this instead of matching the title. ``""`` when the transport sent
+    #: no identity.
+    current_tool_name: str = ""
 
     def __init__(self, capabilities: TransportCapabilities) -> None:
         self.capabilities = capabilities
@@ -725,6 +833,7 @@ class Renderer(ABC):
         elif event.kind == THINKING:
             await self.on_thinking(event.text)
         elif event.kind == TOOL_CALL:
+            self.current_tool_name = event.tool_name or ""
             await self.on_tool_call(
                 event.tool_call_id, event.title, event.tool_kind, event.tool_purpose
             )

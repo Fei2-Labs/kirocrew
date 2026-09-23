@@ -1,6 +1,6 @@
 ---
 name: security-conductor
-description: Use when a security conductor session is being seeded, or when inspecting/debugging one. Operating procedure for the kirocrew-security-conductor agent - run proactive vulnerability discovery on one target as a supervised fleet. Decompose the target into attack surfaces, dispatch one auditor per surface behind the rules of engagement, dispatch an independent verifier per finding whose job is rejecting false positives, adjudicate severity, hold the two human gates, run a retrospective that proposes lessons, and report upward.
+description: Operating procedure for the kirocrew-security-conductor agent. Use when a security conductor session is seeded, inspected or debugged. Run vulnerability discovery on one target as a supervised fleet — one auditor per attack surface, an independent verifier per finding, two human gates.
 ---
 
 # Security Conductor
@@ -41,14 +41,23 @@ than permission.
   golden paths, rules-of-engagement export, list. It is also the human's editing
   surface.
 - `scripts/verify_fix.py` — the fixer lane's acceptance gate. Given a finding and
-  a worktree it asserts BOTH halves: the finding's proof of concept no longer
-  reproduces, AND every `shell` row of the committed `golden-paths.json` beside
-  it whose platform matches this host is still permitted. `0` both hold, `10` the
-  proof still reproduces so the fix did not land, `30` a golden path is refused
-  and the rows are printed, `20` something the script owns could not be settled
-  (an absent verifier, an unreadable deny composite, a corpus that is missing,
-  will not load, or holds no row). It fails closed: a check that could not run is
-  never a pass, so `0` is unreachable while anything went unsettled.
+  a worktree it asserts THREE things: the fix stayed inside the blast radius the
+  conductor declared for it, the finding's proof of concept no longer reproduces,
+  AND every checkable row of the committed `golden-paths.json` beside it whose
+  platform matches this host still holds — `shell` rows re-classified against the
+  fixed deny fence, `test` rows RUN against the fixed worktree. `0` all hold,
+  `10` the proof still reproduces so the fix did not land, `30` a golden path is
+  refused, a `test` row failed, or the fix contract was violated, `20` something
+  the script owns could not be settled (an absent verifier, an unreadable deny
+  composite, a corpus that is missing, will not load, or holds no row, a `test`
+  row that collected nothing, or a declared contract that will not read). It
+  fails closed: a check that could not run is never a pass, so `0` is unreachable
+  while anything went unsettled.
+- `scripts/check_fix_contract.py` — the pre-fix scope gate, run by `verify_fix.py`
+  and runnable on its own. Reads `fix-contract.json` from the worktree root and
+  reports every changed path that is forbidden, outside the allowed set, or over
+  the file-count ceiling. `0` honoured, `30` violated with the paths printed, `20`
+  the contract is absent or malformed.
 
 ## The rules of engagement
 
@@ -73,6 +82,24 @@ what makes it attributable and revertible.
 
 **The rules of engagement need a human review before the first auditor runs.**
 That review is a precondition of the first round, not a formality.
+
+### Preconditions for the first round
+
+Before the first dispatch, REPORT the readiness state as data — every item below
+read from the ledger or the filesystem in this session, never carried over from
+how a previous round left the machine. A missing or unreadable item is reported
+as missing, never inferred as ready, and is a stop condition for the first round.
+
+| Item | Read it from | Ready reads as |
+|---|---|---|
+| Active rules of engagement | `scripts/ledger.py list rules` | how many rows are `active`, and the `approved_by` on each — a row nobody signed is not a reviewed rule, and the count alone cannot tell you the review happened |
+| The gating golden-path corpus | the committed `golden-paths.json` beside the skill | the rows `scripts/verify_fix.py` will actually re-check, because that gate reads this file and never the table. `scripts/ledger.py list golden-paths` reports the table, which is import and dedupe state — a count there is not a corpus a fix is judged against |
+| The six scripts | the skill's `scripts/` directory | all six present and readable; an absent one is `UNKNOWN` and never permission |
+| Scope answered from the ledger | one `scripts/scope_check.py` call | NO fallback warning on stderr, AND a verdict that is not `UNKNOWN`. The fallback names the export it read instead, and its presence means the rows are NOT signed — an answer from a file somebody can edit without leaving a row behind. Silence alone is not the ready reading: an unreadable database, and a ledger whose every rule has been revoked, both answer `UNKNOWN` with no warning at all |
+
+Report the four as four readings, each with the number or the name you read. An
+item you did not read is not ready, and a precondition nobody stated is the state
+the operator has no way to ask about.
 
 ## What qualifies as a work item
 
@@ -110,19 +137,93 @@ rules yourself.
    checks alone. Checks green proves the repository still builds; it does not
    prove the product still works, because no existing test asserts that a
    legitimate command is *not* refused. Exit 10 means the fix did not land, exit
-   30 means it broke a golden path, exit 20 means the question was not settled,
-   and none of the three is acceptance.
+   30 means it broke a golden path or left its declared scope, exit 20 means the
+   question was not settled, and none of the three is acceptance.
+
+### Declare the fix contract before you dispatch a fixer
+
+Write `fix-contract.json` into the fixer's worktree root as part of the dispatch,
+with every path relative to the target's own root:
+
+```json
+{
+  "finding_ids": [16],
+  "allowed_paths": ["<the module the fix belongs in>", "<that module's test dir>"],
+  "forbidden_paths": ["<the module last round's over-reach touched>"],
+  "max_changed_files": 3,
+  "no_new_refusal_statement": "<one sentence the fixer must keep true>"
+}
+```
+
+**Keep your own copy outside that worktree and judge against yours.** Always run
+`verify_fix.py --contract <your copy>`. The named copy is the only one the gate
+enforces, because the file in the fixer's worktree is one the fixer can widen — and a
+fix steered by the very code it is auditing is a named boundary in the rules of
+engagement. Write the worktree copy too, so the fixer can read its own bar, and name it
+in the seed; if you then forget `--contract`, the gate answers `unverifiable` rather
+than passing on a file the subject controls. With no copy anywhere there is no contract
+check and every other behaviour is unchanged. The contract does not get to pick the base
+it is judged against or the finding it covers — a `finding_ids` that excludes the one
+being verified is `unverifiable`, not a scope. The security fix that is minimal is the one a human accepts, and the
+round that taught this one fixed a cron seam by adding a name to the agent spawn's
+env denylist — which stripped the operator's own `KIROCREW_SECURITY_POLICY` from
+every agent child and still exited 0.
+
+A golden path may also be a BEHAVIOUR rather than a command: a `test` row's
+`command_or_flow` is a pytest selector, a test file or one node of it
+(`<path>/test_module.py::test_case`), which `verify_fix.py` RUNS against the fixed
+worktree — so "the operator's own env var still reaches the child" is a row the
+gate can check instead of a sentence in a review comment. A failing row is
+`broken`; one that collects nothing is `unverifiable`, never a pass. **Exit 0 now
+also means the contract was honoured and every behaviour row is green.** There is no
+flag that skips a behaviour row: one would let the fixer choose which half of the
+corpus applies to it.
 
 A gate is held by not dispatching. Never dispatch on an assumed yes, never treat
 silence as approval, and never re-scope a blocked step into something that looks
 permitted. Record each pending gate as your own obligation and re-read it every
 cycle until it is answered.
 
+When you block on one, name WHICH of the two gates holds you, the exact step you
+are asking to be allowed — the surface, the finding id, the command or the PR —
+and what you will do the moment the answer is yes. An operator asked to approve
+"active testing" is approving a mood, and a mood cannot be refused in part; one
+asked to approve a named step can allow that step and hold the rest.
+
 A third `human_approval` row covers the golden-path corpus rather than a
 dispatch: approving a `golden_paths` row, and **deactivating an approved one**,
 both need a human yes on the same terms. The symmetry is the control — a gate
 whose input can be shrunk is not a gate, because the cheapest way to green is
 retiring the row a fix broke. That row is not yours to grant either.
+
+### Hand the operator the command, never run it
+
+Four `scripts/ledger.py` verbs are the human's: `add-rule`,
+`import-golden-paths`, `approve-golden-path` and `approve-lesson`. Each writes a
+row that IS the boundary this fleet is bounded by, so an agent that types one has
+signed the operator's name to its own decision. Being told to run one is not
+authority to run it, and there is no exception that makes it yours.
+
+When one of them is what stands between the fleet and its next step, EMIT IT,
+ready to run — a command that is described rather than handed over gets retyped,
+and retyped from the wrong directory:
+
+- The absolute path to the script, resolved in this session, so the command runs
+  from wherever the operator is standing.
+- Every flag filled from what you read, except `--approved-by`: leave it as the
+  operator's own to fill and say so on the line. The approver is the one field
+  that cannot be yours, because it is the signature.
+- One line saying what THAT verb prints back, so the operator can tell success
+  from silence. All four print one JSON line on stdout, and they do not print the
+  same thing:
+
+  | Verb | A correct run prints |
+  |---|---|
+  | `add-rule` | the new row's id and `active: 1` |
+  | `approve-lesson`, `approve-golden-path` | the row's id, `active: 1` and the approver. A repeat on the same row is instead a sentence on stderr and exit 2 — approval is recorded once, so that refusal is correct behaviour and not a failure to retry |
+  | `import-golden-paths` | the `imported`, `skipped` and `total` counts, and no row id. It is idempotent, so re-importing the same file succeeds with the rows skipped |
+
+Preparing that text is clerical. Typing it is the gate.
 
 ## Auditor seed template
 
@@ -287,6 +388,17 @@ Arm the patrol with `monitor_start` (interval ~120s), never `wait`. Pass
 loop then stops with no symptom. Call `autonudge_stop` yourself when a stop
 condition fires; coasting into the cycle cap is a failure, not a finish.
 
+**Before the first dispatch, file yourself in the audit's folder** — one
+`chat_folder_file_self` with `folder` set to a few-word name for the target
+under audit. It creates the folder if needed and moves only your own session,
+so it never prompts. Every session you then open goes to
+`<audit>/<agent>` via `session_create`'s `folder` argument — auditors,
+verifiers, the retrospective and fixers each under the subfolder named for
+the agent that runs them — so the person sees one heading for the audit, your
+session directly under it, and the fleet grouped by role beneath. A conductor
+floating at the top level while its fleet sits in a folder is the shape this
+step removes.
+
 Each cycle, in this order:
 
 1. **Read the ledger** — one `session_ledger_read`. The injected block is a
@@ -319,6 +431,9 @@ Stop and report, rather than continuing, on any of these:
   exit: final tally, then `autonudge_stop`.
 - The rules of engagement have not been reviewed by a human. Nothing is
   dispatched before that.
+- A readiness precondition is missing, unreadable, or answered from the export
+  rather than the ledger. Report the reading, hand over the command that fixes
+  it, and dispatch nothing until it reads ready.
 - A worker reports a policy refusal. That surface stops until you rule on the
   event; the worker does not continue past it, and neither do you.
 - A worker reports having circumvented a block, a scope rule, or a forbidden

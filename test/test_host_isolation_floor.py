@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import io
 import logging
 import os
 import pathlib
@@ -315,8 +316,12 @@ class TestNoMetricIsEmittedAtImport:
         next(wrapper)
         ToolHookResult.allow()  # the import-time emission, with the process pin in force
         assert provider._ever_built, "the emission did not build a recorder; control is vacuous"
+        report = pytest.CollectReport(module.nodeid, "passed", None, [])
+        from pluggy import Result
+
         with pytest.raises(StopIteration):
-            next(wrapper)
+            wrapper.send(Result.from_call(lambda: report))
+        assert report.failed
 
         assert _root.IMPORT_TIME_METRIC_EMITTERS == [module.nodeid]
         assert not provider._ever_built, "the guard must undo the build it recorded"
@@ -335,8 +340,12 @@ class TestNoMetricIsEmittedAtImport:
 
         wrapper = _root.pytest_make_collect_report(module)
         next(wrapper)
+        report = pytest.CollectReport(module.nodeid, "passed", None, [])
+        from pluggy import Result
+
         with pytest.raises(StopIteration):
-            next(wrapper)
+            wrapper.send(Result.from_call(lambda: report))
+        assert report.failed
 
         assert _root.IMPORT_TIME_METRIC_EMITTERS == [f"conftest import (before {module.nodeid})"]
         assert not provider._ever_built
@@ -1703,6 +1712,24 @@ class TestTheWorkerBudgetIsMemoryBounded:
     rather than a bug. So each reading must degrade to "skip this bound", never to zero.
     """
 
+    #: The per-worker reservation is now platform-aware (3 GiB on Linux/Windows,
+    #: 16 GiB on macOS), so an assertion here computed against the live selector
+    #: would read one number on Linux and another on macOS. These tests are about
+    #: the shared division MECHANISM, not the platform default that feeds it, so
+    #: the autouse fixture below forces the selectors to the Linux/Windows
+    #: constants on every platform; each assertion then derives its expected
+    #: count from ``_GIB_PER_WORKER`` directly. The platform default itself is
+    #: covered by ``test_xdist_host_budget.py::test_per_worker_reservation_is_platform_aware``.
+
+    @pytest.fixture(autouse=True)
+    def _pin_per_worker_reservation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import xdist_budget as budget
+
+        monkeypatch.setattr(budget, "_gib_per_worker", lambda: budget._GIB_PER_WORKER)
+        monkeypatch.setattr(
+            budget, "_gib_per_worker_available", lambda: budget._GIB_PER_WORKER_AVAILABLE
+        )
+
     def test_the_budget_is_registered_from_the_rootdir_not_from_test_conftest(self) -> None:
         """The gap that was silent for every testpath but ``test/``.
 
@@ -1778,9 +1805,13 @@ class TestTheWorkerBudgetIsMemoryBounded:
         monkeypatch.setattr(budget, "_cgroup_limit_mib", lambda: 8 * 1024)
         monkeypatch.setattr(budget, "_host_available_mib", lambda: 0)
 
-        # 8 GiB ceiling at 2 GiB/worker is the tightest real reading, and the
+        # The 8 GiB cgroup ceiling is the tightest real reading, and the
         # unavailable one (0) is skipped rather than read as "no memory".
-        assert budget._static_memory_bounded_capacity(32) == 4
+        # Derived from the reservation rather than restated: the constant tracks a
+        # remeasured per-worker footprint and has moved (2 -> 3 GiB when the
+        # collection floor doubled), so a literal here pins the wrong thing and
+        # goes red for a reason that is not this test's subject.
+        assert budget._static_memory_bounded_capacity(32) == 8 // budget._GIB_PER_WORKER
 
     def test_a_starved_host_is_bounded_rather_than_read_as_unknown(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1816,10 +1847,17 @@ class TestTheWorkerBudgetIsMemoryBounded:
         """The memory budget is SHARED between concurrent runs, not granted to each.
 
         This is the property that decides where each bound goes. A 64-core / 32 GiB host
-        can back 16 workers, so there must be 16 SLOTS in total -- a first run takes them
-        all and a second gets its floor. Put the static bound only on the per-run cap and
-        both runs take 16 each: 32 workers against a 16-worker budget, which is the
-        swapping incident the budget exists to prevent, reached from the other end.
+        can back only as many workers as the reservation allows, so that many SLOTS must
+        exist in total -- a first run takes them all and a second gets its floor. Put the
+        static bound only on the per-run cap and both runs take the full share each:
+        double the workers against a single budget, which is the swapping incident the
+        budget exists to prevent, reached from the other end.
+
+        The expected count is DERIVED from the reservation, not restated. The constant
+        tracks a remeasured per-worker footprint and has already moved once (2 -> 3 GiB
+        when the collection floor doubled); a literal would fail here for a reason that
+        has nothing to do with where the bound is applied, which is the only thing this
+        test is about.
         """
         import xdist_budget as budget
 
@@ -1832,11 +1870,13 @@ class TestTheWorkerBudgetIsMemoryBounded:
         # from an agent shell would otherwise read the spawner's cap here.
         monkeypatch.delenv(budget._XDIST_ENV_CAP, raising=False)
 
+        expected = 32 // budget._GIB_PER_WORKER
+        assert expected < 64, "the memory bound must be the tighter one for this to mean anything"
         first = budget.resolve_workers()
         # A second run in this same process cannot re-lock what it already holds, so the
-        # slot RANGE is what the assertion has to pin: 16, never 64.
-        assert first == 16
-        assert budget._static_memory_bounded_capacity(64) == 16
+        # slot RANGE is what the assertion has to pin: the memory-backed share, never 64.
+        assert first == expected
+        assert budget._static_memory_bounded_capacity(64) == expected
 
     def test_the_live_bound_does_not_shrink_the_shared_range(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2050,3 +2090,64 @@ class TestTheWorkerBudgetIsMemoryBounded:
         monkeypatch.setattr("builtins.open", _fake_cgroup)
 
         assert budget._cgroup_limit_mib() == 8 * 1024
+
+
+class TestCliProcessEnvironmentIsRestored:
+    """CLI startup may mutate this call, not the next test's environment."""
+
+    @pytest.mark.parametrize(
+        "initial",
+        [
+            pytest.param(None, id="absent"),
+            pytest.param(
+                ("outer-active", "outer-tier", "0", "latin-1:strict"),
+                id="non-default",
+            ),
+            pytest.param(("", "", "", ""), id="empty"),
+        ],
+    )
+    def test_real_cli_mutations_are_restored_exactly(self, initial, monkeypatch, tmp_path):
+        names = (
+            "KIROCREW_SANDBOX_ACTIVE",
+            "KIROCREW_SANDBOX_LEVEL",
+            "PYTHONUTF8",
+            "PYTHONIOENCODING",
+        )
+        for index, name in enumerate(names):
+            # Record an undo even for absent keys, so a failed assertion cannot
+            # leak the deliberately mutated process environment.
+            monkeypatch.setenv(name, "test-sentinel")
+            if initial is None:
+                monkeypatch.delenv(name)
+            else:
+                monkeypatch.setenv(name, initial[index])
+        before = {name: os.environ.get(name) for name in names}
+
+        # On Windows the real initializer also reconfigures stdout/stderr. Give it
+        # test-owned streams so that side effect is observed without changing
+        # pytest's capture streams for later tests.
+        stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+        monkeypatch.setattr(sys, "stdout", stdout)
+        monkeypatch.setattr(sys, "stderr", stderr)
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr(sys, "argv", ["kirocrew", "--help"])
+
+        definition = _root._floor_monkeypatch
+        cycle = getattr(definition, "__wrapped__", definition)()
+        next(cycle)
+        try:
+            with pytest.raises(SystemExit) as exit_info:
+                cli.main()
+            assert exit_info.value.code == 0
+            assert "KIROCREW_SANDBOX_ACTIVE" not in os.environ
+            assert "KIROCREW_SANDBOX_LEVEL" not in os.environ
+            assert os.environ["PYTHONUTF8"] == "1"
+            assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
+            expected_errors = "backslashreplace" if cli.platform_compat.IS_WINDOWS else "strict"
+            assert stdout.errors == expected_errors
+            assert stderr.errors == expected_errors
+        finally:
+            cycle.close()
+
+        assert {name: os.environ.get(name) for name in names} == before

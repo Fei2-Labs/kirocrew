@@ -47,6 +47,7 @@
         },
         "title": "echo hello-from-corpus",
         "tool_call_id": "toolu_bdrk_01K2gMtk8bxngM8Cw1FAFNTV",
+        "tool_identity_trusted": true,
         "tool_input": "{\n  \"__tool_use_purpose\": \"Run the requested echo command exactly as specified\",\n  \"command\": \"echo hello-from-corpus\"\n}",
         "tool_kind": "execute",
         "tool_name": "shell",
@@ -104,7 +105,9 @@
       {
         "kind": "tool_result",
         "tool_call_id": "toolu_bdrk_01K2gMtk8bxngM8Cw1FAFNTV",
-        "tool_output": "hello-from-corpus\n"
+        "tool_output": "hello-from-corpus\n",
+        "tool_output_bytes": 18,
+        "tool_output_digest": "6a2cc3653dd746bbeb1a32982ce782a89f7c013a4d0f5928a8ead74c71067614"
       }
     ],
     "frame": "session/update",
@@ -117,7 +120,10 @@
         "kind": "tool_result",
         "tool_call_id": "toolu_bdrk_01K2gMtk8bxngM8Cw1FAFNTV",
         "tool_final": true,
-        "tool_output": "hello-from-corpus\n"
+        "tool_output": "hello-from-corpus\n",
+        "tool_output_bytes": 18,
+        "tool_output_digest": "6a2cc3653dd746bbeb1a32982ce782a89f7c013a4d0f5928a8ead74c71067614",
+        "tool_status": "completed"
       },
       {
         "is_shell": true,

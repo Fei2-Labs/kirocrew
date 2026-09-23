@@ -34,6 +34,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_COPILOT,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -322,7 +323,13 @@ _CODEX = BackendDescriptor(
     permission_config_value="read-only",
     effort_config_id=EFFORT_CONFIG_ID_REASONING,
     capabilities={
-        CAP_SESSION_SHARING: Level.UNAVAILABLE,
+        # SUPPORTED at the 2026-09-21 sync: upstream graduated codex onto
+        # AcpRuntime unconditionally and MEASURED the two halves this rests on --
+        # session/close evicts, and a load restores from the sessionId alone (see
+        # ACP_BACKENDS_SESSION_SHARING in agent_sdk/backends.py for what was
+        # measured where). The descriptor follows the membership set rather than
+        # restating it, so the two cannot disagree.
+        CAP_SESSION_SHARING: Level.SUPPORTED,
         # codex-acp advertises a dedicated `reasoning_effort` config option;
         # Kiro Crew applies it live through session/set_config_option.
         CAP_REASONING_EFFORT: Level.SUPPORTED,
@@ -509,8 +516,38 @@ _KAS = BackendDescriptor(
     },
 )
 
+_DEEPSEEK = BackendDescriptor(
+    id=ACP_BACKEND_DEEPSEEK,
+    label="DeepSeek Harness",
+    experimental=True,
+    dialect=Dialect.SPEC,
+    # Its own sandbox decides tool calls; ``session/request_permission`` carries only
+    # a model-initiated escalation, so no routing guarantee is established here.
+    routing=Routing.UNVERIFIED,
+    signin_command="dsh",
+    install_command="npm i -g @deepseek-ai/dsh",
+    registry_id="",
+    credential_leaves=(),
+    process_markers=("dsh",),
+    permission_config_id="",
+    permission_config_value="",
+    capabilities={
+        CAP_SESSION_SHARING: Level.UNAVAILABLE,
+        CAP_REASONING_EFFORT: Level.DEGRADED,
+        CAP_TOOL_SEARCH: Level.UNAVAILABLE,
+        CAP_AGENT_PROFILES: Level.DEGRADED,
+        CAP_SLASH_COMMANDS: Level.DEGRADED,
+        CAP_TURN_USAGE: Level.UNVERIFIED,
+        CAP_BILLING: Level.UNAVAILABLE,
+        CAP_NATIVE_RESUME: Level.SUPPORTED,
+        CAP_REGISTRY_MODEL_IDS: Level.UNAVAILABLE,
+        CAP_MID_TURN_STEER: Level.UNAVAILABLE,
+    },
+    effort_config_id=EFFORT_CONFIG_ID_REASONING,
+)
+
 _BY_ID: dict[str, BackendDescriptor] = {
-    d.id: d for d in (_KIRO, _CLAUDE, _CODEX, _COPILOT, _KAS, _GOOSE, _OPENCODE, _PI)
+    d.id: d for d in (_KIRO, _CLAUDE, _CODEX, _COPILOT, _KAS, _GOOSE, _OPENCODE, _PI, _DEEPSEEK)
 }
 
 

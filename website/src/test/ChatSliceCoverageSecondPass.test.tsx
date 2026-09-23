@@ -967,7 +967,7 @@ describe('chatSlice slot-detail refresh merges', () => {
 })
 
 describe('chatSlice background-slot reconcile', () => {
-  it('caps the background pane tool log when reasoning lands on a full log', () => {
+  it('a streamed chunk on a background pane leaves its full tool log untouched', () => {
     const store = makeStore()
     store.dispatch(setActiveSlot('front'))
     for (let i = 0; i < 100; i++) {
@@ -978,10 +978,12 @@ describe('chatSlice background-slot reconcile', () => {
     expect(chat(store).slotActivity.bg.toolLog).toHaveLength(100)
     store.dispatch(sseChatMessage({ slot: 'bg', role: 'chunk', content: 'thinking out loud' }))
     const log = chat(store).slotActivity.bg.toolLog
+    // Answer text goes to the pane's transcript only; the tool log holds
+    // tools, so no entry is added and none is evicted to make room.
     expect(log).toHaveLength(100)
-    expect(log[log.length - 1].type).toBe('reasoning')
-    // The oldest tool entry is the one that was evicted.
-    expect(log[0].text).toBe('t1')
+    expect(log.every(e => e.type === 'tool')).toBe(true)
+    expect(log[0].text).toBe('t0')
+    expect(chat(store).slotMessages.bg.at(-1)).toMatchObject({ role: 'streaming', content: 'thinking out loud' })
   })
 
   it('rejects a background pane\u2019s unanswered approvals when a new turn starts', () => {
@@ -1101,7 +1103,7 @@ describe('chatSlice active-slot frame branches', () => {
     store.dispatch(replaceMessages([
       msg({ role: 'permission', content: 'first ask', meta: { approval_id: 'ap-1', tool_call_id: 'tc-9' } }),
     ]))
-    store.dispatch(resolveByApprovalId({ id: 'ap-1', decision: 'rejected' }))
+    store.dispatch(resolveByApprovalId({ slot: 'A', id: 'ap-1', decision: 'rejected' }))
     // A re-broadcast of the same tool's permission must not reopen the bar.
     store.dispatch(sseChatMessage({
       slot: 'A', role: 'permission', content: 'second ask',
@@ -1258,22 +1260,22 @@ describe('chatSlice approval and permission reducers', () => {
     const store = makeStore()
     store.dispatch(setActiveSlot('A'))
     store.dispatch(sseToolActivity({
-      slot: 'A', tool: 'bash', kind: 'shell', purpose: '', input_preview: '', tool_call_id: 'tc-5',
+      slot: 'B', tool: 'bash', kind: 'shell', purpose: '', input_preview: '', tool_call_id: 'tc-5',
     }))
     store.dispatch(hydrateSlotMessages({
       slot: 'B',
       messages: [msg({ role: 'permission', content: 'run?', meta: { approval_id: 'ap-5', tool_call_id: 'tc-5' } })],
     }))
-    store.dispatch(resolveByApprovalId({ id: 'ap-5', decision: 'rejected' }))
+    store.dispatch(resolveByApprovalId({ id: 'ap-5', slot: 'B', decision: 'rejected' }))
     expect(chat(store).slotMessages.B[0].meta?.resolved).toBe('rejected')
-    expect(chat(store).toolLog[0].rejected).toBe(true)
+    expect(chat(store).slotActivity.B.toolLog[0].rejected).toBe(true)
   })
 
   it('defaults an unspecified decision to approved', () => {
     const store = makeStore()
     store.dispatch(setActiveSlot('A'))
     store.dispatch(replaceMessages([msg({ role: 'permission', content: 'run?', meta: { approval_id: 'ap-1' } })]))
-    store.dispatch(resolveByApprovalId({ id: 'ap-1' }))
+    store.dispatch(resolveByApprovalId({ slot: 'A', id: 'ap-1' }))
     expect(chat(store).messages[0].meta?.resolved).toBe('approved')
   })
 

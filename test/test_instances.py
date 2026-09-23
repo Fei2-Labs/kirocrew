@@ -1508,11 +1508,15 @@ def _ssh_effective_config(tmp_path, config_text: str, ssh_args: list[str], host:
     """
     cfg = tmp_path / "ssh_config"
     cfg.write_text(config_text.format(host=host, sock=str(tmp_path / "cm-%r@%h:%p")), "utf-8")
+    # ``cwd=tmp_path``: the real binary is the point of this probe (only ssh can
+    # answer its own precedence rules), so it stays real -- but it runs pinned to
+    # the test's own directory rather than inheriting the worker's checkout cwd.
     out = subprocess.run(
         ["ssh", "-G", "-F", str(cfg), *ssh_args, host],
         capture_output=True,
         text=True,
         timeout=_SSH_CONFIG_PROBE_TIMEOUT_SECS,
+        cwd=tmp_path,
     )
     assert out.returncode == 0, f"ssh -G failed: {out.stderr}"
     # Repeated keys are accumulated, not overwritten: ssh prints one
@@ -1618,6 +1622,7 @@ Host {host}
             capture_output=True,
             text=True,
             timeout=_SSH_CONFIG_PROBE_TIMEOUT_SECS,
+            cwd=tmp_path,
         )
         assert out.returncode == 0, f"production argv broke a working config: {out.stderr}"
         assert "bad configuration option" not in out.stderr.lower()
@@ -2001,17 +2006,39 @@ class TestSshTunnelManager:
 
 
 class _FakeReq:
-    def __init__(self, state, *, headers=None, match=None, body=None, query=None, user="owner"):
+    def __init__(
+        self,
+        state,
+        *,
+        headers=None,
+        match=None,
+        body=None,
+        query=None,
+        user="owner",
+        app_token="",
+    ):
         self.app = {"state": state}
         self.headers = headers or {}
         self.match_info = match or {}
         self.query = query or {}
         self._body = body
-        # Mirrors aiohttp Request mapping: require_auth sets request["user"].
-        self._attrs = {"user": user} if user is not None else {}
+        # Mirrors the aiohttp Request MAPPING, all three reads the owner predicate
+        # in ``_guard`` performs: ``.get("user")`` for the subject, ``"app" in``
+        # then ``["app"]`` for the app-token claim. A double that serves only
+        # ``.get`` raises on the ``in`` test. ``app_token`` stays "" for a browser
+        # session; a test wanting an app token passes it.
+        self._attrs = {"app": app_token}
+        if user is not None:
+            self._attrs["user"] = user
 
     def get(self, key, default=None):
         return self._attrs.get(key, default)
+
+    def __contains__(self, key):
+        return key in self._attrs
+
+    def __getitem__(self, key):
+        return self._attrs[key]
 
     async def json(self):
         if self._body is None:
@@ -2037,6 +2064,17 @@ def _fake_reconfigure(mgr, keep_intent=True):
 
 
 class _State:
+    """Dashboard-state stand-in for the instances handlers.
+
+    ``owner_id`` matches ``_FakeReq``'s default caller, because ``_guard`` demands
+    the positively-identified owner: the whole control plane mints peer dashboard
+    credentials with the owner's manager-held credential, so an authenticated
+    non-owner must not reach it. A test wanting that caller passes a different
+    ``user=``.
+    """
+
+    owner_id = "owner"
+
     def __init__(self, registry, manager=None):
         self.instances_registry = registry
         self.instances_manager = manager
@@ -2443,6 +2481,20 @@ class TestHandlers:
         b = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))
         assert len(b["instances"]) == 3
         assert b["warm_set_cap"] == 3
+
+    def test_automatic_cap_serves_ten_and_then_stops_growing(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        for index in range(11):
+            reg.add(name=f"crew-{index}", ssh_host=f"crew-{index}")
+        state = _State(reg, _ConnectedMgr([]))
+
+        body = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))
+
+        assert len(body["instances"]) == 11
+        assert body["warm_set_cap"] == 10
 
     def test_adding_a_crew_widens_the_served_cap(self, tmp_path, monkeypatch):
         """Otherwise every new crew has to be paired with a config edit.
@@ -3460,6 +3512,45 @@ class TestHandlers:
         assert r.status == 200 and _body(r)["name"] == "Renamed"
         assert mgr.disconnected == []
 
+    def test_rename_persists_in_instances_json_and_survives_reload(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        _enable(tmp_path, monkeypatch)
+        path = tmp_path / "instances.json"
+        reg = InstancesRegistry(path=path)
+        reg.add(name="Old name", ssh_host="crew-host", instance_id="crew-1")
+        state = _State(reg)
+
+        response = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "crew-1"}, body={"name": "New name"})
+            )
+        )
+
+        assert response.status == 200
+        assert _body(response)["name"] == "New name"
+        assert InstancesRegistry(path=path).get("crew-1").name == "New name"
+
+    def test_blank_rename_is_rejected_without_changing_the_stored_name(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        _enable(tmp_path, monkeypatch)
+        path = tmp_path / "instances.json"
+        reg = InstancesRegistry(path=path)
+        reg.add(name="Keep me", ssh_host="crew-host", instance_id="crew-1")
+
+        response = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(_State(reg), match={"id": "crew-1"}, body={"name": "   "})
+            )
+        )
+
+        assert response.status == 400
+        assert _body(response)["code"] == "instance_invalid"
+        assert InstancesRegistry(path=path).get("crew-1").name == "Keep me"
+
     def test_remove_success_and_404(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard import handlers_instances as handlers
 
@@ -4286,8 +4377,8 @@ class TestSelfHealRefreshRestart:
         inst = reg.get("cd-1")
         # _rebuild takes resolved transport params (not a bare ssh host) so the
         # same code path serves both the ssh and ssm transports.
-        ok = await mgr._rebuild(inst, mgr._resolve_transport(inst), 53999)
-        assert ok is True
+        ok = await mgr._rebuild(inst, mgr._resolve_transport(inst), 53999, expected_epoch=0)
+        assert ok is not None
         # The old tunnel's child must be stopped (port freed) before the replace,
         # else it orphans and holds the forward port -> respawn loop.
         assert old.status.state == TunnelState.STOPPED
@@ -4460,6 +4551,333 @@ class TestSelfHealRefreshRestart:
         assert await refresh is False, "a token for a superseded tunnel must not be stored"
         # The valid token of the CURRENT tunnel is untouched.
         assert mgr.get_token("cd-1") == good
+
+    def _tier2_rig(self, tmp_path):
+        """Manager whose tunnel starts can be failed on demand (drives tier 1
+        to fail so a recovery reaches tier 2) and whose mint can be parked on
+        an Event (only while armed; connect's own mints run through)."""
+        arm = asyncio.Event()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        fail_next = {"n": 0}
+        minted = {"n": 0}
+
+        def factory(*a, **k):
+            t = _ResilTunnel(*a, **k)
+            if fail_next["n"] > 0:
+                fail_next["n"] -= 1
+                t.start_result = False
+            return t
+
+        async def mint(
+            host,
+            *,
+            remote_bin="",
+            ttl="20h",
+            remote_port=None,
+            embed_parent_port=None,
+            timeout_secs=None,
+        ):
+            minted["n"] += 1
+            if arm.is_set():
+                arm.clear()
+                started.set()
+                await release.wait()
+                return "TOK-STALE"
+            return f"TOK-{minted['n']}"
+
+        reg, mgr = self._mgr(tmp_path, mint=mint, factory=factory)
+        return reg, mgr, arm, started, release, fail_next
+
+    @pytest.mark.asyncio
+    async def test_a_tier2_remint_for_a_replaced_tunnel_is_discarded(self, tmp_path):
+        """The self-heal tier-2 re-mint runs without the lock, so the operator
+        can disconnect + reconnect while it is in flight; membership is then
+        satisfied by the NEW generation and only the epoch stamp can refuse the
+        stale store. Without the stamp check the current tunnel's token, mint
+        timestamp and ttl would be overwritten by a mint it never requested,
+        and the stale rebuild would replace its live tunnel.
+        """
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr, arm, started, release, fail_next = self._tier2_rig(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+
+        # A tunnel dies; tier 1's rebuild fails; tier 2 parks inside its mint.
+        mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
+        fail_next["n"] = 1
+        arm.set()
+        recovery = asyncio.create_task(mgr._recover("cd-1"))
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        # The ordinary operator reaction: reconnect. connect() replaces the
+        # (ERROR) tunnel left by the failed tier-1 rebuild and bumps the epoch.
+        await mgr.connect("cd-1")
+        good = mgr.get_token("cd-1")
+        good_minted_at = mgr._token_minted_at["cd-1"]
+        good_ttl = mgr._token_ttl_secs["cd-1"]
+        good_tunnel = mgr._tunnels["cd-1"]
+        good_refresh = mgr._refresh_tasks["cd-1"]
+        good_epoch = mgr._tunnel_epoch["cd-1"]
+
+        release.set()
+        await asyncio.wait_for(recovery, timeout=5)
+        # The stale mint was refused whole: token, mint bookkeeping, the live
+        # tunnel (no stale rebuild) and the refresh schedule are all untouched.
+        assert mgr._tokens["cd-1"] == good != "TOK-STALE"
+        assert mgr._token_minted_at["cd-1"] == good_minted_at
+        assert mgr._token_ttl_secs["cd-1"] == good_ttl
+        assert mgr._tunnels["cd-1"] is good_tunnel
+        assert mgr._refresh_tasks["cd-1"] is good_refresh
+        assert mgr._tunnel_epoch["cd-1"] == good_epoch
+
+    @pytest.mark.asyncio
+    async def test_tier2_without_interleaving_still_stores_and_rebuilds(self, tmp_path):
+        """The guard must not be over-eager: an undisturbed tier 2 stores its
+        mint and rebuilds. This also pins the +1 in the store's compare — a
+        failed tier-1 rebuild installs (and bumps the stamp for) its
+        replacement before start() reports failure, so an undisturbed tier 2
+        always sees the Phase 1 stamp plus exactly one.
+        """
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr, _arm, _started, _release, fail_next = self._tier2_rig(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+        first_token = mgr.get_token("cd-1")
+
+        mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
+        fail_next["n"] = 1  # tier 1 fails, tier 2's own rebuild succeeds
+        await mgr._recover("cd-1")
+
+        assert mgr.status("cd-1").state == TunnelState.CONNECTED
+        assert mgr.get_token("cd-1") not in (None, first_token)  # re-mint stored
+        assert mgr._recover_attempts.get("cd-1", 0) == 0  # marked recovered
+
+    @pytest.mark.asyncio
+    async def test_a_disconnect_during_tier1_rebuild_is_not_overwritten(self, tmp_path):
+        """The rebuild's slow awaits run without the lock, so a user disconnect
+        can land inside its old.stop(). An unguarded rebuild would reinstall a
+        tunnel and record the recovery, persisting was_connected=True straight
+        over the disconnect's False — reviving, across restarts, an instance
+        the user turned off. The teardown's epoch bump makes the recovery's
+        expected generation stale, so the gated install refuses and the
+        recovery stands down.
+        """
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        arm = asyncio.Event()
+        parked = asyncio.Event()
+        release = asyncio.Event()
+
+        class _StopParkTunnel(_ResilTunnel):
+            async def stop(self):
+                if arm.is_set():
+                    arm.clear()
+                    parked.set()
+                    await release.wait()
+                await super().stop()
+
+        reg, mgr = self._mgr(tmp_path, factory=_StopParkTunnel)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+        assert reg.get("cd-1").was_connected is True
+
+        # A tunnel dies; tier 1's rebuild parks inside old.stop().
+        mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
+        arm.set()
+        recovery = asyncio.create_task(mgr._recover("cd-1"))
+        await asyncio.wait_for(parked.wait(), timeout=5)
+
+        # The user turns the instance off while the rebuild is parked.
+        assert await mgr.disconnect("cd-1") is True
+        assert reg.get("cd-1").was_connected is False
+
+        release.set()
+        await asyncio.wait_for(recovery, timeout=5)
+
+        # The recovery stood down: nothing tracked, nothing recorded.
+        assert "cd-1" not in mgr._tunnels
+        assert reg.get("cd-1").was_connected is False
+
+    @pytest.mark.asyncio
+    async def test_a_connect_during_tier1_rebuild_keeps_its_live_tunnel(self, tmp_path):
+        """A connect() landing inside tier 1's old.stop() installs a live
+        replacement. An ungated rebuild would overwrite that replacement
+        without stopping it — an orphaned child holding its port, untracked —
+        and the recovery's mismatch handling would then drop the instance
+        entirely. The install gate refuses instead: the recovery stands down
+        and connect's tunnel, token and record stay exactly as connect left
+        them.
+        """
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        arm = asyncio.Event()
+        parked = asyncio.Event()
+        release = asyncio.Event()
+
+        class _StopParkTunnel(_ResilTunnel):
+            async def stop(self):
+                if arm.is_set():
+                    arm.clear()
+                    parked.set()
+                    await release.wait()
+                await super().stop()
+
+        reg, mgr = self._mgr(tmp_path, factory=_StopParkTunnel)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+
+        # A tunnel dies; tier 1's rebuild parks inside old.stop().
+        mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
+        arm.set()
+        recovery = asyncio.create_task(mgr._recover("cd-1"))
+        await asyncio.wait_for(parked.wait(), timeout=5)
+
+        # The user reconnects while the rebuild is parked.
+        await mgr.connect("cd-1")
+        fresh_tunnel = mgr._tunnels["cd-1"]
+        fresh_token = mgr.get_token("cd-1")
+        fresh_epoch = mgr._tunnel_epoch["cd-1"]
+
+        release.set()
+        await asyncio.wait_for(recovery, timeout=5)
+
+        # connect's live tunnel was not overwritten, orphaned, or dropped.
+        assert mgr._tunnels["cd-1"] is fresh_tunnel
+        assert fresh_tunnel.status.state == TunnelState.CONNECTED
+        assert mgr.get_token("cd-1") == fresh_token
+        assert mgr._tunnel_epoch["cd-1"] == fresh_epoch
+        assert reg.get("cd-1").was_connected is True
+
+    @pytest.mark.asyncio
+    async def test_a_disconnect_during_the_rebuilt_tunnels_start_reaps_it(self, tmp_path):
+        """start() is an unlocked await with a window before the child spawns:
+        a disconnect landing there stops a tunnel that has no process yet (a
+        no-op) and untracks it, so the spawn would land afterwards with the
+        rebuild holding the only live handle. The post-start revalidation
+        reaps the rebuild's own tunnel and stands the recovery down instead of
+        leaving an untracked forwarder holding its port.
+        """
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        arm = asyncio.Event()
+        parked = asyncio.Event()
+        release = asyncio.Event()
+
+        class _StartParkTunnel(_ResilTunnel):
+            async def start(self):
+                if arm.is_set():
+                    arm.clear()
+                    parked.set()
+                    await release.wait()
+                return await super().start()
+
+        reg, mgr = self._mgr(tmp_path, factory=_StartParkTunnel)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+
+        # A tunnel dies; tier 1's rebuild installs its replacement and parks
+        # inside that replacement's start().
+        mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
+        arm.set()
+        recovery = asyncio.create_task(mgr._recover("cd-1"))
+        await asyncio.wait_for(parked.wait(), timeout=5)
+        rebuilt = mgr._tunnels["cd-1"]
+
+        # The user turns the instance off while the start is parked.
+        assert await mgr.disconnect("cd-1") is True
+
+        release.set()
+        await asyncio.wait_for(recovery, timeout=5)
+
+        # The rebuild reaped its own tunnel: nothing tracked, nothing running,
+        # and the disconnect's record stands.
+        assert "cd-1" not in mgr._tunnels
+        assert rebuilt.status.state == TunnelState.STOPPED
+        assert reg.get("cd-1").was_connected is False
+
+    @pytest.mark.asyncio
+    async def test_shutdown_ends_the_generation_so_a_surviving_recovery_reinstalls_nothing(
+        self, tmp_path
+    ):
+        """shutdown() cancels in-flight recoveries, but a cancellation landing
+        inside a tunnel stop can be swallowed there. Such a survivor must find
+        the generation stamp moved — shutdown bumps every tracked instance's
+        epoch before its stop awaits — so its gated install refuses and no
+        child is spawned after cleanup.
+        """
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        arm = asyncio.Event()
+        parked = asyncio.Event()
+        release = asyncio.Event()
+
+        class _StopParkTunnel(_ResilTunnel):
+            async def stop(self):
+                if arm.is_set():
+                    arm.clear()
+                    parked.set()
+                    # A swallowed cancellation: absorb it and keep going, the
+                    # way _SshTunnel.stop() suppresses CancelledError around
+                    # its child-task awaits.
+                    while True:
+                        try:
+                            await release.wait()
+                            break
+                        except asyncio.CancelledError:
+                            continue
+                await super().stop()
+
+        reg, mgr = self._mgr(tmp_path, factory=_StopParkTunnel)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+
+        # A tunnel dies; tier 1's rebuild parks inside old.stop(), tracked the
+        # way _on_tunnel_exit tracks it so shutdown's cancel reaches it.
+        mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
+        arm.set()
+        recovery = asyncio.create_task(mgr._recover("cd-1"))
+        mgr._track_recovery("cd-1", recovery)
+        await asyncio.wait_for(parked.wait(), timeout=5)
+
+        await mgr.shutdown()
+        release.set()
+        # The recovery survived its cancellation (swallowed in stop()) but its
+        # expected epoch is stale: the gated install refuses.
+        await asyncio.wait_for(asyncio.gather(recovery, return_exceptions=True), timeout=5)
+
+        assert "cd-1" not in mgr._tunnels
+
+    @pytest.mark.asyncio
+    async def test_a_recovery_surviving_a_disconnect_stores_and_rebuilds_nothing(self, tmp_path):
+        """Teardown deliberately does not drain a parked self-heal (see
+        _teardown_locked: the recovery's cancellation can be swallowed inside
+        _SshTunnel.stop(), so awaiting it under the lock could deadlock). This
+        pins the property that decision rests on: a recovery whose mint
+        returns after the disconnect stores no token and reinstalls no tunnel.
+        """
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr, arm, started, release, fail_next = self._tier2_rig(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+
+        mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
+        fail_next["n"] = 1
+        arm.set()
+        recovery = asyncio.create_task(mgr._recover("cd-1"))
+        mgr._track_recovery("cd-1", recovery)  # as _on_tunnel_exit would
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        assert await asyncio.wait_for(mgr.disconnect("cd-1"), timeout=5) is True
+        release.set()
+        await asyncio.wait_for(recovery, timeout=5)
+
+        assert "cd-1" not in mgr._tokens
+        assert "cd-1" not in mgr._tunnels
+        assert "cd-1" not in mgr._refresh_tasks
 
     @pytest.mark.asyncio
     async def test_a_refresh_refuses_to_start_while_the_instance_is_being_edited(self, tmp_path):
@@ -5255,6 +5673,7 @@ class TestSsmValidation:
             validate_ssm_target(bad)
 
     def test_profile_and_region(self):
+
         from kiro_crew.instances.validation import (
             SsmValidationError,
             validate_aws_profile,
@@ -5307,6 +5726,345 @@ class TestSsmValidation:
                 validate_ssm_run_as(bad)
 
 
+# An ECS task target is ``ecs:<cluster>_<taskId>_<runtimeId>``. Built from parts
+# here so each attack vector below differs from a VALID value in exactly one way.
+_ECS_TASK_ID = "0123456789abcdef0123456789abcdef"
+_ECS_RUNTIME_ID = f"{_ECS_TASK_ID}-1234567890"
+_ECS_OK = f"ecs:mycluster_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}"
+
+
+class TestEcsTargetValidation:
+    """The Fargate lane's ECS task target, at the same guard as the EC2 id.
+
+    The ECS shape has to be widened into ``validate_ssm_target`` for a Fargate
+    crew to be reachable at all, and that validator is a shell-injection and
+    argv-smuggling boundary. So the accept set is pinned narrowly and the reject
+    set is pinned vector by vector: a future widening that loosens the charset
+    fails these tests rather than quietly enlarging the boundary.
+    """
+
+    @pytest.mark.parametrize(
+        "good",
+        [
+            _ECS_OK,
+            f"ecs:my_cluster_with_underscores_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}",
+            f"ecs:A-b_9_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}",
+            # AWS bounds a cluster name at 255 chars; that is the longest value
+            # the pattern accepts, at 336 bytes total.
+            f"ecs:{'c' * 255}_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}",
+        ],
+    )
+    def test_accepts_well_formed_ecs_targets(self, good):
+        from kiro_crew.instances.validation import validate_ssm_target
+
+        assert validate_ssm_target(good) == good
+
+    def test_strips_then_validates_and_returns_the_stripped_value(self):
+        """Surrounding whitespace is removed, and the STRIPPED value is returned.
+
+        Load-bearing ordering: the raw value fails the anchored pattern while its
+        stripped form passes, so returning the caller's original instead of the
+        stripped one would hand back the newline the pattern just refused.
+        """
+        from kiro_crew.instances.validation import validate_ssm_target
+
+        assert validate_ssm_target(f"  {_ECS_OK}\n") == _ECS_OK
+
+    def test_ec2_ids_still_accepted_after_widening(self):
+        """Widening for Fargate must not disturb the EC2/SSM-managed lane."""
+        from kiro_crew.instances.validation import validate_ssm_target
+
+        assert validate_ssm_target("i-0123456789abcdef0") == "i-0123456789abcdef0"
+        assert validate_ssm_target("mi-0123456789abcdef0") == "mi-0123456789abcdef0"
+        assert validate_ssm_target("i-abcdef12") == "i-abcdef12"
+
+    def test_ecs_target_rejects_unicode_digits(self):
+        """``[0-9]`` not ``\\d`` for the runtime suffix.
+
+        Python's ``\\d`` matches any Unicode decimal digit, so a ``\\d{1,20}``
+        suffix ACCEPTS Arabic-Indic digits. This exact vector was accepted by the
+        first proposed pattern and is the reason the shipped one spells the class
+        out. Pinned as its own named test so a future edit back to ``\\d`` fails
+        here with an explanation rather than in a security review.
+        """
+        from kiro_crew.instances.validation import SsmValidationError, validate_ssm_target
+
+        vector = f"ecs:c_{_ECS_TASK_ID}_{_ECS_TASK_ID}-\u0661234567890"
+        with pytest.raises(SsmValidationError):
+            validate_ssm_target(vector)
+
+    def test_ecs_target_rejects_trailing_newline_via_z_anchor(self):
+        """``\\Z`` not ``$``: ``$`` also matches just before a trailing newline."""
+        from kiro_crew.instances.validation import (
+            _ECS_TARGET_RE,
+            SsmValidationError,
+            validate_ssm_target,
+        )
+
+        # A trailing newline cannot reach validate_ssm_target (it strips first),
+        # so the anchor property is asserted on the pattern itself.
+        assert _ECS_TARGET_RE.match(f"{_ECS_OK}\n") is None
+        with pytest.raises(SsmValidationError):
+            validate_ssm_target(f"{_ECS_OK}\nwhoami")
+
+    def test_rejects_values_over_the_length_bound(self):
+        from kiro_crew.instances.validation import (
+            _MAX_SSM_TARGET_LEN,
+            SsmValidationError,
+            validate_ssm_target,
+        )
+
+        longest = f"ecs:{'c' * 255}_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}"
+        assert len(longest) <= _MAX_SSM_TARGET_LEN
+        with pytest.raises(SsmValidationError):
+            validate_ssm_target(f"ecs:{'c' * 256}_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}")
+
+    @pytest.mark.parametrize("suffix_digits", [1, 10, 11, 20])
+    def test_the_length_bound_never_rejects_what_the_pattern_accepts(self, suffix_digits):
+        """The bound must be derived from the pattern, not stated beside it.
+
+        It was stated, as 336, computed from a 10-digit runtime suffix while the
+        pattern accepts 20 -- so every legal target with an 11-to-20 digit suffix
+        was refused by the length check before the pattern could accept it. Failing
+        closed made that a false reject rather than a hole, but the check silently
+        overrode the shape it was supposed to be guarding.
+
+        Parametrised across the suffix lengths that straddle the old boundary, so a
+        future hardcoded number fails here instead of quietly shrinking the accept
+        set.
+        """
+        from kiro_crew.instances.validation import (
+            _ECS_TARGET_RE,
+            ssm_target_matches,
+            validate_ssm_target,
+        )
+
+        target = f"ecs:{'c' * 255}_{_ECS_TASK_ID}_{_ECS_TASK_ID}-{'9' * suffix_digits}"
+        # The pattern accepts it, so every layer above the pattern must too.
+        assert _ECS_TARGET_RE.match(target), "fixture no longer matches the pattern"
+        assert ssm_target_matches(target), f"length bound false-rejects {len(target)} chars"
+        assert validate_ssm_target(target) == target
+
+    def test_the_bound_is_the_longest_value_the_pattern_accepts(self):
+        """Derivation check: the constant equals the longest legal target's length."""
+        from kiro_crew.instances.validation import (
+            _ECS_TARGET_RE,
+            _MAX_SSM_TARGET_LEN,
+            ssm_target_matches,
+        )
+
+        longest = f"ecs:{'c' * 255}_{'0' * 32}_{'0' * 32}-{'9' * 20}"
+        assert _ECS_TARGET_RE.match(longest)
+        assert ssm_target_matches(longest)
+        assert len(longest) == _MAX_SSM_TARGET_LEN == 346
+        # One character more than the longest legal value is refused.
+        assert not ssm_target_matches(longest + "9")
+
+    def test_does_not_unicode_normalise_the_target(self):
+        """A fullwidth cluster char must stay rejected, NOT be folded to ASCII.
+
+        NFKC-normalising first would fold fullwidth ``ｃ`` to ``c`` and turn a
+        rejected value into an accepted one, so the validator deliberately does
+        no normalisation. Asserted because "normalise before validating" is a
+        plausible-sounding change that would silently open the charset.
+        """
+        from kiro_crew.instances.validation import SsmValidationError, validate_ssm_target
+
+        fullwidth = f"ecs:\uff43luster_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}"
+        with pytest.raises(SsmValidationError):
+            validate_ssm_target(fullwidth)
+        # Proof the rejection is the raw form, not the folded one: NFKC of this
+        # value IS an otherwise-valid target, so a normalising validator passes it.
+        import unicodedata
+
+        assert validate_ssm_target(unicodedata.normalize("NFKC", fullwidth))
+
+    @pytest.mark.parametrize(
+        "vector",
+        [
+            pytest.param(f"{_ECS_OK}\nwhoami", id="embedded-newline"),
+            pytest.param(f"ecs:c_$(id)_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="dollar-paren"),
+            pytest.param(f"ecs:c_`id`_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="backtick"),
+            pytest.param(f"{_ECS_OK};id", id="semicolon"),
+            pytest.param(f"{_ECS_OK}|id", id="pipe"),
+            pytest.param(f"{_ECS_OK}&", id="ampersand"),
+            pytest.param(f"ecs:c'_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="single-quote"),
+            pytest.param(f'ecs:c"_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}', id="double-quote"),
+            pytest.param(
+                f"ecs:-oProxyCommand_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="leading-dash-cluster"
+            ),
+            pytest.param(f"{_ECS_OK} --region us-east-1", id="argv-smuggle-region"),
+            pytest.param(f"{_ECS_OK} --profile admin", id="argv-smuggle-profile"),
+            pytest.param(
+                f"ecs:{'c' * 256}_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="overlong-cluster"
+            ),
+            pytest.param(f"ecs:c_{_ECS_TASK_ID}_{_ECS_TASK_ID}-{'9' * 21}", id="overlong-runtime"),
+            pytest.param(f"ecs\uff1ac_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="fullwidth-colon"),
+            pytest.param(f"ecs:\u0441_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="cyrillic-es"),
+            pytest.param(
+                f"ecs:c_{_ECS_TASK_ID}_{_ECS_TASK_ID}-\u0661234567890", id="unicode-digit"
+            ),
+            pytest.param(f"{_ECS_OK}\x00", id="nul-byte"),
+            pytest.param(f"ecs:c\t_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="tab"),
+            pytest.param(
+                f"ecs:c_{_ECS_TASK_ID.upper()}_{_ECS_RUNTIME_ID}", id="uppercase-hex-task-id"
+            ),
+            pytest.param(f"ecs:c_{_ECS_TASK_ID[:31]}_{_ECS_RUNTIME_ID}", id="task-id-31-hex"),
+            pytest.param(f"ecs:c_{_ECS_TASK_ID}0_{_ECS_RUNTIME_ID}", id="task-id-33-hex"),
+            pytest.param(f"ecs:c_{_ECS_TASK_ID}_{_ECS_TASK_ID}", id="no-runtime-suffix"),
+            pytest.param(f"ecs:../../c_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="path-traversal"),
+            pytest.param(f"-{_ECS_OK}", id="leading-dash-whole-arg"),
+            pytest.param(f"ecs:_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="empty-cluster"),
+            pytest.param(f"ec2:c_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="wrong-scheme"),
+            pytest.param(f"ecs:c*_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}", id="glob-in-cluster"),
+        ],
+    )
+    def test_rejects_injection_and_malformed_ecs_targets(self, vector):
+        """Every vector differs from a valid target in exactly one way.
+
+        A naive widening -- ``^ecs:.+_.+_.+$`` -- accepts most of these, including
+        command substitution, argv smuggling and a NUL byte (pinned vector by
+        vector in :meth:`test_naive_widening_accepts_the_dangerous_classes`).
+        That is what this corpus exists to prevent, so do not relax the pattern to
+        make a new case pass: add the case and keep the pattern anchored.
+
+        Vectors differing from a valid target ONLY by surrounding whitespace are
+        deliberately absent here -- the validator strips before matching and
+        returns the stripped value, so it accepts them by design. The anchor that
+        makes that safe is asserted in
+        :meth:`test_pattern_rejects_surrounding_whitespace` instead.
+        """
+        from kiro_crew.instances.validation import SsmValidationError, validate_ssm_target
+
+        with pytest.raises(SsmValidationError):
+            validate_ssm_target(vector)
+
+    @pytest.mark.parametrize(
+        "whitespace_variant",
+        [f"{_ECS_OK}\n", f"{_ECS_OK}\r", f"{_ECS_OK} ", f"  {_ECS_OK}", f"\t{_ECS_OK}\n"],
+    )
+    def test_pattern_rejects_surrounding_whitespace(self, whitespace_variant):
+        """The PATTERN refuses whitespace; the validator strips it first.
+
+        Both halves matter and they are different claims. ``validate_ssm_target``
+        accepts these because it strips and then returns the stripped value, which
+        is safe. The pattern must still refuse them, because that anchoring is
+        what makes the strip sufficient -- under a ``$`` anchor a trailing newline
+        would match, and any caller reaching the pattern without the validator's
+        strip would pass a newline through.
+        """
+        from kiro_crew.instances.validation import ssm_target_matches, validate_ssm_target
+
+        assert not ssm_target_matches(whitespace_variant)
+        assert validate_ssm_target(whitespace_variant) == _ECS_OK
+
+    def test_naive_widening_accepts_the_dangerous_classes(self):
+        """What a loose widening would let through, pinned by class not by count.
+
+        Measured against THIS corpus, the naive pattern accepts 24 of its 27
+        vectors. The count is incidental -- it moves whenever a vector is added --
+        so the assertions that carry the meaning are the per-class ones below:
+        each is a value the naive pattern accepts and the shipped one refuses.
+        """
+        import re
+
+        from kiro_crew.instances.validation import ssm_target_matches
+
+        naive = re.compile(r"^ecs:.+_.+_.+$")
+        dangerous = {
+            "command substitution": f"ecs:c_$(id)_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}",
+            "backtick substitution": f"ecs:c_`id`_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}",
+            "argv smuggling": f"{_ECS_OK} --profile admin",
+            "option injection": f"ecs:-oProxyCommand_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}",
+            "NUL byte": f"{_ECS_OK}\x00",
+            "trailing newline": f"{_ECS_OK}\n",
+            "path traversal": f"ecs:../../c_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}",
+            "glob": f"ecs:c*_{_ECS_TASK_ID}_{_ECS_RUNTIME_ID}",
+            "unicode digit suffix": f"ecs:c_{_ECS_TASK_ID}_{_ECS_TASK_ID}-\u0661234567890",
+        }
+        for label, vector in dangerous.items():
+            assert naive.match(vector), f"corpus stale: naive no longer accepts {label}"
+            assert not ssm_target_matches(vector), f"shipped pattern accepts {label}"
+
+
+class TestSsmTargetShapeHasOneDefinition:
+    """The target charset is a security boundary and must exist ONCE.
+
+    Two copies of one charset is a charset that drifts: widening the authoritative
+    validator while a second copy in ``registry.py`` still refuses the value
+    produces a lane that validates and then rejects its own accepted input. So the
+    charset is spelled in ``validation.py`` alone and imported.
+    """
+
+    def test_registry_does_not_redefine_the_target_pattern(self):
+        """Source-level ratchet: assert the duplicated CHARSET is absent.
+
+        This asserted the identifier -- ``"_SSM_TARGET_RE = re.compile" not in
+        source`` -- and that was a ratchet that could not fail. Measured against
+        four realistic ways of reintroducing the duplication, it caught only one:
+        restoring the exact deleted line. A renamed constant, the same line without
+        spaces around ``=``, and an inline ``re.compile`` with no constant at all
+        each sailed through while putting the second copy of the charset back. A
+        check that passes for three of four evasions is worse than none, because it
+        manufactures confidence.
+
+        So it asserts the CHARSETS instead. Those are what the seam protects, and
+        unlike an identifier they cannot be renamed around: any re-spelling of
+        either shape has to contain them to match the same values.
+        """
+        from pathlib import Path
+
+        from kiro_crew.instances import registry
+
+        source = Path(registry.__file__).read_text(encoding="utf-8")
+        # The EC2/SSM-managed shape's hex class, and the ECS shape's cluster bound.
+        assert "a-f0-9" not in source, "registry re-spells the EC2 target charset"
+        assert "{0,254}" not in source, "registry re-spells the ECS cluster bound"
+        assert "^ecs:" not in source, "registry re-spells the ECS target shape"
+        # It imports the shared decision instead of restating any shape.
+        assert "ssm_target_matches" in source
+
+    def test_registry_and_validator_agree_on_every_shape(self):
+        from kiro_crew.instances.validation import (
+            SsmValidationError,
+            ssm_target_matches,
+            validate_ssm_target,
+        )
+
+        for value in (_ECS_OK, "i-0123456789abcdef0", "mi-0123456789abcdef0", "i-abcdef12"):
+            assert ssm_target_matches(value)
+            assert validate_ssm_target(value) == value
+        # Rejected by BOTH. Deliberately not a whitespace-only variant: the
+        # validator strips first, so those two layers legitimately disagree there
+        # (see TestEcsTargetValidation.test_pattern_rejects_surrounding_whitespace).
+        for value in (f"{_ECS_OK} --profile admin", "x-0123456789abcdef0", f"{_ECS_OK}\nwhoami"):
+            assert not ssm_target_matches(value)
+            with pytest.raises(SsmValidationError):
+                validate_ssm_target(value)
+
+    def test_registry_accepts_an_ecs_target_for_a_fargate_record(self, tmp_path):
+        """End of the seam: a record carrying an ECS target must persist."""
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        inst = reg.add(name="Fargate crew", connection_method="fargate", ssm_target=_ECS_OK)
+        assert inst.ssm_target == _ECS_OK
+        # Round-trips through disk rather than only passing the in-memory check.
+        reloaded = InstancesRegistry(path=tmp_path / "instances.json").get(inst.id)
+        assert reloaded is not None and reloaded.ssm_target == _ECS_OK
+
+    def test_registry_still_refuses_a_malformed_target(self, tmp_path):
+        from kiro_crew.instances.registry import InstancesRegistry, InvalidInstanceError
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        with pytest.raises(InvalidInstanceError):
+            reg.add(
+                name="Bad crew",
+                connection_method="ssm",
+                ssm_target=f"{_ECS_OK} --profile admin",
+            )
+
+
 class TestSsmRegistry:
     """Registry support for connection_method + the SSM coordinate fields."""
 
@@ -5351,6 +6109,7 @@ class TestSsmRegistry:
             aws_profile="dev",
             aws_region="eu-west-2",
             remote_port=7777,
+            provisioner_id="aws_ec2",
         )
         assert inst.connection_method == "ssm"
         assert inst.ssm_target == "i-0123456789abcdef0"
@@ -5359,6 +6118,7 @@ class TestSsmRegistry:
         reloaded = self._reg(tmp_path).get(inst.id)
         assert reloaded.connection_method == "ssm"
         assert reloaded.ssm_target == "i-0123456789abcdef0"
+        assert reloaded.provisioner_id == "aws_ec2"
 
     def test_ssm_requires_target_and_ssh_requires_host(self, tmp_path):
         from kiro_crew.instances.registry import InvalidInstanceError
@@ -5546,6 +6306,12 @@ class TestSsmTunnelArgv:
             return FakeProc()
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        # stop() on the SSM transport reaps the child's whole process group by
+        # pid. FakeProc.pid is a made-up number, so the real signal would land
+        # on whatever unrelated process holds that pid on the host (on CI, an
+        # xdist worker). Keep the signal out of the OS; the fake's terminate()
+        # is the fallback path and settles returncode.
+        monkeypatch.setattr(stm._SshTunnel, "_signal_group", staticmethod(lambda pid, sig: False))
 
         async def main():
             t = _SshTunnel(
@@ -6030,6 +6796,104 @@ class TestSsmTransportSelection:
         await mgr.shutdown()
 
 
+class TestSsmMintOutputRedaction:
+    """The SSM mint's error tail must be no weaker than the SSH mint's.
+
+    Both transports raise ``TokenMintError`` from a partially-successful mint --
+    the remote printed its success URL and then exited non-zero -- so both build
+    an error message out of a stream that can be holding a live token. The SSH
+    transport routes that through ``_redacted_output_tail``, which adds a
+    ``?token=`` URL-param pass and a token-shape pass on top of the generic
+    ``redact()``. A second, weaker copy of that helper on the SSM side leaks the
+    shapes those two extra passes exist to catch, which is what these tests pin.
+    """
+
+    # SYNTHETIC, never a real token: the two-segment `payload.signature` shape
+    # `dashboard/token_auth.generate_token` mints (one dot), with a deliberately
+    # short payload and signature so it clears neither of the bounds
+    # `security`'s own two-segment link-token pattern keys on. A real token is
+    # already redacted by that pattern; this value stands in for the shapes that
+    # are not -- a remote of a different Kiro Crew vintage, or a truncated write.
+    _SYNTHETIC_TOKEN = "eyJzdWIiOiJzeW50aGV0aWMiLCJleHAiOjF9.c3ludGhldGljLXNpZ25hdHVyZQ"
+
+    # SYNTHETIC opaque bearer value: no `eyJ` prefix and no dot, so no token-SHAPE
+    # pattern can recognise it. Only the ``?token=`` URL-param pass catches this,
+    # which is what makes it a separate vector rather than a restatement.
+    _OPAQUE_TOKEN = "9f3c1ab77d2e4f508c6b1e0a4d7c2f91b5e8a03c"
+
+    # The vectors are named because they fail for DIFFERENT reasons, which the
+    # mutation matrix confirms: dropping the token-shape pass kills the first two,
+    # dropping the ``?token=`` URL-param pass kills only the third. An `eyJ`-shaped
+    # value in a URL is caught by the shape pass on its own, so without an opaque
+    # third vector the URL-param pass would be untested here.
+    _VECTORS = (
+        ("bare_two_segment_token", "{token}", _SYNTHETIC_TOKEN),
+        (
+            "two_segment_token_in_success_url",
+            "http://localhost:5476?token={token}",
+            _SYNTHETIC_TOKEN,
+        ),
+        ("opaque_token_in_success_url", "http://localhost:5476?token={token}", _OPAQUE_TOKEN),
+    )
+
+    @staticmethod
+    def _patch_failing_mint(monkeypatch, stdout: str):
+        """Make the send-command chokepoint report a partially-successful mint."""
+        from kiro_crew.cloud import ssm as cloud_ssm
+
+        def fake_run_command(target, command, profile, region, **kwargs):
+            return cloud_ssm.CommandResult(status="Failed", stdout=stdout, stderr="", exit_code=1)
+
+        monkeypatch.setattr(cloud_ssm, "run_command", fake_run_command)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("vector_name, stdout_template, secret", _VECTORS)
+    async def test_failed_ssm_mint_never_carries_a_token_into_its_error(
+        self, monkeypatch, vector_name, stdout_template, secret
+    ):
+        """A partially-successful SSM mint must not put a token in its exception.
+
+        The raised message travels straight into the operator's log, so the
+        assertion is on the real boundary (the exception text), not on the helper
+        in isolation.
+        """
+        from kiro_crew.instances import ssm_token_mint as sm
+
+        stdout = f"starting mint\n{stdout_template.format(token=secret)}\n"
+        self._patch_failing_mint(monkeypatch, stdout)
+
+        with pytest.raises(sm.TokenMintError) as excinfo:
+            await sm.mint_remote_token_ssm("i-0123456789abcdef0", ttl="20h")
+
+        message = str(excinfo.value)
+        assert (
+            secret not in message
+        ), f"{vector_name}: token reached the raised TokenMintError message"
+        # The tail must still carry a reason -- a fix that redacts everything
+        # would pass the leak assertion while destroying the error's usefulness.
+        assert "starting mint" in message
+
+    @pytest.mark.parametrize("vector_name, stdout_template, secret", _VECTORS)
+    def test_ssm_tail_is_no_weaker_than_the_ssh_tail(self, vector_name, stdout_template, secret):
+        """Pin the INVARIANT, not just today's three vectors.
+
+        ``ssm_token_mint``'s tail helper claims to mirror ``token_mint``'s
+        intent. Asserting the mirror directly means the day the SSH side learns a
+        new token shape, the SSM side cannot silently stay behind: this fails
+        instead of a leak going unnoticed.
+        """
+        from kiro_crew.instances import ssm_token_mint as sm
+        from kiro_crew.instances import token_mint as tm
+
+        text = f"starting mint\n{stdout_template.format(token=secret)}\n"
+        assert secret not in tm._redacted_output_tail(
+            text
+        ), f"{vector_name}: the SSH-side reference itself leaked -- fix that first"
+        assert secret not in sm._redacted_tail(
+            text
+        ), f"{vector_name}: SSM tail is weaker than the SSH tail it mirrors"
+
+
 class TestSsmDiagnostics:
     """The SSM diagnosis ladder reports the first broken link, SSM-worded."""
 
@@ -6256,7 +7120,7 @@ class TestForwarderPidHints:
         assert reg.get("cd-1").forwarder_pid == 54321
         assert reg.get("cd-1").forwarder_start == ""
         mgr._tunnels["cd-1"].pid = os.getpid()  # the rebuilt child's pid
-        await mgr._mark_recovered("cd-1")
+        await mgr._mark_recovered("cd-1", mgr._tunnels["cd-1"], mgr._tunnel_epoch["cd-1"])
         inst = reg.get("cd-1")
         assert inst.forwarder_pid == os.getpid()
         assert inst.forwarder_start == (pc.process_start_time(os.getpid()) or "")
@@ -6302,7 +7166,7 @@ class TestForwarderPidHints:
         # The replacement child bound a different loopback port.
         rebuilt = assigned + 1
         mgr._tunnels["cd-1"].status.local_port = rebuilt
-        await mgr._mark_recovered("cd-1")
+        await mgr._mark_recovered("cd-1", mgr._tunnels["cd-1"], mgr._tunnel_epoch["cd-1"])
 
         inst = reg.get("cd-1")
         assert inst.local_port == rebuilt
@@ -6355,7 +7219,7 @@ class TestForwarderPidHints:
         monkeypatch.setattr(reg, "update", recording_update)
 
         await mgr.connect("cd-1")
-        await mgr._mark_recovered("cd-1")
+        await mgr._mark_recovered("cd-1", mgr._tunnels["cd-1"], mgr._tunnel_epoch["cd-1"])
 
         identity_writes = [w for w in writes if "forwarder_sig" in w]
         assert len(identity_writes) == 2, writes
@@ -7622,3 +8486,23 @@ class TestProxyHandlerPolicy:
         assert _body(await api_instances_proxy(req))["code"] == "proxy_method_not_allowed"
         req = self._req(tmp_path, monkeypatch, path="api/chat/slots", manager=None)
         assert _body(await api_instances_proxy(req))["code"] == "instances_manager_unavailable"
+
+
+# ── _slugify hash fallback ─────────────────────────────────────────
+
+
+class TestSlugifyHashFallback:
+    def test_non_ascii_names_derive_distinct_stable_ids(self) -> None:
+        from kiro_crew.instances.registry import _ID_RE, _slugify
+
+        chinese = _slugify("\u5f00\u53d1\u673a")
+        arabic = _slugify("\u062e\u0627\u062f\u0645 \u0627\u0644\u062a\u0637\u0648\u064a\u0631")
+        assert chinese.startswith("instance-")
+        assert chinese != arabic
+        assert chinese == _slugify("\u5f00\u53d1\u673a")
+        assert _ID_RE.match(chinese)
+
+    def test_ascii_names_are_unchanged(self) -> None:
+        from kiro_crew.instances.registry import _slugify
+
+        assert _slugify("Dev Box 2") == "dev-box-2"

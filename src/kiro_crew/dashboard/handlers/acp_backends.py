@@ -33,6 +33,7 @@ from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
@@ -123,6 +124,12 @@ def _probe_installed(
             from kiro_crew.acp import pi
 
             return "installed" if pi.resolve_argv_cached() else "missing"
+        if backend == ACP_BACKEND_COPILOT:
+            # Fork-only harness, resolved by the SAME function the spawn calls; it has
+            # no cached variant because the spawn resolves it per session.
+            from kiro_crew.acp.client import _resolve_copilot_bin
+
+            return "installed" if _resolve_copilot_bin() else "missing"
     except Exception:
         logger.debug("Install probe failed for %s", backend, exc_info=True)
         return "unknown"

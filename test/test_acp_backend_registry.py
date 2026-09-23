@@ -147,9 +147,14 @@ def test_session_sharing_matches_the_advertised_set_not_the_runtime_arm() -> Non
         assert backends.supports(backend, CAP_SESSION_SHARING) is (
             backend in ACP_BACKENDS_SESSION_SHARING
         ), backend
-    # Both spec adapters run one process per session on the legacy client path.
+    # claude runs one process per session on the legacy client path, so it never
+    # shares. codex USED to be the second half of this pair and no longer is:
+    # upstream graduated it onto AcpRuntime and measured both halves sharing
+    # rests on (session/close evicts, a load restores from the sessionId alone).
+    # The loop above is the authority either way -- this line only names the
+    # harness whose answer is a property of its PROCESS MODEL rather than of a
+    # membership decision.
     assert not backends.supports(ACP_BACKEND_CLAUDE, CAP_SESSION_SHARING)
-    assert not backends.supports(ACP_BACKEND_CODEX, CAP_SESSION_SHARING)
 
 
 def test_kas_distinguishes_measured_absence_from_unverified_inheritance() -> None:
@@ -1054,11 +1059,6 @@ class TestCachedRegistryAdapters:
         assert descriptor.id == "codex"
         assert descriptor.routing is Routing.SESSION_CONFIG
         assert "codex-acp" not in selectable_ids()
-        # goose is the known-but-withheld id on this build (codex ships selectable).
-
-    from kiro_crew.acp.backends import selectable_ids
-
-    assert "goose" not in selectable_ids()
 
     def test_hand_written_pi_is_not_a_second_unverified_path(self, monkeypatch) -> None:
         """``pi-acp`` is the registry spelling of the hand-written ``pi`` backend."""
@@ -1083,8 +1083,17 @@ class TestCachedRegistryAdapters:
         descriptor = descriptor_for(adapter.id)
         assert descriptor.id == ACP_BACKEND_PI
         assert descriptor.routing is Routing.PERMISSION_REQUEST
+        # What this test is FOR: the registry spelling must not become a second,
+        # UNVERIFIED path to a backend Crew already gates -- so `pi-acp` is never
+        # selectable in its own right.
         assert "pi-acp" not in selectable_ids()
-        assert ACP_BACKEND_PI not in selectable_ids()
+        # `pi` ITSELF is now selectable, and that is upstream's decision, not
+        # drift: it gained an install probe (`backend_install._probe_pi`), which
+        # is the condition NOT_SHIPPED_SELECTABLE's own comment names -- an id is
+        # withheld only where its readiness verdict would be UNKNOWN with nothing
+        # an operator could act on. Upstream's BASELINE_SELECTABLE_BACKENDS
+        # carries pi and goose; the fork's only addition there is copilot.
+        assert ACP_BACKEND_PI in selectable_ids()
 
 
 def test_canonical_backend_id_maps_registry_ids() -> None:

@@ -68,12 +68,19 @@ interface LexicalComposerInputProps {
   blocks: PasteBlock[]
   onChange: (value: string) => void
   onBlocksChange?: (blocks: PasteBlock[]) => void
+  /** Leave a long paste as full editable text instead of collapsing it into a
+   *  paste-token chip. Defaults false; Cmd/Ctrl+Shift+V is the per-paste
+   *  equivalent when it is off. */
+  showFullPastes?: boolean
   onSend: () => void
   ariaLabel: string
   placeholder: string
   disabled?: boolean
   readOnly?: boolean
   sendOnEnter?: SendMode
+  /** Draw the browser's red spellcheck underlines under the input. Default true
+   *  (Chromium's own default); the Settings composer toggle drives it off. */
+  spellCheck?: boolean
   className?: string
   controlRef?: React.MutableRefObject<ComposerControl | null>
   editorRef?: React.RefCallback<LexicalEditor> | React.RefObject<LexicalEditor | null | undefined>
@@ -296,7 +303,8 @@ function InteractionPlugin({
   disabled,
   readOnly,
   sendOnEnter,
-}: Pick<LexicalComposerInputProps, 'blocks' | 'onBlocksChange' | 'onChange' | 'onSend' | 'onUploadFiles' | 'sentMessages' | 'disabled' | 'readOnly' | 'sendOnEnter'>) {
+  showFullPastes,
+}: Pick<LexicalComposerInputProps, 'blocks' | 'onBlocksChange' | 'onChange' | 'onSend' | 'onUploadFiles' | 'sentMessages' | 'disabled' | 'readOnly' | 'sendOnEnter' | 'showFullPastes'>) {
   const [editor] = useLexicalComposerContext()
   const blocksRef = useRef(blocks)
   const rawPasteRef = useRef(false)
@@ -366,7 +374,7 @@ function InteractionPlugin({
         const selection = $getSelection()
         if (!$isRangeSelection(selection)) return false
         event.preventDefault()
-        if (onBlocksChange && !forceRaw && shouldCollapse(cleaned)) {
+        if (onBlocksChange && !forceRaw && !showFullPastes && shouldCollapse(cleaned)) {
           const block: PasteBlock = {
             id: makePasteId(),
             seq: nextSeq(blocksRef.current),
@@ -528,7 +536,7 @@ function InteractionPlugin({
       // timer cannot write to the latch after teardown (useImeGuard contract).
       latch.reset()
     }
-  }, [disabled, editor, onBlocksChange, onChange, onSend, onUploadFiles, readOnly, sendOnEnter, sentMessages])
+  }, [disabled, editor, onBlocksChange, onChange, onSend, onUploadFiles, readOnly, sendOnEnter, sentMessages, showFullPastes])
 
   return null
 }
@@ -538,12 +546,14 @@ export default function LexicalComposerInput({
   blocks,
   onChange,
   onBlocksChange,
+  showFullPastes = false,
   onSend,
   ariaLabel,
   placeholder,
   disabled = false,
   readOnly = false,
   sendOnEnter = 'enter',
+  spellCheck = true,
   className = '',
   controlRef,
   editorRef,
@@ -581,9 +591,10 @@ export default function LexicalComposerInput({
             <ContentEditable
               aria-label={ariaLabel}
               aria-multiline="true"
+              spellCheck={spellCheck}
               data-composer-input=""
               data-lexical-composer=""
-              className={`relative w-full min-h-[44px] max-h-[50vh] overflow-y-auto border-none bg-transparent text-text outline-none whitespace-pre-wrap break-words ${INPUT_TYPO}`}
+              className={`relative w-full min-h-[44px] max-h-[50vh] overflow-y-auto border-none bg-transparent text-text outline-hidden whitespace-pre-wrap break-words ${INPUT_TYPO}`}
             />
           }
           placeholder={
@@ -606,6 +617,7 @@ export default function LexicalComposerInput({
         <InteractionPlugin
           blocks={blocks}
           onBlocksChange={onBlocksChange}
+          showFullPastes={showFullPastes}
           onChange={onChange}
           onSend={onSend}
           onUploadFiles={onUploadFiles}

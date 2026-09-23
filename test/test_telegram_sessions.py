@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from chat_test_helpers import _make_state
-from test_telegram import FakeClient, FakeCtx, FakeProvider
+from test_telegram import FakeClient, FakeCtx, FakeProvider, _origin
 
 from kiro_crew.history import ConversationLog, transcript_stem
 from kiro_crew.messaging import auto_title
@@ -749,26 +749,44 @@ class TestTelegramSessionPicker:
 
         route_id = dispatcher._session_resume.expectation_id(7, None)
         held: list[str] = []
+        choose_started = asyncio.Event()
+        release_choose = asyncio.Event()
+        message_attempted = asyncio.Event()
         real_choose = dispatcher._session_resume.choose
 
         async def _slow_choose(*args: Any, **kwargs: Any) -> None:
             held.append("choose-start")
-            await asyncio.sleep(0.05)
+            choose_started.set()
+            await asyncio.wait_for(release_choose.wait(), 5)
             await real_choose(*args, **kwargs)
             held.append("choose-end")
 
         dispatcher._session_resume.choose = _slow_choose  # type: ignore[method-assign]
 
         async def _message_after_press() -> None:
-            await asyncio.sleep(0.01)
+            await asyncio.wait_for(choose_started.wait(), 5)
             held.append("message")
+            message_attempted.set()
             async with dispatcher._routing_turn(route_id):
                 held.append("message-routed")
 
-        await asyncio.gather(
-            dispatcher.on_callback(_callback(data, message_id=message_id)),
-            _message_after_press(),
-        )
+        press = asyncio.create_task(dispatcher.on_callback(_callback(data, message_id=message_id)))
+        message = asyncio.create_task(_message_after_press())
+        try:
+            await asyncio.wait_for(message_attempted.wait(), 5)
+            # The message runs from set() through lock acquisition before this
+            # waiter resumes: both deciders must overlap while choose is held.
+            assert "message-routed" not in held, held
+            assert len(dispatcher._routing_locks[route_id][1]) == 2
+        finally:
+            release_choose.set()
+            try:
+                await asyncio.wait_for(asyncio.gather(press, message), 5)
+            finally:
+                for task in (press, message):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(press, message, return_exceptions=True)
 
         assert held.index("choose-end") < held.index(
             "message-routed"
@@ -1117,12 +1135,12 @@ class TestTelegramInboundResumeRouting:
     ) -> None:
         dispatcher, _, sessions, _ = _dispatcher(tmp_path)
         native_key = dispatcher._session_key(("direct", "7"))
-        sessions.queued.append(("1", "queued text", {}))
+        sessions.queued.append(("1", "queued text", _origin()))
         dispatcher._session_resume.route = AsyncMock(
             return_value=RoutingDecision(resumed_key="dashboard:chat-1")
         )
 
-        await dispatcher._drain_queue(native_key, 7, 7)
+        await dispatcher._drain_queue(native_key)
 
         dispatcher._session_resume.route.assert_not_awaited()
         assert sessions.last_key == native_key

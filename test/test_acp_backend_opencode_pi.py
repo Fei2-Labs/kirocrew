@@ -43,13 +43,32 @@ class TestOpenCodeAndPiAreAdaptedOnly:
         assert backend not in ACP_BACKENDS_KIRO_CREDITS
 
 
-def test_pi_is_known_but_withheld_from_the_initial_preview() -> None:
-    """Withheld by being NAMED, not by omission: ``backend_install.py`` has no
-    install probe for pi, so its readiness verdict is ``UNKNOWN`` with nothing an
-    operator could act on."""
+def test_pi_is_known_and_now_admitted_because_its_probe_landed() -> None:
+    """REPOINTED at the 2026-09-21 sync, because the withholding reason is gone.
+
+    This test used to pin pi in ``NOT_SHIPPED_SELECTABLE``, and the reason it gave
+    was specific and checkable: ``backend_install.py`` had no install probe for
+    pi, so its readiness verdict was ``UNKNOWN`` with nothing an operator could
+    act on. Upstream then ADDED that probe -- ``backend_install._probe_pi``, wired
+    into the probe table under ``ACP_BACKEND_PI`` -- and promoted pi into
+    ``BASELINE_SELECTABLE_BACKENDS`` on exactly that basis.
+
+    So the old assertion is not a weaker version of this one, it is the opposite
+    claim resting on a premise that no longer holds. Re-pinning the withholding
+    would demand an ``UNKNOWN`` readiness verdict for a backend that can now
+    answer one. What still has to be true is the part that was never about pi's
+    install story: pi is KNOWN, and its admission is a NAMED decision rather than
+    an accident of omission, which is what the probe assertion below holds down.
+    """
     assert ACP_BACKEND_PI in ACP_BACKENDS_KNOWN
-    assert ACP_BACKEND_PI in NOT_SHIPPED_SELECTABLE
-    assert ACP_BACKEND_PI not in selectable_backends()
+    assert ACP_BACKEND_PI not in NOT_SHIPPED_SELECTABLE
+    assert ACP_BACKEND_PI in selectable_backends()
+    # The premise of the promotion, asserted rather than assumed: if the probe is
+    # ever dropped again, this fails here instead of surfacing as an UNKNOWN
+    # readiness verdict in the dashboard.
+    from kiro_crew.agent_sdk.backend_install import _PROBES
+
+    assert ACP_BACKEND_PI in _PROBES
 
 
 def test_opencode_is_known_and_admitted() -> None:

@@ -5,6 +5,15 @@ Parsing happens once, at import of `load()`, and the result is frozen: a process
 that disagrees with another about a path or a port is the failure mode this
 module exists to prevent.
 
+`SMC_` is a historical prefix. It stands for an earlier project name and says
+nothing about what this deployment is: a task belongs to the owner who launched
+it, one principal reaches it, and there is no sharing surface, no second caller
+and no guest. `SMC_SINGLE_PRINCIPAL` below is what the container refuses to boot
+without, and it is the opposite of a sharing switch -- it is the deployment
+vouching that only one principal can reach the task. Renaming the prefix would
+touch the image, the task definition and every test that constructs an
+environment, so the names stay and this paragraph is the correction.
+
 Two values are deliberately NOT configurable.
 
 `BACKEND_HOST` is fixed at 127.0.0.1. The Kiro Crew backend must never be
@@ -23,15 +32,17 @@ from pathlib import Path
 # Not configurable. See the module docstring.
 BACKEND_HOST = "127.0.0.1"
 
-# The header the owner's control plane sends to reach a control route, and the
-# one the API Gateway integration injects on every request so a client cannot
-# forge it.
+# The header a control-route request must carry. What keeps a
+# customer off those routes is the VALUE, not the header: the front compares it against
+# `SMC_CONTROL_SECRET` in constant time and refuses when no secret is configured, so a
+# caller who sends this header without holding the secret is denied like any other.
+# Nothing strips or rewrites the header on the way in.
 #
-# Pinned here rather than in the front process because three places have to
-# agree on the exact string: the front process that checks it, the CloudFormation
-# integration that injects it, and the control plane that sends it. Two of those
-# are not Python, so a constant private to the front process is a name three
-# systems copy by hand.
+# Pinned here rather than in the front process because the string will have more
+# than one consumer. The front process that checks it is the only one in this tree
+# today; the sender and the deploy template that supplies the secret both belong to
+# the deploy track. That track is not Python, so a constant private to the front
+# process would be a name another system copies by hand.
 CONTROL_SECRET_HEADER = "X-SMC-Control-Secret"
 
 
@@ -227,12 +238,12 @@ def load() -> Settings:
         # `data_home()` resolve to the same directory, so `session_map.json` and
         # `open_slots.json` sit at the home root.
         #
-        # This default was wrong once, and the way it failed is worth keeping in
-        # view: with `data_home/config` the sidecar backs up every transcript and
-        # NEITHER of those two files, so the backup looks healthy and the restore
-        # has no resume and no conversation list. It stays overridable only so a
-        # test can construct the wrong case on purpose; the supervisor refuses to
-        # start when the two disagree.
+        # What the wrong value costs is worth keeping in view. `session_map.json`
+        # and `open_slots.json` are what turn a slot id back into a conversation,
+        # so a `config_dir` pointing somewhere the rest of the task does not read
+        # leaves the transcripts findable and the resume and the conversation list
+        # not. It stays overridable only so a test can construct the wrong case on
+        # purpose; the supervisor refuses to start when the two disagree.
         config_dir=_path("SMC_CONFIG_DIR", str(data_home)),
         crew_name=os.environ.get("SMC_CREW_NAME") or "",
         backup_bucket=os.environ.get("SMC_BACKUP_BUCKET") or None,

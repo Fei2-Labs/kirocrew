@@ -191,6 +191,9 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     # store itself accepts. The cap is owned in kiro_crew/ui_prefs.py beside the
     # limits it has to cover, so the two cannot drift apart again.
     "handlers/ui_prefs.py::api_ui_prefs": ("MAX_REQUEST_BYTES", _BOUNDED_EXPLICIT),
+    # Installed exact-read keys allow 32,768 characters. Escaped astral characters
+    # need 12 JSON bytes each; 512 KiB covers those keys plus the control envelope.
+    "handlers/prompts.py::api_skills": ("512 * 1024", _BOUNDED_EXPLICIT),
     # agents.py tranche.
     "handlers/agents.py::api_agent_config": ("None", _UNBOUNDED_USER_CONTENT),
     "handlers/agents.py::api_default_agent": ("None", _CONTROL_FIELDS_CAP_PENDING),
@@ -280,6 +283,14 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     "chat_tags.py::api_chat_tag_column_update": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_tags.py::api_chat_tag_columns_reorder": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_tags.py::api_chat_slot_drop": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    # chat_folders.py: the reorder endpoint carries a bounded list of folder
+    # ids and integer orders, capped at the folder ceiling, so it takes a
+    # per-route byte ceiling sized from that entry budget rather than the
+    # shared default (a max-size flat-tree reorder exceeds 64 KB).
+    "chat_folders.py::api_chat_folder_reorder": (
+        "_MAX_REORDER_BODY_BYTES",
+        _BOUNDED_EXPLICIT,
+    ),
     # ---- tranche 3 ----
     # chat_handlers.py: control-field slot mutations take the cap; the sites
     # that carry a chat message, queued-edit text, follow-up prompts, or
@@ -361,6 +372,8 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     "handlers/files.py::api_workspaces_create": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/files.py::api_workspaces_update": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/files.py::api_file_write": ("None", _UNBOUNDED_USER_CONTENT),
+    # a root path and a query the handler caps at 200 characters
+    "handlers/files.py::api_file_grep": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/files.py::api_dashboard_config": ("<default>", _BOUNDED_CONTROL_FIELDS),
 }
 

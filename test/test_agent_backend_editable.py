@@ -17,8 +17,14 @@ import pytest
 
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
+    ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
 )
 from kiro_crew.agent_sdk import backends as acp_backends
 from kiro_crew.config.loader import KiroCrewConfig
@@ -27,16 +33,20 @@ from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
 
 FIELD = "agent.acp_backend"
 
-#: The narrowing this file expects the module to record, spelled out here so a
-#: change to ``acp_backends.NOT_SHIPPED_SELECTABLE`` goes red rather than being
-#: absorbed by a derived assertion. Each member's reason lives next to the module
-#: constant: ``backend_install.py`` carries no install probe for it.
-EXPECTED_NOT_SHIPPED_SELECTABLE = frozenset(
-    {
-        acp_backends.ACP_BACKEND_GOOSE,
-        acp_backends.ACP_BACKEND_PI,
-    }
-)
+#: Known ids the public baseline deliberately does not offer, each entry carrying its
+#: reason in ``test_baseline_ships_every_known_backend``. Empty was the state until the
+#: first exception; an entry is a reasoned exclusion rather than a defect, and it earns
+#: its place by naming what the id fails. ``deepseek`` is the one member today.
+#:
+#: deepseek passes the install-probe half of the selectability bar and fails the
+#: ROUTING half. Its sandbox decides its own tool calls -- an in-policy action runs
+#: silently and an out-of-policy one is denied with the denial in the tool result --
+#: and ``session/request_permission`` carries only a model-initiated request to
+#: escalate past that sandbox, refused outright when the model omits its
+#: justification. Four live captures across its confined and read-only postures raised
+#: no permission request at all. So Crew's PreToolUse gate would not run for what a
+#: session actually does, and the switch would be offering a harness Crew cannot gate.
+NOT_SHIPPED_SELECTABLE: frozenset = frozenset({ACP_BACKEND_DEEPSEEK})
 
 
 @pytest.fixture
@@ -100,8 +110,15 @@ def test_a_registered_backend_reaches_the_allowlist(restore_registry):
 
 
 def test_registering_an_unknown_backend_is_refused(restore_registry):
-    """A dashboard option that cannot start a session is worse than an absent one."""
-    with pytest.raises(ValueError):
+    """A dashboard option that cannot start a session is worse than an absent one.
+
+    Matched on the UNKNOWN-id message rather than on ``ValueError`` alone, because
+    ``register_selectable_backend`` refuses for two independent reasons now -- an id
+    outside ``ACP_BACKENDS_KNOWN``, and a known id whose routing is ``UNVERIFIED``. An
+    unknown id resolves to ``UNVERIFIED`` too (``routing_for`` fails closed), so a bare
+    exception assertion here would pass even with the guard this test NAMES deleted.
+    """
+    with pytest.raises(ValueError, match="unknown ACP backend"):
         acp_backends.register_selectable_backend("byo-harness")
     assert "byo-harness" not in acp_backends.selectable_backends()
 
@@ -144,20 +161,22 @@ def test_the_field_declares_no_static_enum():
     assert meta.get("enum") is None
 
 
-def test_baseline_ships_the_reviewed_backends_only():
-    """The build's capability, stated once so a widening OR a narrowing is deliberate.
+def test_baseline_ships_every_known_backend():
+    """The public build's capability, stated once so a NARROWING is deliberate.
 
-    ``ACP_BACKEND_CLAUDE`` is a member: ``acp/client.py`` owns the whole Claude
-    spawn path, the adapter is a public npm package, and ``backend_install.py``
-    probes for it, so the exclusion removed only the switch. Adopted from upstream
-    at the 2026-09-04 sync.
+    Claude Code is not excluded here: ``acp/client.py`` owns the
+    whole Claude spawn path and the adapter is a public npm package, so excluding it
+    would remove only the switch. If a backend is ever taken back out, the
+    reason belongs next to that removal — a build that cannot run a harness is a
+    different claim from a machine that has not installed it, and the install probe
+    already answers the second one.
 
-    FORK DIVERGENCE: the fork ships ``ACP_BACKEND_COPILOT`` and
-    ``ACP_BACKEND_OPENCODE`` in addition to upstream's set — the fork's core spawns
-    ``copilot --acp`` / ``opencode acp`` directly and both have been driven end to
-    end. Same rationale, and the same membership, as ``test_harness_parity.py``'s
-    ``test_initial_adapter_selection_is_limited_to_reviewed_backends`` and
-    ``test_acp_backend_opencode_pi.py``'s ``test_opencode_is_known_and_admitted``.
+    ``NOT_SHIPPED_SELECTABLE`` is where that reason goes. It is an explicit list
+    rather than a relaxed assertion so a plain ``baseline != known`` still fails:
+    an id may sit outside the baseline only by being named there, with the reason
+    in the comment on that set. Every id NOT named there is offered, so a switch
+    that renders always has an install probe behind it to explain a session that
+    failed to start.
     """
     baseline: List[str] = sorted(acp_backends.BASELINE_SELECTABLE_BACKENDS)
     assert baseline == sorted(
@@ -165,15 +184,11 @@ def test_baseline_ships_the_reviewed_backends_only():
             ACP_BACKEND_KIRO,
             ACP_BACKEND_CLAUDE,
             ACP_BACKEND_KAS,
-            acp_backends.ACP_BACKEND_CODEX,
-            acp_backends.ACP_BACKEND_COPILOT,
-            acp_backends.ACP_BACKEND_OPENCODE,
+            ACP_BACKEND_CODEX,
+            ACP_BACKEND_OPENCODE,
+            ACP_BACKEND_PI,
+            ACP_BACKEND_GOOSE,
+            ACP_BACKEND_COPILOT,
         ]
     )
-    # The structural half: an id may sit outside the baseline only by being NAMED
-    # in ``NOT_SHIPPED_SELECTABLE``, so a plain ``baseline != known`` — a silently
-    # dropped adapter — still fails rather than relaxing.
-    assert baseline == sorted(acp_backends.ACP_BACKENDS_KNOWN - acp_backends.NOT_SHIPPED_SELECTABLE)
-    # And the narrowing itself is pinned, so widening the exclusion list is not a
-    # way to make the assertion above pass again.
-    assert acp_backends.NOT_SHIPPED_SELECTABLE == EXPECTED_NOT_SHIPPED_SELECTABLE
+    assert baseline == sorted(acp_backends.ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE)

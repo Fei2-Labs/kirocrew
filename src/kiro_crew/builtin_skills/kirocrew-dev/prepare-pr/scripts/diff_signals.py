@@ -20,14 +20,16 @@ With ``--check-body`` it also reads the PR body the skill writes --
   The body path is fixed, not an argument: the script reads exactly one file,
   inside git's own directory, so there is nothing to point at anything else.
   Unknown arguments are an error (exit 2).
-* **Length (soft).** The prose of ``## What changed`` -- fenced blocks, table rows
-  and image lines excluded -- is counted against ``SOFT_WORDS``, the length the
-  contract's "three short paragraphs at most" come to. Over it prints a WARN and
-  still exits 0: a wide cross-cutting change legitimately needs the words, so the
-  limit is a nudge, never a gate.
+* **Length (hard).** The prose of ``## What changed`` -- fenced blocks, table rows
+  and image lines excluded -- is counted against ``WORD_LIMIT``, the length the
+  contract's "three short paragraphs at most" come to. Over it is exit 21. The
+  accounting check already guarantees nothing is hidden, so a cap cannot cut a
+  true fact -- only a restated one: the body says what changed for the reader
+  and why; the diff is the evidence. Both checks run and print before either
+  exit; when both breach, 20 wins.
 
 Usage:  python3 diff_signals.py [base-branch] [--check-body]
-Exit:   0 printed / body accounts for every area | 20 unaccounted area(s) | 2 environment error
+Exit:   0 printed / body passes | 20 unaccounted area(s) | 21 What changed too long | 2 environment error
 """
 
 import argparse
@@ -50,9 +52,10 @@ SIGNALS = [
     (r"(Dockerfile|\.tf$|\.ya?ml$|\.toml$|\.ini$|(^|/)config)", "config/infra file changed"),
 ]
 
-# Three short paragraphs of ~100 words. SKILL.md's PR description contract states
-# the same number next to its paragraph rule; a test keeps the two equal.
-SOFT_WORDS = 300
+# Three short paragraphs at most, with room for a cross-cutting change; what it
+# stops is the 800-word per-file recital. SKILL.md's PR description contract
+# states the same number next to its paragraph rule; a test keeps the two equal.
+WORD_LIMIT = 500
 
 # git prints every path with forward slashes, on every OS. These helpers split
 # and join git's own output, never filesystem paths, so the separator is git's.
@@ -198,8 +201,8 @@ def body_path(gitdir):
     return os.path.join(gitdir, BODY_FILENAME)
 
 
-def check_body(body, name_status, soft_words=SOFT_WORDS):
-    """Run both checks; print findings; return the exit code (0 or 20)."""
+def check_body(body, name_status, word_limit=WORD_LIMIT):
+    """Run both checks; print findings; return the exit code (0, 20 or 21)."""
     print()
     print("=== Body check ===")
     missing = unaccounted_areas(changed_paths(name_status), body)
@@ -208,17 +211,19 @@ def check_body(body, name_status, soft_words=SOFT_WORDS):
         for f in files:
             print("    " + f)
     prose = what_changed_prose(body)
+    too_long = False
     if prose is None:
         print("WARN: no '## What changed' section found - length check skipped")
     else:
         n = word_count(prose)
-        if n > soft_words:
+        if n > word_limit:
+            too_long = True
             print(
-                "WARN: What changed is {} words of prose (soft limit {}) - "
-                "compress, or split the PR; not a gate".format(n, soft_words)
+                "TOO LONG: What changed is {} words of prose (limit {}) - compress: say what "
+                "changed for the reader and why; the diff is the evidence".format(n, word_limit)
             )
         else:
-            print("What changed: {} words of prose (soft limit {})".format(n, soft_words))
+            print("What changed: {} words of prose (limit {})".format(n, word_limit))
     if missing:
         print(
             "{} unaccounted area(s): name the change in the body, or drop it from the diff".format(
@@ -227,6 +232,8 @@ def check_body(body, name_status, soft_words=SOFT_WORDS):
         )
         return 20
     print("every changed area is named in the body")
+    if too_long:
+        return 21
     return 0
 
 

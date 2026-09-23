@@ -35,6 +35,7 @@ const { identityFamily } = require("./instance-guard");
 const { initNativeLogging } = require("./native-logging");
 const { armCrashCollector, collectCrashReports } = require("./crash-collector");
 const { initGpuPolicy } = require("./disable-gpu");
+const { initGpuCrashFallback } = require("./gpu-crash-fallback");
 const { cancelPendingTrayHide } = require("./hide-to-tray");
 const { exitImmersiveModes } = require("./blocking-prompt");
 const { createMetricsRecorder } = require("./perf-metrics");
@@ -82,7 +83,7 @@ const releaseEarlyBootGuard = installEarlyBootGuard({
 // destination. Construction writes defaults, after which the seed could no
 // longer distinguish a first launch from an existing store.
 seedRenamedStore(app.getPath("userData"), {
-  log: (message) => console.log("store migration: " + message),
+  log: (message) => glog("store migration: " + message),
 });
 
 const store = new Store({
@@ -99,6 +100,9 @@ const store = new Store({
     autoDownloadUpdates: true,
     runLocalGateway: true,
     linuxFrameless: null,
+    // Written by gpu-crash-fallback.js when the GPU process dies at startup;
+    // read before Chromium initializes on the next launch.
+    gpuSoftwareFallback: null,
   },
 });
 
@@ -135,7 +139,7 @@ function resolvePort() {
     }
     const remotePort = remoteHostPort(store);
     if (remotePort) {
-      console.log(
+      glog(
         "Local gateway is off; targeting the configured remote crew on port " + remotePort,
       );
       return remotePort;
@@ -145,7 +149,7 @@ function resolvePort() {
   }
 
   if (configuredPort) return configuredPort;
-  console.debug("No usable dashboard.url port in the data home, falling back to 5476");
+  glog("No usable dashboard.url port in the data home, falling back to 5476");
   return 5476;
 }
 
@@ -153,7 +157,7 @@ const PORT = resolvePort();
 const BACKEND_URL = "http://localhost:" + PORT;
 
 if (migrateRemoteHostConfig(store, PORT)) {
-  console.log("Migrated legacy remoteHost to remoteHosts[" + PORT + "]");
+  glog("Migrated legacy remoteHost to remoteHosts[" + PORT + "]");
 }
 
 app.name = identityFamily(app.getVersion()) === "nightly"
@@ -188,10 +192,23 @@ function glog(line) {
   const entry = "[" + new Date().toISOString() + "] " + line + "\n";
   try {
     fs.appendFileSync(gatewayLogPath(), entry);
-  } catch {
-    // Never let logging break launch or recovery.
+  } catch (error) {
+    // Preserve the diagnostic when the file sink itself is unavailable.
+    console.error(
+      "[gateway-launch] " + line + " (log write failed: "
+        + (error && error.message ? error.message : error) + ")",
+    );
   }
-  console.log("[gateway-launch] " + line);
+}
+
+function gwarn(line) {
+  glog(line);
+  console.warn("[gateway-launch] " + line);
+}
+
+function gerror(line) {
+  glog(line);
+  console.error("[gateway-launch] " + line);
 }
 
 function readInternalSecret() {
@@ -321,6 +338,20 @@ if (!app.requestSingleInstanceLock()) {
     log: glog,
   });
 
+  // Same timing constraint as the opt-in above: a persisted software-rendering
+  // decision has to reach Chromium before it initializes. Also arms the
+  // `child-process-gone` listener that makes that decision, so a GPU process
+  // that dies before the dashboard loads relaunches the app once in software
+  // mode instead of letting Chromium abort it with no window and no log.
+  initGpuCrashFallback({
+    app,
+    store,
+    backendUrl: BACKEND_URL,
+    isQuitting: () => isQuitting,
+    requestQuit,
+    log: glog,
+  });
+
   app.on("second-instance", () => {
     // Relaunch is explicit intent to see the existing window. The window owner
     // cancels a pending fullscreen/tray hide before restore/show/focus.
@@ -347,6 +378,8 @@ const gateway = createGatewaySupervisor({
   cancelPendingTrayHide,
   exitImmersiveModes,
   log: glog,
+  warn: gwarn,
+  error: gerror,
   logPath: gatewayLogPath,
 });
 
@@ -477,14 +510,14 @@ async function fetchMochiGatewayAuth(backendUrl = BACKEND_URL) {
 // bounded renderer/gateway recovery paths can still run.
 process.on("uncaughtException", (error) => {
   try {
-    glog("uncaughtException: " + (error && error.stack ? error.stack : error));
+    gerror("uncaughtException: " + (error && error.stack ? error.stack : error));
   } catch {
     // Logging must never throw from the safety net.
   }
 });
 process.on("unhandledRejection", (reason) => {
   try {
-    glog("unhandledRejection: " + (reason && reason.stack ? reason.stack : reason));
+    gerror("unhandledRejection: " + (reason && reason.stack ? reason.stack : reason));
   } catch {
     // Same last-resort rule as uncaughtException.
   }

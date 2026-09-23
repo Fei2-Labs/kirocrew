@@ -162,10 +162,15 @@ def test_bulk_cooldown_is_shared_but_does_not_delay_interactive_calls(backend, m
     bulk = emb._InferJob(object(), ["background"])
     interactive = emb._InferJob(object(), ["explicit query"])
     jobs.put((emb.PRIORITY_BULK, 1, bulk))
-    backend._bulk_ready_at = time.monotonic() + 30
+    cooldown = 30.0
+    backend._bulk_ready_at = time.monotonic() + cooldown
 
     def wake_with_query(delay):
-        assert 0 < delay <= 30
+        # The worker sleeps for what is LEFT of the cooldown. Where the clock
+        # ticks coarsely (Windows: 15.625 ms) the two ``monotonic()`` reads are
+        # often the same instant, and ``(t + 30) - t`` then rounds to a hair over
+        # 30 -- so the bound is the cooldown to within float noise, not exactly.
+        assert 0 < delay <= cooldown + 1e-6
         jobs.put((emb.PRIORITY_INTERACTIVE, 2, interactive))
 
     monkeypatch.setattr(backend._jobs_changed, "wait", wake_with_query)
@@ -215,3 +220,48 @@ async def test_cancelled_memory_work_keeps_its_slot_until_the_thread_finishes(mo
                 assert await asyncio.wait_for(second, 5) == "static prompt"
             await asyncio.gather(first, return_exceptions=True)
         assert len(submitted) == 2
+
+
+def test_full_pending_queue_enforces_interactive_reserve(backend, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    condition = threading.Condition()
+
+    def infer(texts):
+        if texts == ["running"]:
+            entered.set()
+            assert release.wait(10)
+        return {"data": [{"embedding": [1.0]} for _ in texts]}
+
+    backend._llm = SimpleNamespace(create_embedding=infer)
+    original = backend._jobs.put
+
+    def put(item):
+        original(item)
+        with condition:
+            condition.notify_all()
+
+    monkeypatch.setattr(backend._jobs, "put", put)
+    bound = emb._MAX_PENDING_EMBEDS
+    reserve = emb._INTERACTIVE_QUEUE_RESERVE
+    with ThreadPoolExecutor(max_workers=bound + 1) as pool:
+        running = pool.submit(backend.embed, "running")
+        jobs = []
+        try:
+            assert entered.wait(5)
+            jobs = [pool.submit(backend.embed, f"normal {i}") for i in range(bound - reserve)]
+            with condition:
+                assert condition.wait_for(lambda: backend._jobs.qsize() == bound - reserve, 5)
+            assert backend.embed("normal overflow") is None
+            jobs += [
+                pool.submit(backend.embed, f"interactive {i}", priority=emb.PRIORITY_INTERACTIVE)
+                for i in range(reserve)
+            ]
+            with condition:
+                assert condition.wait_for(lambda: backend._jobs.qsize() == bound, 5)
+            assert backend.embed("interactive overflow", priority=emb.PRIORITY_INTERACTIVE) is None
+            assert not running.done()
+            assert backend._jobs.qsize() == bound
+        finally:
+            release.set()
+        assert running.result(timeout=5) == [1.0]
+        assert all(job.result(timeout=5) == [1.0] for job in jobs)

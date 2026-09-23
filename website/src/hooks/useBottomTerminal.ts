@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react'
-import { safeSetItem } from '../utils/safeStorage'
+import { safeGetItem, safeRemoveItem, safeSetItem } from '../utils/safeStorage'
 import { secureRandomId } from '../utils/secureId'
 
 /* ── App-wide bottom terminal panel ───────────────────────────────────────
@@ -12,14 +12,29 @@ import { secureRandomId } from '../utils/secureId'
  * State is MODULE-LEVEL + localStorage-persisted (mirroring usePanelTabs and
  * terminalRegistry) rather than redux, so the panel survives route changes and
  * full reloads; on reload each persisted tab reconnects to its still-live PTY
- * (backend orphan-reaper window), the same way activity-bar terminal tabs do.
- * Tab session ids are persisted; the running shell is not. */
+ * (backend orphan-reaper window), the same way activity-bar terminal tabs do —
+ * once the backend has confirmed which of those PTYs still exist (see the
+ * hydrate-time reconciliation below). Tab session ids are persisted; the
+ * running shell is not. */
 
 export interface TermTab {
   /** PTY session id — one live shell per tab. */
   id: string
   /** Working directory the shell spawned in (undefined = server default). */
   cwd?: string
+  /** User label; absent means follow the shell's live title. */
+  name?: string
+}
+
+export const MAX_TERMINAL_NAME_LENGTH = 120
+
+/** Cap labels and editing drafts by Unicode code points, preserving surrogate pairs. */
+export function capTerminalName(name: string): string {
+  return Array.from(name).slice(0, MAX_TERMINAL_NAME_LENGTH).join('')
+}
+
+function normalizeTabName(name: unknown): string | undefined {
+  return typeof name === 'string' ? capTerminalName(name.trim()) || undefined : undefined
 }
 
 /** Where the terminal panel is docked — like VS Code's Panel position. */
@@ -40,6 +55,79 @@ interface BottomTerminalState {
 }
 
 const STORAGE_KEY = 'mc-bottom-terminal'
+const NAME_KEY_PREFIX = 'mc-terminal-name:'
+/** Dropped writes stay local until a successful rename, a foreign label event,
+ *  or removal. Keep the fallback separate so layout writes cannot persist them. */
+const volatileNames = new Map<string, { name?: string; fallback?: string }>()
+
+function withLiveName(tab: TermTab): TermTab {
+  const local = volatileNames.get(tab.id)
+  return local ? (tab.name === local.name ? tab : { ...tab, name: local.name }) : withStoredName(tab)
+}
+
+/** Independent coordinates keep a rename from writing a stale tab list, and
+ *  simultaneous renames of different tabs from replacing each other's labels.
+ *  An empty string is an explicit reset, overriding names in layout backups. */
+function withStoredName(tab: TermTab): TermTab {
+  const stored = safeGetItem(NAME_KEY_PREFIX + tab.id)
+  const name = normalizeTabName(stored === null ? tab.name : stored)
+  return name === tab.name ? tab : { ...tab, name }
+}
+
+function withLiveNames(tabs: TermTab[]): TermTab[] {
+  const merged = tabs.map(withLiveName)
+  return merged.every((tab, i) => tab === tabs[i]) ? tabs : merged
+}
+
+/** Read membership afresh before label cleanup; malformed/unreadable storage
+ *  cannot authorize deleting labels. No module-local list drives cleanup. */
+function persistedIds(): Set<string> | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw === null) return new Set()
+    const p: unknown = JSON.parse(raw)
+    if (!p || typeof p !== 'object' || Array.isArray(p)) return null
+    const layout = p as { tabs?: unknown; splits?: unknown }
+    const tabs = Array.isArray(layout.tabs) ? layout.tabs
+      : Array.isArray(layout.splits) ? layout.splits
+        : layout.tabs === undefined && layout.splits === undefined ? [] : null
+    if (!tabs || tabs.some(t => !t || typeof t.id !== 'string')) return null
+    return new Set(tabs.map(t => t.id as string))
+  } catch { return null }
+}
+
+function cleanRemovedNames(ids: Iterable<string>): void {
+  for (const id of ids) {
+    const live = persistedIds()
+    if (live && !live.has(id)) safeRemoveItem(NAME_KEY_PREFIX + id)
+  }
+}
+
+/** Reclaim residue from an interrupted remove/rename, only for absent ids. */
+function cleanOrphanNames(): void {
+  try {
+    const ids: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (key?.startsWith(NAME_KEY_PREFIX)) ids.push(key.slice(NAME_KEY_PREFIX.length))
+    }
+    cleanRemovedNames(ids)
+  } catch { /* unavailable storage */ }
+}
+
+/** Project labels into the existing uiPrefs backup without writing the layout.
+ *  The backup remains self-contained when restored on a fresh origin. */
+export function bottomTerminalPrefsSnapshot(raw: string): string {
+  try {
+    const p = JSON.parse(raw)
+    if (!p || typeof p !== 'object' || Array.isArray(p)) return raw
+    const field = Array.isArray(p.tabs) ? 'tabs' : Array.isArray(p.splits) ? 'splits' : null
+    if (!field) return raw
+    const tabs = p[field].map((tab: TermTab) => tab && typeof tab.id === 'string' ? withStoredName(tab) : tab)
+    if (JSON.stringify(tabs) === JSON.stringify(p[field])) return raw
+    return JSON.stringify({ ...p, [field]: tabs })
+  } catch { return raw }
+}
 /** Min panel height in px; the grip can't drag below this. */
 export const MIN_HEIGHT = 120
 /** Default panel height on first open. */
@@ -84,7 +172,9 @@ function loadPersisted(): BottomTerminalState {
     const p = JSON.parse(raw) as (Partial<BottomTerminalState> & { splits?: TermTab[] }) | null
     if (!p || typeof p !== 'object') return base
     const rawTabs = Array.isArray(p.tabs) ? p.tabs : Array.isArray(p.splits) ? p.splits : []
-    const tabs = (rawTabs.filter(t => t && typeof (t as TermTab).id === 'string') as TermTab[]).slice(0, MAX_TERMINALS)
+    const tabs = (rawTabs.filter(t => t && typeof (t as TermTab).id === 'string') as TermTab[])
+      .slice(0, MAX_TERMINALS)
+      .map(withLiveName)
     return {
       // Only restore "open" when there were tabs to restore — a stale open flag
       // with no tabs would render an empty panel on boot.
@@ -100,10 +190,116 @@ function loadPersisted(): BottomTerminalState {
   }
 }
 
+cleanOrphanNames()
 let state: BottomTerminalState = loadPersisted()
 const listeners = new Set<() => void>()
 
 function emit() { for (const cb of listeners) cb() }
+
+/* ── Hydrate-time reconciliation ──
+ * `loadPersisted` restores the tab LIST, not the shells: a tab is only a session
+ * id, and the backend is the one that knows whether a PTY still answers to it.
+ * A tab leaked by a dispatch that never reached its deadline (#10822), or one
+ * whose shell the orphan reaper has since killed, therefore comes back on every
+ * reload — occupying the tab cap, and re-spawning a fresh shell the moment its
+ * view reconnects (the WS route mints a PTY for an unknown id).
+ *
+ * So the restored set is UNVERIFIED until `GET /api/terminal/sessions` has
+ * ruled on it. While that is pending the hosts render no terminal views
+ * (`useTerminalHydratePending`): a view that connected first would spawn the
+ * very shell the probe is asking about, and the answer would then read "alive"
+ * for a tab nobody wanted back. Only tabs restored at module init are
+ * candidates — one minted after boot has a shell of its own and is never the
+ * probe's business.
+ *
+ * The ruling takes two looks, not one, for the same reason the dispatch-deadline
+ * probe does (ChatPage's run-in-terminal handler): the route skips the null
+ * placeholder a session holds from `ws.prepare()` until its shell is spawned, so
+ * a session another window is opening RIGHT NOW reads exactly like one that never
+ * existed — and this store is shared across windows, so dropping it here would
+ * remove the tab from under that shell as it comes up. `reconcileRestoredTabs`
+ * therefore only names suspects; `confirmRestoredTabs`, fed an uncached second
+ * answer after an opening grace, drops the ones still missing. Absent twice,
+ * that far apart, is gone. */
+let restoredIds: ReadonlySet<string> = new Set(state.tabs.map(t => t.id))
+/** Restored tabs the first answer omitted or reported dead, awaiting the
+ *  confirm probe. Empty outside the confirming phase. */
+let hydrateSuspects: ReadonlySet<string> = new Set()
+type HydratePhase = 'pending' | 'confirming' | 'settled'
+let hydratePhase: HydratePhase = restoredIds.size > 0 ? 'pending' : 'settled'
+
+/** Session ids the backend reports as live, or null when the payload does not
+ *  rule on liveness: a transport failure, a shape this client does not
+ *  recognize, or the feature-disabled answer (which returns an empty list
+ *  without consulting the registry, so its absence means nothing). */
+function liveSessionIds(payload: unknown): Set<string> | null {
+  if (!payload || typeof payload !== 'object') return null
+  const p = payload as { enabled?: unknown; sessions?: unknown }
+  if (p.enabled === false || !Array.isArray(p.sessions)) return null
+  const live = new Set<string>()
+  for (const entry of p.sessions) {
+    if (!entry || typeof entry !== 'object') return null
+    const { session_id, alive } = entry as { session_id?: unknown; alive?: unknown }
+    // One malformed entry voids the whole answer: dropping a tab is
+    // irreversible, so it only happens on a payload read in full.
+    if (typeof session_id !== 'string' || typeof alive !== 'boolean') return null
+    if (alive) live.add(session_id)
+  }
+  return live
+}
+
+/** Leave the hydrate protocol with every remaining tab verified. */
+function settleHydrate(): void {
+  hydratePhase = 'settled'
+  hydrateSuspects = new Set()
+  emit()
+}
+
+/** Drop `ids` from the store, refocusing and hiding the panel as `removeTab`
+ *  would. Persisting the trimmed list is what keeps the other window — and
+ *  the next reload — from restoring the same tabs again. */
+function dropTabs(ids: ReadonlySet<string>): void {
+  const tabs = state.tabs.filter(t => !ids.has(t.id))
+  const activeId = tabs.some(t => t.id === state.activeId) ? state.activeId : (tabs[0]?.id ?? null)
+  set({ ...state, tabs, activeId, open: tabs.length > 0 ? state.open : false })
+}
+
+/** First look: weigh the restored tab set against the backend's session list
+ *  (the JSON body of `GET /api/terminal/sessions`, or null when the probe
+ *  failed). Restored tabs whose session is absent or `alive: false` become
+ *  SUSPECTS and are returned; nothing is dropped yet, and the hosts stay gated
+ *  until `confirmRestoredTabs` rules on them. With no suspects — or on a payload
+ *  that does not rule (see `liveSessionIds`) — every tab is kept and the store
+ *  settles at once: removing a possibly-live shell and its scrollback cannot be
+ *  undone, while a kept dead tab is user-closable and its PTY entry is the
+ *  reaper's to clear. Runs once per document: later calls return []. */
+export function reconcileRestoredTabs(payload: unknown): string[] {
+  if (hydratePhase !== 'pending') return []
+  const live = liveSessionIds(payload)
+  const suspects = live === null
+    ? []
+    : state.tabs.filter(t => restoredIds.has(t.id) && !live.has(t.id)).map(t => t.id)
+  if (suspects.length === 0) { settleHydrate(); return [] }
+  hydratePhase = 'confirming'
+  hydrateSuspects = new Set(suspects)
+  return suspects
+}
+
+/** Second look, from an UNCACHED probe taken after the opening grace: drop the
+ *  suspects this answer still omits or reports dead, keep the ones it now lists
+ *  live (a shell that was opening in another window), and settle. A payload
+ *  that does not rule keeps every suspect. Returns the dropped ids. */
+export function confirmRestoredTabs(payload: unknown): string[] {
+  if (hydratePhase !== 'confirming') return []
+  const live = liveSessionIds(payload)
+  const dropped = live === null
+    ? []
+    : state.tabs.filter(t => hydrateSuspects.has(t.id) && !live.has(t.id)).map(t => t.id)
+  // Drop while still gated, then settle: the hosts first see the kept set.
+  if (dropped.length > 0) dropTabs(new Set(dropped))
+  settleHydrate()
+  return dropped
+}
 
 /* Cross-window sync: the terminal-popout window and the main dashboard share
  * this persisted store (one tab list, whichever window currently hosts the
@@ -111,8 +307,23 @@ function emit() { for (const cb of listeners) cb() }
  * re-loading here can't loop; state is adopted without re-persisting. */
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
-    if (e.key !== STORAGE_KEY) return
-    state = loadPersisted()
+    if (e.storageArea && e.storageArea !== localStorage) return
+    if (e.key === null || e.key === STORAGE_KEY) {
+      if (e.key === null) volatileNames.clear()
+      state = loadPersisted()
+      for (const id of volatileNames.keys()) {
+        if (!state.tabs.some(tab => tab.id === id)) volatileNames.delete(id)
+      }
+    } else if (e.key?.startsWith(NAME_KEY_PREFIX)) {
+      // Read current values, not an event payload queued before a later save.
+      // A label event cannot add/drop tabs or change the local layout.
+      const id = e.key.slice(NAME_KEY_PREFIX.length)
+      volatileNames.delete(id)
+      const stored = loadPersisted()
+      state = { ...state, tabs: state.tabs.map(tab => tab.id === id
+        ? { ...tab, name: stored.tabs.find(t => t.id === id)?.name }
+        : tab) }
+    } else return
     emit()
   })
 
@@ -131,9 +342,16 @@ if (typeof window !== 'undefined') {
 
 function set(next: BottomTerminalState) {
   if (next === state) return
-  state = next
+  const removed = state.tabs.filter(tab => !next.tabs.some(t => t.id === tab.id)).map(tab => tab.id)
+  for (const id of removed) volatileNames.delete(id)
+  state = { ...next, tabs: withLiveNames(next.tabs) }
   emit()
-  try { safeSetItem(STORAGE_KEY, JSON.stringify(state)) } catch { /* quota / locked storage */ }
+  const tabs = state.tabs.map(tab => {
+    const local = volatileNames.get(tab.id)
+    return local ? withStoredName({ ...tab, name: local.fallback }) : tab
+  })
+  try { safeSetItem(STORAGE_KEY, JSON.stringify({ ...state, tabs })) } catch { /* quota / locked storage */ }
+  cleanRemovedNames(removed)
 }
 
 /* ── Actions (module functions so non-React callers — e.g. keyboard handlers,
@@ -182,6 +400,14 @@ export function adoptTab(id: string, cwd?: string): boolean {
   return true
 }
 
+/** Whether a tab with this session id is currently in the store. Lets the
+ *  run-in-terminal dispatch check, at its deadline, that the tab it minted is
+ *  still its own to roll back — a tab the user already closed is gone from
+ *  here, and rolling back anyway would double-delete the PTY. */
+export function hasTab(id: string): boolean {
+  return state.tabs.some(t => t.id === id)
+}
+
 /** Remove a tab from the store (the caller disposes the PTY/xterm first).
  *  Closing the last tab also hides the panel. */
 export function removeTab(id: string): void {
@@ -198,6 +424,28 @@ export function removeTab(id: string): void {
 export function setActiveTab(id: string): void {
   if (state.activeId === id) return
   set({ ...state, activeId: id })
+}
+
+/** Change only the label, never the PTY identity or working directory.
+ *  An empty name returns the tab to the live shell title. */
+export function renameTab(id: string, value: string): void {
+  const name = normalizeTabName(value)
+  const tab = state.tabs.find(t => t.id === id)
+  if (!tab) return
+  const live = persistedIds()
+  const saved = live?.has(id) && safeSetItem(NAME_KEY_PREFIX + id, name ?? '')
+  if (saved) volatileNames.delete(id)
+  else {
+    const prior = volatileNames.get(id)
+    volatileNames.set(id, { name, fallback: prior ? prior.fallback : tab.name })
+  }
+  if (live?.has(id)) {
+    // A close may interleave between membership read and label write. It wins;
+    // the label cannot resurrect its tab or remain as a new orphan coordinate.
+    cleanRemovedNames([id])
+  }
+  state = { ...state, tabs: state.tabs.map(t => t.id === id ? { ...t, name } : t) }
+  emit()
 }
 
 /** Replace the tab order wholesale (drag-to-reorder in the strip). */
@@ -278,13 +526,26 @@ export function useTerminalPosition(): TerminalPosition {
   return useSyncExternalStore(subscribe, getPositionSnapshot, getPositionSnapshot)
 }
 
+/** Whether the restored tab set still awaits its ruling (either look). Hosts
+ *  mount no terminal view while true — see the reconciliation note above. */
+function getHydratePendingSnapshot(): boolean { return hydratePhase !== 'settled' }
+export function isTerminalHydratePending(): boolean { return hydratePhase !== 'settled' }
+export function useTerminalHydratePending(): boolean {
+  return useSyncExternalStore(subscribe, getHydratePendingSnapshot, getHydratePendingSnapshot)
+}
+
 /** Test-only: reset the module store and its persisted copy. */
 export function __resetBottomTerminal(): void {
+  volatileNames.clear()
   state = { open: false, height: DEFAULT_HEIGHT, width: DEFAULT_WIDTH, position: 'bottom', tabs: [], activeId: null }
+  restoredIds = new Set()
+  hydrateSuspects = new Set()
+  hydratePhase = 'settled'
   emit()
   setTerminalCloseFailed(false)
   if (typeof localStorage !== 'undefined') {
     try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
+    cleanOrphanNames()
   }
 }
 

@@ -8,7 +8,7 @@
  * mounted further down the same page.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Pencil } from 'lucide-react'
 import { api, ApiError, type AddInstanceBody, type InstanceView } from '../../api/client'
 import SimpleSelect from '../../components/SimpleSelect'
@@ -32,6 +32,16 @@ export const DEFAULT_TTL = '20h'
 // cleared field falls back to it rather than to the empty string, which the
 // registry rejects for an SSM crew.
 export const DEFAULT_SSM_RUN_AS = 'ec2-user'
+// The port a Fargate crew's front proxy listens on. Mirrors FRONT_PORT in
+// src/kiro_crew/cloud/fargate/taskdef.py; a fargate record forwards to it
+// rather than to a dashboard port.
+export const DEFAULT_FARGATE_REMOTE_PORT = '8080'
+// Example SSM target shown as the field's placeholder: a typical EC2 instance
+// id. The fargate field shows the ECS shape below; its hint spells that shape
+// too and the backend's own message names it verbatim when a value is refused.
+export const SSM_TARGET_EXAMPLE = 'i-0123456789abcdef0'
+// Example ECS task target for the fargate field's placeholder: the shape ECS Exec uses for a task target.
+export const ECS_TARGET_EXAMPLE = 'ecs:my-cluster_taskid_runtimeid'
 
 // A tunnel forwards ONE TCP port and mints a token with a bounded lifetime, so
 // neither field has a sane fallback: coercing an unparseable value would persist
@@ -56,6 +66,7 @@ export const EMPTY_INSTANCE_FORM: InstanceFormValues = {
   awsRegion: '',
   ssmRunAs: '',
   remotePort: DEFAULT_REMOTE_PORT,
+  remotePortAuto: true,
   ttl: DEFAULT_TTL,
   remoteBin: '',
 }
@@ -73,13 +84,15 @@ export function isBlankInstanceForm(values: InstanceFormValues): boolean {
 export function instanceFormFromView(inst: InstanceView): InstanceFormValues {
   return {
     name: inst.name,
-    method: inst.connection_method === 'ssm' ? 'ssm' : 'ssh',
+    method:
+      inst.connection_method === 'fargate' ? 'fargate' : inst.connection_method === 'ssm' ? 'ssm' : 'ssh',
     sshHost: inst.ssh_host || '',
     ssmTarget: inst.ssm_target || '',
     awsProfile: inst.aws_profile || '',
     awsRegion: inst.aws_region || '',
     ssmRunAs: inst.ssm_run_as || '',
     remotePort: String(inst.remote_port || DEFAULT_REMOTE_PORT),
+    remotePortAuto: false,
     ttl: inst.ttl || DEFAULT_TTL,
     remoteBin: inst.remote_bin || '',
   }
@@ -115,14 +128,19 @@ export function useInstanceFormState(
   // form out from under unsaved work.
   const dirty = JSON.stringify(values) !== JSON.stringify(initial)
   const isSsm = values.method === 'ssm'
+  const isFargate = values.method === 'fargate'
+  // Both SSM-forwarded transports address the machine by ssm_target + AWS
+  // coordinates; only 'ssm' also names a remote user and mints a token.
+  const ssmFields = isSsm || isFargate
   // Parsed strictly: `Number('')` is 0 and `Number('80abc')` is NaN, but
   // `parseInt` would accept "80abc" as 80 and quietly forward the wrong port.
   const portRaw = values.remotePort.trim()
   const portNum = /^[0-9]+$/.test(portRaw) ? Number(portRaw) : NaN
   const portValid = Number.isInteger(portNum) && portNum >= PORT_MIN && portNum <= PORT_MAX
   const ttlValid = TTL_RE.test(values.ttl.trim())
-  // The transport-specific required field: ssh_host for SSH, ssm_target for SSM.
-  const targetFilled = isSsm ? !!values.ssmTarget.trim() : !!values.sshHost.trim()
+  // The transport-specific required field: ssh_host for SSH, ssm_target for
+  // SSM and fargate (an ECS task target there; the backend checks its shape).
+  const targetFilled = ssmFields ? !!values.ssmTarget.trim() : !!values.sshHost.trim()
   const valid = !!values.name.trim() && targetFilled && portValid && ttlValid
   /**
    * The request payload. Fields belonging to the transport that is NOT selected
@@ -155,8 +173,20 @@ export function useInstanceFormState(
     } = {}): AddInstanceBody => {
       const v = values
       const ssm = v.method === 'ssm'
+      const fargate = v.method === 'fargate'
       const opt = (raw: string, cleared?: string) =>
         raw.trim() || (explicitClears ? cleared ?? '' : undefined)
+      // The profile and region are lifecycle COORDINATES, not preferences:
+      // stop/start/delete address the machine by {profile, region,
+      // instanceId}, so an edit here would point those calls at a different
+      // AWS account and leave the real instance running, unmanaged and billing.
+      const coordinates = omitIdentity
+        ? {}
+        : {
+            ssm_target: v.ssmTarget.trim(),
+            aws_profile: opt(v.awsProfile),
+            aws_region: opt(v.awsRegion),
+          }
       const full: AddInstanceBody = {
         name: v.name.trim(),
         // Omitted for a locked crew so a partial update cannot rewrite the
@@ -164,28 +194,21 @@ export function useInstanceFormState(
         ...(omitIdentity ? {} : { connection_method: v.method }),
         ...(ssm
           ? {
-              // The profile and region are lifecycle COORDINATES, not
-              // preferences: stop/start/delete address the machine by
-              // {profile, region, instanceId}, so an edit here would point those
-              // calls at a different AWS account and leave the real instance
-              // running, unmanaged and billing.
-              ...(omitIdentity
-                ? {}
-                : {
-                    ssm_target: v.ssmTarget.trim(),
-                    aws_profile: opt(v.awsProfile),
-                    aws_region: opt(v.awsRegion),
-                  }),
+              ...coordinates,
               // An SSM crew must always name a remote user, so a cleared field
               // returns to the default rather than to the empty string.
               ssm_run_as: opt(v.ssmRunAs, DEFAULT_SSM_RUN_AS),
             }
-          : { ssh_host: v.sshHost.trim() }),
+          : fargate
+            ? // A task has no remote user to run as and no kirocrew binary to
+              // name: the forward reaches its front port and nothing else.
+              coordinates
+            : { ssh_host: v.sshHost.trim() }),
         // Both are gated by `valid`, so no fallback coercion here: a submit can
         // only carry a port and TTL the form already accepted.
         remote_port: Number(v.remotePort.trim()),
         ttl: v.ttl.trim(),
-        remote_bin: opt(v.remoteBin),
+        ...(fargate ? {} : { remote_bin: opt(v.remoteBin) }),
       }
       return full
     },
@@ -222,6 +245,8 @@ export function useInstanceFormState(
     patch,
     reset: setValues,
     isSsm,
+    isFargate,
+    ssmFields,
     portValid,
     ttlValid,
     targetFilled,
@@ -310,6 +335,8 @@ export function EditInstanceForm({
   // was restored. A restored draft carries its own, and the rebase below is the ONE
   // place that applies it — deliberately not a second `draft?.baseline ??` here,
   // which would leave each spelling masking a defect in the other.
+  const queryClient = useQueryClient()
+  const [stoppedSave, setStoppedSave] = useState(false)
   const baselineRef = useRef(inst)
   // The baseline is normally fixed for the form's lifetime, but a REBASE replaces it
   // deliberately: the user has been shown that the record moved and chose to apply
@@ -338,37 +365,51 @@ export function EditInstanceForm({
       form.dirty ? { values: form.values, baseline: baselineRef.current } : null,
     )
   }, [form.dirty, form.values])
+  const saveAbortRef = useRef<AbortController | null>(null)
+  useEffect(() => () => {
+    saveAbortRef.current?.abort()
+    saveAbortRef.current = null
+  }, [])
   const saveMutation = useMutation({
-    mutationFn: () =>
-      api.updateInstance(
+    mutationFn: () => {
+      const controller = new AbortController()
+      saveAbortRef.current = controller
+      return api.updateInstance(
         inst.id,
         form.patch(baselineRef.current, { omitIdentity: lockTransport }),
-      ),
-    onSuccess: updated => onSaved(updated),
+        { signal: controller.signal },
+      )
+    },
+    onSuccess: onSaved,
   })
-  // Only meaningful once there is something to lose: a clean form has no typed
-  // values to protect, and re-seeding it silently is correct.
+  const savePending = saveMutation.isPending
   const stale = !!externallyChanged?.length && form.dirty
-  const err = saveMutation.error
+  // An abort is never an API rejection: it is either this form unmounting or the
+  // user choosing Stop waiting on a hung save. The latter keeps the draft open and
+  // reports its outcome separately, so an error banner would misstate the user's click.
+  const err = saveMutation.error && saveMutation.error.name !== 'AbortError'
     ? saveMutation.error instanceof ApiError
       ? saveMutation.error.message
       : i18nT('pages.settings.remoteCrewPanel.failed_to_save_crew')
     : ''
+  const formLabel = i18nT('pages.settings.remoteCrewPanel.edit_crew', { name: inst.name })
   return (
     <div
       className="mt-3 rounded-md border border-border bg-bg-elevated p-3"
       role="group"
-      aria-label={i18nT('pages.settings.remoteCrewPanel.edit_crew', { name: inst.name })}
+      aria-label={formLabel}
     >
       <div className="flex items-center gap-2 mb-3 text-text font-medium text-sm">
         <Pencil className="lucide-inline" />{' '}
-        {i18nT('pages.settings.remoteCrewPanel.edit_crew', { name: inst.name })}
+        {formLabel}
       </div>
-      <InstanceFormFields
-        idPrefix={`edit-instance-${inst.id}`}
-        form={form}
-        lockTransport={lockTransport}
-      />
+      <fieldset disabled={savePending} className="contents min-w-0 border-0 p-0 m-0">
+        <InstanceFormFields
+          idPrefix={`edit-instance-${inst.id}`}
+          form={form}
+          lockTransport={lockTransport}
+        />
+      </fieldset>
       {lockTransport && (
         <p className="mt-2 text-[12px] text-warn">
           {i18nT('pages.settings.remoteCrewPanel.transport_locked_note')}
@@ -397,28 +438,60 @@ export function EditInstanceForm({
           (RemoteCrewPanel) writes that report to redux via setCrewEditForm — the
           hand-off unmounts this form, and coming back re-seeds it from `draft`. */}
       <ErrorNotice message={err} className="mt-3" askAgent />
+      {stoppedSave && (
+        <p
+          role="status"
+          className="mt-3 rounded-lg border border-border bg-bg-hover px-3 py-2 text-[13px] text-text"
+        >
+          {i18nT('pages.settings.remoteCrewPanel.save_stopped_note')}
+        </p>
+      )}
       <div className="mt-3 flex items-center gap-2">
         {/* Save is withheld while the record is stale, rather than the edit being
             discarded: throwing the typing away would punish the far more common
             case (someone edited this same crew from the CLI) to guard the rarer
             one (the crew was replaced under its id). */}
         {stale ? (
-          <Btn primary onClick={onRebase} disabled={saveMutation.isPending}>
+          <Btn primary onClick={onRebase} disabled={savePending}>
             {i18nT('pages.settings.remoteCrewPanel.use_my_edits_anyway')}
           </Btn>
         ) : (
         <Btn
           primary
-          onClick={() => saveMutation.mutate()}
-          disabled={saveMutation.isPending || !form.valid}
+          onClick={() => {
+            setStoppedSave(false)
+            saveMutation.mutate()
+          }}
+          disabled={savePending || !form.valid}
         >
-          {saveMutation.isPending
+          {savePending
             ? i18nT('pages.settings.remoteCrewPanel.saving')
             : i18nT('pages.settings.remoteCrewPanel.save_changes')}
         </Btn>
         )}
-        <Btn onClick={onCancel} disabled={saveMutation.isPending}>
-          {i18nT('pages.settings.remoteCrewPanel.cancel')}
+        {/* Stop waiting stays enabled for a hung save. The abort is client-side
+            only; refreshing the list shows a save the server already applied. The
+            form stays open with its draft so the outcome is visible and editable.
+            A write the server commits AFTER this refetch is not lost either: the
+            shared ['instances'] cache is re-read by InstancesViewport every 60s
+            and by useAutoConnectInstances on window focus, so the list converges
+            on the server's record without a second mechanism here. */}
+        <Btn
+          onClick={() => {
+            if (savePending) {
+              saveAbortRef.current?.abort()
+              saveAbortRef.current = null
+              void queryClient.invalidateQueries({ queryKey: ['instances'] })
+              setStoppedSave(true)
+              return
+            }
+            setStoppedSave(false)
+            onCancel()
+          }}
+        >
+          {savePending
+            ? i18nT('pages.settings.remoteCrewPanel.stop_waiting')
+            : i18nT('pages.settings.remoteCrewPanel.cancel')}
         </Btn>
       </div>
     </div>
@@ -426,7 +499,13 @@ export function EditInstanceForm({
 }
 
 const inputCls =
-  'bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm outline-none focus-ring'
+  // `disabled:` variants, not a conditional class: the pending-save freeze is
+  // applied by the ancestor <fieldset disabled>, which the class string never
+  // sees — only the native :disabled pseudo-class observes it. The cue is a
+  // different fill plus a dashed border, not opacity: 60% opacity on
+  // bg-elevated over --bg is nearly invisible in the dark theme, and the
+  // dashed border reads even where the two fills are close.
+  'bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm outline-hidden focus-ring disabled:bg-bg-hover disabled:text-muted disabled:border-dashed disabled:cursor-not-allowed'
 // A frozen field must LOOK frozen: identical styling invites the user to click in,
 // type, and discover only from the note below the grid that nothing landed.
 const readOnlyCls = `${inputCls} opacity-60 cursor-not-allowed`
@@ -441,7 +520,21 @@ export function InstanceFormFields({
   /** Render the machine-identity fields read-only (see EditInstanceForm). */
   lockTransport?: boolean
 }) {
-  const { values, set, isSsm, portValid, ttlValid } = form
+  const { values, set, isSsm, isFargate, ssmFields, portValid, ttlValid } = form
+  // Machine-identity fields freeze when the caller locks the transport.
+  const identityFrozen = lockTransport
+  const onMethodChange = (v: string) => {
+    const method = v as InstanceFormValues['method']
+    set('method', method)
+    // A port still following the transport default follows the new transport;
+    // a port the user typed stays put.
+    if (values.remotePortAuto) {
+      set(
+        'remotePort',
+        method === 'fargate' ? DEFAULT_FARGATE_REMOTE_PORT : DEFAULT_REMOTE_PORT,
+      )
+    }
+  }
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
       <label htmlFor={`${idPrefix}-name`} className="flex flex-col gap-1 text-[13px] text-muted">
@@ -454,43 +547,68 @@ export function InstanceFormFields({
       <div className="flex flex-col gap-1 text-[13px] text-muted">
         {i18nT('pages.settings.instancesPanel.connection_method')}
         <SimpleSelect
-          options={['ssh', 'ssm']}
-          optionLabels={[i18nT('pages.settings.instancesPanel.ssh_tunnel'), i18nT('pages.settings.instancesPanel.aws_ssm_session_manager')]}
+          options={['ssh', 'ssm', 'fargate']}
+          optionLabels={[
+            i18nT('pages.settings.instancesPanel.ssh_tunnel'),
+            i18nT('pages.settings.instancesPanel.aws_ssm_session_manager'),
+            i18nT('pages.settings.instancesPanel.aws_fargate_task'),
+          ]}
           value={values.method}
-          onChange={v => set('method', v as 'ssh' | 'ssm')}
+          onChange={onMethodChange}
           aria-label={i18nT('pages.settings.instancesPanel.connection_method')}
-          disabled={lockTransport}
+          disabled={identityFrozen}
         />
         <span className="text-[12px] text-muted leading-snug">
-          {isSsm
-            ? i18nT('pages.settings.instancesPanel.tunnels_via_aws_ssm_start_session_no_inbound_ssh')
-            : i18nT('pages.settings.instancesPanel.opens_ssh_n_l_to_the_host_requires_non_interacti')}
+          {isFargate
+            ? i18nT('pages.settings.instancesPanel.fargate_method_hint')
+            : isSsm
+              ? i18nT('pages.settings.instancesPanel.tunnels_via_aws_ssm_start_session_no_inbound_ssh')
+              : i18nT('pages.settings.instancesPanel.opens_ssh_n_l_to_the_host_requires_non_interacti')}
         </span>
       </div>
-      {isSsm ? (
+      {ssmFields ? (
         <>
           <label htmlFor={`${idPrefix}-ssm-target`} className="flex flex-col gap-1 text-[13px] text-muted">
-            {i18nT('pages.settings.instancesPanel.ssm_target_instance_id')}
-            <input id={`${idPrefix}-ssm-target`} aria-label={i18nT('pages.settings.instancesPanel.ssm_target_instance_id')} className={lockTransport ? readOnlyCls : inputCls} aria-readonly={lockTransport || undefined} value={values.ssmTarget} onChange={e => set('ssmTarget', e.target.value)} placeholder="i-0123456789abcdef0" readOnly={lockTransport} />
+            {isFargate
+              ? i18nT('pages.settings.instancesPanel.ecs_task_target')
+              : i18nT('pages.settings.instancesPanel.ssm_target_instance_id')}
+            <input
+              id={`${idPrefix}-ssm-target`}
+              aria-label={
+                isFargate
+                  ? i18nT('pages.settings.instancesPanel.ecs_task_target')
+                  : i18nT('pages.settings.instancesPanel.ssm_target_instance_id')
+              }
+              className={identityFrozen ? readOnlyCls : inputCls}
+              aria-readonly={identityFrozen || undefined}
+              value={values.ssmTarget}
+              onChange={e => set('ssmTarget', e.target.value)}
+              placeholder={isFargate ? ECS_TARGET_EXAMPLE : SSM_TARGET_EXAMPLE}
+              readOnly={identityFrozen}
+            />
             <span className="text-[12px] text-muted leading-snug">
-              {i18nT('pages.settings.instancesPanel.ec2_instance_id_i_or_ssm_managed_instance_id_mi')}
+              {isFargate
+                ? i18nT('pages.settings.instancesPanel.ecs_task_target_hint')
+                : i18nT('pages.settings.instancesPanel.ec2_instance_id_i_or_ssm_managed_instance_id_mi')}
             </span>
           </label>
           <label htmlFor={`${idPrefix}-aws-profile`} className="flex flex-col gap-1 text-[13px] text-muted">
             {i18nT('pages.settings.instancesPanel.aws_profile')} <span className="text-muted-strong">{i18nT('pages.settings.instancesPanel.optional')}</span>
-            <input id={`${idPrefix}-aws-profile`} aria-label={i18nT('pages.settings.instancesPanel.aws_profile')} className={lockTransport ? readOnlyCls : inputCls} aria-readonly={lockTransport || undefined} value={values.awsProfile} onChange={e => set('awsProfile', e.target.value)} placeholder={i18nT('pages.settings.instancesPanel.default_credential_chain')} readOnly={lockTransport} />
+            <input id={`${idPrefix}-aws-profile`} aria-label={i18nT('pages.settings.instancesPanel.aws_profile')} className={identityFrozen ? readOnlyCls : inputCls} aria-readonly={identityFrozen || undefined} value={values.awsProfile} onChange={e => set('awsProfile', e.target.value)} placeholder={i18nT('pages.settings.instancesPanel.default_credential_chain')} readOnly={identityFrozen} />
           </label>
           <label htmlFor={`${idPrefix}-aws-region`} className="flex flex-col gap-1 text-[13px] text-muted">
             {i18nT('pages.settings.instancesPanel.aws_region')} <span className="text-muted-strong">{i18nT('pages.settings.instancesPanel.optional')}</span>
-            <input id={`${idPrefix}-aws-region`} aria-label={i18nT('pages.settings.instancesPanel.aws_region')} className={lockTransport ? readOnlyCls : inputCls} aria-readonly={lockTransport || undefined} value={values.awsRegion} onChange={e => set('awsRegion', e.target.value)} placeholder="us-east-1" readOnly={lockTransport} />
+            <input id={`${idPrefix}-aws-region`} aria-label={i18nT('pages.settings.instancesPanel.aws_region')} className={identityFrozen ? readOnlyCls : inputCls} aria-readonly={identityFrozen || undefined} value={values.awsRegion} onChange={e => set('awsRegion', e.target.value)} placeholder="us-east-1" readOnly={identityFrozen} />
           </label>
-          <label htmlFor={`${idPrefix}-ssm-run-as`} className="flex flex-col gap-1 text-[13px] text-muted">
-            {i18nT('pages.settings.instancesPanel.remote_user')} <span className="text-muted-strong">{i18nT('pages.settings.instancesPanel.optional')}</span>
-            <input id={`${idPrefix}-ssm-run-as`} aria-label={i18nT('pages.settings.instancesPanel.remote_user')} className={inputCls} value={values.ssmRunAs} onChange={e => set('ssmRunAs', e.target.value)} placeholder="ec2-user" />
-            <span className="text-[12px] text-muted leading-snug">
-              {i18nT('pages.settings.instancesPanel.the_user_the_remote_gateway_runs_as_sudo_u_for_s')}
-            </span>
-          </label>
+          {isSsm ? (
+            <label htmlFor={`${idPrefix}-ssm-run-as`} className="flex flex-col gap-1 text-[13px] text-muted">
+              {i18nT('pages.settings.instancesPanel.remote_user')} <span className="text-muted-strong">{i18nT('pages.settings.instancesPanel.optional')}</span>
+              <input id={`${idPrefix}-ssm-run-as`} aria-label={i18nT('pages.settings.instancesPanel.remote_user')} className={inputCls} value={values.ssmRunAs} onChange={e => set('ssmRunAs', e.target.value)} placeholder="ec2-user" />
+              <span className="text-[12px] text-muted leading-snug">
+                {i18nT('pages.settings.instancesPanel.the_user_the_remote_gateway_runs_as_sudo_u_for_s')}
+              </span>
+            </label>
+          ) : null}
         </>
       ) : (
         <label htmlFor={`${idPrefix}-ssh-host`} className="flex flex-col gap-1 text-[13px] text-muted">
@@ -500,9 +618,22 @@ export function InstanceFormFields({
       )}
       <label htmlFor={`${idPrefix}-remote-port`} className="flex flex-col gap-1 text-[13px] text-muted">
         {i18nT('pages.settings.instancesPanel.remote_port')}
-        <input id={`${idPrefix}-remote-port`} aria-label={i18nT('pages.settings.instancesPanel.remote_port')} className={inputCls} value={values.remotePort} onChange={e => set('remotePort', e.target.value)} placeholder="5476" inputMode="numeric" />
+        <input
+          id={`${idPrefix}-remote-port`}
+          aria-label={i18nT('pages.settings.instancesPanel.remote_port')}
+          className={inputCls}
+          value={values.remotePort}
+          onChange={e => {
+            set('remotePort', e.target.value)
+            set('remotePortAuto', false)
+          }}
+          placeholder={isFargate ? DEFAULT_FARGATE_REMOTE_PORT : DEFAULT_REMOTE_PORT}
+          inputMode="numeric"
+        />
         <span className="text-[12px] text-muted leading-snug">
-          {i18nT('pages.settings.instancesPanel.must_match_the_port_the_remote_gateway_serves_on')}
+          {isFargate
+            ? i18nT('pages.settings.instancesPanel.front_port_hint', { port: DEFAULT_FARGATE_REMOTE_PORT })
+            : i18nT('pages.settings.instancesPanel.must_match_the_port_the_remote_gateway_serves_on')}
         </span>
         {!portValid ? (
           <span className="text-[12px] text-danger leading-snug">
@@ -510,6 +641,9 @@ export function InstanceFormFields({
           </span>
         ) : null}
       </label>
+      {/* A fargate forward mints no token and runs no kirocrew binary, so the
+          token TTL and the remote path have nothing to configure there. */}
+      {isFargate ? null : (
       <label htmlFor={`${idPrefix}-ttl`} className="flex flex-col gap-1 text-[13px] text-muted">
         {i18nT('pages.settings.instancesPanel.token_ttl')}
         <input id={`${idPrefix}-ttl`} aria-label={i18nT('pages.settings.instancesPanel.token_ttl')} className={inputCls} value={values.ttl} onChange={e => set('ttl', e.target.value)} placeholder={i18nT('pages.settings.instancesPanel.20h')} />
@@ -519,6 +653,8 @@ export function InstanceFormFields({
           </span>
         ) : null}
       </label>
+      )}
+      {isFargate ? null : (
       <label htmlFor={`${idPrefix}-remote-bin`} className="flex flex-col gap-1 text-[13px] text-muted sm:col-span-2">
         {i18nT('pages.settings.instancesPanel.remote_kirocrew_path')} <span className="text-muted-strong">{i18nT('pages.settings.instancesPanel.optional')}</span>
         <input
@@ -534,6 +670,7 @@ export function InstanceFormFields({
           {i18nT('pages.settings.instancesPanel.commonly')} <code className="text-text">{i18nT('pages.settings.instancesPanel.local_bin_kirocrew')}</code>{i18nT('pages.settings.instancesPanel.use_an_absolute_path_no')} <code className="text-text">~</code>).
         </span>
       </label>
+      )}
     </div>
   )
 }

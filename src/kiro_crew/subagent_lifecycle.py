@@ -24,16 +24,16 @@ class SubagentLifecycle(Generic[InfoT]):
     """Own one-shot terminal claims, report tasks, and teardown gates."""
 
     def __init__(self) -> None:
-        self._report_tasks: set[asyncio.Task[None]] = set()
-        self._report_owners: dict[asyncio.Task[None], InfoT] = {}
+        self._report_tasks: set[asyncio.Task[Any]] = set()
+        self._report_owners: dict[asyncio.Task[Any], InfoT] = {}
         self._teardown_gates: dict[str, asyncio.Event] = {}
 
     @property
-    def report_tasks(self) -> set[asyncio.Task[None]]:
+    def report_tasks(self) -> set[asyncio.Task[Any]]:
         return self._report_tasks
 
     @property
-    def report_owners(self) -> dict[asyncio.Task[None], InfoT]:
+    def report_owners(self) -> dict[asyncio.Task[Any], InfoT]:
         return self._report_owners
 
     @property

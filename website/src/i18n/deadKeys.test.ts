@@ -43,7 +43,7 @@ import pluralKeys from './pluralKeys.json'
  * pruned along with genuinely-dead ones, and a later fix restored -- these predate this
  * sync and are not new. Prune them in a follow-up, not part of the sync.
  */
-const BASELINE = 64
+const BASELINE = 27
 
 const SRC = join(__dirname, '..')
 const PLURAL_SUFFIX = /_(zero|one|two|few|many|other)$/

@@ -1,6 +1,6 @@
 ---
 name: goal-conductor
-description: Use when the user hands over a goal too large for one session ("clear the flaky-test backlog", "take this feature from design to PRs", "push these N PRs green") and wants the fleet's state to be readable rather than inferred. Own a long-horizon goal end to end while tracking it in the work ledger - decompose it into items, stand up one session per item, read each worker's reported status as structured data rather than as a transcript, verify claims with the acceptance evaluator, and decide each next round until the goal is met or a stop condition fires.
+description: Own a goal too large for one session ('clear the flaky-test backlog', 'push N PRs green') end to end via the work ledger — decompose into items, one session per item, read worker status as data, verify claims with the acceptance evaluator, decide each round until done. Use when handed such a goal.
 ---
 
 # Goal Conductor
@@ -46,7 +46,7 @@ A candidate qualifies only if **all three** hold:
    work — CI runs the suite, and its verdict is the one that counts. If an item's
    completion genuinely cannot be stated as one of these, it is not assertable:
    say so and treat it as a needs-human item rather than inventing a condition.
-   A `pr_checks` condition names a NON-DRAFT pull request: while a pull request is a draft, a repository that gates readiness on draft state holds its checks incomplete, so the verdict stays `pending` for as long as the draft lasts and the item can never pass.
+   A `pr_checks` condition names a NON-DRAFT pull request: a draft whose checks have not finished comes back `refused` rather than `pending` — the evaluator reads an unfinished check run on a draft as the author's turn, so no later cycle resolves it and you surface it instead of waiting. A draft whose checks have RESOLVED is judged on them like any other PR, so a green draft passes.
 3. **Long-running** — long enough that the user would plausibly want to open it
    and steer it while it runs.
 
@@ -86,6 +86,35 @@ Record the goal itself with `work_ledger_record` `action=goal` (the goal text an
 the round number) as part of that first turn, so the record exists before any
 item does.
 
+**File yourself in the goal's folder in that same first turn** — one
+`chat_folder_file_self` with `folder` set to the goal's folder, named for the
+goal in a few words. It creates the folder if it does not exist yet and moves
+only YOUR session, so it never prompts. The sidebar the person ends up with is
+one heading per goal, your session directly under it, and one subfolder per
+agent kind holding that agent's sessions:
+
+```
+<goal>/
+  <your conductor session>
+  kirocrew-worker/
+    <item title>          <- one session per work item
+    <item title>
+  kirocrew-conductor/
+    <item title>          <- a nested conductor, when the item decomposes
+```
+
+A conductor that floats at the top level while its workers sit in a folder is
+the failure this step exists to remove. **Running as a crew member is the one
+exception**: your session is then the member's pinned DM thread on the Crew
+page, one thread across every goal, and it is not filed — the tool refuses
+and says so. Skip this step and create your workers under `<goal>/<agent>`
+exactly as below. If a parent conductor dispatched you
+(see "When a conductor dispatched you"), you are already filed under
+`<parent goal>/kirocrew-conductor`; your goal's folder is then
+`<that path>/<your goal>` — read your current path from the `[FOLDER]` line
+or `chat_folder_tree` — so the structure nests instead of flattening into the
+parent's tree.
+
 **Decide, do not ask.** Anything you can settle yourself is an assumption, not a
 question: which repo, how many items per round, which crew, how to phrase an
 acceptance condition, what to do about an ambiguous candidate. Pick the sensible
@@ -118,10 +147,12 @@ For each item in the round, in **exactly this order**:
    `acceptance` condition — the same condition object `accept_eval.py` parses,
    stored verbatim. It returns the `item_id`.
 2. `session_create` with a title that says what the item is FOR, `folder` set to
-   the goal's folder (missing path segments are created automatically, and the
-   session is filed as part of creation — there is no separate move step and no
-   window where the folder can vanish between the two), and **`agent` set
-   explicitly** — see "Which agent" below. It returns the worker's session key.
+   `<goal folder>/<agent>` — the goal's folder from Round 0 with the agent name
+   as the subfolder, e.g. `Flaky test backlog/kirocrew-worker` (missing path
+   segments are created automatically, and the session is filed as part of
+   creation — there is no separate move step and no window where the folder
+   can vanish between the two), and **`agent` set explicitly** — see "Which
+   agent" below. It returns the worker's session key.
 3. `work_ledger_record` `action=bind` with that `item_id` and
    `worker_session_key`.
 4. `session_send` the seed prompt into the new session — the item's goal, its
@@ -129,7 +160,14 @@ For each item in the round, in **exactly this order**:
    The seed is the item's whole contract: the child session gets no other
    context from you.
 
-**A `pr_checks` seed says how the pull request is opened.** Tell the worker to open it non-draft — `gh pr create` without `--draft` — or to run `gh pr ready` before it reports done. A completion claim that arrives on a draft costs a whole verify cycle that can only answer `pending`.
+**A `pr_checks` seed says how the pull request is opened.** Tell the worker to open it non-draft — `gh pr create` without `--draft` — or to run `gh pr ready` before it reports done. A completion claim that arrives on a draft whose checks have not finished costs a whole verify cycle that answers `refused`, which you surface to the user rather than retry.
+
+**A `pr_checks` seed may name the PR procedure.** The worker is a custom agent
+and sees no skill catalog, so nothing auto-loads `prepare-pr` for it. If the
+worker will open a pull request, you can add one line to the seed: it may
+read `<crew-home>/skills/kirocrew-dev/prepare-pr/SKILL.md` (`<crew-home>` is
+`KIROCREW_HOME` when set, else `~/.kiro/crew`) and follow its loop to drive
+the PR to review-ready. Optional — the worker's own method is fine too.
 
 **Bind BEFORE you seed.** The opposite order — seed first, record after —
 protects against a ledger row with no session behind it. This one protects
@@ -449,6 +487,7 @@ what the composer renders:
   that error, say which switch to flip; do not retry.
 - **Reads and creates do not prompt; anything that touches another session does.**
   Auto-approved by name: `chat_folder_tree`, `chat_folder_create`,
+  `chat_folder_file_self` (it writes only your own placement),
   `session_create`, `session_read_message`, `work_ledger_read`,
   `work_ledger_record` — so a patrol cycle that wakes on a nudge with nobody at
   the keyboard never blocks, and filing rides the create itself (the `folder`
