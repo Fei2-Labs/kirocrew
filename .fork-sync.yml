@@ -360,6 +360,20 @@ conflict_policy:
       guards nothing.
 
 divergences:
+  - id: seatbelt-window-ancestor-metadata
+    what: |
+      `sandbox._window_ancestors` plus a literal `file-read-metadata` allow on
+      every masked directory above a private window, in both Seatbelt window
+      branches of `_build_seatbelt_profile`. TEMPORARY: submitted upstream as
+      kirodotdev/KiroCrew#13182; delete this entry once upstream carries it.
+    why: |
+      Without it `realpath()` of a spawn's own scratch dir fails on macOS, and the
+      Copilot CLI refuses `session/new` ("Directory does not exist or cannot be
+      accessed"). Upstream's copy has the bug, so "take upstream" on a sync
+      conflict in sandbox.py silently breaks the copilot backend again.
+    pinned_by: "test/test_sandbox_private_window_in_caller_mask.py::TestSeatbeltHonoursAWindowInsideACallerMask::test_the_masked_ancestors_of_a_window_stay_stat_able"
+    decided: 2026-09-23
+
   - id: spec-adapter-agent-resources
     what: |
       `context._agent_spec_candidates`, `_load_agent_file_resources`, and the
