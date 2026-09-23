@@ -272,6 +272,19 @@ def codex_adapter_resolves() -> bool:
     return bool(adapter_argv)
 
 
+def copilot_resolves() -> bool:
+    """Whether the GitHub Copilot CLI resolves, through the resolver the spawn calls.
+
+    ONE component and NO cached-negative seam: ``_spawn`` resolves ``copilot`` afresh
+    on every session (``asyncio.to_thread(_resolve_copilot_bin)``) and keeps no
+    process-lifetime cache, so a fresh verdict here can never disagree with the next
+    spawn and ``restart_required`` has nothing to read.
+    """
+    from kiro_crew.acp.client import _resolve_copilot_bin
+
+    return bool(_resolve_copilot_bin())
+
+
 def codex_adapter_cached_negative() -> bool:
     """Has the RUNNING gateway already resolved the codex adapter as absent?
 
@@ -428,8 +441,9 @@ def forget_cached_resolution(backend: str) -> None:
     operator's install completes, uses its own answer for its own session, and does not
     stamp that stale miss back over the cleared cache.
 
-    Silent for a backend with no cache of its own: kiro resolves per spawn and KAS
-    shares its answer, so there is nothing of theirs to forget.
+    Silent for a backend with no cache of its own: kiro resolves per spawn, KAS
+    shares its answer and copilot resolves per spawn too, so there is nothing of
+    theirs to forget.
     """
     from kiro_crew.acp import client as _client
 

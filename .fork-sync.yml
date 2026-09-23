@@ -726,9 +726,15 @@ divergences:
       The fork's `ACP_BACKENDS_MODEL_NAMESPACE` adds copilot beside upstream's
       {kiro, kas}; every other capability set is upstream's, copilot opts into
       none of them.
+
+      At the 2026-09-23 sync copilot gained its own install probe
+      (`_probe_copilot` in `agent_sdk/backend_install.py` plus the `copilot`
+      branch in `dashboard/handlers/acp_backends._probe_installed`), so its
+      readiness verdict is `installed`/`missing` rather than UNKNOWN; fork-only,
+      upstream has no copilot.
     pinned_by: "test/test_harness_parity.py::test_initial_adapter_selection_is_limited_to_reviewed_backends, test/test_agent_backend_editable.py::test_baseline_ships_the_reviewed_backends_only, test/test_agent_sdk_capabilities.py (KNOWN list), test/test_provider_dispatch.py::TestKiroDialectSet"
     decided: 2026-08-31
-    revised: 2026-09-15
+    revised: 2026-09-23
 
   - id: copilot-backend-identity
     what: "is_copilot_backend predicate + 'copilot' in session_pid._MANAGED_AGENT_MARKERS."

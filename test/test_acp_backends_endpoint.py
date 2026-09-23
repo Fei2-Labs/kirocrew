@@ -19,6 +19,7 @@ from kiro_crew.acp import backends
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -282,6 +283,30 @@ class TestDescriptorPayload:
 
         monkeypatch.setattr(pi_mod, "resolve_argv_cached", boom)
         assert handler._probe_installed(ACP_BACKEND_PI) == "unknown"
+
+    def test_copilot_probe_answers_through_the_spawn_resolver(self, monkeypatch) -> None:
+        """The fork-only harness answers through the same resolver the spawn calls.
+
+        There is no cached variant to patch: ``_spawn`` resolves ``copilot`` per
+        session via ``_resolve_copilot_bin`` and keeps no process-lifetime cache.
+        """
+        import kiro_crew.acp.client as client_mod
+
+        monkeypatch.setattr(client_mod, "_resolve_copilot_bin", lambda: "/opt/homebrew/bin/copilot")
+        assert handler._probe_installed(ACP_BACKEND_COPILOT) == "installed"
+
+        monkeypatch.setattr(client_mod, "_resolve_copilot_bin", lambda: None)
+        assert handler._probe_installed(ACP_BACKEND_COPILOT) == "missing"
+
+    def test_copilot_probe_still_never_says_missing_on_a_failed_check(self, monkeypatch) -> None:
+        """The three-state rule survives: a broken check is unknown, not missing."""
+        import kiro_crew.acp.client as client_mod
+
+        def boom() -> str:
+            raise OSError("PATH unreadable")
+
+        monkeypatch.setattr(client_mod, "_resolve_copilot_bin", boom)
+        assert handler._probe_installed(ACP_BACKEND_COPILOT) == "unknown"
 
     def test_registry_probe_uses_the_exact_package_resolver(self, monkeypatch) -> None:
         """A package runner on PATH says nothing about one exact global install."""

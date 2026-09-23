@@ -34,6 +34,7 @@ import pytest
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -79,6 +80,7 @@ def _stub_resolvers(
     pi_acp=(["node", "/n/pi-acp.js"], "/usr/bin"),
     pi_cli=("/usr/local/bin/pi", "/usr/bin"),
     codex_acp=(["node", "/n/codex-acp.js"], "/usr/bin"),
+    copilot=None,
     self_served=None,
 ):
     """Patch the spawn resolvers on the module the driver imports from.
@@ -103,6 +105,10 @@ def _stub_resolvers(
     # HAS the codex adapter installed the real resolver answers ``installed`` and the
     # test fails for a property of the machine rather than of the code.
     monkeypatch.setattr(client, "_resolve_codex_acp_bin", lambda: codex_acp)
+    # copilot, stubbed for the same reason as codex: the CLI is installed on the
+    # recording host, so an unstubbed payload test would read ``installed`` here
+    # and ``missing`` in CI.
+    monkeypatch.setattr(client, "_resolve_copilot_bin", lambda: copilot)
     # The self-served harnesses, stubbed through the ONE resolver they share. The
     # default answers every MEMBER of the launch table rather than naming harnesses,
     # so onboarding one needs no edit here -- and every member needs an answer for
@@ -408,6 +414,46 @@ class TestCodexDriverSeams:
         command = driver.codex_adapter_install_command()
         assert command == f"npm i -g {CODEX_ACP_NPM_PKG}"
         assert CODEX_ACP_NPM_PKG in command
+
+
+class TestCopilotProbe:
+    """The fork-only harness's probe: one component, no install command, no cache.
+
+    Mirrors the codex probe tests, minus the cached-negative cases: the spawn
+    resolves ``copilot`` on every session and keeps no process-lifetime cache, so
+    there is no ``restart_required`` surface to pin.
+    """
+
+    def test_a_resolved_binary_is_installed_and_names_nothing(self, monkeypatch):
+        _stub_resolvers(monkeypatch, copilot="/opt/homebrew/bin/copilot")
+        state = probe.probe_backend(ACP_BACKEND_COPILOT)
+        assert state.installed == probe.INSTALLED
+        assert state.missing_components == ()
+        assert state.install_command == ""
+        assert state.restart_required is False
+        assert state.policy_id == "copilot"
+
+    def test_an_absent_binary_names_the_component_and_no_command(self, monkeypatch):
+        """No install_command: the CLI's own installer owns distribution."""
+        _stub_resolvers(monkeypatch, copilot=None)
+        state = probe.probe_backend(ACP_BACKEND_COPILOT)
+        assert state.installed == probe.MISSING
+        assert state.missing_components == (probe.COMPONENT_COPILOT_CLI,)
+        assert state.install_command == ""
+        assert state.restart_required is False
+
+    def test_a_raising_resolver_yields_unknown_never_missing(self, monkeypatch):
+        """A failed CHECK is unknown; collapsing it would advise a needless install."""
+        _stub_resolvers(monkeypatch)
+        from kiro_crew.acp import client
+
+        def _boom():
+            raise OSError("PATH unreadable")
+
+        monkeypatch.setattr(client, "_resolve_copilot_bin", _boom)
+        state = probe.probe_backend(ACP_BACKEND_COPILOT)
+        assert state.installed == probe.UNKNOWN
+        assert state.missing_components == ()
 
 
 # ── Per-backend verdicts ──
@@ -939,9 +985,9 @@ class TestEndpointPayloadShape:
             probe.COMPONENT_CLAUDE_ACP_ADAPTER,
             probe.COMPONENT_CLAUDE_CODE_CLI,
         ]
-        # codex is in ACP_BACKENDS_KNOWN with no entry in ``_PROBES``, so it gets a
-        # row -- the endpoint lists every id the switch can show -- but the row can
-        # only say ``unknown`` and must name nothing to install. That gap is why
+        # codex was in ACP_BACKENDS_KNOWN with no entry in ``_PROBES``, so it got a
+        # row -- the endpoint lists every id the switch can show -- but the row could
+        # only say ``unknown`` and named nothing to install. That gap is why
         # codex now has a probe, so its row carries a real verdict rather than
         # ``unknown``. That is the whole reason it could be offered: the operator
         # gets the component name and the command that installs it.
