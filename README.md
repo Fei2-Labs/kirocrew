@@ -2,11 +2,72 @@
   <img src="assets/banner.svg" alt="Kiro Crew. Keep work moving. Runs on your hardware, remembers across sessions, keeps working unattended.">
 </p>
 
-<h1 align="center">Kiro Crew</h1>
+<h1 align="center">Kiro Crew — Fei2 Labs Fork</h1>
 
 <p align="center">
-  <strong>A persistent workspace for development work that self-improves and continues beyond one session.</strong>
+  <strong>Upstream Kiro Crew + GitHub Copilot backend, durable task queue, and multi-repo workflow extensions.</strong>
 </p>
+
+> **This is a maintained fork of
+> [kirodotdev/KiroCrew](https://github.com/kirodotdev/KiroCrew).** It tracks
+> upstream closely and syncs regularly. The fork exists because the features
+> below require changes to the ACP harness layer, which upstream does not
+> support as a plugin mechanism. Everything else — skills, apps, MCP servers,
+> agents — works the same as upstream.
+
+## What this fork adds
+
+| Feature | What it does | Why it requires a fork |
+|---|---|---|
+| **GitHub Copilot as an ACP backend** | `agent.acp_backend: "copilot"` — run agent sessions through Copilot's native ACP, with its own permission request flow | Harness registration, routing table row, and tool gate branch are compile-time bindings in upstream |
+| **Durable run coordinator & task queue** | Persistent, checkpointed task execution that survives gateway restarts; SQLite-backed work ledger | Deep integration with subagent admission, session lifecycle, and sandbox |
+| **Workflow policy panel** | Dashboard UI for git publication mode, SSH agent forwarding, and external handoff opt-ins; stored outside `config.json` as a security keystone | Requires security layer hooks and dashboard route additions |
+| **Multi-repo Git panel** | Git status, branch, and diff across multiple repositories from the dashboard | Dashboard API and i18n additions |
+| **Spec adapter admission** | Fork-specific agent spec guard that gates MCP delivery based on project context | Wired into `AcpClient` lifecycle |
+| **Connections disconnect owner gate** | Only the connection owner can disconnect — prevents accidental disconnection | Endpoint-level ownership enforcement |
+
+The full list of divergences and their test pins is in
+[`.fork-sync.yml`](.fork-sync.yml).
+
+## Install this fork
+
+**Do not use the official download links below** — they install upstream and
+will overwrite the fork. Build from source instead:
+
+```bash
+git clone https://github.com/Fei2-Labs/kirocrew.git
+cd kirocrew
+make build
+source .venv/bin/activate
+kirocrew setup && kirocrew doctor && kirocrew gateway
+```
+
+To upgrade an existing install when this fork is updated:
+
+```bash
+git pull origin main
+bash scripts/stamp-distribution.sh source
+pip install --force-reinstall --no-deps dist/kirocrew-*.whl  # or: pip install -e .
+# restart the gateway
+```
+
+**Do not run `kirocrew update`** — it pulls from the upstream feed and
+replaces the fork.
+
+## Staying in sync with upstream
+
+This fork rebases regularly against `upstream/main`. Every sync:
+
+1. Merges upstream (never rebase — preserves fork commit identity)
+2. Runs the full import sweep (`pkgutil.walk_packages`) and fork pin test suite
+3. Audits every theirs-picked conflict resolution against `.fork-sync.yml`
+4. Records new divergences with their test pins
+
+---
+
+*Everything below is the upstream README, kept intact for reference.*
+
+---
 
 <p align="center">
   <a href="https://trendshift.io/repositories/103032" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/103032/daily?language=Python" alt="Kiro Crew on Trendshift" width="250" height="55"></a>
