@@ -1,0 +1,80 @@
+name: Fork Release
+
+# Build a stamped wheel and publish a GitHub Release whenever main advances.
+# Other devices upgrade by downloading the wheel from the release.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write  # create releases and upload assets
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for stamp-distribution.sh
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install build deps
+        run: pip install build setuptools wheel
+
+      - name: Stamp fork revision
+        run: bash scripts/stamp-distribution.sh source
+
+      - name: Build frontend
+        working-directory: website
+        run: npm ci && npm run build
+
+      - name: Build wheel
+        run: python -m build --wheel
+
+      - name: Derive version tag
+        id: tag
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAG="v${VERSION}+fork.g${SHORT_SHA}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "${{ steps.tag.outputs.version }} (fork ${{ steps.tag.outputs.sha }})"
+          body: |
+            Fork build from `${{ github.sha }}`.
+
+            ## Install on another device
+
+            ```bash
+            # Download and install the wheel (no git clone needed):
+            curl -fLO "${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/kirocrew-${{ steps.tag.outputs.version }}-py3-none-any.whl"
+            pip install --force-reinstall --no-deps kirocrew-${{ steps.tag.outputs.version }}-py3-none-any.whl
+            ```
+
+            Or if you have the fork cloned:
+            ```bash
+            git pull origin main
+            bash scripts/stamp-distribution.sh source
+            pip install -e .
+            ```
+          files: dist/kirocrew-*.whl
+          make_latest: true
+          generate_release_notes: false
